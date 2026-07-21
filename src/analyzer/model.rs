@@ -1102,11 +1102,38 @@ pub struct MaintainabilitySizeSmell {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredImportPath {
+    pub segments: Vec<String>,
+    /// Lexical namespace/package prefixes at the import declaration, ordered
+    /// from outermost to innermost and derived by the language parser.
+    #[serde(default)]
+    pub lexical_prefixes: Vec<String>,
+    /// Parser-derived lexical containers surrounding the import, ordered
+    /// outermost to innermost.
+    #[serde(default)]
+    pub lexical_scopes: Vec<StructuredImportScope>,
+    /// Start byte of the import declaration, used for source-order visibility.
+    #[serde(default)]
+    pub declaration_start_byte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredImportScope {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportInfo {
     pub raw_snippet: String,
     pub is_wildcard: bool,
     pub identifier: Option<String>,
     pub alias: Option<String>,
+    /// Parser-derived path components. Language adapters should populate this
+    /// from syntax-tree fields instead of making consumers recover structure
+    /// from `raw_snippet`.
+    #[serde(default)]
+    pub path: Option<StructuredImportPath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

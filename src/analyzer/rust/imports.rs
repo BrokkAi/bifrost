@@ -581,6 +581,7 @@ fn rust_import_info(
         is_wildcard,
         identifier,
         alias,
+        path: None,
     }
 }
 
@@ -604,6 +605,7 @@ fn restricted_rust_import_info(
         is_wildcard,
         identifier,
         alias,
+        path: None,
     }
 }
 

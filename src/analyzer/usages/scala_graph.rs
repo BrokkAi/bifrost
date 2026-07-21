@@ -1,6 +1,6 @@
-mod extractor;
-mod hits;
 mod inverted;
+pub(in crate::analyzer::usages) mod local;
+pub(crate) mod namespace;
 mod resolver;
 mod shared;
 pub(super) mod syntax;
@@ -21,10 +21,9 @@ use crate::hash::HashSet;
 
 pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};
 pub(in crate::analyzer::usages) use resolver::{
-    import_candidate_fq_names, import_candidate_owner_fq_names, method_call_arity_applies,
-    method_signature_arity, package_name_of, resolved_extension_receiver_type,
-    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
-    scala_normalized_fq_name,
+    import_candidate_fq_names, import_candidate_owner_fq_names, method_signature_arity,
+    package_name_of, resolved_extension_receiver_type, scala_builtin_type_name,
+    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
 };
 pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
@@ -232,6 +231,28 @@ class ScopeLeak {
   { val Service: Int = 0 }
   def call: Int = Service.run()
 }
+object Stable {
+  val Enabled: Int = 1
+}
+object Decoy {
+  val Enabled: Int = 2
+}
+class StableHolder {
+  val Enabled: Int = 3
+}
+object StableUse {
+  def direct: Int = Stable.Enabled
+  def stable(value: Any): Int = value match {
+    case Stable.Enabled => 1
+    case _ => 0
+  }
+  def packageStable(value: Any): Int = value match {
+    case app.Stable.Enabled => 1
+    case _ => 0
+  }
+  def localRoot(Stable: StableHolder): Int = Stable.Enabled
+  def decoy: Int = Decoy.Enabled
+}
 "#,
         )
         .unwrap();
@@ -264,6 +285,202 @@ class ScopeLeak {
         assert!(has_edge("app.Params.read", "app.Params.second"));
         assert!(!has_edge("app.Params.shadow", "app.Params.first"));
         assert!(has_edge("app.ScopeLeak.call", "svc.Service$.run"));
+        assert!(has_edge("app.StableUse$.direct", "app.Stable$.Enabled"));
+        assert!(has_edge("app.StableUse$.stable", "app.Stable$.Enabled"));
+        assert!(has_edge(
+            "app.StableUse$.packageStable",
+            "app.Stable$.Enabled"
+        ));
+        assert!(!has_edge("app.StableUse$.localRoot", "app.Stable$.Enabled"));
+        assert!(!has_edge("app.StableUse$.decoy", "app.Stable$.Enabled"));
+    }
+
+    #[test]
+    fn scala_inverted_resolves_exact_structured_field_chains() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let write = |path: &str, source: &str| {
+            ProjectFile::new(root.clone(), path).write(source).unwrap();
+        };
+        write(
+            "model/Fields.scala",
+            r#"package model
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def inheritedBare: Int = inherited.leaf.token
+  def inheritedShadow(inherited: other.Middle): Int = inherited.leaf.token
+}
+type Maybe[A] = Option[A]
+infix type <[A, B] = Either[A, B]
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(var maximumHeapSize: Int) }
+object AliasOnly { type Value = Int }
+object Result {
+  opaque type Success[A] = A
+  object Success
+}
+object SupervisorStrategy {
+  type Decider = Throwable => String
+  trait Strategy { def decider: Decider }
+}
+object ClusterShardingSettings {
+  object PassivationStrategySettings { final class AdmissionSettings }
+  final class Settings(
+    val admission: Option[PassivationStrategySettings.AdmissionSettings]
+  )
+}
+trait FSM {
+  case class EventData(value: Int)
+  val Event = EventData
+}
+final class Manager extends FSM {
+  def receive(value: Any): Int = value match {
+    case Event(number) => number
+    case _ => 0
+  }
+}
+"#,
+        );
+        write(
+            "other/Fields.scala",
+            "package other\nclass Leaf(val token: Int)\nclass Middle(val leaf: Leaf)\n",
+        );
+        write(
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        );
+        write(
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        );
+        write(
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        );
+        write(
+            "decoy/Objects.scala",
+            "package decoy\nobject Api { class ActorContext }\n",
+        );
+        write(
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        );
+        write(
+            "app/collision/Api.scala",
+            "package app.collision\nobject Api { class ActorContext }\n",
+        );
+        write(
+            "app/Use.scala",
+            r#"package app
+import model.*
+import root.{api => mixed}
+import decoy.{Api => mixed}
+import collision.{Api => overlap}
+
+class ImportedChild extends Child {
+  def inheritedBare: Middle = inherited
+}
+
+object Use {
+  def packageAlias: Maybe[Int] = None
+  def packageOperator: Int < String = Left(1)
+  def typed(middle: Middle): Int = middle.leaf.token
+  def inherited(child: Child): Int = child.inherited.leaf.token
+  def stable: Int = Stable.middle.leaf.token
+  def nested: Int = { val state = new Owners.State(1); state.maximumHeapSize }
+  def localShadow(middle: other.Middle): Int = middle.leaf.token
+  def ambiguous(owner: dup.Owner): Int = owner.value
+  def aliasIsNotATerm: Any = AliasOnly.Value
+  def stableTypeMember: Result.Success[Int] = 1
+  def stableTermMember: Any = Result.Success
+  def ambiguousPackageObject: mixed.ActorContext = null
+  def relativeObjectImport: overlap.ActorContext = null
+}
+"#,
+        );
+
+        let project = TestProject::new(root, Language::Scala);
+        let analyzer = ScalaAnalyzer::new(Arc::new(project));
+        let nodes: HashSet<String> = analyzer
+            .all_declarations()
+            .map(|unit| unit.fq_name())
+            .collect();
+        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+            .expect("Scala inverted field-chain build should succeed");
+        let has_edge = |caller: &str, callee: &str| {
+            edges
+                .edges
+                .contains_key(&(caller.to_string(), callee.to_string()))
+        };
+
+        for caller in ["app.Use$.typed", "app.Use$.inherited", "app.Use$.stable"] {
+            assert!(
+                has_edge(caller, "model.Middle.leaf"),
+                "missing {caller} -> leaf"
+            );
+            assert!(
+                has_edge(caller, "model.Leaf.token"),
+                "missing {caller} -> token"
+            );
+        }
+        assert!(has_edge(
+            "model.Child.inheritedBare",
+            "model.Base.inherited"
+        ));
+        assert!(has_edge("model.Child.inheritedBare", "model.Middle.leaf"));
+        assert!(has_edge("model.Child.inheritedBare", "model.Leaf.token"));
+        assert!(has_edge("app.Use$.inherited", "model.Base.inherited"));
+        assert!(has_edge("app.Use$.stable", "model.Stable$.middle"));
+        assert!(has_edge("app.Use$.packageAlias", "model.Maybe"));
+        assert!(has_edge("app.Use$.packageOperator", "model.<"));
+        assert!(has_edge(
+            "model.SupervisorStrategy$.Strategy.decider",
+            "model.SupervisorStrategy$.Decider"
+        ));
+        assert!(has_edge(
+            "model.ClusterShardingSettings$.Settings.admission",
+            "model.ClusterShardingSettings$.PassivationStrategySettings$.AdmissionSettings"
+        ));
+        assert!(has_edge("model.Manager.receive", "model.FSM.Event"));
+        assert!(has_edge(
+            "app.ImportedChild.inheritedBare",
+            "model.Base.inherited"
+        ));
+        assert!(has_edge(
+            "app.Use$.stableTypeMember",
+            "model.Result$.Success"
+        ));
+        assert!(has_edge(
+            "app.Use$.nested",
+            "model.Owners$.State.maximumHeapSize"
+        ));
+
+        for caller in ["app.Use$.localShadow", "model.Child.inheritedShadow"] {
+            assert!(!has_edge(caller, "model.Middle.leaf"));
+            assert!(!has_edge(caller, "model.Leaf.token"));
+        }
+        assert!(!has_edge("app.Use$.ambiguous", "dup.Owner.value"));
+        assert!(!has_edge(
+            "app.Use$.aliasIsNotATerm",
+            "model.AliasOnly$.Value"
+        ));
+        assert!(!has_edge(
+            "app.Use$.stableTermMember",
+            "model.Result$.Success"
+        ));
+        for callee in ["root.api.ActorContext", "decoy.Api$.ActorContext"] {
+            assert!(!has_edge("app.Use$.ambiguousPackageObject", callee));
+        }
+        assert!(has_edge(
+            "app.Use$.relativeObjectImport",
+            "app.collision.Api$.ActorContext"
+        ));
+        assert!(!has_edge(
+            "app.Use$.relativeObjectImport",
+            "collision.Api$.ActorContext"
+        ));
     }
 
     #[test]
@@ -274,10 +491,10 @@ class ScopeLeak {
         for index in 0..FILE_COUNT {
             let file = ProjectFile::new(root.clone(), format!("C{index}.scala"));
             let source = if index == 0 {
-                "package bulk\n\ntrait Base\n\nobject Extensions {\n  extension (value: String) def run(): Unit = ()\n}\n\nclass C0 extends Base\n".to_string()
+                "package bulk\n\ntrait Base\n\nobject Extensions {\n  extension (value: String) def run(): Unit = ()\n}\n\nclass C0 extends Base {\n  type Alias = String\n  class Nested\n  def alias(value: Alias): Alias = value\n  def nested(value: Nested): Nested = value\n}\n".to_string()
             } else {
                 format!(
-                    "package bulk\n\nimport bulk.Extensions.run\n\nclass C{index} extends Base\n"
+                    "package bulk\n\nimport bulk.Extensions.run\n\nclass C{index} extends Base {{\n  type Alias = String\n  class Nested\n  def alias(value: Alias): Alias = value\n  def nested(value: Nested): Nested = value\n}}\n"
                 )
             };
             file.write(source).unwrap();

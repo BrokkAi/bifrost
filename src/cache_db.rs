@@ -16,7 +16,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 8;
+const CURRENT_MIGRATION_VERSION: i64 = 9;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -31,6 +31,7 @@ const STRUCTURAL_FACTS_SNAPSHOTS_SQL: &str =
     include_str!("../migrations/cache/0007-structural-facts-snapshots.sql");
 const CPP_TEMPLATE_METADATA_SQL: &str =
     include_str!("../migrations/cache/0008-cpp-template-metadata.sql");
+const SCALA_EXPORTS_SQL: &str = include_str!("../migrations/cache/0009-scala-exports.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -40,6 +41,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     ANALYZER_BLOB_PAYLOAD_COSTS_SQL,
     STRUCTURAL_FACTS_SNAPSHOTS_SQL,
     CPP_TEMPLATE_METADATA_SQL,
+    SCALA_EXPORTS_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -69,6 +71,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply structural facts snapshots migration");
     conn.execute_batch(CPP_TEMPLATE_METADATA_SQL)
         .expect("apply C++ template metadata migration");
+    conn.execute_batch(SCALA_EXPORTS_SQL)
+        .expect("apply Scala exports migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);

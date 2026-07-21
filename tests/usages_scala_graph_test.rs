@@ -4,8 +4,11 @@ use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder,
     UsageHit, UsageHitKind,
 };
-use brokk_bifrost::{CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer};
-use common::{InlineTestProject, line_of};
+use brokk_bifrost::{
+    CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, ScalaAnalyzer,
+};
+use common::{InlineTestProject, call_search_tool_json, line_of};
+use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -19,6 +22,479 @@ fn scala_analyzer_with_files(
     let project = builder.build();
     let analyzer = ScalaAnalyzer::from_project(project.project().clone());
     (project, analyzer)
+}
+
+#[test]
+fn scala_explicit_package_singleton_collision_fails_closed() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "collision/Api/Types.scala",
+            "package collision.Api\nclass ActorContext\n",
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import collision.{Api => mixed}
+object Use {
+  val context: mixed.ActorContext = null // negative-same-tier-package-singleton
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+
+    for target in ["collision.Api$.ActorContext", "collision.Api.ActorContext"] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&target_hits, "negative-same-tier-package-singleton");
+    }
+}
+
+#[test]
+fn scala_usage_finder_routes_field_factory_and_nested_curried_receivers() {
+    let weather_source = r#"package app
+import model.*
+class WeatherRoutes(system: String) {
+  private var sharding = ClusterSharding(system)
+  def route(): String = {
+    val ref = sharding.entityRefFor()
+    ref.ask() // exact-ask
+  }
+  def reset(): EntityRef = {
+    sharding = ClusterSharding(system)
+    sharding.entityRefFor() // exact-field-after-assignment
+  }
+}
+"#;
+    let layer_source = r#"package app
+import model.Graph
+object LayerMacros {
+  def build(nodes: List[Int]): Int = {
+    val graph = Graph(nodes.toSet)(_ < _)
+    graph.buildTargets() // exact-build-targets
+  }
+}
+"#;
+    let imported_source = r#"package app
+import model.Factories.{ambiguous, make}
+import model.Graph
+object ImportedFactories {
+  def positive(): Int = {
+    val graph = make()
+    graph.buildTargets() // positive-imported-arity
+  }
+  def negative(): Int = {
+    val uncertain = ambiguous(1)
+    uncertain.buildTargets() // negative-imported-same-shape
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Runtime.scala",
+            r#"package model
+class EntityRef { def ask(): String = "ok" }
+class ClusterSharding { def entityRefFor(): EntityRef = new EntityRef }
+abstract class ExtensionId[T] { def apply(system: String): T }
+object ClusterSharding extends ExtensionId[ClusterSharding]
+class Graph { def buildTargets(): Int = 1 }
+object Graph { def apply(nodes: Set[Int])(edge: (Int, Int) => Boolean): Graph = new Graph }
+object Factories {
+  def make(): Graph = new Graph
+  def make(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: String): Graph = new Graph
+}
+"#,
+        ),
+        ("app/WeatherRoutes.scala", weather_source),
+        ("app/LayerMacros.scala", layer_source),
+        ("app/ImportedFactories.scala", imported_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, source, marker) in [
+        ("model.EntityRef.ask", weather_source, "ref.ask()"),
+        (
+            "app.WeatherRoutes.sharding",
+            weather_source,
+            "sharding.entityRefFor() // exact-field-after-assignment",
+        ),
+        (
+            "model.ClusterSharding.entityRefFor",
+            weather_source,
+            "sharding.entityRefFor() // exact-field-after-assignment",
+        ),
+        (
+            "model.Graph.buildTargets",
+            layer_source,
+            "graph.buildTargets()",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100));
+        assert_hit_line(&target_hits, line_of(source, marker));
+    }
+
+    let build_targets = definition(&analyzer, "model.Graph.buildTargets");
+    let build_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&build_targets),
+        &candidates,
+        100,
+    ));
+    assert_hit_line(
+        &build_hits,
+        line_of(imported_source, "positive-imported-arity"),
+    );
+    assert_no_hit_line(
+        &build_hits,
+        line_of(imported_source, "negative-imported-same-shape"),
+    );
+}
+
+#[test]
+fn scala_inherited_generic_apply_substitutes_exact_result_owner_and_fails_closed() {
+    let use_source = r#"package app
+import model.*
+object Use {
+  val system = new System
+  val sharding = ClusterSharding(system) // inherited-factory-application
+  def akkaShape = {
+    val ref = sharding.entityRefFor()
+    ref.ask() // inherited-one-hop
+  }
+  def twoHop = {
+    val value = Service(system) // two-hop-factory-application
+    value.selected() // inherited-two-hop
+  }
+  def qualified = {
+    val value = QualifiedFactory(system)
+    value.qualifiedOnly() // qualified-result
+  }
+  def substitutedOther = {
+    val value = WrongFactory(system) // wrong-factory-application
+    value.otherOnly() // substituted-not-factory
+  }
+  def directWins = {
+    val value = DirectFactory(system) // direct-apply-application
+    value.directOnly() // direct-apply-authoritative
+  }
+  def directWithAmbiguousAncestor = {
+    val value = IndependentFactory(system) // ambiguous-ancestor-direct-application
+    value.independentOnly() // direct-apply-ignores-ambiguous-ancestor
+  }
+  def unresolved = {
+    val value = MissingFactory(system)
+    value.selected() // unresolved-argument
+  }
+  def badArity = {
+    val value = BadArityFactory(system)
+    value.selected() // mismatched-arity
+  }
+  def ambiguous = {
+    val value = AmbiguousFactory(system)
+    value.productOnly() // ambiguous-physical-result
+  }
+  def unknownDirect = {
+    val value = BlockingFactory(system)
+    value.otherOnly() // direct-unknown-blocks-inherited
+    value.blockingOnly() // direct-unknown-blocks-constructor
+  }
+  def conflicting = {
+    val value = ConflictFactory(system)
+    value.selected() // conflicting-direct-returns
+  }
+  def compound = {
+    val value = UnionFactory(system)
+    value.selected() // compound-type-argument
+    value.otherOnly() // compound-type-argument-other
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Factories.scala",
+            r#"package model
+class System
+abstract class Factory[T] { def apply(system: System): T }
+abstract class Mid[T] extends Factory[T]
+class EntityRef { def ask(): Unit = () }
+abstract class ClusterSharding { def entityRefFor(): EntityRef }
+object ClusterSharding extends Factory[ClusterSharding]
+class Service { def selected(): Unit = () }
+object Service extends Mid[Service]
+class Other { def otherOnly(): Unit = () }
+object WrongFactory extends Factory[Other]
+class DirectFactory { def directOnly(): Unit = () }
+object DirectFactory extends Factory[Other] {
+  override def apply(system: System): DirectFactory = new DirectFactory
+}
+object MissingFactory extends Factory[external.Missing]
+abstract class PairFactory[A, B] { def apply(system: System): A }
+object BadArityFactory extends PairFactory[Service]
+class BlockingFactory { def blockingOnly(): Unit = () }
+object BlockingFactory extends Factory[Other] {
+  override def apply(system: System) = new Service
+}
+object ConflictFactory {
+  def apply(system: System): Service = new Service
+  def apply(system: System): Other = new Other
+}
+object AmbiguousFactory extends Factory[dup.Product]
+class IndependentProduct { def independentOnly(): Unit = () }
+object IndependentFactory extends dup.Marker {
+  def apply(system: System): IndependentProduct = new IndependentProduct
+}
+object UnionFactory extends Factory[Service | Other]
+"#,
+        ),
+        (
+            "model/nested/Qualified.scala",
+            "package model.nested\nclass QualifiedProduct { def qualifiedOnly(): Unit = () }\n",
+        ),
+        (
+            "model/QualifiedFactory.scala",
+            "package model\nobject QualifiedFactory extends Factory[model.nested.QualifiedProduct]\n",
+        ),
+        (
+            "dup/jvm/Product.scala",
+            "package dup\ntrait Marker\nclass Product { def productOnly(): Unit = () }\n",
+        ),
+        (
+            "dup/js/Product.scala",
+            "package dup\ntrait Marker\nclass Product { def productOnly(): Unit = () }\n",
+        ),
+        ("app/Use.scala", use_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, marker) in [
+        ("model.EntityRef.ask", "inherited-one-hop"),
+        ("model.Service.selected", "inherited-two-hop"),
+        (
+            "model.nested.QualifiedProduct.qualifiedOnly",
+            "qualified-result",
+        ),
+        ("model.Other.otherOnly", "substituted-not-factory"),
+        (
+            "model.DirectFactory.directOnly",
+            "direct-apply-authoritative",
+        ),
+        (
+            "model.IndependentProduct.independentOnly",
+            "direct-apply-ignores-ambiguous-ancestor",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100));
+        assert_hit_line(&target_hits, line_of(use_source, marker));
+    }
+
+    for (fqn, markers) in [
+        (
+            "model.Service.selected",
+            &[
+                "unresolved-argument",
+                "mismatched-arity",
+                "conflicting-direct-returns",
+                "compound-type-argument",
+            ][..],
+        ),
+        (
+            "model.Other.otherOnly",
+            &[
+                "direct-unknown-blocks-inherited",
+                "compound-type-argument-other",
+            ][..],
+        ),
+        (
+            "model.BlockingFactory.blockingOnly",
+            &["direct-unknown-blocks-constructor"][..],
+        ),
+        (
+            "dup.Product.productOnly",
+            &["ambiguous-physical-result"][..],
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100));
+        for marker in markers {
+            assert_no_hit_line(&target_hits, line_of(use_source, marker));
+        }
+    }
+
+    let direct_apply = definition(&analyzer, "model.DirectFactory$.apply");
+    let direct_apply_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&direct_apply),
+        &candidates,
+        100,
+    ));
+    assert_hit_line(
+        &direct_apply_hits,
+        line_of(use_source, "direct-apply-application"),
+    );
+
+    let independent_apply = definition(&analyzer, "model.IndependentFactory$.apply");
+    let independent_apply_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&independent_apply),
+        &candidates,
+        100,
+    ));
+    assert_hit_line(
+        &independent_apply_hits,
+        line_of(use_source, "ambiguous-ancestor-direct-application"),
+    );
+}
+
+#[test]
+fn scala_imported_bare_helper_return_seeds_local_receiver_type() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/matchers/MatchResult.scala",
+            r#"package model
+package matchers
+class MatchResult(val matches: Boolean)
+"#,
+        ),
+        (
+            "model/matchers/MatchersHelper.scala",
+            r#"package model
+package matchers
+class OtherResult(val matches: Boolean)
+private[model] object MatchersHelper {
+  def fullyMatchRegexWithGroups(left: String, regex: String, groups: Seq[String]): MatchResult =
+    new MatchResult(true)
+}
+object OtherHelper {
+  def fullyMatchRegexWithGroups(left: String): OtherResult = new OtherResult(false)
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.matchers.MatchersHelper.fullyMatchRegexWithGroups
+object Use {
+  def positive = {
+    val result = fullyMatchRegexWithGroups("", "", Seq.empty)
+    result.matches // positive-imported-helper-return
+  }
+  def shadowed = {
+    def fullyMatchRegexWithGroups(left: String): model.matchers.OtherResult =
+      model.matchers.OtherHelper.fullyMatchRegexWithGroups(left)
+    val result = fullyMatchRegexWithGroups("")
+    result.matches // negative-local-helper-shadow
+  }
+}
+"#,
+        ),
+        (
+            "other/Use.scala",
+            r#"package app
+object Use {
+  def unrelated = 1
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "model.matchers.MatchResult.matches");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("app/Use.scala")).collect(),
+    ));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            100,
+        );
+    let target_hits = hits(query.result);
+    assert_hit_contains(&target_hits, "positive-imported-helper-return");
+    assert_no_hit_contains(&target_hits, "negative-local-helper-shadow");
+}
+
+#[test]
+fn scala_nested_companion_apply_preserves_exact_duplicate_source_identity() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala-3/ByteString.scala",
+            r#"package akka.util
+object ByteString {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int) {
+    def copy = ByteString1(value) // positive-exact-nested-constructor
+  }
+}
+"#,
+        ),
+        (
+            "scala-2.13/ByteString.scala",
+            r#"package akka.util
+object ByteString {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int)
+}
+"#,
+        ),
+    ]);
+    let target = analyzer
+        .get_definitions("akka.util.ByteString$.ByteString1$.apply")
+        .into_iter()
+        .find(|unit| unit.source() == &project.file("scala-3/ByteString.scala"))
+        .expect("Scala 3 companion apply");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("scala-3/ByteString.scala")).collect(),
+    ));
+    let target_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&target_hits, "positive-exact-nested-constructor");
+    assert!(
+        target_hits
+            .iter()
+            .all(|hit| hit.file == project.file("scala-3/ByteString.scala")),
+        "duplicate physical constructor leaked: {target_hits:#?}"
+    );
 }
 
 fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
@@ -111,6 +587,280 @@ object Consumer {
 }
 
 #[test]
+fn scala_lexical_nested_singletons_and_typed_patterns_preserve_exact_identity() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Outer.scala",
+            r#"package model
+object Outer {
+  object Token
+  class UseRef
+  object internal { object PathToken }
+  object Factory { def apply(value: Int): UseRef = new UseRef }
+  object Pattern { def unapply(value: Any): Option[Int] = None }
+
+  def singleton: Any = Token // positive-lexical-singleton
+  def stablePath(value: Any): Int = value match {
+    case internal.PathToken => 1 // positive-lexical-stable-path
+    case _ => 0
+  }
+  def made = Factory(1) // positive-lexical-object-apply
+  def extracted(value: Any): Int = value match {
+    case Pattern(number) => number // positive-lexical-object-extractor
+    case _ => 0
+  }
+  def shadowedSingleton(Token: Any): Any = Token // negative-term-shadow
+  def typedWithTerm(UseRef: Int, tree: Any): Any = tree match {
+    case value: UseRef => value // positive-typed-pattern-term-namespace
+    case _ => tree
+  }
+  def UseRef(tree: Any): Any = tree match {
+    case value: UseRef => value // positive-typed-pattern-method-name
+    case _ => tree
+  }
+}
+
+object Other {
+  object Token
+  class UseRef
+  def singleton: Any = Token // negative-other-owner-singleton
+  def typed(tree: Any): Any = tree match {
+    case value: UseRef => value // negative-other-owner-type
+    case _ => tree
+  }
+}
+"#,
+        ),
+        (
+            "duplicate/First.scala",
+            r#"package duplicate
+object Outer {
+  object Token
+  def singleton: Any = Token // positive-exact-first
+}
+class PackageType
+object PackageToken
+"#,
+        ),
+        (
+            "duplicate/Second.scala",
+            r#"package duplicate
+object Outer {
+  object Token
+  def singleton: Any = Token // negative-other-physical-second
+}
+class PackageType
+object PackageToken
+"#,
+        ),
+        (
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+object Ambiguous {
+  def typed: duplicate.PackageType = null // negative-package-type-ambiguity
+  def token(value: Any): Int = value match {
+    case duplicate.PackageToken => 1 // negative-package-object-ambiguity
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+
+    let outer = project.file("model/Outer.scala");
+    let outer_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(outer.clone()).collect()));
+    let outer_hits = |target: &CodeUnit| {
+        hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(target),
+                    Some(&outer_provider),
+                    1,
+                    100,
+                )
+                .result,
+        )
+    };
+
+    let token = definition(&analyzer, "model.Outer$.Token$");
+    let token_hits = outer_hits(&token);
+    assert_hit_contains(&token_hits, "positive-lexical-singleton");
+    assert_no_hit_contains(&token_hits, "negative-term-shadow");
+    assert_no_hit_contains(&token_hits, "negative-other-owner-singleton");
+
+    for (target_fqn, marker) in [
+        (
+            "model.Outer$.internal$.PathToken$",
+            "positive-lexical-stable-path",
+        ),
+        (
+            "model.Outer$.Factory$.apply",
+            "positive-lexical-object-apply",
+        ),
+        (
+            "model.Outer$.Pattern$.unapply",
+            "positive-lexical-object-extractor",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = outer_hits(&target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let use_ref = analyzer
+        .get_definitions("model.Outer$.UseRef")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("nested UseRef class");
+    let use_ref_hits = outer_hits(&use_ref);
+    assert_hit_contains(&use_ref_hits, "positive-typed-pattern-term-namespace");
+    assert_hit_contains(&use_ref_hits, "positive-typed-pattern-method-name");
+    assert_no_hit_contains(&use_ref_hits, "negative-other-owner-type");
+
+    let first = project.file("duplicate/First.scala");
+    let ambiguous_token = analyzer
+        .get_definitions("duplicate.Outer$.Token$")
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.source() == &first)
+        .expect("first ambiguous nested Token object");
+    let ambiguous_provider = ExplicitCandidateProvider::new(Arc::new(
+        [
+            project.file("duplicate/First.scala"),
+            project.file("duplicate/Second.scala"),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let ambiguous_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&ambiguous_token),
+                Some(&ambiguous_provider),
+                1,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&ambiguous_hits, "positive-exact-first");
+    assert_no_hit_contains(&ambiguous_hits, "negative-other-physical-second");
+
+    let consumer_provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("consumer/Ambiguous.scala")).collect(),
+    ));
+    for (target_fqn, marker) in [
+        ("duplicate.PackageType", "negative-package-type-ambiguity"),
+        (
+            "duplicate.PackageToken$",
+            "negative-package-object-ambiguity",
+        ),
+    ] {
+        let target = analyzer
+            .get_definitions(target_fqn)
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.source() == &first)
+            .unwrap_or_else(|| panic!("first ambiguous declaration for {target_fqn}"));
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&consumer_provider),
+                    1,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
+fn scala_typed_pattern_binders_activate_after_the_pattern() {
+    let use_source = r#"package app
+import model.{Root => owner}
+import model.Other.flag
+
+object Use {
+  def qualified(input: Any): Any = input match {
+    case value: owner.Nested => value // positive-qualified-pattern
+  }
+
+  def sameRootName(input: Any): Any = input match {
+    case owner: owner.Nested if owner != null => owner // positive-binder-root-pattern
+  }
+
+  def bodyBinding(input: Any): Any = input match {
+    case flag: owner.Nested if flag != null => flag // positive-body-binding-pattern
+  }
+
+  def priorShadow(input: Any): Any = {
+    val owner = new model.Shadow
+    input match {
+      case value: owner.Nested => value // negative-prior-root-shadow
+    }
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Root.scala",
+            r#"package model
+object Root { final class Nested(val id: Int) }
+final class Shadow
+object Other { val flag: Any = new Object }
+"#,
+        ),
+        ("app/Use.scala", use_source),
+    ]);
+    let target = definition(&analyzer, "model.Root$.Nested");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("app/Use.scala")).collect(),
+    ));
+    let target_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                100,
+            )
+            .result,
+    );
+
+    for marker in [
+        "positive-qualified-pattern",
+        "positive-binder-root-pattern",
+        "positive-body-binding-pattern",
+    ] {
+        assert_hit_contains(&target_hits, marker);
+    }
+    assert_no_hit_contains(&target_hits, "negative-prior-root-shadow");
+
+    let imported_flag = definition(&analyzer, "model.Other$.flag");
+    let flag_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&imported_flag),
+                Some(&provider),
+                1,
+                100,
+            )
+            .result,
+    );
+    assert_no_hit_contains(&flag_hits, "positive-body-binding-pattern");
+}
+
+#[test]
 fn scala_usage_finder_distinguishes_class_and_object_identity_roles() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -193,13 +943,157 @@ object Use {
     assert_no_hit_contains(&class_hits, "val bareObject = Token");
     assert_no_hit_contains(&class_hits, "Token.type");
     assert_no_hit_contains(&class_hits, "Token.Nested");
-    assert_no_hit_contains(&class_hits, "case Token(found)");
+    assert_hit_contains(&class_hits, "case Token(found)");
     assert!(
         class_hits
             .iter()
             .all(|hit| hit.file.rel_path() != "other/Token.scala"),
         "unrelated class leaked: {class_hits:#?}"
     );
+}
+
+#[test]
+fn scala_usage_finder_resolves_lexical_anonymous_mixin_type_role() {
+    let source = r#"package app
+class Kind(message: String)()
+trait Factory
+object Owner {
+  trait Factory { this: Kind =>
+  }
+  val value = new Kind("message")() with Factory // positive-lexical-anonymous-mixin
+  def kind(): Kind = new Kind("term")()
+  val ordinary = kind() with Factory // negative-ordinary-term-infix
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[("app/Owner.scala", source)]);
+
+    let target = definition(&analyzer, "app.Owner$.Factory");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&target_hits, "positive-lexical-anonymous-mixin");
+    assert_no_hit_contains(&target_hits, "negative-ordinary-term-infix");
+
+    let decoy = definition(&analyzer, "app.Factory");
+    let decoy_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&decoy)));
+    assert_no_hit_contains(&decoy_hits, "positive-lexical-anonymous-mixin");
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["app.Owner$.Factory"],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    let result = &mcp["results"][0];
+    assert_eq!(result["status"], "found", "{mcp}");
+    let mcp_lines = result["files"]
+        .as_array()
+        .expect("MCP usage files")
+        .iter()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["line"].as_u64())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        mcp_lines.contains(&(line_of(source, "positive-lexical-anonymous-mixin") as u64)),
+        "MCP result omitted the lexical anonymous mixin: {mcp}"
+    );
+    assert!(
+        !mcp_lines.contains(&(line_of(source, "negative-ordinary-term-infix") as u64)),
+        "MCP result treated an ordinary term infix expression as a mixin: {mcp}"
+    );
+}
+
+#[test]
+fn scala_type_roles_cover_anonymous_mixins_and_infix_type_operators() {
+    let use_source = r#"package app
+
+import model.{Base, First, InHandler, OutHandler, CanEqual}
+
+object Use {
+  def mixinRole(): Base =
+    new Base with First with InHandler with OutHandler {} // positive-mixin
+
+  def infixTypeRole[A, B](evidence: A CanEqual B): Unit = () // positive-infix-type
+
+  def termObjectRole: Any = InHandler // negative-term-object
+  def ordinaryInfix(left: String, right: String): String = left CanEqual right // negative-term-infix
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Roles.scala",
+            r#"package model
+
+class Base
+trait First
+trait InHandler
+trait OutHandler
+object InHandler
+
+infix abstract class CanEqual[A, B]
+object CanEqual
+"#,
+        ),
+        (
+            "other/Roles.scala",
+            r#"package other
+trait InHandler
+infix abstract class CanEqual[A, B]
+"#,
+        ),
+        ("app/Use.scala", use_source),
+    ]);
+
+    for (symbol, positive_marker, negative_marker) in [
+        ("model.InHandler", "positive-mixin", "negative-term-object"),
+        (
+            "model.CanEqual",
+            "positive-infix-type",
+            "negative-term-infix",
+        ),
+    ] {
+        let target = definition(&analyzer, symbol);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_line(&target_hits, line_of(use_source, positive_marker));
+        assert_no_hit_line(&target_hits, line_of(use_source, negative_marker));
+        assert!(
+            target_hits
+                .iter()
+                .all(|hit| hit.file.rel_path() != "other/Roles.scala"),
+            "unrelated type identity leaked for {symbol}: {target_hits:#?}"
+        );
+
+        let mcp = call_search_tool_json(
+            project.root(),
+            "scan_usages_by_reference",
+            &json!({
+                "symbols": [symbol],
+                "include_tests": true,
+            })
+            .to_string(),
+        );
+        let result = &mcp["results"][0];
+        assert_eq!(result["status"], "found", "{mcp}");
+        let mcp_lines = result["files"]
+            .as_array()
+            .expect("MCP usage files")
+            .iter()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["line"].as_u64())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            mcp_lines.contains(&(line_of(use_source, positive_marker) as u64)),
+            "MCP result omitted {positive_marker}: {mcp}"
+        );
+        assert!(
+            !mcp_lines.contains(&(line_of(use_source, negative_marker) as u64)),
+            "MCP result included {negative_marker}: {mcp}"
+        );
+    }
 }
 
 #[test]
@@ -280,6 +1174,159 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_resolves_qualified_stable_type_paths_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Structure.scala",
+            r#"package model
+object Structure {
+  case class Value(value: Int)
+  object Value
+  class Plain
+  object Plain { def apply(value: Int): Plain = new Plain }
+  class Box[T](value: T)
+  object Deep { class Leaf }
+}
+"#,
+        ),
+        (
+            "decoy/Structure.scala",
+            r#"package decoy
+object Structure {
+  case class Value(value: Int)
+  object Value
+  class Plain
+  object Plain { def apply(value: Int): Plain = new Plain }
+  class Box[T](value: T)
+  object Deep { class Leaf }
+}
+"#,
+        ),
+        (
+            "app/Direct.scala",
+            r#"package app
+import model.Structure
+object Direct {
+  val decoded = Option.empty[Structure.Value]
+  val created = new Structure.Value(1)
+  val wrongConstructor = new Structure.Value(1, 2)
+  val applied = Structure.Value(2)
+  val wrongApply = Structure.Value(2, 3)
+  def extracted(value: Structure.Value): Int = value match {
+    case Structure.Value(number) => number
+  }
+  def notExtractor(value: Structure.Plain): Int = value match {
+    case Structure.Plain() => 0
+    case _ => 1
+  }
+  val generic = new Structure.Box[Int](1)
+  val wrongGeneric = new Structure.Box[Int](1, 2)
+  val deep = Option.empty[Structure.Deep.Leaf]
+}
+"#,
+        ),
+        (
+            "app/Alias.scala",
+            r#"package app
+import model.{Structure as Schema}
+object Alias {
+  val decoded = Option.empty[Schema.Value]
+  val deep = Option.empty[Schema.Deep.Leaf]
+}
+"#,
+        ),
+        (
+            "model/PackageRoot.scala",
+            r#"package app
+object PackageRoot {
+  val decoded = Option.empty[model.Structure.Value]
+  val deep = Option.empty[model.Structure.Deep.Leaf]
+}
+"#,
+        ),
+        (
+            "app/Shadowed.scala",
+            r#"package app
+import model.Structure
+object Shadowed {
+  val Structure = decoy.Structure
+  val decoded = Option.empty[Structure.Value]
+}
+"#,
+        ),
+        (
+            "decoy/Use.scala",
+            r#"package decoy
+object Use {
+  val decoded = Option.empty[Structure.Value]
+  val created = new Structure.Value(3)
+  val applied = Structure.Value(4)
+}
+"#,
+        ),
+    ]);
+
+    let value = definition(&analyzer, "model.Structure$.Value");
+    let value_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&value)));
+    for expected in [
+        "Option.empty[Structure.Value]",
+        "new Structure.Value(1)",
+        "Structure.Value(2)",
+        "case Structure.Value(number)",
+        "Option.empty[Schema.Value]",
+        "Option.empty[model.Structure.Value]",
+    ] {
+        assert_hit_contains(&value_hits, expected);
+    }
+    assert!(
+        value_hits.iter().all(|hit| !matches!(
+            hit.file.rel_path().to_str(),
+            Some("decoy/Use.scala" | "app/Shadowed.scala")
+        )),
+        "same-name qualified type leaked: {value_hits:#?}"
+    );
+    assert_no_hit_contains(&value_hits, "new Structure.Value(1, 2)");
+    assert_no_hit_contains(&value_hits, "Structure.Value(2, 3)");
+
+    let companion = definition(&analyzer, "model.Structure$.Value$");
+    let companion_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&companion)));
+    assert_hit_contains(&companion_hits, "Structure.Value(2)");
+    assert_hit_contains(&companion_hits, "case Structure.Value(number)");
+    assert_no_hit_contains(&companion_hits, "Option.empty[Structure.Value]");
+
+    let plain = definition(&analyzer, "model.Structure$.Plain");
+    let plain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
+    assert_no_hit_contains(&plain_hits, "case Structure.Plain()");
+
+    let box_constructor = definition(&analyzer, "model.Structure$.Box.Box");
+    let box_constructor_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&box_constructor)),
+    );
+    assert_hit_contains(&box_constructor_hits, "new Structure.Box[Int](1)");
+    assert_no_hit_contains(&box_constructor_hits, "new Structure.Box[Int](1, 2)");
+
+    let leaf = definition(&analyzer, "model.Structure$.Deep$.Leaf");
+    let leaf_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&leaf)));
+    for expected in [
+        "Option.empty[Structure.Deep.Leaf]",
+        "Option.empty[Schema.Deep.Leaf]",
+        "Option.empty[model.Structure.Deep.Leaf]",
+    ] {
+        assert_hit_contains(&leaf_hits, expected);
+    }
+    assert!(
+        leaf_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "decoy/Use.scala"),
+        "multi-level stable type leaked to decoy: {leaf_hits:#?}"
+    );
+}
+
+#[test]
 fn scala_usage_finder_applies_compilation_unit_import_precedence() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -335,6 +1382,162 @@ fn scala_usage_finder_applies_compilation_unit_import_precedence() {
         &imported_hits,
         "object LocalWins { val call = Shared.make() }",
     );
+}
+
+#[test]
+fn scala_usage_finder_resolves_enclosing_package_and_renamed_object_type_roots() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "akka/stream/javadsl/Flow.scala",
+            "package akka.stream.javadsl\nclass Flow[In, Out, Mat]\n",
+        ),
+        (
+            "akka/stream/javadsl/Compound.scala",
+            r#"package akka.stream.javadsl
+object Compound {
+  def flow: javadsl.Flow[Int, String, Unit] = null // positive-compound-package-root
+}
+"#,
+        ),
+        (
+            "akka/stream/javadsl/Sequential.scala",
+            r#"package akka.stream
+package javadsl
+object Sequential {
+  def flow: javadsl.Flow[Int, String, Unit] = null // positive-sequential-package-root
+}
+"#,
+        ),
+        (
+            "akka/stream/javadsl/Visibility.scala",
+            r#"package akka.stream.javadsl
+object Visibility {
+  def before: javadsl.Flow[Int, String, Unit] = null // positive-before-import
+  import decoy.javadsl
+  def after: javadsl.Flow[Int, String, Unit] = null // negative-after-import
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/RedBlackTree.scala",
+            r#"package scala
+package collection
+package immutable
+private[collection] object RedBlackTree {
+  private[immutable] class SetHelper[A]
+}
+"#,
+        ),
+        (
+            "tests/init/crash/rbtree.scala",
+            r#"package scala
+package collection
+package immutable
+private[collection] object RedBlackTree {
+  class Tree[A]
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/TreeSet.scala",
+            r#"package scala
+package collection
+package immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+object TreeSet {
+  private class TreeSetBuilder[A]
+    extends RB.SetHelper[A] // positive-renamed-object-root
+}
+"#,
+        ),
+        (
+            "decoy/Roots.scala",
+            "package decoy\nobject javadsl { class Flow[In, Out, Mat] }\nobject RedBlackTree { trait SetHelper[A] }\n",
+        ),
+        (
+            "akka/stream/javadsl/Collision.scala",
+            r#"package akka.stream.javadsl
+import decoy.*
+object Collision {
+  def flow: javadsl.Flow[Int, String, Unit] = null // negative-wildcard-beats-package
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/Ambiguous.scala",
+            r#"package scala.collection.immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+import decoy.{RedBlackTree => RB}
+class Ambiguous[A] extends RB.SetHelper[A] // negative-ambiguous-renamed-root
+"#,
+        ),
+        (
+            "replica/RootOne.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        ),
+        (
+            "replica/RootTwo.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        ),
+        (
+            "replica/Use.scala",
+            "package replica\nimport replica.{Root => Alias}\nclass Use extends Alias.Tail // negative-physical-terminal-ambiguity\n",
+        ),
+    ]);
+
+    let flow = definition(&analyzer, "akka.stream.javadsl.Flow");
+    let flow_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&flow)));
+    assert_hit_contains(&flow_hits, "positive-compound-package-root");
+    assert_hit_contains(&flow_hits, "positive-sequential-package-root");
+    assert_hit_contains(&flow_hits, "positive-before-import");
+    assert_no_hit_contains(&flow_hits, "negative-after-import");
+    assert_no_hit_contains(&flow_hits, "negative-wildcard-beats-package");
+
+    let helper = definition(
+        &analyzer,
+        "scala.collection.immutable.RedBlackTree$.SetHelper",
+    );
+    let helper_query =
+        UsageFinder::new().query(&analyzer, std::slice::from_ref(&helper), 1000, 1000);
+    assert!(
+        helper_query
+            .candidate_files
+            .iter()
+            .any(|file| file.rel_path() == "scala/collection/immutable/TreeSet.scala"),
+        "renamed-object importer was not routed to the target: {:#?}",
+        helper_query.candidate_files
+    );
+    let helper_hits = hits(helper_query.result);
+    assert_hit_contains(&helper_hits, "positive-renamed-object-root");
+    assert_no_hit_contains(&helper_hits, "negative-ambiguous-renamed-root");
+
+    let replica_tails = analyzer
+        .get_definitions("replica.Root$.Tail")
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .collect::<Vec<_>>();
+    assert_eq!(replica_tails.len(), 2);
+    for tail in replica_tails {
+        let tail_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tail)));
+        assert_no_hit_contains(&tail_hits, "negative-physical-terminal-ambiguity");
+    }
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": [
+                "akka.stream.javadsl.Flow",
+                "scala.collection.immutable.RedBlackTree$.SetHelper"
+            ],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(mcp["results"][0]["status"], "found", "{mcp}");
+    assert_eq!(mcp["results"][1]["status"], "found", "{mcp}");
 }
 
 #[test]
@@ -421,6 +1624,550 @@ class Container(val service: Service) {
     assert_hit_contains(&service_hits, "val anonymousRead = service.run()");
     assert_no_hit_contains(&service_hits, "def shadowed(service: OtherService)");
     assert_no_hit_contains(&service_hits, "val service = new OtherService");
+}
+
+#[test]
+fn scala_usage_finder_resolves_exact_structured_field_chains() {
+    let consumer = r#"package app
+
+import model.{AliasOnly, Child, Middle, Owners, Stable}
+
+object Use {
+  def typed(middle: Middle): Int = middle.leaf.token // positive-typed-chain
+  def inherited(child: Child): Int = child.inherited.leaf.token // positive-inherited-selection
+  def stable: Int = Stable.middle.leaf.token // positive-stable-chain
+  def nested: Int = {
+    val state = new Owners.State(1)
+    state.maximumHeapSize // positive-qualified-nested-constructor
+  }
+  def localShadow(middle: other.Middle): Int = middle.leaf.token // negative-local-shadow
+  def unrelated(middle: other.Middle): Int = middle.leaf.token // negative-unrelated-owner
+  def ambiguous(owner: dup.Owner): Int = owner.value // negative-ambiguous-owner
+  def aliasIsNotATerm: Any = AliasOnly.Value // negative-type-alias-term
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Fields.scala",
+            r#"package model
+
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def bare: Int = inherited.leaf.token // positive-inherited-bare
+  def shadow(inherited: other.Middle): Int = inherited.leaf.token // negative-inherited-shadow
+}
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(var maximumHeapSize: Int) }
+object AliasOnly { type Value = Int }
+"#,
+        ),
+        (
+            "other/Fields.scala",
+            r#"package other
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+"#,
+        ),
+        (
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        ),
+        (
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+
+    let leaf = definition(&analyzer, "model.Middle.leaf");
+    let leaf_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&leaf)));
+    for expected in [
+        "positive-typed-chain",
+        "positive-inherited-selection",
+        "positive-stable-chain",
+        "positive-inherited-bare",
+    ] {
+        assert_hit_contains(&leaf_hits, expected);
+    }
+    for rejected in [
+        "negative-local-shadow",
+        "negative-unrelated-owner",
+        "negative-inherited-shadow",
+    ] {
+        assert_no_hit_contains(&leaf_hits, rejected);
+    }
+
+    let token = definition(&analyzer, "model.Leaf.token");
+    let token_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&token)));
+    for expected in [
+        "positive-typed-chain",
+        "positive-inherited-selection",
+        "positive-stable-chain",
+        "positive-inherited-bare",
+    ] {
+        assert_hit_contains(&token_hits, expected);
+    }
+    assert_no_hit_contains(&token_hits, "negative-local-shadow");
+
+    let inherited = definition(&analyzer, "model.Base.inherited");
+    let inherited_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&inherited)));
+    assert_hit_contains(&inherited_hits, "positive-inherited-selection");
+    assert_hit_contains(&inherited_hits, "positive-inherited-bare");
+    assert_no_hit_contains(&inherited_hits, "negative-inherited-shadow");
+
+    let maximum_heap_size = definition(&analyzer, "model.Owners$.State.maximumHeapSize");
+    let state_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&maximum_heap_size)),
+    );
+    assert_hit_contains(&state_hits, "positive-qualified-nested-constructor");
+
+    let ambiguous = definition(&analyzer, "dup.Owner.value");
+    let ambiguous_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&ambiguous)));
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-owner");
+
+    let alias = definition(&analyzer, "model.AliasOnly$.Value");
+    let alias_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&alias)));
+    assert_no_hit_contains(&alias_hits, "negative-type-alias-term");
+}
+
+#[test]
+fn scala_usage_finder_resolves_local_stable_paths_and_reassigned_owner_fields() {
+    let source = r#"package app
+
+class Quotes
+class Repr(val qctx: Quotes)
+class OtherRepr(val qctx: Quotes)
+class Widget { def run(): Unit = () }
+
+class Consumer {
+  private var checkbox: Widget = _
+
+  def stablePath(): Any = {
+    val repr = new Repr(new Quotes)
+    val singleton: repr.qctx.type = repr.qctx // positive-local-stable-path
+    singleton
+  }
+
+  def reassignedOwnerField(): Unit = {
+    checkbox = new Widget // previous expression ends with var
+    checkbox.run() // positive-reassigned-owner-field
+  }
+
+  def parameterShadowsField(checkbox: Widget): Unit =
+    checkbox.run() // negative-parameter-field-shadow
+
+  def localShadowsField(): Unit = {
+    val checkbox = new Widget
+    checkbox.run() // negative-local-field-shadow
+  }
+
+  def unrelatedStablePath(repr: OtherRepr): Any = {
+    val singleton: repr.qctx.type = repr.qctx // negative-unrelated-stable-path
+    singleton
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Consumer.scala", source),
+        (
+            "duplicate/First.scala",
+            "package duplicate\nclass Quotes\nclass Repr(val qctx: Quotes)\n",
+        ),
+        (
+            "duplicate/Second.scala",
+            "package duplicate\nclass Quotes\nclass Repr(val qctx: Quotes)\n",
+        ),
+        (
+            "duplicate/Use.scala",
+            "package duplicate\nobject Use {\n  val repr = new Repr(new Quotes)\n  val singleton: repr.qctx.type = repr.qctx // negative-physical-stable-path\n}\n",
+        ),
+    ]);
+
+    let qctx = definition(&analyzer, "app.Repr.qctx");
+    let qctx_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&qctx)));
+    assert_hit_contains(&qctx_hits, "positive-local-stable-path");
+    assert_no_hit_contains(&qctx_hits, "negative-unrelated-stable-path");
+    let stable_type_qctx = source.find("repr.qctx.type").expect("stable type qctx") + 5;
+    assert!(
+        qctx_hits.iter().any(|hit| {
+            hit.start_offset == stable_type_qctx && hit.end_offset == stable_type_qctx + 4
+        }),
+        "expected the exact stable-type qctx segment, got {qctx_hits:#?}"
+    );
+
+    let checkbox = definition(&analyzer, "app.Consumer.checkbox");
+    let checkbox_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&checkbox)));
+    assert_hit_contains(&checkbox_hits, "positive-reassigned-owner-field");
+    assert_no_hit_contains(&checkbox_hits, "negative-parameter-field-shadow");
+    assert_no_hit_contains(&checkbox_hits, "negative-local-field-shadow");
+    let checkbox_qualifier = source
+        .find("checkbox.run() // positive-reassigned-owner-field")
+        .expect("field qualifier");
+    assert!(
+        checkbox_hits.iter().any(|hit| {
+            hit.start_offset == checkbox_qualifier
+                && hit.end_offset == checkbox_qualifier + "checkbox".len()
+        }),
+        "expected the exact checkbox qualifier range, got {checkbox_hits:#?}"
+    );
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+    let inverse_qctx_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&qctx), &candidates, 1000));
+    assert!(
+        inverse_qctx_hits.iter().any(|hit| {
+            hit.start_offset == stable_type_qctx && hit.end_offset == stable_type_qctx + 4
+        }),
+        "whole-workspace inverse pass missed the exact stable-type qctx segment: {inverse_qctx_hits:#?}"
+    );
+    assert_no_hit_contains(&inverse_qctx_hits, "negative-unrelated-stable-path");
+
+    let first = project.file("duplicate/First.scala");
+    let duplicate_qctx = analyzer
+        .get_definitions("duplicate.Repr.qctx")
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.source() == &first)
+        .expect("first physical qctx field");
+    let duplicate_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&duplicate_qctx)),
+    );
+    assert_no_hit_contains(&duplicate_hits, "negative-physical-stable-path");
+
+    let inverse_checkbox_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&checkbox),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&inverse_checkbox_hits, "positive-reassigned-owner-field");
+    assert!(
+        inverse_checkbox_hits.iter().any(|hit| {
+            hit.start_offset == checkbox_qualifier
+                && hit.end_offset == checkbox_qualifier + "checkbox".len()
+        }),
+        "whole-workspace inverse pass missed the exact checkbox qualifier: {inverse_checkbox_hits:#?}"
+    );
+    assert_no_hit_contains(&inverse_checkbox_hits, "negative-parameter-field-shadow");
+    assert_no_hit_contains(&inverse_checkbox_hits, "negative-local-field-shadow");
+}
+
+#[test]
+fn scala_usage_finder_resolves_lexical_nested_state_field_in_local_function() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/ClusterReceptionist.scala",
+            r#"package app
+class Registry { def read: Int = 1 }
+class State(val registry: other.Registry)
+object ClusterReceptionist {
+  final case class State(registry: Registry)
+  def behavior(state: State): Int = {
+    def onCommand(): Int = state.registry.read // positive-nested-state-field
+    onCommand()
+  }
+  def decoy(state: app.State): Int = state.registry.read // negative-package-state
+}
+"#,
+        ),
+        (
+            "other/Registry.scala",
+            "package other\nclass Registry { def read: Int = 2 }\n",
+        ),
+    ]);
+
+    let registry = definition(&analyzer, "app.ClusterReceptionist$.State.registry");
+    assert_eq!(
+        analyzer.parent_of(&registry).map(|owner| owner.fq_name()),
+        Some("app.ClusterReceptionist$.State".to_string())
+    );
+    let registry_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&registry)));
+    assert_hit_contains(&registry_hits, "positive-nested-state-field");
+    assert_no_hit_contains(&registry_hits, "negative-package-state");
+}
+
+#[test]
+fn scala_usage_finder_resolves_inherited_field_through_sequential_package_parent() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "impl/IndexedStepperBase.scala",
+            r#"package scala.collection.convert
+package impl
+abstract class IndexedStepperBase[Sub, Semi <: Sub](protected var i0: Int)
+"#,
+        ),
+        (
+            "impl/ArrayStepper.scala",
+            r#"package scala.collection.convert
+package impl
+trait AnyStepper[A]
+class ObjectArrayStepper[A](start: Int)
+  extends IndexedStepperBase[AnyStepper[A], ObjectArrayStepper[A]](start)
+    with AnyStepper[A] {
+  def nextStep(): Int = { val j = i0; i0 += 1; j } // positive-inherited-i0
+  def shadow(i0: Int): Int = i0 // negative-local-i0
+}
+class Unrelated(protected var i0: Int) {
+  def read: Int = i0 // negative-unrelated-i0
+}
+"#,
+        ),
+    ]);
+
+    let i0 = definition(
+        &analyzer,
+        "scala.collection.convert.impl.IndexedStepperBase.i0",
+    );
+    assert_eq!(
+        analyzer.parent_of(&i0).map(|owner| owner.fq_name()),
+        Some("scala.collection.convert.impl.IndexedStepperBase".to_string())
+    );
+    let i0_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&i0)));
+    assert_hit_contains(&i0_hits, "positive-inherited-i0");
+    assert_no_hit_contains(&i0_hits, "negative-local-i0");
+    assert_no_hit_contains(&i0_hits, "negative-unrelated-i0");
+}
+
+#[test]
+fn scala_usage_finder_uses_parser_active_enclosing_package_for_constructor() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala/collection/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "scala/collection/immutable/ArraySeq.scala",
+            r#"package scala.collection
+package immutable
+object ArraySeq {
+  val tail = new ArrayOps(1) // positive-enclosing-package
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/Shadow.scala",
+            r#"package scala.collection
+package immutable
+object Shadow {
+  class ArrayOps(value: Int)
+  val value = new ArrayOps(2) // negative-inner-package
+}
+"#,
+        ),
+        (
+            "other/ArrayOps.scala",
+            "package other\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "scala/collection/immutable/Imported.scala",
+            r#"package scala.collection
+package immutable
+import other.ArrayOps
+object Imported { val value = new ArrayOps(3) } // negative-explicit-import
+"#,
+        ),
+        (
+            "dotted/Use.scala",
+            r#"package scala.collection.immutable
+object Dotted { val value = new ArrayOps(4) } // negative-dotted-parent
+"#,
+        ),
+        (
+            "braced/Use.scala",
+            r#"package scala.collection {
+  package hidden { object Hidden { val value = new ArrayOps(5) } } // positive-braced-child
+}
+package sibling { object Sibling { val value = new ArrayOps(6) } } // negative-braced-sibling
+"#,
+        ),
+    ]);
+
+    let constructor = definition(&analyzer, "scala.collection.ArrayOps.ArrayOps");
+    let constructor_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&constructor)));
+    assert_hit_contains(&constructor_hits, "positive-enclosing-package");
+    assert_hit_contains(&constructor_hits, "positive-braced-child");
+    for marker in [
+        "negative-inner-package",
+        "negative-explicit-import",
+        "negative-dotted-parent",
+        "negative-braced-sibling",
+    ] {
+        assert_no_hit_contains(&constructor_hits, marker);
+    }
+
+    let (_project, ambiguous) = scala_analyzer_with_files(&[
+        (
+            "left/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "right/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "use/Use.scala",
+            r#"package scala.collection
+package immutable
+object Use { val value = new ArrayOps(1) } // negative-ambiguous-package
+"#,
+        ),
+    ]);
+    let ambiguous_constructor = definition(&ambiguous, "scala.collection.ArrayOps.ArrayOps");
+    let ambiguous_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&ambiguous, std::slice::from_ref(&ambiguous_constructor)),
+    );
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-package");
+}
+
+#[test]
+fn scala_usage_finder_resolves_unique_unapplied_companion_apply_values() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Token.scala",
+            r#"package model
+case class Token(value: Int)
+class Manual(value: Int)
+object Manual {
+  def apply(value: Int): Manual = new Manual(value)
+  def apply(value: String): Manual = new Manual(value.length)
+}
+"#,
+        ),
+        (
+            "other/Token.scala",
+            "package other\ncase class Token(value: Int)\n",
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.{Manual, Token}
+object Use {
+  private def accept(value: Int, function: Int => Token): Token = function(value)
+  private def wrong(function: (Int, Int) => Token): Token = function(1, 2)
+  private def keep(value: Any): Any = value
+  val contextual = accept(1, Token) // positive-contextual-method-value
+  val unavailable = Option(1).map(Token) // positive-unique-method-value
+  val wrongArity = wrong(Token) // negative-wrong-context-arity
+  val nonFunction = keep(Token) // negative-known-non-function-parameter
+  val overloaded = Option(1).map(Manual) // negative-overloaded-apply
+  def local(Token: Int => model.Token): model.Token = Option(1).map(Token).get
+    // negative-local-term
+}
+"#,
+        ),
+        (
+            "app/Imported.scala",
+            r#"package app
+import other.Token
+object Imported { val value = Option(1).map(Token) } // negative-unrelated-import
+"#,
+        ),
+    ]);
+
+    let token = definition(&analyzer, "model.Token");
+    let token_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&token)));
+    assert_hit_contains(&token_hits, "positive-contextual-method-value");
+    assert_hit_contains(&token_hits, "positive-unique-method-value");
+    for marker in [
+        "negative-wrong-context-arity",
+        "negative-known-non-function-parameter",
+        "negative-overloaded-apply",
+        "negative-local-term",
+        "negative-unrelated-import",
+    ] {
+        assert_no_hit_contains(&token_hits, marker);
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_same_file_companion_wildcard_nested_type() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("kyo/Chunk.scala", "package kyo\nclass Chunk[+A]\n"),
+        (
+            "p/Clean.scala",
+            "package p\nclass A\n  class B // clean-indented-top-level\n",
+        ),
+        (
+            "kyo/Batch.scala",
+            r#"package kyo
+object Batch:
+    import internal.*
+    def run[A, S](v: A): A =
+        type Item = A | Int
+        def expand(items: List[Item]) =
+            Kyo.foreach(items) {
+                case ToExpand[A @unchecked, S @unchecked](seq: Seq[Any], cont) =>
+                    Kyo.foreach(seq)(v => v)
+                case item => item
+            }
+        expand(Nil)
+    end run
+    object internal:
+        case class Call[A](v: A) // negative-nested-package-wildcard
+    end internal
+end Batch
+"#,
+        ),
+        (
+            "kyo/ai/Context.scala",
+            r#"package kyo.ai
+import Context.*
+import kyo.*
+case class Context(calls: Chunk[Call]):
+    def assistantMessage(calls: Chunk[Call]): Context = this // positive-context-call
+end Context
+object Context:
+    case class Call(id: String)
+end Context
+"#,
+        ),
+    ]);
+
+    assert!(
+        analyzer
+            .top_level_declarations(&_project.file("kyo/Batch.scala"))
+            .iter()
+            .all(|unit| unit.fq_name() != "kyo.Call"),
+        "structurally nested Batch.internal.Call must not be collected as package-level kyo.Call"
+    );
+    assert!(
+        analyzer
+            .get_definitions("kyo.Batch$.internal$.Call")
+            .iter()
+            .any(|unit| unit.source().rel_path() == _project.file("kyo/Batch.scala").rel_path()),
+        "recovered nested Call must retain its exact Batch.internal owner"
+    );
+    assert!(
+        analyzer
+            .top_level_declarations(&_project.file("p/Clean.scala"))
+            .iter()
+            .any(|unit| unit.fq_name() == "p.B"),
+        "indentation alone must not invent recovery ownership"
+    );
+    assert!(
+        analyzer.get_definitions("p.A.B").is_empty(),
+        "clean root declarations must not be nested without structured recovery evidence"
+    );
+
+    let call = definition(&analyzer, "kyo.ai.Context$.Call");
+    let call_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&call)));
+    assert_hit_contains(&call_hits, "positive-context-call");
+    assert_no_hit_contains(&call_hits, "negative-nested-package-wildcard");
 }
 
 #[test]
@@ -696,6 +2443,92 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_resolves_generic_lexical_constructors_and_stable_paths() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Flags.scala",
+            r#"package model
+object Flags {
+  val Enabled: Int = 1
+  case object Nested
+}
+"#,
+        ),
+        (
+            "decoy/Flags.scala",
+            r#"package decoy
+object Flags {
+  val Enabled: Int = 2
+  case object Nested
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+
+import model.Flags
+
+object Use {
+  class Generic[A](value: A)
+
+  def validGeneric = new Generic[Int](1)
+  def wrongGenericArity = new Generic[Int]()
+  def localConstructorRoot(Generic: LocalFactory) = new Generic[Int](1)
+  def directField: Int = Flags.Enabled
+  def stableField(value: Any): Int = value match {
+    case Flags.Enabled => 1
+    case model.Flags.Enabled => 2
+    case _ => 0
+  }
+  def stableObject(value: Any): Int = value match {
+    case Flags.Nested => 1
+    case model.Flags.Nested => 2
+    case _ => 0
+  }
+  def localRootIsNotImported(Flags: LocalFlags): Int = Flags.Enabled
+  def decoyField(value: Any): Int = value match {
+    case decoy.Flags.Enabled => 1
+    case _ => 0
+  }
+  def decoyObject(value: Any): Int = value match {
+    case decoy.Flags.Nested => 1
+    case _ => 0
+  }
+}
+
+class LocalFlags { val Enabled: Int = 2 }
+class LocalFactory
+"#,
+        ),
+    ]);
+
+    let constructor = definition(&analyzer, "app.Use$.Generic.Generic");
+    let constructor_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[constructor]));
+    assert_hit_contains(&constructor_hits, "new Generic[Int](1)");
+    assert_hit_contains(&constructor_hits, "Generic: LocalFactory");
+    assert_no_hit_contains(&constructor_hits, "new Generic[Int]()");
+
+    let enabled = definition(&analyzer, "model.Flags$.Enabled");
+    let enabled_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[enabled]));
+    for expected in [
+        "def directField: Int = Flags.Enabled",
+        "case Flags.Enabled => 1",
+        "case model.Flags.Enabled => 2",
+    ] {
+        assert_hit_contains(&enabled_hits, expected);
+    }
+    assert_no_hit_contains(&enabled_hits, "Flags: LocalFlags");
+    assert_no_hit_contains(&enabled_hits, "case decoy.Flags.Enabled");
+
+    let nested = definition(&analyzer, "model.Flags$.Nested$");
+    let nested_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[nested]));
+    assert_hit_contains(&nested_hits, "case Flags.Nested => 1");
+    assert_hit_contains(&nested_hits, "case model.Flags.Nested => 2");
+    assert_no_hit_contains(&nested_hits, "case decoy.Flags.Nested");
+}
+
+#[test]
 fn scala_usage_finder_matches_all_same_file_overloads_and_curried_constructor_lists() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Calls.scala",
@@ -745,6 +2578,382 @@ object Use {
     assert_hit_contains(&constructor_hits, "new Curried(1)()");
     assert_no_hit_contains(&constructor_hits, "new Curried()(\"missing\")");
     assert_no_hit_contains(&constructor_hits, "new Curried(1)(\"too\", \"many\")");
+}
+
+#[test]
+fn scala_usage_finder_omits_only_trailing_contextual_parameter_lists() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+trait Context
+object Scope {
+  def run[A](value: A)(using Context): A = value
+  def run[A](parallelism: Int)(value: A)(using Context): A = value
+}
+object Required {
+  def run(parallelism: Int)(value: Int)(using Context): Int = value
+}
+object Use {
+  given Context = new Context {}
+  val contextual = Scope.run { 1 }
+  val contextualAfterTwoExplicitLists = Scope.run(2) { 1 }
+  val ambiguousEta = Scope.run
+  val missingRequiredExplicitList = Required.run(2)
+  val completeRequiredExplicitList = Required.run(2)(1)
+}
+"#,
+    )]);
+
+    let scope_run = definition(&analyzer, "app.Scope$.run");
+    let scope_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scope_run)));
+    assert_hit_contains(&scope_hits, "Scope.run { 1 }");
+    assert_hit_contains(&scope_hits, "Scope.run(2) { 1 }");
+    assert_no_hit_contains(&scope_hits, "val ambiguousEta = Scope.run");
+
+    let required_run = definition(&analyzer, "app.Required$.run");
+    let required_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&required_run)),
+    );
+    assert_no_hit_in_enclosing(&required_hits, "app.Use.missingRequiredExplicitList");
+    assert_hit_contains(&required_hits, "Required.run(2)(1)");
+}
+
+#[test]
+fn scala_usage_finder_handles_generic_only_calls_and_semantic_argument_arity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+trait Context
+object Api {
+  def plain[A]: Int = 1
+  def contextual[A](using Context): Int = 2
+  def explicitZero[A](): Int = 3
+  def explicitOne[A](value: Int): Int = value
+  def five(a: Int, b: Int, c: Int, d: Int, e: Int): Int = a + b + c + d + e
+  def transform(value: String): String = value
+  def transform(left: String, right: String): String = left + right
+  def consume(marker: Int, run: String => String): String = run(marker.toString)
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  val plainResult = plain[Int] // positive-generic-plain
+  val contextualResult = contextual[Int] // positive-generic-contextual
+  val missingParens = explicitZero[Int] // negative-generic-explicit-zero
+  val missingValue = explicitOne[Int] // negative-generic-explicit-one
+  val exact = five(1, 2, 3, 4, 5 /* unused */) // positive-commented-arity
+  val extra = five(1, 2, 3, 4, 5, 6 /* unused */) // negative-real-extra-argument
+  val methodValue = consume(1, /* ignored */ transform) // positive-commented-parameter-index
+}
+"#,
+    )]);
+
+    for (target_fqn, positive) in [
+        ("app.Api$.plain", "positive-generic-plain"),
+        ("app.Api$.contextual", "positive-generic-contextual"),
+        ("app.Api$.five", "positive-commented-arity"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        if target_fqn.ends_with(".five") {
+            assert_no_hit_contains(&target_hits, "negative-real-extra-argument");
+        }
+    }
+
+    for (target_fqn, negative) in [
+        ("app.Api$.explicitZero", "negative-generic-explicit-zero"),
+        ("app.Api$.explicitOne", "negative-generic-explicit-one"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, negative);
+    }
+
+    let transforms = analyzer.get_definitions("app.Api$.transform");
+    assert_eq!(
+        transforms.len(),
+        1,
+        "same-file overloads share one physical definition"
+    );
+    let transform_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &transforms));
+    assert_hit_contains(&transform_hits, "positive-commented-parameter-index");
+}
+
+#[test]
+fn scala_method_values_use_expected_parameter_type_before_overload_uniqueness() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("model/TokenOne.scala", "package model\nclass Token\n"),
+        ("model/TokenTwo.scala", "package model\nclass Token\n"),
+        (
+            "app/LocalTokenDuplicate.scala",
+            "package app\nclass LocalToken\n",
+        ),
+        ("shadow/String.scala", "package shadow\nclass String\n"),
+        (
+            "app/Candidates.scala",
+            "package app\nobject Candidates { def builtin(value: String): Unit = () }\n",
+        ),
+        (
+            "app/ShadowUse.scala",
+            r#"package app
+import shadow.String
+import Candidates.builtin
+
+object ShadowUse {
+  private def consume(value: String)(f: String => Unit): Unit = f(value)
+  val rejected = consume(null)(builtin) // negative-shadowed-builtin-string
+}
+"#,
+        ),
+        (
+            "app/Yaml.scala",
+            r#"package app
+import model.Token
+
+class LocalToken
+
+object Yaml {
+  object Cst { class Document }
+
+  def parse(input: String): String = input
+  def parse(document: Cst.Document): String = "document"
+  def parse(input: String, index: Int): String = input + index
+  def wrong(value: Int): String = value.toString
+  def binary(value: String, index: Int): String = value + index
+  def unknown(value: Missing): String = "unknown"
+  def ambiguous(value: Token): String = "ambiguous"
+  def exact(value: LocalToken): String = "exact"
+
+  private def consumeString(value: String)(f: String => String): String = f(value)
+  private def consumeDocument(value: Cst.Document)(f: Cst.Document => String): String = f(value)
+  private def consumeMissing(value: Missing)(f: Missing => String): String = f(value)
+  private def consumeToken(value: Token)(f: Token => String): String = f(value)
+  private def consumeLocal(value: LocalToken)(f: LocalToken => String): String = f(value)
+
+  val fromString = consumeString("yaml")(parse) // positive-string-method-value
+  val fromDocument = consumeDocument(new Cst.Document)(parse) // positive-document-method-value
+  val wrongSameArity = consumeString("yaml")(wrong) // negative-same-arity-type
+  val wrongBinary = consumeString("yaml")(binary) // negative-binary-method-value
+  val unresolved = consumeMissing(null)(unknown) // negative-unresolved-parameter-type
+  val physicallyAmbiguous = consumeToken(null)(ambiguous) // negative-ambiguous-parameter-type
+  val sourceExact = consumeLocal(new LocalToken)(exact) // positive-source-exact-duplicate-type
+}
+"#,
+        ),
+    ]);
+
+    let parse = definition(&analyzer, "app.Yaml$.parse");
+    let parse_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&parse)));
+    assert_hit_contains(&parse_hits, "positive-string-method-value");
+    assert_hit_contains(&parse_hits, "positive-document-method-value");
+
+    let exact = definition(&analyzer, "app.Yaml$.exact");
+    let exact_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&exact)));
+    assert_hit_contains(&exact_hits, "positive-source-exact-duplicate-type");
+
+    for (target, marker) in [
+        ("app.Yaml$.wrong", "negative-same-arity-type"),
+        ("app.Yaml$.binary", "negative-binary-method-value"),
+        ("app.Yaml$.unknown", "negative-unresolved-parameter-type"),
+        ("app.Yaml$.ambiguous", "negative-ambiguous-parameter-type"),
+        (
+            "app.Candidates$.builtin",
+            "negative-shadowed-builtin-string",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
+fn scala_usage_finder_shares_structured_call_list_semantics() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+trait Context
+object Api {
+  def block(value: => Int)(using Context): Int = value
+  def aligned(using Context)(value: Int)(using Context): Int = value
+  def contextualOnly(using Context): Int = 1
+  def partial(prefix: String)(line: String): String = prefix + line
+  def select(prefix: String)(line: String): String = prefix + line
+  def select(left: String, right: String)(line: String): String = left + right + line
+  def ambiguous(prefix: String)(line: String): String = prefix + line
+  def ambiguous(prefix: Int)(line: String): String = prefix.toString + line
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  def consume(run: String => String): String = run("line")
+  def consumeTwo(run: (String, String) => String): String = run("left", "right")
+  val blockResult = Api.block {
+    val first = 1
+    val second = 2
+    first + second
+  } // positive-block
+  val alignedResult = Api.aligned(1) // positive-leading-and-trailing-context
+  val contextualResult = Api.contextualOnly() // positive-contextual-empty-application
+  val partialResult = consume(Api.partial("prefix")) // positive-proven-partial
+  val selectedPartial = consume(Api.select("prefix")) // positive-prefix-disambiguated-partial
+  val wrongExpected = consumeTwo(Api.partial("prefix")) // negative-wrong-partial-arity
+  val ambiguousPartial = consume(Api.ambiguous("prefix")) // negative-ambiguous-partial
+}
+"#,
+    )]);
+
+    for (target_fqn, positive) in [
+        ("app.Api$.block", "val blockResult = Api.block {"),
+        ("app.Api$.aligned", "Api.aligned(1)"),
+        ("app.Api$.contextualOnly", "Api.contextualOnly()"),
+        ("app.Api$.partial", "consume(Api.partial(\"prefix\"))"),
+        ("app.Api$.select", "consume(Api.select(\"prefix\"))"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        if target_fqn.ends_with(".partial") {
+            assert_no_hit_contains(&target_hits, "negative-wrong-partial-arity");
+        }
+    }
+
+    let ambiguous = definition(&analyzer, "app.Api$.ambiguous");
+    let ambiguous_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&ambiguous)));
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-partial");
+}
+
+#[test]
+fn scala_usage_finder_routes_chained_wildcard_contextual_apply() {
+    let consumer_source = r#"package dotty.tools.dotc.typer
+import dotty.tools.dotc.core.*
+import Annotations.*
+
+object Typer {
+  given Context = new Context {}
+  val annotation = Annotation(1, 2, 3)
+  val wrongArity = Annotation(1, 2)
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "dotty/tools/dotc/core/Annotations.scala",
+            r#"package dotty.tools.dotc.core
+trait Context
+object Annotations {
+  object Annotation {
+    def apply(cls: Int, arg: Int, span: Int)(using Context): Int = cls
+    def apply(cls: String, arg: Int, span: Int)(using Context): Int = arg
+  }
+}
+"#,
+        ),
+        ("dotty/tools/dotc/typer/Typer.scala", consumer_source),
+    ]);
+    let target = definition(
+        &analyzer,
+        "dotty.tools.dotc.core.Annotations$.Annotation$.apply",
+    );
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = hits(result);
+
+    assert_hit_line(&hits, line_of(consumer_source, "Annotation(1, 2, 3)"));
+    assert_no_hit_line(&hits, line_of(consumer_source, "Annotation(1, 2)"));
+    assert!(
+        hits.iter()
+            .any(|hit| { hit.file == project.file("dotty/tools/dotc/typer/Typer.scala") }),
+        "default candidate discovery must route the chained wildcard consumer"
+    );
+}
+
+#[test]
+fn scala_usage_finder_keeps_sibling_wildcard_import_scopes_exact() {
+    let consumer_source = r#"package app
+
+object LeftConsumer {
+  import api.LeftFactories.*
+  val value = Factory(1)
+}
+
+object RightConsumer {
+  import api.RightFactories.*
+  val value = Factory(2)
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "api/Factories.scala",
+            r#"package api
+object LeftFactories {
+  object Factory { def apply(value: Int): Int = value }
+}
+object RightFactories {
+  object Factory { def apply(value: Int): Int = value }
+}
+"#,
+        ),
+        ("app/Consumers.scala", consumer_source),
+    ]);
+    let consumer = project.file("app/Consumers.scala");
+
+    for (target_fqn, expected_line, rejected_line) in [
+        (
+            "api.LeftFactories$.Factory$.apply",
+            "val value = Factory(1)",
+            "val value = Factory(2)",
+        ),
+        (
+            "api.RightFactories$.Factory$.apply",
+            "val value = Factory(2)",
+            "val value = Factory(1)",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 100, 100);
+        assert!(
+            query.candidate_files.contains(&consumer),
+            "default candidate discovery must route {target_fqn} to the consumer"
+        );
+        let target_hits = hits(query.result);
+        assert_hit_line(&target_hits, line_of(consumer_source, expected_line));
+        assert_no_hit_line(&target_hits, line_of(consumer_source, rejected_line));
+    }
+}
+
+#[test]
+fn scala_usage_finder_merges_case_class_and_explicit_companion_apply_shapes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "akka/util/Timeout.scala",
+        r#"package akka.util
+case class Timeout(duration: Long)
+object Timeout {
+  def apply(length: Long, unit: String): Timeout = new Timeout(length)
+}
+object Use {
+  val generated = Timeout(1)
+  val explicit = Timeout(1, "second")
+  val tooFew = Timeout()
+  val tooMany = Timeout(1, "second", "extra")
+}
+"#,
+    )]);
+    let target = definition(&analyzer, "akka.util.Timeout$.apply");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_hit_contains(&target_hits, "Timeout(1)");
+    assert_hit_contains(&target_hits, "Timeout(1, \"second\")");
+    assert_no_hit_contains(&target_hits, "Timeout()");
+    assert_no_hit_contains(&target_hits, "Timeout(1, \"second\", \"extra\")");
 }
 
 #[test]
@@ -943,6 +3152,63 @@ def compute(value: String): String = value
 }
 
 #[test]
+fn scala_file_major_query_scans_one_candidate_once_for_many_physical_targets() {
+    const REPLICA_COUNT: usize = 128;
+    let mut builder = InlineTestProject::with_language(Language::Scala);
+    for index in 0..REPLICA_COUNT {
+        builder = builder.file(
+            format!("replicas/{index:03}/Target.scala"),
+            format!(
+                "package replica\nclass Target {{\n  def hit(): Int = {index}\n  def call(): Int = hit() // physical-{index:03}\n}}\n"
+            ),
+        );
+    }
+    let project = builder.build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer.get_definitions("replica.Target.hit");
+    targets.sort_by(|left, right| left.source().cmp(right.source()));
+    assert_eq!(targets.len(), REPLICA_COUNT);
+
+    let selected = targets
+        .iter()
+        .find(|target| target.source().rel_path() == "replicas/127/Target.scala")
+        .expect("selected physical target")
+        .clone();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new([selected.source().clone()].into_iter().collect()));
+    analyzer.reset_scala_query_scan_counts_for_test();
+
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), REPLICA_COUNT + 1, 100)
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = result
+    else {
+        panic!("expected exact physical query success");
+    };
+    assert_eq!(hits_by_overload.len(), REPLICA_COUNT);
+    for target in &targets {
+        let bucket = hits_by_overload
+            .get(target)
+            .unwrap_or_else(|| panic!("missing physical bucket for {target:?}"));
+        if target == &selected {
+            assert_eq!(
+                bucket.len(),
+                1,
+                "selected physical bucket must own its call"
+            );
+            assert_hit_contains(&bucket.iter().cloned().collect::<Vec<_>>(), "physical-127");
+        } else {
+            assert!(bucket.is_empty(), "physical replica leaked into {target:?}");
+        }
+    }
+    assert_eq!(analyzer.scala_query_parse_count_for_test(), 1);
+    assert_eq!(analyzer.scala_query_walk_count_for_test(), 1);
+}
+
+#[test]
 fn scala_inherited_class_method_usages_preserve_target_buckets_and_cap() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Services.scala",
@@ -999,6 +3265,161 @@ class BinaryChild extends BinaryBase {
         ),
         "inherited multi-target query must preserve the query-wide usage cap"
     );
+}
+
+#[test]
+fn scala_inherited_bare_members_use_exact_hierarchy_and_contextual_callable_shape() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Bases.scala",
+            r#"package app
+
+trait ActorBase {
+  def sender(): String = "base"
+}
+
+trait CallbackBase {
+  def transform(value: Int): String = value.toString
+  def transform(value: Int, suffix: String): String = value.toString + suffix
+}
+
+trait ConflictingActor {
+  def sender(): String = "conflict"
+}
+
+trait ConflictingCallbacks {
+  def transform(value: Int): String = "conflict"
+}
+
+trait OtherCallbacks {
+  def transform(value: Int): String = "other"
+}
+"#,
+        ),
+        (
+            "app/Consumers.scala",
+            r#"package app
+
+class GoodConsumer extends ActorBase with CallbackBase {
+  def consume(seed: Int)(callback: Int => String): String = callback(seed)
+
+  val inheritedCall = sender() // positive-inherited-call
+  val inheritedMethodValue = consume(1)(transform) // positive-method-value
+  val inheritedBinaryCall = transform(1, "!") // positive-binary-call
+}
+
+class TraitConflict extends ActorBase with ConflictingActor {
+  val conflicted = sender() // negative-trait-conflict
+}
+
+class CallbackConflict extends CallbackBase with ConflictingCallbacks {
+  def consume(callback: Int => String): String = callback(1)
+  val conflicted = consume(transform) // negative-callback-conflict
+}
+
+class LocalShadow extends ActorBase with CallbackBase {
+  def run(): String = {
+    def sender(): String = "local"
+    sender() // negative-local-shadow
+  }
+
+  def consume(callback: Int => String): String = callback(1)
+  def callback(): String = {
+    def transform(value: Int): String = "local"
+    consume(transform) // negative-method-value-shadow
+  }
+}
+
+class UnrelatedActor {
+  def sender(): String = "unrelated"
+  val value = sender() // negative-unrelated
+}
+
+class OtherOverride extends OtherCallbacks {
+  override def transform(value: Int): String = "override"
+  def consume(callback: Int => String): String = callback(1)
+  val value = consume(transform) // negative-unrelated-override
+}
+
+class SenderOverride extends ActorBase {
+  override def sender(): String = "override"
+  val value = sender() // positive-related-override
+}
+"#,
+        ),
+    ]);
+
+    let sender = definition(&analyzer, "app.ActorBase.sender");
+    let sender_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender)));
+    assert_hit_contains(&sender_hits, "sender() // positive-inherited-call");
+    assert_hit_contains(&sender_hits, "sender() // positive-related-override");
+    assert_no_hit_contains(&sender_hits, "negative-trait-conflict");
+    assert_no_hit_contains(&sender_hits, "negative-local-shadow");
+    assert_no_hit_contains(&sender_hits, "negative-unrelated");
+
+    let sender_override = definition(&analyzer, "app.SenderOverride.sender");
+    let override_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender_override)),
+    );
+    assert_hit_contains(&override_hits, "sender() // positive-related-override");
+    assert_no_hit_contains(&override_hits, "positive-inherited-call");
+
+    let transform = definition(&analyzer, "app.CallbackBase.transform");
+    let transform_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&transform)));
+    assert_hit_contains(
+        &transform_hits,
+        "consume(1)(transform) // positive-method-value",
+    );
+    assert_hit_contains(
+        &transform_hits,
+        "transform(1, \"!\") // positive-binary-call",
+    );
+    assert_no_hit_contains(&transform_hits, "negative-callback-conflict");
+    assert_no_hit_contains(&transform_hits, "negative-method-value-shadow");
+    assert_no_hit_contains(&transform_hits, "negative-unrelated-override");
+
+    let limited = UsageFinder::new().query(&analyzer, &[transform], 100, 1);
+    assert!(
+        matches!(
+            limited.result,
+            FuzzyResult::TooManyCallsites { limit: 1, .. }
+        ),
+        "inherited bare-member overloads must preserve the query-wide cap"
+    );
+}
+
+#[test]
+fn scala_usage_scan_is_stack_safe_for_deep_lexical_scopes() {
+    std::thread::Builder::new()
+        .name("scala-deep-usage-scan".to_string())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let depth = 1_024;
+            let mut source = String::from(
+                "package app\n\nclass Deep {\n  def ping(): Unit = ()\n  def run(): Unit = ",
+            );
+            for _ in 0..depth {
+                source.push_str("{\n");
+            }
+            source.push_str("ping() // positive-deep-scope\n");
+            for _ in 0..depth {
+                source.push_str("}\n");
+            }
+            source.push_str("}\n");
+
+            let (_project, analyzer) =
+                scala_analyzer_with_files(&[("app/Deep.scala", source.as_str())]);
+            let target = definition(&analyzer, "app.Deep.ping");
+            let hits = hits(
+                UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+            );
+            assert_hit_contains(&hits, "ping() // positive-deep-scope");
+        })
+        .expect("spawn deep Scala usage scan")
+        .join()
+        .expect("deep Scala usage scan must not overflow its small stack");
 }
 
 #[test]
@@ -1083,6 +3504,161 @@ object Use { val sdk = SbtScalaSdkData(Some("other")) }
                 .all(|hit| hit.file.rel_path() != "other/Api.scala"),
             "unrelated callable owner leaked for {target:?}: {hits:#?}"
         );
+    }
+}
+
+#[test]
+fn scala_overrides_inherit_defaults_only_from_exact_callable_families() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "defaults/Overrides.scala",
+            r#"
+package defaults
+
+trait DirectBase {
+  def direct(incomplete: Boolean, completion: Boolean = false): Int = 0
+}
+class Direct extends DirectBase {
+  override def direct(incomplete: Boolean, completion: Boolean): Int = 1
+  def one: Int = direct(true) // positive-direct-inherited-default
+  def two: Int = direct(true, false) // positive-direct-explicit
+}
+
+trait Root {
+  def transitive(incomplete: Boolean, completion: Boolean = false): Int = 0
+}
+trait Mid extends Root {
+  override def transitive(incomplete: Boolean, completion: Boolean): Int = 1
+}
+class Leaf extends Mid {
+  override def transitive(incomplete: Boolean, completion: Boolean): Int = 2
+  def one: Int = transitive(true) // positive-transitive-inherited-default
+}
+
+trait DifferentTypesBase {
+  def different(value: String, fallback: String = "fallback"): Int = 0
+}
+class DifferentTypes extends DifferentTypesBase {
+  def different(value: Int, fallback: Int): Int = 1
+  def one: Int = different(1) // negative-different-parameter-types
+}
+
+trait DifferentListsBase {
+  def differentLists(value: Boolean)(fallback: Boolean = false): Int = 0
+}
+class DifferentLists extends DifferentListsBase {
+  def differentLists(value: Boolean, fallback: Boolean): Int = 1
+  def one: Int = differentLists(true) // negative-different-list-topology
+}
+
+trait UnresolvedBase {
+  def unresolved(value: Missing, fallback: Missing = null): Int = 0
+}
+class Unresolved extends UnresolvedBase {
+  override def unresolved(value: Missing, fallback: Missing): Int = 1
+  def one: Int = unresolved(null) // negative-unresolved-parameter-identity
+}
+
+trait CompetingLeft {
+  def competing(first: Boolean = false, second: Boolean): Int = 0
+}
+trait CompetingRight {
+  def competing(first: Boolean, second: Boolean = false): Int = 0
+}
+class Competing extends CompetingLeft with CompetingRight {
+  override def competing(first: Boolean, second: Boolean): Int = 1
+  def none: Int = competing() // negative-unrelated-default-contributors
+}
+"#,
+        ),
+        ("shadow/Boolean.scala", "package shadow\nclass Boolean\n"),
+        (
+            "defaults/Shadowed.scala",
+            r#"
+package defaults
+trait BuiltinBase {
+  def shadowed(value: scala.Boolean, fallback: scala.Boolean = false): Int = 0
+}
+class Shadowed extends BuiltinBase {
+  def shadowed(value: shadow.Boolean, fallback: shadow.Boolean): Int = 1
+  def one: Int = shadowed(new shadow.Boolean) // negative-user-type-versus-builtin
+}
+"#,
+        ),
+        (
+            "jvm/physical/Base.scala",
+            r#"package physical
+trait Base { def ambiguous(value: Boolean, fallback: Boolean = false): Int = 0 }
+"#,
+        ),
+        (
+            "js/physical/Base.scala",
+            r#"package physical
+trait Base { def ambiguous(value: Boolean, fallback: Boolean = false): Int = 0 }
+"#,
+        ),
+        (
+            "physical/Use.scala",
+            r#"package physical
+class Use extends Base {
+  override def ambiguous(value: Boolean, fallback: Boolean): Int = 1
+  def one: Int = ambiguous(true) // negative-ambiguous-physical-ancestor
+}
+"#,
+        ),
+    ]);
+
+    for (target, expected) in [
+        (
+            "defaults.Direct.direct",
+            vec![
+                "positive-direct-inherited-default",
+                "positive-direct-explicit",
+            ],
+        ),
+        (
+            "defaults.Leaf.transitive",
+            vec!["positive-transitive-inherited-default"],
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        for marker in expected {
+            assert_hit_contains(&target_hits, marker);
+        }
+    }
+
+    for (target, marker) in [
+        (
+            "defaults.DifferentTypes.different",
+            "negative-different-parameter-types",
+        ),
+        (
+            "defaults.DifferentLists.differentLists",
+            "negative-different-list-topology",
+        ),
+        (
+            "defaults.Unresolved.unresolved",
+            "negative-unresolved-parameter-identity",
+        ),
+        (
+            "defaults.Shadowed.shadowed",
+            "negative-user-type-versus-builtin",
+        ),
+        (
+            "physical.Use.ambiguous",
+            "negative-ambiguous-physical-ancestor",
+        ),
+        (
+            "defaults.Competing.competing",
+            "negative-unrelated-default-contributors",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, marker);
     }
 }
 
@@ -1203,6 +3779,83 @@ object NumberUse {
 }
 
 #[test]
+fn scala_package_qualified_applications_and_typed_primitive_receivers_resolve_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala/Primitives.scala",
+            r#"
+package scala
+
+class Int {
+  def -(other: Int): Int = this
+  def toLong: Long = ???
+}
+class Boolean {
+  def &&(other: Boolean): Boolean = this
+}
+class Char {
+  def !=(other: Char): Boolean = ???
+}
+class Long
+"#,
+        ),
+        (
+            "kyo/Maybe.scala",
+            r#"
+package kyo
+
+object Maybe {
+  def apply(value: Int): Int = value
+}
+"#,
+        ),
+        (
+            "fansi/Str.scala",
+            r#"
+package fansi
+
+final class Str
+object Str {
+  def apply(value: String): Str = ???
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val maybe = kyo.Maybe(1) // positive-package-object-apply
+  val rendered = fansi.Str("value") // positive-package-companion-apply
+
+  def primitives(offset: Int, enabled: Boolean, ch: Char): Long = {
+    val previous = offset - 1 // positive-typed-int-infix
+    val active = enabled && true // positive-typed-boolean-infix
+    val different = ch != 'x' // positive-typed-char-infix
+    offset.toLong // positive-typed-int-selection
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target, marker) in [
+        ("kyo.Maybe$.apply", "positive-package-object-apply"),
+        ("fansi.Str$.apply", "positive-package-companion-apply"),
+        ("scala.Int.-", "positive-typed-int-infix"),
+        ("scala.Boolean.&&", "positive-typed-boolean-infix"),
+        ("scala.Char.!=", "positive-typed-char-infix"),
+        ("scala.Int.toLong", "positive-typed-int-selection"),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
 fn scala_selection_label_stable_and_type_usages_preserve_exact_targets() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -1314,6 +3967,729 @@ object Use {
 }
 
 #[test]
+fn scala_class_targets_follow_only_exact_companion_apply_and_extractor_roles() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Model.scala",
+            r#"package model
+case class Event(value: Int)
+final class Settings private (val value: Int)
+object Settings {
+  def apply(value: Int): Settings = new Settings(value)
+  def unapply(settings: Settings): Option[Int] = Some(settings.value)
+}
+final class Plain(val value: Int)
+object Plain { def apply(value: Int): Event = Event(value) }
+"#,
+        ),
+        (
+            "other/Model.scala",
+            r#"package other
+case class Event(value: Int)
+final class Settings(val value: Int)
+object Settings {
+  def apply(value: Int): Settings = new Settings(value)
+  def unapply(settings: Settings): Option[Int] = Some(settings.value)
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.{Event => ModelEvent, Settings => ModelSettings, Plain}
+object Use {
+  val event = ModelEvent(1)
+  val wrongEventArity = ModelEvent(1, 2)
+  val settings = ModelSettings(2)
+  val wrongSettingsArity = ModelSettings()
+  val plainReturnsEvent = Plain(3)
+  def extract(value: Any): Int = value match {
+    case ModelEvent(number) => number
+    case ModelSettings(number) => number
+    case Plain(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "other/Use.scala",
+            r#"package other
+object Use {
+  val event = Event(1)
+  val settings = Settings(2)
+  def extract(value: Any): Int = value match {
+    case Event(number) => number
+    case Settings(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+
+    let event = definition(&analyzer, "model.Event");
+    let event_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&event)));
+    assert_hit_contains(&event_hits, "val event = ModelEvent(1)");
+    assert_hit_contains(&event_hits, "case ModelEvent(number)");
+    assert_no_hit_contains(&event_hits, "ModelEvent(1, 2)");
+    assert!(
+        event_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "other/Use.scala"),
+        "same-name package companion leaked: {event_hits:#?}"
+    );
+
+    let settings = definition(&analyzer, "model.Settings");
+    let settings_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&settings)));
+    assert_hit_contains(&settings_hits, "val settings = ModelSettings(2)");
+    assert_hit_contains(&settings_hits, "case ModelSettings(number)");
+    assert_no_hit_contains(&settings_hits, "ModelSettings()");
+
+    let plain = definition(&analyzer, "model.Plain");
+    let plain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
+    assert_no_hit_contains(&plain_hits, "Plain(3)");
+    assert_no_hit_contains(&plain_hits, "case Plain(number)");
+}
+
+#[test]
+fn scala_unqualified_type_roles_follow_exact_callable_precedence() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Model.scala",
+            r#"package model
+class Extracted(val value: Int)
+object Extracted {
+  def unapply(value: Any): Option[Int] = None
+}
+class Built(val value: Int)
+abstract class Zero
+final class Projected private (val value: Int)
+object Projected {
+  def apply(value: Int): Projected = new Projected(value)
+}
+class Other
+class Plain(val value: Int)
+object Plain {
+  def apply(value: Int): Other = new Other
+}
+object LexicalCollision {
+  def apply(value: Int): Other = new Other
+}
+object NestedFactory {
+  final class Settings private (val value: Int)
+  object Settings {
+    def apply(value: Int): Settings = new Settings(value)
+  }
+  val nested = Settings(8) // positive-nested-apply
+}
+trait Growable {
+  def +=(value: Int): Unit
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use {
+  def extract(value: Any): Int = value match {
+    case Extracted(found) => found // positive-extractor
+    case _ => 0
+  }
+  val built = Built(1) // positive-universal
+  val projected = Projected(2) // positive-projected-apply
+  val plain = Plain(3) // positive-other-return-apply
+  val explicitlyPlain = new Plain(4) // positive-explicit-constructor
+  val zero = new Zero: // positive-zero-arity
+    override def toString = "zero"
+  def grow(target: Growable): Unit = target += 1 // positive-infix
+}
+class LocalWins {
+  def Projected(value: Int): Int = value
+  val value = Projected(9) // negative-same-name-member
+}
+class NestedWins {
+  class LexicalCollision(val value: Int)
+  val value = LexicalCollision(7) // positive-lexical-collision
+}
+"#,
+        ),
+    ]);
+
+    for (target, expected) in [
+        ("model.Extracted", "positive-extractor"),
+        ("model.Built", "positive-universal"),
+        ("model.Built.Built", "positive-universal"),
+        ("model.Projected", "positive-projected-apply"),
+        ("model.Projected$.apply", "positive-projected-apply"),
+        ("model.Zero", "positive-zero-arity"),
+        ("model.Growable.+=", "positive-infix"),
+        ("model.Plain$.apply", "positive-other-return-apply"),
+        ("model.NestedFactory$.Settings", "positive-nested-apply"),
+        (
+            "model.NestedFactory$.Settings$.apply",
+            "positive-nested-apply",
+        ),
+        (
+            "app.NestedWins.LexicalCollision",
+            "positive-lexical-collision",
+        ),
+        (
+            "app.NestedWins.LexicalCollision.LexicalCollision",
+            "positive-lexical-collision",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert!(
+            target_hits.iter().any(|hit| hit.snippet.contains(expected)),
+            "{target:?} missing {expected:?}: {target_hits:#?}"
+        );
+        assert_no_hit_contains(&target_hits, "negative-same-name-member");
+    }
+
+    let plain = definition(&analyzer, "model.Plain");
+    let plain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
+    assert_no_hit_contains(&plain_hits, "positive-other-return-apply");
+
+    let plain_constructor = definition(&analyzer, "model.Plain.Plain");
+    let constructor_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain_constructor)),
+    );
+    assert_hit_contains(&constructor_hits, "positive-explicit-constructor");
+    assert_no_hit_contains(&constructor_hits, "positive-other-return-apply");
+
+    let projected_constructor = definition(&analyzer, "model.Projected.Projected");
+    let projected_constructor_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&projected_constructor)),
+    );
+    assert_no_hit_contains(&projected_constructor_hits, "positive-projected-apply");
+
+    let imported_collision = definition(&analyzer, "model.LexicalCollision$.apply");
+    let imported_collision_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&imported_collision)),
+    );
+    assert_no_hit_contains(&imported_collision_hits, "positive-lexical-collision");
+}
+
+#[test]
+fn scala_nested_type_visibility_honors_lexical_alias_wildcard_and_ambiguity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Nested.scala",
+            r#"package model
+object Outer {
+  case class Inner(value: Int)
+  val lexicalType: Inner = Inner(1)
+  val lexicalCall = Inner(2)
+  def lexicalExtract(value: Any): Int = value match {
+    case Inner(number) => number
+    case _ => 0
+  }
+}
+object Sibling { case class Inner(value: Int) }
+"#,
+        ),
+        (
+            "app/Wildcard.scala",
+            r#"package app
+import model.Outer._
+object Wildcard {
+  val typed: Inner = Inner(3)
+  def extract(value: Any): Int = value match {
+    case Inner(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "app/Alias.scala",
+            r#"package app
+import model.Outer.Inner as Renamed
+object Alias {
+  val typed: Renamed = Renamed(4)
+  def extract(value: Any): Int = value match {
+    case Renamed(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "app/Ambiguous.scala",
+            r#"package app
+import model.Outer._
+import model.Sibling._
+object Ambiguous {
+  val typed: Inner = Inner(5)
+  def extract(value: Any): Int = value match {
+    case Inner(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+
+    let inner = definition(&analyzer, "model.Outer$.Inner");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&inner), 100, 100);
+    for expected in [
+        "app/Wildcard.scala",
+        "app/Alias.scala",
+        "app/Ambiguous.scala",
+    ] {
+        assert!(
+            query
+                .candidate_files
+                .iter()
+                .any(|file| file.rel_path() == expected),
+            "default Scala candidate routing omitted {expected}: {:#?}",
+            query.candidate_files
+        );
+    }
+    let inner_hits = hits(query.result);
+    for expected in [
+        "val lexicalType: Inner = Inner(1)",
+        "val lexicalCall = Inner(2)",
+        "case Inner(number)",
+        "val typed: Inner = Inner(3)",
+        "val typed: Renamed = Renamed(4)",
+        "case Renamed(number)",
+    ] {
+        assert_hit_contains(&inner_hits, expected);
+    }
+    assert!(
+        inner_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "app/Ambiguous.scala"),
+        "ambiguous sibling wildcard imports must not select a nested target: {inner_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_method_local_imports_preserve_scope_order_shadowing_and_object_identity() {
+    let consumer_source = r#"package app
+class Consumer {
+  def methodLocal: Any = {
+    import Owner._
+    accept(RetryTick) // positive-method
+  }
+  def anonymous: Any = new Runnable {
+    import Owner._
+    def run(): Unit = accept(RetryTick) // positive-anonymous
+  }
+  def aliased: Any = {
+    import Owner.{RetryTick => AliasTick}
+    accept(AliasTick) // positive-alias
+  }
+  def beforeImport: Any = {
+    accept(RetryTick) // negative-before
+    import Owner._
+  }
+  def siblingScope: Any = {
+    { import Owner._; accept(RetryTick) } // positive-sibling-inner
+    accept(RetryTick) // negative-sibling-outer
+  }
+  def shadowed: Any = {
+    import Owner._
+    val RetryTick = other.RetryTick
+    accept(RetryTick) // negative-shadow
+  }
+  def ambiguous: Any = {
+    import Owner._
+    import other._
+    accept(RetryTick) // negative-ambiguous
+  }
+  def absent: Any = accept(RetryTick) // negative-absent
+  private def accept(value: Any): Any = value
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Owner.scala",
+            r#"package app
+object Owner {
+  private class RetryTick
+  private object RetryTick
+}
+"#,
+        ),
+        ("other/RetryTick.scala", "package other\nobject RetryTick\n"),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let target = definition(&analyzer, "app.Owner$.RetryTick$");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    for marker in [
+        "positive-method",
+        "positive-anonymous",
+        "positive-alias",
+        "positive-sibling-inner",
+    ] {
+        assert_hit_line(&target_hits, line_of(consumer_source, marker));
+    }
+    for marker in [
+        "negative-before",
+        "negative-sibling-outer",
+        "negative-shadow",
+        "negative-ambiguous",
+        "negative-absent",
+    ] {
+        assert_no_hit_line(&target_hits, line_of(consumer_source, marker));
+    }
+
+    let class = definition(&analyzer, "app.Owner$.RetryTick");
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class)));
+    for marker in [
+        "positive-method",
+        "positive-anonymous",
+        "positive-alias",
+        "positive-sibling-inner",
+    ] {
+        assert_no_hit_line(&class_hits, line_of(consumer_source, marker));
+    }
+
+    let imports = analyzer.import_info_of(definition(&analyzer, "app.Consumer").source());
+    assert_eq!(
+        8,
+        imports.len(),
+        "each source import is collected exactly once"
+    );
+    assert!(imports.iter().all(|info| {
+        info.path
+            .as_ref()
+            .is_some_and(|path| path.declaration_start_byte > 0 && !path.lexical_scopes.is_empty())
+    }));
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["app.Owner$.RetryTick$"],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    let result = &mcp["results"][0];
+    assert_eq!(result["status"], "found", "{mcp}");
+    let mcp_hits = result["files"]
+        .as_array()
+        .expect("MCP usage files")
+        .iter()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["line"].as_u64())
+        .collect::<BTreeSet<_>>();
+    for marker in [
+        "positive-method",
+        "positive-anonymous",
+        "positive-alias",
+        "positive-sibling-inner",
+    ] {
+        assert!(
+            mcp_hits.contains(&(line_of(consumer_source, marker) as u64)),
+            "MCP result omitted {marker}: {mcp}"
+        );
+    }
+}
+
+#[test]
+fn scala_local_stable_member_imports_preserve_exact_owner_aliases_and_fail_closed() {
+    let consumer_source = r#"package app
+import decoy.Imported.selfAddress
+import model.Cluster
+
+class DirectConsumer {
+  val cluster = Cluster("direct")
+  import cluster.{ selfAddress }
+  def address: String = selfAddress // positive-direct
+}
+
+class AliasedConsumer {
+  val cluster = Cluster("alias")
+  import cluster.{ selfAddress as localAddress }
+  def address: String = localAddress // positive-alias
+}
+
+class UnresolvedConsumer {
+  val cluster = unavailable
+  import cluster.{ selfAddress }
+  def address: String = selfAddress // negative-unresolved-local-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Cluster.scala",
+            r#"package model
+class Cluster(val name: String) {
+  def selfAddress: String = name
+}
+object Cluster {
+  def apply(name: String): Cluster = new Cluster(name)
+}
+"#,
+        ),
+        (
+            "decoy/Imported.scala",
+            r#"package decoy
+object Imported {
+  def selfAddress: String = "decoy"
+}
+"#,
+        ),
+        ("app/Consumers.scala", consumer_source),
+    ]);
+
+    let target = definition(&analyzer, "model.Cluster.selfAddress");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    for marker in ["positive-direct", "positive-alias"] {
+        assert_hit_line(&target_hits, line_of(consumer_source, marker));
+    }
+    assert_no_hit_line(
+        &target_hits,
+        line_of(consumer_source, "negative-unresolved-local-owner"),
+    );
+
+    let decoy = definition(&analyzer, "decoy.Imported$.selfAddress");
+    let decoy_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&decoy)));
+    for marker in [
+        "positive-direct",
+        "positive-alias",
+        "negative-unresolved-local-owner",
+    ] {
+        assert_no_hit_line(&decoy_hits, line_of(consumer_source, marker));
+    }
+}
+
+#[test]
+fn scala_exact_lexical_roots_cover_receiver_types_import_selectors_and_late_objects() {
+    let source = r#"package app
+
+object Cst { class Stream(val documents: Int) }
+object ClipPath { class Ref(val id: String) }
+object Cache { class Data }
+object Imported { val callsiteClass: String = "decoy" }
+
+final class KnownCallsite(val callsiteClass: String, val callsiteMethod: String)
+
+object Owners {
+  object Cst { class Stream(val documents: Int) }
+  object ClipPath { class Ref(val id: String) }
+
+  def document(stream: Cst.Stream): Int = stream.documents // positive-qualified-receiver
+  def clip(ref: ClipPath.Ref): String = ref.id // positive-sibling-qualified-receiver
+
+  def imported(callsite: KnownCallsite): String = {
+    import callsite.{callsiteClass, callsiteMethod} // positive-local-import-selector
+    callsiteClass + callsiteMethod
+  }
+
+  def unresolved(callsite: Missing): String = {
+    import Imported.callsiteClass
+    import callsite.{callsiteClass}
+    callsiteClass // negative-imprecise-local-import-owner
+  }
+
+  given Cache.Data = new Cache.Data // positive-late-lexical-root
+
+  object Cache { class Data }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Owners.scala", source)]);
+
+    for (target_fqn, marker) in [
+        (
+            "app.Owners$.Cst$.Stream.documents",
+            "positive-qualified-receiver",
+        ),
+        (
+            "app.Owners$.ClipPath$.Ref.id",
+            "positive-sibling-qualified-receiver",
+        ),
+        (
+            "app.KnownCallsite.callsiteClass",
+            "positive-local-import-selector",
+        ),
+        ("app.Owners$.Cache$.Data", "positive-late-lexical-root"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-imprecise-local-import-owner");
+    }
+
+    for decoy_fqn in [
+        "app.Cst$.Stream.documents",
+        "app.ClipPath$.Ref.id",
+        "app.Cache$.Data",
+        "app.Imported$.callsiteClass",
+    ] {
+        let decoy = definition(&analyzer, decoy_fqn);
+        let decoy_hits = authoritative_scala_hits(&analyzer, &decoy);
+        assert_no_hit_contains(&decoy_hits, "positive-qualified-receiver");
+        assert_no_hit_contains(&decoy_hits, "positive-sibling-qualified-receiver");
+        assert_no_hit_contains(&decoy_hits, "positive-local-import-selector");
+        assert_no_hit_contains(&decoy_hits, "positive-late-lexical-root");
+        assert_no_hit_contains(&decoy_hits, "negative-imprecise-local-import-owner");
+    }
+}
+
+#[test]
+fn scala_postfix_calls_and_stable_enum_qualifiers_preserve_exact_roles() {
+    let source = r#"package app
+
+final class Boolish {
+  def &&(next: => Boolean): Boolean = next
+}
+final class OtherBoolish {
+  def &&(next: => Boolean): Boolean = next
+}
+final class Ambiguous {
+  def &&(next: => Boolean): Boolean = next
+  def &&(next: => Int): Boolean = next > 0
+}
+
+enum Kind:
+  case Def(value: Int)
+
+class Plain:
+  class Def
+
+object Standalone:
+  class Def
+
+object Use:
+  def postfix(rhsIsEmpty: Boolish, next: Boolean): Boolean =
+    rhsIsEmpty && // positive-postfix-operator
+      next
+
+  def ambiguous(receiver: Ambiguous, next: Boolean): Boolean =
+    receiver && // negative-postfix-overload
+      next
+
+  val enumValue: Kind.Def = Kind.Def(1) // positive-enum-stable-qualifier
+  val invalidClass: Plain.Def = null // negative-ordinary-class-qualifier
+  val objectValue: Standalone.Def = null // positive-standalone-object-qualifier
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Use.scala", source)]);
+
+    let operator = definition(&analyzer, "app.Boolish.&&");
+    let operator_hits = authoritative_scala_hits(&analyzer, &operator);
+    assert_hit_contains(&operator_hits, "positive-postfix-operator");
+    assert_no_hit_contains(&operator_hits, "negative-postfix-overload");
+    assert_eq!(
+        operator_hits
+            .iter()
+            .filter(|hit| hit.snippet.contains("positive-postfix-operator"))
+            .count(),
+        1,
+        "the postfix expression must own its operator visit: {operator_hits:#?}"
+    );
+
+    let other_operator = definition(&analyzer, "app.OtherBoolish.&&");
+    let other_hits = authoritative_scala_hits(&analyzer, &other_operator);
+    assert_no_hit_contains(&other_hits, "positive-postfix-operator");
+
+    let kind = definition(&analyzer, "app.Kind");
+    let kind_hits = authoritative_scala_hits(&analyzer, &kind);
+    assert_hit_contains(&kind_hits, "positive-enum-stable-qualifier");
+    assert_no_hit_contains(&kind_hits, "negative-ordinary-class-qualifier");
+    assert_no_hit_contains(&kind_hits, "positive-standalone-object-qualifier");
+
+    let nested = definition(&analyzer, "app.Kind$.Def");
+    let nested_hits = authoritative_scala_hits(&analyzer, &nested);
+    assert_hit_contains(&nested_hits, "positive-enum-stable-qualifier");
+
+    let plain = definition(&analyzer, "app.Plain");
+    let plain_hits = authoritative_scala_hits(&analyzer, &plain);
+    assert_no_hit_contains(&plain_hits, "negative-ordinary-class-qualifier");
+
+    let standalone = definition(&analyzer, "app.Standalone$");
+    let standalone_hits = authoritative_scala_hits(&analyzer, &standalone);
+    assert_hit_contains(&standalone_hits, "positive-standalone-object-qualifier");
+}
+
+#[test]
+fn scala_stable_enum_qualifier_fails_closed_for_physical_replicas() {
+    let replica = r#"package model
+enum Kind:
+  case Def(value: Int)
+"#;
+    let consumer = r#"package app
+import model.Kind
+object Use:
+  val value: Kind.Def = null // negative-ambiguous-enum-qualifier
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/model/Kind.scala", replica),
+        ("js/model/Kind.scala", replica),
+        ("app/Use.scala", consumer),
+    ]);
+
+    for target in analyzer.get_definitions("model.Kind") {
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-enum-qualifier");
+    }
+}
+
+#[test]
+fn scala_case_class_wildcard_exposes_only_stable_companion_children() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Container.scala",
+            r#"package model
+case class Container(value: Int) {
+  class InstanceNested
+}
+object Container {
+  class CompanionNested
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.Container.*
+object Use {
+  val companion: CompanionNested = new CompanionNested
+  val invalidInstanceLeak: InstanceNested = new InstanceNested
+}
+"#,
+        ),
+    ]);
+
+    let companion = definition(&analyzer, "model.Container$.CompanionNested");
+    let companion_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&companion)));
+    assert_hit_contains(
+        &companion_hits,
+        "val companion: CompanionNested = new CompanionNested",
+    );
+
+    let instance = definition(&analyzer, "model.Container.InstanceNested");
+    let instance_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&instance)));
+    assert!(
+        instance_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "app/Use.scala"),
+        "case-class instance children leaked through companion wildcard import: {instance_hits:#?}"
+    );
+}
+
+#[test]
 fn scala_qualified_call_initializer_seeds_local_receiver_type() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Console.scala",
@@ -1347,6 +4723,1386 @@ object Action {
 
     assert_hit_contains(&hits, "console.textSent(\"expected\")");
     assert_no_hit_contains(&hits, "decoy.textSent");
+}
+
+#[test]
+fn scala_unqualified_call_initializer_uses_exact_owner_and_hierarchy_return_types() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Messages.scala",
+            r#"package model
+
+class Messages { def tail: Int = 1 }
+class OtherMessages { def tail: Int = 2 }
+"#,
+        ),
+        (
+            "helpers/ImportedFactories.scala",
+            r#"package helpers
+
+import model.{Messages, OtherMessages}
+
+object ImportedFactories {
+  def systemDrain(seed: Int): OtherMessages = new OtherMessages
+  def importedDrain(seed: Int): Messages = new Messages
+}
+"#,
+        ),
+        (
+            "app/Factories.scala",
+            r#"package app
+
+import helpers.ImportedFactories.{importedDrain, systemDrain}
+import model.{Messages, OtherMessages}
+
+trait InheritedFactory {
+  def inheritedDrain(seed: Int): Messages = new Messages
+}
+
+class SameOwnerFactory {
+  def systemDrain(seed: Int): Messages = new Messages
+  def sameOwner(): Int = {
+    val messages = systemDrain(1)
+    messages.tail // positive-same-owner
+  }
+
+  def overloaded(seed: Int): Messages = new Messages
+  def overloaded(seed: String): OtherMessages = new OtherMessages
+  def ambiguousOverload(): Int = {
+    val messages = overloaded(1)
+    messages.tail // negative-overload
+  }
+
+  def otherDrain(seed: Int): OtherMessages = new OtherMessages
+  def wrongReturn(): Int = {
+    val messages = otherDrain(1)
+    messages.tail // negative-return
+  }
+
+  def localShadow(): Int = {
+    def systemDrain(seed: Int): OtherMessages = new OtherMessages
+    val messages = systemDrain(1)
+    messages.tail // negative-local-shadow
+  }
+}
+
+class InheritedConsumer extends InheritedFactory {
+  def run(): Int = {
+    val messages = inheritedDrain(1)
+    messages.tail // positive-inherited
+  }
+}
+
+class ImportedConsumer {
+  def run(): Int = {
+    val messages = importedDrain(1)
+    messages.tail // positive-imported
+  }
+}
+
+class UnrelatedFactory {
+  def systemDrain(seed: Int): OtherMessages = new OtherMessages
+  def run(): Int = {
+    val messages = systemDrain(1)
+    messages.tail // negative-unrelated
+  }
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "model.Messages.tail");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_hit_contains(&hits, "messages.tail // positive-same-owner");
+    assert_hit_contains(&hits, "messages.tail // positive-inherited");
+    assert_hit_contains(&hits, "messages.tail // positive-imported");
+    assert_no_hit_contains(&hits, "negative-overload");
+    assert_no_hit_contains(&hits, "negative-return");
+    assert_no_hit_contains(&hits, "negative-local-shadow");
+    assert_no_hit_contains(&hits, "negative-unrelated");
+}
+
+#[test]
+fn scala_usage_engines_keep_named_arguments_out_of_assignment_inference() {
+    let source = r#"package app
+
+class Body { val summary: Int = 1 }
+class Other { val summary: Int = 2 }
+case class Result(body: Int, short: Int)
+class Built(val body: Int, val short: Int)
+
+abstract class Parser {
+  protected def makeBody(seed: Int): Body
+  protected def makeOther(seed: Int): Other
+
+  final def parse(seed: Int): Int =
+    val body = makeBody(seed)
+    val result = Result(
+      body = body.summary, // positive-first-named-rhs
+      short = body.summary, // positive-second-named-rhs
+    )
+    val built = new Built(
+      body = body.summary, // positive-constructor-first-named-rhs
+      short = body.summary, // positive-constructor-second-named-rhs
+    )
+    var changing = makeBody(seed)
+    changing = makeOther(seed)
+    result.short + built.short + changing.summary // positive-real-reassignment
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/NamedArguments.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for target_fqn in [
+        "app.Body.summary",
+        "app.Result.body",
+        "app.Built.body",
+        "app.Other.summary",
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        let inverted = hits(ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        match target_fqn {
+            "app.Body.summary" => {
+                for marker in [
+                    "positive-first-named-rhs",
+                    "positive-second-named-rhs",
+                    "positive-constructor-first-named-rhs",
+                    "positive-constructor-second-named-rhs",
+                ] {
+                    assert_hit_contains(&targeted, marker);
+                    assert_hit_contains(&inverted, marker);
+                }
+                assert_no_hit_contains(&targeted, "positive-real-reassignment");
+                assert_no_hit_contains(&inverted, "positive-real-reassignment");
+            }
+            "app.Result.body" => {
+                assert_hit_contains(&targeted, "positive-first-named-rhs");
+                assert_hit_contains(&inverted, "positive-first-named-rhs");
+                let lhs = source
+                    .find("body = body.summary")
+                    .expect("named argument lhs");
+                assert!(
+                    targeted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "targeted named-argument LHS was not the Result field: {targeted:#?}"
+                );
+                assert!(
+                    inverted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "inverted named-argument LHS was not the Result field: {inverted:#?}"
+                );
+            }
+            "app.Built.body" => {
+                assert_hit_contains(&targeted, "positive-constructor-first-named-rhs");
+                assert_hit_contains(&inverted, "positive-constructor-first-named-rhs");
+                let lhs = source
+                    .find("body = body.summary, // positive-constructor-first-named-rhs")
+                    .expect("constructor named argument lhs");
+                assert!(
+                    targeted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "targeted constructor named-argument LHS was not the Built field: {targeted:#?}"
+                );
+                assert!(
+                    inverted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "inverted constructor named-argument LHS was not the Built field: {inverted:#?}"
+                );
+            }
+            "app.Other.summary" => {
+                assert_hit_contains(&targeted, "positive-real-reassignment");
+                assert_hit_contains(&inverted, "positive-real-reassignment");
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn scala_nested_mixin_factory_receiver_survives_while_reassignment() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "queue/Messages.scala",
+            r#"package queue
+
+class LatestMessages
+class Messages {
+  def nonEmpty: Boolean = true
+  def tail: Messages = new Messages
+}
+
+trait SystemQueue { self: Mailbox =>
+  def systemDrain(seed: LatestMessages): Messages = new Messages
+}
+
+class Mailbox
+"#,
+        ),
+        (
+            "app/Dispatcher.scala",
+            r#"package app
+
+import queue.{LatestMessages, Mailbox, SystemQueue}
+
+class Dispatcher {
+  private class SharingMailbox extends Mailbox with SystemQueue {
+    def cleanUp(): Unit = {
+      var messages = systemDrain(new LatestMessages)
+      while (messages.nonEmpty) {
+        messages = messages.tail // positive-nested-mixin-reassignment
+      }
+    }
+  }
+}
+"#,
+        ),
+    ]);
+
+    let tail = definition(&analyzer, "queue.Messages.tail");
+    let tail_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tail)));
+    assert_hit_contains(
+        &tail_hits,
+        "messages = messages.tail // positive-nested-mixin-reassignment",
+    );
+
+    let drain = definition(&analyzer, "queue.SystemQueue.systemDrain");
+    let drain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&drain)));
+    assert_hit_contains(&drain_hits, "systemDrain(new LatestMessages)");
+
+    let non_empty = definition(&analyzer, "queue.Messages.nonEmpty");
+    let non_empty_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&non_empty)));
+    assert_hit_contains(&non_empty_hits, "while (messages.nonEmpty)");
+}
+
+#[test]
+fn scala_inherited_companion_apply_fallback_preserves_exact_owner_identity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Factories.scala",
+            r#"package app
+
+trait KnownFactory {
+  def apply(value: Int): Int
+}
+
+class ExternalBacked {
+  def apply(index: Int): Int = index
+}
+object ExternalBacked extends external.Factory[ExternalBacked]
+
+class Plain {
+  def apply(index: Int): Int = index
+}
+object Plain
+
+class Known {
+  def apply(index: Int): Int = index
+}
+object Known extends KnownFactory
+
+class Duplicate {
+  def apply(index: Int): Int = index
+}
+object Duplicate extends external.Factory[Duplicate]
+
+object Use {
+  val external = ExternalBacked(1)
+  val plain = Plain(2)
+  val known = Known(3)
+  val duplicate = Duplicate(4)
+}
+"#,
+        ),
+        (
+            "app/Duplicate.scala",
+            r#"package app
+object Duplicate extends external.Factory[Duplicate]
+"#,
+        ),
+        (
+            "other/Factories.scala",
+            r#"package other
+class ExternalBacked {
+  def apply(index: Int): Int = index
+}
+object ExternalBacked extends external.Factory[ExternalBacked]
+object Use {
+  val external = ExternalBacked(5)
+}
+"#,
+        ),
+    ]);
+
+    let external = definition(&analyzer, "app.ExternalBacked.apply");
+    let external_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&external)));
+    assert_hit_contains(&external_hits, "val external = ExternalBacked(1)");
+    assert_no_hit_contains(&external_hits, "val external = ExternalBacked(5)");
+
+    for (target_fqn, rejected_call) in [
+        ("app.Plain.apply", "val plain = Plain(2)"),
+        ("app.Known.apply", "val known = Known(3)"),
+        ("app.Duplicate.apply", "val duplicate = Duplicate(4)"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, rejected_call);
+    }
+}
+
+#[test]
+fn scala_union_receiver_requires_every_structured_alternative_to_share_member_family() {
+    let consumer_source = r#"package app
+
+import model.CompletionValue.Workspace
+import model.CompletionValue.Extension
+import model.Unrelated
+import model.Duplicate
+
+object Use {
+  def imported(v: Workspace | Extension): Option[String] = v.insertText
+  def nested(v: model.CompletionValue.Workspace | model.CompletionValue.Extension |
+      model.CompletionValue.Interpolator | model.CompletionValue.ImplicitClass): Option[String] =
+    v.insertText
+  def concrete(v: model.CompletionValue.Interpolator): Option[String] = v.insertText
+  def unsupported(v: Workspace | Unrelated): Option[String] = v.insertText
+  def duplicate(v: Duplicate | Extension): Option[String] = v.insertText
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/CompletionValue.scala",
+            r#"package model
+
+sealed trait CompletionValue {
+  def insertText: Option[String] = None
+}
+object CompletionValue {
+  sealed trait Symbolic extends CompletionValue
+  object Symbolic
+  class Workspace extends Symbolic
+  class Extension extends Symbolic
+  class Interpolator extends Symbolic {
+    override val insertText: Option[String] = Some("interpolated")
+  }
+  class ImplicitClass extends CompletionValue
+}
+class Unrelated
+"#,
+        ),
+        (
+            "model/InheritedDuplicate.scala",
+            "package model\nclass Duplicate extends CompletionValue\n",
+        ),
+        (
+            "model/PlainDuplicate.scala",
+            "package model\nclass Duplicate\n",
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+
+    let insert_text = definition(&analyzer, "model.CompletionValue.insertText");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&insert_text)));
+    let lines = hits.iter().map(|hit| hit.line).collect::<BTreeSet<_>>();
+    assert_eq!(
+        lines,
+        BTreeSet::from([
+            line_of(consumer_source, "def imported"),
+            line_of(consumer_source, "    v.insertText"),
+        ]),
+        "only unions whose alternatives all inherit the member may resolve: {hits:#?}"
+    );
+}
+
+#[test]
+fn scala_nested_structural_owners_cover_field_apply_and_inherited_call_families() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "left/Owners.scala",
+            r#"package left
+object Outer {
+  class Base {
+    val marker: Int = 1
+    def run(value: Int): Int = value
+    def apply(value: Int): Int = value
+  }
+  class Child extends Base {
+    val inheritedField = marker
+    val inheritedCall = run(1)
+  }
+  object Factory { def apply(value: Int): Child = new Child }
+  val made = Factory(1)
+  val notAnInstanceApply = Base(1)
+}
+"#,
+        ),
+        (
+            "right/Owners.scala",
+            r#"package right
+object Outer {
+  class Base {
+    val marker: Int = 2
+    def run(value: Int): Int = value + 1
+  }
+  class Child extends Base {
+    val inheritedField = marker
+    val inheritedCall = run(2)
+  }
+  object Factory { def apply(value: Int): Child = new Child }
+  val made = Factory(2)
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, expected) in [
+        ("left.Outer$.Base.marker", "val inheritedField = marker"),
+        ("left.Outer$.Base.run", "val inheritedCall = run(1)"),
+        ("left.Outer$.Factory$.apply", "val made = Factory(1)"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let parent = analyzer
+            .parent_of(&target)
+            .unwrap_or_else(|| panic!("missing structural parent for {target_fqn}"));
+        assert_eq!(
+            parent.source(),
+            target.source(),
+            "member ownership must preserve exact source identity"
+        );
+        let hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&hits, expected);
+        assert!(
+            hits.iter()
+                .all(|hit| hit.file.rel_path() != "right/Owners.scala"),
+            "unrelated nested owner leaked for {target_fqn}: {hits:#?}"
+        );
+    }
+
+    let instance_apply = definition(&analyzer, "left.Outer$.Base.apply");
+    let instance_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&instance_apply)),
+    );
+    assert_no_hit_contains(&instance_hits, "Base(1)");
+}
+
+#[test]
+fn scala_file_major_scan_emits_each_structured_invocation_and_stable_prefix_event() {
+    let source = r#"package parity
+
+object Stable {
+  val mapping: Map[String, Int] = Map("key" -> 1)
+  def ordinary(value: Int): Int = value
+  def generic[A](value: A): A = value
+  def parameterless: Int = 1
+}
+
+enum Mode { case Live, Idle }
+
+opaque type Choice[A] = A
+object Choice { def apply[A](value: A): Choice[A] = value }
+
+object Dual {
+  type Factory = Int
+  val Factory: Array[Int] = Array(1)
+}
+
+object Syntax {
+  extension (value: String) def decorated: String = value
+}
+
+class Ops { infix def combine(value: Int): Int = value }
+
+class Use {
+  val indexed: Array[Int] = Array(1)
+  var remapped: Map[String, Int] = Map("key" -> 2)
+
+  def indexedValue: Int = indexed(0) // positive-applied-val
+  def remappedValue: Int = remapped("key") // positive-applied-var
+  def qualifiedField: Int = Stable.mapping("key") // positive-qualified-applied-field
+  def ordinaryCall: Int = Stable.ordinary(1) // positive-ordinary-call
+  def genericCall: String = Stable.generic[String]("value") // positive-type-argument-call
+  def parameterlessCall: Int = Stable.parameterless // positive-parameterless-call
+  def extensionCall: String = {
+    import Syntax.*
+    "value".decorated // positive-extension-call
+  }
+  def infixCall(ops: Ops): Int = ops combine 1 // positive-infix-call
+  def stableRoot: Int = Stable.ordinary(2) // positive-stable-root
+  def enumRoot: Mode = Mode.Live // positive-enum-root
+  def dualNamespaceApply: Choice[Int] = Choice(1) // positive-dual-namespace-apply
+  def importedDualRoleField: Int = {
+    import Dual.Factory
+    Factory(0) // positive-imported-dual-role-field
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("parity/Use.scala", source),
+        (
+            "external/External.scala",
+            r#"package external
+class External
+trait Factory { def parameterless[A]: Int }
+object External extends Factory { def parameterless[A]: Int = 1 }
+"#,
+        ),
+        (
+            "external/Use.scala",
+            r#"package externaluse
+import external.*
+object Use {
+  val parameterless: Int = 0
+  def value: Int = External.parameterless // positive-wildcard-parameterless-call
+}
+"#,
+        ),
+        (
+            "collision/Foo.scala",
+            r#"package collision
+class Foo { val bar: Array[Int] = Array(1) }
+object Foo { val bar: Array[Int] = Array(2) }
+object Use {
+  import Foo.bar
+  val value = bar(0) // positive-companion-imported-field
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("parity.Use.indexed", "positive-applied-val"),
+        ("parity.Use.remapped", "positive-applied-var"),
+        ("parity.Stable$.mapping", "positive-qualified-applied-field"),
+        ("parity.Stable$.ordinary", "positive-ordinary-call"),
+        ("parity.Stable$.generic", "positive-type-argument-call"),
+        (
+            "parity.Stable$.parameterless",
+            "positive-parameterless-call",
+        ),
+        ("parity.Syntax$.decorated", "positive-extension-call"),
+        ("parity.Ops.combine", "positive-infix-call"),
+        ("parity.Stable$", "positive-stable-root"),
+        ("parity.Mode", "positive-enum-root"),
+        ("parity.Choice$.apply", "positive-dual-namespace-apply"),
+        ("parity.Dual$.Factory", "positive-imported-dual-role-field"),
+        (
+            "external.External$.parameterless",
+            "positive-wildcard-parameterless-call",
+        ),
+        ("collision.Foo$.bar", "positive-companion-imported-field"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let enclosing_field = definition(&analyzer, "externaluse.Use$.parameterless");
+    let enclosing_field_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&enclosing_field)),
+    );
+    assert_no_hit_contains(
+        &enclosing_field_hits,
+        "positive-wildcard-parameterless-call",
+    );
+
+    let instance_field = definition(&analyzer, "collision.Foo.bar");
+    let instance_field_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&instance_field)),
+    );
+    assert_no_hit_contains(&instance_field_hits, "positive-companion-imported-field");
+}
+
+#[test]
+fn scala_file_major_applied_fields_and_stable_roots_keep_physical_identity() {
+    let replica = |marker: &str| {
+        format!(
+            r#"package replica
+class Holder {{
+  val indexed: Array[Int] = Array(1)
+  def use: Int = indexed(0) // {marker}-applied-field
+}}
+object Stable {{
+  val value: Int = 1
+  def use: Int = Stable.value // {marker}-stable-root
+}}
+object Dual {{
+  type Factory = Int
+  val Factory: Array[Int] = Array(1)
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let ambiguous = r#"package app
+import replica.Stable
+object Consumer {
+  val value = Stable.value // negative-ambiguous-stable-root
+  import replica.Dual.Factory
+  val factory = Factory(0) // negative-ambiguous-imported-field
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/Defs.scala", &jvm),
+        ("js/replica/Defs.scala", &js),
+        ("app/Consumer.scala", ambiguous),
+    ]);
+
+    for (platform, path) in [
+        ("jvm", "jvm/replica/Defs.scala"),
+        ("js", "js/replica/Defs.scala"),
+    ] {
+        for fqn in ["replica.Holder.indexed", "replica.Stable$"] {
+            let target = analyzer
+                .get_definitions(fqn)
+                .into_iter()
+                .find(|unit| rel_path_string(unit.source()) == path)
+                .unwrap_or_else(|| panic!("missing exact {fqn} in {path}"));
+            let target_hits = hits(
+                UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+            );
+            let marker = if fqn.ends_with("indexed") {
+                format!("{platform}-applied-field")
+            } else {
+                format!("{platform}-stable-root")
+            };
+            assert_hit_contains(&target_hits, &marker);
+            let other = if platform == "jvm" { "js" } else { "jvm" };
+            assert_no_hit_contains(&target_hits, &format!("{other}-"));
+            assert_no_hit_contains(&target_hits, "negative-ambiguous-stable-root");
+        }
+
+        let imported_field = analyzer
+            .get_definitions("replica.Dual$.Factory")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing exact replica.Dual$.Factory in {path}"));
+        let imported_field_hits = hits(
+            UsageFinder::new()
+                .find_usages_default(&analyzer, std::slice::from_ref(&imported_field)),
+        );
+        assert_no_hit_contains(&imported_field_hits, "negative-ambiguous-imported-field");
+    }
+}
+
+#[test]
+fn scala_inverse_uses_default_and_absolute_type_namespaces_with_exact_precedence() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "library/scala/Core.scala",
+            r#"package scala
+class Int
+object Int { val MinValue: Int = null }
+class Option[A]
+object Some
+object None
+class deprecated extends scala.annotation.StaticAnnotation
+class Any
+class Null
+"#,
+        ),
+        (
+            "other/Other.scala",
+            r#"package other
+class Option[A]
+"#,
+        ),
+        ("fixtures/DefaultTerms.scala", "object Some\nobject None\n"),
+        (
+            "Build.scala",
+            r#"object Build {
+  val some = Some // positive-scala-some-over-default-package-decoy
+  val none = None // positive-scala-none-over-default-package-decoy
+}
+"#,
+        ),
+        (
+            "SameFile.scala",
+            r#"object Some
+object None
+object SameFile {
+  val some = Some // negative-same-file-some-shadow
+  val none = None // negative-same-file-none-shadow
+}
+"#,
+        ),
+        (
+            "shadowterm/Use.scala",
+            r#"package shadowterm
+object Some
+object None
+object Use {
+  val some = Some // negative-package-some-shadow
+  val none = None // negative-package-none-shadow
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+object Use {
+  val number: Int = null // positive-default-type
+  val option: Option[Int] = null // positive-default-generic
+  val none = None // positive-default-object
+  val minimum = Int.MinValue // positive-default-stable-member
+  @deprecated class Old // positive-default-annotation
+}
+"#,
+        ),
+        (
+            "shadow/Use.scala",
+            r#"package shadow
+import other.*
+object Use {
+  val option: Option[Int] = null // negative-wildcard-over-default
+}
+"#,
+        ),
+        (
+            "rooted/Use.scala",
+            r#"package rooted
+object scala { class Option[A] }
+object Use {
+  val absolute: _root_.scala.Option[Int] = null // positive-absolute-root
+  val relative: scala.Option[Int] = null // negative-local-scala-root
+}
+"#,
+        ),
+        (
+            "intrinsic/Use.scala",
+            r#"package intrinsic
+object Use {
+  val any: Any = null // negative-intrinsic-any
+  val nothing: Null = null // negative-intrinsic-null
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("scala.Int", "positive-default-type"),
+        ("scala.Option", "positive-default-generic"),
+        ("scala.None$", "positive-default-object"),
+        ("scala.Int$.MinValue", "positive-default-stable-member"),
+        ("scala.deprecated", "positive-default-annotation"),
+        ("scala.Option", "positive-absolute-root"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let option = definition(&analyzer, "scala.Option");
+    let option_hits = authoritative_scala_hits(&analyzer, &option);
+    assert_no_hit_contains(&option_hits, "negative-wildcard-over-default");
+    assert_no_hit_contains(&option_hits, "negative-local-scala-root");
+    let default_query =
+        UsageFinder::new().query(&analyzer, std::slice::from_ref(&option), 1000, 100);
+    assert!(
+        default_query
+            .candidate_files
+            .iter()
+            .any(|file| file.rel_path() == std::path::Path::new("app/Use.scala")),
+        "implicit scala consumers must enter the production candidate scope: {:#?}",
+        default_query.candidate_files
+    );
+    assert_hit_contains(&hits(default_query.result), "positive-default-generic");
+
+    for (target_fqn, marker, shadow_markers) in [
+        (
+            "scala.Some$",
+            "positive-scala-some-over-default-package-decoy",
+            [
+                "negative-same-file-some-shadow",
+                "negative-package-some-shadow",
+            ],
+        ),
+        (
+            "scala.None$",
+            "positive-scala-none-over-default-package-decoy",
+            [
+                "negative-same-file-none-shadow",
+                "negative-package-none-shadow",
+            ],
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        for shadow_marker in shadow_markers {
+            assert_no_hit_contains(&target_hits, shadow_marker);
+        }
+    }
+
+    for (target_fqn, marker) in [
+        ("scala.Any", "negative-intrinsic-any"),
+        ("scala.Null", "negative-intrinsic-null"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_no_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
+fn scala_default_namespace_keeps_same_file_identity_and_global_duplicates_ambiguous() {
+    let replica = |marker: &str| {
+        format!(
+            r#"package scala
+class Int {{
+  val self: Int = null // {marker}-same-file
+}}
+class Option[A]
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/scala/Core.scala", &jvm),
+        ("js/scala/Core.scala", &js),
+        (
+            "app/Use.scala",
+            r#"package app
+object Use {
+  val option: Option[Int] = null // negative-ambiguous-default
+}
+"#,
+        ),
+    ]);
+
+    for (platform, path) in [
+        ("jvm", "jvm/scala/Core.scala"),
+        ("js", "js/scala/Core.scala"),
+    ] {
+        let target = analyzer
+            .get_definitions("scala.Int")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing exact scala.Int in {path}"));
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, &format!("{platform}-same-file"));
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-default");
+        let other = if platform == "jvm" { "js" } else { "jvm" };
+        assert_no_hit_contains(&target_hits, &format!("{other}-same-file"));
+    }
+}
+
+#[test]
+fn scala_inverse_resolves_exported_owner_this_and_intermediate_stable_types_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "kyo/Types.scala",
+            r#"package kyo
+object Fields {
+  object Pin { opaque type Pin = Int }
+  export Pin.*
+}
+class Schema {
+  type Focused = Int
+  class Inner {
+    val focused: Schema.this.Focused = 1 // positive-owner-this
+  }
+}
+object Use {
+  val pin: Fields.Pin = null // positive-exported-alias
+}
+"#,
+        ),
+        (
+            "akka/stream/scaladsl/Sink.scala",
+            r#"package akka.stream.scaladsl
+object Sink { def foreachAsync(value: Int): Int = value }
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import akka.stream.scaladsl
+object Use {
+  val selected = scaladsl.Sink.foreachAsync(1) // positive-intermediate-object
+}
+object Shadow {
+  final class LocalSink { def foreachAsync(value: Int): Int = value }
+  final class LocalApi { val Sink: LocalSink = new LocalSink }
+  val scaladsl: LocalApi = new LocalApi
+  val local = scaladsl.Sink.foreachAsync(2) // negative-shadowed-intermediate
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("kyo.Fields$.Pin$.Pin", "positive-exported-alias"),
+        ("kyo.Schema.Focused", "positive-owner-this"),
+        ("akka.stream.scaladsl.Sink$", "positive-intermediate-object"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-shadowed-intermediate");
+    }
+}
+
+#[test]
+fn scala_file_major_scan_preserves_forward_roles_across_namespace_and_inheritance_shapes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "defs/Definitions.scala",
+            r#"package defs
+
+enum ImportedMode { case Live, Idle }
+
+case class Product(value: Int)
+
+object Container {
+  case class Settings(value: Int)
+}
+
+trait Parent {
+  def inherited(value: Int): Int = value
+  def iterator: Iterator[Int] = Iterator.empty
+}
+class Child extends Parent {
+  val ref: Int = 1
+}
+trait OtherParent { def iterator: Iterator[Int] = Iterator.empty }
+
+opaque type Token = Int
+object Token {
+  def empty[A]: Token = 0
+  def direct(value: Int): Int = value
+}
+
+object Syntax {
+  extension (value: String) def cyan: String = value
+}
+
+trait ImportsHolder { def addImports(value: Int): Unit = () }
+class ImportsHolderImpl extends ImportsHolder
+object ImportsHolder {
+  def apply(value: Int)(implicit project: String): ImportsHolder = new ImportsHolderImpl
+}
+"#,
+        ),
+        (
+            "use/Use.scala",
+            r#"package use
+
+import defs.*
+import defs.Container.*
+import defs.ImportedMode.*
+import defs.Syntax.*
+
+object Use extends Parent {
+  def contextual(value: Int)(using String): Int = value
+  def curried(value: Int)(suffix: String): String = value.toString + suffix
+
+  val importedRoot = ImportedMode.Live // positive-imported-stable-type-root
+  val syntheticFactory = Product(1) // positive-synthetic-factory
+  val nestedSyntheticFactory = Settings(2) // positive-nested-synthetic-factory
+  val contextualCall = contextual(3) // positive-contextual-unqualified
+  val inheritedCall = inherited(4) // positive-inherited-unqualified
+  val methodValue: String => String = curried(5) // positive-partial-method-value
+  def receiverInherited(child: Child) = child.inherited(6) // positive-inherited-receiver
+  def receiverParameterless(child: Child) = child.iterator // positive-inherited-parameterless
+  def capturedReceiver(child: Child^) = child.iterator // positive-captured-receiver
+  def intersectionReceiver(child: Child & OtherParent) = child.iterator // negative-intersection-receiver
+  val singletonGeneric = Token.empty[Int] // positive-generic-nullary-singleton
+  val singletonDirect = Token.direct(7) // positive-direct-singleton
+  val extensionLiteral = "value".cyan // positive-literal-extension
+  val importedEnumField = Live // positive-imported-enum-field
+  def receiverField(child: Child) = child.ref // positive-typed-receiver-field
+  val inferredHolder = ImportsHolder(1)("project")
+  inferredHolder.addImports(8) // positive-applied-receiver-result
+}
+"#,
+        ),
+    ]);
+
+    let mut missing = Vec::new();
+    for (target_fqn, marker) in [
+        ("defs.ImportedMode", "positive-imported-stable-type-root"),
+        ("defs.Product.Product", "positive-synthetic-factory"),
+        (
+            "defs.Container$.Settings.Settings",
+            "positive-nested-synthetic-factory",
+        ),
+        ("use.Use$.contextual", "positive-contextual-unqualified"),
+        ("defs.Parent.inherited", "positive-inherited-unqualified"),
+        ("use.Use$.curried", "positive-partial-method-value"),
+        ("defs.Parent.inherited", "positive-inherited-receiver"),
+        ("defs.Parent.iterator", "positive-inherited-parameterless"),
+        ("defs.Parent.iterator", "positive-captured-receiver"),
+        ("defs.Token$.empty", "positive-generic-nullary-singleton"),
+        ("defs.Token$.direct", "positive-direct-singleton"),
+        ("defs.Syntax$.cyan", "positive-literal-extension"),
+        ("defs.ImportedMode$.Live", "positive-imported-enum-field"),
+        ("defs.Child.ref", "positive-typed-receiver-field"),
+        (
+            "defs.ImportsHolder.addImports",
+            "positive-applied-receiver-result",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        if !target_hits.iter().any(|hit| hit.snippet.contains(marker)) {
+            missing.push((target_fqn, marker, target_hits));
+        }
+    }
+    assert!(missing.is_empty(), "missing parity events: {missing:#?}");
+
+    let inherited_iterator = definition(&analyzer, "defs.Parent.iterator");
+    let inherited_iterator_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&inherited_iterator)),
+    );
+    assert_no_hit_contains(&inherited_iterator_hits, "negative-intersection-receiver");
+}
+
+#[test]
+fn scala_file_major_scan_preserves_production_parity_event_shapes() {
+    let source = r#"package parity
+
+object Duration {
+  enum Units { case Days, Weeks }
+}
+import Duration.Units.*
+extension (value: Int) def week: Int = value + Weeks.ordinal // positive-nested-field
+
+object Ansi {
+  extension (value: String) def cyan: String = value
+}
+
+object Result {
+  def panic[E, A](value: Throwable): Either[E, A] = throw value
+}
+
+enum Domain { case Continuous(value: Double) }
+final case class Present(value: Domain)
+
+final class TestInboxImpl[T](val ref: T)
+object TestInboxImpl {
+  def apply[T](name: String): TestInboxImpl[T] = new TestInboxImpl[T](null.asInstanceOf[T])
+}
+
+final class NoArgTest
+final class OneArgTest
+trait Suite { protected def withFixture(value: NoArgTest, config: Int): Int }
+trait FixtureSuite extends Suite { protected def withFixture(value: OneArgTest): Int }
+
+trait Frame
+given Frame = new Frame {}
+
+import Ansi.*
+private def topLevelExtension: String = s"${"value".cyan}" // positive-interpolated-extension
+
+abstract class Use extends FixtureSuite {
+  import Ansi.*
+
+  private def consume(value: String => String): String = value("input")
+  private def consumeLines(stream: String, value: String => Unit)(onFailure: String => Unit)(using Frame): Unit = value(stream)
+  private def withOutputStream(metadata: Int)(value: String => Unit): Int = { value(metadata.toString); metadata }
+  private def elementProbeFailure(selector: String, message: String)(using Frame): String => String = value => selector + message + value
+  private def resolveVariantWire[A](schema: A)(using Frame): String => String = identity
+  private def processPullLine(line: String, image: String)(using Frame): Unit = ()
+  private def serialize(stream: String, value: Int): Unit = ()
+
+  val ordinary = consume(elementProbeFailure("selector", "message")) // positive-ordinary-call
+  val resolver = consume(resolveVariantWire("schema")) // positive-returning-function-call
+  val process = consumeLines("bytes", processPullLine(_, "image"))(identity) // positive-placeholder-partial
+  val serializer = withOutputStream(1)(serialize(_, 1)) // positive-placeholder-second
+  val inherited = withFixture(new OneArgTest) // positive-inherited-overload
+  val qualified = Result.panic[Nothing, Nothing](new RuntimeException) // positive-qualified-singleton-call
+  val extracted = Present(Domain.Continuous(1.0)) match {
+    case Present(Domain.Continuous(value)) => value // positive-extractor-root
+  }
+  def genericFactory[T]: T = {
+    val replyToInbox = TestInboxImpl[T]("replyTo")
+    replyToInbox.ref // positive-generic-factory-field
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("parity/Use.scala", source)]);
+
+    let mut missing = Vec::new();
+    for (target_fqn, marker) in [
+        ("parity.Duration$.Units$.Weeks", "positive-nested-field"),
+        ("parity.Use.elementProbeFailure", "positive-ordinary-call"),
+        (
+            "parity.Use.resolveVariantWire",
+            "positive-returning-function-call",
+        ),
+        ("parity.Use.processPullLine", "positive-placeholder-partial"),
+        ("parity.Use.serialize", "positive-placeholder-second"),
+        (
+            "parity.FixtureSuite.withFixture",
+            "positive-inherited-overload",
+        ),
+        ("parity.Ansi$.cyan", "positive-interpolated-extension"),
+        ("parity.Result$.panic", "positive-qualified-singleton-call"),
+        ("parity.Domain", "positive-extractor-root"),
+        ("parity.TestInboxImpl.ref", "positive-generic-factory-field"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        if !target_hits.iter().any(|hit| hit.snippet.contains(marker)) {
+            missing.push((target_fqn, marker, target_hits));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "missing production parity events: {missing:#?}"
+    );
+}
+
+#[test]
+fn scala_completed_function_results_do_not_masquerade_as_remaining_curried_lists() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "external/Output.scala",
+            "package external\nfinal class Output\n",
+        ),
+        (
+            "app/Calls.scala",
+            r#"package app
+
+trait Frame
+given Frame = new Frame {}
+
+object Calls:
+  def withStability[A](parse: String => A)(predicate: A => Boolean)(failure: A => RuntimeException): Unit = ()
+  def elementProbeFailure(selector: String, message: String)(using Frame): String => RuntimeException =
+    actual => new RuntimeException(selector + message + actual)
+
+  def retry[A](parse: String => A, predicate: A => Boolean): Unit =
+    withStability(parse)(predicate)(elementProbeFailure("selector", "message")) // positive-completed-generic-function-result
+
+  def serialize(output: external.Output, snapshot: Int): Unit = ()
+  def withOutputStream(write: external.Output => Unit): Unit = ()
+  val saved = withOutputStream(serialize(_, 1)) // positive-completed-external-placeholder
+
+  def remaining(value: Int)(next: Missing): String = value.toString
+  def consumeUnknown[A](next: A => String): String = ""
+  val rejected = consumeUnknown(remaining(1)) // negative-remaining-curried-unknown
+
+  def knownString(value: Int)(next: String): String = next
+  def knownInt(value: Int)(next: Int): String = next.toString
+  def consumeString(run: String => String): String = run("value")
+  val selected = consumeString(knownString(1)) // positive-known-curried-overload
+  val rejectedKnown = consumeString(knownInt(1)) // negative-known-curried-overload
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        (
+            "app.Calls$.elementProbeFailure",
+            "positive-completed-generic-function-result",
+        ),
+        (
+            "app.Calls$.serialize",
+            "positive-completed-external-placeholder",
+        ),
+        ("app.Calls$.knownString", "positive-known-curried-overload"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let remaining = definition(&analyzer, "app.Calls$.remaining");
+    let remaining_hits = authoritative_scala_hits(&analyzer, &remaining);
+    assert_no_hit_contains(&remaining_hits, "negative-remaining-curried-unknown");
+
+    let rejected_known = definition(&analyzer, "app.Calls$.knownInt");
+    let rejected_known_hits = authoritative_scala_hits(&analyzer, &rejected_known);
+    assert_no_hit_contains(&rejected_known_hits, "negative-known-curried-overload");
+}
+
+#[test]
+fn scala_wildcard_members_resolve_nested_enum_and_isolate_ambiguous_imports() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "kyo/Definitions.scala",
+            r#"package kyo
+
+object Duration:
+  enum Units:
+    case Days, Weeks
+  object Units:
+    val all = List(Days, Weeks)
+
+object Ansi:
+  extension (value: String) def cyan: String = value
+
+object internal:
+  def collision: Int = 1
+"#,
+        ),
+        (
+            "kyo/internal/Package.scala",
+            r#"package kyo.internal
+def collision: Int = 2
+"#,
+        ),
+        (
+            "use/Use.scala",
+            r#"package use
+
+import kyo.Duration.Units.*
+import kyo.internal.*
+import kyo.Ansi.*
+
+object Use:
+  val week = Weeks // positive-mixed-enum-owner
+  val shade = "value".cyan // positive-later-unambiguous-wildcard
+  val unresolved = collision // negative-ambiguous-wildcard
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("kyo.Ansi$.cyan", "positive-later-unambiguous-wildcard"),
+        ("kyo.Duration$.Units.Weeks", "positive-mixed-enum-owner"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    for target_fqn in ["kyo.internal$.collision", "kyo.internal.collision"] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-wildcard");
+    }
+}
+
+#[test]
+fn scala_file_major_parity_callable_negatives_fail_closed() {
+    let source = r#"package paritynegative
+
+final class NoArgTest
+final class OneArgTest
+
+trait Suite { protected def withFixture(value: NoArgTest, config: Int): Int }
+trait FixtureSuite extends Suite { protected def withFixture(value: OneArgTest): Int }
+
+object Sibling {
+  def elementProbeFailure(selector: String, message: String): String = selector + message
+  val unrelated = elementProbeFailure("selector", "message") // negative-sibling-owner
+}
+
+abstract class Use extends FixtureSuite {
+  private def elementProbeFailure(selector: String, message: String): String = selector + message
+  val positive = elementProbeFailure("selector", "message") // positive-exact-owner
+  val wrongShape = elementProbeFailure("selector") // negative-wrong-call-shape
+  val inherited = withFixture(new OneArgTest) // positive-inherited-overload
+  val inheritedOther = withFixture(new NoArgTest, 1) // negative-inherited-overload
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("paritynegative/Use.scala", source)]);
+
+    let element = definition(&analyzer, "paritynegative.Use.elementProbeFailure");
+    let element_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&element)));
+    assert_hit_contains(&element_hits, "positive-exact-owner");
+    assert_no_hit_contains(&element_hits, "negative-wrong-call-shape");
+    assert_no_hit_contains(&element_hits, "negative-sibling-owner");
+
+    let inherited = definition(&analyzer, "paritynegative.FixtureSuite.withFixture");
+    let inherited_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&inherited)));
+    assert_hit_contains(&inherited_hits, "positive-inherited-overload");
+    assert_no_hit_contains(&inherited_hits, "negative-inherited-overload");
+}
+
+#[test]
+fn scala_unqualified_calls_resolve_through_lexical_owner_tiers() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Owners.scala",
+        r#"package app
+
+object Outer {
+  def catalog(value: Int): Int = value
+
+  class Inner {
+    val inheritedLexically = catalog(1) // positive-lexical-outer
+  }
+
+  class Nearer {
+    def catalog(value: Int): Int = value + 1
+    val nearer = catalog(2) // negative-nearer-owner
+  }
+
+  class Shadowed {
+    def run(catalog: Int => Int): Int =
+      catalog(3) // negative-local-shadow
+  }
+}
+
+object Unrelated {
+  def catalog(value: Int): Int = value + 2
+  val call = catalog(4) // negative-unrelated-owner
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "app.Outer$.catalog");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&target_hits, "catalog(1) // positive-lexical-outer");
+    assert_no_hit_contains(&target_hits, "negative-nearer-owner");
+    assert_no_hit_contains(&target_hits, "negative-local-shadow");
+    assert_no_hit_contains(&target_hits, "negative-unrelated-owner");
+}
+
+#[test]
+fn scala_fresh_instance_receivers_require_a_valid_structured_constructor() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Fresh.scala",
+        r#"package app
+
+class Worker(seed: Int) {
+  def run(): Int = seed
+}
+
+object Use {
+  val good = new Worker(1).run() // positive-fresh-instance
+  val wrongConstructor = new Worker().run() // negative-wrong-constructor
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "app.Worker.run");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(
+        &target_hits,
+        "new Worker(1).run() // positive-fresh-instance",
+    );
+    assert_no_hit_contains(&target_hits, "negative-wrong-constructor");
 }
 
 #[test]
@@ -1391,6 +6147,24 @@ fn hits(result: FuzzyResult) -> Vec<UsageHit> {
         .expect("expected usage graph success")
         .into_iter()
         .collect()
+}
+
+fn authoritative_scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit) -> Vec<UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    )
 }
 
 fn assert_hit_contains(hits: &[UsageHit], needle: &str) {
@@ -1727,6 +6501,136 @@ class Consumer {
     assert_eq!(1, hits.len());
     assert!(hits[0].snippet.contains("help()"));
     assert!(hits[0].line < 10, "unexpected hit: {hits:#?}");
+}
+
+#[test]
+fn scala_graph_resolves_transitive_export_selectors_and_routes_original_files() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "dotty/tools/tasty/TastyFormat.scala",
+            r#"package dotty.tools.tasty
+object TastyFormat {
+  def astTagToString(tag: Int): String = tag.toString
+  def isModifierTag(tag: Int): Boolean = tag > 0
+  def original(): Int = 1
+}
+"#,
+        ),
+        (
+            "dotty/tools/tasty/besteffort/BestEffortTastyFormat.scala",
+            r#"package dotty.tools.tasty.besteffort
+import dotty.tools.tasty.TastyFormat
+object BestEffortTastyFormat {
+  export TastyFormat.{*, astTagToString as _, original as selected}
+}
+"#,
+        ),
+        (
+            "dotty/tools/dotc/core/tasty/TastyPrinter.scala",
+            r#"package dotty.tools.dotc.core.tasty
+import dotty.tools.tasty.besteffort.BestEffortTastyFormat.*
+object TastyPrinter {
+  def selectedCall(): Int = selected() // positive-renamed-export
+  def print(nextByte: Int): Boolean =
+    while nextByte > 0 && !isModifierTag(nextByte) do () // positive-tasty-export
+    true
+}
+"#,
+        ),
+    ]);
+
+    let tasty_format = project.file("dotty/tools/tasty/TastyFormat.scala");
+    let tasty_printer = project.file("dotty/tools/dotc/core/tasty/TastyPrinter.scala");
+    assert!(
+        analyzer
+            .referencing_files_of(&tasty_format)
+            .contains(&tasty_printer),
+        "transitive export target must participate in import candidate routing"
+    );
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let modifier = definition(&analyzer, "dotty.tools.tasty.TastyFormat$.isModifierTag");
+    let modifier_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&modifier),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&modifier_hits, "positive-tasty-export");
+
+    let original = definition(&analyzer, "dotty.tools.tasty.TastyFormat$.original");
+    let original_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&original),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&original_hits, "positive-renamed-export");
+
+    let excluded = definition(&analyzer, "dotty.tools.tasty.TastyFormat$.astTagToString");
+    let excluded_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&excluded),
+        &candidates,
+        1000,
+    ));
+    assert_no_hit_contains(&excluded_hits, "positive-tasty-export");
+}
+
+#[test]
+fn scala_graph_export_cycles_terminate_and_ambiguous_exports_fail_closed() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Exports.scala",
+            r#"package pkg
+object Left { def help(): Int = 1 }
+object Right { def help(): Int = 2 }
+object Ambiguous {
+  export Left.*
+  export Right.*
+}
+object CycleA {
+  def leaf(): Int = 3
+  export CycleB.*
+}
+object CycleB { export CycleA.* }
+"#,
+        ),
+        (
+            "app/Consumer.scala",
+            r#"package app
+object AmbiguousConsumer {
+  import pkg.Ambiguous.*
+  def call(): Int = help() // negative-ambiguous-export
+}
+object CycleConsumer {
+  import pkg.CycleB.*
+  def call(): Int = leaf() // positive-cycle-export
+}
+"#,
+        ),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for target in ["pkg.Left$.help", "pkg.Right$.help"] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-export");
+    }
+
+    let leaf = definition(&analyzer, "pkg.CycleA$.leaf");
+    let leaf_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&leaf),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&leaf_hits, "positive-cycle-export");
 }
 
 #[test]
@@ -2676,6 +7580,59 @@ object Utility {
 }
 
 #[test]
+fn scala_template_field_initializers_preserve_member_identity_without_leaking_local_decoys() {
+    let source = r#"
+package app
+
+class ORSet {
+  protected val elementsMap: Map[String, Int] = Map.empty
+  private val copiedBefore = elementsMap // positive-before
+  private val localBlock = { val elementsMap = Map("local" -> 1); elementsMap } // negative-local-block
+  private val copiedAfter = elementsMap // positive-after
+
+  def methodLocal: Map[String, Int] = {
+    val elementsMap = Map("method" -> 1)
+    elementsMap // negative-method-local
+  }
+
+  final class Nested {
+    private val elementsMap = Map("nested" -> 1)
+    private val nestedCopy = elementsMap // negative-nested-owner
+  }
+}
+
+final class InheritedORSet extends ORSet {
+  private val inheritedCopy = elementsMap // positive-inherited
+}
+
+final class ShadowingORSet extends ORSet {
+  protected val elementsMap: Map[String, Int] = Map("shadow" -> 1)
+  private val shadowCopy = elementsMap // negative-subclass-shadow
+}
+
+final class Unrelated {
+  private val elementsMap = Map("unrelated" -> 1)
+  private val copied = elementsMap // negative-unrelated-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/ORSet.scala", source)]);
+    let elements_map = definition(&analyzer, "app.ORSet.elementsMap");
+
+    let hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&elements_map)),
+    );
+
+    assert_hit_contains(&hits, "positive-before");
+    assert_hit_contains(&hits, "positive-after");
+    assert_hit_contains(&hits, "positive-inherited");
+    assert_no_hit_contains(&hits, "negative-local-block");
+    assert_no_hit_contains(&hits, "negative-method-local");
+    assert_no_hit_contains(&hits, "negative-nested-owner");
+    assert_no_hit_contains(&hits, "negative-subclass-shadow");
+    assert_no_hit_contains(&hits, "negative-unrelated-owner");
+}
+
+#[test]
 fn scala_graph_keeps_receiver_inference_scoped_and_conservative() {
     let consumer_source = r#"
 package app
@@ -3055,6 +8012,121 @@ class Workflow {
 
     assert_no_hit_in_enclosing(&primary_hits, "example.Workflow.ambiguous");
     assert_no_hit_in_enclosing(&secondary_hits, "example.Workflow.ambiguous");
+}
+
+#[test]
+fn scala_unqualified_inherited_call_resolves_package_relative_mixin() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "akka/actor/dungeon/ReceiveTimeout.scala",
+            r#"package akka.actor.dungeon
+
+object ReceiveTimeout
+
+trait ReceiveTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "akka/actor/other/OtherTimeout.scala",
+            r#"package akka.actor.other
+
+trait OtherTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "dungeon/ReceiveTimeout.scala",
+            r#"package dungeon
+
+trait ReceiveTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "akka/actor/ActorCell.scala",
+            r#"package akka.actor
+
+class ActorCell extends dungeon.ReceiveTimeout {
+  def invoke(message: Any, beforeReceive: Any): Unit = {
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+  }
+}
+
+class ConflictedCell extends dungeon.ReceiveTimeout with other.OtherTimeout {
+  def invoke(message: Any, beforeReceive: Any): Unit = {
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+  }
+}
+
+class DuplicateCell extends duplicate.SharedTimeout {
+  def invoke(message: Any, beforeReceive: Any): Unit = {
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+  }
+}
+"#,
+        ),
+        (
+            "akka/actor/duplicate/First.scala",
+            r#"package akka.actor.duplicate
+trait SharedTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "akka/actor/duplicate/Second.scala",
+            r#"package akka.actor.duplicate
+trait SharedTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "unrelated/Cell.scala",
+            r#"package unrelated
+class Cell {
+  def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+  def invoke(message: Any, beforeReceive: Any): Unit =
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(
+        &analyzer,
+        "akka.actor.dungeon.ReceiveTimeout.checkReceiveTimeoutIfNeeded",
+    );
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(
+        &target_hits,
+        "checkReceiveTimeoutIfNeeded(message, beforeReceive)",
+    );
+    assert_no_hit_in_enclosing(&target_hits, "akka.actor.ConflictedCell.invoke");
+    assert_no_hit_in_enclosing(&target_hits, "unrelated.Cell.invoke");
+
+    let root_package_decoy = definition(
+        &analyzer,
+        "dungeon.ReceiveTimeout.checkReceiveTimeoutIfNeeded",
+    );
+    let root_package_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&root_package_decoy)),
+    );
+    assert_no_hit_in_enclosing(&root_package_hits, "akka.actor.ActorCell.invoke");
+
+    let duplicate = definition(
+        &analyzer,
+        "akka.actor.duplicate.SharedTimeout.checkReceiveTimeoutIfNeeded",
+    );
+    let duplicate_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&duplicate)));
+    assert_no_hit_in_enclosing(&duplicate_hits, "akka.actor.DuplicateCell.invoke");
 }
 
 #[test]
@@ -3450,5 +8522,1452 @@ class Consumer {
     match result {
         FuzzyResult::TooManyCallsites { limit, .. } => assert_eq!(1, limit),
         other => panic!("expected TooManyCallsites, got {other:?}"),
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_package_lexical_field_and_application_projections() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        ),
+        (
+            "root/consumer/sibling/Local.scala",
+            "package root.consumer.sibling\nclass Local\n",
+        ),
+        (
+            "root/model/Model.scala",
+            r#"package root.model
+
+object Result {
+  opaque type Success[A] = A
+  object Success
+}
+class Context { val system: Int = 1 }
+trait Actor { val context: Context = new Context }
+trait Generator[A]
+trait GeneratorMarker[A]
+object Generator {
+  def anonymous[A] = new Generator[List[A]] with GeneratorMarker[List[A]] {} // positive-top-level-generic-trait-new
+}
+case class Good[A](value: A)
+object Good { class GoodType[A] }
+
+object Outer {
+  object internal { class BranchData }
+  class Holder { val branch: internal.BranchData = null } // positive-lexical-object-root
+}
+
+object Constructors {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int) {
+    def copy = ByteString1(value) // positive-nested-self-constructor
+  }
+  trait Generator[A]
+  trait Marker[A]
+  abstract class FlowVisitorCollect[A](empty: A, combine: (A, A) => A)
+  class Inside { val bytes = ByteString1(1) } // positive-universal-constructor
+}
+
+object Qualified {
+  final class Applied(val value: Int)
+  object Applied { def apply(value: Int): Applied = new Applied(value) }
+  final class Extracted(val value: Int)
+  object Extracted { def unapply(value: Any): Option[Int] = None }
+  object Factory { def apply(value: Int): Int = value }
+  object Pattern { def unapply(value: Any): Option[Int] = None }
+}
+"#,
+        ),
+        (
+            "root/model/PatternUse.scala",
+            r#"package root.model
+object PatternUse {
+  val constructed = Good(1) // positive-synthetic-constructor-apply
+  def extract(value: Any): Any = value match {
+    case (Good(found), Good(_)) => found // positive-synthetic-constructor-extractor
+    case _ => value
+  }
+}
+"#,
+        ),
+        (
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+
+import root.{api => classic}
+import root.api
+import root.model.*
+import root.model.Constructors.*
+
+class Child extends Actor {
+  val inherited = context // positive-inherited-field
+}
+
+object Use {
+  val aliased: classic.ActorContext = null // positive-package-alias
+  val directlyImported: api.ActorContext = null // positive-direct-package
+  val relative: sibling.Local = null // positive-relative-package
+  val stable: Result.Success[Int] = 1 // positive-stable-type-member
+  val term = Result.Success // negative-term-for-type-member
+  val explicit = new Constructors.FlowVisitorCollect[Int](0, _ + _) {} // positive-generic-new
+  val anonymous = new Constructors.Generator[Int] with Constructors.Marker[Int] {} // positive-generic-trait-new
+  val qualifiedApply = Qualified.Applied(2) // positive-qualified-apply
+  def qualifiedExtract(value: Any): Int = value match {
+    case Qualified.Extracted(found) => found // positive-qualified-extractor
+    case _ => 0
+  }
+  val objectApply = Qualified.Factory(3) // positive-qualified-object-apply
+  def objectExtract(value: Any): Int = value match {
+    case Qualified.Pattern(found) => found // positive-qualified-object-extractor
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "decoy/api/Types.scala",
+            "package decoy.api\nclass ActorContext\n",
+        ),
+        (
+            "decoy/Objects.scala",
+            "package decoy\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "root/consumer/collision/Api.scala",
+            "package root.consumer.collision\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "root/consumer/Ambiguous.scala",
+            r#"package root.consumer
+import root.{api => clash}
+import decoy.{api => clash}
+object Ambiguous {
+  val wrong: clash.ActorContext = null // negative-conflicting-package-alias
+}
+"#,
+        ),
+        (
+            "root/consumer/CrossNamespace.scala",
+            r#"package root.consumer
+import root.{api => mixed}
+import decoy.{Api => mixed}
+object CrossNamespace {
+  val wrong: mixed.ActorContext = null // negative-package-object-alias
+}
+"#,
+        ),
+        (
+            "root/consumer/CandidateCollision.scala",
+            r#"package root.consumer
+import collision.{Api => overlap}
+object CandidateCollision {
+  val selected: overlap.ActorContext = null // positive-relative-object-import
+}
+"#,
+        ),
+    ]);
+
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    for (target, marker) in [
+        ("root.api.ActorContext", "positive-package-alias"),
+        ("root.api.ActorContext", "positive-direct-package"),
+        ("root.consumer.sibling.Local", "positive-relative-package"),
+        ("root.model.Result$.Success", "positive-stable-type-member"),
+        (
+            "root.model.Outer$.internal$.BranchData",
+            "positive-lexical-object-root",
+        ),
+        ("root.model.Actor.context", "positive-inherited-field"),
+        (
+            "root.model.Constructors$.FlowVisitorCollect.FlowVisitorCollect",
+            "positive-generic-new",
+        ),
+        (
+            "root.model.Constructors$.Generator",
+            "positive-generic-trait-new",
+        ),
+        (
+            "root.model.Generator",
+            "positive-top-level-generic-trait-new",
+        ),
+        // The ordinary companion-apply tier is resolved before the primary
+        // constructor fallback, even for nested same-name class/object pairs.
+        (
+            "root.model.Constructors$.ByteString1$.apply",
+            "positive-nested-self-constructor",
+        ),
+        (
+            "root.model.Good.Good",
+            "positive-synthetic-constructor-extractor",
+        ),
+        (
+            "root.model.Good.Good",
+            "positive-synthetic-constructor-apply",
+        ),
+        (
+            "root.model.Qualified$.Applied$.apply",
+            "positive-qualified-apply",
+        ),
+        (
+            "root.model.Qualified$.Extracted$.unapply",
+            "positive-qualified-extractor",
+        ),
+        (
+            "root.model.Qualified$.Factory$.apply",
+            "positive-qualified-object-apply",
+        ),
+        (
+            "root.model.Qualified$.Pattern$.unapply",
+            "positive-qualified-object-extractor",
+        ),
+        (
+            "root.consumer.collision.Api$.ActorContext",
+            "positive-relative-object-import",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-conflicting-package-alias");
+        assert_no_hit_contains(&target_hits, "negative-package-object-alias");
+        assert_no_hit_contains(&target_hits, "negative-term-for-type-member");
+    }
+
+    for target in ["decoy.Api$.ActorContext", "collision.Api$.ActorContext"] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&target_hits, "negative-package-object-alias");
+        assert_no_hit_contains(&target_hits, "positive-relative-object-import");
+    }
+}
+
+#[test]
+fn scala_usage_finder_preserves_exact_stable_type_alias_identity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "root/model/Result.scala",
+            r#"package root.model
+class Box[A]
+object Result {
+  type BoxAlias[A] = Box[A]
+  type Decider = Int => Int
+  def decider: Decider = identity // positive-unqualified-nested-alias
+  opaque type Success[A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+    def unapply[A](value: Success[A]): Option[A] = None
+  }
+}
+"#,
+        ),
+        (
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+import root.model.Result
+object Use {
+  val typed: Result.Success[Int] = 1 // positive-exact-stable-alias
+  val constructed = new Result.BoxAlias[Int] // positive-alias-constructor-role
+  val term = Result.Success // negative-term-companion
+  val applied = Result.Success(1) // negative-companion-apply
+  def extracted(value: Any): Any = value match {
+    case Result.Success(found) => found // negative-companion-extractor
+    case _ => value
+  }
+}
+"#,
+        ),
+        (
+            "jvm/dup/Result.scala",
+            "package dup\nobject Result { opaque type Ambiguous = Int }\n",
+        ),
+        (
+            "js/dup/Result.scala",
+            "package dup\nobject Result { opaque type Ambiguous = Int }\n",
+        ),
+        (
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+object Ambiguous {
+  val value: dup.Result.Ambiguous = 1 // negative-physical-alias-ambiguity
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+
+    let success_candidates = analyzer
+        .get_definitions("root.model.Result$.Success")
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(
+        success_candidates
+            .iter()
+            .any(|candidate| analyzer.is_type_alias(candidate)),
+        "expected the opaque alias declaration in {success_candidates:#?}"
+    );
+    let success_companions = analyzer
+        .get_definitions("root.model.Result$.Success$")
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(
+        success_companions
+            .iter()
+            .any(|candidate| !analyzer.is_type_alias(candidate)),
+        "expected the separately encoded same-name companion declaration in {success_companions:#?}"
+    );
+    let success_alias = success_candidates
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("exact opaque alias target");
+    let success_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&success_alias),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&success_hits, "positive-exact-stable-alias");
+    for marker in [
+        "negative-term-companion",
+        "negative-companion-apply",
+        "negative-companion-extractor",
+    ] {
+        assert_no_hit_contains(&success_hits, marker);
+    }
+
+    let box_alias = analyzer
+        .get_definitions("root.model.Result$.BoxAlias")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("exact constructible alias target");
+    let box_alias_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&box_alias),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&box_alias_hits, "positive-alias-constructor-role");
+
+    let decider_alias = analyzer
+        .get_definitions("root.model.Result$.Decider")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("exact nested Decider alias target");
+    let decider_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&decider_alias),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&decider_hits, "positive-unqualified-nested-alias");
+
+    let ambiguous_aliases = analyzer
+        .get_definitions("dup.Result$.Ambiguous")
+        .into_iter()
+        .filter(|candidate| analyzer.is_type_alias(candidate))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ambiguous_aliases.len(),
+        2,
+        "expected two physical aliases with the same logical identity"
+    );
+    for alias in ambiguous_aliases {
+        let alias_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&alias),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&alias_hits, "negative-physical-alias-ambiguity");
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_package_type_aliases_without_term_leakage() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Aliases.scala",
+            "package model\ntype Maybe[A] = Option[A]\ninfix type <[A, B] = Either[A, B]\n",
+        ),
+        (
+            "model/SamePackage.scala",
+            r#"package model
+object SamePackage {
+  val maybe: Maybe[Int] = None // positive-package-alias
+  val effect: Int < String = Left(1) // positive-operator-alias
+  val Maybe = 1
+  val term = Maybe // negative-alias-term
+}
+"#,
+        ),
+        (
+            "app/Wildcard.scala",
+            r#"package app
+import model.*
+object Wildcard {
+  val maybe: Maybe[Int] = None // positive-wildcard-alias
+  val effect: Int < String = Left(1) // positive-wildcard-operator
+}
+"#,
+        ),
+        (
+            "app/Explicit.scala",
+            r#"package app
+import model.{Maybe as Optional}
+object Explicit {
+  val maybe: Optional[Int] = None // positive-renamed-alias
+  val qualified: model.Maybe[Int] = None // positive-qualified-alias
+}
+"#,
+        ),
+        (
+            "left/Collision.scala",
+            "package collision\ntype Duplicate = Int\n",
+        ),
+        (
+            "right/Collision.scala",
+            "package collision\ntype Duplicate = String\n",
+        ),
+        (
+            "app/Ambiguous.scala",
+            r#"package app
+object Ambiguous {
+  val duplicate: collision.Duplicate = 1 // negative-physical-alias-ambiguity
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    let alias_hits = |fqn: &str| {
+        let target = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(|candidate| analyzer.is_type_alias(candidate))
+            .unwrap_or_else(|| panic!("missing exact alias {fqn}"));
+        hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        )
+    };
+
+    let maybe_hits = alias_hits("model.Maybe");
+    for marker in [
+        "positive-package-alias",
+        "positive-wildcard-alias",
+        "positive-renamed-alias",
+        "positive-qualified-alias",
+    ] {
+        assert_hit_contains(&maybe_hits, marker);
+    }
+    assert_no_hit_contains(&maybe_hits, "negative-alias-term");
+
+    let operator_hits = alias_hits("model.<");
+    for marker in ["positive-operator-alias", "positive-wildcard-operator"] {
+        assert_hit_contains(&operator_hits, marker);
+    }
+
+    for duplicate in analyzer
+        .get_definitions("collision.Duplicate")
+        .into_iter()
+        .filter(|candidate| analyzer.is_type_alias(candidate))
+    {
+        let duplicate_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&duplicate),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&duplicate_hits, "negative-physical-alias-ambiguity");
+    }
+}
+
+#[test]
+fn scala_usage_finder_keeps_nested_singleton_types_on_the_exact_physical_owner() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/Assertions.scala",
+            "package org.scalatest\ntrait Assertions {\n  object UseDefaultAssertions\n  def jvm(use: UseDefaultAssertions.type): Unit = () // positive-jvm-singleton\n}\n",
+        ),
+        (
+            "js/Assertions.scala",
+            "package org.scalatest\ntrait Assertions {\n  object UseDefaultAssertions\n  def js(use: UseDefaultAssertions.type): Unit = () // negative-js-singleton\n}\n",
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    let targets = analyzer
+        .get_definitions("org.scalatest.Assertions.UseDefaultAssertions$")
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected duplicate physical singleton owners"
+    );
+    let jvm = targets
+        .into_iter()
+        .find(|target| rel_path_string(target.source()) == "jvm/Assertions.scala")
+        .expect("JVM singleton declaration");
+    let jvm_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&jvm),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&jvm_hits, "positive-jvm-singleton");
+    assert_no_hit_contains(&jvm_hits, "negative-js-singleton");
+}
+
+#[test]
+fn scala_usage_finder_resolves_nested_types_through_the_exact_companion_root() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/Tasty.scala",
+            r#"package kyo
+object Tasty {
+  sealed trait Symbol
+  object Symbol {
+    sealed trait ClassLike
+    final class Class extends ClassLike
+    final class Field
+  }
+  def classLike: Option[Symbol.ClassLike] = None // positive-jvm-classlike
+  def concrete: Option[Symbol.Class] = None // positive-jvm-class
+  def field: Option[Symbol.Field] = None // positive-jvm-field
+}
+"#,
+        ),
+        (
+            "js/Tasty.scala",
+            r#"package kyo
+object Tasty {
+  sealed trait Symbol
+  object Symbol {
+    sealed trait ClassLike
+    final class Class extends ClassLike
+    final class Field
+  }
+  def classLike: Option[Symbol.ClassLike] = None // negative-js-classlike
+  def concrete: Option[Symbol.Class] = None // negative-js-class
+  def field: Option[Symbol.Field] = None // negative-js-field
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    for (fqn, positive, negative) in [
+        (
+            "kyo.Tasty$.Symbol$.ClassLike",
+            "positive-jvm-classlike",
+            "negative-js-classlike",
+        ),
+        (
+            "kyo.Tasty$.Symbol$.Class",
+            "positive-jvm-class",
+            "negative-js-class",
+        ),
+        (
+            "kyo.Tasty$.Symbol$.Field",
+            "positive-jvm-field",
+            "negative-js-field",
+        ),
+    ] {
+        let target = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(|target| rel_path_string(target.source()) == "jvm/Tasty.scala")
+            .unwrap_or_else(|| panic!("missing exact JVM target {fqn}"));
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_inherited_stable_extractor_fields() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "akka/FSM.scala",
+            r#"package akka
+
+object FSM {
+  final case class Event[D](event: D)
+}
+
+trait FSM[D] {
+  import FSM._
+  type Event = FSM.Event[D]
+  val Event: FSM.Event.type = FSM.Event
+}
+"#,
+        ),
+        (
+            "akka/Manager.scala",
+            r#"package akka
+
+final class Manager extends FSM[Int] {
+  def keep(event: Event): Event = event // positive-inherited-event-type
+  def receive(value: Any): Int = value match {
+    case Event(number) => number // positive-inherited-stable-extractor
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+    let event = definition(&analyzer, "akka.FSM.Event");
+    let event_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&event)));
+    assert_hit_contains(&event_hits, "positive-inherited-stable-extractor");
+    assert_hit_contains(&event_hits, "positive-inherited-event-type");
+}
+
+#[test]
+fn scala_owned_class_methods_cover_hierarchy_parameterless_and_stable_objects() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Methods.scala",
+            r#"package model
+
+trait DeepReady {
+  def ready: Boolean = false
+}
+
+class Base extends DeepReady {
+  def inherited(value: Int): Int = value
+  override def ready: Boolean = true
+  def fresh(): Base = new Base
+}
+
+trait TraitDecoy {
+  def inherited(value: Int): Int = value + 1
+  def ready: Boolean = false
+}
+
+trait AbstractReady {
+  def ready: Boolean
+}
+
+object Helpers {
+  def stable(value: Int): Int = value
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+
+import model.*
+
+class Child extends Base {
+  def applied: Int = inherited(1) // positive-inherited-class
+  def bare: Boolean = ready // positive-unqualified-parameterless
+  def chained: String = ready.toString // positive-unqualified-parameterless-chain
+}
+
+class Qualified {
+  def use(base: Base): Boolean = base.ready // positive-qualified-parameterless
+  def stable: Int = Helpers.stable(1) // positive-stable-object
+}
+
+class FactoryScope {
+  def makeBase(): Base = new Base
+  class Nested {
+    def local: Boolean = {
+      val base = makeBase()
+      base.ready // positive-lexical-factory-result
+    }
+  }
+}
+
+class LocalObjectScope {
+  def build: Boolean = {
+    object Logic extends Base {
+      def local: Boolean = ready // positive-local-object-hierarchy
+      def viaFactory: Boolean = {
+        val base = fresh()
+        base.ready // positive-local-object-factory-result
+      }
+    }
+    Logic.local
+  }
+}
+
+class LocalDeclarationBlock {
+  def localVal: Boolean = {
+    abstract class Logic extends Base {
+      val ready: Boolean
+      def read: Boolean = ready // negative-local-val-declaration
+    }
+    true
+  }
+
+  def localVar: Boolean = {
+    abstract class Logic extends Base {
+      var ready: Boolean
+      def read: Boolean = ready // negative-local-var-declaration
+    }
+    true
+  }
+}
+
+class NestedFactory {
+  final class Product() {
+    def available: Boolean = true
+  }
+  def use: Boolean = {
+    val product = Product()
+    product.available // positive-nested-universal-apply-binding
+  }
+}
+
+class Ambiguous extends Base with TraitDecoy {
+  def use: Int = inherited(2) // negative-same-depth-owner
+}
+
+class AbstractContract extends Base with AbstractReady {
+  def use: Boolean = ready // positive-abstract-trait-contract
+}
+
+class FieldBlock extends Base {
+  val ready: Boolean = false
+  def use: Boolean = ready // negative-direct-field-block
+}
+
+class ObjectBlock extends Base {
+  object ready
+  def use: Any = ready // negative-direct-object-block
+}
+
+class AliasDoesNotBlock extends Base {
+  type ready = Int
+  def use: Boolean = ready // positive-type-alias-separate-namespace
+}
+
+trait SelfNoMember
+class OuterCarrier extends Base {
+  trait SelfScope { self: SelfNoMember =>
+    class Inner {
+      def use: Boolean = ready // positive-self-no-match-continues-outer
+    }
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target, marker) in [
+        ("model.Base.inherited", "positive-inherited-class"),
+        ("model.Base.ready", "positive-unqualified-parameterless"),
+        (
+            "model.Base.ready",
+            "positive-unqualified-parameterless-chain",
+        ),
+        ("model.Base.ready", "positive-qualified-parameterless"),
+        ("model.Base.ready", "positive-lexical-factory-result"),
+        ("model.Base.ready", "positive-local-object-hierarchy"),
+        ("model.Base.ready", "positive-local-object-factory-result"),
+        ("model.Base.ready", "positive-abstract-trait-contract"),
+        ("model.Base.ready", "positive-type-alias-separate-namespace"),
+        ("model.Base.ready", "positive-self-no-match-continues-outer"),
+        (
+            "app.NestedFactory.Product.available",
+            "positive-nested-universal-apply-binding",
+        ),
+        ("model.Helpers$.stable", "positive-stable-object"),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-same-depth-owner");
+        assert_no_hit_contains(&target_hits, "negative-direct-field-block");
+        assert_no_hit_contains(&target_hits, "negative-direct-object-block");
+        assert_no_hit_contains(&target_hits, "negative-local-val-declaration");
+        assert_no_hit_contains(&target_hits, "negative-local-var-declaration");
+    }
+}
+
+#[test]
+fn scala_self_type_is_a_class_member_visibility_tier_not_an_ancestor() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Mailbox.scala",
+            r#"package model
+
+class Mailbox {
+  def systemQueueGet: Int = 1
+}
+
+class OuterBase {
+  def ping: Int = 2
+}
+
+class SelfBase {
+  def ping: Int = 3
+}
+"#,
+        ),
+        (
+            "queue/Queues.scala",
+            r#"package queue
+
+import model.{Mailbox => BoundMailbox, OuterBase, SelfBase}
+
+trait DefaultQueue { self: BoundMailbox =>
+  def drain: Int = systemQueueGet // positive-self-type-class-member
+}
+
+trait Outer extends OuterBase { self: SelfBase =>
+  class Inner {
+    def use: Int = ping // positive-outer-owner-before-outer-self-type
+  }
+}
+"#,
+        ),
+    ]);
+
+    let mailbox_get = definition(&analyzer, "model.Mailbox.systemQueueGet");
+    let mailbox_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&mailbox_get)));
+    assert_hit_contains(&mailbox_hits, "positive-self-type-class-member");
+
+    let outer_ping = definition(&analyzer, "model.OuterBase.ping");
+    let outer_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&outer_ping)));
+    assert_hit_contains(&outer_hits, "positive-outer-owner-before-outer-self-type");
+
+    let self_ping = definition(&analyzer, "model.SelfBase.ping");
+    let self_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&self_ping)));
+    assert_no_hit_contains(&self_hits, "positive-outer-owner-before-outer-self-type");
+}
+
+#[test]
+fn scala_usage_finder_filters_callable_roles_before_shape_and_uniqueness() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Roles.scala",
+        r#"package app
+trait Context
+trait Contains { infix def contains(value: Int): Boolean = true }
+class Roleful(value: Int) extends Contains {
+  def this() = this(0)
+  def this(text: String, flag: Boolean) = this(text.length)
+}
+
+object Roleful { def apply(using Context): Roleful = new Roleful(0) }
+object Use {
+  given Context = new Context {}
+  val primary = new Roleful(1) // role-primary-new
+  val secondaryZero = new Roleful() // role-secondary-zero-new
+  val secondaryTwo = new Roleful("two", true) // role-secondary-two-new
+  val wrongNew = new Roleful("wrong", false, 3) // role-wrong-new
+  val companion = Roleful() // role-companion-apply
+  val primaryFallback = Roleful(2) // role-primary-bare-fallback
+  val secondaryMustNotBeBare = Roleful("two", true) // role-secondary-bare-negative
+  val inheritedInfix = primary contains 1 // role-inherited-infix
+}
+"#,
+    )]);
+
+    let constructors = analyzer.get_definitions("app.Roleful.Roleful");
+    assert_eq!(
+        constructors.len(),
+        2,
+        "expected primary plus the exact secondary-constructor CodeUnit"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = UsageFinder::new().find_usages_default(&analyzer, &constructors)
+    else {
+        panic!("expected constructor usage success");
+    };
+    for constructor in &constructors {
+        let signature = analyzer.signatures(constructor).join("\n");
+        let constructor_hits = hits_by_overload
+            .get(constructor)
+            .unwrap_or_else(|| panic!("missing constructor bucket for {signature}"))
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if signature.contains("def this") {
+            assert_hit_contains(&constructor_hits, "role-secondary-zero-new");
+            assert_hit_contains(&constructor_hits, "role-secondary-two-new");
+        } else {
+            assert_hit_contains(&constructor_hits, "role-primary-new");
+            assert_hit_contains(&constructor_hits, "role-primary-bare-fallback");
+        }
+        for marker in [
+            "role-wrong-new",
+            "role-companion-apply",
+            "role-secondary-bare-negative",
+        ] {
+            assert_no_hit_contains(&constructor_hits, marker);
+        }
+    }
+
+    let roleful = definition(&analyzer, "app.Roleful");
+    let type_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&roleful)));
+    for marker in [
+        "role-primary-new",
+        "role-secondary-zero-new",
+        "role-secondary-two-new",
+    ] {
+        assert_hit_contains(&type_hits, marker);
+    }
+    assert_no_hit_contains(&type_hits, "role-wrong-new");
+
+    let apply = definition(&analyzer, "app.Roleful$.apply");
+    let apply_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&apply)));
+    assert_hit_contains(&apply_hits, "role-companion-apply");
+    for marker in [
+        "role-primary-new",
+        "role-secondary-zero-new",
+        "role-secondary-two-new",
+        "role-primary-bare-fallback",
+        "role-secondary-bare-negative",
+    ] {
+        assert_no_hit_contains(&apply_hits, marker);
+    }
+
+    let contains = definition(&analyzer, "app.Contains.contains");
+    let contains_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&contains)));
+    assert_hit_contains(&contains_hits, "role-inherited-infix");
+}
+
+#[test]
+fn scala_usage_finder_resolves_exact_lexical_type_namespace_before_lower_tiers() {
+    let main = r#"package lexical
+class Collision { class Member }
+trait Contract { type Result = String; class Inherited }
+class Direct extends Contract {
+  val beforeAlias: Result = 1 // direct-later-alias
+  type Result = Int
+  val beforeClass: Factory = null // direct-later-class
+  class Factory
+}
+class InheritedUse extends Contract {
+  val Result = "term"
+  val alias: Result = "ok" // inherited-alias-term-collision
+  val nested: Inherited = null // inherited-class
+}
+class Covariant[+Collision] {
+  val blocked: Collision = null // type-param-barrier
+  val qualifiedBlocked: Collision.Member = null // qualified-type-param-barrier
+}
+class LocalBarrier {
+  def use: Unit = {
+    type Collision = String
+    val blocked: Collision = "ok" // local-alias-barrier
+    val qualifiedBlocked: Collision.Member = null // qualified-local-alias-barrier
+  }
+}
+trait DiamondRoot { class Diamond }
+trait DiamondLeft extends DiamondRoot
+trait DiamondRight extends DiamondRoot
+class DiamondUse extends DiamondLeft with DiamondRight {
+  val value: Diamond = null // diamond-dedup
+}
+trait Left { class Conflict }
+trait Right { class Conflict }
+class AmbiguousUse extends Left with Right {
+  val value: Conflict = null // physical-member-ambiguity
+}
+"#;
+    let same_jvm = r#"package replica
+trait Base { class Exact }
+class Local extends Base { val value: Exact = null // same-source-replica
+}
+"#;
+    let external = r#"package replica
+class External extends Base { val value: Exact = null // ambiguous-base-no-fallback
+}
+class QualifiedExternal extends replica.Base { val value: Exact = null // qualified-ambiguous-base-no-fallback
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("lexical/Main.scala", main),
+        ("jvm/replica/Base.scala", same_jvm),
+        (
+            "js/replica/Base.scala",
+            "package replica\ntrait Base { class Exact }\n",
+        ),
+        (
+            "fallback/replica/Exact.scala",
+            "package replica\nclass Exact\n",
+        ),
+        ("external/replica/Use.scala", external),
+    ]);
+
+    for (target, positive, negative) in [
+        (
+            "lexical.Direct.Result",
+            "direct-later-alias",
+            Some("inherited-alias-term-collision"),
+        ),
+        ("lexical.Direct.Factory", "direct-later-class", None),
+        (
+            "lexical.Contract.Result",
+            "inherited-alias-term-collision",
+            Some("direct-later-alias"),
+        ),
+        ("lexical.Contract.Inherited", "inherited-class", None),
+        ("lexical.DiamondRoot.Diamond", "diamond-dedup", None),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        if let Some(negative) = negative {
+            assert_no_hit_contains(&target_hits, negative);
+        }
+    }
+
+    let collision = definition(&analyzer, "lexical.Collision");
+    let collision_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&collision)));
+    for marker in [
+        "type-param-barrier",
+        "qualified-type-param-barrier",
+        "local-alias-barrier",
+        "qualified-local-alias-barrier",
+    ] {
+        assert_no_hit_contains(&collision_hits, marker);
+    }
+    for target in ["lexical.Left.Conflict", "lexical.Right.Conflict"] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, "physical-member-ambiguity");
+    }
+    let fallback = definition(&analyzer, "replica.Exact");
+    let fallback_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&fallback)));
+    assert_no_hit_contains(&fallback_hits, "ambiguous-base-no-fallback");
+    assert_no_hit_contains(&fallback_hits, "qualified-ambiguous-base-no-fallback");
+
+    let replica_exact = analyzer
+        .get_definitions("replica.Base.Exact")
+        .into_iter()
+        .find(|unit| rel_path_string(unit.source()) == "jvm/replica/Base.scala")
+        .expect("JVM physical nested type");
+    let replica_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&replica_exact)),
+    );
+    assert_hit_contains(&replica_hits, "same-source-replica");
+}
+
+#[test]
+fn scala_targeted_usage_keeps_duplicate_owner_members_source_exact() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+class Base {{
+  var count: Int = 0
+  def ready: Boolean = true
+  def direct: Int = {{
+    val field = count // {platform}-direct-field
+    val method = ready // {platform}-direct-method
+    field
+  }}
+}}
+class Local extends Base {{
+  val field = count // {platform}-inherited-field
+  val method = ready // {platform}-inherited-method
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let external = r#"package consumer
+import replica.Base
+class External extends Base {
+  val field = count // ambiguous-external-field
+  val method = ready // ambiguous-external-method
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/Base.scala", &jvm),
+        ("js/replica/Base.scala", &js),
+        ("consumer/External.scala", external),
+    ]);
+    for (platform, path) in [
+        ("jvm", "jvm/replica/Base.scala"),
+        ("js", "js/replica/Base.scala"),
+    ] {
+        for (member, marker_kind) in [("count", "field"), ("ready", "method")] {
+            let fqn = format!("replica.Base.{member}");
+            let target = analyzer
+                .get_definitions(&fqn)
+                .into_iter()
+                .find(|unit| rel_path_string(unit.source()) == path)
+                .unwrap_or_else(|| panic!("missing {path} physical {fqn}"));
+            let targeted = hits(
+                UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+            );
+            for marker in [
+                format!("{platform}-direct-{marker_kind}"),
+                format!("{platform}-inherited-{marker_kind}"),
+            ] {
+                assert_hit_contains(&targeted, &marker);
+            }
+            let other = if platform == "jvm" { "js" } else { "jvm" };
+            for marker in [
+                format!("{other}-direct-{marker_kind}"),
+                format!("{other}-inherited-{marker_kind}"),
+                format!("ambiguous-external-{marker_kind}"),
+            ] {
+                assert_no_hit_contains(&targeted, &marker);
+            }
+        }
+    }
+}
+
+#[test]
+fn scala_targeted_usage_keeps_typed_receivers_on_exact_physical_owner() {
+    let replica = |platform: &str, argument_type: &str, argument: &str| {
+        format!(
+            r#"package replica
+object RedBlackTree {{
+  final class Tree {{
+    def blackWithLeft(value: {argument_type}): Tree = this
+  }}
+  def balance(tree: Tree): Tree =
+    tree.blackWithLeft({argument}) // {platform}-exact-receiver
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm", "Int", "1");
+    let js = replica("js", "String", "\"left\"");
+    let native = replica("native", "Boolean", "true");
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/RedBlackTree.scala", &jvm),
+        ("js/replica/RedBlackTree.scala", &js),
+        ("native/replica/RedBlackTree.scala", &native),
+        (
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+import replica.RedBlackTree.Tree
+object Ambiguous {
+  def balance(tree: Tree): Tree =
+    tree.blackWithLeft(1) // ambiguous-logical-receiver
+}
+"#,
+        ),
+    ]);
+
+    let fqn = "replica.RedBlackTree$.Tree.blackWithLeft";
+    for (platform, path) in [
+        ("jvm", "jvm/replica/RedBlackTree.scala"),
+        ("js", "js/replica/RedBlackTree.scala"),
+        ("native", "native/replica/RedBlackTree.scala"),
+    ] {
+        let target = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing {path} physical {fqn}"));
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, &format!("{platform}-exact-receiver"));
+        for other in ["jvm", "js", "native"] {
+            if other != platform {
+                assert_no_hit_contains(&target_hits, &format!("{other}-exact-receiver"));
+            }
+        }
+        assert_no_hit_contains(&target_hits, "ambiguous-logical-receiver");
+    }
+}
+
+#[test]
+fn scala_usage_finder_handles_generic_companion_enum_roots_and_convergent_diamonds() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Model.scala",
+        r#"package app
+
+object Chart {
+  final case class Encoding[A, B](left: A, right: B)
+  val generic = Encoding[Int, String](1, "one") // positive-generic-apply
+}
+
+enum Extent {
+  case Continuous(min: Double, max: Double)
+  case Categories(keys: List[String])
+}
+object Extent {
+  def categories(keys: List[String]): Extent = Extent.Categories(keys)
+}
+object Scale {
+  def keys(extent: Extent): List[String] = extent match {
+    case Extent.Categories(values) => values // positive-enum-extractor
+    case _ => Nil
+  }
+}
+"#,
+    )]);
+
+    for (target, expected) in [
+        ("app.Chart$.Encoding", "positive-generic-apply"),
+        ("app.Extent.Categories", "positive-enum-extractor"),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, expected);
+    }
+}
+
+#[test]
+fn scala_usage_finder_deduplicates_convergent_member_paths() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Diamond.scala",
+        r#"package app
+trait SharedOps { infix def contains(value: Int): Boolean = true }
+trait Intermediate extends SharedOps
+class Convergent extends Intermediate with SharedOps
+object EnumerationLike {
+  def selected(ids: Convergent): Boolean = ids contains 1 // positive-convergent-infix
+}
+trait LeftOps { infix def contains(value: Int): Boolean = true }
+trait RightOps { infix def contains(value: Int): Boolean = true }
+object AmbiguousLike {
+  def selected(ids: LeftOps | RightOps): Boolean = ids contains 1 // negative-distinct-diamond
+}
+"#,
+    )]);
+    let target = definition(&analyzer, "app.SharedOps.contains");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&target_hits, "positive-convergent-infix");
+    assert_no_hit_contains(&target_hits, "negative-distinct-diamond");
+    for target in ["app.LeftOps.contains", "app.RightOps.contains"] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, "negative-distinct-diamond");
+    }
+}
+
+#[test]
+fn scala_usage_finder_fails_closed_for_physical_enum_root_ambiguity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/replica/Extent.scala",
+            "package replica\nenum Extent { case Categories(keys: List[String]) }\nobject Extent\n",
+        ),
+        (
+            "js/replica/Extent.scala",
+            "package replica\nenum Extent { case Categories(keys: List[String]) }\nobject Extent\n",
+        ),
+        (
+            "external/Use.scala",
+            r#"package external
+object Use {
+  def keys(extent: replica.Extent): List[String] = extent match {
+    case replica.Extent.Categories(values) => values // negative-physical-enum-root
+    case _ => Nil
+  }
+}
+"#,
+        ),
+    ]);
+    for path in ["jvm/replica/Extent.scala", "js/replica/Extent.scala"] {
+        let target = analyzer
+            .get_definitions("replica.Extent.Categories")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing physical enum case in {path}"));
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, "negative-physical-enum-root");
+    }
+}
+
+#[test]
+fn scala_abstract_parameterless_contract_accepts_exact_field_implementation_references() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+abstract class ArrayBuilder {{
+  protected def elems: String | Null
+}}
+object ArrayBuilder {{
+  class Child extends ArrayBuilder {{
+    protected var elems: String | Null = "value"
+    def reset(): Unit = {{
+      val previous = elems // {platform}-abstract-field-read
+      elems = null // {platform}-abstract-field-write
+    }}
+    def local(): String = {{
+      val elems = "local"
+      elems // {platform}-local-shadow-read
+    }}
+  }}
+}}
+class ConcreteBase {{
+  def elems: String | Null = "base"
+}}
+class ConcreteChild extends ConcreteBase {{
+  override var elems: String | Null = "child"
+  def reset(): Unit = {{
+    val previous = elems // {platform}-concrete-field-read
+    elems = null // {platform}-concrete-field-write
+  }}
+}}
+class Unrelated {{
+  var elems: String | Null = "other"
+  def reset(): Unit = elems = null // {platform}-unrelated-field-write
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/ArrayBuilder.scala", &jvm),
+        ("js/replica/ArrayBuilder.scala", &js),
+    ]);
+
+    for (platform, path) in [
+        ("jvm", "jvm/replica/ArrayBuilder.scala"),
+        ("js", "js/replica/ArrayBuilder.scala"),
+    ] {
+        let target = analyzer
+            .get_definitions("replica.ArrayBuilder.elems")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing {path} abstract elems contract"));
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        for marker in [
+            format!("{platform}-abstract-field-read"),
+            format!("{platform}-abstract-field-write"),
+        ] {
+            assert_hit_contains(&target_hits, &marker);
+        }
+        let other = if platform == "jvm" { "js" } else { "jvm" };
+        for marker in [
+            format!("{other}-abstract-field-read"),
+            format!("{other}-abstract-field-write"),
+            format!("{platform}-concrete-field-read"),
+            format!("{platform}-concrete-field-write"),
+            format!("{platform}-unrelated-field-write"),
+            format!("{platform}-local-shadow-read"),
+        ] {
+            assert_no_hit_contains(&target_hits, &marker);
+        }
+
+        let concrete = analyzer
+            .get_definitions("replica.ConcreteBase.elems")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing {path} concrete elems method"));
+        let concrete_hits = hits(
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&concrete)),
+        );
+        for marker in [
+            format!("{platform}-concrete-field-read"),
+            format!("{platform}-concrete-field-write"),
+        ] {
+            assert_no_hit_contains(&concrete_hits, &marker);
+        }
     }
 }

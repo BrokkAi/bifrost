@@ -1,8 +1,8 @@
-use super::inverted::{CachedCallableAlternatives, NameResolver};
-use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
+use super::inverted::{CachedCallableAlternatives, is_package_level_type};
+use crate::analyzer::scala::scala_import_path;
+use crate::analyzer::usages::scala_graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::analyzer::{
-    CallableArity, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    ScalaAnalyzer, TypeHierarchyProvider,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,25 +25,27 @@ pub(super) struct TargetSpec {
     pub(super) member_name: String,
     pub(super) target_fq_name: String,
     pub(super) owner_fq_name: Option<String>,
-    family_owner_fq_names: HashSet<String>,
-    receiver_owner_fq_names: HashSet<String>,
     pub(super) arity: Option<usize>,
-    pub(super) callable_arity: Option<CallableArity>,
     pub(super) callable_alternatives: CachedCallableAlternatives,
     pub(super) is_extension_method: bool,
+    pub(super) accepts_field_implementation: bool,
     pub(super) is_object_type: bool,
-    pub(super) accepts_object_roles: bool,
-    pub(super) unapplied_reference_is_unambiguous: bool,
+    pub(super) accepts_apply_role: bool,
+    pub(super) accepts_term_field_role: bool,
+    pub(super) type_parent: Option<CodeUnit>,
+    pub(super) accepts_companion_apply_syntax: bool,
 }
 
 impl TargetSpec {
     pub(super) fn from_target(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<Self> {
-        if target.is_class() {
+        if target.is_class() || scala.is_type_alias(target) {
             let owner_name = scala_display_name(target);
-            let is_object_type = target.short_name().ends_with('$');
-            let accepts_object_roles = scala
-                .project_types()
-                .type_accepts_object_roles(scala, target);
+            let is_type_alias = scala.is_type_alias(target);
+            let is_object_type = !is_type_alias && target.short_name().ends_with('$');
+            let types = scala.project_types();
+            let accepts_apply_role =
+                !is_type_alias && types.class_accepts_apply_role(scala, target);
+            let accepts_term_field_role = types.has_term_field_declaration(target);
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
@@ -53,82 +55,72 @@ impl TargetSpec {
                 member_name: owner_name.clone(),
                 target_fq_name: scala_normalized_fq_name(&target.fq_name()),
                 owner_fq_name: Some(scala_normalized_fq_name(&target.fq_name())),
-                family_owner_fq_names: HashSet::from_iter([scala_normalized_fq_name(
-                    &target.fq_name(),
-                )]),
-                receiver_owner_fq_names: HashSet::from_iter([scala_normalized_fq_name(
-                    &target.fq_name(),
-                )]),
                 owner_name: Some(owner_name),
                 arity: None,
-                callable_arity: None,
                 callable_alternatives: Arc::new(Vec::new()),
                 is_extension_method: false,
+                accepts_field_implementation: false,
                 is_object_type,
-                accepts_object_roles,
-                unapplied_reference_is_unambiguous: false,
+                accepts_apply_role,
+                accepts_term_field_role,
+                type_parent: scala.structural_parent_of(target),
+                accepts_companion_apply_syntax: false,
             });
         }
 
         let owner = owner_of(scala, target);
         let owner_name = owner.as_ref().map(scala_display_name);
-        let kind = if target.is_field() {
-            TargetKind::Field
-        } else if target.is_synthetic() || owner_name.as_deref() == Some(target.identifier()) {
-            TargetKind::Constructor
-        } else {
-            TargetKind::Method
-        };
         let arity = target.signature().and_then(signature_arity).or_else(|| {
             scala
                 .signatures(target)
                 .into_iter()
                 .find_map(|sig| signature_arity(&sig))
         });
-        let signature_metadata = scala.signature_metadata(target);
-        let callable_arity = signature_metadata
+        let callable_alternatives = if !target.is_field() && target.is_function() {
+            scala
+                .project_types()
+                .effective_callable_alternatives_for(scala, target)
+        } else {
+            Arc::new(Vec::new())
+        };
+        let has_constructor_role = callable_alternatives.iter().any(|alternative| {
+            matches!(
+                alternative.role,
+                ScalaCallableRole::PrimaryConstructor | ScalaCallableRole::SecondaryConstructor
+            )
+        });
+        let has_ordinary_role = callable_alternatives
             .iter()
-            .find_map(|metadata| metadata.callable_arity())
-            .or_else(|| arity.map(CallableArity::exact));
-        let callable_alternatives = matches!(kind, TargetKind::Method | TargetKind::Constructor)
-            .then(|| {
-                scala
-                    .project_types()
-                    .callable_alternatives_for(scala, target)
-            })
-            .unwrap_or_else(|| Arc::new(Vec::new()));
+            .any(|alternative| alternative.role == ScalaCallableRole::Ordinary);
+        let kind = if target.is_field() {
+            TargetKind::Field
+        } else if target.is_synthetic()
+            || owner_name.as_deref() == Some(target.identifier())
+            || has_constructor_role && !has_ordinary_role
+        {
+            TargetKind::Constructor
+        } else {
+            TargetKind::Method
+        };
         let is_extension_method = callable_alternatives
             .iter()
             .any(|alternative| alternative.extension_receiver_type.is_some());
+        let accepts_field_implementation = kind == TargetKind::Method
+            && scala
+                .project_types()
+                .is_abstract_scala_method(scala, target)
+            && callable_alternatives.iter().any(|alternative| {
+                alternative.role == ScalaCallableRole::Ordinary && alternative.shape.is_empty()
+            });
         let member_name = if kind == TargetKind::Constructor {
             owner_name.clone()?
         } else {
             target.identifier().to_string()
         };
-        let unapplied_reference_is_unambiguous = kind == TargetKind::Method
-            && scala
-                .definitions(&target.fq_name())
-                .filter(CodeUnit::is_function)
-                .map(|candidate| {
-                    scala
-                        .project_types()
-                        .callable_alternatives_for(scala, &candidate)
-                        .len()
-                        .max(1)
-                })
-                .sum::<usize>()
-                == 1;
         let member_owners = inherited_member_owners(scala, &owner, kind, &member_name, arity);
-        let family_owner_fq_names = member_owners
-            .family_owners
-            .iter()
-            .map(CodeUnit::fq_name)
-            .collect();
-        let receiver_owner_fq_names = member_owners
-            .receiver_owners
-            .iter()
-            .map(CodeUnit::fq_name)
-            .collect();
+        let accepts_companion_apply_syntax = kind == TargetKind::Method
+            && member_name == "apply"
+            && companion_apply_owner_is_unambiguous(scala, target, owner.as_ref());
         Some(Self {
             target: target.clone(),
             target_fq_name: scala_normalized_fq_name(&target.fq_name()),
@@ -139,34 +131,98 @@ impl TargetSpec {
             owner_name,
             kind,
             member_name,
-            family_owner_fq_names,
-            receiver_owner_fq_names,
             arity,
-            callable_arity,
             callable_alternatives,
             is_extension_method,
+            accepts_field_implementation,
             is_object_type: false,
-            accepts_object_roles: false,
-            unapplied_reference_is_unambiguous,
+            accepts_apply_role: false,
+            accepts_term_field_role: false,
+            type_parent: None,
+            accepts_companion_apply_syntax,
         })
     }
+}
 
-    pub(super) fn owner_fq_matches(&self, owner_fq_name: &str) -> bool {
-        self.family_owner_fq_names.contains(owner_fq_name)
+fn companion_apply_owner_is_unambiguous(
+    scala: &ScalaAnalyzer,
+    target: &CodeUnit,
+    owner: Option<&CodeUnit>,
+) -> bool {
+    let Some(_owner) = owner else {
+        return false;
+    };
+    if let Some(structural_owner) = scala.structural_parent_of(target) {
+        if scala
+            .project_types()
+            .type_accepts_object_roles(scala, &structural_owner)
+        {
+            return true;
+        }
+        return inherited_companion_apply_fallback_is_unambiguous(scala, target, &structural_owner);
+    }
+    let normalized_target = scala_normalized_fq_name(&target.fq_name());
+    !scala
+        .global_usage_definition_index()
+        .by_normalized_fqn(&normalized_target)
+        .iter()
+        .filter(|candidate| candidate.is_function() && *candidate != target)
+        .filter_map(|candidate| scala.structural_parent_of(candidate))
+        .any(|candidate_owner| {
+            scala
+                .project_types()
+                .type_accepts_object_roles(scala, &candidate_owner)
+        })
+}
+
+fn inherited_companion_apply_fallback_is_unambiguous(
+    scala: &ScalaAnalyzer,
+    target: &CodeUnit,
+    owner: &CodeUnit,
+) -> bool {
+    let index = scala.global_usage_definition_index();
+    let normalized_target = scala_normalized_fq_name(&target.fq_name());
+    if index
+        .by_normalized_fqn(&normalized_target)
+        .iter()
+        .any(|candidate| candidate.is_function() && candidate != target)
+    {
+        return false;
     }
 
-    pub(super) fn receiver_owner_fq_matches(&self, owner_fq_name: &str) -> bool {
-        self.receiver_owner_fq_names.contains(owner_fq_name)
-            || scala_builtin_type_name(owner_fq_name).is_some_and(|builtin| {
-                self.receiver_owner_fq_names
-                    .contains(&format!("scala.{builtin}"))
+    let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
+    let mut companions = index
+        .by_normalized_fqn(&normalized_owner)
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && *candidate != owner
+                && scala
+                    .project_types()
+                    .type_accepts_object_roles(scala, candidate)
+        });
+    let Some(companion) = companions.next() else {
+        return false;
+    };
+    if companions.next().is_some() {
+        return false;
+    }
+
+    let Some(facts) = scala.forward_owner_facts(companion) else {
+        return false;
+    };
+    !facts.supertype_lookup_paths.is_empty()
+        && std::iter::once(companion.clone())
+            .chain(scala.get_ancestors(companion))
+            .all(|candidate_owner| {
+                !scala
+                    .definitions(&format!("{}.apply", candidate_owner.fq_name()))
+                    .any(|candidate| {
+                        candidate.is_function()
+                            && scala.structural_parent_of(&candidate).as_ref()
+                                == Some(&candidate_owner)
+                    })
             })
-    }
-
-    pub(super) fn related_override_owner_fq_matches(&self, owner_fq_name: &str) -> bool {
-        self.owner.as_ref().map(CodeUnit::fq_name).as_deref() != Some(owner_fq_name)
-            && self.family_owner_fq_names.contains(owner_fq_name)
-    }
 }
 
 struct InheritedMemberOwners {
@@ -174,9 +230,9 @@ struct InheritedMemberOwners {
     receiver_owners: Vec<CodeUnit>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum InheritedMemberState {
-    Related,
+    Related(HashSet<CodeUnit>),
     Blocked,
     None,
 }
@@ -208,26 +264,28 @@ fn inherited_member_owners(
             receiver_owners,
         };
     }
-    let mut seen = HashSet::from_iter([scala_normalized_fq_name(&owner.fq_name())]);
-    let mut related_owner_fq_names = seen.clone();
+    let mut seen = HashSet::from_iter([owner.clone()]);
+    let mut related_declaration_owners = seen.clone();
     let mut inherited_state_by_owner = HashMap::from_iter([(
-        scala_normalized_fq_name(&owner.fq_name()),
-        InheritedMemberState::Related,
+        owner.clone(),
+        InheritedMemberState::Related(HashSet::from_iter([owner.clone()])),
     )]);
     for descendant in scala.get_descendants(owner) {
-        let descendant_fq_name = scala_normalized_fq_name(&descendant.fq_name());
-        if !seen.insert(descendant_fq_name.clone()) {
+        if !seen.insert(descendant.clone()) {
             continue;
         }
         match direct_member_state(scala, &descendant, kind, member_name, arity) {
             DirectMemberState::RelatedOverride => {
-                related_owner_fq_names.insert(descendant_fq_name.clone());
-                inherited_state_by_owner.insert(descendant_fq_name, InheritedMemberState::Related);
+                related_declaration_owners.insert(descendant.clone());
+                inherited_state_by_owner.insert(
+                    descendant.clone(),
+                    InheritedMemberState::Related(HashSet::from_iter([descendant.clone()])),
+                );
                 family_owners.push(descendant.clone());
                 receiver_owners.push(descendant);
             }
             DirectMemberState::BlockingDeclaration => {
-                inherited_state_by_owner.insert(descendant_fq_name, InheritedMemberState::Blocked);
+                inherited_state_by_owner.insert(descendant.clone(), InheritedMemberState::Blocked);
             }
             DirectMemberState::None => {
                 let state = inherited_member_state_from_ancestors(
@@ -236,11 +294,12 @@ fn inherited_member_owners(
                     kind,
                     member_name,
                     arity,
-                    &related_owner_fq_names,
+                    &related_declaration_owners,
                     &inherited_state_by_owner,
                 );
-                inherited_state_by_owner.insert(descendant_fq_name, state);
-                if state == InheritedMemberState::Related {
+                let is_related = matches!(state, InheritedMemberState::Related(_));
+                inherited_state_by_owner.insert(descendant.clone(), state);
+                if is_related {
                     receiver_owners.push(descendant);
                 }
             }
@@ -258,25 +317,24 @@ fn inherited_member_state_from_ancestors(
     kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
-    related_owner_fq_names: &HashSet<String>,
-    inherited_state_by_owner: &HashMap<String, InheritedMemberState>,
+    related_declaration_owners: &HashSet<CodeUnit>,
+    inherited_state_by_owner: &HashMap<CodeUnit, InheritedMemberState>,
 ) -> InheritedMemberState {
     let mut related_matches = HashSet::default();
     let mut has_blocking_match = false;
     for ancestor in scala.get_direct_ancestors(descendant) {
-        let ancestor_fq_name = scala_normalized_fq_name(&ancestor.fq_name());
         if owner_declares_matching_member(scala, &ancestor, kind, member_name, arity) {
-            if related_owner_fq_names.contains(&ancestor_fq_name) {
-                related_matches.insert(ancestor_fq_name);
+            if related_declaration_owners.contains(&ancestor) {
+                related_matches.insert(ancestor);
             } else {
                 has_blocking_match = true;
             }
             continue;
         }
 
-        match inherited_state_by_owner.get(&ancestor_fq_name) {
-            Some(InheritedMemberState::Related) => {
-                related_matches.insert(ancestor_fq_name);
+        match inherited_state_by_owner.get(&ancestor) {
+            Some(InheritedMemberState::Related(declarations)) => {
+                related_matches.extend(declarations.iter().cloned());
             }
             Some(InheritedMemberState::Blocked) => has_blocking_match = true,
             Some(InheritedMemberState::None) | None => {}
@@ -286,7 +344,7 @@ fn inherited_member_state_from_ancestors(
         return InheritedMemberState::Blocked;
     }
     if related_matches.len() == 1 {
-        InheritedMemberState::Related
+        InheritedMemberState::Related(related_matches)
     } else {
         InheritedMemberState::None
     }
@@ -299,10 +357,24 @@ fn direct_member_state(
     member_name: &str,
     arity: Option<usize>,
 ) -> DirectMemberState {
+    if scala
+        .definitions(&format!("{}.{}$", owner.fq_name(), member_name))
+        .any(|unit| {
+            unit.is_class()
+                && unit.short_name().ends_with('$')
+                && scala.structural_parent_of(&unit).as_ref() == Some(owner)
+        })
+    {
+        return DirectMemberState::BlockingDeclaration;
+    }
     if kind == TargetKind::Method
         && scala
             .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-            .any(|unit| unit.is_function() && method_arity_matches(scala, &unit, arity))
+            .any(|unit| {
+                unit.is_function()
+                    && scala.parent_of(&unit).as_ref() == Some(owner)
+                    && method_arity_matches(scala, &unit, arity)
+            })
     {
         return DirectMemberState::RelatedOverride;
     }
@@ -322,10 +394,13 @@ fn owner_declares_matching_member(
 ) -> bool {
     scala
         .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-        .any(|unit| member_matches_target_kind(scala, &unit, kind, arity))
+        .any(|unit| {
+            scala.parent_of(&unit).as_ref() == Some(owner)
+                && member_matches_target_kind(scala, &unit, kind, arity)
+        })
 }
 
-fn member_matches_target_kind(
+pub(super) fn member_matches_target_kind(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
     kind: TargetKind,
@@ -341,39 +416,6 @@ fn member_matches_target_kind(
         }
         TargetKind::Type | TargetKind::Constructor => false,
     }
-}
-
-fn imported_factory_return_owner(
-    scala: &ScalaAnalyzer,
-    resolver: &NameResolver,
-    unit: &CodeUnit,
-    spec: &TargetSpec,
-) -> Option<String> {
-    let return_type = scala
-        .project_types()
-        .member_return_type(scala, resolver, &unit.fq_name())?;
-    spec.receiver_owners.iter().find_map(|owner| {
-        return_type_matches_owner(&return_type, unit.package_name(), owner).then(|| owner.fq_name())
-    })
-}
-
-fn return_type_matches_owner(return_type: &str, return_package: &str, owner: &CodeUnit) -> bool {
-    let base = return_type_base(return_type);
-    if scala_normalized_fq_name(base) == scala_normalized_fq_name(&owner.fq_name()) {
-        return true;
-    }
-    !base.contains('.')
-        && return_package == owner.package_name()
-        && base == scala_display_name(owner)
-}
-
-fn return_type_base(return_type: &str) -> &str {
-    return_type
-        .split(['[', '(', '{', ' '])
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(return_type)
 }
 
 pub(in crate::analyzer::usages) fn scala_builtin_type_name(
@@ -503,7 +545,9 @@ fn scala_declared_type_in_package(
     preferred_scala_type(
         scala
             .global_usage_definition_index()
-            .types_in_package(package_name, simple),
+            .types_in_package(package_name, simple)
+            .iter()
+            .filter(|unit| is_package_level_type(unit)),
     )
     .map(|unit| unit.fq_name())
 }
@@ -577,22 +621,11 @@ pub(in crate::analyzer::usages) fn method_signature_arity(
     })
 }
 
-pub(in crate::analyzer::usages) fn method_call_arity_applies(
-    scala: &ScalaAnalyzer,
-    unit: &CodeUnit,
-    call_arity: usize,
-) -> bool {
-    let callable_arity = scala
-        .signature_metadata(unit)
-        .into_iter()
-        .find_map(|metadata| metadata.callable_arity());
-    callable_arity.map_or_else(
-        || method_signature_arity(scala, unit).is_some_and(|arity| arity == call_arity),
-        |arity| arity.accepts(call_arity),
-    )
-}
-
 fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+    if let Some(owner) = scala.structural_parent_of(target) {
+        return owner.is_class().then_some(owner);
+    }
+
     if let Some((owner_short, _)) = target.short_name().rsplit_once('.') {
         let owner_fq = if target.package_name().is_empty() {
             owner_short.to_string()
@@ -613,354 +646,6 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
                 .into_iter()
                 .any(|child| &child == target)
         })
-}
-
-pub(super) struct Visibility {
-    pub(super) type_names: HashSet<String>,
-    class_type_names: HashSet<String>,
-    object_type_names: HashSet<String>,
-    pub(super) owner_names: HashSet<String>,
-    owner_name_to_fq_name: HashMap<String, String>,
-    receiver_type_name_to_fq_name: HashMap<String, String>,
-    receiver_name_to_fq_name: HashMap<String, String>,
-    pub(super) direct_member_names: HashSet<String>,
-    pub(super) ambiguous_direct_member_names: HashSet<String>,
-}
-
-impl Visibility {
-    pub(super) fn for_file(
-        scala: &ScalaAnalyzer,
-        file: &ProjectFile,
-        spec: &TargetSpec,
-        resolver: &NameResolver,
-    ) -> Self {
-        let mut visibility = Self {
-            type_names: HashSet::default(),
-            class_type_names: HashSet::default(),
-            object_type_names: HashSet::default(),
-            owner_names: HashSet::default(),
-            owner_name_to_fq_name: HashMap::default(),
-            receiver_type_name_to_fq_name: HashMap::default(),
-            receiver_name_to_fq_name: HashMap::default(),
-            direct_member_names: HashSet::default(),
-            ambiguous_direct_member_names: ambiguous_wildcard_members(scala, file, spec),
-        };
-
-        let file_package = package_name_of(scala, file);
-        if file == spec.target.source()
-            || file_package.as_deref() == Some(spec.target.package_name())
-        {
-            visibility.type_names.insert(spec.member_name.clone());
-            if spec.owner.is_none() {
-                visibility
-                    .direct_member_names
-                    .insert(spec.member_name.clone());
-            }
-            if let Some(owner_name) = spec.owner_name.as_ref()
-                && let Some(owner) = spec.owner.as_ref()
-            {
-                visibility.add_owner_name(owner_name.clone(), owner.fq_name());
-            }
-        }
-        if spec
-            .owner
-            .as_ref()
-            .is_some_and(|owner| file_package.as_deref() == Some(owner.package_name()))
-            && let Some(owner_name) = spec.owner_name.as_ref()
-            && let Some(owner) = spec.owner.as_ref()
-        {
-            visibility.add_owner_name(owner_name.clone(), owner.fq_name());
-        }
-
-        for owner in &spec.family_owners {
-            if file == owner.source() || file_package.as_deref() == Some(owner.package_name()) {
-                visibility.add_owner_name(scala_display_name(owner), owner.fq_name());
-            }
-        }
-        for owner in &spec.receiver_owners {
-            if file == owner.source() || file_package.as_deref() == Some(owner.package_name()) {
-                visibility.add_receiver_type_name(scala_display_name(owner), owner.fq_name());
-            }
-        }
-
-        let file_package = file_package.unwrap_or_default();
-        for import in scala.import_info_of(file) {
-            visibility.apply_import(scala, resolver, &import, spec, &file_package);
-        }
-
-        visibility.retain_exact_visible_bindings(resolver, spec);
-
-        visibility
-    }
-
-    pub(super) fn class_type_name_matches(&self, name: &str) -> bool {
-        self.class_type_names.contains(name)
-    }
-
-    pub(super) fn object_type_name_matches(&self, name: &str) -> bool {
-        self.object_type_names.contains(name)
-    }
-
-    pub(super) fn owner_fq_name_for(&self, owner_name: &str) -> Option<&str> {
-        self.owner_name_to_fq_name
-            .get(owner_name)
-            .map(String::as_str)
-    }
-
-    pub(super) fn receiver_type_fq_name_for(&self, owner_name: &str) -> Option<&str> {
-        self.receiver_type_name_to_fq_name
-            .get(owner_name)
-            .map(String::as_str)
-    }
-
-    pub(super) fn receiver_fq_name_for(&self, receiver_name: &str) -> Option<&str> {
-        self.receiver_name_to_fq_name
-            .get(receiver_name)
-            .map(String::as_str)
-    }
-
-    fn add_owner_name(&mut self, owner_name: String, owner_fq_name: String) {
-        self.owner_names.insert(owner_name.clone());
-        self.owner_name_to_fq_name.insert(owner_name, owner_fq_name);
-    }
-
-    fn add_receiver_type_name(&mut self, owner_name: String, owner_fq_name: String) {
-        self.receiver_type_name_to_fq_name
-            .insert(owner_name, owner_fq_name);
-    }
-
-    fn add_receiver_name(&mut self, receiver_name: String, owner_fq_name: String) {
-        self.receiver_name_to_fq_name
-            .insert(receiver_name, owner_fq_name);
-    }
-
-    fn retain_exact_visible_bindings(&mut self, resolver: &NameResolver, spec: &TargetSpec) {
-        let class_identity = if spec.kind == TargetKind::Constructor {
-            spec.owner.as_ref().map(CodeUnit::fq_name)
-        } else {
-            Some(spec.target.fq_name())
-        };
-        if let Some(class_identity) = class_identity {
-            self.class_type_names.extend(
-                self.type_names
-                    .iter()
-                    .filter(|name| resolver.resolve(name).as_deref() == Some(&class_identity))
-                    .cloned(),
-            );
-        }
-        let object_identity = spec.target.fq_name();
-        self.object_type_names.extend(
-            self.type_names
-                .iter()
-                .filter(|name| resolver.resolve_object(name).as_deref() == Some(&object_identity))
-                .cloned(),
-        );
-
-        self.owner_name_to_fq_name.retain(|name, expected| {
-            resolver.resolve_object(name).as_deref() == Some(expected.as_str())
-        });
-        self.owner_names
-            .retain(|name| self.owner_name_to_fq_name.contains_key(name));
-        self.receiver_type_name_to_fq_name
-            .retain(|name, expected| resolver.resolve(name).as_deref() == Some(expected.as_str()));
-    }
-
-    fn apply_import(
-        &mut self,
-        scala: &ScalaAnalyzer,
-        resolver: &NameResolver,
-        import: &ImportInfo,
-        spec: &TargetSpec,
-        file_package: &str,
-    ) {
-        let names = Self::matching_import_names(import, spec, file_package);
-        self.type_names.extend(names.type_names);
-        for (owner_name, owner_fq_name) in names.owner_names {
-            self.add_owner_name(owner_name, owner_fq_name);
-        }
-        self.direct_member_names.extend(names.direct_member_names);
-        self.apply_family_owner_import(import, spec, file_package);
-        self.apply_receiver_owner_import(import, spec, file_package);
-        self.apply_imported_factory_receiver(scala, resolver, import, spec, file_package);
-    }
-
-    fn apply_family_owner_import(
-        &mut self,
-        import: &ImportInfo,
-        spec: &TargetSpec,
-        file_package: &str,
-    ) {
-        let Some(path) = scala_import_path(import) else {
-            return;
-        };
-        if import.is_wildcard {
-            let candidates = import_candidate_fq_names(&path, file_package);
-            for owner in &spec.family_owners {
-                if candidates.contains(owner.package_name()) {
-                    self.add_owner_name(scala_display_name(owner), owner.fq_name());
-                }
-            }
-            return;
-        }
-        let normalized = scala_normalized_fq_name(&path);
-        for owner in &spec.family_owners {
-            let owner_fq_name = owner.fq_name();
-            if normalized == scala_normalized_fq_name(&owner_fq_name) {
-                let local_name = import
-                    .identifier
-                    .clone()
-                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-                self.add_owner_name(local_name, owner_fq_name);
-            }
-        }
-    }
-
-    fn apply_receiver_owner_import(
-        &mut self,
-        import: &ImportInfo,
-        spec: &TargetSpec,
-        file_package: &str,
-    ) {
-        let Some(path) = scala_import_path(import) else {
-            return;
-        };
-        if import.is_wildcard {
-            let candidates = import_candidate_fq_names(&path, file_package);
-            for owner in &spec.receiver_owners {
-                if candidates.contains(owner.package_name()) {
-                    self.add_receiver_type_name(scala_display_name(owner), owner.fq_name());
-                }
-            }
-            return;
-        }
-        let normalized = scala_normalized_fq_name(&path);
-        for owner in &spec.receiver_owners {
-            let owner_fq_name = owner.fq_name();
-            if normalized == scala_normalized_fq_name(&owner_fq_name) {
-                let local_name = import
-                    .identifier
-                    .clone()
-                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-                self.add_receiver_type_name(local_name, owner_fq_name);
-            }
-        }
-    }
-
-    fn apply_imported_factory_receiver(
-        &mut self,
-        scala: &ScalaAnalyzer,
-        resolver: &NameResolver,
-        import: &ImportInfo,
-        spec: &TargetSpec,
-        file_package: &str,
-    ) {
-        if import.is_wildcard || spec.kind != TargetKind::Method {
-            return;
-        }
-        let Some(path) = scala_import_path(import) else {
-            return;
-        };
-        let candidate_fq_names = import_candidate_fq_names(&path, file_package);
-        let local_name = import
-            .identifier
-            .clone()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
-        for candidate in candidate_fq_names {
-            for unit in scala
-                .definitions(&candidate)
-                .filter(|unit| unit.is_function())
-            {
-                if let Some(owner_fq_name) =
-                    imported_factory_return_owner(scala, resolver, &unit, spec)
-                {
-                    self.add_receiver_name(local_name, owner_fq_name);
-                    return;
-                }
-            }
-            let object_candidate = object_member_fq_name(&candidate);
-            for unit in scala
-                .definitions(&object_candidate)
-                .filter(|unit| unit.is_function())
-            {
-                if let Some(owner_fq_name) =
-                    imported_factory_return_owner(scala, resolver, &unit, spec)
-                {
-                    self.add_receiver_name(local_name, owner_fq_name);
-                    return;
-                }
-            }
-        }
-    }
-
-    pub(super) fn matching_import_names(
-        import: &ImportInfo,
-        spec: &TargetSpec,
-        file_package: &str,
-    ) -> ImportNames {
-        let Some(path) = scala_import_path(import) else {
-            return ImportNames::default();
-        };
-        let mut names = ImportNames::default();
-        let local_name = import
-            .identifier
-            .as_deref()
-            .map(str::to_string)
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()).to_string());
-        if import.is_wildcard {
-            let candidates = import_candidate_fq_names(&path, file_package);
-            let normalized_candidates: HashSet<String> = candidates
-                .iter()
-                .map(|candidate| scala_normalized_fq_name(candidate))
-                .collect();
-            if candidates.contains(spec.target.package_name()) {
-                names.type_names.insert(spec.member_name.clone());
-                if spec.owner.is_none() {
-                    names.direct_member_names.insert(spec.member_name.clone());
-                }
-            }
-            if spec
-                .owner
-                .as_ref()
-                .is_some_and(|owner| candidates.contains(owner.package_name()))
-                && let Some(owner_name) = spec.owner_name.as_ref()
-                && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
-            {
-                names
-                    .owner_names
-                    .insert(owner_name.clone(), owner_fq_name.clone());
-            }
-            if spec.owner_fq_name.as_ref().is_some_and(|owner_fq| {
-                normalized_candidates.contains(&scala_normalized_fq_name(owner_fq))
-            }) {
-                names.direct_member_names.insert(spec.member_name.clone());
-            }
-            return names;
-        }
-
-        let normalized_candidates: HashSet<String> = import_candidate_fq_names(&path, file_package)
-            .into_iter()
-            .map(|candidate| scala_normalized_fq_name(&candidate))
-            .collect();
-        if normalized_candidates.contains(&spec.target_fq_name) {
-            names.type_names.insert(local_name.clone());
-        }
-        if spec.owner_fq_name.as_ref().is_some_and(|owner_fq| {
-            normalized_candidates.contains(&scala_normalized_fq_name(owner_fq))
-        }) {
-            if let Some(owner_fq_name) = spec.owner_fq_name.as_ref() {
-                names
-                    .owner_names
-                    .insert(local_name.clone(), owner_fq_name.clone());
-            }
-            if spec.kind == TargetKind::Constructor {
-                names.type_names.insert(local_name.clone());
-            }
-        }
-        if normalized_candidates.contains(&spec.target_fq_name) && spec.kind != TargetKind::Type {
-            names.direct_member_names.insert(local_name);
-        }
-        names
-    }
 }
 
 pub(in crate::analyzer::usages) fn import_candidate_fq_names(
@@ -986,96 +671,6 @@ pub(in crate::analyzer::usages) fn import_candidate_owner_fq_names(
         }
     }
     owners
-}
-
-fn object_member_fq_name(fq_name: &str) -> String {
-    let Some((owner, member)) = fq_name.rsplit_once('.') else {
-        return fq_name.to_string();
-    };
-    if owner.ends_with('$') {
-        fq_name.to_string()
-    } else {
-        format!("{owner}$.{member}")
-    }
-}
-
-#[derive(Default)]
-pub(super) struct ImportNames {
-    pub(super) type_names: HashSet<String>,
-    pub(super) owner_names: HashMap<String, String>,
-    pub(super) direct_member_names: HashSet<String>,
-}
-
-fn ambiguous_wildcard_members(
-    scala: &ScalaAnalyzer,
-    file: &ProjectFile,
-    spec: &TargetSpec,
-) -> HashSet<String> {
-    if spec.kind == TargetKind::Type {
-        return HashSet::default();
-    }
-
-    let mut exposing_wildcards = HashSet::default();
-    let file_package = package_name_of(scala, file).unwrap_or_default();
-    for import in scala.import_info_of(file) {
-        if !import.is_wildcard {
-            continue;
-        }
-        let Some(path) = scala_import_path(&import) else {
-            continue;
-        };
-        if wildcard_path_could_expose(scala, &path, &file_package, spec) {
-            exposing_wildcards.insert(path);
-        }
-    }
-
-    let mut ambiguous = HashSet::default();
-    if exposing_wildcards.len() > 1 {
-        ambiguous.insert(spec.member_name.clone());
-    }
-    ambiguous
-}
-
-fn wildcard_path_could_expose(
-    scala: &ScalaAnalyzer,
-    path: &str,
-    file_package: &str,
-    spec: &TargetSpec,
-) -> bool {
-    let candidates = import_candidate_fq_names(path, file_package);
-    let normalized_candidates: HashSet<String> = candidates
-        .iter()
-        .map(|candidate| scala_normalized_fq_name(candidate))
-        .collect();
-    if spec.is_extension_method {
-        return scala.all_declarations().any(|unit| {
-            unit.is_function()
-                && unit.identifier() == spec.member_name
-                && unit
-                    .signature()
-                    .map(str::to_string)
-                    .or_else(|| scala.signatures(&unit).into_iter().next())
-                    .is_some_and(|signature| signature.starts_with("extension "))
-                && owner_of(scala, &unit).is_some_and(|owner| {
-                    normalized_candidates.contains(&scala_normalized_fq_name(&owner.fq_name()))
-                })
-        });
-    }
-
-    if spec.owner.is_none() {
-        return candidates.iter().any(|candidate| {
-            scala
-                .definitions(&format!("{candidate}.{}", spec.member_name))
-                .any(|unit| {
-                    matches!(spec.kind, TargetKind::Method) && unit.is_function()
-                        || matches!(spec.kind, TargetKind::Field) && unit.is_field()
-                })
-        });
-    }
-
-    spec.owner_fq_name
-        .as_ref()
-        .is_some_and(|owner_fq| normalized_candidates.contains(&scala_normalized_fq_name(owner_fq)))
 }
 
 fn signature_arity(signature: &str) -> Option<usize> {

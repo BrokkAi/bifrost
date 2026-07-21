@@ -19,6 +19,7 @@ fn test_could_import_file_relative_parent_import() {
         is_wildcard: false,
         identifier: Some("utils".to_string()),
         alias: None,
+        path: None,
     };
     assert!(analyzer.could_import_file(&source, &[import], &target));
 }
@@ -38,6 +39,7 @@ fn test_could_import_file_relative_parent_module_import() {
         is_wildcard: false,
         identifier: Some("something".to_string()),
         alias: None,
+        path: None,
     };
     assert!(analyzer.could_import_file(&source, &[import], &target));
 }
@@ -57,6 +59,7 @@ fn test_could_import_file_invalid_relative_import_conservative_return() {
         is_wildcard: false,
         identifier: Some("utils".to_string()),
         alias: None,
+        path: None,
     };
     assert!(analyzer.could_import_file(&source, &[import], &target));
 }
@@ -76,6 +79,7 @@ fn test_could_import_file_negative_match() {
         is_wildcard: false,
         identifier: Some("unrelated".to_string()),
         alias: None,
+        path: None,
     };
     assert!(!analyzer.could_import_file(&source, &[import], &target));
 }

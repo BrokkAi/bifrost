@@ -7,6 +7,7 @@ mod semantic;
 pub(crate) mod structural;
 mod supertypes;
 mod tests;
+pub(crate) mod wildcard_imports;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
@@ -20,8 +21,8 @@ use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
     DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
     ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
-    build_direct_descendant_index,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex, build_direct_descendant_index_from_candidates,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -33,8 +34,18 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 pub(crate) use declarations::scala_class_parameter_field_keyword;
-pub(crate) use supertypes::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
+pub(crate) use imports::{ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at};
+pub(crate) use supertypes::{
+    ScalaSupertypeLookupPath, scala_supertype_lookup_nodes, scala_type_lookup_segments,
+};
 use tests::detect_scala_test_assertion_smells;
+pub(crate) use wildcard_imports::{
+    ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
+    ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
+    resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
+    scala_import_path, scala_import_path_candidates, scala_import_visible_at,
+    scala_package_prefixes_at,
+};
 
 pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
@@ -133,6 +144,7 @@ pub struct ScalaAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    package_namespaces: Arc<OnceLock<Vec<String>>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
@@ -140,6 +152,8 @@ pub struct ScalaAnalyzer {
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
     project_types_build_count: Arc<AtomicUsize>,
+    scala_query_parse_count: Arc<AtomicUsize>,
+    scala_query_walk_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
@@ -147,6 +161,60 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
+    pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
+    }
+
+    pub(crate) fn import_lexical_context_for_unit(
+        &self,
+        unit: &CodeUnit,
+    ) -> Option<(
+        Vec<String>,
+        Vec<crate::analyzer::StructuredImportScope>,
+        usize,
+    )> {
+        let reference_byte = self
+            .ranges(unit)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .min()?;
+        let prepared = self.inner.prepared_syntax(unit.source())?;
+        let root = prepared.tree().root_node();
+        Some((
+            scala_package_prefixes_at(root, prepared.source(), reference_byte),
+            scala_lexical_scope_path_at(root, reference_byte),
+            reference_byte,
+        ))
+    }
+
+    pub(crate) fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
+        self.inner
+            .fetch_file_state(owner.source())
+            .and_then(|state| state.scala_exports.get(owner).cloned())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit)
+    }
+
+    pub(crate) fn is_full_enum_case_declaration(&self, code_unit: &CodeUnit) -> bool {
+        if !code_unit.is_class() {
+            return false;
+        }
+        let Some(range) = self.ranges(code_unit).into_iter().next() else {
+            return false;
+        };
+        let Some(prepared) = self.inner.prepared_syntax(code_unit.source()) else {
+            return false;
+        };
+        prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+            .is_some_and(|node| node.kind() == "full_enum_case")
+    }
+
     pub(crate) fn forward_owner_facts(
         &self,
         code_unit: &CodeUnit,
@@ -182,6 +250,8 @@ impl ScalaAnalyzer {
         clone.inner = clone.inner.clone_with_project(project);
         clone.project_types = Arc::new(OnceLock::new());
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
+        clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
+        clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
         clone
     }
 
@@ -204,22 +274,27 @@ impl ScalaAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             importable_declarations_by_package: Arc::new(OnceLock::new()),
+            package_namespaces: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
+            scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
+            scala_query_walk_count: Arc::new(AtomicUsize::new(0)),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
 
     /// Owned handles to the workspace indexes (refcount bumps, not map
     /// clones), for per-query views held behind `Arc` caches.
+    #[allow(dead_code)]
     pub(crate) fn global_usage_definition_index_shared(
         &self,
     ) -> Arc<crate::analyzer::GlobalUsageDefinitionIndex> {
         self.inner.global_usage_definition_index_shared()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
         self.inner.usage_facts_index_shared()
     }
@@ -227,11 +302,42 @@ impl ScalaAnalyzer {
     pub(crate) fn project_types(
         &self,
     ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+        self.initialize_project_types(|| {
+            self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
+        })
+    }
+
+    pub(crate) fn record_query_parse(&self) {
+        self.scala_query_parse_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_query_walk(&self) {
+        self.scala_query_walk_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn project_types_from_file_states(
+        &self,
+        file_states: HashMap<ProjectFile, FileState>,
+    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+        self.initialize_project_types(|| file_states)
+    }
+
+    fn initialize_project_types<F>(
+        &self,
+        file_states: F,
+    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>
+    where
+        F: FnOnce() -> HashMap<ProjectFile, FileState>,
+    {
         self.project_types
             .get_or_init(|| {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(crate::analyzer::usages::scala_graph::ScalaProjectTypes::build(self))
+                Arc::new(
+                    crate::analyzer::usages::scala_graph::ScalaProjectTypes::build_from_file_states(
+                        file_states(),
+                    ),
+                )
             })
             .clone()
     }
@@ -339,6 +445,12 @@ impl ScalaAnalyzer {
 
 impl TestDetectionProvider for ScalaAnalyzer {}
 
+impl TypeAliasProvider for ScalaAnalyzer {
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
+    }
+}
+
 impl IAnalyzer for ScalaAnalyzer {
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
@@ -429,6 +541,19 @@ impl IAnalyzer for ScalaAnalyzer {
         self.project_types_build_count.load(Ordering::Relaxed)
     }
 
+    fn reset_scala_query_scan_counts_for_test(&self) {
+        self.scala_query_parse_count.store(0, Ordering::Relaxed);
+        self.scala_query_walk_count.store(0, Ordering::Relaxed);
+    }
+
+    fn scala_query_parse_count_for_test(&self) -> usize {
+        self.scala_query_parse_count.load(Ordering::Relaxed)
+    }
+
+    fn scala_query_walk_count_for_test(&self) -> usize {
+        self.scala_query_walk_count.load(Ordering::Relaxed)
+    }
+
     fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
         self.inner.global_usage_definition_index()
     }
@@ -449,6 +574,11 @@ impl IAnalyzer for ScalaAnalyzer {
             .into_iter()
             .filter(|child| !child.is_synthetic())
             .collect()
+    }
+
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.structural_parent_of(code_unit)
+            .or_else(|| IAnalyzer::parent_of(&self.inner, code_unit))
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -494,6 +624,10 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
         Some(self)
     }
 

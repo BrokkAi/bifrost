@@ -138,6 +138,7 @@ fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
         is_wildcard: false,
         identifier,
         alias,
+        path: None,
     })
 }
 

@@ -450,6 +450,7 @@ pub(super) fn parse_python_import_infos(raw: &str) -> Vec<ImportInfo> {
                         .to_string()
                 })),
                 alias,
+                path: None,
             });
         }
     } else if let Some((module, names)) = raw
@@ -462,6 +463,7 @@ pub(super) fn parse_python_import_infos(raw: &str) -> Vec<ImportInfo> {
                 is_wildcard: true,
                 identifier: None,
                 alias: None,
+                path: None,
             });
         } else {
             for part in split_top_level_commas(names) {
@@ -475,6 +477,7 @@ pub(super) fn parse_python_import_infos(raw: &str) -> Vec<ImportInfo> {
                     is_wildcard: false,
                     identifier: Some(alias.clone().unwrap_or_else(|| name.clone())),
                     alias,
+                    path: None,
                 });
             }
         }

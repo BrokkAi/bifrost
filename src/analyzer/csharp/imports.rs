@@ -265,6 +265,7 @@ pub(super) fn csharp_import_info(raw: String) -> ImportInfo {
         is_wildcard: true,
         identifier,
         alias: None,
+        path: None,
     }
 }
 
@@ -292,6 +293,7 @@ pub(super) fn csharp_import_info_from_using_directive(
             is_wildcard: false,
             identifier: Some(target),
             alias: None,
+            path: None,
         });
     }
     csharp_using_alias_from_node(node, source).map(|(alias, target)| ImportInfo {
@@ -299,6 +301,7 @@ pub(super) fn csharp_import_info_from_using_directive(
         is_wildcard: false,
         identifier: Some(target),
         alias: Some(alias),
+        path: None,
     })
 }
 

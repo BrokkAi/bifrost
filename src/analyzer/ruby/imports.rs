@@ -26,6 +26,7 @@ pub(super) fn parse_ruby_require_call(node: Node<'_>, source: &str) -> Option<Im
         is_wildcard: false,
         identifier: Some(path),
         alias: None,
+        path: None,
     })
 }
 
@@ -365,6 +366,7 @@ fn collect_ruby_autoload_edges(
                 is_wildcard: false,
                 identifier: Some(path),
                 alias: None,
+                path: None,
             };
             if let Some(required) = resolve_required_file(file, &import) {
                 files.insert(required);

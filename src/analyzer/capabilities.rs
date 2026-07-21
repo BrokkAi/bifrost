@@ -307,11 +307,24 @@ where
     A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
 {
-    let mut candidates = analyzer
-        .all_declarations()
-        .filter(|candidate| candidate.is_class())
-        .collect::<Vec<_>>();
+    build_direct_descendant_index_from_candidates(
+        analyzer
+            .all_declarations()
+            .filter(|candidate| candidate.is_class())
+            .collect(),
+        |candidate| provider.get_direct_ancestors(candidate),
+    )
+}
+
+pub(crate) fn build_direct_descendant_index_from_candidates<F>(
+    mut candidates: Vec<CodeUnit>,
+    mut direct_ancestors: F,
+) -> DirectDescendantIndex
+where
+    F: FnMut(&CodeUnit) -> Vec<CodeUnit>,
+{
     candidates.sort();
+    candidates.dedup();
     let mut types_by_fq_name: HashMap<String, Vec<CodeUnit>> = HashMap::default();
     for candidate in &candidates {
         types_by_fq_name
@@ -333,7 +346,7 @@ where
     let mut edges = Vec::new();
     for candidate in candidates {
         let descendant = index_by_node[&candidate];
-        for ancestor in provider.get_direct_ancestors(&candidate) {
+        for ancestor in direct_ancestors(&candidate) {
             let ancestor = types_by_fq_name
                 .get(&ancestor.fq_name())
                 .and_then(|same_name| {

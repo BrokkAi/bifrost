@@ -510,6 +510,12 @@ fn scope_has_matching_local(
                 continue;
             }
             if language == Language::Scala
+                && node.kind() == "enumerator"
+                && !scala_enumerator_binding_visible_at(node, focus_start)
+            {
+                continue;
+            }
+            if language == Language::Scala
                 && matches!(node.kind(), "val_definition" | "var_definition")
                 && (!scala_has_value_definition_keyword(node)
                     || node.child_by_field_name("pattern").is_none())
@@ -547,6 +553,19 @@ fn js_ts_scope_declaration_matches(
         .is_some_and(|name| identifier_matches(language, name, source, identifier))
 }
 
+fn scala_enumerator_binding_visible_at(enumerator: Node<'_>, focus_start: usize) -> bool {
+    let Some(pattern) = enumerator
+        .named_child(0)
+        .filter(|child| child.kind() != "guard")
+    else {
+        return false;
+    };
+    enumerator
+        .named_children(&mut enumerator.walk())
+        .find(|child| child.start_byte() >= pattern.end_byte() && child.kind() != "guard")
+        .is_some_and(|expression| expression.end_byte() <= focus_start)
+}
+
 fn scala_has_value_definition_keyword(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)
@@ -555,6 +574,18 @@ fn scala_has_value_definition_keyword(node: Node<'_>) -> bool {
 
 fn binding_name_nodes(language: Language, declaration: Node<'_>, parameter: bool) -> Vec<Node<'_>> {
     let mut roots = Vec::new();
+    if language == Language::Scala && declaration.kind() == "enumerator" {
+        // tree-sitter-scala represents both generators (`pattern <- expression`)
+        // and value enumerators (`pattern = expression`) with an `enumerator`
+        // node. Its first named child is the binding pattern; guard-only
+        // enumerators instead begin with a `guard` and declare nothing.
+        if let Some(pattern) = declaration
+            .named_child(0)
+            .filter(|child| child.kind() != "guard")
+        {
+            roots.push(pattern);
+        }
+    }
     for field in ["name", "pattern", "declarator", "left"] {
         push_field_children(declaration, field, &mut roots);
     }
@@ -932,7 +963,7 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
         Language::Rust => matches!(kind, "let_declaration" | "for_expression"),
         Language::Scala => matches!(
             kind,
-            "val_definition" | "var_definition" | "generator" | "case_clause"
+            "val_definition" | "var_definition" | "enumerator" | "case_clause"
         ),
         Language::CSharp => matches!(
             kind,

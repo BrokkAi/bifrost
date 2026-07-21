@@ -353,6 +353,7 @@ pub struct FileState {
     pub(crate) definition_lookup_units: HashSet<CodeUnit>,
     pub(crate) import_statements: Vec<String>,
     pub(crate) imports: Vec<ImportInfo>,
+    pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub(crate) supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub(crate) type_identifiers: HashSet<String>,
@@ -782,6 +783,7 @@ pub struct ParsedFile {
     pub definition_lookup_units: HashSet<CodeUnit>,
     pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
+    pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
     pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub type_identifiers: HashSet<String>,
@@ -856,6 +858,7 @@ impl ParsedFile {
             definition_lookup_units: HashSet::default(),
             import_statements: Vec::new(),
             imports: Vec::new(),
+            scala_exports: HashMap::default(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),
@@ -1577,6 +1580,7 @@ where
             definition_lookup_units: parsed.definition_lookup_units,
             import_statements: parsed.import_statements,
             imports: parsed.imports,
+            scala_exports: parsed.scala_exports,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
@@ -6368,6 +6372,7 @@ mod tests {
             definition_lookup_units: HashSet::default(),
             import_statements: Vec::new(),
             imports: Vec::new(),
+            scala_exports: HashMap::default(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),
@@ -6976,6 +6981,7 @@ mod tests {
             is_wildcard: false,
             identifier: Some("value".to_string()),
             alias: None,
+            path: None,
         });
         assert!(adapter.storage_contains_tests(&state));
         assert!(adapter.hydrate_contains_tests(false, &tsx_file, ""));

@@ -694,6 +694,7 @@ pub(super) fn parse_import_info(raw: String) -> ImportInfo {
         is_wildcard,
         identifier,
         alias: None,
+        path: None,
     }
 }
 

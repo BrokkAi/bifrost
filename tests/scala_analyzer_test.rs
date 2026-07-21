@@ -25,6 +25,71 @@ fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
 }
 
 #[test]
+fn scala_indexes_source_backed_type_aliases_with_distinct_namespace_identity() {
+    let source = r#"package aliases
+
+type Ordinary = String
+opaque type Selector = String
+
+object Fiber {
+  object Promise {
+    opaque type Unsafe = String
+    object Unsafe
+  }
+}
+"#;
+    let project = inline_scala_project(&[("aliases/Aliases.scala", source)]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+
+    let ordinary = definition(&analyzer, "aliases.Ordinary");
+    let selector = definition(&analyzer, "aliases.Selector");
+    let unsafe_alias = definition(&analyzer, "aliases.Fiber$.Promise$.Unsafe");
+    let unsafe_companion = definition(&analyzer, "aliases.Fiber$.Promise$.Unsafe$");
+
+    for alias in [&ordinary, &selector, &unsafe_alias] {
+        assert_eq!(alias.kind(), CodeUnitType::Field);
+        assert!(analyzer.is_type_alias(alias), "{}", alias.fq_name());
+        assert!(
+            analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(alias)),
+            "{}",
+            alias.fq_name()
+        );
+        assert_eq!(
+            analyzer.get_source(alias, false).as_deref(),
+            analyzer.signatures(alias).first().map(String::as_str)
+        );
+    }
+    assert_eq!(ordinary.short_name(), "Ordinary");
+    assert_eq!(selector.short_name(), "Selector");
+    assert_eq!(unsafe_alias.short_name(), "Fiber$.Promise$.Unsafe");
+    assert_eq!(
+        analyzer
+            .parent_of(&unsafe_alias)
+            .map(|parent| parent.fq_name()),
+        Some("aliases.Fiber$.Promise$".to_string())
+    );
+    assert!(unsafe_companion.is_class());
+    assert!(!analyzer.is_type_alias(&unsafe_companion));
+    assert_ne!(unsafe_alias, unsafe_companion);
+
+    let expected = "opaque type Unsafe = String";
+    let expected_start = source.find(expected).expect("nested alias source");
+    let range = analyzer
+        .ranges(&unsafe_alias)
+        .into_iter()
+        .next()
+        .expect("alias range");
+    assert_eq!(range.start_byte, expected_start);
+    assert_eq!(range.end_byte, expected_start + expected.len());
+    assert_eq!(
+        analyzer.get_source(&unsafe_alias, false).as_deref(),
+        Some(expected)
+    );
+}
+
+#[test]
 fn test_simple_unqualified_classes() {
     let project = inline_scala_project(&[(
         "Foo.scala",
@@ -56,6 +121,18 @@ fn test_simple_unqualified_classes() {
     let color = definition(&analyzer, "Color");
     assert!(color.is_class());
     assert_eq!("Color", color.fq_name());
+}
+
+#[test]
+fn scala_indented_root_type_without_unmatched_end_marker_remains_top_level() {
+    let project = inline_scala_project(&[("RootTypes.scala", "package p\nclass A\n  class B\n")]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "RootTypes.scala");
+
+    let top_level = analyzer.top_level_declarations(&file);
+    assert!(top_level.iter().any(|unit| unit.fq_name() == "p.A"));
+    assert!(top_level.iter().any(|unit| unit.fq_name() == "p.B"));
+    assert!(analyzer.get_definitions("p.A.B").is_empty());
 }
 
 #[test]

@@ -1,10 +1,12 @@
 use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
+    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
 };
+use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
-use super::imports::parse_scala_import_infos;
-use super::supertypes::extract_scala_supertypes;
+use super::imports::{scala_export_info_from_node, scala_import_infos_from_node_with_prefixes};
+use super::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
+use super::wildcard_imports::scala_package_prefixes_at;
 
 pub(super) fn parse_scala_file(
     file: &ProjectFile,
@@ -18,7 +20,48 @@ pub(super) fn parse_scala_file(
         parsed: &mut parsed,
     };
     visitor.visit_compilation_unit(tree.root_node(), "");
+    collect_scala_imports(tree.root_node(), source, &mut parsed);
     parsed
+}
+
+fn scala_compilation_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut named_cursor = node.walk();
+    let mut children = node.named_children(&mut named_cursor).collect::<Vec<_>>();
+    let mut token_cursor = node.walk();
+    children.extend(
+        node.children(&mut token_cursor)
+            .filter(|child| !child.is_named() && child.kind() == "_end_ident"),
+    );
+    children.sort_unstable_by_key(Node::start_byte);
+    children
+}
+
+fn collect_scala_imports(
+    root: Node<'_>,
+    source: &str,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "import_declaration" {
+            let raw = scala_node_text(node, source).trim().to_string();
+            if !raw.is_empty() {
+                let package_prefixes = scala_package_prefixes_at(root, source, node.start_byte());
+                parsed
+                    .imports
+                    .extend(scala_import_infos_from_node_with_prefixes(
+                        node,
+                        source,
+                        &package_prefixes,
+                    ));
+                parsed.import_statements.push(raw);
+            }
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
 }
 
 struct ScalaVisitor<'a> {
@@ -32,23 +75,32 @@ enum ScalaWork<'tree> {
         children: Vec<Node<'tree>>,
         index: usize,
         package_name: String,
-        recovery_parent: Option<CodeUnit>,
+        package_prefixes: Vec<String>,
+        recovery_owners: Vec<ScalaRecoveryOwner>,
     },
     TemplateBody {
         node: Node<'tree>,
         package_name: String,
+        package_prefixes: Vec<String>,
         parent: CodeUnit,
     },
 }
 
+#[derive(Clone)]
+struct ScalaRecoveryOwner {
+    declaration: CodeUnit,
+    name: String,
+    indentation: usize,
+}
+
 impl<'a> ScalaVisitor<'a> {
     fn visit_compilation_unit(&mut self, node: Node<'_>, package_name: &str) {
-        let mut cursor = node.walk();
         let mut stack = vec![ScalaWork::CompilationUnit {
-            children: node.named_children(&mut cursor).collect(),
+            children: scala_compilation_children(node),
             index: 0,
             package_name: package_name.to_string(),
-            recovery_parent: None,
+            package_prefixes: Vec::new(),
+            recovery_owners: Vec::new(),
         }];
         while let Some(work) = stack.pop() {
             match work {
@@ -56,19 +108,28 @@ impl<'a> ScalaVisitor<'a> {
                     children,
                     index,
                     package_name,
-                    recovery_parent,
+                    package_prefixes,
+                    recovery_owners,
                 } => self.process_compilation_unit(
                     children,
                     index,
                     package_name,
-                    recovery_parent,
+                    package_prefixes,
+                    recovery_owners,
                     &mut stack,
                 ),
                 ScalaWork::TemplateBody {
                     node,
                     package_name,
+                    package_prefixes,
                     parent,
-                } => self.process_template_body(node, &package_name, &parent, &mut stack),
+                } => self.process_template_body(
+                    node,
+                    &package_name,
+                    &package_prefixes,
+                    &parent,
+                    &mut stack,
+                ),
             }
         }
     }
@@ -78,12 +139,47 @@ impl<'a> ScalaVisitor<'a> {
         children: Vec<Node<'tree>>,
         mut index: usize,
         mut current_package: String,
-        mut recovery_parent: Option<CodeUnit>,
+        mut package_prefixes: Vec<String>,
+        mut recovery_owners: Vec<ScalaRecoveryOwner>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
+        let mut unmatched_end_names = HashMap::<String, usize>::default();
+        for candidate in &children[index..] {
+            if candidate.kind() == "_end_ident" {
+                *unmatched_end_names
+                    .entry(scala_node_text(*candidate, self.source).trim().to_string())
+                    .or_default() += 1;
+            }
+        }
         while index < children.len() {
             let child = children[index];
             index += 1;
+            if child.kind() == "_end_ident" {
+                let name = scala_node_text(child, self.source).trim();
+                if let Some(count) = unmatched_end_names.get_mut(name) {
+                    *count -= 1;
+                    if *count == 0 {
+                        unmatched_end_names.remove(name);
+                    }
+                }
+                if let Some(position) = recovery_owners.iter().rposition(|owner| owner.name == name)
+                {
+                    recovery_owners.truncate(position);
+                }
+                continue;
+            }
+            if child.is_named() {
+                let indentation = child.start_position().column;
+                while recovery_owners
+                    .last()
+                    .is_some_and(|owner| owner.indentation >= indentation)
+                {
+                    recovery_owners.pop();
+                }
+            }
+            let recovery_parent = recovery_owners
+                .last()
+                .map(|owner| owner.declaration.clone());
             match child.kind() {
                 "package_clause" => {
                     let package = scala_package_name(child, self.source);
@@ -97,34 +193,45 @@ impl<'a> ScalaVisitor<'a> {
                             self.parsed.package_name = current_package.clone();
                             self.parsed.content_qualifier = current_package.clone();
                         }
+                        package_prefixes.push(current_package.clone());
                     }
                     if let Some(body) = child.child_by_field_name("body") {
                         stack.push(ScalaWork::CompilationUnit {
                             children,
                             index,
                             package_name: current_package.clone(),
-                            recovery_parent: recovery_parent.clone(),
+                            package_prefixes: package_prefixes.clone(),
+                            recovery_owners: recovery_owners.clone(),
                         });
-                        let mut cursor = body.walk();
                         stack.push(ScalaWork::CompilationUnit {
-                            children: body.named_children(&mut cursor).collect(),
+                            children: scala_compilation_children(body),
                             index: 0,
                             package_name: current_package.clone(),
-                            recovery_parent: None,
+                            package_prefixes: package_prefixes.clone(),
+                            recovery_owners: Vec::new(),
                         });
                         return;
                     }
                 }
-                "import_declaration" => {
-                    let raw = scala_node_text(child, self.source).trim().to_string();
-                    if !raw.is_empty() {
-                        self.parsed.imports.extend(parse_scala_import_infos(&raw));
-                        self.parsed.import_statements.push(raw);
-                    }
-                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
-                    self.visit_type_declaration(child, &current_package, None, stack);
+                    let name = scala_type_declaration_name_node(child)
+                        .map(|name| scala_node_text(name, self.source).trim().to_string());
+                    if let Some(declaration) = self.visit_type_declaration(
+                        child,
+                        &current_package,
+                        &package_prefixes,
+                        recovery_parent,
+                        stack,
+                    ) && let Some(name) = name
+                        && unmatched_end_names.contains_key(&name)
+                    {
+                        recovery_owners.push(ScalaRecoveryOwner {
+                            declaration,
+                            name,
+                            indentation: child.start_position().column,
+                        });
+                    }
                 }
                 "function_definition" | "function_declaration" => {
                     self.visit_function(child, &current_package, recovery_parent.clone())
@@ -132,18 +239,46 @@ impl<'a> ScalaVisitor<'a> {
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, &current_package, recovery_parent.clone())
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, &current_package, recovery_parent.clone())
+                }
                 "ERROR" => {
-                    // tree-sitter-scala sometimes recovers annotated constructor headers as a
-                    // top-level ERROR containing the class, followed by body members as siblings.
-                    if recovery_parent.is_some() && scala_error_is_closing_brace(child, self.source)
+                    // Tree-sitter can recover a malformed type header as either a definition
+                    // inside ERROR or keyword/name/colon children, then emit indented members as
+                    // compilation-unit siblings. Preserve the structured owner until its end
+                    // marker or a dedent proves the recovery scope has ended.
+                    if let Some(type_node) = scala_error_type_declaration(child) {
+                        let name = scala_type_declaration_name_node(type_node)
+                            .map(|name| scala_node_text(name, self.source).trim().to_string());
+                        if let Some(declaration) = self.visit_type_declaration(
+                            type_node,
+                            &current_package,
+                            &package_prefixes,
+                            recovery_parent,
+                            stack,
+                        ) && let Some(name) = name
+                        {
+                            recovery_owners.push(ScalaRecoveryOwner {
+                                declaration,
+                                name,
+                                indentation: child.start_position().column,
+                            });
+                        }
+                    } else if let Some((kind, name_node, colon)) = scala_error_type_header(child)
+                        && let Some(declaration) = self.visit_recovered_type_header(
+                            child,
+                            colon,
+                            kind,
+                            name_node,
+                            &current_package,
+                            recovery_parent,
+                        )
                     {
-                        recovery_parent = None;
-                    } else if recovery_parent.is_none()
-                        && let Some(type_node) = scala_error_type_declaration(child)
-                        && let Some(parent) =
-                            self.visit_type_declaration(type_node, &current_package, None, stack)
-                    {
-                        recovery_parent = Some(parent);
+                        recovery_owners.push(ScalaRecoveryOwner {
+                            declaration,
+                            name: scala_node_text(name_node, self.source).trim().to_string(),
+                            indentation: child.start_position().column,
+                        });
                     }
                 }
                 _ => {}
@@ -151,10 +286,61 @@ impl<'a> ScalaVisitor<'a> {
         }
     }
 
+    fn visit_recovered_type_header(
+        &mut self,
+        node: Node<'_>,
+        colon: Node<'_>,
+        kind: &str,
+        name_node: Node<'_>,
+        package_name: &str,
+        parent: Option<CodeUnit>,
+    ) -> Option<CodeUnit> {
+        let raw_name = scala_node_text(name_node, self.source).trim();
+        if raw_name.is_empty() {
+            return None;
+        }
+        let display_name = if kind == "object" {
+            format!("{raw_name}$")
+        } else {
+            raw_name.to_string()
+        };
+        let short_name = parent.as_ref().map_or_else(
+            || display_name.clone(),
+            |parent| format!("{}.{}", parent.short_name(), display_name),
+        );
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Class,
+            package_name.to_string(),
+            short_name,
+        );
+        if self.parsed.contains_declaration(&code_unit) {
+            return Some(code_unit);
+        }
+        self.parsed.add_code_unit_with_range(
+            code_unit.clone(),
+            Range {
+                start_byte: node.start_byte(),
+                end_byte: colon.end_byte(),
+                start_line: node.start_position().row,
+                end_line: colon.end_position().row,
+            },
+            parent,
+            None,
+        );
+        self.parsed
+            .add_signature(code_unit.clone(), format!("{kind} {raw_name}"));
+        if kind == "trait" {
+            self.parsed.set_scala_trait(code_unit.clone());
+        }
+        Some(code_unit)
+    }
+
     fn visit_type_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
         package_name: &str,
+        package_prefixes: &[String],
         parent: Option<CodeUnit>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) -> Option<CodeUnit> {
@@ -188,7 +374,11 @@ impl<'a> ScalaVisitor<'a> {
             .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
         self.parsed
             .add_signature(code_unit.clone(), scala_type_signature(node, self.source));
-        let raw_supertypes = extract_scala_supertypes(node, self.source);
+        let mut raw_supertypes = Vec::new();
+        if let Some(enum_owner) = scala_full_enum_case_owner_supertype(node, self.source) {
+            raw_supertypes.push(enum_owner);
+        }
+        raw_supertypes.extend(extract_scala_supertypes(node, self.source));
         if !raw_supertypes.is_empty() {
             self.parsed.set_raw_supertypes(
                 code_unit.clone(),
@@ -206,7 +396,9 @@ impl<'a> ScalaVisitor<'a> {
             self.parsed.set_scala_trait(code_unit.clone());
         }
 
-        if node.kind() == "class_definition" && !scala_class_parameter_lists(node).is_empty() {
+        if matches!(node.kind(), "class_definition" | "full_enum_case")
+            && !scala_class_parameter_lists(node).is_empty()
+        {
             let constructor = CodeUnit::new(
                 self.file.clone(),
                 CodeUnitType::Function,
@@ -233,6 +425,7 @@ impl<'a> ScalaVisitor<'a> {
             stack.push(ScalaWork::TemplateBody {
                 node: body,
                 package_name: package_name.to_string(),
+                package_prefixes: package_prefixes.to_vec(),
                 parent: code_unit.clone(),
             });
         }
@@ -245,7 +438,8 @@ impl<'a> ScalaVisitor<'a> {
         package_name: &str,
         parent: &CodeUnit,
     ) {
-        let is_case_class = scala_is_case_class_definition(node, self.source);
+        let is_case_class =
+            node.kind() == "full_enum_case" || scala_is_case_class_definition(node, self.source);
         for parameters in scala_class_parameter_lists(node) {
             let mut cursor = parameters.walk();
             for parameter in parameters.named_children(&mut cursor) {
@@ -287,6 +481,7 @@ impl<'a> ScalaVisitor<'a> {
         &mut self,
         body: Node<'tree>,
         package_name: &str,
+        package_prefixes: &[String],
         parent: &CodeUnit,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
@@ -294,31 +489,56 @@ impl<'a> ScalaVisitor<'a> {
         let children = body.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children {
             match child.kind() {
-                "import_declaration" => {
-                    let raw = scala_node_text(child, self.source).trim().to_string();
-                    if !raw.is_empty() {
-                        self.parsed.imports.extend(parse_scala_import_infos(&raw));
-                        self.parsed.import_statements.push(raw);
-                    }
-                }
                 "function_definition" | "function_declaration" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
                 }
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
+                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
-                    self.visit_type_declaration(child, package_name, Some(parent.clone()), stack);
+                    self.visit_type_declaration(
+                        child,
+                        package_name,
+                        package_prefixes,
+                        Some(parent.clone()),
+                        stack,
+                    );
                 }
-                "extension_definition" => {
-                    self.visit_extension_definition(child, package_name, parent, stack)
+                "extension_definition" => self.visit_extension_definition(
+                    child,
+                    package_name,
+                    package_prefixes,
+                    parent,
+                    stack,
+                ),
+                "export_declaration" => {
+                    if let Some(info) = scala_export_info_from_node(child, self.source) {
+                        self.parsed
+                            .scala_exports
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(info);
+                    }
                 }
                 "simple_enum_case" => self.visit_enum_case(child, package_name, parent),
+                "full_enum_case" => {
+                    self.visit_type_declaration(
+                        child,
+                        package_name,
+                        package_prefixes,
+                        Some(parent.clone()),
+                        stack,
+                    );
+                }
                 "enum_case_definitions" | "enum_body" => {
                     stack.push(ScalaWork::TemplateBody {
                         node: child,
                         package_name: package_name.to_string(),
+                        package_prefixes: package_prefixes.to_vec(),
                         parent: parent.clone(),
                     });
                 }
@@ -331,6 +551,7 @@ impl<'a> ScalaVisitor<'a> {
         &mut self,
         node: Node<'tree>,
         package_name: &str,
+        package_prefixes: &[String],
         parent: &CodeUnit,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
@@ -347,14 +568,24 @@ impl<'a> ScalaVisitor<'a> {
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
+                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
-                    self.visit_type_declaration(child, package_name, Some(parent.clone()), stack);
+                    self.visit_type_declaration(
+                        child,
+                        package_name,
+                        package_prefixes,
+                        Some(parent.clone()),
+                        stack,
+                    );
                 }
                 "template_body" | "block" | "indented_block" => self.visit_extension_block(
                     child,
                     receiver_parameters,
                     package_name,
+                    package_prefixes,
                     parent,
                     stack,
                 ),
@@ -368,6 +599,7 @@ impl<'a> ScalaVisitor<'a> {
         node: Node<'tree>,
         receiver_parameters: Option<Node<'tree>>,
         package_name: &str,
+        package_prefixes: &[String],
         parent: &CodeUnit,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
@@ -383,14 +615,24 @@ impl<'a> ScalaVisitor<'a> {
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
+                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
-                    self.visit_type_declaration(child, package_name, Some(parent.clone()), stack);
+                    self.visit_type_declaration(
+                        child,
+                        package_name,
+                        package_prefixes,
+                        Some(parent.clone()),
+                        stack,
+                    );
                 }
                 "template_body" | "block" | "indented_block" => self.visit_extension_block(
                     child,
                     receiver_parameters,
                     package_name,
+                    package_prefixes,
                     parent,
                     stack,
                 ),
@@ -495,6 +737,34 @@ impl<'a> ScalaVisitor<'a> {
         }
     }
 
+    fn visit_type_alias(&mut self, node: Node<'_>, package_name: &str, parent: Option<CodeUnit>) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = scala_node_text(name_node, self.source).trim();
+        if name.is_empty() {
+            return;
+        }
+
+        let short_name = parent.as_ref().map_or_else(
+            || name.to_string(),
+            |parent| format!("{}.{}", parent.short_name(), name),
+        );
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Field,
+            package_name.to_string(),
+            short_name,
+        );
+        self.parsed
+            .add_code_unit(code_unit.clone(), node, self.source, parent, None);
+        self.parsed.add_signature(
+            code_unit.clone(),
+            scala_node_text(node, self.source).trim().to_string(),
+        );
+        self.parsed.mark_type_alias(code_unit);
+    }
+
     fn visit_enum_case(&mut self, node: Node<'_>, package_name: &str, parent: &CodeUnit) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -551,8 +821,22 @@ fn scala_error_type_declaration(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn scala_error_is_closing_brace(node: Node<'_>, source: &str) -> bool {
-    scala_node_text(node, source).trim() == "}"
+fn scala_error_type_header(node: Node<'_>) -> Option<(&'static str, Node<'_>, Node<'_>)> {
+    let mut kind = None;
+    let mut name = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "class" => kind = Some("class"),
+            "object" => kind = Some("object"),
+            "trait" => kind = Some("trait"),
+            "enum" => kind = Some("enum"),
+            "identifier" if kind.is_some() && name.is_none() => name = Some(child),
+            ":" if kind.is_some() && name.is_some() => return Some((kind?, name?, child)),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn first_descendant_identifier(node: Node<'_>) -> Option<Node<'_>> {
@@ -583,6 +867,7 @@ fn scala_type_signature(node: Node<'_>, source: &str) -> String {
         "object_definition" => "object",
         "trait_definition" => "trait",
         "enum_definition" => "enum",
+        "full_enum_case" => "case",
         _ => "class",
     };
     let name = node

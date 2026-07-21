@@ -17,12 +17,46 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         self.direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get_or_init(|| self.build_direct_descendant_index())
             .descendants(code_unit)
     }
 }
 
 impl ScalaAnalyzer {
+    fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
+        let _scope = crate::profiling::scope("ScalaAnalyzer::build_direct_descendant_index");
+        let file_states = self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit);
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::default();
+        for state in file_states.values() {
+            for candidate in state
+                .definition_lookup_units
+                .iter()
+                .chain(&state.declarations)
+                .filter(|candidate| candidate.is_class())
+            {
+                if seen.insert(candidate.clone()) {
+                    candidates.push(candidate.clone());
+                }
+            }
+        }
+
+        let types = self.project_types_from_file_states(file_states);
+        let ancestors_by_owner = types
+            .exact_direct_ancestors_snapshot()
+            .expect("source-free Scala project types cache exact direct ancestors");
+        for (owner, ancestors) in ancestors_by_owner {
+            self.direct_ancestors
+                .insert(owner.clone(), Arc::new(ancestors.clone()));
+        }
+        build_direct_descendant_index_from_candidates(candidates, |candidate| {
+            ancestors_by_owner
+                .get(candidate)
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
+
     #[allow(dead_code)]
     pub(crate) fn type_relations(&self) -> &[TypeRelation] {
         self.type_relations
@@ -54,17 +88,24 @@ impl ScalaAnalyzer {
             return Vec::new();
         }
 
-        let resolver = ScalaNameResolver::for_file(self, code_unit.source(), types);
+        let Some(facts) = self.forward_owner_facts(code_unit) else {
+            return Vec::new();
+        };
+        let resolver = ScalaNameResolver::for_file_types(self, code_unit, types);
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
-        for raw in self.inner.raw_supertypes_of(code_unit) {
-            let Some(fqn) = resolver.resolve(&raw) else {
+        for path in facts.supertype_lookup_paths {
+            let Some(fqn) =
+                types.resolve_type_in_hierarchy_context(self, &resolver, path.segments())
+            else {
                 continue;
             };
             if !seen.insert(fqn.clone()) {
                 continue;
             }
-            if let Some(definition) = self.definitions(&fqn).find(|unit| unit.is_class()) {
+            if let crate::analyzer::usages::scala_graph::namespace::ScalaTypeNamespaceResolution::Resolved(definition) =
+                types.exact_type_declaration_for_owner_context(&fqn, code_unit)
+            {
                 ancestors.push(definition);
             }
         }

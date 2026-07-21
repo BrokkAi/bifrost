@@ -69,8 +69,8 @@ use crate::analyzer::usages::ruby_graph::{
 use crate::analyzer::usages::scala_graph::{
     import_candidate_fq_names, import_candidate_owner_fq_names,
     package_name_of as scala_package_name_of, scala_builtin_type_name,
-    scala_extension_receiver_matches_resolved, scala_import_path, scala_literal_type_name,
-    scala_node_text, scala_normalized_fq_name,
+    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_node_text,
+    scala_normalized_fq_name,
 };
 use crate::analyzer::{
     AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,

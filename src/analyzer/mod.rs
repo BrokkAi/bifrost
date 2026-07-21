@@ -46,7 +46,8 @@ pub use capabilities::{
     TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{
-    DirectDescendantIndex, build_direct_descendant_index, build_reverse_file_index,
+    DirectDescendantIndex, build_direct_descendant_index,
+    build_direct_descendant_index_from_candidates, build_reverse_file_index,
     build_reverse_import_index, memoized_reverse_file_index, memoized_reverse_import_index,
     resolve_imported_files_from_infos,
 };
@@ -97,8 +98,9 @@ pub use model::{
     CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
     ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
     MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
-    Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
-    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
+    Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
+    StructuredImportScope, SummaryFileProjection, TestAssertionSmell, TestAssertionWeights,
+    metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,

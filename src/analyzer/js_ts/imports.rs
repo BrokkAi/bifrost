@@ -22,6 +22,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
             is_wildcard: false,
             identifier: None,
             alias: None,
+            path: None,
         }];
     };
 
@@ -37,6 +38,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                         is_wildcard: false,
                         identifier: Some(identifier.to_string()),
                         alias: None,
+                        path: None,
                     });
                 }
             }
@@ -47,6 +49,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                         is_wildcard: true,
                         identifier: None,
                         alias: Some(alias),
+                        path: None,
                     });
                 }
             }
@@ -69,6 +72,7 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
                 is_wildcard: false,
                 identifier: Some(binding.imported_name),
                 alias: binding.alias,
+                path: None,
             })
             .collect();
     }
@@ -83,6 +87,7 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
             is_wildcard: false,
             identifier: None,
             alias: None,
+            path: None,
         }];
     }
 
@@ -296,6 +301,7 @@ fn collect_named_es_imports(
             is_wildcard: false,
             identifier,
             alias,
+            path: None,
         });
     }
 }

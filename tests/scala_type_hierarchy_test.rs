@@ -64,6 +64,52 @@ class Worker extends Base with Runnable
 }
 
 #[test]
+fn scala_sequential_package_clauses_resolve_constructor_applied_generic_parent() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "impl/Base.scala",
+            r#"
+package scala.collection.convert
+package impl
+abstract class IndexedStepperBase[Sub, Semi <: Sub](protected var i0: Int)
+"#,
+        ),
+        (
+            "impl/Child.scala",
+            r#"
+package scala.collection.convert
+package impl
+trait AnyStepper[A]
+class ObjectArrayStepper[A](start: Int)
+  extends IndexedStepperBase[AnyStepper[A], ObjectArrayStepper[A]](start)
+    with AnyStepper[A]
+"#,
+        ),
+    ]);
+
+    let child = definition(
+        &analyzer,
+        "scala.collection.convert.impl.ObjectArrayStepper",
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        BTreeSet::from([
+            "scala.collection.convert.impl.AnyStepper".to_string(),
+            "scala.collection.convert.impl.IndexedStepperBase".to_string(),
+        ])
+    );
+
+    let base = definition(
+        &analyzer,
+        "scala.collection.convert.impl.IndexedStepperBase",
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        BTreeSet::from(["scala.collection.convert.impl.ObjectArrayStepper".to_string()])
+    );
+}
+
+#[test]
 fn scala_trait_extends_trait_parent() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "Types.scala",
@@ -155,6 +201,142 @@ class Worker extends Base with Audited
 }
 
 #[test]
+fn scala_descendant_index_batches_file_hierarchy_facts_and_preserves_visibility() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "lib/Types.scala",
+            r#"
+package lib
+class Base
+trait Runnable
+"#,
+        ),
+        (
+            "root/api/Types.scala",
+            r#"
+package root.api
+class PackageBase
+"#,
+        ),
+        (
+            "alias/Children.scala",
+            r#"
+package alias
+import lib.Base as Parent
+import lib.Runnable
+import root.{api => classic}
+class First extends Parent with Runnable
+class Second extends Parent
+class Third extends Parent
+class PackageAliasChild extends classic.PackageBase
+"#,
+        ),
+        (
+            "wild/Child.scala",
+            r#"
+package wild
+import lib._
+class WildcardChild extends Base with Runnable
+"#,
+        ),
+        (
+            "same/Types.scala",
+            r#"
+package same
+class Peer
+class SamePackageChild extends Peer
+"#,
+        ),
+        (
+            "companion/Types.scala",
+            r#"
+package companion
+class Foo
+object Foo { trait Base }
+class Child extends Foo.Base
+object Bases { trait StableBase }
+import Bases.*
+class StableWildcardChild extends StableBase
+"#,
+        ),
+    ]);
+    let base = definition(&analyzer, "lib.Base");
+    let runnable = definition(&analyzer, "lib.Runnable");
+    let peer = definition(&analyzer, "same.Peer");
+    let package_base = definition(&analyzer, "root.api.PackageBase");
+    let package_alias_child = definition(&analyzer, "alias.PackageAliasChild");
+    let first = definition(&analyzer, "alias.First");
+    let companion_base = definition(&analyzer, "companion.Foo$.Base");
+    let companion_child = definition(&analyzer, "companion.Child");
+    let stable_base = definition(&analyzer, "companion.Bases$.StableBase");
+    let stable_wildcard_child = definition(&analyzer, "companion.StableWildcardChild");
+
+    analyzer.reset_full_hydration_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        BTreeSet::from([
+            "alias.First".to_string(),
+            "alias.Second".to_string(),
+            "alias.Third".to_string(),
+            "wild.WildcardChild".to_string(),
+        ])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["alias.First".to_string(), "wild.WildcardChild".to_string(),])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&peer)),
+        BTreeSet::from(["same.SamePackageChild".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&package_base)),
+        BTreeSet::from(["alias.PackageAliasChild".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&package_alias_child)),
+        BTreeSet::from(["root.api.PackageBase".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&first)),
+        BTreeSet::from(["lib.Base".to_string(), "lib.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&companion_base)),
+        BTreeSet::from(["companion.Child".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&companion_child)),
+        BTreeSet::from(["companion.Foo$.Base".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&stable_base)),
+        BTreeSet::from(["companion.StableWildcardChild".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&stable_wildcard_child)),
+        BTreeSet::from(["companion.Bases$.StableBase".to_string()])
+    );
+    assert_eq!(
+        analyzer.full_hydration_count_for_test(),
+        0,
+        "descendant construction must not point-hydrate once per declaration"
+    );
+    assert_eq!(
+        analyzer.bulk_hydration_count_for_test(),
+        6,
+        "descendant construction should project each Scala file once"
+    );
+    assert_eq!(
+        analyzer.scala_project_types_build_count_for_test(),
+        1,
+        "descendant construction and ancestor queries must share one project-types snapshot"
+    );
+}
+
+#[test]
 fn scala_object_resolves_trait_parents() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "Types.scala",
@@ -171,6 +353,73 @@ object Worker extends Runnable with Logged
         fq_names(analyzer.get_direct_ancestors(&worker)),
         BTreeSet::from(["app.Logged".to_string(), "app.Runnable".to_string()])
     );
+}
+
+#[test]
+fn scala_hierarchy_wildcards_use_ordered_owner_tiers_and_reject_namespace_collisions() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("Bases/Global.scala", "package Bases\ntrait SelectedBase\n"),
+        (
+            "relative/Bases.scala",
+            "package relative\nobject Bases { trait SelectedBase }\n",
+        ),
+        (
+            "relative/Child.scala",
+            r#"package relative
+import Bases.*
+class RelativeChild extends SelectedBase
+"#,
+        ),
+        (
+            "collision/Bases.scala",
+            "package collision\nobject Bases { trait ClashingBase }\n",
+        ),
+        (
+            "collision/Bases/Types.scala",
+            "package collision.Bases\ntrait ClashingBase\n",
+        ),
+        (
+            "collision/Child.scala",
+            r#"package collision
+import Bases.*
+class CollisionChild extends ClashingBase
+"#,
+        ),
+        (
+            "explicit/Api.scala",
+            "package explicit\nobject Api { trait ExplicitBase }\n",
+        ),
+        (
+            "explicit/Api/Types.scala",
+            "package explicit.Api\ntrait ExplicitBase\n",
+        ),
+        (
+            "consumer/Child.scala",
+            r#"package consumer
+import explicit.{Api => mixed}
+class ExplicitCollisionChild extends mixed.ExplicitBase
+"#,
+        ),
+    ]);
+
+    let relative_child = definition(&analyzer, "relative.RelativeChild");
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&relative_child)),
+        BTreeSet::from(["relative.Bases$.SelectedBase".to_string()]),
+        "the relative singleton tier must win before the global package tier"
+    );
+
+    for child in [
+        "collision.CollisionChild",
+        "consumer.ExplicitCollisionChild",
+    ] {
+        let child = definition(&analyzer, child);
+        assert!(
+            analyzer.get_direct_ancestors(&child).is_empty(),
+            "same-tier package/singleton imports must fail closed for {}",
+            child.fq_name()
+        );
+    }
 }
 
 #[test]

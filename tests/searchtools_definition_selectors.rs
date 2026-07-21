@@ -493,6 +493,81 @@ object InputArtifact {
 }
 
 #[test]
+fn scala_opaque_type_alias_is_a_distinct_source_backed_field_symbol() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "kyo/Fiber.scala",
+            r#"package kyo
+
+object Fiber {
+  object Promise {
+    opaque type Unsafe = String
+    object Unsafe
+  }
+}
+"#,
+        )
+        .build();
+
+    let search = call_tool(
+        &project,
+        "search_symbols",
+        r#"{"patterns":["Fiber.Promise.Unsafe"],"include_tests":true,"limit":5}"#,
+    );
+    let aliases = search["files"]
+        .as_array()
+        .expect("search files")
+        .iter()
+        .flat_map(|file| file["fields"].as_array().expect("field bucket"))
+        .filter(|field| field["symbol"] == "kyo.Fiber.Promise.Unsafe")
+        .collect::<Vec<_>>();
+    assert_eq!(aliases.len(), 1, "{search}");
+
+    let alias = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["kyo.Fiber$.Promise$.Unsafe"]}"#,
+    );
+    assert_eq!(
+        alias["sources"].as_array().map(Vec::len),
+        Some(1),
+        "{alias}"
+    );
+    assert_eq!(
+        alias["ambiguous"].as_array().map(Vec::len),
+        Some(0),
+        "{alias}"
+    );
+    assert_eq!(
+        alias["not_found"].as_array().map(Vec::len),
+        Some(0),
+        "{alias}"
+    );
+    assert_eq!(
+        alias["sources"][0]["text"].as_str().map(str::trim),
+        Some("opaque type Unsafe = String"),
+        "{alias}"
+    );
+
+    let companion = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["kyo.Fiber$.Promise$.Unsafe$"]}"#,
+    );
+    assert_eq!(
+        companion["sources"].as_array().map(Vec::len),
+        Some(1),
+        "{companion}"
+    );
+    assert!(
+        companion["sources"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("object Unsafe")),
+        "{companion}"
+    );
+}
+
+#[test]
 fn symbol_sources_resolves_scala_annotated_class_and_owner_qualified_method() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

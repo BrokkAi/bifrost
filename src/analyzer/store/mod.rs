@@ -2379,6 +2379,7 @@ pub(crate) struct PreparedParsedBlob {
     children: Vec<(i64, i64, i64)>,
     import_statements: Vec<(i64, String)>,
     imports: Vec<(i64, Vec<u8>)>,
+    scala_exports: Vec<(i64, i64, Vec<u8>)>,
     type_identifiers: Vec<String>,
     ruby_dispatch_modes: Vec<(i64, i64)>,
     scala_traits: Vec<i64>,
@@ -2663,6 +2664,15 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         .enumerate()
         .map(|(ordinal, import)| Ok((usize_to_i64(ordinal)?, serialize_blob(import)?)))
         .collect::<Result<Vec<_>>>()?;
+    let mut scala_exports = Vec::new();
+    for (owner, entries) in &state.scala_exports {
+        let Some(&owner_key) = unit_keys.get(owner) else {
+            continue;
+        };
+        for (ordinal, info) in entries.iter().enumerate() {
+            scala_exports.push((owner_key, usize_to_i64(ordinal)?, serialize_blob(info)?));
+        }
+    }
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().cloned().collect();
     type_identifiers.sort();
 
@@ -2677,6 +2687,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         children.len(),
         import_statements.len(),
         imports.len(),
+        scala_exports.len(),
         type_identifiers.len(),
         ruby_dispatch_modes.len(),
         scala_traits.len(),
@@ -2711,6 +2722,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(cpp_template_metadata.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(imports.iter().map(|(_, bytes)| bytes.len())),
+        saturating_sum(scala_exports.iter().map(|(_, _, bytes)| bytes.len())),
     ]);
     let content_package = adapter.storage_file_content_qualifier(&state.content_qualifier);
     let contains_tests = bool_to_i64(adapter.storage_contains_tests(&state));
@@ -2736,6 +2748,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         children,
         import_statements,
         imports,
+        scala_exports,
         type_identifiers,
         ruby_dispatch_modes,
         scala_traits,
@@ -2851,6 +2864,13 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         &blob.imports,
         |stmt, row| {
             stmt.execute(params![oid, lang, row.0, row.1])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO scala_exports(blob_oid, lang, owner_key, ordinal, info) VALUES(?1, ?2, ?3, ?4, ?5)",
+        &blob.scala_exports,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
         }
     );
     insert_rows!(
@@ -3004,6 +3024,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     )?;
     let scala_trait_count = insert_scala_traits(tx, &oid, lang, &unit_keys, &state.scala_traits)?;
     let (import_statement_count, import_count) = insert_imports(tx, &oid, lang, state)?;
+    insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
     let side_counts = PersistedSideTableCounts {
         range_count,
         signature_count,
@@ -3037,6 +3058,7 @@ fn collect_stored_units<A: LanguageAdapter>(adapter: &A, state: &FileState) -> V
     candidates.extend(state.type_aliases.iter().cloned());
     candidates.extend(state.ruby_method_dispatch_modes.keys().cloned());
     candidates.extend(state.scala_traits.iter().cloned());
+    candidates.extend(state.scala_exports.keys().cloned());
 
     let top_level_ordinals: HashMap<CodeUnit, usize> = state
         .top_level_declarations
@@ -3367,6 +3389,37 @@ fn insert_imports(
     Ok((statement_count, import_count))
 }
 
+fn insert_scala_exports(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    unit_keys: &HashMap<CodeUnit, i64>,
+    exports: &HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
+) -> Result<usize> {
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO scala_exports(
+           blob_oid, lang, owner_key, ordinal, info
+         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut count = 0;
+    for (owner, entries) in exports {
+        let Some(owner_key) = unit_keys.get(owner) else {
+            continue;
+        };
+        for (ordinal, info) in entries.iter().enumerate() {
+            stmt.execute(params![
+                oid,
+                lang,
+                owner_key,
+                usize_to_i64(ordinal)?,
+                serialize_blob(info)?,
+            ])?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn insert_blob_meta<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     oid: &str,
@@ -3477,6 +3530,7 @@ type BlobMetaRows = HashMap<String, BlobMetaRow>;
 type SignatureMetadataRow = (i64, Vec<u8>);
 type SignatureMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
 type CppTemplateMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
+type ScalaExportRows = HashMap<String, Vec<(i64, Vec<u8>)>>;
 type RangeRow = (i64, i64, i64, i64, i64);
 type RangeRows = HashMap<String, Vec<RangeRow>>;
 type RubyDispatchRows = HashMap<String, Vec<(i64, i64)>>;
@@ -3537,6 +3591,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
     let scala_traits = read_scala_traits(conn, &oid, lang, &by_key)?;
     let import_statements = read_import_statements(conn, &oid, lang)?;
     let imports = read_import_infos(conn, &oid, lang)?;
+    let scala_exports = read_scala_exports(conn, &oid, lang, &by_key)?;
     let signatures = read_unit_string_vec(conn, &oid, lang, "unit_signatures", "text", &by_key)?;
     let signature_metadata = read_signature_metadata(conn, &oid, lang, &by_key)?;
     let cpp_template_metadata = read_cpp_template_metadata(conn, &oid, lang, &by_key)?;
@@ -3568,6 +3623,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         definition_lookup_units,
         import_statements,
         imports,
+        scala_exports,
         raw_supertypes,
         supertype_lookup_paths,
         type_identifiers: meta.type_identifiers,
@@ -3663,6 +3719,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
     let scala_traits_by_oid = read_scala_traits_bulk(conn, lang, &oids)?;
     let import_statements_by_oid = read_import_statements_bulk(conn, lang, &oids)?;
     let import_infos_by_oid = read_import_infos_bulk(conn, lang, &oids)?;
+    let scala_exports_by_oid = read_scala_exports_bulk(conn, lang, &oids)?;
 
     let mut out = HashMap::default();
     for (file, oid) in entries {
@@ -3735,6 +3792,8 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             .get(&oid_text)
             .cloned()
             .unwrap_or_default();
+        let scala_exports =
+            scala_exports_map_for_file(scala_exports_by_oid.get(&oid_text), &by_key)?;
         let raw_supertypes = unit_string_map_for_file(supertypes_by_oid.get(&oid_text), &by_key);
         let supertype_lookup_paths =
             unit_string_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
@@ -3774,6 +3833,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             definition_lookup_units,
             import_statements,
             imports,
+            scala_exports,
             raw_supertypes,
             supertype_lookup_paths,
             type_identifiers: meta.type_identifiers.clone(),
@@ -4163,6 +4223,39 @@ fn read_import_infos_bulk(
     Ok(out)
 }
 
+fn read_scala_exports_bulk(
+    conn: &Connection,
+    lang: &str,
+    oids: &[String],
+) -> Result<ScalaExportRows> {
+    let mut out: ScalaExportRows = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk_placeholders(chunk);
+        let sql = format!(
+            "SELECT blob_oid, owner_key, info FROM scala_exports
+             WHERE lang = ? AND blob_oid IN ({placeholders})
+             ORDER BY blob_oid, owner_key, ordinal"
+        );
+        let params = chunk_params(lang, chunk);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (oid, owner_key, info) = row?;
+            out.entry(oid).or_default().push((owner_key, info));
+        }
+    }
+    Ok(out)
+}
+
 fn read_unit_string_vec_bulk(
     conn: &Connection,
     lang: &str,
@@ -4432,6 +4525,21 @@ fn cpp_template_metadata_map_for_file(
     for (key, value) in rows.into_iter().flatten() {
         if let Some(unit) = by_key.get(key) {
             out.insert(unit.unit.clone(), deserialize_blob(value)?);
+        }
+    }
+    Ok(out)
+}
+
+fn scala_exports_map_for_file(
+    rows: Option<&Vec<(i64, Vec<u8>)>>,
+    by_key: &HashMap<i64, UnitRow>,
+) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>> {
+    let mut out = HashMap::default();
+    for (key, value) in rows.into_iter().flatten() {
+        if let Some(owner) = by_key.get(key) {
+            out.entry(owner.unit.clone())
+                .or_insert_with(Vec::new)
+                .push(deserialize_blob(value)?);
         }
     }
     Ok(out)
@@ -4984,6 +5092,32 @@ fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<Imp
     Ok(out)
 }
 
+fn read_scala_exports(
+    conn: &Connection,
+    oid: &str,
+    lang: &str,
+    by_key: &HashMap<i64, UnitRow>,
+) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>> {
+    let mut stmt = conn.prepare(
+        "SELECT owner_key, info FROM scala_exports
+         WHERE blob_oid = ?1 AND lang = ?2
+         ORDER BY owner_key, ordinal",
+    )?;
+    let rows = stmt.query_map(params![oid, lang], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = HashMap::default();
+    for row in rows {
+        let (key, info) = row?;
+        if let Some(owner) = by_key.get(&key) {
+            out.entry(owner.unit.clone())
+                .or_insert_with(Vec::new)
+                .push(deserialize_blob(&info)?);
+        }
+    }
+    Ok(out)
+}
+
 fn read_unit_string_vec(
     conn: &Connection,
     oid: &str,
@@ -5366,6 +5500,8 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
                + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.import_count + meta.type_identifier_count
                + meta.ruby_dispatch_count + meta.scala_trait_count
+               + (SELECT COUNT(*) FROM scala_exports AS exports
+                  WHERE exports.blob_oid = meta.blob_oid AND exports.lang = meta.lang)
                + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
                   WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang)
                + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END,
@@ -5403,6 +5539,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.import_count + meta.type_identifier_count
            + meta.ruby_dispatch_count + meta.scala_trait_count
+           + (SELECT COUNT(*) FROM scala_exports AS exports
+              WHERE exports.blob_oid = meta.blob_oid AND exports.lang = meta.lang)
            + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
               WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang) END,
        CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
@@ -5427,6 +5565,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(CAST(statement AS BLOB))) FROM import_statements
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(info)) FROM import_details
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(info)) FROM scala_exports
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(type_identifier AS BLOB))) FROM type_identifiers
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
@@ -7657,7 +7797,7 @@ mod tests {
         let scala_file = write_file(
             root,
             "src/main/scala/app/Demo.scala",
-            "package app\ntrait Runnable { def run(first: Int = 0)(rest: String*): Int }\nclass Worker extends Runnable\n",
+            "package app\ntrait Runnable { def run(first: Int = 0)(rest: String*): Int }\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
         );
 
         assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
@@ -7676,7 +7816,7 @@ mod tests {
         let scala_file = write_file(
             root,
             "src/main/scala/app/Demo.scala",
-            "package app\nimport scala.collection.mutable.ListBuffer\ntrait Runnable\nclass Worker extends Runnable\n",
+            "package app\nimport scala.collection.mutable.ListBuffer\ntrait Runnable\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
         );
         let ts_file = write_file(
             root,
@@ -7964,6 +8104,21 @@ mod tests {
         assert_file_state_equivalent(parsed.as_ref(), &legacy_state);
         assert_file_state_equivalent(parsed.as_ref(), &prepared_state);
         assert_file_state_equivalent(&legacy_state, &prepared_state);
+        let bulk_states = prepared_store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                lang,
+                adapter,
+                &HashMap::from_iter([(file.clone(), source)]),
+            )
+            .unwrap();
+        assert_eq!(
+            bulk_states
+                .get(file)
+                .expect("prepared blob should bulk hydrate")
+                .scala_exports,
+            parsed.scala_exports
+        );
         assert_eq!(
             legacy.content_row_count(oid, lang).unwrap(),
             prepared_store.content_row_count(oid, lang).unwrap()
@@ -8041,6 +8196,7 @@ mod tests {
             definition_lookup_units: parsed.definition_lookup_units,
             import_statements: parsed.import_statements,
             imports: parsed.imports,
+            scala_exports: parsed.scala_exports,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
@@ -8064,6 +8220,7 @@ mod tests {
             expected.top_level_declarations
         );
         assert_eq!(actual.declarations, expected.declarations);
+        assert_eq!(actual.scala_exports, expected.scala_exports);
         assert_eq!(
             actual.definition_lookup_units,
             expected.definition_lookup_units

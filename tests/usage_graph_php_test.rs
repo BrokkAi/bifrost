@@ -470,7 +470,6 @@ class Factory extends BaseFactory {
         value["edges"]
     );
 }
-
 #[test]
 fn inverted_graph_follows_call_receiver_types_and_nullsafe_members() {
     let project = InlineTestProject::with_language(Language::Php)
