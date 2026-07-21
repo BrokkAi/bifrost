@@ -6217,12 +6217,18 @@ pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
+/// Return the terminal identifier represented by a callable or type callee.
+///
+/// Qualified, scoped, template, and field wrappers are traversed through their
+/// grammar fields so both function calls and type constructions emit the token
+/// that names the referenced declaration.
 pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
     loop {
         let next = match node.kind() {
-            "qualified_identifier" | "scoped_identifier" | "template_function" => {
-                node.child_by_field_name("name")
-            }
+            "qualified_identifier"
+            | "scoped_identifier"
+            | "template_function"
+            | "template_type" => node.child_by_field_name("name"),
             "field_expression" => node.child_by_field_name("field"),
             _ => None,
         };
@@ -6230,6 +6236,36 @@ pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
             return node;
         };
         node = next;
+    }
+}
+
+/// Whether `node` is part of a call's callee expression, walking only through
+/// the grammar wrappers that can structurally contain that callee.
+pub(super) fn is_call_callee_node(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "call_expression" => {
+                return parent
+                    .child_by_field_name("function")
+                    .or_else(|| parent.named_child(0))
+                    == Some(node);
+            }
+            "qualified_identifier"
+            | "scoped_identifier"
+            | "template_function"
+            | "template_type"
+            | "field_expression" => node = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+pub(super) fn call_callee_reference_node(node: Node<'_>) -> Node<'_> {
+    if is_call_callee_node(node) {
+        function_terminal_node(node)
+    } else {
+        node
     }
 }
 

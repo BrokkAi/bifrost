@@ -577,7 +577,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         if !direct_temporary_resolves_to_explicit_constructor(call, &unit, ctx) {
             *ctx.raw_match_count += 1;
-            push_type_hit(node, ctx);
+            push_type_hit(function_terminal_node(node), ctx);
         }
         return;
     }
@@ -618,7 +618,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
         {
             *ctx.raw_match_count += 1;
-            push_type_hit(hit_node, ctx);
+            push_type_hit(call_callee_reference_node(hit_node), ctx);
             return;
         }
         LexicalTypeResolution::Resolved { .. } => {
@@ -662,7 +662,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 )
             {
                 *ctx.raw_match_count += 1;
-                push_unproven_hit(hit_node, ctx);
+                push_unproven_hit(call_callee_reference_node(hit_node), ctx);
                 return;
             }
         }
@@ -672,7 +672,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .parser_alias_resolves_to_type(ctx.analyzer, ctx.file, text, &ctx.spec.target)
     {
         *ctx.raw_match_count += 1;
-        push_type_hit(hit_node, ctx);
+        push_type_hit(call_callee_reference_node(hit_node), ctx);
         return;
     }
     if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
@@ -1370,6 +1370,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(type_node) = constructor_type_node(node) else {
         return;
     };
+    let hit_node = function_terminal_node(type_node);
     let text = node_text(type_node, ctx.source);
     if !name_mentions(text, &ctx.spec.member_name) {
         return;
@@ -1384,7 +1385,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             Some(true) => {}
             Some(false) => return,
             None => {
-                push_unproven_hit(type_node, ctx);
+                push_unproven_hit(hit_node, ctx);
                 return;
             }
         }
@@ -1393,9 +1394,9 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .visibility
         .resolves_to_type(ctx.analyzer, ctx.file, text, owner)
     {
-        push_hit(type_node, ctx);
+        push_hit(hit_node, ctx);
     } else {
-        push_unproven_hit(type_node, ctx);
+        push_unproven_hit(hit_node, ctx);
     }
 }
 
@@ -1431,7 +1432,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             Some(true) => {}
             Some(false) => return,
             None => {
-                push_unproven_hit(function, ctx);
+                push_unproven_hit(function_terminal_node(function), ctx);
                 return;
             }
         }
@@ -1500,7 +1501,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         TargetKind::FreeFunction,
         &ctx.spec.target,
     ) {
-        push_hit(function, ctx);
+        push_hit(function_terminal_node(function), ctx);
     } else if ctx.visibility.resolve_known_non_target(
         ctx.file,
         text,
@@ -1510,7 +1511,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // An explicitly namespace-qualified call to a different namespace (e.g. `other::run()` when
         // the target is `ns::run`) is a proven non-match, not an unresolved reference.
     } else {
-        push_unproven_hit(function, ctx);
+        push_unproven_hit(function_terminal_node(function), ctx);
     }
 }
 
@@ -1604,7 +1605,7 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
-    if is_declaration_name(node) || cpp_reference_is_call_callee(node) {
+    if is_declaration_name(node) || is_call_callee_node(node) {
         return;
     }
     *ctx.raw_match_count += 1;
@@ -1625,25 +1626,6 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     } else {
         push_unproven_hit(node, ctx);
     }
-}
-
-/// Whether `node` is (part of) the callee expression of a call — walking through
-/// the qualified/template/field wrappers so `foo`, `ns::foo`, and `obj.foo` in
-/// `…()` are all recognised (and thus left to the call_expression arm).
-fn cpp_reference_is_call_callee(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        match parent.kind() {
-            "call_expression" => {
-                return parent
-                    .child_by_field_name("function")
-                    .or_else(|| parent.named_child(0))
-                    == Some(node);
-            }
-            "qualified_identifier" | "template_function" | "field_expression" => node = parent,
-            _ => return false,
-        }
-    }
-    false
 }
 
 fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
