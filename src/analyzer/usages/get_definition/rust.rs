@@ -1103,6 +1103,7 @@ fn rust_enclosing_scoped_type_identifier_name(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rust_focused_terminal_scoped_type_candidates(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,

@@ -1376,17 +1376,15 @@ impl RustAnalyzer {
         let Some(module) = index.module_at_byte(file, byte) else {
             return false;
         };
-        let Some(module_identity) = index.declaration_identities.values().find(|identity| {
-            identity.file == *file
-                && identity.module == *module
-                && identity.name == name
-                && identity.namespace == RustSymbolNamespace::Module
-        }) else {
-            return false;
+        let module_identity = RustSymbolIdentity {
+            file: file.clone(),
+            module: module.clone(),
+            name: name.to_string(),
+            namespace: RustSymbolNamespace::Module,
         };
         if !index
             .declaration_domains
-            .get(module_identity)
+            .get(&module_identity)
             .is_some_and(|domains| domains.iter().any(|domain| domain.contains_module(module)))
         {
             return false;
