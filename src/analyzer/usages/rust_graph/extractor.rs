@@ -561,6 +561,11 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             record_token_tree_static_member_hits(node, ctx);
         }
         "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
+        "type_binding" | "associated_type_binding"
+            if ctx.target_is_field && ctx.target_owner_is_trait =>
+        {
+            record_associated_type_binding_hit(node, ctx)
+        }
         "tuple_struct_pattern" if ctx.target_is_enum_variant => {
             record_unqualified_tuple_variant_pattern_hit(node, ctx)
         }
@@ -574,6 +579,51 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     for child in node.named_children(&mut cursor) {
         scan_member_node(child, ctx);
     }
+}
+
+fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(name) = binding.child_by_field_name("name") else {
+        return;
+    };
+    if simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name) {
+        return;
+    }
+
+    let mut ancestor = binding.parent();
+    let trait_type = loop {
+        let Some(candidate) = ancestor else {
+            return;
+        };
+        if candidate.kind() == "generic_type" {
+            break candidate.child_by_field_name("type");
+        }
+        if matches!(candidate.kind(), "where_predicate" | "function_item") {
+            return;
+        }
+        ancestor = candidate.parent();
+    };
+    let Some(trait_type) = trait_type else {
+        return;
+    };
+    if !resolved_type_matches_owner(trait_type, ctx) {
+        return;
+    }
+
+    let start = name.start_byte();
+    let end = name.end_byte();
+    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    else {
+        return;
+    };
+    push_member_hit(
+        ctx.file,
+        ctx.source,
+        ctx.line_starts,
+        start,
+        end,
+        enclosing,
+        ctx.hits,
+    );
 }
 
 fn record_unqualified_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
