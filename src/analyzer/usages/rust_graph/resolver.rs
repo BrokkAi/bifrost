@@ -182,12 +182,18 @@ fn resolve_direct_token_path_child(
     segment: Node<'_>,
 ) -> Option<String> {
     let name = source.get(segment.start_byte()..segment.end_byte())?;
-    let candidates: BTreeSet<_> = support
-        .members_for_owner_name(owner_fqn, name)
-        .into_iter()
-        .collect();
+    let candidates: BTreeSet<_> = if owner_fqn.is_empty() {
+        support.fqn(name)
+    } else {
+        support.members_for_owner_name(owner_fqn, name)
+    }
+    .into_iter()
+    .collect();
     if candidates.len() == 1 {
-        candidates.into_iter().next().map(|candidate| candidate.fq_name())
+        candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.fq_name())
     } else {
         None
     }
@@ -275,13 +281,7 @@ fn lexical_import_fqn(
 fn rust_token_path_segment(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
-        "identifier"
-            | "type_identifier"
-            | "crate"
-            | "self"
-            | "super"
-            | "default"
-            | "metavariable"
+        "identifier" | "type_identifier" | "crate" | "self" | "super" | "default" | "metavariable"
     )
 }
 
