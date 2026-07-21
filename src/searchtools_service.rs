@@ -1829,6 +1829,7 @@ mod watcher_startup_tests {
     use serde_json::json;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     const WATCHER_FAILURE: &str = "injected watcher startup failure";
@@ -1899,11 +1900,22 @@ mod watcher_startup_tests {
         const CALLERS: usize = 8;
         let (_temp, root) = workspace("Concurrent.java", "class Concurrent {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(CALLERS);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
         let starter: WatcherStarter = {
             let calls = Arc::clone(&calls);
+            let release_startup_rx = Arc::clone(&release_startup_rx);
             Arc::new(move |project| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(50));
+                startup_started_tx
+                    .send(())
+                    .expect("test should wait for watcher startup");
+                release_startup_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("test should release watcher startup");
                 ProjectChangeWatcher::start_polling_for_tests(project)
             })
         };
@@ -1916,7 +1928,7 @@ mod watcher_startup_tests {
             )
             .unwrap(),
         );
-        let barrier = Arc::new(Barrier::new(CALLERS));
+        let barrier = Arc::new(Barrier::new(CALLERS + 1));
 
         let handles = (0..CALLERS)
             .map(|_| {
@@ -1928,6 +1940,15 @@ mod watcher_startup_tests {
                 })
             })
             .collect::<Vec<_>>();
+        barrier.wait();
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one caller should begin watcher startup");
+        for _ in 0..CALLERS {
+            release_startup_tx
+                .send(())
+                .expect("watcher startup should be waiting");
+        }
         for handle in handles {
             assert!(handle.join().unwrap().is_ok());
         }
