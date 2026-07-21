@@ -102,6 +102,12 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
         }
 
         let root = children[index];
+        let dollar_crate_root = rust_token_is_dollar_crate(root, source);
+        let mut dollar_crate_owner = if dollar_crate_root {
+            rust.resolve_module_package(file, "crate")
+        } else {
+            None
+        };
         let mut segment_index = index;
         loop {
             let segment = children[segment_index];
@@ -119,16 +125,39 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
                 RustTokenPathRole::Value
             };
 
-            if let Some(fqn) = resolve_token_path_segment_fqn(
-                rust,
-                support,
-                refs,
-                file,
-                source,
-                root,
-                segment,
-                (segment_index > index).then(|| children[segment_index - 2]),
-            ) {
+            let macro_call = !continues
+                && children
+                    .get(segment_index + 1)
+                    .is_some_and(|bang| bang.kind() == "!")
+                && children
+                    .get(segment_index + 2)
+                    .is_some_and(|arguments| arguments.kind() == "token_tree");
+            let fqn = if dollar_crate_root && macro_call {
+                None
+            } else if dollar_crate_root {
+                if segment_index == index {
+                    None
+                } else {
+                    dollar_crate_owner.as_deref().and_then(|owner| {
+                        resolve_direct_token_path_child(support, source, owner, segment)
+                    })
+                }
+            } else {
+                resolve_token_path_segment_fqn(
+                    rust,
+                    support,
+                    refs,
+                    file,
+                    source,
+                    root,
+                    segment,
+                    (segment_index > index).then(|| children[segment_index - 2]),
+                )
+            };
+            if dollar_crate_root && segment_index > index {
+                dollar_crate_owner.clone_from(&fqn);
+            }
+            if let Some(fqn) = fqn {
                 resolved.push(ResolvedRustTokenPathSegment {
                     node: segment,
                     fqn,
@@ -144,6 +173,24 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
         }
     }
     resolved
+}
+
+fn resolve_direct_token_path_child(
+    support: &dyn RustDefinitionProvider,
+    source: &str,
+    owner_fqn: &str,
+    segment: Node<'_>,
+) -> Option<String> {
+    let name = source.get(segment.start_byte()..segment.end_byte())?;
+    let candidates: BTreeSet<_> = support
+        .members_for_owner_name(owner_fqn, name)
+        .into_iter()
+        .collect();
+    if candidates.len() == 1 {
+        candidates.into_iter().next().map(|candidate| candidate.fq_name())
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,8 +275,19 @@ fn lexical_import_fqn(
 fn rust_token_path_segment(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
-        "identifier" | "type_identifier" | "crate" | "self" | "super" | "default"
+        "identifier"
+            | "type_identifier"
+            | "crate"
+            | "self"
+            | "super"
+            | "default"
+            | "metavariable"
     )
+}
+
+fn rust_token_is_dollar_crate(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "metavariable"
+        && source.get(node.start_byte()..node.end_byte()) == Some("$crate")
 }
 
 pub(crate) fn rust_token_path_segment_is_qualified(node: Node<'_>) -> bool {
