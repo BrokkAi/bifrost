@@ -176,15 +176,83 @@ fn thresholds_cover_clean_rated_and_unrated_findings() {
     );
     assert_status(&default, 1);
     let stdout = String::from_utf8(default.stdout).expect("UTF-8 human report");
+    assert!(!stdout.contains('\u{001B}'));
+    assert!(stdout.contains("[warning]  src/app.py:2:12\n"), "{stdout}");
     assert!(
-        stdout.contains("src/app.py:2:12: [warning] bifrost.security.dynamic-eval"),
+        stdout.contains("    Dynamic evaluation is forbidden\n"),
         "{stdout}"
     );
-    assert!(
-        stdout.contains("  evidence: structural_match call\n"),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("  evidence:"), "{stdout}");
     assert!(stdout.contains("summary: 1 finding; 1 complete policy run"));
+
+    let verbose = run(
+        project.root(),
+        &["--policy-file", "policies/dynamic-eval.rqlp", "--verbose"],
+    );
+    assert_status(&verbose, 1);
+    let verbose = String::from_utf8(verbose.stdout).expect("UTF-8 verbose human report");
+    assert!(verbose.contains("src/app.py:2:12: [warning] bifrost.security.dynamic-eval"));
+    assert!(verbose.contains("  evidence: structural_match call\n"));
+
+    let colored = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--color",
+            "always",
+        ],
+    );
+    assert_status(&colored, 1);
+    assert!(
+        colored
+            .stdout
+            .windows(5)
+            .any(|window| window == b"\x1b[33m")
+    );
+
+    let no_color = bifrost(project.root())
+        .args([
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--color",
+            "auto",
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run policy with NO_COLOR");
+    assert_status(&no_color, 1);
+    assert!(!no_color.stdout.contains(&0x1b));
+
+    let never = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--color",
+            "never",
+        ],
+    );
+    assert_status(&never, 1);
+    assert!(!never.stdout.contains(&0x1b));
+
+    let verbose_colored = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--verbose",
+            "--color",
+            "always",
+        ],
+    );
+    assert_status(&verbose_colored, 1);
+    assert!(
+        verbose_colored
+            .stdout
+            .windows(5)
+            .any(|window| window == b"\x1b[33m")
+    );
 }
 
 #[test]
@@ -517,6 +585,27 @@ fn policy_mode_is_exclusive_and_output_failures_use_status_two_without_clobberin
         vec!["--policy-file", "policies/dynamic-eval.rqlp", "--unknown"],
         vec!["--unknown", "--policy-file", "policies/dynamic-eval.rqlp"],
         vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--color",
+            "sometimes",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--format",
+            "json",
+            "--verbose",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--format",
+            "sarif",
+            "--color",
+            "never",
+        ],
+        vec![
             "--args",
             "not-json",
             "--policy-file",
@@ -643,9 +732,11 @@ fn output_path_may_be_outside_the_analyzed_workspace() {
         .expect("write outside workspace");
     assert_status(&output, 1);
     assert!(output.stdout.is_empty());
+    let file_output = fs::read(output_path).unwrap();
+    assert!(!file_output.contains(&0x1b));
     assert!(
-        fs::read_to_string(output_path)
+        String::from_utf8(file_output)
             .unwrap()
-            .contains("bifrost.security.dynamic-eval")
+            .contains("Dynamic evaluation is forbidden")
     );
 }

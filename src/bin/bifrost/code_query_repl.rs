@@ -659,7 +659,7 @@ fn parse_query_input(line: &str) -> Result<Value, String> {
 }
 
 fn should_colorize_repl() -> bool {
-    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    super::stdout_supports_color()
 }
 
 fn loaded_query_text(value: &Value) -> String {

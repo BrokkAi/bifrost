@@ -1126,9 +1126,10 @@ fn apply_proven_hit(record: &mut ReferenceDifferentialSite, hit: &UsageHit) {
         UsageHitKind::Reference | UsageHitKind::OverrideDeclaration => {
             ReferenceClassification::Consistent
         }
-        UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::SelfReceiver => {
-            ReferenceClassification::EditorOnly
-        }
+        UsageHitKind::Import
+        | UsageHitKind::Reexport
+        | UsageHitKind::SelfReceiver
+        | UsageHitKind::Definition => ReferenceClassification::EditorOnly,
     };
     record.note = None;
     record.inverse_hit = Some(inverse_hit_evidence(hit, record));

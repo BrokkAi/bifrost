@@ -5,7 +5,7 @@ use crate::analyzer::usages::cpp_call_match::{
 };
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_own_declarator, push_definition_hit, push_hit,
-    push_self_receiver_hit, push_type_hit, push_unproven_hit,
+    push_self_receiver_hit, push_type_hit, push_unproven_definition_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
@@ -1677,7 +1677,7 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
     {
         // A definition in another explicit namespace is a proven non-match.
     } else {
-        push_unproven_hit(function, ctx);
+        push_unproven_definition_hit(function, ctx);
     }
 }
 
@@ -1973,7 +1973,7 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         match qualified_owner_resolution(function, ctx) {
             QualifiedOwnerResolution::Target => push_definition_hit(function, ctx),
             QualifiedOwnerResolution::NonTarget => {}
-            QualifiedOwnerResolution::Unresolved => push_unproven_hit(function, ctx),
+            QualifiedOwnerResolution::Unresolved => push_unproven_definition_hit(function, ctx),
         }
         return;
     }
@@ -2004,7 +2004,7 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         // A method definition for another visible owner is a proven non-match.
     } else {
-        push_unproven_hit(function, ctx);
+        push_unproven_definition_hit(function, ctx);
     }
 }
 

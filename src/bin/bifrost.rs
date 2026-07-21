@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,9 +13,10 @@ use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
 use brokk_bifrost::policy::{
-    HumanRenderOptions, POLICY_EXIT_UNRELIABLE, PolicyBatchOutcome, PolicyFailOn,
-    PolicyRenderError, PolicyReportDocument, SarifToolIdentity, escape_terminal_text,
-    evaluate_policy_files, write_policy_human, write_policy_json, write_policy_sarif,
+    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, POLICY_EXIT_UNRELIABLE,
+    PolicyBatchOutcome, PolicyFailOn, PolicyRenderError, PolicyReportDocument, SarifToolIdentity,
+    escape_terminal_text, evaluate_policy_files, write_policy_human, write_policy_json,
+    write_policy_sarif,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -42,6 +43,13 @@ enum PolicyOutputFormat {
     Human,
     Json,
     Sarif,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 fn main() -> ExitCode {
@@ -78,6 +86,8 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--format"
                 | "--fail-on"
                 | "--output"
+                | "--color"
+                | "--verbose"
                 | "--require-explicit-schema-versions"
         ) {
             return true;
@@ -109,6 +119,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--format"
             | "--fail-on"
             | "--output"
+            | "--color"
     )
 }
 
@@ -144,6 +155,10 @@ fn run_inner(
     let mut policy_fail_on = PolicyFailOn::Warning;
     let mut policy_fail_on_seen = false;
     let mut policy_output: Option<PathBuf> = None;
+    let mut policy_verbose = false;
+    let mut policy_verbose_seen = false;
+    let mut policy_color = PolicyColorMode::Auto;
+    let mut policy_color_seen = false;
     let mut require_explicit_schema_versions = false;
 
     while let Some(arg) = args.next() {
@@ -284,6 +299,23 @@ fn run_inner(
                     return Err("--output may only be provided once".to_string());
                 }
             }
+            "--verbose" => {
+                if policy_verbose_seen {
+                    return Err("--verbose may only be provided once".to_string());
+                }
+                policy_verbose = true;
+                policy_verbose_seen = true;
+            }
+            "--color" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--color requires auto, always, or never".to_string())?;
+                if policy_color_seen {
+                    return Err("--color may only be provided once".to_string());
+                }
+                policy_color = parse_policy_color(&value)?;
+                policy_color_seen = true;
+            }
             "--require-explicit-schema-versions" => {
                 require_explicit_schema_versions = true;
             }
@@ -334,12 +366,18 @@ fn run_inner(
                     .to_string(),
             );
         }
+        if policy_format != PolicyOutputFormat::Human && (policy_verbose_seen || policy_color_seen)
+        {
+            return Err("--verbose and --color are only valid with --format human".to_string());
+        }
         let status = run_policy_mode(
             root,
             &policy_files,
             policy_format,
             policy_fail_on,
             policy_output.as_deref(),
+            policy_verbose,
+            policy_color,
             require_explicit_schema_versions,
         );
         return Ok(CliRunResult::PolicyStatus(status));
@@ -478,12 +516,26 @@ fn parse_policy_fail_on(value: &str) -> Result<PolicyFailOn, String> {
     }
 }
 
+fn parse_policy_color(value: &str) -> Result<PolicyColorMode, String> {
+    match value {
+        "auto" => Ok(PolicyColorMode::Auto),
+        "always" => Ok(PolicyColorMode::Always),
+        "never" => Ok(PolicyColorMode::Never),
+        other => Err(format!(
+            "Invalid --color value: {other}. Expected auto, always, or never."
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_policy_mode(
     root: PathBuf,
     policy_files: &[PathBuf],
     format: PolicyOutputFormat,
     fail_on: PolicyFailOn,
     output_path: Option<&Path>,
+    verbose: bool,
+    color_mode: PolicyColorMode,
     require_explicit_schema_versions: bool,
 ) -> u8 {
     let outcome = match evaluate_policy_files(
@@ -501,10 +553,18 @@ fn run_policy_mode(
             return POLICY_EXIT_UNRELIABLE;
         }
     };
+    let human_options = HumanRenderOptions::new(
+        if verbose {
+            HumanRenderDetail::Verbose
+        } else {
+            HumanRenderDetail::Concise
+        },
+        resolve_policy_color(color_mode, output_path.is_none()),
+    );
     let status = outcome.exit_status();
     let write_result = match output_path {
-        Some(path) => write_policy_output_file(path, format, &outcome),
-        None => write_policy_stdout(format, &outcome),
+        Some(path) => write_policy_output_file(path, format, &human_options, &outcome),
+        None => write_policy_stdout(format, &human_options, &outcome),
     };
     if let Err(error) = write_result {
         eprintln!(
@@ -521,8 +581,49 @@ fn run_policy_mode(
     status
 }
 
+fn resolve_policy_color(mode: PolicyColorMode, writing_stdout: bool) -> HumanRenderColor {
+    match mode {
+        PolicyColorMode::Always => HumanRenderColor::Ansi,
+        PolicyColorMode::Never => HumanRenderColor::Plain,
+        PolicyColorMode::Auto if writing_stdout && stdout_supports_color() => {
+            HumanRenderColor::Ansi
+        }
+        PolicyColorMode::Auto => HumanRenderColor::Plain,
+    }
+}
+
+fn stdout_supports_color() -> bool {
+    auto_color_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+        terminal_supports_ansi(),
+    )
+}
+
+const fn auto_color_enabled(
+    is_terminal: bool,
+    no_color_present: bool,
+    ansi_supported: bool,
+) -> bool {
+    is_terminal && !no_color_present && ansi_supported
+}
+
+#[cfg(unix)]
+const fn terminal_supports_ansi() -> bool {
+    true
+}
+
+#[cfg(windows)]
+const fn terminal_supports_ansi() -> bool {
+    // Do not assume that a Windows console has virtual-terminal processing
+    // enabled. `--color always` remains the explicit opt-in for ANSI-capable
+    // terminals; auto mode chooses the safe plain representation.
+    false
+}
+
 fn write_policy_stdout(
     format: PolicyOutputFormat,
+    human_options: &HumanRenderOptions,
     outcome: &PolicyBatchOutcome,
 ) -> Result<(), String> {
     // Buffer the bounded encoding before touching stdout so size/serialization
@@ -530,6 +631,7 @@ fn write_policy_stdout(
     let mut encoded = Vec::new();
     render_policy_report(
         format,
+        human_options,
         outcome.report(),
         &mut encoded,
         outcome.max_serialized_report_bytes(),
@@ -546,6 +648,7 @@ fn write_policy_stdout(
 fn write_policy_output_file(
     destination: &Path,
     format: PolicyOutputFormat,
+    human_options: &HumanRenderOptions,
     outcome: &PolicyBatchOutcome,
 ) -> Result<(), String> {
     let parent = destination
@@ -560,6 +663,7 @@ fn write_policy_output_file(
     })?;
     render_policy_report(
         format,
+        human_options,
         outcome.report(),
         &mut temporary,
         outcome.max_serialized_report_bytes(),
@@ -588,17 +692,15 @@ fn write_policy_output_file(
 
 fn render_policy_report<W: Write>(
     format: PolicyOutputFormat,
+    human_options: &HumanRenderOptions,
     report: &PolicyReportDocument,
     output: W,
     max_serialized_bytes: usize,
 ) -> Result<u64, PolicyRenderError> {
     match format {
-        PolicyOutputFormat::Human => write_policy_human(
-            report,
-            &HumanRenderOptions::default(),
-            output,
-            max_serialized_bytes,
-        ),
+        PolicyOutputFormat::Human => {
+            write_policy_human(report, human_options, output, max_serialized_bytes)
+        }
         PolicyOutputFormat::Json => write_policy_json(report, output, max_serialized_bytes),
         PolicyOutputFormat::Sarif => write_policy_sarif(
             report,
@@ -728,6 +830,8 @@ OPTIONS:
                            directories, or globs. Repeatable; valid only with --tool.
     --policy-file PATH     Evaluate a workspace-relative .rqlp policy. Repeatable.
     --format FORMAT        Policy output: human, json, or sarif (default: human)
+    --verbose              Include complete evidence, provenance, and rule details in human output
+    --color MODE           Human output color: auto, always, or never (default: auto)
     --fail-on THRESHOLD    Policy finding threshold: never, finding, note, warning, or error
                            (default: warning; finding includes unrated findings)
     --require-explicit-schema-versions
@@ -945,4 +1049,17 @@ fn toolset_of(name: &str) -> Option<&'static str> {
                 .any(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(name))
         })
     })
+}
+
+#[cfg(test)]
+mod policy_color_tests {
+    use super::auto_color_enabled;
+
+    #[test]
+    fn auto_color_requires_an_ansi_terminal_and_respects_no_color() {
+        assert!(auto_color_enabled(true, false, true));
+        assert!(!auto_color_enabled(false, false, true));
+        assert!(!auto_color_enabled(true, true, true));
+        assert!(!auto_color_enabled(true, false, false));
+    }
 }

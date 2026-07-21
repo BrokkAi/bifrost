@@ -2,6 +2,7 @@ mod common;
 
 use brokk_bifrost::usages::{
     CppUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
+    UsageHitKind,
 };
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile,
@@ -952,9 +953,11 @@ std::string run() {
     );
     let hits = usage_hits(&analyzer, &handle);
 
-    assert_eq!(2, hits.len(), "{hits:#?}");
-    assert_hit_contains(&hits, "src/parity.cpp", "ConsoleHandler::handle");
+    assert_eq!(1, hits.len(), "{hits:#?}");
     assert_hit_contains(&hits, "src/main.cpp", "handler.handle(\"Ben\")");
+    let editor_hits = editor_usage_hits(&analyzer, &handle);
+    assert_eq!(2, editor_hits.len(), "{editor_hits:#?}");
+    assert_hit_contains(&editor_hits, "src/parity.cpp", "ConsoleHandler::handle");
 }
 
 #[test]
@@ -5013,9 +5016,11 @@ fn cpp_graph_filters_same_arity_free_function_overloads_by_argument_type() {
     let int_overload = parity_format_header_overload(&analyzer, "int");
 
     let string_hits = usage_hits(&analyzer, &string_overload);
-    assert_eq!(2, string_hits.len(), "string hits: {string_hits:#?}");
+    assert_eq!(1, string_hits.len(), "string hits: {string_hits:#?}");
+    let string_editor_hits = editor_usage_hits(&analyzer, &string_overload);
+    assert_eq!(2, string_editor_hits.len(), "{string_editor_hits:#?}");
     assert_hit_contains(
-        &string_hits,
+        &string_editor_hits,
         "src/parity.cpp",
         "std::string format(const std::string& value)",
     );
@@ -5023,8 +5028,14 @@ fn cpp_graph_filters_same_arity_free_function_overloads_by_argument_type() {
     assert_no_hit_contains(&string_hits, "parity::format(7)");
 
     let int_hits = usage_hits(&analyzer, &int_overload);
-    assert_eq!(2, int_hits.len(), "int hits: {int_hits:#?}");
-    assert_hit_contains(&int_hits, "src/parity.cpp", "std::string format(int value)");
+    assert_eq!(1, int_hits.len(), "int hits: {int_hits:#?}");
+    let int_editor_hits = editor_usage_hits(&analyzer, &int_overload);
+    assert_eq!(2, int_editor_hits.len(), "{int_editor_hits:#?}");
+    assert_hit_contains(
+        &int_editor_hits,
+        "src/parity.cpp",
+        "std::string format(int value)",
+    );
     assert_hit_contains(&int_hits, "src/main.cpp", "parity::format(7)");
     assert_no_hit_contains(&int_hits, "parity::format(first)");
 }
@@ -6240,12 +6251,14 @@ std::string Service::execute(const std::string& name) {
     });
     let build_hits = graph_success_hits(&analyzer, &build_service_header);
     assert_eq!(
-        2,
+        1,
         build_hits.len(),
         "build_service hits were {build_hits:#?}"
     );
+    let build_editor_hits = editor_usage_hits(&analyzer, &build_service_header);
+    assert_eq!(2, build_editor_hits.len(), "{build_editor_hits:#?}");
     assert_hit_contains(
-        &build_hits,
+        &build_editor_hits,
         "src/service.cpp",
         "Service build_service(Repository& repository)",
     );
@@ -6262,9 +6275,11 @@ std::string Service::execute(const std::string& name) {
             && slash_path(unit.source()) == "include/service.h"
     });
     let execute_hits = graph_success_hits(&analyzer, &execute_header);
-    assert_eq!(2, execute_hits.len(), "execute hits were {execute_hits:#?}");
+    assert_eq!(1, execute_hits.len(), "execute hits were {execute_hits:#?}");
+    let execute_editor_hits = editor_usage_hits(&analyzer, &execute_header);
+    assert_eq!(2, execute_editor_hits.len(), "{execute_editor_hits:#?}");
     assert_hit_contains(
-        &execute_hits,
+        &execute_editor_hits,
         "src/service.cpp",
         "std::string Service::execute(const std::string& name)",
     );
@@ -6355,9 +6370,27 @@ int ping(void) { return 1; }
             && unit.signature() == Some("(int)")
     });
     let parse_hits = graph_success_hits(&analyzer, &parse_int);
-    assert_eq!(1, parse_hits.len(), "parse hits were {parse_hits:#?}");
-    assert_hit_contains(&parse_hits, "src/api.cpp", "int parse(int value)");
-    assert_no_hit_contains(&parse_hits, "int parse(double value)");
+    assert!(parse_hits.is_empty(), "parse hits were {parse_hits:#?}");
+    let parse_editor_hits = editor_usage_hits(&analyzer, &parse_int);
+    assert_eq!(1, parse_editor_hits.len(), "{parse_editor_hits:#?}");
+    assert_hit_contains(&parse_editor_hits, "src/api.cpp", "int parse(int value)");
+    assert_no_hit_contains(&parse_editor_hits, "int parse(double value)");
+    let raw_parse_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&parse_int))
+        .all_hits_including_imports();
+    let definition_hit = raw_parse_hits
+        .iter()
+        .find(|hit| hit.kind == UsageHitKind::Definition)
+        .expect("out-of-line definition remains editor-visible");
+    let definition_source = definition_hit
+        .file
+        .read_to_string()
+        .expect("definition source");
+    assert_eq!(
+        "parse",
+        &definition_source[definition_hit.start_offset..definition_hit.end_offset],
+        "definition hit must select only the terminal callable identifier"
+    );
 
     let ping = definition_by(&analyzer, |unit| {
         unit.kind() == CodeUnitType::Function
@@ -6365,8 +6398,66 @@ int ping(void) { return 1; }
             && slash_path(unit.source()) == "include/api.h"
     });
     let ping_hits = graph_success_hits(&analyzer, &ping);
-    assert_eq!(1, ping_hits.len(), "ping hits were {ping_hits:#?}");
-    assert_hit_contains(&ping_hits, "src/api.cpp", "int ping(void)");
+    assert!(ping_hits.is_empty(), "ping hits were {ping_hits:#?}");
+    let ping_editor_hits = editor_usage_hits(&analyzer, &ping);
+    assert_eq!(1, ping_editor_hits.len(), "{ping_editor_hits:#?}");
+    assert_hit_contains(&ping_editor_hits, "src/api.cpp", "int ping(void)");
+}
+
+#[test]
+fn cpp_graph_classifies_unresolved_out_of_line_definitions_as_editor_only() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/api.h",
+            r#"namespace example {
+struct Service {
+    int run(int value);
+};
+}
+"#,
+        ),
+        (
+            "src/unresolved.cpp",
+            "int Service::run(int value) { return value; }\n",
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "example.Service.run"
+            && slash_path(unit.source()) == "include/api.h"
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_by_overload,
+        ..
+    } = result
+    else {
+        panic!("expected structured C++ result");
+    };
+
+    assert!(
+        hits_by_overload.values().all(BTreeSet::is_empty),
+        "unresolved definition must not be a proven reference: {hits_by_overload:#?}"
+    );
+    let unproven = unproven_by_overload.values().flatten().collect::<Vec<_>>();
+    assert_eq!(1, unproven.len(), "{unproven_by_overload:#?}");
+    assert_eq!(UsageHitKind::Definition, unproven[0].kind);
+    assert_eq!("src/unresolved.cpp", slash_path(&unproven[0].file));
+    let source = unproven[0]
+        .file
+        .read_to_string()
+        .expect("definition source");
+    assert_eq!(
+        "Service::run",
+        &source[unproven[0].start_offset..unproven[0].end_offset]
+    );
 }
 
 // Issue #230 / #220: a bare constant reference that also matches a same-named

@@ -81,38 +81,17 @@ With `--fail-on never`, the complete human report is:
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
 note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 2
-app.py:2:12: [warning] bifrost.security.dynamic-eval: Dynamic evaluation is forbidden
-  finding: cc59cd275916575bf43db14db832fba67ed3b0db15790fbea87a984c3ee1756a (strong)
-  analysis: match (definite, complete)
-  evidence: structural_match call
-  match anchor: strong structural_match app.py
-    semantic owner: python:app.py:canonical_ast_identity:[["function","run"],["return",null],["call","eval"]]
-    selected source: fe36d6a5c7b9aba5fb78c7a1f4a4bf6ea1d43e68de0c65682eb6a0aeb47e65b7
-    occurrence ordinal: 0
-  match terminal: structural_match call; identity python:app.py:canonical_ast_identity:[["function","run"],["return",null],["call","eval"]] at app.py:2:12
-  proof reason: direct_structural_match
-  classification: unclassified
-  proof: proven
-policy rule: bifrost.security.dynamic-eval (No dynamic evaluation)
-  policy hash: 5cf37a869e311d9c8c5c20dcb0c96dea81066eaa7be2109a2a87e602b55f6bbc
-  analysis type: match
-  policy schema: 1 (implicit_compatible)
-  selector schema /analysis/selector: 2 (implicit_compatible)
-  endpoint dependencies: none
-  match directories: none
-  precedence: none
-  message: static - Dynamic evaluation is forbidden
-  severity: fixed warning
-  description: Reject calls that execute source text as Python code.
-  tag: code-execution
-  tag: security
+[warning]  app.py:2:12
+    Dynamic evaluation is forbidden
+
 summary: 1 finding; 1 complete policy run
 ```
 
 </details>
 
 The same run with the default `warning` threshold produces identical report
-text and exits 1.
+text and exits 1. Add `--verbose` to include the complete finding identity,
+evidence, provenance, proof, classification, rule schema, and manifest record.
 
 ## Schema Versions And Selectors
 
