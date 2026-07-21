@@ -53,6 +53,8 @@ With line numbers enabled, `symbol` advertises `scan_usages_by_location`, `get_d
 
 Location navigation keeps declarations and definitions distinct. Both tools accept `{"references":[{"path":"src/file.ext","line":1,"column":1}]}`. Declaration results contain `operation: "declaration"` and a `declarations` array; definition results contain `operation: "definition"` and a `definitions` array. An empty operation-specific selection reports `no_declaration` or `no_definition`, and more than one selected target reports `ambiguous`. Declaration navigation prefers contracts such as C++ prototypes, Java interface methods, and Rust trait items, while definition navigation selects concrete bodies or implementation items. Entities without a separate body remain valid for both operations.
 
+Exact MCP source positions use 1-based lines and 1-based Unicode code-point columns, with an exclusive end position. Individual `scan_usages` hits expose `line`, `column`, `end_line`, and `end_column`. Definition, declaration, and type-definition candidates expose `start_line`, `start_column`, `end_line`, and `end_column`. Column fields are omitted when a row is an aggregate or Bifrost cannot prove an exact token span; byte offsets are never part of the public result.
+
 `searchtools` is the compatibility mode and exposes the full current union of MCP tools in toolset order. Use `symbol|extended` for the packaged coding-agent surface, or a smaller composition such as `symbol|workspace` when a host should see fewer tools.
 
 Pass `--no-line-numbers` to remove rendered line and line-range prefixes from MCP text previews while keeping `structuredContent` unchanged.

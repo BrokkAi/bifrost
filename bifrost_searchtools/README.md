@@ -119,6 +119,13 @@ Location navigation results expose a `NavigationOperation`. Declarations use
 `no_declaration`, `no_definition`, and `ambiguous`. Reference-based definition
 lookup is unchanged, and there is no declaration-by-reference method.
 
+Exact source positions use 1-based lines and 1-based Unicode code-point
+columns, with an exclusive end position. Individual usage hits carry `line`,
+`column`, `end_line`, and `end_column`; definition, declaration, and nested type
+candidates carry `start_line`, `start_column`, `end_line`, and `end_column`.
+Column fields are absent for aggregate rows or candidates whose exact name token
+cannot be proven. Byte offsets remain internal.
+
 ## `query_code` detail and ranges
 
 `query_code` is the version-2 typed query surface. Omit `schema_version` for v2

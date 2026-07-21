@@ -83,6 +83,8 @@ The git tools return `GitTextResult` with `.text`. Code-quality tools return `Co
 
 `get_declarations_by_location(...)` returns `DeclarationLookupResult` objects with `operation is NavigationOperation.DECLARATION` and a typed `declarations` list. `get_definitions_by_location(...)` returns `DefinitionLookupResult` objects with `operation is NavigationOperation.DEFINITION` and a typed `definitions` list. Their statuses distinguish `no_declaration`, `no_definition`, and `ambiguous`; `get_definitions_by_reference(...)` is unchanged.
 
+Exact source positions use 1-based lines and 1-based Unicode code-point columns, with exclusive ends. Individual usage hits expose `line`, `column`, `end_line`, and `end_column`; definition, declaration, and nested type candidates expose `start_line`, `start_column`, `end_line`, and `end_column`. Columns are omitted for aggregate rows or candidates without a proven exact token span, and public results do not expose byte offsets.
+
 The many per-rule tuning knobs on code-quality smell reports are accepted through an `options` dict whose keys map 1:1 to the underlying Rust tool arguments.
 
 `get_summaries(...)` is directory-aware for MCP callers: directory targets surface a `compact_symbols` inventory alongside ordinary summaries when mixed with file or class targets. The direct Rust `brokk_bifrost::searchtools::get_summaries(...)` API and the Python client are narrower and report directory targets in `not_found` instead of embedding directory inventory in `SummaryResult`.

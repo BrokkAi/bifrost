@@ -862,10 +862,13 @@ class NavigationOperation(StrEnum):
 
 @dataclass(frozen=True)
 class DefinitionCandidate:
-    fqn: str
+    name: str
+    fqn: str | None
     path: str
     start_line: int
+    start_column: int | None
     end_line: int
+    end_column: int | None
     kind: str
     signature: str | None
     language: str
@@ -873,19 +876,39 @@ class DefinitionCandidate:
     @classmethod
     def from_dict(cls, data: dict) -> DefinitionCandidate:
         return cls(
-            fqn=data["fqn"],
+            name=data["name"],
+            fqn=data.get("fqn"),
             path=data["path"],
             start_line=int(data["start_line"]),
+            start_column=(
+                int(data["start_column"])
+                if data.get("start_column") is not None
+                else None
+            ),
             end_line=int(data["end_line"]),
+            end_column=(
+                int(data["end_column"])
+                if data.get("end_column") is not None
+                else None
+            ),
             kind=data["kind"],
             signature=data.get("signature"),
             language=data["language"],
         )
 
     def render_text(self) -> str:
-        location = f"{self.path}:{self.start_line}..{self.end_line}"
+        if self.start_column is not None and self.end_column is not None:
+            location = (
+                f"{self.path}:{self.start_line}:{self.start_column}-"
+                f"{self.end_line}:{self.end_column}"
+            )
+        else:
+            location = f"{self.path}:{self.start_line}..{self.end_line}"
         signature = f" {self.signature}" if self.signature else ""
-        return f"{self.fqn} ({self.kind}, {self.language}) at {location}{signature}"
+        return (
+            f"{self.fqn or self.name} ({self.kind}, {self.language}) "
+            f"at {location}{signature}"
+        )
 
 
 @dataclass(frozen=True)
@@ -1634,7 +1657,18 @@ def _append_usage_hits(lines: list[str], file_group: dict, prefix: str) -> None:
     for hit in hits:
         line = hit.get("line_range") or hit.get("line")
         enclosing = hit.get("enclosing")
-        location = f"{prefix}line {line}" if line is not None else f"{prefix}hit"
+        if (
+            hit.get("line") is not None
+            and hit.get("column") is not None
+            and hit.get("end_line") is not None
+            and hit.get("end_column") is not None
+        ):
+            location = (
+                f"{prefix}line {hit['line']}:{hit['column']}-"
+                f"{hit['end_line']}:{hit['end_column']}"
+            )
+        else:
+            location = f"{prefix}line {line}" if line is not None else f"{prefix}hit"
         if enclosing:
             location += f" in {enclosing}"
         if hit.get("hit_count") is not None:

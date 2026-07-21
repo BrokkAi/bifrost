@@ -17141,7 +17141,7 @@ fn cpp_navigation_distinguishes_header_declaration_and_source_definition() {
 
 #[test]
 fn cpp_navigation_distinguishes_same_file_declaration_and_definition_ranges() {
-    let source = "void run();\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let source = "void run(); void run() {}\nvoid invoke() { run(); }\n";
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("app.cpp", source)
         .build();
@@ -17157,6 +17157,14 @@ fn cpp_navigation_distinguishes_same_file_declaration_and_definition_ranges() {
         declaration["results"][0]["declarations"][0]["start_line"], 1,
         "{declaration}"
     );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_column"], 6,
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["end_column"], 9,
+        "{declaration}"
+    );
 
     let definition = lookup(project.root(), &args);
     assert_eq!(
@@ -17164,7 +17172,15 @@ fn cpp_navigation_distinguishes_same_file_declaration_and_definition_ranges() {
         "{definition}"
     );
     assert_eq!(
-        definition["results"][0]["definitions"][0]["start_line"], 2,
+        definition["results"][0]["definitions"][0]["start_line"], 1,
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["start_column"], 18,
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["end_column"], 21,
         "{definition}"
     );
 }
@@ -22435,6 +22451,65 @@ fn python_reference_context_resolves_attribute_qualifier_to_class() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Types", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 1, "{value}");
+    assert_eq!(result["definitions"][0]["start_column"], 7, "{value}");
+    assert_eq!(result["definitions"][0]["end_line"], 1, "{value}");
+    assert_eq!(result["definitions"][0]["end_column"], 12, "{value}");
+}
+
+#[test]
+fn navigation_and_type_candidates_expose_exact_same_line_unicode_ranges() {
+    let source = "class Først {} class Widget {}\nconst value: Widget = new Widget();\nvalue;\n";
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", source)
+        .build();
+    let reference = source.find("new Widget").unwrap() + "new ".len();
+    let expected_start = source.lines().next().unwrap().find("Widget").unwrap();
+    let expected_column = source.lines().next().unwrap()[..expected_start]
+        .chars()
+        .count()
+        + 1;
+    let expected_end_column = expected_column + "Widget".chars().count();
+
+    let definition = lookup(
+        project.root(),
+        &location_reference("app.ts", source, reference),
+    );
+    let declaration = lookup_declaration(
+        project.root(),
+        &location_reference("app.ts", source, reference),
+    );
+    for candidate in [
+        &definition["results"][0]["definitions"][0],
+        &declaration["results"][0]["declarations"][0],
+    ] {
+        assert_eq!(candidate["start_line"], 1, "candidate: {candidate}");
+        assert_eq!(
+            candidate["start_column"], expected_column,
+            "candidate: {candidate}"
+        );
+        assert_eq!(candidate["end_line"], 1, "candidate: {candidate}");
+        assert_eq!(
+            candidate["end_column"], expected_end_column,
+            "candidate: {candidate}"
+        );
+    }
+
+    let type_lookup = lookup_type(
+        project.root(),
+        &location_reference("app.ts", source, source.rfind("value").unwrap()),
+    );
+    let type_definition = &type_lookup["results"][0]["types"][0]["definitions"][0];
+    assert_eq!(type_definition["start_line"], 1, "{type_lookup}");
+    assert_eq!(
+        type_definition["start_column"], expected_column,
+        "{type_lookup}"
+    );
+    assert_eq!(type_definition["end_line"], 1, "{type_lookup}");
+    assert_eq!(
+        type_definition["end_column"], expected_end_column,
+        "{type_lookup}"
+    );
 }
 
 #[test]
@@ -22485,6 +22560,9 @@ fn rust_parameter_definition_by_location_has_local_candidate_contract() {
     assert_eq!(definition["signature"], "cfg: &config::Config", "{value}");
     assert_eq!(definition["path"], "main.rs", "{value}");
     assert_eq!(definition["start_line"], 1, "{value}");
+    assert_eq!(definition["start_column"], 16, "{value}");
+    assert_eq!(definition["end_line"], 1, "{value}");
+    assert_eq!(definition["end_column"], 19, "{value}");
 }
 
 #[test]
