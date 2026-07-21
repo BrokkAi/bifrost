@@ -1254,10 +1254,7 @@ fn resolve_run_policy_identity(
     project: &dyn Project,
     document_uri: &Uri,
 ) -> Result<(PathBuf, PolicySourceIdentity), String> {
-    let document_path = uri_to_path(document_uri)
-        .ok_or_else(|| "Run Policy requires a file document URI".to_string())?;
-    let project_file = project
-        .file_by_abs_path_allow_missing(&document_path)
+    let project_file = resolve_project_file_allow_missing(project, document_uri)
         .ok_or_else(|| "Run Policy document is outside the active Bifrost workspace".to_string())?;
     let workspace_root = project.workspace_root_for_file(&project_file);
     let project_file_path = project_file.abs_path();

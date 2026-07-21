@@ -17,7 +17,7 @@ The behavior is visible by opening a workspace policy, changing it without savin
 - [x] (2026-07-21 18:57Z) Milestone 3: added the typed VS Code policy runner, dedicated results view, navigation, evidence tooltip, and stale-result lifecycle; the complete 61-test extension suite passes.
 - [x] (2026-07-21 19:00Z) Milestone 4: replaced the generic policy artwork with theme-specific Brokk-helmet document icons and inspected 16- and 24-pixel light/dark renders for legibility.
 - [x] (2026-07-21 19:35Z) Ran `cargo fmt --check`, strict all-target/all-feature clippy, the complete `nlp,python` Rust test suite, 185 matching LSP integration tests, and all 64 VS Code tests.
-- [ ] Run manual Extension Development Host validation; automated editor behavior and the rendered 16/24-pixel icon assets are validated, but an interactive Extension Host was not available in this session.
+- [x] (2026-07-21 20:34Z) Ran a real isolated VS Code Extension Development Host smoke test: executed a `.rqlp` match policy, rendered `complete · 1 finding`, opened the finding at the exact 12-character `eval(source)` span, and compared the policy icon beside Python, JSON, RQL, and Markdown Explorer icons.
 - [x] (2026-07-21 19:35Z) Completed the five-specialist guided review, fixed every Critical/High/Medium finding, and received clean senior and architecture re-reviews.
 
 ## Surprises & Discoveries
@@ -45,6 +45,9 @@ The behavior is visible by opening a workspace policy, changing it without savin
 
 - Observation: The feature-complete implementation needed generation tracking in addition to request cancellation.
   Evidence: VS Code cancellation is cooperative, so a superseded server response can still arrive. `PolicyRunTracker` gates publication by run ID and content revision, preventing older results from replacing newer ones and preserving a stale marker when content changes during a run.
+
+- Observation: The first real VS Code run exposed a macOS path-alias boundary that integration tests using canonical temporary roots had hidden.
+  Evidence: VS Code sent a `file:///tmp/...` document URI while `FilesystemProject` canonicalized its root to `/private/tmp/...`, so the policy-only resolver rejected a visibly in-workspace document. Reusing the shared allow-missing URI resolver canonicalizes the existing path prefix, and a real-server symlinked-workspace regression test now covers the same class of alias.
 
 ## Decision Log
 
@@ -88,7 +91,9 @@ The behavior is visible by opening a workspace policy, changing it without savin
 
 All four implementation milestones and automated validation are complete. `evaluate_policy_source` evaluates editor-provided bytes under a server-derived identity with a caller-owned `IAnalyzer`, capability-confined dependencies, and cancellation checks. `bifrost/runPolicy` selects the owning configured root, uses the overlay-snapshot analyzer, and returns the canonical report with explicit policy and report coordinate roots. VS Code now exposes a cancellable policy-only Play command and dedicated results view with exact completion semantics, run/report diagnostics and truncation, safe evidence tooltips, navigable findings, generation-safe publication, and conservative stale-result marking. Theme-specific Brokk-helmet document icons remain legible in inspected 16- and 24-pixel renders.
 
-The five-specialist review found and drove fixes for server-authoritative identity, configured roots outside editor workspaces, multi-root path coordinates, stale response races, user cancellation, unsupported/empty messaging, hidden diagnostics/truncation, canonical tagged diagnostic codes, Markdown injection, and duplicated policy input preparation. Senior and architecture re-reviews found no remaining Critical, High, or Medium issues; security retained only a Low observation that cancellation cannot interrupt one already-running bounded registry load. Formatting, strict clippy, the complete `cargo test --features nlp,python` suite, the 185-test LSP integration selection, and all 64 VS Code tests pass. Interactive Extension Development Host validation remains the sole unperformed acceptance step.
+The five-specialist review found and drove fixes for server-authoritative identity, configured roots outside editor workspaces, multi-root path coordinates, stale response races, user cancellation, unsupported/empty messaging, hidden diagnostics/truncation, canonical tagged diagnostic codes, Markdown injection, and duplicated policy input preparation. Senior and architecture re-reviews found no remaining Critical, High, or Medium issues; security retained only a Low observation that cancellation cannot interrupt one already-running bounded registry load. Formatting, strict clippy, the complete `cargo test --features nlp,python` suite, the LSP integration selection, and all 64 VS Code tests pass.
+
+The final isolated Extension Development Host smoke test found and then verified the fix for `/tmp` versus `/private/tmp` document identity. The successful rerun displayed one complete finding and navigated to the exact `eval(source)` span in `app.py`. In the real dark-theme Explorer, the light-box footprint and perceived height of the red helmet/document policy glyph match the adjacent 16-pixel Python, JSON, ordinary RQL, and Markdown icons without crowding the filename row. All automated and manual acceptance steps are complete.
 
 ## Context and Orientation
 
@@ -167,3 +172,5 @@ Revision note (2026-07-21 19:00Z): Marked Milestone 4 complete after replacing t
 Revision note (2026-07-21 19:05Z): Recorded the pinned-toolchain clippy invocation and its clean result after fixing generic annotations in the cancellable-worker unit tests.
 
 Revision note (2026-07-21 19:35Z): Recorded final automated validation and the guided-review fixes for server-derived identity, configured/multi-root coordinates, cancellation and publication races, completion messaging, diagnostic projection, safe Markdown rendering, and canonical tagged diagnostic codes. Senior and architecture re-reviews are clean; only interactive Extension Host validation remains.
+
+Revision note (2026-07-21 20:34Z): Recorded the real VS Code smoke test, the macOS `/tmp` path-alias failure it exposed, the shared-resolver fix and symlink regression test, successful finding navigation, and the final Explorer icon-size comparison.

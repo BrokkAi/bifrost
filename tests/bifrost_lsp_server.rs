@@ -1425,6 +1425,48 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_runs_policy_from_symlinked_workspace_uri() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canonical parent");
+    let real_root = parent.join("real-workspace");
+    let linked_root = parent.join("linked-workspace");
+    fs::create_dir_all(real_root.join("policies")).expect("create policy directory");
+    std::os::unix::fs::symlink(&real_root, &linked_root).expect("create workspace symlink");
+    fs::write(real_root.join("app.py"), "result = eval(source)\n").expect("write source fixture");
+    fs::write(real_root.join("policies/live.rqlp"), "").expect("write policy placeholder");
+    let source = r#"(policy
+  :schema-version 1
+  :id "test.symlinked-uri"
+  :name "Symlinked URI"
+  :message "Avoid eval"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 2
+          (language python (call :callee (name "eval"))))))"#;
+    let mut server = LspServer::start(&real_root);
+
+    let response = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&linked_root.join("policies/live.rqlp")),
+            "source": source,
+        }),
+    );
+
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["policyRootUri"], uri_for(&real_root));
+    assert_eq!(response["result"]["reportRootUri"], uri_for(&real_root));
+    assert_eq!(
+        response["result"]["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        "app.py"
+    );
+}
+
 #[test]
 fn bifrost_lsp_server_derives_policy_identity_from_configured_root() {
     let workspace = TempDir::new().expect("workspace tempdir");
