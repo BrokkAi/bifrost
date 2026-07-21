@@ -3820,6 +3820,88 @@ public class OverrideChild extends Base {
 }
 
 #[test]
+fn java_scan_usages_separates_interface_and_concrete_method_ranges() {
+    let runner = r#"package com.example;
+public class Runner {
+    Handler makeAnonymous() {
+        return new Handler() {
+            @Override public String handle(String value) { return value; }
+        };
+    }
+    String run() {
+        Handler handler = new ConsoleHandler();
+        ConsoleHandler direct = new ConsoleHandler();
+        return handler.handle(" Ada ") + ":" + direct.handle(" Grace ") + ":" + makeAnonymous().handle(" Linus ");
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Handler.java",
+            "package com.example; public interface Handler { String handle(String value); }\n",
+        )
+        .file(
+            "com/example/ConsoleHandler.java",
+            "package com.example; public class ConsoleHandler implements Handler { @Override public String handle(String value) { return value.trim(); } }\n",
+        )
+        .file("com/example/Runner.java", runner)
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let return_line = runner
+        .lines()
+        .find(|line| line.contains("return handler.handle"))
+        .expect("return line");
+    let ranges = return_line
+        .match_indices(".handle")
+        .map(|(byte, _)| {
+            let start = return_line[..byte].chars().count() + 2;
+            (start, start + "handle".chars().count())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(3, ranges.len());
+
+    for (symbol, expected_ranges, expected_total_hits) in [
+        ("com.example.Handler.handle", vec![ranges[0], ranges[2]], 3),
+        ("com.example.ConsoleHandler.handle", vec![ranges[1]], 2),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_reference",
+                &serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string(),
+            )
+            .expect("scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let usage = only_result(&value);
+        assert_eq!("found", usage["status"], "{symbol}: {value}");
+        assert_eq!(
+            expected_total_hits, usage["total_hits"],
+            "{symbol}: {value}"
+        );
+        assert_eq!(0, usage["unproven_hits"], "{symbol}: {value}");
+
+        let runner_hits = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|file| file["path"] == "com/example/Runner.java")
+            .and_then(|file| file["hits"].as_array())
+            .expect("Runner.java hits");
+        let actual_ranges = runner_hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit["column"].as_u64().unwrap() as usize,
+                    hit["end_column"].as_u64().unwrap() as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected_ranges, actual_ranges, "{symbol}: {value}");
+    }
+}
+
+#[test]
 fn scan_usages_java_varargs_calls_stay_narrow() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
