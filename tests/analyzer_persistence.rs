@@ -1,11 +1,12 @@
 //! Analyzer-level persistence behavior for the blob-keyed SQLite store.
 
-use brokk_bifrost::analyzer::{BuildProgressEvent, BuildProgressPhase};
+use brokk_bifrost::analyzer::{BuildProgressEvent, BuildProgressPhase, store::analyzer_db_path};
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, Language, Project, ProjectFile, PythonAnalyzer, TestProject,
     WorkspaceAnalyzer,
 };
 use git2::{IndexAddOption, Repository, Signature};
+use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -1571,6 +1572,68 @@ fn dirty_file_reconcile_parses_only_changed_blob() {
     assert!(!names.contains("alpha.Alpha"));
     assert!(names.contains("beta.beta"));
     assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
+}
+
+#[test]
+fn corrupt_persisted_blob_is_reparsed_and_repaired() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "alpha.py", "class Alpha:\n    pass\n");
+    write_file(root, "beta.py", "def beta():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let alpha_oid = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .tree()
+        .unwrap()
+        .get_path(Path::new("alpha.py"))
+        .unwrap()
+        .id()
+        .to_string();
+    let project = python_project(root);
+
+    let cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    drop(cold);
+
+    let cache = Connection::open(analyzer_db_path(root)).unwrap();
+    cache
+        .execute(
+            "DELETE FROM code_units WHERE blob_oid = ?1 AND lang = 'python'",
+            [alpha_oid],
+        )
+        .unwrap();
+    drop(cache);
+
+    let repair_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let repaired =
+        build_persisted_with_progress(Arc::clone(&project), AnalyzerConfig::default(), {
+            let events = Arc::clone(&repair_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    let names = declaration_names(repaired.analyzer());
+    assert!(names.contains("alpha.Alpha"));
+    assert!(names.contains("beta.beta"));
+    assert_eq!(
+        parsed_file_count(&repair_events.lock().unwrap()),
+        1,
+        "only the quarantined blob should be reparsed"
+    );
+    drop(repaired);
+
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    assert!(declaration_names(warm.analyzer()).contains("alpha.Alpha"));
+    assert_eq!(
+        parsed_file_count(&warm_events.lock().unwrap()),
+        0,
+        "the repaired blob should hydrate normally on the following build"
+    );
 }
 
 #[test]

@@ -12,11 +12,11 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
 - [x] (2026-07-21 13:35Z) Inventoried the CI matrix, large integration suites, lazy-cache/deadlock tests, and ignored-test candidates; recorded the first bounded milestone.
 - [ ] Establish a completed, reproducible focused baseline for the concurrency/cache milestone. Two isolated-Cargo attempts began cold dependency builds but the execution host ended each 30-second capture before Cargo returned a result; do not treat either as a pass or failure. Re-run in a session that can retain the command to completion before editing the test fixture.
 - [ ] Audit and, only with equivalent behavioral evidence, reduce the JS/TS lazy-index deadlock regression's generated fixture cost. The test now asserts its triggering imported-call contract rather than only a broad node count; fixture reduction still requires a completed baseline and pre-fix reproduction.
-- [ ] Audit persistence, reconciliation, and interrupted-state transitions with deterministic low-budget corruption and cancellation probes.
-- [ ] Audit protocol, parser, and boundary inputs: JSON, RQL, Rune, LSP, MCP, CLI, source text, Unicode, CRLF, and paths.
+- [ ] Audit persistence, reconciliation, and interrupted-state transitions with deterministic low-budget corruption and cancellation probes. Added the first recovery probe: a single corrupted cached Python blob must reparse while its clean peer hydrates, then hydrate normally after repair.
+- [ ] Audit protocol, parser, and boundary inputs: JSON, RQL, Rune, LSP, MCP, CLI, source text, Unicode, CRLF, and paths. The first LSP/MCP review found existing behavior-focused coverage for malformed language input, CRLF/Unicode incremental edits, stale document versions, cancellation, and unknown requests; continue with RQL/Rune/CLI before declaring this milestone complete.
 - [ ] Audit watcher lifecycle, incremental invalidation, cancellation, and stale generations using barriers/channels instead of elapsed-time races.
 - [ ] Audit analyzer ambiguity and structural-query behavior across import, receiver, ordering, and platform boundaries; use `InlineTestProject` for small projects.
-- [ ] Review ignored, flaky, duplicate, and implementation-mirroring tests; retain only documented opt-in benchmarks/external-model tests or explicitly justified deferred contracts.
+- [ ] Review ignored, flaky, duplicate, and implementation-mirroring tests; removed six ignored parity-marker non-tests with empty or unconditional-panic bodies. Continue reviewing the remaining ignored tests, retaining only documented opt-in benchmarks/external-model tests or explicitly justified deferred contracts.
 - [ ] Run the full acceptance matrix and publish the final report in this plan.
 
 ## Surprises & Discoveries
@@ -33,8 +33,16 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
   Evidence: `tests/jsts_usage_graph_deadlock.rs` imports `common::usage_graph::has_edge` and asserts that edge after the bounded pool execution.
 - Observation: local focused Cargo evidence is incomplete because the execution host terminated capture while compiling a fresh isolated target. This is an environment limitation, not a test result.
   Evidence: both helper-created directories `/private/tmp/bifrost-cargo-target.Fu9mNt` and `/private/tmp/bifrost-cargo-target.75F82c` remain younger than the cleanup script's 24-hour safety threshold after output ended in dependency compilation.
+- Observation: a later retained-background attempt did not launch because this sandbox rejects the `nice` operation used by its process wrapper. The focused persistence test therefore still has no pass/fail result.
+  Evidence: `nohup scripts/with-isolated-cargo-target.sh cargo test ...` reported `nice(5) failed: operation not permitted` and the process exited without a test log.
 - Observation: ignored tests have several distinct classes: intentionally opt-in measurement benchmarks, external model downloads, known analyzer gaps, a 10k-file smoke, and stress cases. They must not be treated as one category.
   Evidence: `rg -n '#\\[ignore' tests src` identifies explicit reasons at `tests/measure_*.rs`, `tests/nlp_*`, `tests/searchtools_service.rs:7185`, `tests/lsp_click_around_regression.rs`, and language parity suites.
+- Observation: store-unit tests prove a corrupted blob is excluded from hydration, but persisted workspace tests did not prove the next build reparses and repairs just that blob while retaining a clean peer as warm state.
+  Evidence: `src/analyzer/store/mod.rs` has `metadata_unit_count_mismatch_is_treated_as_incomplete`; `tests/analyzer_persistence.rs` had warm and dirty-file reconciliation coverage but no externally corrupted-cache repair scenario.
+- Observation: the initial LSP/MCP boundary audit found mature, behavior-focused coverage for malformed language input, cancellation, CRLF and Unicode incremental edits, stale `didChange` versions, and unknown requests. Adding another test in those shapes would duplicate existing contracts.
+  Evidence: `tests/bifrost_lsp_server.rs` covers malformed diagnostics around lines 7156-7520, formatting cancellation around 8941-9030, CRLF/Unicode edits around 9400-9475, stale changes around 9579-9627, and unknown requests at 7662; `src/lsp/handlers/formatting.rs` retains one explicit opt-in integration test.
+- Observation: six ignored parity markers do not exercise code: three Python markers and one Git-hotspot marker panic unconditionally, while two JS/TS markers have empty bodies. They add no executable contract and turn `--ignored` into a knowingly failing/non-informative mode.
+  Evidence: `tests/usages_python_graph_test.rs`, `tests/usages_js_ts_graph_test.rs`, and `src/code_quality/git_hotspots.rs` each contained the named ignored marker functions.
 
 ## Decision Log
 
@@ -49,6 +57,12 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
   Date/Author: 2026-07-21 / Codex.
 - Decision: strengthen the integration test before reducing its generated workload.
   Rationale: node count was not the behavior that reaches the lazy index. The imported-call edge is a stable observable result, while a workload reduction needs separate evidence that the former deadlock shape remains reproducible.
+  Date/Author: 2026-07-21 / Codex.
+- Decision: add recovery coverage at the persisted-workspace boundary rather than duplicating the store's metadata-mismatch unit assertions.
+  Rationale: deleting one `code_units` row through a second SQLite connection simulates externally interrupted/corrupt cache state. The test proves observable recovery: one parse to repair the affected Git blob, no parse for its peer, and zero parses on the following warm build.
+  Date/Author: 2026-07-21 / Codex.
+- Decision: remove ignored parity-marker non-tests rather than converting them into comments or retaining their test names.
+  Rationale: the markers contain neither a fixture nor a behavioral assertion, so they are not regressions and cannot become useful by being run. The relevant supported behavior remains covered by nearby real tests; future parity work needs an issue or an executable contract, not a placeholder test.
   Date/Author: 2026-07-21 / Codex.
 
 ## Context and Orientation
