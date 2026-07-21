@@ -22,7 +22,7 @@ After this change, a contributor can run one command against any corpus reposito
 
 "Shrinking" means reducing a failing case to the smallest reproduction that still violates the invariant — dropping unrelated batch entries, trimming context strings — before it is recorded.
 
-"Ledger" means the append-only JSONL file of shrunk, deduplicated findings that survives across resumed runs, in the spirit of the FIRD runbook (`.agents/docs/reference-differential-runbook.md`).
+"Ledger" means the append-only JSONL file of shrunk, deduplicated findings that survives across resumed runs, in the spirit of the FIRD runbook (`.agents/docs/reference-differential-runbook.md`). The ledger lives inside this repository under `.agents/plans/mcp-property-fuzzer/` and is committed, so findings are visible to the whole team rather than stranded on one operator's scratch disk.
 
 
 ## Repository orientation
@@ -32,7 +32,7 @@ The pieces this plan touches or imitates:
 - `src/bin/bifrost_reference_differential.rs` — the FIRD CLI driver. The fuzzer gets a sibling binary, `src/bin/bifrost_mcp_property_fuzzer.rs`, and copies its argument conventions (corpus roots, resume, per-repo selection) where they fit.
 - `src/reference_differential/mod.rs` — FIRD's engine and report schema; the model for a new `src/mcp_property_fuzzer/mod.rs`.
 - `src/mcp_core.rs`, `src/searchtools_service.rs`, `src/tool_arguments.rs`, `src/searchtools_render.rs` — the descriptor definitions, the service layer that executes tool calls, argument parsing, and response rendering. The fuzzer calls the service layer in-process (like FIRD calls the analyzer) rather than spawning stdio servers, but it must construct calls exactly as the MCP handler would parse them, so selector-string handling and response rendering are genuinely under test.
-- Corpus layout (identical to FIRD; see the runbook): clones under `/home/jonathan/Projects/brokkbench/clones` (a symlink to `/mnt/T9/repo-clones`), membership and LOC ranking from `/home/jonathan/Projects/brokkbench/sft-tools-commits/<language>/<slug>.jsonl` plus `repos.csv::code_loc`. Durable run output goes under `/mnt/optane/tmp/mcp-property-fuzzer/`.
+- Corpus layout (identical to FIRD; see the runbook): clones under `/home/jonathan/Projects/brokkbench/clones`, which is a symlink to `/mnt/minasmorgul/repo-clones` (recreated 2026-07-21 after the previous `/mnt/T9` mount disappeared). Membership per language comes from `/home/jonathan/Projects/brokkbench/sft-tools-commits/<language>/<slug>.jsonl`; per-language priority is by task count derived from `/home/jonathan/Projects/brokkbench/tasks.py`'s task data (see Decision Log), not by `repos.csv::code_loc`. Durable run output — the ledger and any campaign state files — lives in this repository under `.agents/plans/mcp-property-fuzzer/`.
 
 
 ## The invariants
@@ -56,14 +56,14 @@ Inputs come from the index, not from randomness, so coverage is exhaustive rathe
 
 Also probe the negative shapes real agents produced in traces, as a small fixed set: `file::struct tag` keyword-prefixed selectors, redundant `.__init__` package suffixes, file paths passed where symbols are expected. These are I5 probes — the expectation is not resolution but a non-empty corrective hint.
 
-Two knobs bound runtime: a per-repository symbol cap (default a few thousand, sampled deterministically by hashing FQNs so reruns are stable) and per-language repo caps drawn from the FIRD corpus ranking. A full pass over one mid-size repository should take minutes, not hours; I1(a) alone is a pure index walk and should run corpus-wide routinely.
+Two knobs bound runtime: a per-repository symbol cap (default a few thousand, sampled deterministically by hashing FQNs so reruns are stable) and per-language repo priority by task count (see Repository orientation). A full pass over one mid-size repository should take minutes, not hours; I1(a) alone is a pure index walk and should run corpus-wide routinely.
 
 
 ## Ledger, shrinking, and the run-until-dry loop
 
 Each raw violation is shrunk (smallest batch, shortest context still failing), keyed by its failure signature, and appended to the ledger only if the signature is new for that run series. A ledger row records: signature, invariant, repository and pinned commit, tool, exact shrunk arguments (verbatim JSON), the relevant response excerpt(s), and for I1 the file-side evidence (expected range versus reported). Every row must be re-runnable in isolation via a `--rerun <ledger-line>` mode, mirroring FIRD's single-site rerun.
 
-The autonomous loop an operating agent follows: run a corpus pass; for each new signature, rerun to confirm, then decide product-defect versus expected-behavior using the same discipline as the FIRD runbook ("a raw classification is a triage input, not proof"); file confirmed defects as GitHub issues (one per signature, carrying the shrunk repro verbatim) and record the issue number back into the ledger; fix or hand off; rerun the affected signature after any fix lands. The campaign is dry when two consecutive full passes add no new signatures. Campaign state (which repos, which pass, issue links) lives in this file's Progress section, per PLANS.md.
+The autonomous loop an operating agent follows: run a corpus pass; for each new signature, rerun to confirm, then decide product-defect versus expected-behavior using the same discipline as the FIRD runbook ("a raw classification is a triage input, not proof"); file confirmed defects as GitHub issues on `BrokkAi/bifrost` (one per signature, carrying the shrunk repro verbatim) and record the issue number back into the ledger; fix or hand off; rerun the affected signature after any fix lands. Issue workflow specifics: `gh` is authenticated as `jbellis`; an issue is assigned to `jbellis` when the agent starts actively working its fix; fixes land directly on `master` (per repository AGENTS.md, no branches) with a thorough commit message — the commit message is the source of truth for what problem is being solved, so it must explain the defect, root cause, and fix in detail — containing `Fixes #N` so pushing to `origin/master` closes the issue; each fix is committed and pushed individually as it lands. The campaign is dry when two consecutive full passes add no new signatures. Campaign state (which repos, which pass, issue links) lives in this file's Progress section, per PLANS.md.
 
 
 ## Milestones
@@ -74,13 +74,13 @@ The autonomous loop an operating agent follows: run a corpus pass; for each new 
     cargo run --release --bin bifrost_mcp_property_fuzzer -- \
       --clones-root /home/jonathan/Projects/brokkbench/clones \
       --repo TheHive-Project__TheHive --invariants I1 \
-      --out /mnt/optane/tmp/mcp-property-fuzzer/m1.jsonl
+      --out .agents/plans/mcp-property-fuzzer/m1.jsonl
 
 **M2 — All invariants, single repository, both render modes.** Wire the service layer in-process for both `render_line_numbers` modes; implement I2–I5 and the probe generator. Acceptance: on vuejs/core the I2 check reproduces the `file#symbol` inconsistency if it still exists at HEAD (or a fixture regression test demonstrates the check fires on a synthetic case); I3(c) and I5 pass on current HEAD (their motivating bugs are fixed) but each has a fixture test proving the check can fire.
 
 **M3 — Corpus runner, ledger, resume, dedupe, shrink, rerun.** Bounded concurrency across repositories (reuse the pattern from `.agents/plans/concurrent-reference-corpus.md`), deterministic sampling, `--resume`, `--rerun`. Acceptance: a two-language corpus run resumes cleanly after an interrupt, produces a deduplicated ledger, and every ledger line reruns to the same violation.
 
-**M4 — Acceptance campaign and issue workflow.** Run the full corpus per language, triage per the discipline above, file issues for confirmed signatures, and record the campaign in Progress. Acceptance: the campaign ledger exists under `/mnt/optane/tmp/mcp-property-fuzzer/`, every confirmed signature has an issue link, and a follow-up pass after at least one fix shows its signature gone.
+**M4 — Acceptance campaign and issue workflow, tiered by task count.** First complete M1–M3 with whatever smoke tests make sense. Then run the campaign language-at-a-time in widening tiers drawn from the per-language task-count ranking: first the top 1 repository per language across all languages, then top 5, then top 10. Triage per the discipline above at each tier, file issues for confirmed signatures per the issue workflow in the Ledger section, fix confirmed defects, and commit and push each fix individually as it lands. Acceptance: the committed ledger under `.agents/plans/mcp-property-fuzzer/` covers every repo in the current tier, every confirmed signature has an issue link recorded in the ledger, and a follow-up pass after at least one fix shows its signature gone. A tier is complete only when its pass adds no new signatures; widening from top-1 to top-5 to top-10 happens tier by tier, not all at once.
 
 
 ## Validation
@@ -88,15 +88,38 @@ The autonomous loop an operating agent follows: run a corpus pass; for each new 
 Beyond per-milestone acceptance: `cargo test` must stay green; new tests live beside the module (`tests/mcp_property_fuzzer.rs` for the engine, CLI tests mirroring `tests/bifrost_reference_differential_cli.rs`). Every invariant must have at least one fixture that makes it fire and one that proves it stays silent on healthy input — a checker that never fires is indistinguishable from a checker that is broken, so fixture-triggered firing is a hard requirement, not a nicety. When the runbook-style operational knowledge grows past this plan, split a `.agents/docs/mcp-property-fuzzer-runbook.md` out of it, as FIRD did.
 
 
+## Surprises & Discoveries
+
+Nothing yet recorded. This section is maintained per `.agents/PLANS.md`; unexpected behaviors, bugs, and insights discovered during implementation go here with short evidence snippets.
+
+
 ## Decision log
 
 - 2026-07-21: Plan authored from the P2T trace-audit findings (issues #1014–#1019). Chose the oracle-free contract plane over an identifier-census differential as the first build because triage is mechanical (both contradicting responses are in hand), which is what makes the run-until-dry loop autonomous. The census differential (an over-approximating absolute leg that would catch symmetric resolution blind spots like #1014/#1015) is explicitly out of scope here and should become its own ExecPlan.
 - 2026-07-21: Queries generated from the index rather than random strings: coverage should be exhaustive over what Bifrost claims to know, and malformed-input robustness is probed only through the I2 spelling set and the small fixed set of negative shapes agents actually produced in traces.
+- 2026-07-21: Corpus root corrected at execution start. The plan's original path (`/home/jonathan/Projects/brokkbench/clones` → `/mnt/T9/repo-clones`) was stale because `/mnt/T9` is no longer mounted; the 12,816-clone corpus now lives at `/mnt/minasmorgul/repo-clones` (confirmed to contain all four acceptance repos). The `clones` symlink was recreated pointing at the new location so commands in this plan work verbatim. `/mnt/optane` is likewise gone, so durable output moved into this repository.
+- 2026-07-21: Ledger location changed from `/mnt/optane/tmp/mcp-property-fuzzer/` to `.agents/plans/mcp-property-fuzzer/` inside this repository, committed to git. Rationale: the operator (Jonathan) wants findings visible to the rest of the team, and a local scratch path on one machine is neither durable nor visible.
+- 2026-07-21: Ticket workflow confirmed as GitHub issues on `BrokkAi/bifrost`, as originally written. An earlier same-day revision briefly considered a local `tickets.md` because `gh` authentication was broken; the operator repaired `gh`/`git` credentials (authenticated as `jbellis`) and reverted to issues, with these specifics: assign the issue to `jbellis` when the agent starts actively working it; fixes commit directly to `master` with thorough commit messages (the message is the source of truth for the problem being solved) containing `Fixes #N`; push each fix to `origin/master` as it lands.
+- 2026-07-21: Per-language repository prioritization changed from `repos.csv::code_loc` size ranking to task count per repository as derived from `/home/jonathan/Projects/brokkbench/tasks.py`'s task data, per operator direction ("for each language i want to prioritize by task count"). Rationale: task count reflects where agent traffic actually concentrates, so fuzzing effort follows real usage rather than repository size. The exact derivation (which tasks.py data structure yields the per-repo counts) will be recorded here when pinned during M3 implementation.
+- 2026-07-21: Campaign scale structured into tiers. M1–M3 complete first with smoke tests; M4 then proceeds language-at-a-time in widening per-language tiers — top 1 repository by task count across all languages, then top 5, then top 10 — committing and pushing each fix as it goes. Rationale: bounds triage load early (every new signature gets individual attention) while still reaching broad coverage, and gives the team a steady stream of reviewed fixes rather than one giant batch.
 
 
 ## Progress
 
+- [x] (2026-07-21) Execution environment prepared: `~/Projects/brokkbench/clones` symlink recreated at `/mnt/minasmorgul/repo-clones`; `.agents/plans/mcp-property-fuzzer/` ledger directory created; `gh` authenticated as `jbellis` with push access to `BrokkAi/bifrost`.
 - [ ] M1: skeleton binary, corpus selection flags, I1 index walk, Scala fixture, TheHive acceptance run
 - [ ] M2: in-process service wiring (both render modes), I2–I5, probe generator, per-invariant fixtures
-- [ ] M3: corpus concurrency, deterministic sampling, resume, dedupe, shrink, --rerun
-- [ ] M4: full-corpus campaign, triage, issues filed and linked, post-fix verification pass
+- [ ] M3: corpus concurrency, deterministic sampling, resume, dedupe, shrink, --rerun, task-count ranking pinned and recorded in Decision Log
+- [ ] M4 tier 1: top-1 repo per language by task count, full pass, triage, issues filed, fixes pushed
+- [ ] M4 tier 2: widen to top-5 repos per language after tier 1 adds no new signatures
+- [ ] M4 tier 3: widen to top-10 repos per language after tier 2 adds no new signatures
+
+
+## Outcomes & Retrospective
+
+Nothing yet recorded. Filled in at major milestones and at completion, per `.agents/PLANS.md`.
+
+
+---
+
+Revision note (2026-07-21): Updated at execution start to capture operator decisions made in conversation: corrected corpus paths (`/mnt/minasmorgul/repo-clones`, `/mnt/optane` gone), moved the ledger into this repository under `.agents/plans/mcp-property-fuzzer/`, confirmed the GitHub-issue ticket workflow with assign-to-`jbellis` and `Fixes #N` commit conventions, switched per-language prioritization from code_loc to task count per `tasks.py`, and structured M4 into top-1/top-5/top-10 tiers. All changes are recorded in the Decision Log; no technical content of the invariants, milestones M1–M3, or query generation was altered.
