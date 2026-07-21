@@ -1065,7 +1065,7 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "b962895821730977967b60c508eb6c2cd98b3e3caefdf446bf93641cbbbdd6f3"
+            "b109e00564138c473a962d4c272a95f9f2d64bb731af9fc436913595ed8b8ff3"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
         assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 6);
