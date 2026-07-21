@@ -1,6 +1,6 @@
-use crate::analyzer::rust::RustBindingSeeds;
 use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
+use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
@@ -88,11 +88,7 @@ pub(super) fn effective_scan_files(
         return filtered_candidates;
     }
 
-    let seed_names: HashSet<&str> = seeds
-        .identities()
-        .iter()
-        .map(|(_, name)| name.as_str())
-        .collect();
+    let seed_names: HashSet<&str> = seeds.candidate_names().collect();
     let textual_candidates = analyzed.into_iter().filter(|file| {
         if scan_scope.is_cancelled() {
             return false;
@@ -125,10 +121,8 @@ pub(super) fn scan_files_for_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: Option<&RustBindingSeeds>,
-    allow_lexical_import_bindings: bool,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
-    let target_short = target.identifier().to_string();
     let target_fqn = target.fq_name();
     let support = analyzer.global_usage_definition_index();
     let hits = Mutex::new(BTreeSet::new());
@@ -155,7 +149,7 @@ pub(super) fn scan_files_for_target(
         let line_starts = prepared.line_starts();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         let refs = rust.reference_context_of(file);
-        let (mut direct_names, qualified_names) = match seeds {
+        let (mut direct_names, _) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
@@ -164,15 +158,11 @@ pub(super) fn scan_files_for_target(
         // local import binding. Treat any seed rooted in this file as a direct name
         // so those in-module references resolve.
         if let Some(seeds) = seeds {
-            for (seed_file, seed_name) in seeds.identities() {
-                if seed_file == file {
-                    direct_names.insert(seed_name.clone());
-                }
+            for identity in seeds.identities_in_file(file) {
+                direct_names.insert(identity.name().to_string());
             }
             direct_names.extend(refs.bare_names_resolving_to(&target_fqn));
         }
-        let target_self_file = file == target.source();
-
         let mut local_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
             file,
@@ -183,17 +173,11 @@ pub(super) fn scan_files_for_target(
             refs: &refs,
             support,
             seeds,
-            allow_lexical_import_bindings,
-            root: tree.root_node(),
             target,
-            target_fqn: &target_fqn,
             target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
             target_is_module: target.is_module(),
-            target_short: &target_short,
             direct_names: &direct_names,
-            qualified_names: &qualified_names,
             lexical_scope: &lexical_scope,
-            target_self_file,
             hits: &mut local_hits,
         };
         scan_node(tree.root_node(), &mut ctx);
@@ -217,50 +201,104 @@ pub(super) struct ScanCtx<'a> {
     pub(super) refs: &'a RustReferenceContext,
     pub(super) support: &'a GlobalUsageDefinitionIndex,
     seeds: Option<&'a RustBindingSeeds>,
-    allow_lexical_import_bindings: bool,
-    root: Node<'a>,
     target: &'a CodeUnit,
-    pub(super) target_fqn: &'a str,
     pub(super) target_is_path_qualifier: bool,
     pub(super) target_is_module: bool,
-    pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
-    qualified_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
-    target_self_file: bool,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
-    pub(super) fn matches_identifier(&self, text: &str, byte: usize) -> bool {
-        if self.direct_names.contains(text) || (self.target_self_file && text == self.target_short)
+    pub(super) fn matches_identifier(
+        &self,
+        text: &str,
+        byte: usize,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        if !self.direct_names.contains(text) {
+            return false;
+        }
+        self.seeds.is_none_or(|seeds| {
+            self.rust
+                .usage_reference_at(
+                    self.file,
+                    seeds,
+                    &[text],
+                    byte,
+                    namespace,
+                    self.lexical_scope.name_bound_at(text, byte)
+                        || self.item_shadows_target(text, byte),
+                )
+                .is_exact()
+        })
+    }
+
+    pub(super) fn matches_path(
+        &self,
+        segments: &[&str],
+        byte: usize,
+        namespace: RustReferenceNamespace,
+        root_shadowed: bool,
+    ) -> bool {
+        self.seeds.is_some_and(|seeds| {
+            self.rust
+                .usage_reference_at(self.file, seeds, segments, byte, namespace, root_shadowed)
+                .is_exact()
+        })
+    }
+
+    pub(super) fn path_root_shadowed_at(&self, name: &str, byte: usize) -> bool {
+        !matches!(name, "crate" | "self" | "super" | "$crate")
+            && (self.lexical_scope.name_bound_at(name, byte)
+                || self.item_shadows_target(name, byte))
+    }
+
+    fn item_shadows_target(&self, name: &str, byte: usize) -> bool {
+        self.lexical_scope.item_bound_at(name, byte)
+            && self.seeds.is_none_or(|seeds| {
+                !self
+                    .rust
+                    .usage_root_declaration_matches_at(self.file, seeds, name, byte)
+                    && !self
+                        .rust
+                        .usage_local_module_prefix_visible_at(self.file, seeds, name, byte)
+            })
+    }
+}
+
+pub(super) fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
+    let mut ancestor = Some(node);
+    while let Some(current) = ancestor {
+        if current.kind() == "macro_invocation"
+            && current
+                .child_by_field_name("macro")
+                .is_some_and(|macro_path| {
+                    macro_path.start_byte() <= node.start_byte()
+                        && node.end_byte() <= macro_path.end_byte()
+                })
         {
-            return true;
+            return RustReferenceNamespace::Macro;
         }
-        let Some(seeds) = self.seeds else {
-            return false;
-        };
-        if !self.allow_lexical_import_bindings {
-            return false;
-        }
-        let binder = lexical_scope::visible_import_binder_in_tree(self.root, self.source, byte);
-        let bindings = self
-            .rust
-            .resolve_imported_export_from_binder_forward(self.file, &binder, text);
-        !bindings.is_empty()
-            && bindings
-                .iter()
-                .all(|binding| seeds.identities().contains(binding))
+        ancestor = current.parent();
     }
 
-    pub(super) fn matches_qualified_name(&self, text: &str) -> bool {
-        self.qualified_names.contains(text)
+    if matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
+        return RustReferenceNamespace::Type;
     }
-
-    pub(super) fn name_shadowed_at(&self, name: &str, byte: usize) -> bool {
-        self.lexical_scope.name_bound_at(name, byte)
-            || (!self.target_self_file && self.lexical_scope.item_bound_at(name, byte))
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "scoped_type_identifier" {
+            return RustReferenceNamespace::Type;
+        }
+        if parent.kind() == "scoped_identifier"
+            && parent
+                .child_by_field_name("path")
+                .is_some_and(|path| same_node(path, node))
+        {
+            return RustReferenceNamespace::PathPrefix;
+        }
     }
+    RustReferenceNamespace::Value
 }
 
 fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -282,7 +320,11 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     let matching_self_type =
                         text == "Self" && self_reference_matches_target(node, ctx);
                     let matching_identifier = !identifier_is_scoped_path_part(node)
-                        && ctx.matches_identifier(text, node.start_byte())
+                        && ctx.matches_identifier(
+                            text,
+                            node.start_byte(),
+                            rust_reference_namespace(node),
+                        )
                         && !is_shadowed_identifier(text, node, ctx);
                     if matching_self_type || matching_identifier {
                         record_hit(node, ctx);
@@ -339,9 +381,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .ok()
                     .map(str::trim)
                     .unwrap_or_default();
-                if ctx.direct_names.contains(text)
-                    || (ctx.target_self_file && text == ctx.target_short)
-                {
+                if ctx.matches_identifier(text, current.start_byte(), RustReferenceNamespace::Any) {
                     record_import_hit(current, ctx);
                 }
             }
@@ -370,7 +410,7 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
 fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if lexical_scope::is_pattern_binding_identifier(node)
         || ctx.lexical_scope.name_bound_at(text, node.start_byte())
-        || (!ctx.target_self_file && ctx.lexical_scope.item_bound_at(text, node.start_byte()))
+        || ctx.item_shadows_target(text, node.start_byte())
     {
         return true;
     }
@@ -406,7 +446,7 @@ pub(super) fn scan_files_for_member_target(
     let unproven_hits = Mutex::new(BTreeSet::new());
     let support = analyzer.global_usage_definition_index();
     let constructor_returns = self_like_constructor_returns(rust, support, &owner);
-    let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
+    let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
 
     files.par_iter().for_each(|file| {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1418,6 +1458,12 @@ enum ConstructorReturn {
     NeedsUnwrap,
 }
 
+#[derive(Clone, Debug)]
+struct SelfLikeConstructor {
+    declaration: CodeUnit,
+    return_kind: ConstructorReturn,
+}
+
 fn field_expression_is_called(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "call_expression"
@@ -1493,7 +1539,6 @@ fn scoped_static_member_matches_target(
     if owner_name == "Self" {
         return self_static_owner_matches_target(owner_node, ctx);
     }
-
     let item_matches = if ctx.target_is_field {
         CodeUnit::is_field
     } else {
@@ -1589,7 +1634,7 @@ fn self_like_constructor_returns(
     rust: &RustAnalyzer,
     support: &GlobalUsageDefinitionIndex,
     owner: &CodeUnit,
-) -> HashMap<String, ConstructorReturn> {
+) -> HashMap<String, SelfLikeConstructor> {
     let Ok(source) = owner.source().read_to_string() else {
         return HashMap::default();
     };
@@ -1622,8 +1667,15 @@ fn self_like_constructor_returns(
                 source: &source,
                 owner,
             };
-            constructor_return_kind_from_type_node(return_type, &ctx)
-                .map(|kind| (code_unit.identifier().to_string(), kind))
+            constructor_return_kind_from_type_node(return_type, &ctx).map(|return_kind| {
+                (
+                    code_unit.identifier().to_string(),
+                    SelfLikeConstructor {
+                        declaration: code_unit,
+                        return_kind,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -1785,14 +1837,13 @@ pub(super) fn type_node_last_segment(type_node: Node<'_>, source: &str) -> Optio
 
 fn self_like_constructor_seeds(
     rust: &RustAnalyzer,
-    owner: &CodeUnit,
-    constructor_returns: &HashMap<String, ConstructorReturn>,
+    constructor_returns: &HashMap<String, SelfLikeConstructor>,
 ) -> HashMap<String, RustBindingSeeds> {
     constructor_returns
-        .keys()
-        .map(|name| {
-            let seeds = rust.usage_seeds(owner.source(), name);
-            let seeds = rust.usage_binding_seeds(&seeds);
+        .iter()
+        .map(|(name, constructor)| {
+            let roots = BTreeSet::from([constructor.declaration.clone()]);
+            let seeds = rust.usage_binding_seeds(&roots);
             (name.clone(), seeds)
         })
         .collect()
@@ -1808,9 +1859,8 @@ fn visible_bare_constructor_names(
         let (direct_names, _) = rust.usage_binding_names(file, seeds);
         if direct_names.contains(constructor)
             || seeds
-                .identities()
-                .iter()
-                .any(|(seed_file, seed_name)| seed_file == file && seed_name == constructor)
+                .identities_in_file(file)
+                .any(|identity| identity.name() == constructor)
         {
             visible.insert(constructor.clone());
         }
@@ -1865,7 +1915,7 @@ fn receiver_explicitly_mismatched(
 fn infer_receiver_names(
     source: &str,
     owner_local_names: &HashSet<String>,
-    self_like_constructors: &HashMap<String, ConstructorReturn>,
+    self_like_constructors: &HashMap<String, SelfLikeConstructor>,
     visible_bare_constructors: &HashSet<String>,
 ) -> Vec<String> {
     let owner_type_names = expanded_receiver_type_names(source, owner_local_names);
@@ -1925,7 +1975,7 @@ fn resolved_owner_receiver_names(
 fn collect_receiver_bindings(
     source: &str,
     owner_type_names: &HashSet<String>,
-    self_like_constructors: &HashMap<String, ConstructorReturn>,
+    self_like_constructors: &HashMap<String, SelfLikeConstructor>,
     visible_bare_constructors: &HashSet<String>,
 ) -> LocalInferenceEngine<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -1960,7 +2010,9 @@ fn collect_receiver_bindings(
                     if owner_type_names.contains(&ty)
                         && self_like_constructors
                             .get(&ctor)
-                            .is_some_and(|kind| constructor_return_can_seed(*kind, unwrapped))
+                            .is_some_and(|constructor| {
+                                constructor_return_can_seed(constructor.return_kind, unwrapped)
+                            })
                     {
                         engine.seed_symbol(name, ty);
                     }
@@ -1972,9 +2024,9 @@ fn collect_receiver_bindings(
                 // function whose return type is the owner. Seed the receiver's type so
                 // method/field accesses on it resolve.
                 None if visible_bare_constructors.contains(&ty)
-                    && self_like_constructors
-                        .get(&ty)
-                        .is_some_and(|kind| constructor_return_can_seed(*kind, unwrapped)) =>
+                    && self_like_constructors.get(&ty).is_some_and(|constructor| {
+                        constructor_return_can_seed(constructor.return_kind, unwrapped)
+                    }) =>
                 {
                     if let Some(owner_repr) = owner_repr.clone() {
                         engine.seed_symbol(name, owner_repr);

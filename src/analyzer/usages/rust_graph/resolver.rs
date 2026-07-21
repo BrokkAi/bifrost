@@ -39,7 +39,7 @@ pub(super) enum RustGraphSeedKind {
 }
 
 pub(super) struct RustGraphSeeds {
-    pub(super) seeds: BTreeSet<(ProjectFile, String)>,
+    pub(super) roots: BTreeSet<CodeUnit>,
     pub(super) kind: RustGraphSeedKind,
 }
 
@@ -64,6 +64,7 @@ pub(crate) enum RustTokenPathRole {
 
 pub(crate) struct ResolvedRustTokenPathSegment<'tree> {
     pub(crate) node: Node<'tree>,
+    pub(crate) path: Vec<Node<'tree>>,
     pub(crate) fqn: String,
     pub(crate) role: RustTokenPathRole,
 }
@@ -109,8 +110,10 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
             None
         };
         let mut segment_index = index;
+        let mut path = Vec::new();
         loop {
             let segment = children[segment_index];
+            path.push(segment);
             let continues = children
                 .get(segment_index + 1..=segment_index + 2)
                 .is_some_and(|next| next[0].kind() == "::" && rust_token_path_segment(next[1]));
@@ -160,6 +163,7 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
             if let Some(fqn) = fqn {
                 resolved.push(ResolvedRustTokenPathSegment {
                     node: segment,
+                    path: path.clone(),
                     fqn,
                     role,
                 });
@@ -609,25 +613,25 @@ pub(super) fn local_impl_target_importer_files(
 }
 
 pub(super) fn infer_graph_seeds(analyzer: &RustAnalyzer, target: &CodeUnit) -> RustGraphSeeds {
-    let seeds = infer_export_graph_seeds(analyzer, target);
-    if !seeds.is_empty() {
+    let roots = infer_export_graph_seeds(analyzer, target);
+    if !roots.is_empty() {
         return RustGraphSeeds {
-            seeds,
+            roots,
             kind: RustGraphSeedKind::Export,
         };
     }
 
     RustGraphSeeds {
-        seeds: local_declaration_graph_seeds(analyzer, target),
+        roots: local_declaration_graph_seeds(analyzer, target),
         kind: RustGraphSeedKind::LocalDeclaration,
     }
 }
 
-fn infer_export_graph_seeds(
-    analyzer: &RustAnalyzer,
-    target: &CodeUnit,
-) -> BTreeSet<(ProjectFile, String)> {
-    let mut seeds = BTreeSet::new();
+fn infer_export_graph_seeds(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<CodeUnit> {
+    let Some(seed_target) = graph_seed_target(analyzer, target) else {
+        return BTreeSet::new();
+    };
+    let roots = BTreeSet::from([seed_target]);
     // A module-scope constant is represented as a parentless field. Its own
     // declaration remains a valid import origin even when a public-like
     // visibility produces additional export seeds through the crate graph.
@@ -637,22 +641,13 @@ fn infer_export_graph_seeds(
         && analyzer.parent_of(target).is_none()
         && is_local_declaration(analyzer, target)
     {
-        seeds.insert((target.source().clone(), target.identifier().to_string()));
+        return roots;
     }
-    let nested_module_target = analyzer
-        .parent_of(target)
-        .is_some_and(|parent| parent.is_module());
-    for seed_name in infer_export_names(analyzer, target) {
-        let resolved = analyzer.usage_seeds(target.source(), &seed_name);
-        if resolved.is_empty() && nested_module_target {
-            seeds.insert((target.source().clone(), seed_name));
-        } else {
-            seeds.extend(resolved);
-        }
+    if !infer_export_names(analyzer, target).is_empty() {
+        return roots;
     }
 
-    if seeds.is_empty()
-        && let Some(parent) = analyzer.parent_of(target)
+    if let Some(parent) = analyzer.parent_of(target)
         && parent.is_module()
         && parent.source() != target.source()
         && is_public_like_declaration(analyzer, target)
@@ -662,37 +657,25 @@ fn infer_export_graph_seeds(
             .exports_by_name
             .contains_key(target.identifier())
         {
-            let resolved = analyzer.usage_seeds(target.source(), target.identifier());
-            if resolved.is_empty() {
-                seeds.insert((parent.source().clone(), target.identifier().to_string()));
-            } else {
-                seeds.extend(resolved);
-            }
+            return roots;
         }
     }
 
     // Last resort: resolve an export-visible item that reaches the public API only
     // through a `pub use` re-export of a private module. These names are tried only
     // via real re-export chains, so a private, never-re-exported item stays unseeded.
-    if seeds.is_empty() {
-        for seed_name in reexport_fallback_export_names(analyzer, target) {
-            seeds.extend(analyzer.usage_seeds(target.source(), &seed_name));
-        }
+    if !reexport_fallback_export_names(analyzer, target).is_empty()
+        && analyzer.usage_binding_seeds(&roots).has_import_edges()
+    {
+        return roots;
     }
 
-    seeds
+    BTreeSet::new()
 }
 
-fn local_declaration_graph_seeds(
-    analyzer: &RustAnalyzer,
-    target: &CodeUnit,
-) -> BTreeSet<(ProjectFile, String)> {
+fn local_declaration_graph_seeds(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<CodeUnit> {
     let member_target = is_member_target(analyzer, target);
-    let seed_target = if member_target {
-        analyzer.parent_of(target)
-    } else {
-        Some(target.clone())
-    };
+    let seed_target = graph_seed_target(analyzer, target);
     let Some(seed_target) = seed_target else {
         return BTreeSet::new();
     };
@@ -705,12 +688,16 @@ fn local_declaration_graph_seeds(
     {
         return BTreeSet::new();
     }
-    [(
-        seed_target.source().clone(),
-        seed_target.identifier().to_string(),
-    )]
-    .into_iter()
-    .collect()
+    [seed_target].into_iter().collect()
+}
+
+fn graph_seed_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+    let seed_target = if is_member_target(analyzer, target) {
+        analyzer.parent_of(target)?
+    } else {
+        target.clone()
+    };
+    Some(canonical_imported_impl_target(analyzer, &seed_target).unwrap_or(seed_target))
 }
 
 fn is_local_declaration(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {

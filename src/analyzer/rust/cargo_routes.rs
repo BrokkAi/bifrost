@@ -3,7 +3,7 @@ use crate::hash::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::declarations::rust_package_name;
-use super::imports::rust_external_module_route;
+use super::imports::{rust_external_module_route, rust_external_module_segments};
 
 pub(super) fn resolve_module_package_for_file(
     importing_file: &ProjectFile,
@@ -103,6 +103,13 @@ pub(crate) struct RustCargoRouteIndex {
     manifest_by_file: HashMap<ProjectFile, PathBuf>,
     package_by_route: HashMap<(PathBuf, String), String>,
     root_file_by_route: HashMap<(PathBuf, String), ProjectFile>,
+    kind_by_route: HashMap<(PathBuf, String), RustCargoRouteKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RustCargoRouteKind {
+    CurrentLibrary,
+    Dependency,
 }
 
 struct CargoCrate {
@@ -139,13 +146,15 @@ impl RustCargoRouteIndex {
         }
         let mut package_by_route = HashMap::default();
         let mut root_file_by_route = HashMap::default();
+        let mut kind_by_route = HashMap::default();
         for cargo_crate in &crates {
             let own_route = (
                 cargo_crate.directory.clone(),
                 cargo_crate.library_name.clone(),
             );
             package_by_route.insert(own_route.clone(), cargo_crate.root_package.clone());
-            root_file_by_route.insert(own_route, cargo_crate.root_file.clone());
+            root_file_by_route.insert(own_route.clone(), cargo_crate.root_file.clone());
+            kind_by_route.insert(own_route, RustCargoRouteKind::CurrentLibrary);
             for dependencies in cargo_dependency_tables(&cargo_crate.manifest) {
                 for (exposed_name, dependency) in dependencies {
                     let target = dependency
@@ -170,8 +179,12 @@ impl RustCargoRouteIndex {
                             crates[target].root_package.clone(),
                         );
                         root_file_by_route.insert(
-                            (cargo_crate.directory.clone(), exposed_name),
+                            (cargo_crate.directory.clone(), exposed_name.clone()),
                             crates[target].root_file.clone(),
+                        );
+                        kind_by_route.insert(
+                            (cargo_crate.directory.clone(), exposed_name),
+                            RustCargoRouteKind::Dependency,
                         );
                     }
                 }
@@ -181,6 +194,7 @@ impl RustCargoRouteIndex {
             manifest_by_file,
             package_by_route,
             root_file_by_route,
+            kind_by_route,
         }
     }
 
@@ -200,6 +214,25 @@ impl RustCargoRouteIndex {
         })
     }
 
+    pub(super) fn resolve_module_package_segments_with_kind(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<(String, RustCargoRouteKind)> {
+        let manifest = self.manifest_by_file.get(importing_file)?;
+        let (root, nested) = rust_external_module_segments(segments)?;
+        let route = (manifest.clone(), normalize_crate_name(root));
+        let package = self.package_by_route.get(&route)?;
+        let kind = *self.kind_by_route.get(&route)?;
+        Some((
+            match nested {
+                Some(nested) => format!("{package}.{nested}"),
+                None => package.clone(),
+            },
+            kind,
+        ))
+    }
+
     pub(super) fn resolve_crate_root_file(
         &self,
         importing_file: &ProjectFile,
@@ -213,6 +246,23 @@ impl RustCargoRouteIndex {
         self.root_file_by_route
             .get(&(manifest.clone(), normalize_crate_name(root)))
             .cloned()
+    }
+
+    pub(super) fn resolve_crate_root_file_segments_with_kind(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<(ProjectFile, RustCargoRouteKind)> {
+        let manifest = self.manifest_by_file.get(importing_file)?;
+        let (root, nested) = rust_external_module_segments(segments)?;
+        if nested.is_some() {
+            return None;
+        }
+        let route = (manifest.clone(), normalize_crate_name(root));
+        Some((
+            self.root_file_by_route.get(&route)?.clone(),
+            *self.kind_by_route.get(&route)?,
+        ))
     }
 }
 

@@ -224,10 +224,18 @@ struct BindingVisibility {
     function: Option<(usize, usize)>,
 }
 
+#[derive(Clone, Copy)]
+struct ItemVisibility {
+    start: usize,
+    end: usize,
+    module: Option<(usize, usize)>,
+}
+
 /// Position-aware Rust binding visibility for one parsed file.
 pub(crate) struct RustLexicalScopeIndex {
     bindings: HashMap<String, Vec<BindingVisibility>>,
-    items: HashMap<String, Vec<(usize, usize)>>,
+    items: HashMap<String, Vec<ItemVisibility>>,
+    modules: Vec<(usize, usize)>,
     functions: Vec<(usize, usize)>,
 }
 
@@ -236,6 +244,7 @@ impl RustLexicalScopeIndex {
         let mut index = Self {
             bindings: HashMap::default(),
             items: HashMap::default(),
+            modules: Vec::new(),
             functions: Vec::new(),
         };
         let mut stack = vec![(root, None, root.start_byte(), root.end_byte())];
@@ -311,6 +320,9 @@ impl RustLexicalScopeIndex {
                 }
                 "struct_item" | "enum_item" | "trait_item" | "mod_item" => {
                     index.add_item_binding(node, scope_start, scope_end, source);
+                    if node.kind() == "mod_item" {
+                        index.modules.push((node.start_byte(), node.end_byte()));
+                    }
                 }
                 _ => {}
             }
@@ -332,10 +344,16 @@ impl RustLexicalScopeIndex {
     }
 
     pub(crate) fn item_bound_at(&self, name: &str, byte: usize) -> bool {
+        let module = self
+            .modules
+            .iter()
+            .copied()
+            .filter(|(start, end)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end)| end - start);
         self.items.get(name).is_some_and(|items| {
             items
                 .iter()
-                .any(|(start, end)| *start <= byte && byte < *end)
+                .any(|item| item.module == module && item.start <= byte && byte < item.end)
         })
     }
 
@@ -419,7 +437,11 @@ impl RustLexicalScopeIndex {
         self.items
             .entry(name.to_string())
             .or_default()
-            .push((start, end));
+            .push(ItemVisibility {
+                start,
+                end,
+                module: enclosing_mod_item_range(item),
+            });
     }
 }
 

@@ -38,6 +38,7 @@ fn usage_finder_routes_seeded_public_rust_export_through_graph() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Service;
 
 fn run() {
@@ -391,6 +392,7 @@ fn rust_graph_strategy_finds_aliased_import_usage() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Service as S;
 
 fn run() {
@@ -428,6 +430,7 @@ pub struct Helper;
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::{Service, Helper};
 
 fn run() {
@@ -468,6 +471,7 @@ fn rust_graph_strategy_finds_self_import_module_qualified_usage() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::{self};
 
 fn run() {
@@ -500,6 +504,8 @@ fn rust_graph_strategy_finds_public_reexport_alias_usage() {
         (
             "src/main.rs",
             r#"
+mod service;
+mod index;
 use crate::index::PublicService;
 
 fn run() {
@@ -527,6 +533,8 @@ fn run() {
 #[test]
 fn rust_graph_strategy_resolves_relative_module_layouts() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod pkg;\n"),
+        ("src/pkg/mod.rs", "mod service;\nmod nested;\n"),
         ("src/pkg/service.rs", "pub struct Service;\n"),
         (
             "src/pkg/nested/mod.rs",
@@ -561,6 +569,7 @@ fn run() {
 #[test]
 fn rust_graph_strategy_counts_function_parameter_type_usages() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod service;\nmod searchtools;\n"),
         ("src/service.rs", "pub struct SearchSymbolsParams;\n"),
         (
             "src/searchtools.rs",
@@ -607,6 +616,7 @@ fn local_definition_shadows_imported_rust_name() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Service;
 
 struct Service;
@@ -683,6 +693,7 @@ fn rust_graph_strategy_filters_non_rust_candidates_without_widening() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Service;
 
 fn run() {
@@ -723,6 +734,7 @@ fn run() {
 #[test]
 fn rust_graph_strategy_returns_too_many_callsites_when_hits_exceed_limit() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod service;\nmod first;\nmod second;\n"),
         ("src/service.rs", "pub struct Service;\n"),
         (
             "src/first.rs",
@@ -857,6 +869,7 @@ fn usage_finder_routes_rust_targets_through_multi_analyzer_delegate() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Service;
 
 fn run() {
@@ -2025,6 +2038,7 @@ impl Foo {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Foo;
 
 fn run() {
@@ -2909,6 +2923,7 @@ fn rust_graph_strategy_keeps_pub_crate_exports_graph_visible() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Local;
 
 fn run() {
@@ -2932,24 +2947,29 @@ fn run() {
 
 #[test]
 fn rust_graph_strategy_reads_visibility_from_tree_sitter_nodes() {
-    let (_project, analyzer) = rust_analyzer_with_files(&[
+    let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/service.rs",
             r#"
 pub(in crate::service) struct Scoped;
 pub/**/ struct CommentedPublic;
 struct Private;
+
+fn internal(scoped: Scoped, private: Private) { // VALID_IN_DOMAIN
+    let _ = (scoped, private);
+}
 "#,
         ),
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::{CommentedPublic, Private, Scoped};
 
 fn run() {
-    let _ = Scoped {};
-    let _ = CommentedPublic {};
-    let _ = Private {};
+    let _ = Scoped {}; // INVALID_SCOPED_DECOY
+    let _ = CommentedPublic {}; // VALID_PUBLIC
+    let _ = Private {}; // INVALID_PRIVATE_DECOY
 }
 "#,
         ),
@@ -2960,34 +2980,53 @@ fn run() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
-    assert_eq!(
-        1,
-        strategy
-            .find_usages(&analyzer, std::slice::from_ref(&scoped), &candidates, 1000)
-            .into_either()
-            .expect("scoped visibility success")
-            .len()
+    let scoped_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&scoped), &candidates, 1000)
+        .into_either()
+        .expect("scoped visibility success");
+    assert_eq!(1, scoped_hits.len(), "scoped visibility: {scoped_hits:#?}");
+    assert!(
+        scoped_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/service.rs")),
+        "pub(in crate::service) must stay inside service: {scoped_hits:#?}"
     );
+
+    let commented_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&commented),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("commented pub visibility success");
     assert_eq!(
         1,
-        strategy
-            .find_usages(
-                &analyzer,
-                std::slice::from_ref(&commented),
-                &candidates,
-                1000,
-            )
-            .into_either()
-            .expect("commented pub visibility success")
-            .len()
+        commented_hits.len(),
+        "commented pub visibility: {commented_hits:#?}"
     );
+    assert!(
+        commented_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/main.rs")),
+        "comment-separated pub must remain public: {commented_hits:#?}"
+    );
+
+    let private_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&private), &candidates, 1000)
+        .into_either()
+        .expect("private local declaration scan success");
     assert_eq!(
         1,
-        strategy
-            .find_usages(&analyzer, std::slice::from_ref(&private), &candidates, 1000)
-            .into_either()
-            .expect("private local declaration scan success")
-            .len()
+        private_hits.len(),
+        "private visibility: {private_hits:#?}"
+    );
+    assert!(
+        private_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/service.rs")),
+        "private item must stay inside service: {private_hits:#?}"
     );
 }
 
@@ -2998,12 +3037,13 @@ fn rust_graph_strategy_resolves_barrel_reexport_from_private_module() {
             "src/lib.rs",
             r#"
 mod service;
+mod consumer;
 pub use service::Foo;
 "#,
         ),
         ("src/service.rs", "pub struct Foo;\n"),
         (
-            "src/main.rs",
+            "src/consumer.rs",
             r#"
 use crate::Foo;
 
@@ -3027,22 +3067,37 @@ fn run() {
 
 #[test]
 fn rust_graph_strategy_does_not_treat_self_reexport_as_public_barrel() {
-    let (_project, analyzer) = rust_analyzer_with_files(&[
+    let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/lib.rs",
             r#"
 mod service;
+mod child;
 pub(self) use service::Foo;
+
+fn local(value: Foo) { // VALID_ROOT_USE
+    let _ = value;
+}
 "#,
         ),
         ("src/service.rs", "pub struct Foo;\n"),
+        (
+            "src/child.rs",
+            r#"
+use super::Foo;
+
+fn child(value: Foo) { // VALID_DESCENDANT_USE
+    let _ = value;
+}
+"#,
+        ),
         (
             "src/main.rs",
             r#"
 use crate::Foo;
 
 fn run() {
-    let _ = Foo {};
+    let _ = Foo {}; // INVALID_CROSS_ROOT_DECOY
 }
 "#,
         ),
@@ -3058,9 +3113,18 @@ fn run() {
     let hits = result
         .into_either()
         .expect("pub(self) local declaration scan success");
+    assert_eq!(2, hits.len(), "module-private alias routing: {hits:#?}");
     assert!(
-        hits.iter().all(|hit| hit.file
-            != ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs")),
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/lib.rs"))
+            && hits
+                .iter()
+                .any(|hit| hit.file == project.file("src/child.rs")),
+        "pub(self) alias must remain usable in its module and descendants: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/main.rs")),
         "pub(self) use must not expose Foo as a public barrel reexport: {hits:#?}"
     );
 }
@@ -3091,6 +3155,9 @@ pub use crate::first::PublicBar;
         (
             "src/main.rs",
             r#"
+mod service;
+mod first;
+mod second;
 use crate::second::{Foo, PublicBar};
 
 fn run() {
@@ -3233,6 +3300,7 @@ struct Hidden;
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::*;
 
 fn run() {
@@ -3274,6 +3342,8 @@ fn rust_graph_strategy_resolves_bounded_glob_reexports() {
         (
             "src/main.rs",
             r#"
+mod service;
+mod index;
 use crate::index::Foo;
 
 fn run() {
@@ -3929,6 +3999,7 @@ fn rust_graph_strategy_resolves_public_inline_module_exports() {
             "src/lib.rs",
             r#"
 pub mod service;
+mod consumer;
 pub mod inline {
     pub struct Inline;
 }
@@ -3936,7 +4007,7 @@ pub mod inline {
         ),
         ("src/service.rs", "pub struct FileBacked;\n"),
         (
-            "src/main.rs",
+            "src/consumer.rs",
             r#"
 use crate::service::FileBacked;
 use crate::inline::Inline;
@@ -3984,6 +4055,7 @@ fn rust_graph_strategy_resolves_basic_crate_import_struct_usage() {
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Service;
 
 fn run() {
@@ -4007,12 +4079,77 @@ fn run() {
 }
 
 #[test]
+fn authoritative_rust_member_scan_resolves_associated_call_through_star_reexport() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod layer;\npub mod filter;\n"),
+        (
+            "src/layer/mod.rs",
+            "mod context;\npub use self::context::*;\n",
+        ),
+        (
+            "src/layer/context.rs",
+            r#"
+pub struct Context<S> {
+    value: Option<S>,
+}
+
+impl<S> Context<S> {
+    pub(crate) fn none() -> Self {
+        Self { value: None }
+    }
+}
+"#,
+        ),
+        (
+            "src/filter.rs",
+            r#"
+use crate::layer::Context;
+
+pub fn disabled<S>() -> bool {
+    let _ = Context::<S>::none();
+    true
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/layer/context.rs"),
+        "Context",
+        "none",
+    );
+    let candidates = [project.file("src/filter.rs")].into_iter().collect();
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("authoritative associated call lookup");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "associated call through star reexport: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .next()
+            .is_some_and(|hit| hit.snippet.contains("Context::<S>::none"))
+    );
+}
+
+#[test]
 fn rust_graph_strategy_counts_type_argument_usages() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         ("src/service.rs", "pub struct Foo;\n"),
         (
             "src/main.rs",
             r#"
+mod service;
 use crate::service::Foo;
 use std::collections::HashMap;
 
@@ -4169,10 +4306,11 @@ fn rust_graph_strategy_finds_private_inline_module_usages_via_named_import() {
 mod service {
     pub struct Foo;
 }
+mod consumer;
 "#,
         ),
         (
-            "src/main.rs",
+            "src/consumer.rs",
             r#"
 use crate::service::Foo;
 
@@ -4200,6 +4338,269 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_seeds_keep_same_named_inline_declarations_distinct() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod left {
+    pub struct Owner;
+
+    fn consume(value: Owner) { // LEFT_OWNER_USE
+        let _ = value;
+    }
+}
+
+mod right {
+    pub struct Owner;
+
+    fn consume(value: Owner) { // RIGHT_OWNER_USE
+        let _ = value;
+    }
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "left.Owner");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("LEFT_OWNER_USE")),
+        "expected the exact inline-module declaration usage: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("RIGHT_OWNER_USE")),
+        "same-named declaration in a sibling inline module must not match: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_seeds_preserve_exact_inline_identity_through_reexport_aliases() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+mod left { pub struct Owner; }
+mod right { pub struct Owner; }
+
+pub use left::Owner as LeftOwner;
+pub use right::Owner as RightOwner;
+mod consumer;
+"#,
+        ),
+        (
+            "src/consumer.rs",
+            r#"
+use crate::{LeftOwner, RightOwner};
+
+fn consume_left(value: LeftOwner) { // LEFT_ALIAS_USE
+    let _ = value;
+}
+
+fn consume_right(value: RightOwner) { // RIGHT_ALIAS_USE
+    let _ = value;
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "left.Owner");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("LEFT_ALIAS_USE")),
+        "expected the alias chain rooted at the exact declaration: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("RIGHT_ALIAS_USE")),
+        "the sibling declaration's alias chain must remain distinct: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_seeds_keep_same_named_nested_private_modules_distinct() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod left {
+    mod shared { pub struct Item; }
+    use self::shared as selected;
+    fn consume(_: selected::Item) {} // LEFT_SHARED_USE
+}
+mod right {
+    mod shared { pub struct Item; }
+    use self::shared as selected;
+    fn consume(_: selected::Item) {} // RIGHT_SHARED_USE
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "left.shared.Item");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("LEFT_SHARED_USE")),
+        "expected the exact nested module usage: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("RIGHT_SHARED_USE")),
+        "same-named nested private module must not cross-match: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_aliases_preserve_type_and_value_namespaces() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod source {
+    pub struct Same { pub value: usize }
+    #[allow(non_snake_case)]
+    pub fn Same() {}
+}
+use source::Same as Alias;
+fn type_consumer(_: Alias) {} // TYPE_ALIAS_USE
+
+// namespace separation padding
+// namespace separation padding
+// namespace separation padding
+// namespace separation padding
+// namespace separation padding
+fn value_consumer() { Alias(); } // VALUE_ALIAS_USE
+"#,
+    )]);
+    let definitions = analyzer.get_definitions("source.Same");
+    let type_target = definitions
+        .iter()
+        .find(|definition| definition.is_class())
+        .cloned()
+        .expect("type declaration");
+    let value_target = definitions
+        .iter()
+        .find(|definition| definition.is_function())
+        .cloned()
+        .expect("value declaration");
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let type_hits = strategy
+        .find_usages(&analyzer, &[type_target], &candidates, 1000)
+        .into_either()
+        .expect("type alias usage success");
+    let value_hits = strategy
+        .find_usages(&analyzer, &[value_target], &candidates, 1000)
+        .into_either()
+        .expect("value alias usage success");
+
+    assert!(
+        type_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("TYPE_ALIAS_USE"))
+    );
+    assert!(
+        type_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("VALUE_ALIAS_USE"))
+    );
+    assert!(
+        value_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("VALUE_ALIAS_USE"))
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("TYPE_ALIAS_USE"))
+    );
+}
+
+#[test]
+fn rust_graph_aliases_preserve_macro_and_value_namespaces() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+macro_rules! same { () => {}; }
+fn same() {}
+mod consumer {
+    use super::same as alias;
+    fn run() {
+        alias!(); // MACRO_ALIAS_USE
+
+        // namespace separation padding
+        // namespace separation padding
+        // namespace separation padding
+        // namespace separation padding
+        // namespace separation padding
+        alias(); // VALUE_ALIAS_USE
+    }
+}
+"#,
+    )]);
+    let definitions = analyzer.get_definitions("same");
+    let macro_target = definitions
+        .iter()
+        .find(|definition| definition.is_macro())
+        .cloned()
+        .expect("macro declaration");
+    let value_target = definitions
+        .iter()
+        .find(|definition| definition.is_function())
+        .cloned()
+        .expect("value declaration");
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let macro_hits = strategy
+        .find_usages(&analyzer, &[macro_target], &candidates, 1000)
+        .into_either()
+        .expect("macro alias usage success");
+    let value_hits = strategy
+        .find_usages(&analyzer, &[value_target], &candidates, 1000)
+        .into_either()
+        .expect("value alias usage success");
+
+    assert!(
+        macro_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("MACRO_ALIAS_USE"))
+    );
+    assert!(
+        macro_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("VALUE_ALIAS_USE"))
+    );
+    assert!(
+        value_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("VALUE_ALIAS_USE"))
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("MACRO_ALIAS_USE"))
+    );
+}
+
+#[test]
+fn rust_graph_routes_imports_through_chained_namespace_aliases() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod target { pub struct Item; }
+use target as namespace;
+mod consumer {
+    use super::namespace::Item as Imported;
+    fn consume(_: Imported) {} // CHAINED_NAMESPACE_ALIAS_USE
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "target.Item");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("CHAINED_NAMESPACE_ALIAS_USE")),
+        "expected import through a parent namespace alias: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_resolves_private_inline_module_when_explicitly_reexported() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         (
@@ -4209,10 +4610,11 @@ mod service {
     pub struct Foo;
 }
 pub use service::Foo;
+mod consumer;
 "#,
         ),
         (
-            "src/main.rs",
+            "src/consumer.rs",
             r#"
 use crate::Foo;
 
@@ -4238,28 +4640,23 @@ fn run() {
 
 #[test]
 fn rust_graph_strategy_finds_public_and_private_inline_module_usages() {
-    let (_project, analyzer) = rust_analyzer_with_files(&[
-        (
-            "src/lib.rs",
-            r#"
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
 pub mod service {
     pub struct Foo;
     struct Hidden;
+
+    fn internal() {
+        let _ = Hidden {};
+    }
 }
-"#,
-        ),
-        (
-            "src/main.rs",
-            r#"
-use crate::service::{Foo, Hidden};
 
 fn run() {
-    let _ = Foo {};
-    let _ = Hidden {};
+    let _ = service::Foo {};
 }
 "#,
-        ),
-    ]);
+    )]);
 
     let foo = definition(&analyzer, "service.Foo");
     let hidden = definition(&analyzer, "service.Hidden");
@@ -4440,12 +4837,29 @@ fn run() {
 
 #[test]
 fn rust_graph_strategy_resolves_bare_module_const_and_turbofish_free_function() {
-    let (_project, analyzer) = rust_analyzer_with_files(&[
+    let consumer = r#"
+fn run() {
+    let _ = crate::fixtures::MANIFESTS;
+    let _ = crate::other::MANIFESTS;
+    crate::is_unpin::<u8>();
+    crate::other::is_unpin::<u8>();
+}
+"#;
+    let main = r#"
+fn run() {
+    let _ = crate::fixtures::MANIFESTS; // INVALID_LIB_MAIN_DECOY
+    let _ = crate::other::MANIFESTS;
+    crate::is_unpin::<u8>(); // INVALID_LIB_MAIN_DECOY
+    crate::other::is_unpin::<u8>();
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/lib.rs",
             r#"
 pub mod fixtures;
 pub mod other;
+pub mod consumer;
 pub fn is_unpin<T>() {}
 "#,
         ),
@@ -4454,32 +4868,37 @@ pub fn is_unpin<T>() {}
             "src/other.rs",
             "pub const MANIFESTS: &[&str] = &[];\npub fn is_unpin<T>() {}\n",
         ),
-        (
-            "src/main.rs",
-            r#"
-use crate::fixtures::MANIFESTS;
-
-fn run() {
-    let _ = MANIFESTS;
-    let _ = crate::other::MANIFESTS;
-    crate::is_unpin::<u8>();
-    crate::other::is_unpin::<u8>();
-}
-"#,
-        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
     ]);
 
     let constant_hits = rust_graph_hits(&analyzer, "fixtures._module_.MANIFESTS");
+    let constant_start = consumer
+        .find("crate::fixtures::MANIFESTS")
+        .expect("valid const use")
+        + "crate::fixtures::".len();
     assert_eq!(
         1,
         constant_hits.len(),
         "module const hits: {constant_hits:?}"
     );
-    assert!(constant_hits[0].snippet.contains("MANIFESTS"));
+    assert_eq!(project.file("src/consumer.rs"), constant_hits[0].file);
+    assert_eq!(
+        (constant_start, constant_start + "MANIFESTS".len()),
+        (constant_hits[0].start_offset, constant_hits[0].end_offset)
+    );
 
     let function_hits = rust_graph_hits(&analyzer, "is_unpin");
+    let function_start = consumer
+        .find("crate::is_unpin::<u8>()")
+        .expect("valid function use")
+        + "crate::".len();
     assert_eq!(1, function_hits.len(), "turbofish hits: {function_hits:?}");
-    assert!(function_hits[0].snippet.contains("is_unpin::<u8>"));
+    assert_eq!(project.file("src/consumer.rs"), function_hits[0].file);
+    assert_eq!(
+        (function_start, function_start + "is_unpin".len()),
+        (function_hits[0].start_offset, function_hits[0].end_offset)
+    );
 }
 
 #[test]
@@ -5564,5 +5983,433 @@ fn render(output: &mut String, alert: &NodeAlert, other: &OtherAlert) {
         expected,
         (hit.start_offset, hit.end_offset),
         "the token-tree receiver chain must retain its intermediate field type"
+    );
+}
+
+#[test]
+fn rust_usage_routes_pub_crate_type_through_private_parent_binding() {
+    let consumer = r#"
+use super::Style;
+use crate::decoy::Style as DecoyStyle;
+
+fn consume(value: Style, decoy: DecoyStyle) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod decoy; mod style; mod value;\n"),
+        ("src/style.rs", "pub(crate) struct Style;\n"),
+        ("src/decoy.rs", "pub(crate) struct Style;\n"),
+        ("src/value/mod.rs", "use crate::style::Style;\nmod map;\n"),
+        ("src/value/map.rs", consumer),
+    ]);
+
+    let target = definition(&analyzer, "style.Style");
+    let found = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .into_either()
+        .expect("Rust graph usage success");
+    let expected = consumer
+        .find("value: Style")
+        .map(|start| start + "value: ".len())
+        .expect("target Style use");
+
+    assert_eq!(
+        1,
+        found.len(),
+        "only the routed Style use may match: {found:#?}"
+    );
+    let hit = found.iter().next().expect("routed Style usage");
+    assert_eq!(project.file("src/value/map.rs"), hit.file);
+    assert_eq!(
+        (expected, expected + "Style".len()),
+        (hit.start_offset, hit.end_offset)
+    );
+}
+
+#[test]
+fn rust_usage_routes_restricted_named_and_glob_reexports() {
+    let consumer = r#"
+use crate::facade::{Globbed, Named};
+
+fn consume(named: Named, globbed: Globbed) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod facade;\n"),
+        (
+            "src/facade/mod.rs",
+            "mod consumer; mod globbed; mod named;\npub(crate) use self::named::Named;\npub(in crate::facade) use self::globbed::*;\n",
+        ),
+        ("src/facade/named.rs", "pub(crate) struct Named;\n"),
+        ("src/facade/globbed.rs", "pub(crate) struct Globbed;\n"),
+        ("src/facade/consumer.rs", consumer),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("facade.named.Named", "named: Named"),
+        ("facade.globbed.Globbed", "globbed: Globbed"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let found = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&target))
+            .into_either()
+            .expect("Rust graph usage success");
+        let expected = consumer
+            .find(marker)
+            .map(|start| start + marker.find(':').expect("type separator") + 2)
+            .expect("restricted re-export use");
+        assert_eq!(
+            1,
+            found.len(),
+            "restricted route for {target_fqn}: {found:#?}"
+        );
+        let hit = found.iter().next().expect("restricted re-export usage");
+        assert_eq!(project.file("src/facade/consumer.rs"), hit.file);
+        assert_eq!(expected, hit.start_offset);
+    }
+}
+
+#[test]
+fn rust_qualified_resolution_respects_module_and_local_import_extents() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod wanted { pub fn ping() {} }
+use crate::wanted as selected;
+
+fn outer() { selected::ping(); } // VALID_PARENT_IMPORT
+
+mod child {
+    mod selected { pub fn ping() {} }
+    fn run() { selected::ping(); } // SHADOWED_CHILD_PATH
+}
+
+fn local() {
+    use crate::wanted as local_selected;
+    local_selected::ping(); // VALID_LOCAL_IMPORT
+}
+
+fn outside() { local_selected::ping(); } // LEAKED_LOCAL_IMPORT
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "wanted.ping");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("VALID_PARENT_IMPORT"))
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("VALID_LOCAL_IMPORT"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("SHADOWED_CHILD_PATH"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("LEAKED_LOCAL_IMPORT"))
+    );
+}
+
+#[test]
+fn rust_qualified_resolution_respects_item_shadowing_inside_and_outside_macros() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod wanted { pub struct Owner; }
+use wanted::Owner;
+macro_rules! preserve { ($($tokens:tt)*) => {}; }
+
+fn valid(_: Owner) {} // VALID_OWNER_USE
+
+fn shadowed() {
+    struct Owner;
+    let _ = Owner::VALUE; // SHADOWED_ORDINARY_PATH
+    preserve!(Owner::VALUE); // SHADOWED_MACRO_PATH
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "wanted.Owner");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("VALID_OWNER_USE"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("SHADOWED_ORDINARY_PATH"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("SHADOWED_MACRO_PATH"))
+    );
+}
+
+#[test]
+fn rust_qualified_resolution_does_not_bypass_private_visibility() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod hidden {
+    struct Secret;
+    fn valid(_: Secret) {} // VALID_PRIVATE_USE
+}
+
+fn invalid(_: crate::hidden::Secret) {} // INVALID_PRIVATE_USE
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "hidden.Secret");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("VALID_PRIVATE_USE"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("INVALID_PRIVATE_USE"))
+    );
+}
+
+#[test]
+fn rust_qualified_resolution_rejects_colliding_glob_reexport_origins() {
+    let source = r#"
+mod left { pub struct Item; }
+mod right { pub struct Item; }
+
+mod facade {
+    pub use crate::left::*;
+    pub use crate::right::*;
+}
+
+use facade::*;
+fn ambiguous(_: Item) {} // AMBIGUOUS_GLOB_ORIGIN
+fn exact(_: left::Item) {} // EXACT_LEFT_ORIGIN
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+
+    let hits = rust_graph_hits(&analyzer, "left.Item");
+    let ambiguous =
+        source.find("ambiguous(_: Item)").expect("ambiguous use") + "ambiguous(_: ".len();
+    let exact = source.find("exact(_: left::Item)").expect("exact use") + "exact(_: left::".len();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.start_offset == exact && hit.end_offset == exact + "Item".len())
+    );
+    assert!(
+        hits.iter().all(|hit| hit.start_offset != ambiguous),
+        "a colliding glob alias must preserve both canonical origins: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_direct_resolution_respects_private_owner_module_domain() {
+    let source = r#"
+mod outer {
+    mod hidden {
+        pub struct Item;
+        fn inside(_: Item) {} // VALID_INSIDE_PRIVATE_MODULE
+    }
+}
+
+mod sibling {
+    fn invalid(_: crate::outer::hidden::Item) {} // INVALID_SIBLING_PRIVATE_MODULE
+}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let hits = rust_graph_hits(&analyzer, "outer.hidden.Item");
+    let inside = source.find("inside(_: Item)").expect("inside use") + "inside(_: ".len();
+    let invalid = source
+        .find("invalid(_: crate::outer::hidden::Item)")
+        .expect("invalid sibling use")
+        + "invalid(_: crate::outer::hidden::".len();
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.start_offset == inside && hit.end_offset == inside + "Item".len()),
+        "the item must resolve inside its private owner module: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.start_offset != invalid),
+        "a public item must not bypass its private owner module: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_direct_resolution_allows_physical_root_item_in_inline_descendant() {
+    let source = r#"
+pub struct RootItem;
+mod descendant {
+    fn valid(_: super::RootItem) {}
+}
+
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let hits = rust_graph_hits(&analyzer, "RootItem");
+    let expected = source.find("super::RootItem").expect("descendant use") + "super::".len();
+
+    assert!(
+        hits.iter().any(
+            |hit| hit.start_offset == expected && hit.end_offset == expected + "RootItem".len()
+        ),
+        "physical-root items must remain visible in inline descendants: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_physical_owners_do_not_attach_file_to_inline_module() {
+    let lib = r#"
+pub struct RootItem;
+mod shadow {
+    fn valid(_: super::RootItem) {}
+}
+"#;
+    let detached = "fn invalid(_: crate::RootItem) {}\n";
+    let (project, analyzer) =
+        rust_analyzer_with_files(&[("src/lib.rs", lib), ("src/shadow.rs", detached)]);
+    let hits = rust_graph_hits(&analyzer, "RootItem");
+    let valid = lib.find("super::RootItem").expect("inline valid use") + "super::".len();
+    let invalid = detached.find("crate::RootItem").expect("detached use") + "crate::".len();
+
+    assert!(hits.iter().any(|hit| {
+        hit.file == project.file("src/lib.rs")
+            && hit.start_offset == valid
+            && hit.end_offset == valid + "RootItem".len()
+    }));
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/shadow.rs") || hit.start_offset != invalid
+        }),
+        "an inline module must not attach a same-named analyzed file: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_rooted_import_requires_shared_physical_owner() {
+    let consumer = r#"
+use crate::fixtures::MANIFESTS;
+fn valid() { let _ = MANIFESTS; }
+"#;
+    let main = r#"
+use crate::fixtures::MANIFESTS;
+fn invalid() { let _ = MANIFESTS; }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod fixtures;\npub mod consumer;\n"),
+        ("src/fixtures.rs", "pub const MANIFESTS: &[&str] = &[];\n"),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "fixtures._module_.MANIFESTS");
+    let valid = consumer.find("let _ = MANIFESTS").expect("valid use") + "let _ = ".len();
+    let invalid = main.find("let _ = MANIFESTS").expect("invalid use") + "let _ = ".len();
+
+    assert!(hits.iter().any(|hit| {
+        hit.file == project.file("src/consumer.rs")
+            && hit.start_offset == valid
+            && hit.end_offset == valid + "MANIFESTS".len()
+    }));
+    assert!(
+        hits.iter()
+            .all(|hit| { hit.file != project.file("src/main.rs") || hit.start_offset != invalid }),
+        "a rooted import must not cross unrelated crate roots: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_unrooted_local_import_requires_shared_physical_owner() {
+    let consumer = r#"
+use fixtures::MANIFESTS;
+fn valid() { let _ = MANIFESTS; }
+"#;
+    let main = r#"
+use fixtures::MANIFESTS;
+fn invalid() { let _ = MANIFESTS; }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod fixtures;\npub mod consumer;\n"),
+        ("src/fixtures.rs", "pub const MANIFESTS: &[&str] = &[];\n"),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "fixtures._module_.MANIFESTS");
+    let valid = consumer.find("let _ = MANIFESTS").expect("valid use") + "let _ = ".len();
+    let invalid = main.find("let _ = MANIFESTS").expect("invalid use") + "let _ = ".len();
+
+    assert!(hits.iter().any(|hit| {
+        hit.file == project.file("src/consumer.rs")
+            && hit.start_offset == valid
+            && hit.end_offset == valid + "MANIFESTS".len()
+    }));
+    assert!(
+        hits.iter()
+            .all(|hit| { hit.file != project.file("src/main.rs") || hit.start_offset != invalid }),
+        "an unrooted local import must not cross unrelated crate roots: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_binary_can_import_own_library_crate_name_through_alias() {
+    let main = r#"
+use demo_app as own_library;
+use own_library::Item as LibraryItem;
+fn consume(_: LibraryItem) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub struct Item;\n"),
+        ("src/main.rs", main),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "Item");
+    let expected = main
+        .find("consume(_: LibraryItem)")
+        .expect("own-library use")
+        + "consume(_: ".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/main.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "LibraryItem".len()
+        }),
+        "a binary target must resolve its own Cargo library through an alias: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_path_dependency_alias_chain_preserves_external_provenance() {
+    let consumer = r#"
+use dep_alias::model as external_model;
+use external_model as chained_model;
+fn valid(_: chained_model::Item) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ndep_alias = { package = \"dep-package\", path = \"dep\" }\n",
+        ),
+        ("src/lib.rs", "mod consumer;\n"),
+        ("src/consumer.rs", consumer),
+        (
+            "dep/Cargo.toml",
+            "[package]\nname = \"dep-package\"\nversion = \"0.1.0\"\n",
+        ),
+        ("dep/src/lib.rs", "pub mod model;\n"),
+        ("dep/src/model.rs", "pub struct Item;\n"),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "dep.src.model.Item");
+    let expected = consumer
+        .find("chained_model::Item")
+        .expect("path-dependency use")
+        + "chained_model::".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "Item".len()
+        }),
+        "a path dependency must retain External provenance through module aliases: {hits:#?}"
     );
 }

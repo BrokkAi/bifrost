@@ -40,8 +40,8 @@ use tests::detect_rust_test_assertion_smells;
 
 pub use graph_support::RustReferenceContext;
 use hierarchy::RustHierarchyIndex;
-pub(crate) use usage_index::RustBindingSeeds;
 use usage_index::RustUsageIndex;
+pub(crate) use usage_index::{RustBindingSeeds, RustReferenceNamespace};
 
 #[derive(Clone)]
 pub struct RustAnalyzer {

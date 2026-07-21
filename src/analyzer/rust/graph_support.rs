@@ -9,7 +9,8 @@ use tree_sitter::Node;
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
 use super::imports::{
-    resolve_rust_module_path_with_crate, rust_crate_root_package, split_rust_import_module_and_name,
+    RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
+    rust_imports_with_visibility_from_use_declaration,
 };
 use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree, visible_import_binder_at};
 
@@ -215,42 +216,52 @@ impl RustAnalyzer {
             );
         }
 
-        for import in self.inner.import_info_of(file) {
-            let raw = import.raw_snippet.trim();
-            if !raw.starts_with("pub use ") {
-                continue;
+        if let Some(prepared) = self.prepared_syntax(file) {
+            let source = prepared.source();
+            let root = prepared.tree().root_node();
+            for index_in_root in 0..root.named_child_count() {
+                let Some(node) = root.named_child(index_in_root) else {
+                    continue;
+                };
+                if node.kind() != "use_declaration" {
+                    continue;
+                }
+                for import in rust_imports_with_visibility_from_use_declaration(node, source) {
+                    if matches!(
+                        import.visibility,
+                        RustVisibility::Private | RustVisibility::SelfModule
+                    ) {
+                        continue;
+                    }
+                    if import.info.is_wildcard {
+                        if !import.path.is_empty() {
+                            index.reexport_stars.push(ReexportStar {
+                                module_specifier: import.path.join("::"),
+                            });
+                        }
+                        continue;
+                    }
+                    let Some(imported_name) = import.path.last().cloned() else {
+                        continue;
+                    };
+                    let Some(local_name) = import
+                        .info
+                        .alias
+                        .clone()
+                        .or_else(|| import.info.identifier.clone())
+                    else {
+                        continue;
+                    };
+                    let module_specifier = import.path[..import.path.len() - 1].join("::");
+                    index.exports_by_name.insert(
+                        local_name,
+                        ExportEntry::ReexportedNamed {
+                            module_specifier,
+                            imported_name,
+                        },
+                    );
+                }
             }
-            if let Some(module_specifier) = raw
-                .strip_prefix("pub use ")
-                .map(str::trim)
-                .and_then(|value| value.strip_suffix("::*;"))
-                .map(str::trim)
-            {
-                index.reexport_stars.push(ReexportStar {
-                    module_specifier: module_specifier.to_string(),
-                });
-                continue;
-            }
-            let Some((module_specifier, imported_name)) =
-                split_rust_import_module_and_name(&import.raw_snippet)
-            else {
-                continue;
-            };
-            let exported_name = import
-                .alias
-                .clone()
-                .or_else(|| import.identifier.clone())
-                .unwrap_or_else(|| imported_name.clone());
-            if exported_name == "self" {
-                continue;
-            }
-            index.exports_by_name.insert(
-                exported_name,
-                ExportEntry::ReexportedNamed {
-                    module_specifier,
-                    imported_name,
-                },
-            );
         }
 
         index
@@ -861,6 +872,15 @@ impl RustAnalyzer {
         })
     }
 
+    pub(super) fn rust_declaration_visibility(&self, code_unit: &CodeUnit) -> RustVisibility {
+        let Some(prepared) = self.prepared_syntax(code_unit.source()) else {
+            return RustVisibility::Private;
+        };
+        self.rust_declaration_node(code_unit, prepared.tree().root_node())
+            .map(|node| super::imports::rust_item_visibility(node, prepared.source()))
+            .unwrap_or(RustVisibility::Private)
+    }
+
     /// Whether the declaration's own visibility makes it part of the crate's
     /// exported surface (`pub` / `pub(crate)`), unlike the looser
     /// [`Self::is_rust_public_like_declaration`] which also accepts module-private
@@ -939,6 +959,13 @@ impl RustAnalyzer {
             };
             current = parent;
         }
+    }
+
+    pub(crate) fn is_external_module_declaration(&self, code_unit: &CodeUnit) -> bool {
+        code_unit.is_module()
+            && self.rust_declaration_node_is(code_unit, |node, _source| {
+                node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
+            })
     }
 
     fn rust_declaration_node_is<F>(&self, code_unit: &CodeUnit, predicate: F) -> bool
@@ -1064,6 +1091,77 @@ pub(super) fn rust_module_files_from_path(
         }
     }
     files
+}
+
+pub(super) fn rust_module_files_from_segments(
+    file: &ProjectFile,
+    segments: &[String],
+) -> Vec<ProjectFile> {
+    let Some(relative_module) = rust_relative_module_segments(file, segments) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for rel_path in [
+        relative_module.with_extension("rs"),
+        relative_module.join("mod.rs"),
+        PathBuf::from("src")
+            .join(&relative_module)
+            .with_extension("rs"),
+        PathBuf::from("src").join(&relative_module).join("mod.rs"),
+    ] {
+        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
+        if candidate.exists() {
+            files.push(candidate);
+        }
+    }
+    files
+}
+
+fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Option<PathBuf> {
+    let (first, rest) = segments.split_first()?;
+    let append = |base: &mut PathBuf, parts: &[String]| {
+        for part in parts {
+            base.push(part);
+        }
+    };
+    let mut module = match first.as_str() {
+        "crate" | "self" => {
+            let mut path = PathBuf::new();
+            append(&mut path, rest);
+            path
+        }
+        "super" => {
+            let mut path = file
+                .parent()
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_path_buf();
+            let mut index = 0;
+            while rest.get(index).is_some_and(|part| part == "super") {
+                path.pop();
+                index += 1;
+            }
+            append(&mut path, &rest[index..]);
+            path
+        }
+        crate_name if Some(crate_name) == rust_current_crate_name(file).as_deref() => {
+            let mut path = PathBuf::new();
+            append(&mut path, rest);
+            path
+        }
+        _ => {
+            let parent = file.rel_path().parent().unwrap_or(Path::new(""));
+            let stem = file.rel_path().file_stem()?.to_str()?;
+            let mut path = if matches!(stem, "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            append(&mut path, segments);
+            path
+        }
+    };
+    (!module.as_os_str().is_empty()).then_some(std::mem::take(&mut module))
 }
 
 fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
