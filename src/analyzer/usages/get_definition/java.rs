@@ -766,10 +766,12 @@ fn resolve_java_bare_identifier(
     }
     // A bare identifier can be an unqualified field access — resolve it to a
     // field of the enclosing class (or an inherited one), unless the name is
-    // bound locally (a local, parameter, or type variable), in which case it is
-    // not this field. Java resolves these members before considering static
-    // imports, including on-demand imports with the same simple name.
-    if !java_local_binding_before(source, root, name, node.start_byte()) {
+    // bound in the active lexical path. Java resolves these members before
+    // considering static imports, including on-demand imports with the same
+    // simple name.
+    let locally_bound =
+        java_local_binding_before(analyzer, java, file, source, root, name, node.start_byte());
+    if !locally_bound {
         let class_ranges = ClassRangeIndex::build(analyzer, file);
         if let Some(owner_fqn) = class_ranges.enclosing(node.start_byte()) {
             let outcome = java_member_candidates(
@@ -785,6 +787,12 @@ fn resolve_java_bare_identifier(
                 return outcome;
             }
         }
+    }
+    if locally_bound {
+        return no_definition(
+            "local_binding",
+            format!("`{name}` resolves to a local Java binding"),
+        );
     }
     let static_import = java_static_import_candidates(
         analyzer,
@@ -1144,6 +1152,33 @@ fn java_bindings_before_scoped(
     root: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<CodeUnit> {
+    java_bindings_before_scoped_inner(analyzer, java, file, source, root, cutoff_start, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_local_binding_before(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    cutoff_start: usize,
+) -> bool {
+    java_bindings_before_scoped_inner(analyzer, java, file, source, root, cutoff_start, false)
+        .is_shadowed(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_bindings_before_scoped_inner(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+    include_fields: bool,
+) -> LocalInferenceEngine<CodeUnit> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     java_seed_active_path(
         analyzer,
@@ -1152,11 +1187,13 @@ fn java_bindings_before_scoped(
         source,
         root,
         cutoff_start,
+        include_fields,
         &mut bindings,
     );
     bindings
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_seed_active_path(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -1164,6 +1201,7 @@ fn java_seed_active_path(
     source: &str,
     node: Node<'_>,
     cutoff_start: usize,
+    include_fields: bool,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     let mut stack = vec![node];
@@ -1187,7 +1225,15 @@ fn java_seed_active_path(
                 bindings,
             );
         } else {
-            java_seed_inline_typed_binding(analyzer, java, file, source, node, bindings);
+            java_seed_inline_typed_binding_inner(
+                analyzer,
+                java,
+                file,
+                source,
+                node,
+                include_fields,
+                bindings,
+            );
         }
 
         let mut cursor = node.walk();
@@ -1265,8 +1311,23 @@ fn java_seed_inline_typed_binding(
     node: Node<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
+    java_seed_inline_typed_binding_inner(analyzer, java, file, source, node, true, bindings);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_seed_inline_typed_binding_inner(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    include_fields: bool,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
     match node.kind() {
-        "local_variable_declaration" | "field_declaration" => {
+        "local_variable_declaration" | "field_declaration"
+            if include_fields || node.kind() == "local_variable_declaration" =>
+        {
             let resolved = node.child_by_field_name("type").and_then(|type_node| {
                 java_type_from_node_with_context(analyzer, java, file, source, type_node)
             });
@@ -1760,15 +1821,6 @@ fn java_identifier_binding_before(
 ) -> bool {
     let mut found = false;
     collect_java_identifier_binding_before(source, root, name, before_byte, true, &mut found);
-    found
-}
-
-/// Like [`java_identifier_binding_before`] but counts only local variables and
-/// parameters, not field declarations — used to decide whether a bare name is
-/// shadowed by a local (and so is not a field reference).
-fn java_local_binding_before(source: &str, root: Node<'_>, name: &str, before_byte: usize) -> bool {
-    let mut found = false;
-    collect_java_identifier_binding_before(source, root, name, before_byte, false, &mut found);
     found
 }
 
