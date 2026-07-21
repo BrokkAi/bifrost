@@ -172,6 +172,8 @@ object Use:
   val made = Token.Number(1)
   def read(token: Token): Int = token match
     case Token.Number(value) => value
+  def invalid(token: Token): Int = token match
+    case Token.Number(first, second) => first + second
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
         .file("model/Token.scala", source)
@@ -196,6 +198,27 @@ object Use:
     assert_eq!(
         results[0]["definitions"][0]["path"], "model/Token.scala",
         "{value}"
+    );
+
+    let wrong_arity = source
+        .rfind("Number(first, second)")
+        .expect("wrong-arity pattern reference");
+    let wrong_arity_value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({
+            "references": [location_in("model/Token.scala", source, wrong_arity)]
+        })
+        .to_string(),
+    );
+    let wrong_arity_result = &wrong_arity_value["results"][0];
+    assert_eq!(
+        wrong_arity_result["status"], "no_definition",
+        "{wrong_arity_value}"
+    );
+    assert_eq!(
+        wrong_arity_result["diagnostics"][0]["kind"], "no_applicable_scala_callable",
+        "{wrong_arity_value}"
     );
 
     let sources = call_search_tool_json(

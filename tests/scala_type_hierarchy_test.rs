@@ -110,6 +110,178 @@ class ObjectArrayStepper[A](start: Int)
 }
 
 #[test]
+fn scala_hierarchy_preserves_sequential_enclosing_package_context_source_free() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "collection/Factory.scala",
+            r#"package scala.collection
+trait StrictOptimizedSeqFactory[Coll]
+"#,
+        ),
+        (
+            "mutable/ListBuffer.scala",
+            r#"package scala.collection
+package mutable
+class ListBuffer extends StrictOptimizedSeqFactory[ListBuffer]
+"#,
+        ),
+        (
+            "mutable/DottedListBuffer.scala",
+            r#"package scala.collection.mutable
+class DottedListBuffer extends StrictOptimizedSeqFactory[DottedListBuffer]
+"#,
+        ),
+    ]);
+    let factory = definition(&analyzer, "scala.collection.StrictOptimizedSeqFactory");
+    let sequential = definition(&analyzer, "scala.collection.mutable.ListBuffer");
+    let dotted = definition(&analyzer, "scala.collection.mutable.DottedListBuffer");
+
+    analyzer.reset_full_hydration_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&factory)),
+        BTreeSet::from(["scala.collection.mutable.ListBuffer".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&sequential)),
+        BTreeSet::from(["scala.collection.StrictOptimizedSeqFactory".to_string()])
+    );
+    assert!(
+        analyzer.get_direct_ancestors(&dotted).is_empty(),
+        "a single dotted package must not expose its parent package for unqualified lookup"
+    );
+    assert_eq!(
+        analyzer.full_hydration_count_for_test(),
+        0,
+        "source-free hierarchy construction must retain zero point hydration"
+    );
+    assert_eq!(
+        analyzer.bulk_hydration_count_for_test(),
+        3,
+        "source-free hierarchy construction must project each file exactly once"
+    );
+    assert_eq!(
+        analyzer.scala_project_types_build_count_for_test(),
+        1,
+        "hierarchy construction must retain one shared project-types snapshot"
+    );
+}
+
+#[test]
+fn scala_hierarchy_qualified_package_roots_follow_import_and_ambiguity_precedence() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala/CollectionObject.scala",
+            r#"package scala
+object collection { trait BitSetOps }
+"#,
+        ),
+        (
+            "scala/collection/BitSetOps.scala",
+            r#"package scala.collection
+trait BitSetOps
+"#,
+        ),
+        (
+            "extras/Syntax.scala",
+            r#"package extras
+object Syntax { val unrelated: Int = 1 }
+"#,
+        ),
+        (
+            "scala/collection/immutable/BitSet.scala",
+            r#"package scala
+package collection
+package immutable
+import extras.Syntax.*
+class BitSet extends collection.BitSetOps
+"#,
+        ),
+        (
+            "imported/Collection.scala",
+            r#"package imported
+object collection { trait BitSetOps }
+"#,
+        ),
+        (
+            "scala/collection/immutable/ImportedBitSet.scala",
+            r#"package scala
+package collection
+package immutable
+import imported.collection
+class ImportedBitSet extends collection.BitSetOps
+"#,
+        ),
+        (
+            "collision/Collection.scala",
+            r#"package collision
+object collection { trait BitSetOps }
+"#,
+        ),
+        (
+            "collision/collection/BitSetOps.scala",
+            r#"package collision.collection
+trait BitSetOps
+"#,
+        ),
+        (
+            "scala/collection/immutable/AmbiguousBitSet.scala",
+            r#"package scala
+package collection
+package immutable
+import collision.collection
+class AmbiguousBitSet extends collection.BitSetOps
+"#,
+        ),
+    ]);
+
+    let bit_set = definition(&analyzer, "scala.collection.immutable.BitSet");
+    let imported = definition(&analyzer, "scala.collection.immutable.ImportedBitSet");
+    let ambiguous = definition(&analyzer, "scala.collection.immutable.AmbiguousBitSet");
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&bit_set)),
+        BTreeSet::from(["scala.collection.BitSetOps".to_string()]),
+        "the enclosing package root must beat the implicit scala.collection singleton and survive an unrelated wildcard import"
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&imported)),
+        BTreeSet::from(["imported.collection$.BitSetOps".to_string()]),
+        "an explicit import must remain above enclosing package roots"
+    );
+    assert!(
+        analyzer.get_direct_ancestors(&ambiguous).is_empty(),
+        "an imported package/singleton collision must fail closed"
+    );
+}
+
+#[test]
+fn scala_hierarchy_qualified_package_root_rejects_duplicate_physical_terminals() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "collection/First.scala",
+            "package scala.collection\ntrait BitSetOps\n",
+        ),
+        (
+            "collection/Second.scala",
+            "package scala.collection\ntrait BitSetOps\n",
+        ),
+        (
+            "immutable/BitSet.scala",
+            r#"package scala
+package collection
+package immutable
+class BitSet extends collection.BitSetOps
+"#,
+        ),
+    ]);
+    let bit_set = definition(&analyzer, "scala.collection.immutable.BitSet");
+    assert!(
+        analyzer.get_direct_ancestors(&bit_set).is_empty(),
+        "duplicate physical package terminals must fail closed"
+    );
+}
+
+#[test]
 fn scala_trait_extends_trait_parent() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "Types.scala",

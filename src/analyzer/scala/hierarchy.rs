@@ -1,7 +1,20 @@
 use super::*;
+use crate::analyzer::ImportInfo;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::usages::scala_graph::{ScalaNameResolver, ScalaProjectTypes};
 use std::sync::Arc;
+
+#[derive(Clone)]
+struct ScalaHierarchyOwnerContext {
+    supertype_lookup_paths: Vec<ScalaSupertypeLookupPath>,
+    imports: Vec<ImportInfo>,
+}
+
+enum ScalaHierarchyPackageResolution {
+    NoMatch,
+    Resolved(String),
+    AuthoritativeMiss,
+}
 
 impl TypeHierarchyProvider for ScalaAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -27,6 +40,7 @@ impl ScalaAnalyzer {
         let _scope = crate::profiling::scope("ScalaAnalyzer::build_direct_descendant_index");
         let file_states = self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit);
         let mut candidates = Vec::new();
+        let mut contexts = HashMap::default();
         let mut seen = HashSet::default();
         for state in file_states.values() {
             for candidate in state
@@ -38,16 +52,24 @@ impl ScalaAnalyzer {
                 if seen.insert(candidate.clone()) {
                     candidates.push(candidate.clone());
                 }
+                if let Some(context) = hierarchy_owner_context_from_state(state, candidate) {
+                    contexts.insert(candidate.clone(), context);
+                }
             }
         }
 
         let types = self.project_types_from_file_states(file_states);
-        let ancestors_by_owner = types
-            .exact_direct_ancestors_snapshot()
-            .expect("source-free Scala project types cache exact direct ancestors");
-        for (owner, ancestors) in ancestors_by_owner {
+        let mut ancestors_by_owner = HashMap::default();
+        for candidate in &candidates {
+            let ancestors = contexts
+                .get(candidate)
+                .map(|context| {
+                    self.resolve_direct_ancestor_units_with_context(candidate, &types, context)
+                })
+                .unwrap_or_default();
             self.direct_ancestors
-                .insert(owner.clone(), Arc::new(ancestors.clone()));
+                .insert(candidate.clone(), Arc::new(ancestors.clone()));
+            ancestors_by_owner.insert(candidate.clone(), ancestors);
         }
         build_direct_descendant_index_from_candidates(candidates, |candidate| {
             ancestors_by_owner
@@ -88,16 +110,61 @@ impl ScalaAnalyzer {
             return Vec::new();
         }
 
-        let Some(facts) = self.forward_owner_facts(code_unit) else {
+        let Some(state) = self.inner.fetch_file_state(code_unit.source()) else {
             return Vec::new();
         };
-        let resolver = ScalaNameResolver::for_file_types(self, code_unit, types);
+        let Some(context) = hierarchy_owner_context_from_state(&state, code_unit) else {
+            return Vec::new();
+        };
+        self.resolve_direct_ancestor_units_with_context(code_unit, types, &context)
+    }
+
+    fn resolve_direct_ancestor_units_with_context(
+        &self,
+        code_unit: &CodeUnit,
+        types: &ScalaProjectTypes,
+        context: &ScalaHierarchyOwnerContext,
+    ) -> Vec<CodeUnit> {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
-        for path in facts.supertype_lookup_paths {
-            let Some(fqn) =
-                types.resolve_type_in_hierarchy_context(self, &resolver, path.segments())
-            else {
+        for path in &context.supertype_lookup_paths {
+            let fallback_package = [code_unit.package_name().to_string()];
+            let package_prefixes = if path.package_prefixes().is_empty() {
+                fallback_package.as_slice()
+            } else {
+                path.package_prefixes()
+            };
+            let resolver = ScalaNameResolver::for_file_with_package_context(
+                self,
+                Some(code_unit.source()),
+                package_prefixes,
+                &context.imports,
+                types,
+            );
+            let non_wildcard_imports = context
+                .imports
+                .iter()
+                .filter(|import| !import.is_wildcard)
+                .cloned()
+                .collect::<Vec<_>>();
+            let wildcard_baseline =
+                (non_wildcard_imports.len() != context.imports.len()).then(|| {
+                    ScalaNameResolver::for_file_with_package_context(
+                        self,
+                        Some(code_unit.source()),
+                        package_prefixes,
+                        &non_wildcard_imports,
+                        types,
+                    )
+                });
+            let Some(fqn) = self.resolve_hierarchy_supertype_path(
+                types,
+                &resolver,
+                wildcard_baseline.as_ref(),
+                path,
+                package_prefixes,
+                &context.imports,
+            ) else {
                 continue;
             };
             if !seen.insert(fqn.clone()) {
@@ -110,6 +177,75 @@ impl ScalaAnalyzer {
             }
         }
         ancestors
+    }
+
+    fn resolve_hierarchy_supertype_path(
+        &self,
+        types: &ScalaProjectTypes,
+        resolver: &ScalaNameResolver,
+        wildcard_baseline: Option<&ScalaNameResolver>,
+        path: &ScalaSupertypeLookupPath,
+        package_prefixes: &[String],
+        imports: &[ImportInfo],
+    ) -> Option<String> {
+        let segments = path.segments();
+        if let [root, _, ..] = segments
+            && !hierarchy_import_claims_root(imports, root, resolver, wildcard_baseline)
+        {
+            match self.resolve_enclosing_package_supertype(package_prefixes, segments) {
+                ScalaHierarchyPackageResolution::Resolved(fqn) => return Some(fqn),
+                ScalaHierarchyPackageResolution::AuthoritativeMiss => return None,
+                ScalaHierarchyPackageResolution::NoMatch => {}
+            }
+        }
+        types.resolve_type_in_hierarchy_context(self, resolver, segments)
+    }
+
+    fn resolve_enclosing_package_supertype(
+        &self,
+        package_prefixes: &[String],
+        segments: &[String],
+    ) -> ScalaHierarchyPackageResolution {
+        let Some((root, rest)) = segments.split_first() else {
+            return ScalaHierarchyPackageResolution::NoMatch;
+        };
+        if rest.is_empty() || root == "_root_" {
+            return ScalaHierarchyPackageResolution::NoMatch;
+        }
+        for package in scala_enclosing_package_root_candidates(package_prefixes, root) {
+            if package == *root {
+                continue;
+            }
+            if !self.inner.forward_package_exists(&package) {
+                continue;
+            }
+            let qualified = std::iter::once(package.as_str())
+                .chain(rest.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(".");
+            let mut declarations = self
+                .inner
+                .definitions(&qualified)
+                .filter(CodeUnit::is_class)
+                .collect::<Vec<_>>();
+            declarations.sort();
+            declarations.dedup();
+            let ordinary = declarations
+                .iter()
+                .filter(|unit| !unit.short_name().ends_with('$'))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected = if ordinary.is_empty() {
+                declarations
+            } else {
+                ordinary
+            };
+            return match selected.as_slice() {
+                [definition] => ScalaHierarchyPackageResolution::Resolved(definition.fq_name()),
+                [] | [_, _, ..] => ScalaHierarchyPackageResolution::AuthoritativeMiss,
+            };
+        }
+        ScalaHierarchyPackageResolution::NoMatch
     }
 
     fn resolve_direct_ancestor_relations(
@@ -160,6 +296,64 @@ impl ScalaAnalyzer {
             .map(|unit| unit.fq_name())
             .collect()
     }
+}
+
+fn hierarchy_owner_context_from_state(
+    state: &FileState,
+    owner: &CodeUnit,
+) -> Option<ScalaHierarchyOwnerContext> {
+    let raw_supertypes = state.raw_supertypes.get(owner)?;
+    let supertype_lookup_paths = state
+        .supertype_lookup_paths
+        .get(owner)?
+        .iter()
+        .map(|path| ScalaSupertypeLookupPath::decode(path))
+        .collect::<Option<Vec<_>>>()?;
+    if raw_supertypes.len() != supertype_lookup_paths.len() {
+        return None;
+    }
+    let reference_byte = state
+        .ranges
+        .get(owner)
+        .into_iter()
+        .flatten()
+        .map(|range| range.start_byte)
+        .min()
+        .unwrap_or(usize::MAX);
+    let fallback_package = [owner.package_name().to_string()];
+    let package_prefixes = supertype_lookup_paths
+        .first()
+        .map(ScalaSupertypeLookupPath::package_prefixes)
+        .filter(|prefixes| !prefixes.is_empty())
+        .unwrap_or(fallback_package.as_slice());
+    let imports = state
+        .imports
+        .iter()
+        .filter(|import| scala_import_visible_at(import, package_prefixes, &[], reference_byte))
+        .cloned()
+        .collect();
+    Some(ScalaHierarchyOwnerContext {
+        supertype_lookup_paths,
+        imports,
+    })
+}
+
+fn hierarchy_import_claims_root(
+    imports: &[ImportInfo],
+    root: &str,
+    resolver: &ScalaNameResolver,
+    wildcard_baseline: Option<&ScalaNameResolver>,
+) -> bool {
+    imports.iter().any(|import| {
+        !import.is_wildcard
+            && import
+                .identifier
+                .as_deref()
+                .is_some_and(|visible| visible == root)
+    }) || wildcard_baseline.is_some_and(|baseline| {
+        (resolver.resolve(root), resolver.resolve_object(root))
+            != (baseline.resolve(root), baseline.resolve_object(root))
+    })
 }
 
 #[cfg(test)]

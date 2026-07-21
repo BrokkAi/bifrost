@@ -13,11 +13,24 @@ pub(super) struct ScalaSupertypeFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScalaSupertypeLookupPath {
     segments: Vec<String>,
+    /// Parser-established package scopes at the owner declaration, ordered
+    /// outermost to innermost. Sequential clauses retain each intermediate
+    /// scope; one dotted clause retains only its complete package.
+    #[serde(default)]
+    package_prefixes: Vec<String>,
 }
 
 impl ScalaSupertypeLookupPath {
     pub(crate) fn segments(&self) -> &[String] {
         &self.segments
+    }
+
+    pub(crate) fn package_prefixes(&self) -> &[String] {
+        &self.package_prefixes
+    }
+
+    pub(super) fn set_package_prefixes(&mut self, package_prefixes: &[String]) {
+        self.package_prefixes = package_prefixes.to_vec();
     }
 
     pub(super) fn encode(&self) -> String {
@@ -39,6 +52,7 @@ pub(super) fn extract_scala_supertypes(
             raw: node_text(parent, source).to_string(),
             lookup_path: ScalaSupertypeLookupPath {
                 segments: scala_type_lookup_segments(lookup_node, source),
+                package_prefixes: Vec::new(),
             },
         })
         .filter(|fact| !fact.lookup_path.segments.is_empty())
@@ -79,7 +93,10 @@ pub(super) fn scala_full_enum_case_owner_supertype(
     segments.reverse();
     Some(ScalaSupertypeFact {
         raw: segments.join("."),
-        lookup_path: ScalaSupertypeLookupPath { segments },
+        lookup_path: ScalaSupertypeLookupPath {
+            segments,
+            package_prefixes: Vec::new(),
+        },
     })
 }
 

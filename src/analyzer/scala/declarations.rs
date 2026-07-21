@@ -379,6 +379,9 @@ impl<'a> ScalaVisitor<'a> {
             raw_supertypes.push(enum_owner);
         }
         raw_supertypes.extend(extract_scala_supertypes(node, self.source));
+        for fact in &mut raw_supertypes {
+            fact.lookup_path.set_package_prefixes(package_prefixes);
+        }
         if !raw_supertypes.is_empty() {
             self.parsed.set_raw_supertypes(
                 code_unit.clone(),

@@ -2631,3 +2631,152 @@ object Types {
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
 }
+
+#[test]
+fn scala_bare_application_prefers_exact_lexical_singleton_before_package_decoys() {
+    let source = r#"package app
+object cons { def apply(left: Int, right: Int): Int = 0 }
+object Stream {
+  object cons { def apply(left: Int, right: Int): Int = 2 }
+  val lexical = cons(1, 2)
+  def imported: Int = {
+    import imported.cons
+    cons(1, 2)
+  }
+  def local: Int = {
+    val cons = (left: Int, right: Int) => left + right
+    cons(1, 2)
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Stream.scala", source)
+        .file(
+            "imported/cons.scala",
+            "package imported\nobject cons { def apply(left: Int, right: Int): Int = 1 }\n",
+        )
+        .file(
+            "external/cons.scala",
+            "package external\nobject cons { def apply(left: Int, right: Int): Int = 3 }\n",
+        )
+        .build();
+    let references = [
+        source.find("lexical = cons").expect("lexical application") + "lexical = ".len(),
+        source
+            .find("    cons(1, 2)\n  }\n  def local")
+            .expect("imported application")
+            + 4,
+        source.rfind("    cons").expect("local application") + 4,
+    ]
+    .into_iter()
+    .map(|start| location_in("app/Stream.scala", source, start))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results[..2]
+        .iter()
+        .zip(["app.Stream$.cons$.apply", "imported.cons$.apply"])
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+    for result in &results[2..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+    }
+}
+
+#[test]
+fn scala_inherited_same_arity_overloads_use_exact_constructed_argument_types() {
+    let source = r#"package app
+trait NoArgTest
+trait OneArgTest
+trait SiblingTest
+class FixturelessTestFunAndConfigMap extends NoArgTest
+class TestFunAndConfigMap extends OneArgTest
+class SiblingFunAndConfigMap extends SiblingTest
+
+trait TestSuite {
+  def withFixture(test: NoArgTest): Int = 1
+}
+trait FixtureTestSuite extends TestSuite {
+  def withFixture(test: OneArgTest): Int = 2
+}
+class Spec extends FixtureTestSuite {
+  val fixtureless = withFixture(new FixturelessTestFunAndConfigMap)
+  val fixture = withFixture(new TestFunAndConfigMap)
+  val sibling = withFixture(new SiblingFunAndConfigMap)
+  def unknown(value: Any): Int = withFixture(value)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Fixture.scala", source)
+        .build();
+    let references = [
+        source
+            .find("fixtureless = withFixture")
+            .expect("fixtureless call")
+            + "fixtureless = ".len(),
+        source.find("fixture = withFixture").expect("fixture call") + "fixture = ".len(),
+        source.find("sibling = withFixture").expect("sibling call") + "sibling = ".len(),
+        source.rfind("withFixture(value)").expect("unknown call"),
+    ]
+    .into_iter()
+    .map(|start| location_in("app/Fixture.scala", source, start))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results[..2].iter().zip([
+        "app.TestSuite.withFixture",
+        "app.FixtureTestSuite.withFixture",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+    for result in &results[2..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+    }
+}
+
+#[test]
+fn scala_inherited_same_arity_overloads_fail_closed_for_duplicate_argument_types() {
+    let source = r#"package app
+import duplicate.DuplicateArg
+trait NoArgTest
+trait OneArgTest
+trait TestSuite { def withFixture(test: NoArgTest): Int = 1 }
+trait FixtureTestSuite extends TestSuite { def withFixture(test: OneArgTest): Int = 2 }
+class Spec extends FixtureTestSuite {
+  val duplicate = withFixture(new DuplicateArg)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Fixture.scala", source)
+        .file(
+            "duplicate/First.scala",
+            "package duplicate\nclass DuplicateArg extends app.NoArgTest\n",
+        )
+        .file(
+            "duplicate/Second.scala",
+            "package duplicate\nclass DuplicateArg extends app.NoArgTest\n",
+        )
+        .build();
+    let start = source
+        .find("duplicate = withFixture")
+        .expect("duplicate argument call")
+        + "duplicate = ".len();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [location_in("app/Fixture.scala", source, start)]}).to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}

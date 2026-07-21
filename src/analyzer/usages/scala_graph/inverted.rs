@@ -3593,7 +3593,7 @@ impl ProjectTypes {
         (fields.len() == 1).then(|| fields[0].clone())
     }
 
-    fn constructor_target_matches(
+    pub(crate) fn constructor_target_matches(
         &self,
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
