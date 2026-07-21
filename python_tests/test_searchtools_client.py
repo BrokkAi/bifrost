@@ -23,9 +23,12 @@ from bifrost_searchtools import (
     CodeQueryReferenceSite,
     CodeQueryResult,
     ContainerKind,
+    DeclarationLookupResult,
+    DefinitionLookupResult,
     DirectoryListingEntry,
     FileSummariesResult,
     MostRelevantFilesRankingMode,
+    NavigationOperation,
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
@@ -58,6 +61,46 @@ def _git_commit(root: Path, message: str) -> None:
 
 
 class CodeQueryModelTest(unittest.TestCase):
+    def test_navigation_models_deserialize_distinct_fields_and_render_operation(self) -> None:
+        candidate = {
+            "name": "run",
+            "fqn": "Runner.run",
+            "path": "Runner.java",
+            "start_line": 2,
+            "end_line": 2,
+            "kind": "function",
+            "signature": "()",
+            "language": "java",
+        }
+        declaration = DeclarationLookupResult.from_dict(
+            {
+                "query": {"path": "App.java", "line": 1},
+                "operation": "declaration",
+                "status": "resolved",
+                "declarations": [candidate],
+                "diagnostics": [],
+            }
+        )
+        definition = DefinitionLookupResult.from_dict(
+            {
+                "query": {"path": "App.java", "line": 1},
+                "operation": "definition",
+                "status": "resolved",
+                "definitions": [candidate],
+                "diagnostics": [],
+            }
+        )
+
+        self.assertIs(declaration.operation, NavigationOperation.DECLARATION)
+        self.assertEqual(["Runner.run"], [item.fqn for item in declaration.declarations])
+        self.assertIsNone(declaration.declarations[0].start_column)
+        self.assertIsNone(declaration.declarations[0].end_column)
+        self.assertIn("Runner.java:2..2", declaration.declarations[0].render_text())
+        self.assertIn("operation: declaration", declaration.render_text())
+        self.assertIs(definition.operation, NavigationOperation.DEFINITION)
+        self.assertEqual(["Runner.run"], [item.fqn for item in definition.definitions])
+        self.assertIn("operation: definition", definition.render_text())
+
     def test_typed_diagnostics_drive_completion_without_message_parsing(self) -> None:
         advisory = CodeQueryResult.from_dict(
             {
@@ -592,6 +635,21 @@ class SearchToolsClientTest(unittest.TestCase):
 
         self.assertIn("A.method2", text)
         self.assertIsInstance(usages.structured, dict)
+        hits = usages.structured["results"][0]["files"][0]["hits"]
+        self.assertTrue(hits)
+        for hit in hits:
+            self.assertTrue(
+                all(
+                    coordinate in hit
+                    for coordinate in ("column", "end_line", "end_column")
+                ),
+                hit,
+            )
+            exact_range = (
+                f"line {hit['line']}:{hit['column']}-"
+                f"{hit['end_line']}:{hit['end_column']}"
+            )
+            self.assertIn(exact_range, text)
 
     def test_scan_usages_by_location_returns_rendered_native_payload(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
@@ -938,9 +996,59 @@ namespace Demo
         }
 
         self.assertIn("get_definitions_by_location", visible_names)
+        self.assertIn("get_declarations_by_location", visible_names)
         self.assertNotIn("get_definitions_by_reference", visible_names)
         self.assertIn("get_definitions_by_reference", names)
         self.assertNotIn("get_definitions_by_location", names)
+        self.assertNotIn("get_declarations_by_location", names)
+
+    def test_location_navigation_dispatches_typed_declaration_and_definition_results(self) -> None:
+        references = [{"path": "B.java", "line": 8, "column": 11}]
+        with SearchToolsClient(root=self.fixture_root) as client:
+            declarations = client.get_declarations_by_location(references)
+            definitions = client.get_definitions_by_location(references)
+
+        self.assertEqual(1, len(declarations))
+        self.assertIs(declarations[0].operation, NavigationOperation.DECLARATION)
+        self.assertEqual("A.method1", declarations[0].declarations[0].fqn)
+        self.assertIsNotNone(declarations[0].declarations[0].start_column)
+        self.assertIsNotNone(declarations[0].declarations[0].end_column)
+        self.assertEqual(1, len(definitions))
+        self.assertIs(definitions[0].operation, NavigationOperation.DEFINITION)
+        self.assertEqual("A.method1", definitions[0].definitions[0].fqn)
+        self.assertIsNotNone(definitions[0].definitions[0].start_column)
+        self.assertIsNotNone(definitions[0].definitions[0].end_column)
+        rendered = definitions[0].definitions[0].render_text()
+        self.assertIn(
+            f":{definitions[0].definitions[0].start_column}-",
+            rendered,
+        )
+
+    def test_location_navigation_deserializes_exact_lexical_candidate(self) -> None:
+        source = (
+            "class Demo { void Run(string arg) { "
+            "System.Console.WriteLine(arg); } }\n"
+        )
+        column = source.rindex("arg") + 1
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Demo.cs").write_text(source)
+            with SearchToolsClient(root=root) as client:
+                results = client.get_definitions_by_location(
+                    [{"path": "Demo.cs", "line": 1, "column": column}]
+                )
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("resolved", results[0].status)
+        self.assertEqual(1, len(results[0].definitions))
+        candidate = results[0].definitions[0]
+        self.assertEqual("arg", candidate.name)
+        self.assertIsNone(candidate.fqn)
+        self.assertEqual(1, candidate.start_line)
+        self.assertEqual(30, candidate.start_column)
+        self.assertEqual(1, candidate.end_line)
+        self.assertEqual(33, candidate.end_column)
+        self.assertIn("arg (parameter, csharp)", candidate.render_text())
 
     def test_activate_workspace_switches_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

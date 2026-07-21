@@ -124,6 +124,11 @@ assert.deepStrictEqual(
   `${mcpPath} should launch the package-local Bifrost launcher`,
 );
 assert.deepStrictEqual(
+  mcpConfig.mcpServers?.bifrost?.cwd,
+  ".",
+  `${mcpPath} should run the launcher from the plugin package directory`,
+);
+assert.deepStrictEqual(
   cursorMcpConfig.mcpServers?.bifrost?.command,
   "./bin/bifrost-launcher.mjs",
   `${cursorMcpPath} should launch the package-local Bifrost launcher`,

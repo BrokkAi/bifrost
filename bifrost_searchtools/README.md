@@ -66,7 +66,8 @@ exposes:
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
-| `get_definitions_by_location([{"path": ..., "line": ..., "column": ...}])` | Resolve references at known file locations. |
+| `get_declarations_by_location([{"path": ..., "line": ..., "column": ...}])` | Resolve references to declaration contracts at known file locations. |
+| `get_definitions_by_location([{"path": ..., "line": ..., "column": ...}])` | Resolve references to concrete definitions at known file locations. |
 | `get_definitions_by_reference([{"symbol": ..., "context": ..., "target": ...}])` | Resolve copied references inside symbol source blocks. |
 | `get_type_by_location(path, *, line=..., column=...)` | Resolve the type of an expression or identifier at a known file location. |
 | `get_summaries(targets)` | Signature-level file/class outlines; immediate directory children; or exact-package types and direct child packages. |
@@ -111,6 +112,19 @@ The git tools return a `GitTextResult` (`.text`), the slopcop tools return a
 `CodeQualityReport` (`.report`), and the rest return structured dataclasses from
 `bifrost_searchtools.models`. The per-rule tuning knobs on the smell reports are
 passed through `options` (keys map 1:1 to the Rust tool arguments).
+
+Location navigation results expose a `NavigationOperation`. Declarations use
+`DeclarationLookupResult.declarations`; definitions use
+`DefinitionLookupResult.definitions`. Their statuses distinguish
+`no_declaration`, `no_definition`, and `ambiguous`. Reference-based definition
+lookup is unchanged, and there is no declaration-by-reference method.
+
+Exact source positions use 1-based lines and 1-based Unicode code-point
+columns, with an exclusive end position. Individual usage hits carry `line`,
+`column`, `end_line`, and `end_column`; definition, declaration, and nested type
+candidates carry `start_line`, `start_column`, `end_line`, and `end_column`.
+Column fields are absent for aggregate rows or candidates whose exact name token
+cannot be proven. Byte offsets remain internal.
 
 ## `query_code` detail and ranges
 

@@ -981,10 +981,4 @@ mod tests {
             }]
         );
     }
-
-    #[test]
-    #[ignore = "Brokk parity marker: add a cross-repo golden hotspot report harness if a lightweight Brokk-side CLI entrypoint becomes available"]
-    fn parity_marker_cross_repo_hotspot_markdown_match() {
-        panic!("parity marker only");
-    }
 }

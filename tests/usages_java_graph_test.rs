@@ -1546,6 +1546,181 @@ public class ClusterProcessPersistService {
 }
 
 #[test]
+fn java_graph_strategy_excludes_incompatible_anonymous_return_receivers() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Handler.java",
+            "package com.example; public interface Handler { String handle(String value); }\n",
+        ),
+        (
+            "com/example/ConsoleHandler.java",
+            r#"
+package com.example;
+
+public class ConsoleHandler implements Handler {
+    @Override
+    public String handle(String value) { return value.trim(); }
+}
+"#,
+        ),
+        (
+            "com/example/UnrelatedHandler.java",
+            r#"
+package com.example;
+
+public class UnrelatedHandler {
+    public String handle(String value) { return value.toUpperCase(); }
+}
+"#,
+        ),
+        (
+            "com/example/Runner.java",
+            r#"
+package com.example;
+
+public class Runner {
+    public Handler makeAnonymous() {
+        return new Handler() {
+            @Override
+            public String handle(String value) { return value.toLowerCase(); }
+        };
+    }
+
+    public String run() {
+        ConsoleHandler console = new ConsoleHandler();
+        console.handle("Console"); // direct-console-handler
+        new UnrelatedHandler().handle("Other"); // incompatible-concrete-handler
+        return makeAnonymous().handle("Anonymous"); // anonymous-handler-return
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let console_handle = definition(&analyzer, "com.example.ConsoleHandler.handle");
+    let concrete_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&console_handle),
+        &candidates,
+        1000,
+    );
+    assert_success_counts(concrete_result.clone(), &console_handle, 2, 0);
+    let concrete_hits = hits(concrete_result);
+    assert_eq!(
+        1,
+        concrete_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .count(),
+        "only the direct ConsoleHandler call should be a concrete method reference: {concrete_hits:#?}"
+    );
+    assert_hit_contains(&concrete_hits, "direct-console-handler");
+
+    let handler_handle = definition(&analyzer, "com.example.Handler.handle");
+    let interface_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&handler_handle),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&interface_hits, "anonymous-handler-return");
+}
+
+#[test]
+fn java_graph_strategy_preserves_inherited_and_anonymous_subclass_receivers() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Handler.java",
+            "package com.example; public interface Handler { String handle(String value); }\n",
+        ),
+        (
+            "com/example/ConsoleHandler.java",
+            r#"
+package com.example;
+
+public class ConsoleHandler implements Handler {
+    @Override
+    public String handle(String value) { return value.trim(); }
+}
+"#,
+        ),
+        (
+            "com/example/Factory.java",
+            "package com.example; public interface Factory { Handler make(); }\n",
+        ),
+        (
+            "com/example/FactoryImpl.java",
+            r#"
+package com.example;
+
+public class FactoryImpl implements Factory {
+    @Override
+    public Handler make() {
+        return new ConsoleHandler() {};
+    }
+}
+"#,
+        ),
+        (
+            "com/example/Base.java",
+            "package com.example; public class Base { public int value; public void run() {} }\n",
+        ),
+        (
+            "com/example/Child.java",
+            "package com.example; public class Child extends Base {}\n",
+        ),
+        (
+            "com/example/Runner.java",
+            r#"
+package com.example;
+
+public class Runner {
+    String runHandler() {
+        return new FactoryImpl().make().handle("anonymous-console-subclass");
+    }
+
+    int runInherited() {
+        new Child().run(); // inherited-method
+        return new Child().value; // inherited-field
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let console_handle = definition(&analyzer, "com.example.ConsoleHandler.handle");
+    let console_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&console_handle),
+        &candidates,
+        1000,
+    );
+    assert_success_counts(console_result.clone(), &console_handle, 2, 0);
+    assert_hit_contains(&hits(console_result), "anonymous-console-subclass");
+
+    let base_run = definition(&analyzer, "com.example.Base.run");
+    let base_run_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&base_run),
+        &candidates,
+        1000,
+    );
+    assert_success_counts(base_run_result.clone(), &base_run, 1, 0);
+    assert_hit_contains(&hits(base_run_result), "inherited-method");
+
+    let base_value = definition(&analyzer, "com.example.Base.value");
+    let base_value_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&base_value),
+        &candidates,
+        1000,
+    );
+    assert_success_counts(base_value_result, &base_value, 0, 1);
+}
+
+#[test]
 fn java_graph_strategy_counts_anonymous_class_and_super_method_usages() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

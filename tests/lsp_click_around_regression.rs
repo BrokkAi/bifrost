@@ -67,6 +67,129 @@ fn milestone_0_harness_smoke_definition_references_and_null() {
 }
 
 #[test]
+fn declaration_and_definition_navigation_contracts() {
+    let fixture = ClickFixture::new("declaration_definition_navigation")
+        .file(
+            "Runner.java",
+            r#"interface Runner { void <java_interface>run(); }
+class LocalRunner implements Runner { public void run() {} }
+class App { void invoke(Runner runner) { runner.<java_call>run(); } }
+"#,
+        )
+        .file(
+            "service.h",
+            "namespace ns { class Service { public: void <cpp_declaration>run(); }; }\n",
+        )
+        .file(
+            "service.cpp",
+            "#include \"service.h\"\nnamespace ns { void Service::<cpp_definition>run() {} }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.<cpp_call>run(); }\n",
+        )
+        .file(
+            "same_file.cpp",
+            "void <cpp_same_declaration>local();\nvoid <cpp_same_definition>local() {}\nvoid invoke_local() { <cpp_same_call>local(); }\n",
+        )
+        .file("duplicate.h", "void duplicate();\n")
+        .file(
+            "duplicate_a.cpp",
+            "#include \"duplicate.h\"\nvoid <cpp_duplicate_a>duplicate() {}\n",
+        )
+        .file(
+            "duplicate_b.cpp",
+            "#include \"duplicate.h\"\nvoid <cpp_duplicate_b>duplicate() {}\n",
+        )
+        .file(
+            "duplicate_app.cpp",
+            "#include \"duplicate.h\"\nvoid invoke_duplicate() { <cpp_duplicate_call>duplicate(); }\n",
+        )
+        .file(
+            "lib.rs",
+            r#"trait RustRunner { type <rust_trait>Output; }
+struct LocalRustRunner;
+impl RustRunner for LocalRustRunner { type <rust_impl>Output = String; }
+type Selected = <LocalRustRunner as RustRunner>::<rust_qualified>Output;
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "java declaration uses interface contract",
+                "java_call",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["java_interface"]),
+            ),
+            ClickCase::new(
+                "cpp declaration uses header prototype",
+                "cpp_call",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["cpp_declaration"]),
+            ),
+            ClickCase::new(
+                "cpp definition uses source body",
+                "cpp_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_definition"]),
+            ),
+            ClickCase::new(
+                "cpp same-file declaration uses prototype range",
+                "cpp_same_call",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["cpp_same_declaration"]),
+            ),
+            ClickCase::new(
+                "cpp same-file definition uses body range",
+                "cpp_same_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_same_definition"]),
+            ),
+            ClickCase::new(
+                "cpp same-file prototype navigates to body",
+                "cpp_same_declaration",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_same_definition"]),
+            ),
+            ClickCase::new(
+                "cpp prototype is not its own definition",
+                "cpp_declaration",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "cpp ambiguous definitions return every body",
+                "cpp_duplicate_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_duplicate_a", "cpp_duplicate_b"]),
+            ),
+            ClickCase::new(
+                "rust impl associated type declaration uses trait",
+                "rust_impl",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["rust_trait"]),
+            ),
+            ClickCase::new(
+                "rust impl associated type definition stays on itself",
+                "rust_impl",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["rust_impl"]),
+            ),
+            ClickCase::new(
+                "rust qualified associated type definition uses concrete impl",
+                "rust_qualified",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["rust_impl"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("declaration_definition_navigation", &timings, 11);
+}
+
+#[test]
 fn milestone_1_go_embedded_promotion_click_around() {
     let fixture = ClickFixture::new("milestone_1_go_embedded_promotion")
         .file("go.mod", "module example.com/app\n")
@@ -692,10 +815,10 @@ object AmbiguousImports:
                 ClickExpectation::Empty,
             ),
             ClickCase::new(
-                "conflicting inherited trait members return empty definition",
+                "conflicting inherited trait members return all definitions",
                 "ambiguous_id_call",
                 ClickOperation::Definition,
-                ClickExpectation::Empty,
+                ClickExpectation::Locations(&["primary_id_decl", "secondary_id_decl"]),
             ),
             ClickCase::new(
                 "trait default method resolves through inherited receiver",
@@ -1256,25 +1379,25 @@ void run() {
                 "derived receiver resolves to out-of-line method",
                 "derived_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["derived_tick_decl", "derived_tick_def"]),
+                ClickExpectation::Locations(&["derived_tick_def"]),
             ),
             ClickCase::new(
                 "base receiver resolves to base out-of-line method",
                 "base_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["base_tick_decl", "base_tick_def"]),
+                ClickExpectation::Locations(&["base_tick_def"]),
             ),
             ClickCase::new(
                 "base pointer receiver resolves to base method",
                 "base_ptr_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["base_tick_decl", "base_tick_def"]),
+                ClickExpectation::Locations(&["base_tick_def"]),
             ),
             ClickCase::new(
                 "unrelated same-name method resolves to unrelated owner",
                 "other_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["other_tick_decl", "other_tick_def"]),
+                ClickExpectation::Locations(&["other_tick_def"]),
             ),
             ClickCase::new(
                 "derived field shadows base field for derived receiver",
@@ -1304,13 +1427,13 @@ void run() {
                 "factory call resolves to out-of-line free function",
                 "make_derived_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["make_derived_decl", "make_derived_def"]),
+                ClickExpectation::Locations(&["make_derived_def"]),
             ),
             ClickCase::new(
                 "typed factory result receiver resolves to derived method",
                 "made_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["derived_tick_decl", "derived_tick_def"]),
+                ClickExpectation::Locations(&["derived_tick_def"]),
             ),
             ClickCase::new(
                 "free function declaration references call site",
@@ -2031,7 +2154,7 @@ end
 }
 
 #[test]
-#[ignore = "stress"]
+#[ignore = "stress: generated 24-layer Go embedding navigation; run explicitly with cargo test --test lsp_click_around_regression -- --ignored"]
 fn stress_milestone_12_go_embedded_promotion_click_around() {
     let mut service = String::from(
         r#"package service
@@ -2101,7 +2224,7 @@ func use() {
 }
 
 #[test]
-#[ignore = "stress"]
+#[ignore = "stress: generated 16-type Rust trait-implementation navigation; run explicitly with cargo test --test lsp_click_around_regression -- --ignored"]
 fn stress_milestone_12_rust_trait_impl_click_around() {
     let mut service = String::from("use crate::contracts::Worker;\n\n");
     let mut client_imports = Vec::new();

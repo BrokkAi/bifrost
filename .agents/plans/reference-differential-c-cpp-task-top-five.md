@@ -39,9 +39,12 @@ The observable result is ten accepted repository records selected by exact desce
 - [x] (2026-07-21 06:20Z) Published the six-family C++ fix stack in clean master head `d4a02d76`, rebuilt its release runner, and completed five fresh task-selected records. All 78 adjudicated product witnesses cleared; 51 raw residual rows remained for exact review.
 - [x] (2026-07-21 06:35Z) Exact-reran all 51 clean-head residuals. The sampled ESPHome return-type coordinate exposed a seventh legitimate family: public inverse lookup omitted all seven guarded `LwIPSocketImpl` self-type references after an earlier include defined the shared guard. Created #1010 and verified it is open and assigned only to `jbellis` before implementation.
 - [x] (2026-07-21 06:45Z) Delegated and root-reviewed #1010's structured same-file guard-stability fix. Its InlineTestProject reduction proves targeted and public inverse parity for seven self-type roles and retains a post-declaration `#undef` negative; 142 C++ graph tests, formatting, diff checks, isolated all-target/all-feature Clippy, and the complete serialized feature-enabled suite all pass.
-- [ ] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
-- [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C++ root cause not owned by somebody else; rebuild and rerun the complete C++ set after any fix.
-- [ ] Publish compact manifests and summaries, comment on and close every assigned issue proven fixed, run the final local gates, and verify the clean local head, `origin/master`, and remote master agree.
+- [x] (2026-07-21 07:20Z) Published #1010 in clean master head `a328a673`, rebuilt the release runner, and completed the final five-repository C++ corpus. All records are complete at pinned clean heads with fingerprint `66cb273e`; the run sampled 22,269 sites with zero file or candidate-limit errors.
+- [x] (2026-07-21 08:10Z) Exact-reran all 50 final raw rows with ephemeral caches. The residual set exactly equals the preceding 51-row clean audit minus the fixed `LwIPSocketImpl` coordinate: one ESPHome declaration-sampler artifact, 45 qpid batch-parity artifacts retained by targeted APIs, and four Circl Go/Plan 9 assembly parser artifacts.
+- [x] (2026-07-21 08:35Z) Posted final-head evidence and closed assigned issues #925 through #932 (with #928 already closed), #940, #1000 through #1005, and #1010 as completed.
+- [x] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
+- [x] File/assign, implement, review, test, publish, and exact-prove every legitimate C++ root cause not owned by somebody else; rebuild and rerun the complete C++ set after any fix.
+- [x] Publish compact manifests and summaries, comment on and close every assigned issue proven fixed, run the final local gates, and verify the clean local head, `origin/master`, and remote master agree.
 
 ## Surprises & Discoveries
 
@@ -155,7 +158,9 @@ The observable result is ten accepted repository records selected by exact desce
 
 ## Outcomes & Retrospective
 
-The C milestone is complete. The literal selector contract produced five accepted clean records, including the honest zero-file BitcoinAddressFinder result; a separately labeled `aws__s2n-tls` run supplied the fifth substantive C audit. Across those substantive records, 50,000 sampled sites yielded 7,913 consistent, two soundly unproven, 42,085 inconclusive, and zero missing or actionable residuals. #996 fixed the operational macro-cursor contention found during the campaign, and #997 fixed all eight declaration-name forward errors. #996, #997, and the previously fixed C issues #924 and #928 are closed with clean production evidence. C++ remains outstanding.
+Both language milestones are complete. The C selector contract produced five accepted clean records, including the honest zero-file BitcoinAddressFinder result; a separately labeled `aws__s2n-tls` run supplied the fifth substantive C audit. Across those substantive records, 50,000 sampled sites yielded 7,913 consistent, two soundly unproven, 42,085 inconclusive, and zero missing or actionable residuals. #996 fixed macro-cursor contention and #997 fixed all eight declaration-name forward errors.
+
+The C++ selector contract produced five accepted clean records, including the honest zero-file `ljharb__qs` result. The final `a328a673` corpus sampled 22,269 sites: 3,989 consistent, 107 editor-only, 339 unproven, 17,784 inconclusive, and 50 exhaustively audited non-product missing rows. The task-ranked C++ baseline exposed seven legitimate families fixed through #940 and #1000 through #1005; its complete rerun exposed and then cleared #1010. All 78 baseline product witnesses and seven #1010 self-type roles pass exact production proof. Final formatting, isolated all-target/all-feature Clippy, focused C++ suites, and the complete serialized feature-enabled suite passed. All fixes and evidence documents are on `origin/master`, and every assigned campaign issue proven fixed is closed with evidence.
 
 ## Context and Orientation
 

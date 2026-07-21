@@ -231,6 +231,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         "typeDefinitionProvider should be advertised while the handler is supported: {initialize}"
     );
     assert_eq!(
+        initialize["result"]["capabilities"]["declarationProvider"], true,
+        "declarationProvider should be advertised while the handler is supported: {initialize}"
+    );
+    assert_eq!(
         initialize["result"]["capabilities"]["implementationProvider"], true,
         "implementationProvider should be advertised while the handler is supported: {initialize}"
     );
@@ -5744,6 +5748,60 @@ fn bifrost_lsp_server_broad_endpoints_ignore_scala_ambiguous_wildcard_import_typ
             "Scala ambiguous wildcard import type must not produce {endpoint} result, got {response}"
         );
     }
+}
+
+#[test]
+fn bifrost_lsp_server_broad_endpoints_fail_closed_on_ambiguous_csharp_attribute() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::create_dir(root.join("System")).expect("create System directory");
+    fs::write(
+        root.join("System/Attribute.cs"),
+        "namespace System { public class Attribute { } }\n",
+    )
+    .expect("write attribute base");
+    let caller = r#"namespace Demo {
+    public class Marker : System.Attribute { }
+    public class MarkerAttribute : System.Attribute { }
+
+    [Marker]
+    public sealed class Consumer { }
+}
+"#;
+    let caller_path = root.join("Consumer.cs");
+    fs::write(&caller_path, caller).expect("write C# fixture");
+
+    let mut server = LspServer::start(&root);
+    let file_uri = uri_for(&caller_path);
+    let (line, character) = position_after(caller, "    [");
+    for endpoint in [
+        BroadEndpoint::Hover,
+        BroadEndpoint::References,
+        BroadEndpoint::DocumentHighlight,
+    ] {
+        let response = endpoint_response(&mut server, &file_uri, endpoint, line, character);
+        let no_result = response["result"].is_null()
+            || response["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty());
+        assert!(
+            no_result,
+            "ambiguous attribute shorthand must not produce broad {} output: {response}",
+            endpoint.label()
+        );
+    }
+
+    let definition = server.text_document_position_response(
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        definition["result"].as_array().map(Vec::len),
+        Some(2),
+        "explicit definition navigation should retain attribute ambiguity: {definition}"
+    );
 }
 
 #[test]

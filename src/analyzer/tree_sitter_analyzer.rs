@@ -809,8 +809,18 @@ pub struct ParsedFile {
     pub scala_traits: HashSet<CodeUnit>,
     pub type_aliases: HashSet<CodeUnit>,
     pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
+    /// Physical declaration occurrences retained only for request-time navigation.
+    ///
+    /// Unlike `ranges`, this collection is not persisted or exposed through
+    /// `IAnalyzer`: broad consumers continue to observe the preferred semantic
+    /// declaration range, while explicit navigation may distinguish prototypes
+    /// and bodies that share one `CodeUnit` identity.
+    pub(crate) navigation_ranges: HashMap<CodeUnit, Vec<Range>>,
+    pub(crate) navigation_ranges_truncated: HashSet<CodeUnit>,
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
 }
+
+const MAX_NAVIGATION_RANGES_PER_CODE_UNIT: usize = 257;
 
 #[derive(Debug, Clone)]
 struct DeclarationIdentity(CodeUnit);
@@ -884,6 +894,8 @@ impl ParsedFile {
             scala_traits: HashSet::default(),
             type_aliases: HashSet::default(),
             ranges: HashMap::default(),
+            navigation_ranges: HashMap::default(),
+            navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
         }
     }
@@ -906,6 +918,7 @@ impl ParsedFile {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
+        self.record_navigation_range(code_unit.clone(), range);
         let inserted = self.insert_declaration(code_unit.clone());
 
         if inserted && parent.is_none() {
@@ -1010,6 +1023,18 @@ impl ParsedFile {
     ) {
         self.remove_code_unit(&code_unit);
         self.add_code_unit_with_range(code_unit, range, parent, top_level);
+    }
+
+    pub(crate) fn record_navigation_range(&mut self, code_unit: CodeUnit, range: Range) {
+        let ranges = self.navigation_ranges.entry(code_unit.clone()).or_default();
+        if ranges.contains(&range) {
+            return;
+        }
+        if ranges.len() < MAX_NAVIGATION_RANGES_PER_CODE_UNIT {
+            ranges.push(range);
+        } else {
+            self.navigation_ranges_truncated.insert(code_unit);
+        }
     }
 
     pub(crate) fn declarations(&self) -> &HashSet<CodeUnit> {

@@ -17,6 +17,7 @@ from .models import (
     CodeQualityReport,
     FileSummariesResult,
     DefinitionByReferenceLookupResult,
+    DeclarationLookupResult,
     DefinitionLookupResult,
     FindFilenamesResult,
     FindFilesContainingResult,
@@ -314,6 +315,16 @@ class SearchToolsClient:
             {"references": references},
         )
         return [DefinitionLookupResult.from_dict(item) for item in result["results"]]
+
+    def get_declarations_by_location(
+        self,
+        references: list[dict[str, Any]],
+    ) -> list[DeclarationLookupResult]:
+        result = self._call_tool(
+            "get_declarations_by_location",
+            {"references": references},
+        )
+        return [DeclarationLookupResult.from_dict(item) for item in result["results"]]
 
     def get_definitions_by_reference(
         self,

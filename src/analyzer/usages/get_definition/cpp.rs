@@ -1,4 +1,9 @@
 use super::*;
+use crate::analyzer::LanguageAdapter;
+use crate::analyzer::cpp::CppAdapter;
+use crate::analyzer::declaration_range::{
+    code_unit_declaration_name_range_for_range, node_for_exact_range,
+};
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_parameter_type_text,
@@ -6,6 +11,235 @@ use crate::analyzer::usages::cpp_call_match::{
 };
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CppNavigationKind {
+    DeclarationOnly,
+    Definition,
+    Both,
+    Unknown,
+}
+
+pub(super) struct CppNavigationIndex {
+    ranges: HashMap<CodeUnit, Vec<Range>>,
+    truncated: HashSet<CodeUnit>,
+}
+
+impl CppNavigationIndex {
+    pub(super) fn build(file: &ProjectFile, source: &str, tree: &Tree) -> Self {
+        let parsed = CppAdapter.parse_file(file, source, tree);
+        Self {
+            ranges: parsed.navigation_ranges,
+            truncated: parsed.navigation_ranges_truncated,
+        }
+    }
+
+    fn ranges(&self, candidate: &CodeUnit) -> &[Range] {
+        self.ranges.get(candidate).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn is_truncated(&self, candidate: &CodeUnit) -> bool {
+        self.truncated.contains(candidate)
+    }
+}
+
+pub(super) fn declaration_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<CodeUnit> {
+    let tree = parse_cpp_tree(source)?;
+    let index = CppNavigationIndex::build(file, source, &tree);
+    index
+        .ranges
+        .iter()
+        .flat_map(|(candidate, ranges)| {
+            ranges.iter().filter_map(|range| {
+                let name_range = code_unit_declaration_name_range_for_range(
+                    source,
+                    tree.root_node(),
+                    candidate,
+                    *range,
+                )?;
+                (offset >= name_range.start_byte && offset < name_range.end_byte).then_some((
+                    name_range.end_byte.saturating_sub(name_range.start_byte),
+                    candidate.clone(),
+                ))
+            })
+        })
+        .min_by_key(|(length, candidate)| (*length, candidate.clone()))
+        .map(|(_, candidate)| candidate)
+}
+
+pub(super) struct CppNavigationSelection {
+    pub(super) targets: Vec<NavigationTarget>,
+    pub(super) structure_unavailable: bool,
+    pub(super) unproven_link_unit: bool,
+    pub(super) truncated: bool,
+}
+
+pub(super) fn select_navigation_targets(
+    context: &mut DefinitionBatchContext<'_>,
+    candidates: &[CodeUnit],
+    operation: NavigationOperation,
+) -> CppNavigationSelection {
+    let mut classified = Vec::new();
+    let mut structure_unavailable = false;
+    let mut source_ranges_truncated = false;
+    for candidate in candidates {
+        let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
+            if operation == NavigationOperation::Declaration {
+                classified.push((candidate.clone(), None, CppNavigationKind::Unknown));
+            }
+            structure_unavailable = true;
+            continue;
+        };
+        let root = tree.root_node();
+        let Some(index) = context.cpp_navigation_index(candidate.source()) else {
+            if operation == NavigationOperation::Declaration {
+                classified.push((candidate.clone(), None, CppNavigationKind::Unknown));
+            }
+            structure_unavailable = true;
+            continue;
+        };
+        let ranges = index.ranges(candidate);
+        source_ranges_truncated |= index.is_truncated(candidate);
+        if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
+            classified.push((candidate.clone(), None, CppNavigationKind::Both));
+            continue;
+        }
+        classified.extend(ranges.iter().copied().map(|range| {
+            let kind = cpp_navigation_kind_for_range(root, candidate, &range);
+            (candidate.clone(), Some(range), kind)
+        }));
+    }
+    let has_declaration_only = classified
+        .iter()
+        .any(|(_, _, kind)| *kind == CppNavigationKind::DeclarationOnly);
+    let mut selected: Vec<_> = classified
+        .into_iter()
+        .filter(|(_, _, kind)| match operation {
+            NavigationOperation::Declaration => {
+                if has_declaration_only {
+                    *kind == CppNavigationKind::DeclarationOnly
+                } else {
+                    true
+                }
+            }
+            NavigationOperation::Definition => matches!(
+                *kind,
+                CppNavigationKind::Definition | CppNavigationKind::Both
+            ),
+        })
+        .collect();
+    selected.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    selected.dedup();
+    let unproven_link_unit = operation == NavigationOperation::Definition
+        && selected
+            .iter()
+            .filter(|(_, _, kind)| *kind == CppNavigationKind::Definition)
+            .count()
+            > 1
+        && selected
+            .iter()
+            .filter(|(_, _, kind)| *kind == CppNavigationKind::Definition)
+            .map(|(candidate, _, _)| {
+                (
+                    definition_symbol_key(candidate),
+                    candidate.signature().map(str::to_owned),
+                )
+            })
+            .collect::<HashSet<_>>()
+            .len()
+            == 1;
+    let truncated = source_ranges_truncated || selected.len() > context.navigation_target_limit;
+    selected.truncate(context.navigation_target_limit);
+    CppNavigationSelection {
+        targets: selected
+            .into_iter()
+            .map(|(code_unit, declaration_range, _)| NavigationTarget {
+                code_unit,
+                declaration_range,
+            })
+            .collect(),
+        structure_unavailable,
+        unproven_link_unit,
+        truncated,
+    }
+}
+
+fn cpp_navigation_kind_for_range(
+    root: Node<'_>,
+    candidate: &CodeUnit,
+    range: &Range,
+) -> CppNavigationKind {
+    if !candidate.is_callable() && !candidate.is_class() {
+        return CppNavigationKind::Both;
+    }
+    let Some(node) = cpp_declaration_node_for_range(root, range) else {
+        return CppNavigationKind::Unknown;
+    };
+    if candidate.is_callable() {
+        return if cpp_subtree_contains(node, |descendant| {
+            descendant.kind() == "function_definition"
+                && descendant.child_by_field_name("body").is_some()
+        }) {
+            CppNavigationKind::Definition
+        } else {
+            CppNavigationKind::DeclarationOnly
+        };
+    }
+    // Export macros between `class`/`struct` and the type name can make
+    // tree-sitter recover a complete class as a function-shaped node. The C++
+    // declaration parser only assigns such a range to a class after recovering
+    // its body structurally, so retain that body classification for explicit
+    // definition navigation.
+    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
+        return CppNavigationKind::Definition;
+    }
+    if !cpp_subtree_contains(node, |descendant| {
+        matches!(
+            descendant.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        )
+    }) {
+        return CppNavigationKind::Both;
+    }
+    if cpp_subtree_contains(node, |descendant| {
+        matches!(
+            descendant.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        ) && descendant.child_by_field_name("body").is_some()
+    }) {
+        CppNavigationKind::Definition
+    } else {
+        CppNavigationKind::DeclarationOnly
+    }
+}
+
+fn cpp_declaration_node_for_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+    node_for_exact_range(root, range).or_else(|| {
+        root.descendant_for_byte_range(range.start_byte, range.end_byte)
+            .and_then(|mut node| {
+                while node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+                    node = node.parent()?;
+                }
+                Some(node)
+            })
+    })
+}
+
+fn cpp_subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if predicate(candidate) {
+            return true;
+        }
+        let mut cursor = candidate.walk();
+        stack.extend(candidate.named_children(&mut cursor));
+    }
+    false
+}
 
 pub(super) fn resolve_cpp(
     analyzer: &dyn IAnalyzer,

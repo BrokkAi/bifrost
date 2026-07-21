@@ -193,6 +193,14 @@ claude plugin validate .
 - Update the VS Code extension's `bifrost.binaryVersion` and
   `bifrost.archiveSha256` entries to the same release, and update
   `plugins/bifrost-agent/bifrost-release.json` from the same release sidecars.
+- The release workflow then checks out `master`, verifies that its Cargo
+  version still matches the released tag, and persists the canonical plugin
+  metadata plus its generated Amp copy. A version mismatch intentionally fails
+  the release check before any metadata is committed; update or reconcile
+  `master` rather than publishing release metadata onto a different version.
+- The macOS release smoke downloads the published agent-plugin archive, starts
+  from an empty launcher cache, runs `prepare --json`, and requires the
+  packaged MCP server to advertise `search_symbols` through `tools/list`.
 - Confirm the release workflow uploads `bifrost-agent-<tag>.tar.gz` after
   preparing `plugins/bifrost-agent/bifrost-release.json`.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
