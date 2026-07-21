@@ -1,5 +1,5 @@
 {
-  "binaryVersion": "0.8.6",
+  "binaryVersion": "0.8.7",
   "archiveSha256": {
     "aarch64-pc-windows-msvc": "affc2f83cc2197ee366e96bc2db11edef2866a0f93ce415686625922f50ccefb",
     "aarch64-unknown-linux-gnu": "dbd0895107a4310195b44c987a722b9256738c303e2588c09296173de484cd67",
