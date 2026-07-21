@@ -273,6 +273,7 @@ struct RustOriginRoute {
 #[derive(Debug, Default)]
 struct RustPhysicalOwnerIndex {
     roots_by_file: HashMap<ProjectFile, HashSet<ProjectFile>>,
+    inferred_crates_by_file: HashMap<ProjectFile, String>,
 }
 
 impl RustPhysicalOwnerIndex {
@@ -340,16 +341,30 @@ impl RustPhysicalOwnerIndex {
                     .map(|child| (child, owner.clone())),
             );
         }
+        let rooted_crates: HashSet<_> = roots
+            .iter()
+            .filter_map(|root| physical_roots.get(root))
+            .map(|module| module.crate_root.clone())
+            .collect();
+        index.inferred_crates_by_file.extend(
+            physical_roots
+                .iter()
+                .filter(|(_, module)| !rooted_crates.contains(&module.crate_root))
+                .map(|(file, module)| (file.clone(), module.crate_root.clone())),
+        );
         index
     }
 
     fn intersects(&self, left: &ProjectFile, right: &ProjectFile) -> bool {
-        let Some(left) = self.roots_by_file.get(left) else {
-            return false;
-        };
-        self.roots_by_file
-            .get(right)
-            .is_some_and(|right| left.iter().any(|root| right.contains(root)))
+        self.roots_by_file.get(left).is_some_and(|left| {
+            self.roots_by_file
+                .get(right)
+                .is_some_and(|right| left.iter().any(|root| right.contains(root)))
+        }) || self.inferred_crates_by_file.get(left).is_some_and(|left| {
+            self.inferred_crates_by_file
+                .get(right)
+                .is_some_and(|right| left == right)
+        })
     }
 
     fn owned_by(&self, file: &ProjectFile, root: &ProjectFile) -> bool {
@@ -362,6 +377,7 @@ impl RustPhysicalOwnerIndex {
         self.roots_by_file
             .get(file)
             .is_some_and(|roots| !roots.is_empty())
+            || self.inferred_crates_by_file.contains_key(file)
     }
 }
 
