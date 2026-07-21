@@ -1,22 +1,26 @@
 //! Oracle-free contract fuzzing of the MCP searchtools surface.
 //!
 //! This module implements the engine half of `bifrost_mcp_property_fuzzer`:
-//! given an in-process analyzer (and, in later milestones, the service layer),
-//! it generates probes from the index Bifrost itself built and checks
-//! self-consistency invariants (I1..I5 in `.agents/plans/mcp_property_fuzzer.md`)
-//! that need no external ground truth. Every violation is recorded with a
-//! failure signature — `(invariant, language, tool, syntactic shape)` — so a
-//! corpus with thousands of instances of the same bug yields one ledger entry
-//! with an occurrence count, not thousands.
+//! given an in-process analyzer and (for the service invariants) an in-process
+//! `SearchToolsService`, it generates probes from the index Bifrost itself
+//! built and checks self-consistency invariants (I1..I5 in
+//! `.agents/plans/mcp_property_fuzzer.md`) that need no external ground truth.
+//! Every violation is recorded with a failure signature — `(invariant,
+//! language, tool, syntactic shape)` — so a corpus with thousands of instances
+//! of the same bug yields one ledger entry with an occurrence count, not
+//! thousands.
 //!
-//! M1 scope: I1 (range integrity) as a pure index walk. I1 has four parts:
-//! (a) a container symbol's ranges must contain the ranges of its indexed
-//! members; (b) the text at a symbol's primary range must contain the symbol's
-//! terminal name token; (c) `get_symbol_sources` must return text identical to
-//! the file content at the reported range; (d) a class declaration's range
-//! must not end immediately before a tree-sitter ERROR node. Parts (a), (b),
-//! and (d) need no tool calls and are implemented here; part (c) arrives with
-//! the service-layer wiring in M2.
+//! I1 (range integrity) is a pure index walk with four parts: (a) a container
+//! symbol's ranges must contain the ranges of its indexed members; (b) the
+//! text at a symbol's primary range must contain the symbol's terminal name
+//! token; (c) `get_symbol_sources` must return text identical to the file
+//! content at the reported range; (d) a class declaration's range must not end
+//! immediately before a tree-sitter ERROR node. Parts (a), (b), and (d) need
+//! no tool calls and live in this file; part (c) and I2..I5 (selector-form
+//! equivalence, cross-tool round-trips, diagnostic honesty, hint presence)
+//! live in [`service_probes`], which derives tool calls from the same sampled
+//! symbols and executes them through `SearchToolsService` exactly as the MCP
+//! handler would.
 //!
 //! Part (a) is restricted to the containment claims the index actually makes:
 //! modules are excluded (packages legitimately span files), and class parents
@@ -40,11 +44,14 @@
 //! runs over fresh clones — and any `--cache-mode ephemeral` run — are always
 //! cold, so the check is fully live there.
 
-use crate::analyzer::common::display_identifier_for_target;
+pub mod service_probes;
+
+use crate::analyzer::common::{display_identifier_for_target, display_symbol_for_target};
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, ParseError, ParseErrorKind, Range};
 use serde::{Deserialize, Serialize};
+pub use service_probes::ProbeSummary;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The contract invariants the fuzzer can check. Parsing accepts all five so
 /// the CLI surface is stable; the engine rejects any that are not implemented
@@ -111,6 +118,18 @@ pub struct FuzzerConfig {
     pub corpus_language: String,
     pub invariants: Vec<InvariantKind>,
     pub max_symbols: usize,
+    /// Cap on sampled symbols that receive service-layer (tool-call) probes;
+    /// smaller than `max_symbols` because tool calls cost more than index
+    /// walks. The service sample is a prefix of the index sample, so the two
+    /// nest consistently.
+    pub max_service_symbols: usize,
+    /// Cap on `scan_usages_by_reference` probes, which are the most expensive
+    /// service calls. Scanned symbols are a prefix of the service sample.
+    pub max_scan_probes: usize,
+    /// Optional substring filter restricting service probes to symbols whose
+    /// fq name contains it (used by acceptance runs and `--rerun`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub symbol_filter: Option<String>,
     pub seed: u64,
 }
 
@@ -187,6 +206,11 @@ pub struct I1Summary {
     /// (Rust `impl` blocks, Go receiver methods, out-of-line C++ definitions).
     pub skipped_containment_not_claimed: usize,
     pub skipped_non_ident_name: usize,
+    /// Module units skipped by the name-token check: a module's name comes
+    /// from its file (`index.mjs` → terminal `mjs`), not from a token in the
+    /// source text, so the expectation never applies — the same class of
+    /// naming convention as the auxiliary-constructor skip.
+    pub skipped_module_name: usize,
     pub skipped_no_source_text: usize,
     /// Callable units whose name-token check was skipped because they index as
     /// auxiliary constructors of their parent class (same display identifier).
@@ -202,6 +226,10 @@ pub struct I1Summary {
 pub struct FuzzerReport {
     pub config: FuzzerConfig,
     pub i1_summary: I1Summary,
+    /// Probe execution counters; present whenever at least one service-driven
+    /// invariant (I2..I5) was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_summary: Option<ProbeSummary>,
     pub violations: Vec<Violation>,
 }
 
@@ -234,14 +262,23 @@ pub struct I1File {
 pub struct SymbolFacts {
     pub fq_name: String,
     pub identifier: String,
+    /// Display-normalized fq name (what search results render, e.g. Scala's
+    /// trailing `$` stripped); the spelling agents actually type.
+    pub display_fq: String,
     pub kind: CodeUnitType,
     pub file_index: usize,
     pub ranges: Vec<Range>,
     pub child_indexes: Vec<usize>,
     /// Index of the enclosing declaration in `symbols`, when both were
-    /// selected and live in the same file. Used to recognize auxiliary
-    /// constructors (a callable carrying its parent class's identifier).
+    /// selected and live in the same file. Drives the I1(a) containment walk.
     pub parent_index: Option<usize>,
+    /// Auxiliary-constructor convention: a callable that carries the display
+    /// identifier of a class indexed in the same file (Scala `def this`,
+    /// Kotlin `constructor`). Computed at collection time from a pre-sampling
+    /// class census, so the flag never depends on whether the class survived
+    /// deterministic sampling. The class identifier legitimately never
+    /// appears in the constructor's range text, so I1(b) skips these.
+    pub aux_constructor: bool,
 }
 
 /// Everything I1 needs, detached from the analyzer.
@@ -271,9 +308,9 @@ const PARSE_ERROR_MIN_SPAN_BYTES: usize = 8;
 /// enough to keep the ledger readable.
 const EVIDENCE_EXCERPT_BYTES: usize = 240;
 
-/// Run all requested invariants over a detached I1 input. Later milestones
-/// route tool-driven invariants through the service layer instead of this
-/// entry point; for M1 only I1 is implemented.
+/// Analyzer-only entry point: runs I1, the only invariant family computable
+/// without tool calls. Service-driven invariants (I1c, I2..I5) require
+/// [`run_invariants_with_service`].
 pub fn run_invariants(
     analyzer: &dyn IAnalyzer,
     config: &FuzzerConfig,
@@ -281,22 +318,76 @@ pub fn run_invariants(
     for invariant in &config.invariants {
         if *invariant != InvariantKind::I1 {
             return Err(format!(
-                "invariant {} is not implemented yet (M1 implements I1 only)",
+                "invariant {} needs the service layer; use run_invariants_with_service",
                 invariant.code()
             ));
         }
     }
     let mut i1_summary = I1Summary::default();
     let input = collect_i1_input(analyzer, config.max_symbols, config.seed, &mut i1_summary);
-    let mut violations = check_i1(&input, &config.corpus_language, &mut i1_summary);
-    violations.sort_by(|left, right| {
-        left.signature
-            .cmp(&right.signature)
-            .then_with(|| left.symbol.cmp(&right.symbol))
-    });
+    let violations = check_i1(&input, &config.corpus_language, &mut i1_summary);
     Ok(FuzzerReport {
         config: config.clone(),
         i1_summary,
+        probe_summary: None,
+        violations,
+    })
+}
+
+/// Full entry point. I1 always runs first: its violations are reported only
+/// when I1 was requested, but its invalid-symbol set always excludes
+/// range-invalid symbols from downstream probes, because probes derive
+/// contexts and expectations from those ranges (the plan's "I1 is a
+/// prerequisite" rule). I2..I5 then run through the service layer, which must
+/// serve the same workspace the analyzer indexes.
+pub fn run_invariants_with_service(
+    service: &crate::searchtools_service::SearchToolsService,
+    analyzer: &dyn IAnalyzer,
+    config: &FuzzerConfig,
+    probe_dump: Option<&std::path::Path>,
+) -> Result<FuzzerReport, String> {
+    let mut i1_summary = I1Summary::default();
+    let input = collect_i1_input(analyzer, config.max_symbols, config.seed, &mut i1_summary);
+    let mut i1_sink = ViolationSink::default();
+    let mut invalid = HashSet::new();
+    check_i1_ex(
+        &input,
+        &config.corpus_language,
+        &mut i1_summary,
+        &mut i1_sink,
+        Some(&mut invalid),
+    );
+    let mut violations = if config.invariants.contains(&InvariantKind::I1) {
+        i1_sink.into_sorted_vec()
+    } else {
+        Vec::new()
+    };
+    let mut probe_summary = None;
+    if config
+        .invariants
+        .iter()
+        .any(|kind| *kind != InvariantKind::I1)
+    {
+        let mut summary = ProbeSummary::default();
+        violations.extend(service_probes::run_service_invariants(
+            service,
+            &input,
+            &invalid,
+            config,
+            &mut summary,
+            probe_dump,
+        )?);
+        violations.sort_by(|left, right| {
+            left.signature
+                .cmp(&right.signature)
+                .then_with(|| left.symbol.cmp(&right.symbol))
+        });
+        probe_summary = Some(summary);
+    }
+    Ok(FuzzerReport {
+        config: config.clone(),
+        i1_summary,
+        probe_summary,
         violations,
     })
 }
@@ -313,8 +404,18 @@ pub fn collect_i1_input(
     summary: &mut I1Summary,
 ) -> I1Input {
     let mut selected: Vec<CodeUnit> = Vec::new();
+    // Pre-sampling census of every indexed class's display identifier per
+    // file: the auxiliary-constructor convention (a callable carrying its
+    // class's name) must be detectable regardless of what sampling keeps.
+    let mut class_names_by_path: HashMap<String, HashSet<String>> = HashMap::new();
     for unit in analyzer.all_declarations() {
         summary.declarations_total += 1;
+        if unit.kind() == CodeUnitType::Class {
+            class_names_by_path
+                .entry(rel_path(&unit))
+                .or_default()
+                .insert(display_identifier_for_target(&unit));
+        }
         if unit.is_synthetic() {
             summary.skipped_synthetic += 1;
             continue;
@@ -336,6 +437,11 @@ pub fn collect_i1_input(
 
     for unit in &selected {
         let path = rel_path(unit);
+        let identifier = display_identifier_for_target(unit);
+        let aux_constructor = unit.kind().is_callable_kind()
+            && class_names_by_path
+                .get(&path)
+                .is_some_and(|names| names.contains(&identifier));
         let file_index = *file_indexes.entry(path.clone()).or_insert_with(|| {
             let parse_errors = analyzer.parse_errors(unit.source());
             if parse_errors.is_none() {
@@ -355,12 +461,14 @@ pub fn collect_i1_input(
         facts_by_unit.insert(unit.clone(), input.symbols.len());
         input.symbols.push(SymbolFacts {
             fq_name: unit.fq_name(),
-            identifier: display_identifier_for_target(unit),
+            identifier,
+            display_fq: display_symbol_for_target(unit),
             kind: unit.kind(),
             file_index,
             ranges,
             child_indexes: Vec::new(),
             parent_index: None,
+            aux_constructor,
         });
     }
 
@@ -384,13 +492,17 @@ pub fn collect_i1_input(
     input
 }
 
-/// The pure I1 checker. Violations are deduplicated by failure signature:
-/// the first exemplar supplies the evidence, later instances increment
-/// `occurrences` and append their symbol to `exemplars` (capped).
-pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec<Violation> {
-    let mut by_signature: HashMap<String, Violation> = HashMap::new();
-    let mut record = |violation: Violation| {
-        by_signature
+/// Dedupes violations by failure signature: the first exemplar supplies the
+/// evidence, later instances increment `occurrences` and append their symbol
+/// to `exemplars` (capped at [`MAX_EXEMPLARS`]).
+#[derive(Debug, Default)]
+pub struct ViolationSink {
+    by_signature: HashMap<String, Violation>,
+}
+
+impl ViolationSink {
+    pub fn record(&mut self, violation: Violation) {
+        self.by_signature
             .entry(violation.signature.clone())
             .and_modify(|existing| {
                 existing.occurrences += 1;
@@ -401,9 +513,85 @@ pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec
                 }
             })
             .or_insert(violation);
-    };
+    }
 
-    for symbol in input.symbols.iter() {
+    pub fn into_sorted_vec(self) -> Vec<Violation> {
+        let mut violations: Vec<Violation> = self.by_signature.into_values().collect();
+        violations.sort_by(|left, right| {
+            left.signature
+                .cmp(&right.signature)
+                .then_with(|| left.symbol.cmp(&right.symbol))
+        });
+        violations
+    }
+}
+
+/// Build one violation with its dedup signature. `tool` is the MCP tool whose
+/// contract broke, or `index` for violations visible from the index alone.
+#[allow(clippy::too_many_arguments)]
+pub fn violation(
+    invariant: InvariantKind,
+    language: &str,
+    tool: &str,
+    shape: &str,
+    symbol: &str,
+    path: &str,
+    arguments: Option<serde_json::Value>,
+    evidence: serde_json::Value,
+) -> Violation {
+    Violation {
+        signature: format!("({}, {language}, {tool}, {shape})", invariant.code()),
+        invariant: invariant.code().to_string(),
+        tool: tool.to_string(),
+        shape: shape.to_string(),
+        language: language.to_string(),
+        symbol: symbol.to_string(),
+        path: path.to_string(),
+        arguments,
+        evidence,
+        exemplars: vec![symbol.to_string()],
+        occurrences: 1,
+    }
+}
+
+fn i1_violation(
+    language: &str,
+    shape: &str,
+    symbol: &str,
+    path: &str,
+    evidence: serde_json::Value,
+) -> Violation {
+    violation(
+        InvariantKind::I1,
+        language,
+        "index",
+        shape,
+        symbol,
+        path,
+        None,
+        evidence,
+    )
+}
+
+/// The pure I1 checker, without invalid-symbol tracking.
+pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec<Violation> {
+    let mut sink = ViolationSink::default();
+    check_i1_ex(input, language, summary, &mut sink, None);
+    sink.into_sorted_vec()
+}
+
+/// The full I1 checker. Every symbol cited by a violation (as parent, child,
+/// or self) is added to `invalid` when provided, so service-layer probes can
+/// exclude range-invalid symbols whose ranges would poison derived inputs
+/// (the plan's "I1 is a prerequisite" rule).
+pub fn check_i1_ex(
+    input: &I1Input,
+    language: &str,
+    summary: &mut I1Summary,
+    sink: &mut ViolationSink,
+    mut invalid: Option<&mut HashSet<usize>>,
+) {
+    for (symbol_index, symbol) in input.symbols.iter().enumerate() {
         if symbol.ranges.is_empty() {
             continue;
         }
@@ -422,7 +610,7 @@ pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec
                         && child_primary.end_byte <= parent_range.end_byte
                 });
                 if !contained {
-                    record(i1_violation(
+                    sink.record(i1_violation(
                         language,
                         SHAPE_CONTAINER_RANGE_MISSES_MEMBER,
                         &child.fq_name,
@@ -441,16 +629,27 @@ pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec
                             "expected": "some parent range contains the child's primary range",
                         }),
                     ));
+                    if let Some(invalid) = invalid.as_deref_mut() {
+                        invalid.insert(symbol_index);
+                        invalid.insert(child_index);
+                    }
                 }
             }
         } else {
             summary.skipped_containment_not_claimed += 1;
         }
 
-        if symbol.kind == CodeUnitType::Class {
-            check_parse_error_boundary(symbol, file, language, summary, &mut record);
+        if symbol.kind == CodeUnitType::Class
+            && check_parse_error_boundary(symbol, file, language, summary, sink)
+            && let Some(invalid) = invalid.as_deref_mut()
+        {
+            invalid.insert(symbol_index);
         }
 
+        if symbol.kind == CodeUnitType::Module {
+            summary.skipped_module_name += 1;
+            continue;
+        }
         if !is_ident_like(&symbol.identifier) {
             summary.skipped_non_ident_name += 1;
             continue;
@@ -461,7 +660,7 @@ pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec
         };
         let primary = primary_range(&symbol.ranges).expect("ranges checked non-empty above");
         let Some(fragment) = text.get(primary.start_byte..primary.end_byte) else {
-            record(i1_violation(
+            sink.record(i1_violation(
                 language,
                 SHAPE_RANGE_OUTSIDE_SOURCE,
                 &symbol.fq_name,
@@ -473,15 +672,18 @@ pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec
                     "expected": "primary range lies on UTF-8 boundaries inside the indexed source",
                 }),
             ));
+            if let Some(invalid) = invalid.as_deref_mut() {
+                invalid.insert(symbol_index);
+            }
             continue;
         };
-        if is_auxiliary_constructor(symbol, &input.symbols) {
+        if symbol.aux_constructor {
             summary.skipped_constructor_name += 1;
             continue;
         }
         summary.name_token_checks += 1;
         if !fragment.contains(&symbol.identifier) {
-            record(i1_violation(
+            sink.record(i1_violation(
                 language,
                 SHAPE_RANGE_NAME_TOKEN_ABSENT,
                 &symbol.fq_name,
@@ -494,30 +696,31 @@ pub fn check_i1(input: &I1Input, language: &str, summary: &mut I1Summary) -> Vec
                     "expected": "text at the primary range contains the terminal name token",
                 }),
             ));
+            if let Some(invalid) = invalid.as_deref_mut() {
+                invalid.insert(symbol_index);
+            }
         }
     }
-
-    by_signature.into_values().collect()
 }
 
 /// I1(d): a class declaration whose last byte sits immediately before a
 /// tree-sitter ERROR node was truncated by the parser; error recovery then
 /// swallowed the rest of the construct, so its members vanished from the
 /// index with no index-side trace. Containment cannot see this — there are
-/// no indexed children left to check.
+/// no indexed children left to check. Returns true when a violation fired.
 fn check_parse_error_boundary(
     symbol: &SymbolFacts,
     file: &I1File,
     language: &str,
     summary: &mut I1Summary,
-    record: &mut impl FnMut(Violation),
-) {
+    sink: &mut ViolationSink,
+) -> bool {
     let Some(errors) = file.parse_errors.as_deref() else {
-        return; // Warm-cache file; counted at collection time.
+        return false; // Warm-cache file; counted at collection time.
     };
     summary.parse_error_boundary_checks += 1;
     let Some(declaration_end) = symbol.ranges.iter().map(|range| range.end_byte).max() else {
-        return;
+        return false;
     };
     for error in errors {
         if error.kind != ParseErrorKind::Error {
@@ -534,7 +737,7 @@ fn check_parse_error_boundary(
         if span <= PARSE_ERROR_MIN_SPAN_BYTES {
             continue;
         }
-        record(i1_violation(
+        sink.record(i1_violation(
             language,
             SHAPE_DECLARATION_TRUNCATED_AT_PARSE_ERROR,
             &symbol.fq_name,
@@ -548,46 +751,9 @@ fn check_parse_error_boundary(
                 "expected": "no tree-sitter ERROR node immediately after the class declaration's end; adjacency means the parser truncated the declaration and its members vanished from the index",
             }),
         ));
-        return; // One violation per class is enough.
+        return true; // One violation per class is enough.
     }
-}
-
-/// Auxiliary constructors index under the class name by CodeUnit convention
-/// (Scala `def this`, Kotlin `constructor`), so the class identifier
-/// legitimately never appears in the constructor's range text. Detected
-/// structurally: a callable whose indexed parent is a class with the same
-/// display identifier.
-fn is_auxiliary_constructor(symbol: &SymbolFacts, symbols: &[SymbolFacts]) -> bool {
-    if !symbol.kind.is_callable_kind() {
-        return false;
-    }
-    let Some(parent_index) = symbol.parent_index else {
-        return false;
-    };
-    let parent = &symbols[parent_index];
-    parent.kind == CodeUnitType::Class && parent.identifier == symbol.identifier
-}
-
-fn i1_violation(
-    language: &str,
-    shape: &str,
-    symbol: &str,
-    path: &str,
-    evidence: serde_json::Value,
-) -> Violation {
-    Violation {
-        signature: format!("(I1, {language}, index, {shape})"),
-        invariant: "I1".to_string(),
-        tool: "index".to_string(),
-        shape: shape.to_string(),
-        language: language.to_string(),
-        symbol: symbol.to_string(),
-        path: path.to_string(),
-        arguments: None,
-        evidence,
-        exemplars: vec![symbol.to_string()],
-        occurrences: 1,
-    }
+    false
 }
 
 /// Whether I1(a) containment applies to a parent of `kind` in `language`.
@@ -612,7 +778,7 @@ fn is_container_kind(kind: CodeUnitType) -> bool {
     kind == CodeUnitType::Class || kind.is_callable_kind()
 }
 
-fn primary_range(ranges: &[Range]) -> Option<Range> {
+pub(crate) fn primary_range(ranges: &[Range]) -> Option<Range> {
     ranges
         .iter()
         .min_by_key(|range| (range.start_line, range.start_byte))
@@ -626,7 +792,7 @@ fn ser_ranges(ranges: &[Range]) -> Vec<SerRange> {
 /// I1(b) only applies to identifier-shaped names. Constructors (`<init>`),
 /// operators, and other symbolic names legitimately need not appear verbatim
 /// at the declaration range.
-fn is_ident_like(identifier: &str) -> bool {
+pub(crate) fn is_ident_like(identifier: &str) -> bool {
     let mut chars = identifier.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -635,7 +801,7 @@ fn is_ident_like(identifier: &str) -> bool {
         && chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '~'))
 }
 
-fn excerpt(text: &str) -> String {
+pub(crate) fn excerpt(text: &str) -> String {
     if text.len() <= EVIDENCE_EXCERPT_BYTES {
         return text.to_string();
     }

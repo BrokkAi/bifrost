@@ -7,14 +7,19 @@
 //!       --clones-root /path/to/clones --repo owner__name \
 //!       --invariants I1 --out ledger.jsonl
 //!
-//! M1 scope: `--repo` selection (repeatable), I1 index walk, JSONL ledger with
-//! FIRD-style resume. Corpus-wide selection, concurrency, shrinking, and
-//! `--rerun` arrive in M3.
+//! Current scope: `--repo` selection (repeatable), I1 as an index walk plus
+//! I1(c)/I2–I5 through an in-process `SearchToolsService` (both render modes),
+//! JSONL ledger with FIRD-style resume. Corpus-wide selection, concurrency,
+//! shrinking, and `--rerun` arrive in M3.
 
-use brokk_bifrost::mcp_property_fuzzer::{
-    FuzzerConfig, FuzzerReport, InvariantKind, run_invariants,
+use brokk_bifrost::mcp_property_fuzzer::service_probes::{
+    DEFAULT_MAX_SCAN_PROBES, DEFAULT_MAX_SERVICE_SYMBOLS,
 };
-use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use brokk_bifrost::mcp_property_fuzzer::{
+    FuzzerConfig, FuzzerReport, InvariantKind, run_invariants_with_service,
+};
+use brokk_bifrost::searchtools_service::SearchToolsService;
+use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project};
 use git2::{Repository, StatusOptions};
 use serde::Serialize;
 use serde_json::Value;
@@ -100,6 +105,10 @@ struct FuzzerArgs {
     languages: Vec<String>,
     invariants: Vec<InvariantKind>,
     max_symbols: usize,
+    max_service_symbols: usize,
+    max_scan_probes: usize,
+    symbol_filter: Option<String>,
+    dump_probes: Option<PathBuf>,
     seed: u64,
     parallelism: usize,
     cache_mode: CacheMode,
@@ -116,6 +125,10 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
     let mut languages = Vec::new();
     let mut invariants = None;
     let mut max_symbols = DEFAULT_MAX_SYMBOLS;
+    let mut max_service_symbols = DEFAULT_MAX_SERVICE_SYMBOLS;
+    let mut max_scan_probes = DEFAULT_MAX_SCAN_PROBES;
+    let mut symbol_filter = None;
+    let mut dump_probes = None;
     let mut seed = 0_u64;
     let mut parallelism = DEFAULT_PARALLELISM;
     let mut cache_mode = CacheMode::Persisted;
@@ -156,6 +169,23 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
             "--max-symbols" => {
                 max_symbols = take_positive_usize(args, &mut index, "--max-symbols")?
             }
+            "--max-service-symbols" => {
+                max_service_symbols =
+                    take_positive_usize(args, &mut index, "--max-service-symbols")?
+            }
+            "--max-scan-probes" => {
+                max_scan_probes = take_positive_usize(args, &mut index, "--max-scan-probes")?
+            }
+            "--symbol-filter" => {
+                symbol_filter = Some(take_value(args, &mut index, "--symbol-filter")?)
+            }
+            "--dump-probes" => {
+                dump_probes = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    "--dump-probes",
+                )?))
+            }
             "--seed" => {
                 let value = take_value(args, &mut index, "--seed")?;
                 seed = value
@@ -188,8 +218,20 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
         out: out.unwrap_or_default(),
         repos,
         languages,
-        invariants: invariants.unwrap_or_else(|| vec![InvariantKind::I1]),
+        invariants: invariants.unwrap_or_else(|| {
+            vec![
+                InvariantKind::I1,
+                InvariantKind::I2,
+                InvariantKind::I3,
+                InvariantKind::I4,
+                InvariantKind::I5,
+            ]
+        }),
         max_symbols,
+        max_service_symbols,
+        max_scan_probes,
+        symbol_filter,
+        dump_probes,
         seed,
         parallelism,
         cache_mode,
@@ -403,6 +445,9 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             corpus_language: repo.language.clone(),
             invariants: args.invariants.clone(),
             max_symbols: args.max_symbols,
+            max_service_symbols: args.max_service_symbols,
+            max_scan_probes: args.max_scan_probes,
+            symbol_filter: args.symbol_filter.clone(),
             seed: args.seed,
         };
         let fingerprint = run_fingerprint(&config)?;
@@ -433,7 +478,28 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             repo.root.display()
         );
         let started = Instant::now();
-        let result = run_engine(&repo.root, &config, args.parallelism, args.cache_mode);
+        // With several repos selected the dump path is suffixed per slug so
+        // later repos never overwrite earlier ones.
+        let dump_path = args.dump_probes.as_ref().map(|path| {
+            if total > 1 {
+                path.with_file_name(format!(
+                    "{}.{}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "probes.jsonl".to_string()),
+                    repo.slug
+                ))
+            } else {
+                path.clone()
+            }
+        });
+        let result = run_engine(
+            &repo.root,
+            &config,
+            args.parallelism,
+            args.cache_mode,
+            dump_path.as_deref(),
+        );
         let record = RepositoryRecord {
             schema_version: SCHEMA_VERSION,
             record_type: "repository",
@@ -493,6 +559,7 @@ fn run_engine(
     config: &FuzzerConfig,
     parallelism: usize,
     cache_mode: CacheMode,
+    probe_dump: Option<&Path>,
 ) -> Result<FuzzerReport, String> {
     let started = Instant::now();
     eprintln!(
@@ -507,21 +574,32 @@ fn run_engine(
         parallelism: Some(parallelism),
         ..AnalyzerConfig::default()
     };
-    let workspace = match cache_mode {
-        CacheMode::Persisted => WorkspaceAnalyzer::build_persisted(project, analyzer_config)
-            .map_err(|error| format!("failed to build persisted analyzer: {error}"))?,
-        CacheMode::Ephemeral => WorkspaceAnalyzer::build(project, analyzer_config),
-    };
+    let service = match cache_mode {
+        CacheMode::Persisted => {
+            SearchToolsService::new_manual_persisted_for_project(project, analyzer_config)
+        }
+        CacheMode::Ephemeral => {
+            SearchToolsService::new_manual_ephemeral_for_project(project, analyzer_config)
+        }
+    }
+    .map_err(|error| format!("failed to build searchtools service: {error}"))?;
     eprintln!(
         "progress phase=workspace status=completed repo={} elapsed={:.1}s",
         config.corpus_language,
         started.elapsed().as_secs_f64()
     );
-    let report = run_invariants(workspace.analyzer(), config)?;
+    let workspace = service.analyzer_snapshot()?;
+    let report = run_invariants_with_service(&service, workspace.analyzer(), config, probe_dump)?;
+    let probe_calls = report
+        .probe_summary
+        .as_ref()
+        .map(|summary| summary.calls_executed)
+        .unwrap_or(0);
     eprintln!(
-        "progress phase=i1 status=completed repo={} symbols={} violations={} elapsed={:.1}s",
+        "progress phase=checks status=completed repo={} symbols={} probe_calls={} violations={} elapsed={:.1}s",
         config.corpus_language,
         report.i1_summary.symbols_selected,
+        probe_calls,
         report.violations.len(),
         started.elapsed().as_secs_f64()
     );
@@ -674,11 +752,23 @@ fn print_help() {
     println!("  --repo SLUG            Corpus clone to audit; repeatable");
     println!("  --language LANG        Corpus language filter/inference hint; repeatable");
     println!(
-        "  --invariants LIST      Comma-separated invariants to check (default: I1; M1 implements I1 only)"
+        "  --invariants LIST      Comma-separated invariants to check (default: I1,I2,I3,I4,I5)"
     );
     println!("  --out PATH             JSONL ledger to append repository records to");
     println!(
         "  --max-symbols N        Deterministically sampled symbols per repository (default: {DEFAULT_MAX_SYMBOLS})"
+    );
+    println!(
+        "  --max-service-symbols N  Sampled symbols receiving tool-call probes (default: {DEFAULT_MAX_SERVICE_SYMBOLS})"
+    );
+    println!(
+        "  --max-scan-probes N    scan_usages_by_reference probes per repository (default: {DEFAULT_MAX_SCAN_PROBES})"
+    );
+    println!(
+        "  --symbol-filter TEXT   Restrict service probes to symbols whose fq name contains TEXT"
+    );
+    println!(
+        "  --dump-probes PATH     Write every executed probe (arguments + outcomes) as JSONL for triage"
     );
     println!("  --seed N               Deterministic sampling seed (default: 0)");
     println!(

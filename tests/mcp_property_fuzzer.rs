@@ -39,11 +39,13 @@ fn facts(
     SymbolFacts {
         fq_name: fq_name.to_string(),
         identifier: identifier.to_string(),
+        display_fq: fq_name.to_string(),
         kind,
         file_index: 0,
         ranges,
         child_indexes,
         parent_index: None,
+        aux_constructor: false,
     }
 }
 
@@ -232,6 +234,34 @@ fn i1_skips_non_identifier_names() {
 }
 
 #[test]
+fn i1_skips_module_name_token_check() {
+    // A module unit's name comes from its file (`index.mjs` → terminal `mjs`),
+    // not from a token in the source, so the name-token expectation never
+    // applies (observed on vuejs/core: 102 false occurrences, one signature).
+    let text = "export * from '@vue/compiler-sfc'\n\nimport './register-ts.js'\n".to_string();
+    let module_range = range(&text, "export", None);
+    let input = I1Input {
+        files: vec![I1File {
+            path: "packages/vue/compiler-sfc/index.mjs".to_string(),
+            text: Some(text),
+            parse_errors: Some(vec![]),
+        }],
+        symbols: vec![facts(
+            "index.mjs",
+            "mjs",
+            CodeUnitType::Module,
+            vec![module_range],
+            vec![],
+        )],
+    };
+    let mut summary = Default::default();
+    let violations = check_i1(&input, "ts", &mut summary);
+    assert!(violations.is_empty(), "{violations:?}");
+    assert_eq!(summary.skipped_module_name, 1);
+    assert_eq!(summary.name_token_checks, 0);
+}
+
+#[test]
 fn i1_deduplicates_by_signature_with_occurrence_count() {
     let text = "class A @Inject()\n\n  def m: Int = 1\n\n  def n: Int = 2\n".to_string();
     let class_range = range(&text, "class A", Some("@Inject()"));
@@ -260,6 +290,9 @@ fn fuzzer_config(language: &str) -> FuzzerConfig {
         corpus_language: language.to_string(),
         invariants: vec![InvariantKind::I1],
         max_symbols: 5_000,
+        max_service_symbols: 1_000,
+        max_scan_probes: 100,
+        symbol_filter: None,
         seed: 0,
     }
 }
@@ -396,14 +429,15 @@ class JobSrv @Inject() (
 "#;
 
 #[test]
-fn unimplemented_invariants_are_rejected_for_now() {
+fn service_invariants_are_rejected_by_engine_only_entry() {
     let project = InlineTestProject::new()
         .file("src/A.scala", "class A {\n  def m: Int = 1\n}\n")
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let mut config = fuzzer_config("scala");
     config.invariants = vec![InvariantKind::I2];
-    let error = run_invariants(workspace.analyzer(), &config).expect_err("I2 not implemented");
+    let error = run_invariants(workspace.analyzer(), &config)
+        .expect_err("I2 needs the service-phase entry point");
     assert!(error.contains("I2"), "{error}");
 }
 
@@ -507,45 +541,23 @@ fn i1_silent_when_parse_error_is_unrelated_to_class() {
 #[test]
 fn i1_skips_auxiliary_constructor_name_token() {
     // Scala's `def this` indexes under the class name by convention; the
-    // class identifier never appears in the constructor text.
+    // class identifier never appears in the constructor text. Collection
+    // flags the convention from a pre-sampling class census (so the flag
+    // never depends on the parent surviving sampling); the pure checker
+    // simply honors the flag.
     let text = "class A {\n  def this() = this(1)\n}\n".to_string();
-    let class_range = range(&text, "class A", None);
     let ctor_range = range(&text, "def this", Some("this(1)"));
     let mut ctor = facts("A.A", "A", CodeUnitType::Function, vec![ctor_range], vec![]);
-    ctor.parent_index = Some(0);
-    let input = I1Input {
-        files: vec![I1File {
-            path: "A.scala".to_string(),
-            text: Some(text.clone()),
-            parse_errors: Some(vec![]),
-        }],
-        symbols: vec![
-            facts("A", "A", CodeUnitType::Class, vec![class_range], vec![1]),
-            ctor,
-        ],
-    };
-    assert!(check(&input).is_empty());
-
-    // Without the indexed parent link there is no constructor evidence, and
-    // the missing token is reported as before.
-    let orphan = facts("A.A", "A", CodeUnitType::Function, vec![ctor_range], vec![]);
+    ctor.aux_constructor = true;
     let input = I1Input {
         files: vec![I1File {
             path: "A.scala".to_string(),
             text: Some(text),
             parse_errors: Some(vec![]),
         }],
-        symbols: vec![
-            facts("A", "A", CodeUnitType::Class, vec![class_range], vec![]),
-            orphan,
-        ],
+        symbols: vec![ctor],
     };
-    let violations = check(&input);
-    assert_eq!(violations.len(), 1, "{violations:?}");
-    assert_eq!(
-        violations[0].signature,
-        "(I1, scala, index, range-name-token-absent)"
-    );
+    assert!(check(&input).is_empty());
 }
 
 #[test]

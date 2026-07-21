@@ -419,6 +419,76 @@ impl SearchToolsService {
         })
     }
 
+    /// Construct a manual, non-semantic service over `project` with an
+    /// ephemeral (non-persisted) analyzer cache and a caller-supplied analyzer
+    /// config. One-shot audit drivers (the MCP property fuzzer) use this:
+    /// nothing is written into the target checkout, and because every file is
+    /// parsed fresh, session-only evidence such as tree-sitter ERROR nodes
+    /// (`IAnalyzer::parse_errors`) is available for the whole workspace.
+    pub fn new_manual_ephemeral_for_project(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, String> {
+        Self::new_manual_with_cache(project, config, false)
+    }
+
+    /// Persisted-cache sibling of [`Self::new_manual_ephemeral_for_project`]
+    /// for warmed, resumable campaigns. Session-only evidence (tree-sitter
+    /// ERROR nodes) is unavailable for files served from the warm cache.
+    pub fn new_manual_persisted_for_project(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, String> {
+        Self::new_manual_with_cache(project, config, true)
+    }
+
+    fn new_manual_with_cache(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        persisted: bool,
+    ) -> Result<Self, String> {
+        let root = project.root().to_path_buf();
+        let watcher_starter = production_watcher_starter();
+        let workspace = if persisted {
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config)
+                .map_err(|error| format!("Failed to build persisted workspace: {error}"))?
+        } else {
+            WorkspaceAnalyzer::build(Arc::clone(&project), config)
+        };
+        let session = assemble_session(
+            project,
+            workspace,
+            UpdateStrategy::Manual,
+            false,
+            &watcher_starter,
+            None,
+        )?;
+        Ok(Self {
+            root: RwLock::new(Some(root)),
+            session: RwLock::new(Some(session)),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::Manual,
+            semantic_indexing: false,
+            watcher_starter,
+        })
+    }
+
+    /// Clone the active session's workspace analyzer for read-only use.
+    /// In-process drivers that derive their inputs from the same index the
+    /// service serves (the MCP property fuzzer's probe generator) use this
+    /// instead of building a second analyzer over the same root.
+    pub fn analyzer_snapshot(&self) -> Result<Arc<WorkspaceAnalyzer>, String> {
+        let session = self
+            .session
+            .read()
+            .map_err(|_| "workspace session lock poisoned".to_string())?;
+        session
+            .as_ref()
+            .map(|session| Arc::clone(&session.snapshot))
+            .ok_or_else(|| "no active workspace session".to_string())
+    }
+
     /// Construct with no file watcher and no semantic indexer: the caller drives
     /// updates via the incremental `update_paths` tool. For batch consumers that
     /// re-use one session across many revisions of one worktree.

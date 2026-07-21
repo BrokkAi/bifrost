@@ -149,36 +149,6 @@ fn invalid_invariant_is_rejected() {
 }
 
 #[test]
-fn unimplemented_invariant_is_rejected_cleanly() {
-    let fixture = ClonesFixture::new();
-    fixture.add_rust_repo("tiny__rust");
-    let out = fixture.run(&[
-        "--repo",
-        "tiny__rust",
-        "--language",
-        "rust",
-        "--invariants",
-        "I2",
-        "--force",
-        "--cache-mode",
-        "ephemeral",
-    ]);
-    assert!(
-        out.status.success(),
-        "I2 should record an engine error, not crash: stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let ledger_text = fs::read_to_string(&fixture.ledger).expect("read ledger");
-    let record: serde_json::Value =
-        serde_json::from_str(ledger_text.lines().next().expect("one record")).expect("parse");
-    assert_eq!(record["status"], "engine_error", "{record}");
-    assert!(
-        record["message"].as_str().expect("message").contains("I2"),
-        "{record}"
-    );
-}
-
-#[test]
 fn missing_repo_flag_is_rejected() {
     let out = Command::new(env!("CARGO_BIN_EXE_bifrost_mcp_property_fuzzer"))
         .args(["--clones-root", ".", "--out", "/tmp/unused-fuzzer.jsonl"])
