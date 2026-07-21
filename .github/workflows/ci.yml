@@ -55,6 +55,20 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Test release scripts
+        run: node --test scripts/check-release-version.test.mjs
+
   # This cross-platform launcher smoke is integration-like. Run it after master
   # updates; release packaging repeats the focused launcher tests before upload.
   agent-plugin:

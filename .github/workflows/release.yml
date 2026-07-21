@@ -400,15 +400,7 @@ jobs:
           node-version: 22
 
       - name: Confirm master is the released version
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
-        run: |
-          cargo_version="$(node -e 'const fs = require("node:fs"); const match = fs.readFileSync("Cargo.toml", "utf8").match(/^version\\s*=\\s*"([^"]+)"$/m); if (!match) process.exit(1); process.stdout.write(match[1]);')"
-          if [ "$cargo_version" != "$RELEASE_VERSION" ]; then
-            echo "Refusing to sync release metadata for $RELEASE_VERSION onto master at Cargo version $cargo_version." >&2
-            exit 1
-          fi
+        run: node scripts/check-release-version.mjs "${{ steps.tag.outputs.version }}"
 
       - name: Download release artifacts
         uses: actions/download-artifact@v7
