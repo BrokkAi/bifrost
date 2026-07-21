@@ -4,6 +4,7 @@
 //! its candidate procedures. Control-flow stitching consumes this facade; it
 //! does not reach into the usage-graph dispatch resolver directly.
 
+mod heap;
 mod value_flow;
 
 use std::fmt;

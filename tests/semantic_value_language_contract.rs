@@ -2,13 +2,17 @@ mod common;
 
 use brokk_bifrost::AnalyzerConfig;
 use brokk_bifrost::analyzer::semantic::{
-    AllocationKind, ArgumentDomain, CallArgumentExpansion, CallBinding, CallBindings,
-    CancellationToken, CandidateCoverage, CaptureMode, CaptureSource, DispatchCandidate,
-    DispatchOracle, FormalMultiplicity, MemoryAccessKind, MemoryLocationKind, OracleCallContext,
-    OracleContractError, OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle,
-    ProcedurePortKind, ProcedureSemantics, SemanticBudget, SemanticEffect, SemanticOutcome,
-    SemanticRequest, SemanticValueKind, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
-    ValueFlowRelationKind, ValueFlowSnapshot, WorkspaceSemanticOracle,
+    AbstractObjectIdentity, AccessPath, AccessPathAtPoint, AccessPathRoot, AccessPathTail,
+    AccessSelector, AliasQuery, AliasRelation, AllocationKind, ArgumentDomain,
+    CallArgumentExpansion, CallBinding, CallBindings, CancellationToken, CandidateCoverage,
+    CaptureMode, CaptureSource, DispatchCandidate, DispatchOracle, FormalMultiplicity, HeapOracle,
+    IndexSelector, MemoryAccessKind, MemoryLocationKind, MemoryStoreHandle, ObjectCardinality,
+    ObservationPhase, OracleCallContext, OracleContractError, OracleLimits, ProcedureHandle,
+    ProcedureKind, ProcedurePortHandle, ProcedurePortKind, ProcedureSemantics,
+    ScopedSemanticLocator, SemanticBudget, SemanticEffect, SemanticOutcome, SemanticRequest,
+    SemanticValueKind, StoreAtPoint, UpdateEligibility, ValueAtPoint, ValueFlowEndpoint,
+    ValueFlowKind, ValueFlowOracle, ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason,
+    WorkspaceSemanticOracle,
 };
 
 use common::{InlineTestProject, semantic_graph::SemanticGraph};
@@ -956,6 +960,611 @@ fn assert_open_default_bindings(
     );
 }
 
+fn assert_heap_oracle(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+) {
+    let oracle = analyzer.semantic_oracle_provider();
+    let cancellation = CancellationToken::default();
+    let factory = procedure_handle_named(graph, "factory", ProcedureKind::Method);
+    let allocation = factory
+        .semantics()
+        .allocations()
+        .first()
+        .expect("factory must publish its allocation");
+    let allocation_point = factory.point_handle(allocation.point).unwrap();
+    let allocation_value = factory.value_handle(allocation.result).unwrap();
+    let value_query = ValueAtPoint::new(
+        allocation_value.clone(),
+        allocation_point.clone(),
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let points_to = oracle
+        .pointees(
+            &value_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("allocation points-to query should materialize");
+    let objects = available(&points_to).objects();
+    assert_eq!(objects.candidates().len(), 1);
+    assert!(matches!(
+        objects.candidates()[0].value().identity(),
+        AbstractObjectIdentity::Allocation(handle) if handle.id() == allocation.id
+    ));
+    assert_eq!(
+        objects.candidates()[0].value().cardinality(),
+        ObjectCardinality::Unknown,
+        "an acyclic allocation-site identity is not by itself a runtime singleton"
+    );
+    assert_eq!(budget.used(), points_to.work());
+
+    let path = AccessPath::exact(
+        AccessPathRoot::Value(allocation_value),
+        Vec::new(),
+        OracleLimits::default(),
+    )
+    .unwrap();
+    let access = AccessPathAtPoint::new(
+        path,
+        allocation_point,
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let locations = oracle
+        .locations(
+            &access,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("allocation location query should materialize");
+    assert!(matches!(
+        available(&locations).locations().candidates()[0]
+            .value()
+            .path()
+            .root(),
+        AccessPathRoot::Allocation(_)
+    ));
+
+    let before_allocation = AccessPathAtPoint::new(
+        AccessPath::exact(
+            AccessPathRoot::Allocation(factory.allocation_handle(allocation.id).unwrap()),
+            Vec::new(),
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        factory.point_handle(allocation.point).unwrap(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let before_locations = oracle
+        .locations(
+            &before_allocation,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("pre-allocation location query should remain explicit");
+    assert!(matches!(before_locations, SemanticOutcome::Unknown { .. }));
+    assert!(
+        available(&before_locations)
+            .locations()
+            .candidates()
+            .is_empty()
+    );
+
+    let query = AliasQuery::new(access.clone(), access).unwrap();
+    let mut budget = SemanticBudget::default();
+    let alias = oracle
+        .alias(
+            &query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("reflexive alias query should materialize");
+    assert_eq!(
+        *available(&alias).answer().value(),
+        AliasRelation::MustAlias
+    );
+
+    let loop_method = procedure_handle_named(graph, "looping", ProcedureKind::Method);
+    let loop_allocation = loop_method
+        .semantics()
+        .allocations()
+        .first()
+        .expect("loop fixture must publish an allocation");
+    let loop_query = ValueAtPoint::new(
+        loop_method.value_handle(loop_allocation.result).unwrap(),
+        loop_method.point_handle(loop_allocation.point).unwrap(),
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let loop_points_to = oracle
+        .pointees(
+            &loop_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("loop allocation points-to query should materialize");
+    assert_eq!(
+        available(&loop_points_to).objects().candidates()[0]
+            .value()
+            .cardinality(),
+        ObjectCardinality::Summary,
+        "one allocation handle in a CFG cycle must summarize repeated runtime objects"
+    );
+
+    let recursive = procedure_handle_named(graph, "recursive", ProcedureKind::Method);
+    let recursive_allocation = recursive.semantics().allocations().first().unwrap();
+    let recursive_call = recursive
+        .semantics()
+        .call_sites()
+        .iter()
+        .find(|call| {
+            mapped_source(recursive.semantics(), source, call.source).contains("recursive")
+        })
+        .and_then(|call| recursive.call_site_handle(call.id))
+        .expect("recursive fixture must retain its self-call context");
+    let recursive_query = ValueAtPoint::new(
+        recursive.value_handle(recursive_allocation.result).unwrap(),
+        recursive.point_handle(recursive_allocation.point).unwrap(),
+        ObservationPhase::AfterEffects,
+        OracleCallContext::bounded(vec![recursive_call], OracleLimits::default()),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let recursive_points_to = oracle
+        .pointees(
+            &recursive_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("recursive allocation points-to query should materialize");
+    assert_eq!(
+        available(&recursive_points_to).objects().candidates()[0]
+            .value()
+            .cardinality(),
+        ObjectCardinality::Summary,
+        "a recursive call context must not treat one allocation handle as a singleton"
+    );
+
+    let branch = procedure_handle_named(graph, "branch", ProcedureKind::Method);
+    let (branch_point, branch_source) = branch
+        .semantics()
+        .points()
+        .iter()
+        .find_map(|point| {
+            point.events.iter().find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    ..
+                } => Some((point.id, source)),
+                _ => None,
+            })
+        })
+        .expect("branch fixture must publish its return transfer");
+    let branch_query = ValueAtPoint::new(
+        branch.value_handle(branch_source).unwrap(),
+        branch.point_handle(branch_point).unwrap(),
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let branch_points_to = oracle
+        .pointees(
+            &branch_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("branch join points-to query should materialize");
+    let branch_objects = available(&branch_points_to).objects();
+    assert_eq!(
+        branch_objects.candidates().len(),
+        2,
+        "both branch-reaching definitions must survive the point-sensitive join"
+    );
+    assert!(branch_objects.candidates().iter().any(|candidate| matches!(
+        candidate.value().identity(),
+        AbstractObjectIdentity::Allocation(_)
+    )));
+    assert!(branch_objects.candidates().iter().any(|candidate| matches!(
+        candidate.value().identity(),
+        AbstractObjectIdentity::ProcedurePort(_)
+    )));
+    let bounded = WorkspaceSemanticOracle::with_limits(analyzer, OracleLimits::uniform(1).unwrap());
+    let mut budget = SemanticBudget::default();
+    let bounded_branch = bounded
+        .pointees(
+            &branch_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("bounded branch query should retain a prefix");
+    assert_eq!(
+        available(&bounded_branch).objects().coverage(),
+        CandidateCoverage::Truncated
+    );
+    assert_eq!(available(&bounded_branch).objects().candidates().len(), 1);
+
+    let two = procedure_handle_named(graph, "two", ProcedureKind::Method);
+    let two_point = two
+        .semantics()
+        .points()
+        .last()
+        .expect("two-allocation fixture must have an exit point")
+        .id;
+    let allocations = two.semantics().allocations();
+    assert_eq!(allocations.len(), 2);
+    let at_exit = |allocation: &brokk_bifrost::analyzer::semantic::AllocationSite| {
+        AccessPathAtPoint::new(
+            AccessPath::exact(
+                AccessPathRoot::Value(two.value_handle(allocation.result).unwrap()),
+                Vec::new(),
+                OracleLimits::default(),
+            )
+            .unwrap(),
+            two.point_handle(two_point).unwrap(),
+            ObservationPhase::AfterEffects,
+            OracleCallContext::empty(),
+        )
+        .unwrap()
+    };
+    let disjoint_query =
+        AliasQuery::new(at_exit(&allocations[0]), at_exit(&allocations[1])).unwrap();
+    let mut budget = SemanticBudget::default();
+    let disjoint = oracle
+        .alias(
+            &disjoint_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("distinct allocation-site alias query should materialize");
+    assert_eq!(
+        *available(&disjoint).answer().value(),
+        AliasRelation::Disjoint
+    );
+    let bounded_alias_oracle =
+        WorkspaceSemanticOracle::with_limits(analyzer, OracleLimits::uniform(1).unwrap());
+    let mut budget = SemanticBudget::default();
+    assert!(matches!(
+        bounded_alias_oracle
+            .alias(
+                &disjoint_query,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("bounded alias query must return a typed partial"),
+        SemanticOutcome::Unproven { .. }
+    ));
+
+    let capture_parent = procedure_named(graph, "capture", ProcedureKind::Method);
+    let capture = capture_parent.captures().first().unwrap();
+    let capture_child = graph
+        .artifact()
+        .procedure_handle(capture.target)
+        .expect("capture child must have a scoped handle");
+    let capture_port = ProcedurePortHandle::capture(capture_child.clone(), capture.destination)
+        .expect("capture row must define a child slot");
+    let capture_point = capture_child
+        .point_handle(capture_child.semantics().entry_point())
+        .unwrap();
+    let capture_access = AccessPathAtPoint::new(
+        AccessPath::exact(
+            AccessPathRoot::CaptureSlot(capture_port),
+            Vec::new(),
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        capture_point,
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let capture_locations = oracle
+        .locations(
+            &capture_access,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("capture-slot location query should materialize");
+    assert!(matches!(
+        available(&capture_locations).locations().candidates()[0]
+            .value()
+            .object()
+            .identity(),
+        AbstractObjectIdentity::CaptureSlot(_)
+    ));
+
+    let field_reader = procedure_handle_named(graph, "readField", ProcedureKind::Method);
+    let (field_point, field_location) = field_reader
+        .semantics()
+        .points()
+        .iter()
+        .find_map(|point| {
+            point.events.iter().find_map(|event| match event.effect {
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    ..
+                } => Some((point.id, location)),
+                _ => None,
+            })
+        })
+        .expect("field reader must publish a structured field load");
+    let MemoryLocationKind::Field { base, ref member } = field_reader
+        .semantics()
+        .memory_location(field_location)
+        .unwrap()
+        .kind
+    else {
+        unreachable!("field load selected above")
+    };
+    let scoped_member = ScopedSemanticLocator::new(
+        std::sync::Arc::clone(field_reader.artifact()),
+        member.clone(),
+    )
+    .unwrap();
+    let field_access = AccessPathAtPoint::new(
+        AccessPath::exact(
+            AccessPathRoot::Value(field_reader.value_handle(base).unwrap()),
+            vec![AccessSelector::Field(scoped_member.clone())],
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        field_reader.point_handle(field_point).unwrap(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let field_locations = oracle
+        .locations(
+            &field_access,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("field location query should materialize");
+    let field_location = available(&field_locations).locations().candidates()[0].value();
+    assert!(matches!(
+        field_location.object().identity(),
+        AbstractObjectIdentity::ProcedurePort(_)
+    ));
+    assert!(matches!(
+        field_location.path().selectors(),
+        [AccessSelector::Field(_)]
+    ));
+    let static_access = AccessPathAtPoint::new(
+        AccessPath::exact(
+            AccessPathRoot::Static(scoped_member),
+            Vec::new(),
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        field_reader.point_handle(field_point).unwrap(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let static_locations = oracle
+        .locations(
+            &static_access,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("static-root location query should materialize");
+    assert!(matches!(
+        available(&static_locations).locations().candidates()[0]
+            .value()
+            .object()
+            .identity(),
+        AbstractObjectIdentity::Static(_)
+    ));
+    let field_writer = procedure_named(graph, "writeField", ProcedureKind::Method);
+    assert!(
+        field_writer
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .any(|event| matches!(
+                event.effect,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    ..
+                }
+            ))
+    );
+
+    let rewrite = procedure_handle_named(graph, "rewrite", ProcedureKind::Method);
+    let (store_point, store_index, location_id, stored_id) = rewrite
+        .semantics()
+        .points()
+        .iter()
+        .find_map(|point| {
+            point
+                .events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| match event.effect {
+                    SemanticEffect::MemoryStore {
+                        location, value, ..
+                    } => Some((point.id, index, location, value)),
+                    _ => None,
+                })
+        })
+        .expect("rewrite must publish its indexed store");
+    let location = rewrite.semantics().memory_location(location_id).unwrap();
+    let MemoryLocationKind::Index {
+        base,
+        index: Some(index),
+    } = location.kind
+    else {
+        panic!("rewrite store must retain its exact base and index")
+    };
+    let point = rewrite.point_handle(store_point).unwrap();
+    let base = ValueAtPoint::new(
+        rewrite.value_handle(base).unwrap(),
+        point.clone(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let target = AccessPathAtPoint::new(
+        AccessPath::exact(
+            AccessPathRoot::Value(base.value().clone()),
+            vec![AccessSelector::Index(IndexSelector::Exact(
+                rewrite.value_handle(index).unwrap(),
+            ))],
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        point.clone(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let stored = ValueAtPoint::new(
+        rewrite.value_handle(stored_id).unwrap(),
+        point.clone(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let store = StoreAtPoint::new(
+        MemoryStoreHandle::new(point.clone(), store_index).unwrap(),
+        target.clone(),
+        stored,
+        Some(base),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let eligibility = oracle
+        .update_eligibility(
+            &store,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("indexed store update query should materialize");
+    let UpdateEligibility::Weak(reasons) = available(&eligibility) else {
+        panic!("parameter-rooted indexed stores cannot justify a strong update")
+    };
+    assert!(
+        reasons.contains(&WeakUpdateReason::UnknownObjectCardinality)
+            || reasons.contains(&WeakUpdateReason::SummaryPath)
+            || reasons.contains(&WeakUpdateReason::EscapingObject)
+    );
+    let bounded_update_oracle =
+        WorkspaceSemanticOracle::with_limits(analyzer, OracleLimits::uniform(1).unwrap());
+    let mut budget = SemanticBudget::default();
+    assert!(matches!(
+        bounded_update_oracle
+            .update_eligibility(
+                &store,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("bounded update query must return typed weak reasons"),
+        SemanticOutcome::Unproven { .. }
+    ));
+
+    let wildcard = AccessPathAtPoint::new(
+        AccessPath::bounded(
+            target.path().root().clone(),
+            vec![AccessSelector::Index(IndexSelector::Any)],
+            AccessPathTail::Exact,
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        point,
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let wildcard_locations = oracle
+        .locations(
+            &wildcard,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("wildcard index location query should materialize");
+    assert!(
+        available(&wildcard_locations)
+            .locations()
+            .candidates()
+            .iter()
+            .all(|candidate| !candidate.value().path().is_exact()),
+        "wildcard selectors must preserve a summary path tail"
+    );
+    let deep = AccessPathAtPoint::new(
+        AccessPath::exact(
+            target.path().root().clone(),
+            vec![
+                AccessSelector::Index(IndexSelector::Exact(rewrite.value_handle(index).unwrap())),
+                AccessSelector::Index(IndexSelector::Exact(rewrite.value_handle(index).unwrap())),
+            ],
+            OracleLimits::default(),
+        )
+        .unwrap(),
+        target.point().clone(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let shallow_limits = OracleLimits::new(brokk_bifrost::analyzer::semantic::OracleLimitValues {
+        access_path_length: 1,
+        ..OracleLimits::default().values()
+    })
+    .unwrap();
+    let shallow = WorkspaceSemanticOracle::with_limits(analyzer, shallow_limits);
+    let mut budget = SemanticBudget::default();
+    let shallow_locations = shallow
+        .locations(&deep, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("depth-capped location query should materialize");
+    let shallow_path = available(&shallow_locations).locations().candidates()[0]
+        .value()
+        .path();
+    assert_eq!(shallow_path.selectors().len(), 1);
+    assert_eq!(shallow_path.tail(), AccessPathTail::Summary);
+
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut budget = SemanticBudget::default();
+    assert!(matches!(
+        oracle
+            .pointees(
+                &value_query,
+                &mut SemanticRequest::new(&mut budget, &cancelled),
+            )
+            .unwrap(),
+        SemanticOutcome::Cancelled {
+            partial: None,
+            work
+        } if work == Default::default()
+    ));
+
+    let mut budget = SemanticBudget::uniform(1).unwrap();
+    assert!(matches!(
+        oracle
+            .pointees(
+                &value_query,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap(),
+        SemanticOutcome::ExceededBudget {
+            partial: Some(_),
+            ..
+        }
+    ));
+
+    let branch = procedure_named(graph, "branch", ProcedureKind::Method);
+    assert!(
+        branch.allocations().iter().any(|allocation| mapped_source(
+            branch,
+            source,
+            allocation.source
+        )
+        .contains("new Box")),
+        "heap fixture must retain its branch allocation"
+    );
+}
+
 #[test]
 fn typescript_and_java_publish_expression_backed_call_and_return_facts() {
     const TYPESCRIPT: &str = r#"class Box {}
@@ -989,6 +1598,11 @@ class Sample {
     variadic(input: Box) { this.collect(input, input); }
     defaults(input: Box = new Box()) {}
     defaultCall() { this.defaults(); }
+    looping(flag: boolean) { while (flag) { new Box(); flag = false; } }
+    recursive(flag: boolean): Box { const made = new Box(); if (flag) return this.recursive(false); return made; }
+    two() { const first = new Box(); const second = new Box(); return first; }
+    readField(box: Box) { return box.value; }
+    writeField(box: Box, replacement: Box) { box.value = replacement; }
     static staticCall(input: Box) { consume(input); return input; }
 }
 function consume(input: Box) {}
@@ -1022,6 +1636,11 @@ class Sample {
     void collect(Object... values) {}
     void variadic(Object input) { this.collect(input, input); }
     static void consume(Object input) {}
+    void looping(boolean flag) { while (flag) { new Box(); flag = false; } }
+    Object recursive(boolean flag) { Object made = new Box(); if (flag) return this.recursive(false); return made; }
+    Object two() { Object first = new Box(); Object second = new Box(); return first; }
+    Object readField(Box box) { return box.value; }
+    void writeField(Box box, Object replacement) { box.value = replacement; }
     static Object staticCall(Object input) { consume(input); return input; }
 }
 "#;
@@ -1059,6 +1678,8 @@ class Sample {
     assert_variadic_and_static_receiver_bindings(&analyzer, &java, JAVA);
     assert_open_spread_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_open_default_bindings(&analyzer, &typescript, TYPESCRIPT);
+    assert_heap_oracle(&analyzer, &typescript, TYPESCRIPT);
+    assert_heap_oracle(&analyzer, &java, JAVA);
 
     for graph in [&typescript, &java] {
         let factory = procedure_named(graph, "factory", ProcedureKind::Method);

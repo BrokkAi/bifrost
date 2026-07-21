@@ -13,8 +13,8 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v2";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v3";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v3";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v4";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -193,6 +193,7 @@ fn js_ts_capabilities() -> SemanticCapabilities {
         SemanticCapability::Values,
         SemanticCapability::Assignments,
         SemanticCapability::Allocations,
+        SemanticCapability::FieldMemory,
         SemanticCapability::IndexMemory,
         SemanticCapability::LocalFlow,
         SemanticCapability::ParameterFlow,
@@ -1086,6 +1087,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             vec![right]
+        } else if left.kind() == "member_expression" {
+            let object = required_field(left, "object")?;
+            let property = required_field(left, "property")?;
+            let base =
+                self.expression_value(builder, object, terminal, expression_value_kind(object))?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field {
+                    base,
+                    member: self.memory_member_locator(property)?,
+                },
+            )?;
+            self.add_field_identity_gap(builder, terminal, location)?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            vec![object, right]
         } else if left.kind() == "subscript_expression" {
             let object = required_field(left, "object")?;
             let index = required_field(left, "index")?;
@@ -2183,6 +2208,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 access,
                 SemanticEffect::MemoryLoad {
                     kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+        } else {
+            let property = required_field(node, "property")?;
+            let base =
+                self.expression_value(builder, object, access, expression_value_kind(object))?;
+            let result =
+                self.expression_value(builder, node, access, expression_value_kind(node))?;
+            let location = self.session.add_memory_location(
+                builder,
+                access,
+                MemoryLocationKind::Field {
+                    base,
+                    member: self.memory_member_locator(property)?,
+                },
+            )?;
+            self.add_field_identity_gap(builder, access, location)?;
+            self.append_effect(
+                builder,
+                access,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
                     location,
                     result,
                 },
@@ -3616,6 +3665,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
         self.session
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn memory_member_locator(&self, node: Node<'tree>) -> Result<SemanticLocator, TsLoweringError> {
+        let procedure = self.session.locator();
+        let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
+        Ok(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        ))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), TsLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "field occurrence is structured, but its declaration identity is not yet resolved",
+        )?;
+        Ok(())
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, TsLoweringError> {

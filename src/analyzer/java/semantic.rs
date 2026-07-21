@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v2";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v3";
 
 impl ProgramSemanticsProvider for JavaAnalyzer {
     fn current_artifact_key(
@@ -157,6 +157,7 @@ fn java_capabilities() -> SemanticCapabilities {
         SemanticCapability::Values,
         SemanticCapability::Assignments,
         SemanticCapability::Allocations,
+        SemanticCapability::FieldMemory,
         SemanticCapability::IndexMemory,
         SemanticCapability::LocalFlow,
         SemanticCapability::ParameterFlow,
@@ -1035,6 +1036,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             vec![right]
+        } else if left.kind() == "field_access" {
+            let object = required_field(left, "object")?;
+            let field = required_field(left, "field")?;
+            let base =
+                self.expression_value(builder, object, terminal, expression_value_kind(object))?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field {
+                    base,
+                    member: self.memory_member_locator(field)?,
+                },
+            )?;
+            self.add_field_identity_gap(builder, terminal, location)?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            vec![object, right]
         } else if left.kind() == "array_access" {
             let array = required_field(left, "array")?;
             let index = required_field(left, "index")?;
@@ -1824,8 +1849,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "field_access" => {
                 self.implicit_exception_gap(builder, entry, node)?;
-                let children = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+                let object = required_field(node, "object")?;
+                let field = required_field(node, "field")?;
+                let access = self.point(builder, node, Vec::new())?;
+                let base =
+                    self.expression_value(builder, object, access, expression_value_kind(object))?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    access,
+                    MemoryLocationKind::Field {
+                        base,
+                        member: self.memory_member_locator(field)?,
+                    },
+                )?;
+                self.add_field_identity_gap(builder, access, location)?;
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Field,
+                        location,
+                        result,
+                    },
+                )?;
+                self.edge(builder, access, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[object],
+                    EdgeTarget::normal(access),
+                    scope,
+                    stack,
+                )
             }
             "array_access" => {
                 self.implicit_exception_gap(builder, entry, node)?;
@@ -3232,6 +3287,42 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let anchor = source_anchor(node, 0).map_err(JavaLoweringError::Invalid)?;
         self.session
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn memory_member_locator(
+        &self,
+        node: Node<'tree>,
+    ) -> Result<SemanticLocator, JavaLoweringError> {
+        let procedure = self.session.locator();
+        let anchor = source_anchor(node, 0).map_err(JavaLoweringError::Invalid)?;
+        Ok(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        ))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), JavaLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "field occurrence is structured, but its declaration identity is not yet resolved",
+        )?;
+        Ok(())
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, JavaLoweringError> {
