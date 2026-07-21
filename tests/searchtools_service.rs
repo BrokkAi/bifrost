@@ -5423,6 +5423,14 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
 fn scan_usages_location_batch_follows_chained_rust_type_reexports() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
+            "Cargo.toml",
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .file(
             "src/query/ir.rs",
             r#"pub struct CodeQueryPlan;
 pub struct LogicalQueryPlan;
@@ -5443,6 +5451,7 @@ pub use ir::{CodeQueryPlan, LogicalQueryPlan};
             "src/lib.rs",
             r#"pub mod query;
 pub mod structural;
+pub mod execution;
 "#,
         )
         .file(
@@ -5454,7 +5463,7 @@ pub fn execute(plan: &CodeQueryPlan, logical: &LogicalQueryPlan) {}
         )
         .file(
             "src/main.rs",
-            r#"use crate::structural::CodeQueryPlan;
+            r#"use demo::structural::CodeQueryPlan;
 
 fn plan_summary_text(plan: &CodeQueryPlan) {}
 "#,
