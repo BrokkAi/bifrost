@@ -527,6 +527,7 @@ fn parse_policy_color(value: &str) -> Result<PolicyColorMode, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_policy_mode(
     root: PathBuf,
     policy_files: &[PathBuf],
@@ -584,15 +585,40 @@ fn resolve_policy_color(mode: PolicyColorMode, writing_stdout: bool) -> HumanRen
     match mode {
         PolicyColorMode::Always => HumanRenderColor::Ansi,
         PolicyColorMode::Never => HumanRenderColor::Plain,
-        PolicyColorMode::Auto
-            if writing_stdout
-                && io::stdout().is_terminal()
-                && env::var_os("NO_COLOR").is_none() =>
-        {
+        PolicyColorMode::Auto if writing_stdout && stdout_supports_color() => {
             HumanRenderColor::Ansi
         }
         PolicyColorMode::Auto => HumanRenderColor::Plain,
     }
+}
+
+fn stdout_supports_color() -> bool {
+    auto_color_enabled(
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+        terminal_supports_ansi(),
+    )
+}
+
+const fn auto_color_enabled(
+    is_terminal: bool,
+    no_color_present: bool,
+    ansi_supported: bool,
+) -> bool {
+    is_terminal && !no_color_present && ansi_supported
+}
+
+#[cfg(unix)]
+const fn terminal_supports_ansi() -> bool {
+    true
+}
+
+#[cfg(windows)]
+const fn terminal_supports_ansi() -> bool {
+    // Do not assume that a Windows console has virtual-terminal processing
+    // enabled. `--color always` remains the explicit opt-in for ANSI-capable
+    // terminals; auto mode chooses the safe plain representation.
+    false
 }
 
 fn write_policy_stdout(
@@ -1023,4 +1049,17 @@ fn toolset_of(name: &str) -> Option<&'static str> {
                 .any(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(name))
         })
     })
+}
+
+#[cfg(test)]
+mod policy_color_tests {
+    use super::auto_color_enabled;
+
+    #[test]
+    fn auto_color_requires_an_ansi_terminal_and_respects_no_color() {
+        assert!(auto_color_enabled(true, false, true));
+        assert!(!auto_color_enabled(false, false, true));
+        assert!(!auto_color_enabled(true, true, true));
+        assert!(!auto_color_enabled(true, false, false));
+    }
 }

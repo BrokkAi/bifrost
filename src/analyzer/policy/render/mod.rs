@@ -572,11 +572,11 @@ mod tests {
         assert_eq!(first, second);
         let finding = String::from_utf8(first).unwrap();
         assert!(
-            finding.starts_with("app.ts:1:8: [warning] test.render: Avoid target\n"),
+            finding.starts_with("[warning]  app.ts:1:8\n    Avoid target\n\n"),
             "unexpected human report:\n{finding}"
         );
-        assert!(finding.contains("  evidence: structural_match function\n"));
-        assert!(finding.contains("policy rule: test.render (Render)\n"));
+        assert!(!finding.contains("  evidence: structural_match function\n"));
+        assert!(!finding.contains("policy rule: test.render (Render)\n"));
         assert!(finding.contains("summary: 1 finding; 1 complete policy run\n"));
         assert!(!finding.contains('\u{001B}'));
 
@@ -594,7 +594,7 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("policy rule: test.render (Render)\n"));
+        assert!(!output.contains("policy rule: test.render (Render)\n"));
         assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
 
         let cancellation = CancellationToken::new();

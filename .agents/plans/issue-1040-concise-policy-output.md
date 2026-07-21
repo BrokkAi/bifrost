@@ -13,7 +13,8 @@ Routine policy runs should be readable at a glance. After this change, the defau
 - [x] (2026-07-21 18:20Z) Defined explicit human detail and resolved color options, then split concise and audit rendering without weakening diagnostics, escaping, or byte limits.
 - [x] (2026-07-21 18:20Z) Added `--verbose` and `--color auto|always|never`, resolving terminal and `NO_COLOR` behavior only in the CLI.
 - [x] (2026-07-21 18:20Z) Updated renderer, CLI, and documentation tests for concise, verbose, colored, redirected, file, incomplete, escaped, and bounded output; 25 focused tests pass.
-- [ ] Run formatting, focused tests, full feature tests as practical, and clippy; review the final diff and record outcomes.
+- [x] (2026-07-21 18:31Z) Completed security, duplication, intent, operations, and architecture reviews and addressed every finding; post-review focused tests pass.
+- [x] (2026-07-21 18:39Z) Ran formatting, focused post-review tests, and all-target/all-feature clippy; reviewed the final diff and recorded outcomes.
 
 ## Surprises & Discoveries
 
@@ -23,6 +24,8 @@ Routine policy runs should be readable at a glance. After this change, the defau
   Evidence: `should_colorize_repl()` returns `stdout().is_terminal() && var_os("NO_COLOR").is_none()`.
 - Observation: A feature-enabled isolated build compiles the Rust sources but cannot link the local Python extension symbols on this host.
   Evidence: `cargo test --features nlp,python --test policy_rendering --no-run` reached the final dynamic-library link and failed with unresolved `_Py*` symbols; the helper then removed its isolated target.
+- Observation: `origin/master` advanced by one unrelated commit during implementation, and repository instructions prohibit rebasing without an explicit request.
+  Evidence: `git rev-list --left-right --count HEAD...origin/master` reports `1 1`; the new master commit is `a283aabd` for CodeQuery scheduling.
 
 ## Decision Log
 
@@ -35,10 +38,16 @@ Routine policy runs should be readable at a glance. After this change, the defau
 - Decision: Treat `--color` and `--verbose` as human-format options and reject their use with JSON or SARIF.
   Rationale: Machine formats must stay canonical and option combinations should not be silently ignored.
   Date/Author: 2026-07-21 / Codex
+- Decision: Auto color is conservative on Windows, where terminal attachment alone does not prove virtual-terminal processing is enabled; `--color always` remains the explicit override.
+  Rationale: Bifrost supports Windows, and plain output is safer than emitting visible escape sequences to legacy consoles.
+  Date/Author: 2026-07-21 / Codex
+- Decision: Address every specialist-review finding, including low-severity duplication and documentation observations.
+  Rationale: Sharing terminal capability logic avoids drift, and updating internal tests prevents a full-suite regression hidden by integration-only validation.
+  Date/Author: 2026-07-21 / Codex
 
 ## Outcomes & Retrospective
 
-The implementation milestone is complete: concise plain output is the deterministic library default, verbose retains the audit record, CLI color is sink- and terminal-aware, and documentation examples match the new default. Final CI gates and adversarial review remain.
+Issue #1040 is implemented and locally validated. Default human reports are compact and deterministic, `--verbose` preserves the complete audit record, and `--color auto|always|never` respects sinks, `NO_COLOR`, terminal capability, and explicit overrides. JSON and SARIF remain unchanged. Security, duplication, intent, operations, and architecture reviews completed; every finding was addressed. The focused renderer, CLI, docs, internal renderer, and color-decision tests pass, and `cargo clippy --all-targets --all-features -- -D warnings` passes in a clean isolated target. A feature-enabled test binary could not link because this host does not expose Python symbols to the Rust dynamic-library link, while featureless focused tests passed. The branch remains one commit behind the newly advanced `origin/master`; no rebase was performed because repository instructions require explicit authorization.
 
 ## Context and Orientation
 
@@ -119,3 +128,7 @@ No external crate is required: use `std::io::IsTerminal`, `std::env::var_os`, fi
 Revision note (2026-07-21): Created the initial self-contained plan after issue diagnosis, before implementation, to establish renderer/CLI ownership and compatibility boundaries.
 
 Revision note (2026-07-21 18:20Z): Recorded the completed implementation milestone, focused test evidence, and the host Python-linker limitation before review and final validation.
+
+Revision note (2026-07-21 18:31Z): Recorded specialist-review fixes, conservative Windows behavior, current remote drift, and the successful post-review focused tests.
+
+Revision note (2026-07-21 18:39Z): Marked the plan complete after clean all-feature clippy, summarized validation evidence, and documented the only host/remote limitations.

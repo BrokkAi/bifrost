@@ -176,6 +176,7 @@ fn thresholds_cover_clean_rated_and_unrated_findings() {
     );
     assert_status(&default, 1);
     let stdout = String::from_utf8(default.stdout).expect("UTF-8 human report");
+    assert!(!stdout.contains('\u{001B}'));
     assert!(stdout.contains("[warning]  src/app.py:2:12\n"), "{stdout}");
     assert!(
         stdout.contains("    Dynamic evaluation is forbidden\n"),
@@ -222,6 +223,36 @@ fn thresholds_cover_clean_rated_and_unrated_findings() {
         .expect("run policy with NO_COLOR");
     assert_status(&no_color, 1);
     assert!(!no_color.stdout.contains(&0x1b));
+
+    let never = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--color",
+            "never",
+        ],
+    );
+    assert_status(&never, 1);
+    assert!(!never.stdout.contains(&0x1b));
+
+    let verbose_colored = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--verbose",
+            "--color",
+            "always",
+        ],
+    );
+    assert_status(&verbose_colored, 1);
+    assert!(
+        verbose_colored
+            .stdout
+            .windows(5)
+            .any(|window| window == b"\x1b[33m")
+    );
 }
 
 #[test]
@@ -701,8 +732,10 @@ fn output_path_may_be_outside_the_analyzed_workspace() {
         .expect("write outside workspace");
     assert_status(&output, 1);
     assert!(output.stdout.is_empty());
+    let file_output = fs::read(output_path).unwrap();
+    assert!(!file_output.contains(&0x1b));
     assert!(
-        fs::read_to_string(output_path)
+        String::from_utf8(file_output)
             .unwrap()
             .contains("Dynamic evaluation is forbidden")
     );
