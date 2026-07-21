@@ -1047,6 +1047,13 @@ fn receiver_owner_proof(
     enclosing: &CodeUnit,
     ctx: &mut MemberScanCtx<'_>,
 ) -> ReceiverOwnerProof {
+    if receiver.kind() == "self"
+        && enclosing_impl_item(receiver)
+            .is_some_and(|impl_item| impl_item_contains_scan_target(impl_item, ctx))
+    {
+        return ReceiverOwnerProof::Structured;
+    }
+
     let receiver_types = rust_expression_type_definition_candidates_cached(
         ctx.analyzer,
         ctx.support,
@@ -1518,10 +1525,18 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
 }
 
 fn impl_item_contains_requested_target(node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
-    ctx.file == ctx.requested_target.source()
+    impl_item_contains_target(node, ctx.requested_target, ctx)
+}
+
+fn impl_item_contains_scan_target(node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    impl_item_contains_target(node, ctx.scan_target, ctx)
+}
+
+fn impl_item_contains_target(node: Node<'_>, target: &CodeUnit, ctx: &MemberScanCtx<'_>) -> bool {
+    ctx.file == target.source()
         && ctx
             .rust
-            .ranges(ctx.requested_target)
+            .ranges(target)
             .into_iter()
             .any(|range| node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte())
 }

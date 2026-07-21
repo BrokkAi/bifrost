@@ -1544,6 +1544,66 @@ impl Foo {
 }
 
 #[test]
+fn rust_self_receiver_preserves_external_generic_impl_owner() {
+    let source = r#"
+use std::cell::RefCell;
+
+struct Ast;
+
+impl<'a> arena_tree::Node<'a, RefCell<Ast>> {
+    pub fn collect_text(&'a self) {
+        self.collect_text_append();
+    }
+
+    pub fn collect_text_append(&'a self) {}
+}
+
+impl<'a> other_tree::Node<'a, RefCell<Ast>> {
+    pub fn collect_text(&'a self) {
+        self.collect_text_append();
+    }
+
+    pub fn collect_text_append(&'a self) {}
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/nodes.rs", source)]);
+    let file = project.file("src/nodes.rs");
+    let target = definition(&analyzer, "arena_tree.Node.collect_text_append");
+
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+    let expected = source
+        .find("self.collect_text_append")
+        .expect("target call")
+        + "self.".len();
+    let unrelated = source
+        .rfind("self.collect_text_append")
+        .expect("same-named unrelated call")
+        + "self.".len();
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected only the matching impl call: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == file
+                && hit.kind == UsageHitKind::SelfReceiver
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "collect_text_append".len())
+        }),
+        "direct self call must retain its external generic impl owner: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            (hit.start_offset, hit.end_offset)
+                != (unrelated, unrelated + "collect_text_append".len())
+        }),
+        "same-named method on another external generic impl must not match: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_self_receiver_hits_do_not_trigger_external_usage_cap() {
     let (project, analyzer) = rust_analyzer_with_files(&[(
         "src/service.rs",
