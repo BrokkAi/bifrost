@@ -1004,7 +1004,7 @@ fn analyze_scala_candidates_with_usage_graph(
         },
         |unit| unit.is_function() || unit.is_class(),
         |nodes, _targets| {
-            crate::analyzer::usages::scala_graph::build_scala_usage_edges(analyzer, nodes, |_| true)
+            crate::analyzer::usages::scala_graph::build_full_scala_usage_edges(analyzer, nodes)
         },
         scala_graph_finding,
     )

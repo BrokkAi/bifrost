@@ -103,6 +103,12 @@ pub(super) enum ScalaResolvedReference {
 }
 
 pub(super) trait ScalaReferenceSink {
+    fn may_match_name(&self, _name: &str) -> bool {
+        true
+    }
+
+    fn register_imports(&mut self, _imports: &[crate::analyzer::ImportInfo]) {}
+
     fn record(
         &mut self,
         target: ScalaResolvedReference,
@@ -6370,6 +6376,7 @@ pub(super) fn scan_scala_query_file(
     let types = scala.project_types();
     let package = super::resolver::package_name_of(scala, file).unwrap_or_default();
     let imports = scala.import_info_of(file);
+    sink.register_imports(&imports);
     let resolver = Arc::new(NameResolver::for_file_with_facts(
         scala,
         Some(file),
@@ -6830,6 +6837,24 @@ fn record_reference(
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) {
+    if node.kind() == "type_identifier"
+        && !is_extractor_reference(node)
+        && !is_infix_pattern_operator(node)
+    {
+        let lookup = scala_qualified_type_root(node);
+        let segments = scala_type_lookup_segments(lookup, ctx.source);
+        if !segments
+            .iter()
+            .any(|segment| ctx.sink.may_match_name(segment))
+        {
+            return;
+        }
+    }
+    if let Some(name) = reference_lookup_name(node, ctx.source)
+        && !ctx.sink.may_match_name(name)
+    {
+        return;
+    }
     match node.kind() {
         // A type reference in any type position: param/return types, `extends`,
         // and the type child of `new Foo()`. Construction is covered here without
@@ -7674,6 +7699,25 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+fn reference_lookup_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let node = match node.kind() {
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            let function = invocation_function_reference(function);
+            if function.kind() == "field_expression" {
+                function.child_by_field_name("field")?
+            } else {
+                function
+            }
+        }
+        "infix_expression" | "postfix_expression" => node.child_by_field_name("operator")?,
+        "identifier" | "operator_identifier" => node,
+        _ => return None,
+    };
+    let name = node_text(node, source).trim();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Resolve an explicit member import whose owner is a parser-proven local
@@ -9098,7 +9142,7 @@ fn record_override_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
         return;
     }
     let name = node_text(name_node, ctx.source).trim();
-    if name.is_empty() {
+    if name.is_empty() || !ctx.sink.may_match_name(name) {
         return;
     }
     let Some(owner) = ctx.enclosing_class(name_node.start_byte()) else {
