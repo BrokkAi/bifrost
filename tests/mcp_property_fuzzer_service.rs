@@ -1361,3 +1361,32 @@ fn empty_init_files_are_skipped_for_summary_probes() {
         report.violations
     );
 }
+
+// The laravel types/-stub twin shape: the listed name itself is offered as
+// an ambiguity selector (resolves to an identical twin), so the element is
+// resolvable from its listing context — unlike the bfg shape, where only
+// alternative names are offered and the listed one never resolves.
+#[test]
+fn i3a_silent_when_ambiguity_offers_the_listed_name_itself() {
+    let mut probe = record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "types/Support/LazyCollection.php".to_string(),
+        },
+        json!({
+            "ambiguous": [{
+                "target": "Users",
+                "matches": ["Illuminate.Tests.Auth.PasswordBrokerName.Users", "Users"]
+            }],
+            "not_found": [],
+            "sources": []
+        }),
+    );
+    probe.symbol_fq = "Users".to_string();
+    let records = vec![probe];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}

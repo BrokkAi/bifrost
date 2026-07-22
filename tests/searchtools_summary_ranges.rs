@@ -1025,3 +1025,107 @@ fn larger_empty_cpp_headers_use_head_tail_excerpt_summary_fallback() {
     assert!(excerpt.text.contains("// line 36"));
     assert!(excerpt.text.contains("// line 60"));
 }
+
+// Regression coverage for GH #1017: a bare (no-slash) target must resolve to
+// a real filesystem directory even when unrelated files elsewhere in the
+// tree happen to share its basename. The tool's own documentation promises
+// "Real filesystem directories win name collisions"; before the fix,
+// `WorkspaceFileResolver::resolve_literal`'s basename fallback matched the
+// colliding stub files first and returned `Ambiguous`, short-circuiting
+// before `directory_listing` ever got a chance to see the real directory.
+#[test]
+fn get_summaries_directory_wins_over_basename_colliding_files() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "value = 1\n")
+        .file("pkg/module.py", "def foo():\n    pass\n")
+        .file("other/pkg", "not a real package, just a same-named stub\n")
+        .file("another/pkg", "also just a same-named stub\n")
+        .build();
+    let analyzer = brokk_bifrost::PythonAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["pkg".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert!(
+        result.ambiguous_paths.is_empty(),
+        "directory should win the collision outright: {result:#?}"
+    );
+    assert!(result.summaries.is_empty(), "{result:#?}");
+    assert_eq!(1, result.listings.len(), "{result:#?}");
+    let listing = &result.listings[0];
+    assert_eq!(ContainerKind::Directory, listing.kind);
+    assert_eq!("pkg", listing.target);
+    assert!(listing.entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::File { path, .. } if path == "pkg/__init__.py"
+    )));
+    assert!(listing.entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::File { path, .. } if path == "pkg/module.py"
+    )));
+}
+
+// Trailing-slash spellings of the same target already worked before the fix
+// (they route through `directory_listing` directly because
+// `is_bare_literal_candidate` rejects any input containing '/'). Keep this
+// pinned as an explicit no-regression check alongside the bare-name fix.
+#[test]
+fn get_summaries_directory_target_trailing_slash_still_resolves() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "value = 1\n")
+        .file("pkg/module.py", "def foo():\n    pass\n")
+        .file("other/pkg", "not a real package, just a same-named stub\n")
+        .file("another/pkg", "also just a same-named stub\n")
+        .build();
+    let analyzer = brokk_bifrost::PythonAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["pkg/".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous_paths.is_empty(), "{result:#?}");
+    assert_eq!(1, result.listings.len(), "{result:#?}");
+    assert_eq!(ContainerKind::Directory, result.listings[0].kind);
+    assert_eq!("pkg", result.listings[0].target);
+}
+
+// No-regression check: when a bare name matches ONLY files (no real
+// directory of that name exists anywhere), the pre-existing ambiguous-path
+// behavior must be preserved.
+#[test]
+fn get_summaries_bare_name_matching_only_files_stays_ambiguous() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/main.py", "print('hi')\n")
+        .file("a/dup", "one\n")
+        .file("b/dup", "two\n")
+        .build();
+    let analyzer = brokk_bifrost::PythonAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["dup".to_string()],
+        },
+    );
+
+    assert!(result.listings.is_empty(), "{result:#?}");
+    assert!(result.summaries.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.ambiguous_paths.len(), "{result:#?}");
+    let ambiguous = &result.ambiguous_paths[0];
+    assert_eq!("dup", ambiguous.input);
+    assert_eq!(
+        vec!["a/dup".to_string(), "b/dup".to_string()],
+        ambiguous.matches
+    );
+}

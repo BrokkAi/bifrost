@@ -173,6 +173,25 @@ pub(super) fn route_summary_targets(
             continue;
         }
 
+        // A real filesystem directory at this workspace-relative path takes
+        // precedence over any file whose *basename* merely collides with the
+        // target (documented contract: "Real filesystem directories win name
+        // collisions"). Check directory candidates before falling back to
+        // resolver.resolve_literal's basename search, otherwise a bare name
+        // that happens to collide with unrelated same-named files elsewhere
+        // in the tree short-circuits into an ambiguous/file match and the
+        // directory is never offered. An exact file match at this literal
+        // path cannot itself collide with a directory (a path cannot be both
+        // on a real filesystem), so this reordering cannot regress plain file
+        // targets.
+        if let Some(listing) = directory_listing(&workspace_files, target) {
+            let key = (listing.kind, listing.target.clone());
+            if listed_containers.insert(key) {
+                listings.push(listing);
+            }
+            continue;
+        }
+
         match resolver.resolve_literal(target) {
             ResolvedFileInput::File(file) => {
                 file_targets.insert(file);
@@ -183,14 +202,6 @@ pub(super) fn route_summary_targets(
                 continue;
             }
             ResolvedFileInput::NotFound(_) => {}
-        }
-
-        if let Some(listing) = directory_listing(&workspace_files, target) {
-            let key = (listing.kind, listing.target.clone());
-            if listed_containers.insert(key) {
-                listings.push(listing);
-            }
-            continue;
         }
 
         let matches = resolve_file_patterns(analyzer, &[target.to_string()]);

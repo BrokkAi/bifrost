@@ -1126,7 +1126,7 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             return;
         }
     }
-    if !ctx.target_is_field && receiver_is_self_rooted(receiver) {
+    if !ctx.target_is_field && receiver_is_self_rooted(receiver, ctx.source) {
         push_self_receiver_member_hit(
             ctx.file,
             ctx.source,
@@ -1156,7 +1156,14 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
         let [receiver, dot, member] = window else {
             continue;
         };
-        if !matches!(receiver.kind(), "identifier" | "self") || dot.kind() != "." {
+        // Inside a macro token stream the receiver of `.member(...)` for an adapter
+        // chain (`self.as_mut().member(...)`) is the adapter's call-parens token_tree,
+        // not an identifier/self token; recognize that shape as a self-rooted receiver.
+        let receiver_is_adapter_parens = receiver.kind() == "token_tree"
+            && token_tree_receiver_is_self_rooted_adapter_chain(&children, index, ctx.source);
+        if (!matches!(receiver.kind(), "identifier" | "self") && !receiver_is_adapter_parens)
+            || dot.kind() != "."
+        {
             continue;
         }
         if simple_node_text(*member, ctx.source).as_deref() != Some(ctx.member_name) {
@@ -1177,11 +1184,21 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
         else {
             continue;
         };
-        let receiver_types = token_tree_receiver_type_candidates(&children, index, ctx);
-        let proof = if receiver_types.is_empty() {
-            receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx)
+        let proof = if receiver_is_adapter_parens {
+            // No token-stream type inference is available for an adapter's call-parens
+            // receiver; prove it by the enclosing impl's Self type, matching bare `self`.
+            if enclosing_impl_type_matches_owner(*receiver, ctx) {
+                ReceiverOwnerProof::Inferred
+            } else {
+                ReceiverOwnerProof::Unknown
+            }
         } else {
-            receiver_type_candidates_proof(&receiver_types, ctx)
+            let receiver_types = token_tree_receiver_type_candidates(&children, index, ctx);
+            if receiver_types.is_empty() {
+                receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx)
+            } else {
+                receiver_type_candidates_proof(&receiver_types, ctx)
+            }
         };
         let inferred_match = match proof {
             ReceiverOwnerProof::Structured => false,
@@ -1223,7 +1240,9 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
                 continue;
             }
         }
-        if !ctx.target_is_field && receiver_is_self_rooted(*receiver) {
+        if !ctx.target_is_field
+            && (receiver_is_adapter_parens || receiver_is_self_rooted(*receiver, ctx.source))
+        {
             push_self_receiver_member_hit(
                 ctx.file,
                 ctx.source,
@@ -1244,6 +1263,48 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
                 ctx.hits,
             );
         }
+    }
+}
+
+/// In a macro token stream, the receiver token that immediately precedes `.member(...)`
+/// for an adapter chain like `self.as_mut().member(...)` is the adapter's empty
+/// call-parens token_tree (`()`), preceded by `<adapter> . <inner>`. Recognize that
+/// shape, walking back through nested adapter parens, bottoming out at `self`.
+fn token_tree_receiver_is_self_rooted_adapter_chain(
+    children: &[Node<'_>],
+    receiver_index: usize,
+    source: &str,
+) -> bool {
+    // The receiver token must be the adapter's empty call parens `()`.
+    if children[receiver_index].kind() != "token_tree"
+        || children[receiver_index].named_child_count() != 0
+        || receiver_index < 3
+    {
+        return false;
+    }
+    let adapter = children[receiver_index - 1];
+    let dot = children[receiver_index - 2];
+    if adapter.kind() != "identifier"
+        || dot.kind() != "."
+        || simple_node_text(adapter, source)
+            .is_none_or(|name| !is_self_preserving_receiver_adapter(&name))
+    {
+        return false;
+    }
+    token_tree_adapter_chain_root_is_self(children, receiver_index - 3, source)
+}
+
+/// Whether the token at `index` bottoms out at `self`, following any further
+/// `<adapter>()` parens links back toward the chain root.
+fn token_tree_adapter_chain_root_is_self(
+    children: &[Node<'_>],
+    index: usize,
+    source: &str,
+) -> bool {
+    match children[index].kind() {
+        "self" => true,
+        "token_tree" => token_tree_receiver_is_self_rooted_adapter_chain(children, index, source),
+        _ => false,
     }
 }
 
@@ -1499,9 +1560,19 @@ fn receiver_owner_proof(
         return ReceiverOwnerProof::Inferred;
     }
 
+    // Only reached once type inference above was inconclusive. A self-rooted chain of
+    // Self-preserving adapters (`self.as_mut()`, …) dispatches to the enclosing type's
+    // member, so prove it by the same enclosing-impl type identity as bare `self` —
+    // this also covers the cross-impl case (a trait `impl` calling an inherent sibling),
+    // because it matches on the impl's Self *type*, not on physical range containment.
     let matches = match receiver.kind() {
         "self" => enclosing_impl_type_matches_owner(receiver, ctx),
         "field_expression" => self_field_receiver_matches_owner(receiver, enclosing, ctx),
+        "call_expression" | "parenthesized_expression"
+            if receiver_is_self_rooted(receiver, ctx.source) =>
+        {
+            enclosing_impl_type_matches_owner(receiver, ctx)
+        }
         _ => false,
     };
     if matches {
@@ -1633,12 +1704,66 @@ fn same_rust_declaration_identity(left: &CodeUnit, right: &CodeUnit) -> bool {
         && left.kind() == right.kind()
 }
 
-fn receiver_is_self_rooted(receiver: Node<'_>) -> bool {
+/// Universally Self-preserving receiver adapters: calling one of these no-argument
+/// methods on `self` yields a value of the *same nominal type* — `Self`, `&Self`,
+/// `&mut Self`, or a smart-pointer re-borrow such as `Pin<&mut Self>` — so a method
+/// invoked *through* the adapter still dispatches to the enclosing type's member.
+///
+/// The set is deliberately small and limited to the standard by-reference receiver
+/// conversions (`AsMut`/`AsRef`/`Clone`/`Borrow`). Anything that can change the
+/// nominal type (`into`, a user `AsRef<Other>`, `deref` to a different target, …)
+/// is excluded so we never mistake a foreign owner's same-named method for a self
+/// call. Type inference still runs first, so a receiver that inference resolves to a
+/// concrete different owner is rejected before this allowlist is ever consulted.
+const SELF_PRESERVING_RECEIVER_ADAPTERS: &[&str] =
+    &["as_mut", "as_ref", "clone", "borrow", "borrow_mut"];
+
+fn is_self_preserving_receiver_adapter(name: &str) -> bool {
+    SELF_PRESERVING_RECEIVER_ADAPTERS.contains(&name)
+}
+
+/// Whether `receiver` is `self` (possibly parenthesized) or a chain of Self-preserving
+/// adapter calls rooted at `self` — e.g. `self.as_mut()`, `(self).as_ref()`,
+/// `self.as_ref().as_mut()`. Such a receiver dispatches to the enclosing type's member,
+/// so a hit through it is classified as a self-receiver hit exactly like bare `self`.
+fn receiver_is_self_rooted(receiver: Node<'_>, source: &str) -> bool {
     match receiver.kind() {
         "self" => true,
-        "parenthesized_expression" => receiver.named_child(0).is_some_and(receiver_is_self_rooted),
+        "parenthesized_expression" => receiver
+            .named_child(0)
+            .is_some_and(|inner| receiver_is_self_rooted(inner, source)),
+        "call_expression" => self_rooted_adapter_call(receiver, source),
         _ => false,
     }
+}
+
+/// `<inner>.<adapter>()` where `<adapter>` is a Self-preserving receiver adapter and
+/// `<inner>` is itself self-rooted. Restricted to no-argument calls: every allowlisted
+/// adapter is nullary, and requiring empty arguments keeps an unrelated same-named
+/// method that happens to take arguments from being read as an adapter.
+fn self_rooted_adapter_call(call: Node<'_>, source: &str) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "field_expression" {
+        return false;
+    }
+    if call
+        .child_by_field_name("arguments")
+        .is_none_or(|args| args.named_child_count() != 0)
+    {
+        return false;
+    }
+    let adapter_matches = function
+        .child_by_field_name("field")
+        .and_then(|field| simple_node_text(field, source))
+        .is_some_and(|name| is_self_preserving_receiver_adapter(&name));
+    if !adapter_matches {
+        return false;
+    }
+    function
+        .child_by_field_name("value")
+        .is_some_and(|value| receiver_is_self_rooted(value, source))
 }
 
 /// Whether `receiver` is direct `self` inside an inherent impl whose resolved
