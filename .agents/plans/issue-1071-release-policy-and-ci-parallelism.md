@@ -17,9 +17,9 @@ The observable result is that `node scripts/release-version.mjs check` succeeds 
 - [x] (2026-07-22 16:56Z) Implemented the canonical release-version command and 11 focused/integration tests covering tag, manifest, projection, CRLF, and GitHub-output behavior.
 - [x] (2026-07-22 16:56Z) Added reusable release-context and Rust-notice workflows and migrated the binary, crate, and wheel callers without changing their publishing boundaries.
 - [x] (2026-07-22 17:18Z) Validated, reviewed, and checkpointed the release-policy milestone with focused tests, local tag/output smoke, projection idempotence, YAML parsing, `actionlint`, a direct-needs audit, and diff whitespace checks.
-- [ ] Replace the serial repository-policy job with a quick gate plus parallel license and crate-package jobs.
-- [ ] Start Python and Rust matrices after the same quick gate while keeping each Rust target's clippy and tests together.
-- [ ] Validate, review, checkpoint, and record final timing evidence.
+- [x] (2026-07-22 17:23Z) Replaced the serial repository-policy job with a quick gate plus parallel dependency-license and crate-package jobs.
+- [x] (2026-07-22 17:23Z) Started Python and Rust matrices after the same quick gate while keeping each Rust target's clippy and tests together.
+- [x] (2026-07-22 17:28Z) Validated and reviewed the final CI graph, including all local quick-gate commands, crate packaging, YAML parsing, `actionlint`, dependency audits, and diff checks; remote timing is intentionally deferred until an ordinary pushed CI run exists.
 
 ## Surprises & Discoveries
 
@@ -63,6 +63,8 @@ The observable result is that `node scripts/release-version.mjs check` succeeds 
 ## Outcomes & Retrospective
 
 The release-policy implementation is locally complete. Eleven focused unit and subprocess tests pass; a real repository check, sync idempotence check, and tag/GitHub-output smoke pass; every workflow parses as YAML; the release jobs' direct output dependencies were audited; and `actionlint` 1.7.12 reports no findings. The only broad-suite caveat is the pre-existing Node 24 Pi dependency-resolution failure noted above; the affected release test passes independently and GitHub Actions uses Node 22. Remote release execution is deliberately deferred because these workflows publish artifacts.
+
+The CI implementation is also locally complete. `quick-policy` contains only toolchain setup, formatting, the focused release-policy tests, and the read-only repository projection check. Every other CI job directly needs that gate, with Python and Rust becoming eligible at the same point. Dependency licenses and crate packaging are independent jobs; the latter reproduced the real package verification successfully at 8,199,282 bytes against its 10,000,000-byte budget. The matrix definitions, Rust clippy/test grouping, publishing surfaces, credentials, permissions, and Action versions are unchanged. A pinned final `actionlint` run reports no findings, and a programmatic graph audit confirms all non-gate jobs depend directly on `quick-policy`. The next ordinary pushed run will provide the remote wall-clock comparison to the 7-minute-48-second policy baseline and the previous Python tail; no workflow was dispatched from this implementation session.
 
 ## Context and Orientation
 
