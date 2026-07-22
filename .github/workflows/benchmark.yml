@@ -3,6 +3,7 @@ name: Benchmark
 on:
   schedule:
     - cron: '17 9 * * *'
+  pull_request:
   workflow_dispatch:
     inputs:
       repo:
