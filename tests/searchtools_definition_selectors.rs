@@ -1210,6 +1210,195 @@ fn csharp_generic_arity_selectors_resolve_indexed_source_names() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// C/C++ elaborated-type-specifier tag selectors (issue #1019, shape 1)
+//
+// Agents naturally spell C/C++ type references the way a use site requires
+// (`struct git_refdb`, `enum Color`, `union Value`), including through the
+// existing `path::symbol`/`path#symbol` selector routes, but Bifrost indexes
+// the bare type identifier. `struct git_refdb` must resolve/ambiguate exactly
+// like the keyword-free `git_refdb` in every selector shape.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c_struct_tag_selectors_resolve_like_their_keyword_free_spelling() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/libgit2/refdb.h",
+            "struct git_refdb {\n    int backend_flags;\n};\n",
+        )
+        .file(
+            "include/git2/types.h",
+            "struct git_refdb {\n    int placeholder;\n};\n",
+        )
+        .build();
+
+    // Bare `struct git_refdb` must ambiguate exactly like bare `git_refdb`:
+    // two same-named top-level tag declarations in different files.
+    let tagged = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["struct git_refdb"]}"#,
+    );
+    let bare = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["git_refdb"]}"#,
+    );
+    assert_eq!(0, tagged["not_found"].as_array().unwrap().len(), "{tagged}");
+    assert_eq!(
+        bare["ambiguous"][0]["matches"], tagged["ambiguous"][0]["matches"],
+        "tagged: {tagged}, bare: {bare}"
+    );
+    assert_eq!(
+        2,
+        tagged["ambiguous"][0]["matches"].as_array().unwrap().len()
+    );
+
+    // `path::struct X` and `path#struct X` must each resolve to the single
+    // definition in that file, exactly like the keyword-free anchored form.
+    for (selector, keyword_free, expected_snippet) in [
+        (
+            "src/libgit2/refdb.h::struct git_refdb",
+            "src/libgit2/refdb.h::git_refdb",
+            "backend_flags",
+        ),
+        (
+            "src/libgit2/refdb.h#struct git_refdb",
+            "src/libgit2/refdb.h#git_refdb",
+            "backend_flags",
+        ),
+        (
+            "include/git2/types.h::struct git_refdb",
+            "include/git2/types.h::git_refdb",
+            "placeholder",
+        ),
+    ] {
+        let tagged = call_tool(
+            &project,
+            "get_symbol_sources",
+            &format!(r#"{{"symbols":["{selector}"]}}"#),
+        );
+        let keyword_free_result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &format!(r#"{{"symbols":["{keyword_free}"]}}"#),
+        );
+        assert_eq!(0, tagged["not_found"].as_array().unwrap().len(), "{tagged}");
+        assert_eq!(1, tagged["sources"].as_array().unwrap().len(), "{tagged}");
+        assert_eq!(
+            tagged["sources"][0]["text"], keyword_free_result["sources"][0]["text"],
+            "selector {selector} must resolve identically to {keyword_free}: {tagged}"
+        );
+        assert!(
+            tagged["sources"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected_snippet),
+            "{tagged}"
+        );
+    }
+}
+
+#[test]
+fn c_struct_tag_selector_resolves_like_bare_spelling_via_get_definitions_by_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/libgit2/refdb.h",
+            "int helper(int value) {\n    return value;\n}\n\nstruct git_refdb {\n    int free_id(int value) {\n        return helper(value);\n    }\n};\n",
+        )
+        .build();
+
+    for (symbol, keyword_free) in [
+        (
+            "src/libgit2/refdb.h::struct git_refdb.free_id",
+            "src/libgit2/refdb.h::git_refdb.free_id",
+        ),
+        (
+            "src/libgit2/refdb.h#struct git_refdb.free_id",
+            "src/libgit2/refdb.h#git_refdb.free_id",
+        ),
+    ] {
+        let tagged = call_tool(
+            &project,
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": symbol,
+                    "context": "        return helper(value);",
+                    "target": "helper"
+                }]
+            })
+            .to_string(),
+        );
+        let keyword_free_result = call_tool(
+            &project,
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": keyword_free,
+                    "context": "        return helper(value);",
+                    "target": "helper"
+                }]
+            })
+            .to_string(),
+        );
+        let tagged = &tagged["results"][0];
+        let keyword_free_result = &keyword_free_result["results"][0];
+        assert_eq!("resolved", tagged["status"], "{symbol}: {tagged}");
+        assert_eq!(
+            "helper", tagged["definitions"][0]["fqn"],
+            "{symbol}: {tagged}"
+        );
+        assert_eq!(
+            tagged["status"], keyword_free_result["status"],
+            "{symbol} vs {keyword_free}"
+        );
+        assert_eq!(
+            tagged["definitions"], keyword_free_result["definitions"],
+            "{symbol} vs {keyword_free}"
+        );
+    }
+}
+
+#[test]
+fn cpp_enum_and_union_tag_selectors_resolve_like_their_keyword_free_spelling() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/values.hpp",
+            "enum Color {\n    Red,\n    Green,\n    Blue,\n};\n\nunion Value {\n    int i;\n    float f;\n};\n",
+        )
+        .build();
+
+    for (selector, expected_snippet) in [
+        ("enum Color", "enum Color"),
+        ("src/values.hpp::enum Color", "enum Color"),
+        ("src/values.hpp#enum Color", "enum Color"),
+        ("union Value", "union Value"),
+        ("src/values.hpp::union Value", "union Value"),
+        ("src/values.hpp#union Value", "union Value"),
+    ] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &format!(r#"{{"symbols":["{selector}"]}}"#),
+        );
+        assert_eq!(
+            0,
+            result["not_found"].as_array().unwrap().len(),
+            "{selector} must resolve: {result}"
+        );
+        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+        assert!(
+            result["sources"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected_snippet),
+            "{selector}: {result}"
+        );
+    }
+}
+
 #[test]
 fn java_package_module_returns_deduped_outline_blocks_for_each_defining_file() {
     let project = InlineTestProject::with_language(Language::Java)

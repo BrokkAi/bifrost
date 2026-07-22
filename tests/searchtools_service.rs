@@ -1391,6 +1391,50 @@ fn get_definitions_by_reference_accepts_js_file_anchored_symbols() {
     }
 }
 
+// #1019 shape 2 (regression): a TS/JS target inside a block-scoped closure
+// (declared in a nested block, captured by an arrow function, referenced
+// through `get_definitions_by_reference`) must report a `local_binding`
+// diagnostic naming the identifier, not a bare dead-end. This was already
+// fixed at HEAD via `local_bindings_for_exported_name`
+// (src/analyzer/usages/get_definition/mod.rs); this test only pins the
+// contract so a regression here is caught.
+#[test]
+fn get_definitions_by_reference_reports_local_binding_for_block_scoped_closure_capture() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/core.ts",
+            "export function outer(): number {\n  {\n    const helper = 1;\n    const later = () => helper + 1;\n    return later();\n  }\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "outer",
+                    "context": "const later = () => helper + 1;",
+                    "target": "helper"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+    assert_eq!("no_definition", result["status"], "{value}");
+    assert_eq!("local_binding", result["diagnostics"][0]["kind"], "{value}");
+    assert!(
+        result["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("helper"),
+        "{value}"
+    );
+}
+
 // #1057 M3: the `definitions` (reference) surface must report ambiguity in the
 // same conditions as get_symbol_sources/get_summaries. A bare terminal name
 // whose only exact hit is a top-level namesake, while a same-named member
@@ -1672,6 +1716,96 @@ func (c *Client) Build() error {
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
         "example.com/app.Helper.UpdatePackageMetadata", result["definitions"][0]["fqn"],
+        "{value}"
+    );
+}
+
+// #1019 shape 3(a): a Rust `self.<field>` chain, used as a by-reference
+// target, resolves to the field's own definition via the already-resolved
+// enclosing symbol's owner type — no new receiver/type inference, this
+// already drops out of the existing `self` handling in
+// `rust_expression_type_fqn_mode` plus the owner+member lookup in
+// `resolve_rust_field` (src/analyzer/usages/get_definition/rust.rs). This
+// pins that the ordinary (non-macro-wrapped) case keeps working end to end.
+#[test]
+fn get_definitions_by_reference_resolves_rust_self_field_chain_to_field_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "struct Ctx {\n    resource_span: u32,\n}\n\nstruct Inner {\n    ctx: Ctx,\n}\n\npub struct Sleep {\n    inner: Inner,\n}\n\nimpl Sleep {\n    fn poll(&self) {\n        let _res_span = self.inner.ctx.resource_span.clone();\n    }\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "Sleep.poll",
+                    "context": "let _res_span = self.inner.ctx.resource_span.clone();",
+                    "target": "inner"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!("Sleep.inner", result["definitions"][0]["fqn"], "{value}");
+    assert_eq!("field", result["definitions"][0]["kind"], "{value}");
+}
+
+// #1019 shape 3(b): when the receiver's owner type cannot be resolved at all
+// (here: `Sleep` is declared inside a `pin_project_lite`-style macro
+// invocation that Bifrost's declaration extraction does not expand into items
+// — the #1015 gap, out of scope to fix here), the by-reference lookup used to
+// fall through to a generic "did not resolve to an indexed Rust definition"
+// message naming the *entire* dotted chain (`self.inner.ctx.resource_span.clone`)
+// with no hint. It must now name the owner type it tried and suggest a
+// concrete follow-up query.
+#[test]
+fn get_definitions_by_reference_hints_owner_type_when_rust_field_owner_is_unindexed() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+"pin_project! {\n    pub struct Sleep {\n        inner: Inner,\n    }\n}\n\nstruct Inner {\n    ctx: Ctx,\n}\n\nstruct Ctx {\n    resource_span: u32,\n}\n\nimpl Sleep {\n    fn poll(&self) {\n        let _res_span = self.inner.ctx.resource_span.clone();\n    }\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "Sleep.poll",
+                    "context": "let _res_span = self.inner.ctx.resource_span.clone();",
+                    "target": "inner"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+    assert_eq!("no_definition", result["status"], "{value}");
+    assert_eq!(
+        "no_indexed_definition", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+    let message = result["diagnostics"][0]["message"].as_str().unwrap();
+    // The diagnostic must not collapse to the unhelpful whole-chain wording
+    // and must instead name the owner type and a concrete retry.
+    assert!(message.contains("Sleep"), "{value}");
+    assert!(message.contains("inner"), "{value}");
+    assert!(message.contains("get_symbol_sources"), "{value}");
+    assert_ne!(
+        message,
+        "`self.inner.ctx.resource_span.clone` did not resolve to an indexed Rust definition",
         "{value}"
     );
 }

@@ -519,9 +519,14 @@ fn query_symbol_interpretations(language: Language, input: &str) -> BTreeSet<Vec
 }
 
 pub(crate) fn symbol_selector_leaf(language: Language, input: &str) -> Option<String> {
+    // A leaf containing whitespace (e.g. the untouched `struct git_refdb`
+    // primary reading, kept alongside its tag-stripped variant per #1019) can
+    // never be a real indexed identifier, so it cannot be *the* canonical
+    // terminal name and must not spoil cross-variant agreement here.
     let leaves: BTreeSet<_> = query_symbol_interpretations(language, input)
         .into_iter()
         .filter_map(|path| path.into_iter().next_back())
+        .filter(|leaf| !leaf.contains(char::is_whitespace))
         .collect();
     (leaves.len() == 1)
         .then(|| leaves.into_iter().next())
@@ -576,6 +581,22 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
         }
     }
 
+    // C/C++ elaborated-type-specifier tags: agents naturally spell C/C++ type
+    // references the way a use site requires them (`struct git_refdb`, `enum
+    // Color`, `union Value`), but Bifrost indexes the bare type identifier.
+    // Offer the tag-stripped spelling as an additional variant so `struct Foo`,
+    // `file::struct Foo`, and `file#struct Foo` resolve/ambiguate exactly like
+    // the keyword-free `Foo` (#1019).
+    if language == Language::Cpp {
+        let normalized: Vec<_> = primary
+            .iter()
+            .map(|segment| strip_cpp_tag_keyword(segment).to_string())
+            .collect();
+        if normalized != primary && normalized.iter().all(|segment| !segment.is_empty()) {
+            variants.push(normalized);
+        }
+    }
+
     if language == Language::TypeScript
         && let Some(ts_static) = trim_trailing_static_member_segment(&primary)
     {
@@ -583,6 +604,31 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
     }
 
     variants
+}
+
+/// Strip a leading C/C++ elaborated-type-specifier keyword (`struct`, `enum`,
+/// `union`, `class`) from a symbol-selector segment, repeatedly (so `enum
+/// class Color` also normalizes to `Color`). No real C/C++ identifier can
+/// contain an embedded space, so this only ever fires on client-provided tag
+/// syntax, never on an indexed name (#1019).
+fn strip_cpp_tag_keyword(segment: &str) -> &str {
+    let mut current = segment;
+    loop {
+        let Some(rest) = ["struct", "enum", "union", "class"]
+            .into_iter()
+            .find_map(|keyword| current.strip_prefix(keyword))
+        else {
+            return current;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            return current;
+        }
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return current;
+        }
+        current = rest;
+    }
 }
 
 fn trim_trailing_static_member_segment(segments: &[String]) -> Option<Vec<String>> {
