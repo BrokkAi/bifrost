@@ -21,7 +21,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 07:42Z) Completed Milestone 1, ran the five focused benchmark targets, all new benchmark unit tests, all-target/all-feature Clippy, and a five-perspective guided review; fixed every confirmed finding before checkpointing.
 - [x] (2026-07-22 07:42Z) Captured a correctness-clean local pre-index report for all 12 query cases at .cache/issue920-preindex-output/run-20260722T073755Z.json.
 - [x] (2026-07-22 09:55Z) Completed Milestone 2 implementation and its three-specialist guided review; fixed construction peak-memory, finalization/selection cancellation, duplicate retained-byte accounting, scoped-versus-admitted telemetry, narrow-scope build cost, live-overlay freshness, and cold-ratio findings.
-- [ ] Capture a comparable post-index local report and record candidate reduction, latency, and retained bytes.
+- [x] (2026-07-22 10:16Z) Captured paired clean-commit Dapper scan-only and Auto reports at commit 4c480b6d; the workspace query reduced warm median from 107.4 ms to 26.0 ms, examined facts from 49,181 to 27, and retained 1,979,756 bytes (16.2% of normalized-facts bytes).
 - [ ] Complete Milestone 3 using the measured promotion criteria, run focused tests, run guided review, fix confirmed findings, update this plan, and commit.
 - [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
 - [ ] Run cargo fmt --check, all-target/all-feature Clippy, and the complete nlp,python feature-enabled test gate.
@@ -140,7 +140,7 @@ The local pre-index report passed all cases. First/warm median milliseconds were
 
 Milestone 2 is implementation- and guided-review-complete. The posting index retains dense `(file_id, fact_id)` rows for kind, name, selective kind/name, exact callee/module role values, kwarg keywords, and compact source-trigram filters; facts and sources remain in their existing caches. Construction preflights fixed allocations, enforces a conservative peak estimate, polls cancellation through source, fact, finalization, census, and selection loops, and publishes only under an unchanged source generation. Forced scan/index tests cover every structural language, RQL/JSON equivalence, nested captures/negation, file/source/fact/pipeline/result cutoffs, update/update_all, add/delete, clones, and mutable overlays. The complete LSP suite remains green.
 
-The latest dirty-tree Dapper development run is encouraging but not yet authoritative: its workspace query reduced examined facts from 49,181 to 27 and warm median from the paired scan's earlier 98.5 ms to 25.2 ms. It retained 1,979,748 bytes against 12,215,566 normalized-facts bytes (16.2%), and its first request/warm median ratio was 8.24x. A clean milestone commit and paired rerun are required next.
+The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satisfies the Milestone 2 promotion gates. For `workspace-exact-sql-mapper-class`, scan-only first/warm median/p95 was 217.6/107.4/245.1 ms and Auto was 208.9/26.0/26.8 ms, a 4.13x warm-median improvement with an 8.04x first-to-warm ratio. Indexed warm execution reduced candidate/examined facts from 49,181 to 27, materialized facts from 49,181 to 24,269, and inspected source bytes from 1,159,390 to 917,649. The transition warmup built over 157 files and 85,325 facts in 210.9 ms; the retained index was 1,979,756 bytes versus 12,215,566 normalized-facts bytes, or 16.2%. Both paths returned the same 27 results without truncation or diagnostics.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -450,6 +450,33 @@ Milestone 2 focused validation before checkpoint:
     # 10 pass after review hardening
     cargo test indexed_ --lib
     # 10 pass, including all-language differential and RQL/JSON parity
+    cargo test --test code_query_pipelines --test code_query_public_api
+    # 73 + 5 pass
+    cargo test --test bifrost_mcp_server --test bifrost_tool_cli --test searchtools_service
+    # 20 + 26 + 167 pass, 1 intentionally ignored; rerun outside the sandbox because the linked primary-worktree cache path is read-only there
+    BIFROST_CACHE_DIR=<fresh temporary directory> scripts/test_python.sh
+    # 56 pass; isolation proved two earlier persisted-store hydration failures came from shared stale cache state, without modifying the primary worktree cache
+    cargo fmt --check
+    git diff --check
+    # pass
+
+Milestone 2 clean local benchmark pair:
+
+    implementation commit = 4c480b6d3707d4b380423026ecd0bb8caf6aa9c2
+    repository = DapperLib/Dapper at 72a54c475f75e18cb93cba0809d00a5e6e49efd9
+    machine = local Apple arm64 development build
+    cold contract = fresh MCP process and analyzer snapshot; empty in-memory query indexes and derived layers; pinned checkout and durable structural-facts store retained; Auto records one viable use before building on reuse
+    scan report = .cache/issue920-dapper-clean-scan/run-20260722T101518Z.json
+    auto report = .cache/issue920-dapper-clean-auto/run-20260722T101527Z.json
+    case = workspace-exact-sql-mapper-class; result cardinality = 27; truncated = false; diagnostics = []
+    scan first/median/p95 = 217.6/107.4/245.1 ms
+    auto first/median/p95 = 208.9/26.0/26.8 ms; first/median = 8.04x
+    scan scoped/admitted/candidate/materialized/examined facts = unavailable/49,181/49,181/49,181/49,181
+    auto scoped/admitted/candidate/materialized/examined facts = 85,325/49,181/27/24,269/27
+    scan/auto inspected source bytes = 1,159,390/917,649
+    transition build = 157 files; 85,325 facts; 12,215,566 normalized-facts bytes; 210.9 ms; no wait/cancel/fallback
+    warm index lifecycle = 1 ready lookup; 1 lookup; 1 hit; no miss/build/wait/cancel/fallback
+    retained posting bytes = 1,979,756, or 16.2% of normalized-facts bytes
 
 ## Interfaces and Dependencies
 
