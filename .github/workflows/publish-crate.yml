@@ -21,32 +21,30 @@ permissions:
   id-token: write
 
 jobs:
+  release-context:
+    name: validate release context
+    uses: ./.github/workflows/release-context.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
+
   publish:
     name: cargo publish
+    needs: release-context
     runs-on: ubuntu-latest
     environment: release
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
-
-      - name: Verify Cargo.toml version matches tag
-        shell: bash
-        run: |
-          tag="${{ inputs.tag || github.ref_name }}"
-          tag_version="${tag#v}"
-          crate_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
-          if [ "$tag_version" != "$crate_version" ]; then
-            echo "Tag $tag_version != Cargo.toml $crate_version" >&2
-            exit 1
-          fi
 
       - name: Authenticate to crates.io (trusted publishing)
         id: auth

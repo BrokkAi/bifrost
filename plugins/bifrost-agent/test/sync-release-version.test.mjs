@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const testDir = path.dirname(fileURLToPath(import.meta.url));
-const syncScript = path.resolve(testDir, "../../../scripts/sync-release-version.mjs");
+const releaseVersionScript = path.resolve(testDir, "../../../scripts/release-version.mjs");
 
 const jsonProjections = [
   "plugins/bifrost-agent/.codex-plugin/plugin.json",
@@ -33,7 +33,7 @@ const allProjections = [
 test("release version check accepts synced CRLF projections", async () => {
   const root = await createFixture("1.2.3", "1.2.3", "\r\n");
   try {
-    await execFileAsync(process.execPath, [syncScript, "--check"], { cwd: root });
+    await execFileAsync(process.execPath, [releaseVersionScript, "check"], { cwd: root });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -42,13 +42,52 @@ test("release version check accepts synced CRLF projections", async () => {
 test("release version update preserves CRLF projections", async () => {
   const root = await createFixture("1.2.4", "1.2.3", "\r\n");
   try {
-    await execFileAsync(process.execPath, [syncScript], { cwd: root });
-    await execFileAsync(process.execPath, [syncScript, "--check"], { cwd: root });
+    await execFileAsync(process.execPath, [releaseVersionScript, "sync"], { cwd: root });
+    await execFileAsync(process.execPath, [releaseVersionScript, "check"], { cwd: root });
 
     for (const relativePath of allProjections) {
       const source = await readFile(path.join(root, relativePath), "utf8");
       assert.equal(/(^|[^\r])\n/u.test(source), false, `${relativePath} contains a bare LF`);
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release version check rejects projection drift", async () => {
+  const root = await createFixture("1.2.4", "1.2.3", "\n");
+  try {
+    await assert.rejects(
+      execFileAsync(process.execPath, [releaseVersionScript, "check"], { cwd: root }),
+      /Release metadata is not synced to Cargo\.toml version 1\.2\.4/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitHub outputs are emitted only after successful release validation", async () => {
+  const root = await createFixture("1.2.3", "1.2.3", "\n");
+  const outputPath = path.join(root, "github-output.txt");
+  try {
+    await writeFile(outputPath, "");
+    await execFileAsync(
+      process.execPath,
+      [releaseVersionScript, "check", "--tag", "refs/tags/v1.2.3", "--github-output", outputPath],
+      { cwd: root },
+    );
+    assert.equal(await readFile(outputPath, "utf8"), "tag=v1.2.3\nversion=1.2.3\n");
+
+    await writeFile(outputPath, "");
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [releaseVersionScript, "check", "--tag", "v1.2.4", "--github-output", outputPath],
+        { cwd: root },
+      ),
+      /does not match Cargo\.toml package version/u,
+    );
+    assert.equal(await readFile(outputPath, "utf8"), "");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -60,6 +99,11 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     root,
     "Cargo.toml",
     `[package]${lineEnding}version = "${cargoVersion}"${lineEnding}`,
+  );
+  await writeFixtureFile(
+    root,
+    "pyproject.toml",
+    `[project]${lineEnding}dynamic = ["version"]${lineEnding}`,
   );
 
   const basicPlugin = { version: projectionVersion };

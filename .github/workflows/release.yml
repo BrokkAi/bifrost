@@ -16,41 +16,26 @@ env:
   ANDROID_API: '21'
 
 jobs:
-  notices:
-    name: generate Rust notices
-    runs-on: ubuntu-latest
+  release-context:
+    name: validate release context
+    uses: ./.github/workflows/release-context.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
     permissions:
       contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.96.0
-
-      - name: Install pinned cargo-about
-        run: cargo install --locked cargo-about --version 0.9.1 --features cli
-
-      - name: Fetch locked dependencies for offline notice report
-        run: cargo fetch --locked
-
-      - name: Generate Rust notice report
-        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
-
-      - name: Upload Rust notice report
-        uses: actions/upload-artifact@v6
-        with:
-          name: rust-third-party-licenses
-          path: dist/THIRD_PARTY_LICENSES.html
-          if-no-files-found: error
+  notices:
+    name: generate Rust notices
+    needs: release-context
+    uses: ./.github/workflows/rust-notices.yml
+    with:
+      ref: ${{ needs.release-context.outputs.tag }}
+    permissions:
+      contents: read
 
   build:
     name: build (${{ matrix.target }})
-    needs: notices
+    needs: [release-context, notices]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -91,14 +76,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download Rust notice report
         uses: actions/download-artifact@v7
@@ -169,7 +147,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          stage="${BIN_NAME}-${{ steps.tag.outputs.name }}-${{ matrix.target }}"
+          stage="${BIN_NAME}-${{ needs.release-context.outputs.tag }}-${{ matrix.target }}"
           mkdir -p "dist/${stage}"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${stage}/"
           cp LICENSE.md README.md licenses/GPL-3.0.md licenses/SOURCE.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
@@ -180,7 +158,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $stage = "${env:BIN_NAME}-${{ steps.tag.outputs.name }}-${{ matrix.target }}"
+          $stage = "${env:BIN_NAME}-${{ needs.release-context.outputs.tag }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/$stage/"
           Copy-Item LICENSE.md, README.md, licenses/GPL-3.0.md, licenses/SOURCE.md, licenses/THIRD_PARTY_LICENSES.html, licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/$stage/"
@@ -200,7 +178,7 @@ jobs:
 
   agent-plugin-package:
     name: stage agent plugin package
-    needs: build
+    needs: [release-context, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -208,14 +186,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -231,7 +202,7 @@ jobs:
       - name: Prepare agent plugin release metadata
         run: >
           node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ steps.tag.outputs.version }}"
+          --version "${{ needs.release-context.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
@@ -251,18 +222,18 @@ jobs:
           mkdir -p "$package_root" dist
           cp -R plugins/bifrost-agent "$package_root/bifrost-agent"
           cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "$package_root/bifrost-agent/"
-          tar -C "$package_root" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+          tar -C "$package_root" -czf "dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz" bifrost-agent
 
       - name: Upload staged agent plugin
         uses: actions/upload-artifact@v6
         with:
           name: bifrost-agent-package
-          path: dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz
+          path: dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz
           if-no-files-found: error
 
   agent-plugin-prepublish-smoke:
     name: prepublication agent plugin smoke
-    needs: [build, agent-plugin-package]
+    needs: [release-context, build, agent-plugin-package]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -270,7 +241,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -321,7 +292,7 @@ jobs:
 
   release:
     name: release
-    needs: [build, agent-plugin-prepublish-smoke]
+    needs: [release-context, build, agent-plugin-prepublish-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -329,14 +300,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
@@ -347,17 +311,17 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.release-context.outputs.tag }}
+          name: ${{ needs.release-context.outputs.tag }}
           generate_release_notes: true
           files: |
-            dist/${{ env.BIN_NAME }}-${{ steps.tag.outputs.name }}-*.tar.gz
-            dist/${{ env.BIN_NAME }}-${{ steps.tag.outputs.name }}-*.zip
-            dist/${{ env.BIN_NAME }}-${{ steps.tag.outputs.name }}-*.sha256
+            dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.tar.gz
+            dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.zip
+            dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.sha256
 
   pi-package:
     name: Pi package
-    needs: [release, publish-agent-plugin]
+    needs: [release-context, release, publish-agent-plugin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -365,14 +329,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@v7
@@ -394,7 +351,7 @@ jobs:
       - name: Prepare Pi release metadata
         run: >
           node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ steps.tag.outputs.version }}"
+          --version "${{ needs.release-context.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
@@ -417,12 +374,12 @@ jobs:
       - name: Upload Pi package artifact to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.release-context.outputs.tag }}
           files: dist/brokk-bifrost-agent-*.tgz
 
   vscode:
     name: vscode extension
-    needs: [release, publish-agent-plugin]
+    needs: [release-context, release, publish-agent-plugin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -430,14 +387,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@v7
@@ -459,7 +409,7 @@ jobs:
       - name: Prepare extension manifest
         run: >
           node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ steps.tag.outputs.version }}"
+          --version "${{ needs.release-context.outputs.version }}"
           --manifest editors/vscode/package.json
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
@@ -478,26 +428,26 @@ jobs:
         working-directory: editors/vscode
 
       - name: Package extension
-        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
+        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix"
         working-directory: editors/vscode
 
       - name: Upload editor artifact to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.release-context.outputs.tag }}
           files: dist/*.vsix
 
       - name: Publish extension to Visual Studio Marketplace
         run: >
           npx --no-install vsce publish
-          --packagePath "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
+          --packagePath "../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix"
         working-directory: editors/vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
   agent-plugin-release-smoke:
     name: packaged agent plugin smoke
-    needs: release
+    needs: [release-context, release]
     runs-on: macos-latest
     permissions:
       contents: read
@@ -505,14 +455,7 @@ jobs:
       - name: Checkout release scripts
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -529,7 +472,7 @@ jobs:
         shell: bash
         run: >
           tar -C "${RUNNER_TEMP}/bifrost-agent-release"
-          -xzf "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz"
+          -xzf "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz"
 
       - name: Smoke packaged launcher and MCP
         shell: bash
@@ -540,7 +483,7 @@ jobs:
 
   publish-agent-plugin:
     name: publish validated agent plugin
-    needs: [release, agent-plugin-release-smoke]
+    needs: [release-context, release, agent-plugin-release-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -548,14 +491,7 @@ jobs:
       - name: Checkout release scripts
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download validated agent plugin
         uses: actions/download-artifact@v7
@@ -566,21 +502,21 @@ jobs:
       - name: Upload agent plugin to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          files: dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz
+          tag_name: ${{ needs.release-context.outputs.tag }}
+          files: dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz
 
       - name: Announce release on Discord
         continue-on-error: true
         env:
           DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
         shell: bash
         run: bash scripts/announce-discord-release.sh
 
   sync-agent-plugin-release-metadata:
     name: sync generated release metadata
-    needs: [vscode, agent-plugin-release-smoke]
+    needs: [release-context, vscode, agent-plugin-release-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -593,20 +529,15 @@ jobs:
         with:
           ref: master
 
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: scripts/resolve-release-tag.sh
-
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
           node-version: 22
 
       - name: Confirm master is the released version
-        run: node scripts/check-release-version.mjs "${{ steps.tag.outputs.version }}"
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+        run: node scripts/release-version.mjs check --tag "$RELEASE_TAG"
 
       - name: Download release artifacts
         uses: actions/download-artifact@v7
@@ -617,7 +548,7 @@ jobs:
       - name: Prepare generated release metadata
         run: >
           node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ steps.tag.outputs.version }}"
+          --version "${{ needs.release-context.outputs.version }}"
           --manifest editors/vscode/package.json
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
@@ -626,7 +557,7 @@ jobs:
         run: node scripts/generate-amp-skill-bundle.mjs
 
       - name: Validate synchronized release projections
-        run: node scripts/sync-release-version.mjs --check
+        run: node scripts/release-version.mjs check
 
       - name: Validate agent plugin manifests
         run: node scripts/check-codex-plugin-manifest.mjs
@@ -659,5 +590,5 @@ jobs:
             editors/vscode/package.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: sync release metadata for ${{ steps.tag.outputs.name }}"
+          git commit -m "chore: sync release metadata for ${{ needs.release-context.outputs.tag }}"
           git push origin HEAD:master
