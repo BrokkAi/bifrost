@@ -371,6 +371,7 @@ fn test_hello_ts_skeletons() {
         r#"
         export class Greeter {
           greeting: string
+          this.greeting = message
           constructor(message: string) { ... }
           greet(): string { ... }
         }
