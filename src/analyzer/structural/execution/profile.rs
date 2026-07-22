@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::super::query::CodeQuery;
 use super::super::search::CodeQueryResult;
@@ -8,6 +9,43 @@ use super::plan::{
     PhysicalQueryPlan, PhysicalQueryPlanExplain,
 };
 use super::scheduler::SchedulerRunProfile;
+use crate::hash::HashSet;
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) enum QueryRetainedValueKind {
+    StructuralIndex,
+    DirectImportTopology,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+struct QueryRetainedValueIdentity {
+    kind: QueryRetainedValueKind,
+    address: usize,
+}
+
+/// Request-wide retained-memory census shared by parallel profile branches.
+/// The semantic kind is part of the identity so unrelated snapshot value
+/// types cannot collide even if an allocator later reuses an address.
+#[derive(Clone, Default)]
+pub(crate) struct QueryRetainedValueCensus {
+    observed: Arc<Mutex<HashSet<QueryRetainedValueIdentity>>>,
+}
+
+impl QueryRetainedValueCensus {
+    pub(crate) fn first_observation<T>(
+        &self,
+        kind: QueryRetainedValueKind,
+        value: &Arc<T>,
+    ) -> bool {
+        self.observed
+            .lock()
+            .expect("query retained-value census lock poisoned")
+            .insert(QueryRetainedValueIdentity {
+                kind,
+                address: Arc::as_ptr(value) as usize,
+            })
+    }
+}
 
 /// Structured observations from one physical query-plan execution.
 #[derive(Debug, Clone, Serialize)]
@@ -1196,6 +1234,17 @@ mod public_contract_tests {
     use super::*;
     use crate::analyzer::structural::execution::plan::{LogicalQueryOperator, LogicalQueryPlan};
     use crate::analyzer::structural::query::SCHEMA_VERSION;
+
+    #[test]
+    fn retained_value_census_deduplicates_by_kind_and_identity() {
+        let census = QueryRetainedValueCensus::default();
+        let value = Arc::new(7_u8);
+
+        assert!(census.first_observation(QueryRetainedValueKind::StructuralIndex, &value));
+        assert!(!census.first_observation(QueryRetainedValueKind::StructuralIndex, &value));
+        assert!(census.first_observation(QueryRetainedValueKind::DirectImportTopology, &value));
+        assert!(!census.first_observation(QueryRetainedValueKind::DirectImportTopology, &value));
+    }
 
     fn union_query() -> CodeQuery {
         CodeQuery::from_json(&json!({

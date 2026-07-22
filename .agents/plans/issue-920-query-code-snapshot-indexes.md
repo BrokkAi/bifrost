@@ -26,6 +26,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 11:32Z) Ran the Milestone 3 five-perspective guided review. It confirmed eager first-use Auto admission, duplicated failed-build fallback work, incomplete MultiAnalyzer generation identity, fixed-budget ownership, construction-memory, live-overlay replay, parser strictness, and cleanup findings.
 - [x] (2026-07-22 12:19Z) Resolved every confirmed Milestone 3 review finding: request-scoped Auto admission, partial-work fallback reuse, all-delegate generation identity, configured budget ownership, conservative construction preflight, post-replay generation rejection, strict benchmark parsing, and derived-layer-specific public telemetry all pass focused validation and all-target/all-feature Clippy.
 - [x] (2026-07-22 12:36Z) Completed Milestone 3 with clean-commit Gson evidence: 262 files/1,005 import edges, 112 exact results, warm median 335.5 to 263.2 ms, first/warm 2.16x, zero warm import resolution, and 20,262 retained bytes (0.44% of the persisted structural-facts payload).
+- [x] (2026-07-22 12:50Z) Centralized request-wide retained-value accounting behind a typed census and removed the per-file clone of bulk import facts; all-target/all-feature checking plus focused census and topology tests pass before the final architecture-review fixes.
 - [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
 - [ ] Run cargo fmt --check, all-target/all-feature Clippy, and the complete nlp,python feature-enabled test gate.
 - [ ] Open a draft PR, temporarily enable the benchmark workflow on the PR branch, collect the Ubuntu artifact, record baseline figures, and remove the temporary workflow trigger.
@@ -172,6 +173,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Decision: Keep both structural postings and direct-import topology memory-only for issue #920.
   Rationale: Neither layer has demonstrated the required process-restart benefit, smaller serialized representation, and complete durable invalidation key. Existing structural facts remain the sole persisted substrate.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Account request-wide retained snapshot values through a profile-owned census keyed by both semantic value kind and Arc identity.
+  Rationale: Parallel seed branches share retained values, so summing per-branch bytes double-counts memory; including the semantic kind prevents unrelated cached value types from colliding if they have the same allocator address.
   Date/Author: 2026-07-22 / Codex.
 
 ## Outcomes & Retrospective

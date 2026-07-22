@@ -950,13 +950,16 @@ impl RequestLocalDirectImportGraph {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return (true, false);
                 }
-                let imports = bulk_infos
-                    .as_ref()
-                    .and_then(|infos| infos.get(file))
-                    .cloned()
-                    .unwrap_or_else(|| provider.import_info_of(file));
+                let owned_imports;
+                let imports =
+                    if let Some(imports) = bulk_infos.as_ref().and_then(|infos| infos.get(file)) {
+                        imports.as_slice()
+                    } else {
+                        owned_imports = provider.import_info_of(file);
+                        &owned_imports
+                    };
                 let mut targets =
-                    crate::analyzer::resolve_imported_files_from_infos(provider, file, &imports)
+                    crate::analyzer::resolve_imported_files_from_infos(provider, file, imports)
                         .into_iter()
                         .filter(|target| self.analyzed.contains(target))
                         .collect::<Vec<_>>();

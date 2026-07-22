@@ -18,7 +18,8 @@ use super::execution::plan::{
 use super::execution::profile::{
     CodeQueryProfile, QueryAccessPathProfile, QueryAccessPathTermProfile, QueryCacheProfile,
     QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
-    QueryOperatorTermination, QueryOperatorWorkProfile,
+    QueryOperatorTermination, QueryOperatorWorkProfile, QueryRetainedValueCensus,
+    QueryRetainedValueKind,
 };
 use super::execution::scheduler::BoundedReadyScheduler;
 use super::facts::{FileFacts, Span};
@@ -890,7 +891,7 @@ struct QueryExecutionState<'a> {
     deferred_derived_builds: HashSet<DerivedLayerRequest>,
     cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
-    observed_snapshot_values: Option<Arc<Mutex<HashSet<usize>>>>,
+    retained_value_census: Option<QueryRetainedValueCensus>,
     access_mode: StructuralAccessMode,
     access_failure: Option<String>,
     parallel_seed_budget: Option<FairSeedBudgetLease>,
@@ -1257,7 +1258,7 @@ fn execute_internal_with_strategy(
         cache_profile: capture_profile.then(QueryCacheProfile::default),
         profile: capture_profile
             .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
-        observed_snapshot_values: capture_profile.then(|| Arc::new(Mutex::new(HashSet::default()))),
+        retained_value_census: capture_profile.then(QueryRetainedValueCensus::default),
         access_mode,
         access_failure: None,
         parallel_seed_budget: None,
@@ -2578,7 +2579,7 @@ fn execute_parallel_seed_union(
     let cancellation = state.cancellation;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
-    let observed_snapshot_values = state.observed_snapshot_values.clone();
+    let retained_value_census = state.retained_value_census.clone();
     let scheduler_workers = state.scheduler_workers;
     let base_budget = state.budget;
     let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
@@ -2607,7 +2608,7 @@ fn execute_parallel_seed_union(
                     cache_profile: profiling.then(QueryCacheProfile::default),
                     profile: profiling
                         .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
-                    observed_snapshot_values: observed_snapshot_values.clone(),
+                    retained_value_census: retained_value_census.clone(),
                     access_mode,
                     access_failure: None,
                     parallel_seed_budget: Some(lease.clone()),
@@ -3069,15 +3070,9 @@ fn prepare_seed_access(
                     }
                 }
                 let first_observation =
-                    state
-                        .observed_snapshot_values
-                        .as_ref()
-                        .is_some_and(|observed| {
-                            observed
-                                .lock()
-                                .expect("observed structural index lock poisoned")
-                                .insert(Arc::as_ptr(&index) as usize)
-                        });
+                    state.retained_value_census.as_ref().is_some_and(|census| {
+                        census.first_observation(QueryRetainedValueKind::StructuralIndex, &index)
+                    });
                 if first_observation {
                     access.retained_bytes =
                         access.retained_bytes.saturating_add(index.retained_bytes());
@@ -3862,15 +3857,10 @@ fn acquire_direct_import_layer(
                     }
                 }
                 let first_observation =
-                    state
-                        .observed_snapshot_values
-                        .as_ref()
-                        .is_some_and(|observed| {
-                            observed
-                                .lock()
-                                .expect("observed snapshot values lock poisoned")
-                                .insert(Arc::as_ptr(&layer) as usize)
-                        });
+                    state.retained_value_census.as_ref().is_some_and(|census| {
+                        census
+                            .first_observation(QueryRetainedValueKind::DirectImportTopology, &layer)
+                    });
                 if first_observation {
                     topology.retained_bytes = topology
                         .retained_bytes
