@@ -724,7 +724,7 @@ public class Consumer {
 }
 
 #[test]
-fn java_graph_strategy_connects_interface_methods_to_overrides_and_concrete_calls() {
+fn java_graph_strategy_separates_interface_calls_from_concrete_overrides() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
             "com/example/Service.java",
@@ -772,7 +772,11 @@ public class Consumer {
         .map(|hit| hit.snippet.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(3, method_hits.len(), "expected override plus two calls");
+    assert_eq!(
+        2,
+        method_hits.len(),
+        "expected override plus interface call"
+    );
     assert!(
         snippets
             .iter()
@@ -785,11 +789,13 @@ public class Consumer {
             .any(|snippet| snippet.contains("service.run()")),
         "interface-typed receiver call should be a reference: {snippets:#?}"
     );
-    assert!(
-        snippets
+    assert_eq!(
+        1,
+        method_hits
             .iter()
-            .any(|snippet| snippet.contains("impl.run()")),
-        "concrete receiver call should be a reference: {snippets:#?}"
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .count(),
+        "only the interface-typed call belongs to the interface method: {method_hits:#?}"
     );
 }
 
@@ -1168,15 +1174,26 @@ public abstract class Base implements Service {
 "#,
         ),
         (
+            "com/example/Mid.java",
+            "package com.example; public abstract class Mid implements Service { public abstract void run(Object arg); }\n",
+        ),
+        (
+            "com/example/Leaf.java",
+            "package com.example; public abstract class Leaf extends Mid {}\n",
+        ),
+        (
             "com/example/Consumer.java",
             r#"
 package com.example;
 
 public class Consumer {
-    void call(Service service, ServiceImpl impl, Base base) {
+    void call(Service service, ServiceImpl impl, Base base, Leaf leaf) {
         service.run("x");
         impl.run("x");
         base.run(new Object());
+        base.run("x");
+        leaf.run(new Object());
+        leaf.run("x");
     }
 }
 "#,
@@ -1195,27 +1212,42 @@ public class Consumer {
         .find(|cu| cu.signature() == Some("(String)"))
         .expect("missing concrete method");
 
-    let interface_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+    let interface_result = JavaUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&interface_target),
         &candidates,
         1000,
-    ));
+    );
+    assert_success_counts(interface_result.clone(), &interface_target, 2, 4);
+    let interface_hits = hits(interface_result);
     assert_hit_contains(&interface_hits, "void run(String arg)");
     assert_hit_contains(&interface_hits, "service.run(\"x\")");
-    assert_hit_contains(&interface_hits, "impl.run(\"x\")");
+    assert_eq!(
+        1,
+        interface_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .count(),
+        "only the interface-typed call belongs to the interface method: {interface_hits:#?}"
+    );
     assert_no_hit_contains(&interface_hits, "void run(Object arg)");
     assert!(
         interface_hits.iter().all(|hit| hit.line != 8),
         "base.run(Object) should not be an interface run(String) usage: {interface_hits:#?}"
     );
+    assert!(
+        interface_hits.iter().all(|hit| hit.line != 9),
+        "the inherited overload call should stay unproven until argument types are resolved: {interface_hits:#?}"
+    );
 
-    let concrete_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+    let concrete_result = JavaUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&concrete_target),
         &candidates,
         1000,
-    ));
+    );
+    assert_success_counts(concrete_result.clone(), &concrete_target, 2, 0);
+    let concrete_hits = hits(concrete_result);
     assert_hit_contains(&concrete_hits, "impl.run(\"x\")");
     assert!(
         concrete_hits.iter().all(|hit| hit.line != 6),
@@ -1302,7 +1334,7 @@ public class Consumer {
         &candidates,
         1000,
     );
-    assert_success_counts(result, &method_target, 0, 1);
+    assert_success_counts(result, &method_target, 0, 0);
 }
 
 #[test]
@@ -1587,8 +1619,10 @@ public class Runner {
     }
 
     public String run() {
-        ConsoleHandler console = new ConsoleHandler();
-        console.handle("Console"); // direct-console-handler
+        Handler handler = new ConsoleHandler();
+        ConsoleHandler direct = new ConsoleHandler();
+        handler.handle("Interface"); // interface-handler
+        direct.handle("Console"); // direct-console-handler
         new UnrelatedHandler().handle("Other"); // incompatible-concrete-handler
         return makeAnonymous().handle("Anonymous"); // anonymous-handler-return
     }
@@ -1624,7 +1658,17 @@ public class Runner {
         &candidates,
         1000,
     ));
+    assert_hit_contains(&interface_hits, "interface-handler");
     assert_hit_contains(&interface_hits, "anonymous-handler-return");
+    assert_no_hit_line(&interface_hits, 16);
+    assert_eq!(
+        2,
+        interface_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .count(),
+        "only the two interface-contract calls should be references: {interface_hits:#?}"
+    );
 }
 
 #[test]

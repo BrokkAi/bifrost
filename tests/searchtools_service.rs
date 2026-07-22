@@ -256,6 +256,59 @@ fn query_code_loads_workspace_rql_and_json_files() {
 }
 
 #[test]
+fn query_code_exposes_planning_only_explain_and_opt_in_profile_reports() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "class App:\n    pass\n")
+        .build();
+    let queries = project.root().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(
+        queries.join("app-profile.rql"),
+        "(profile (class :name \"App\"))\n",
+    )
+    .expect("profile RQL query");
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let ordinary = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "match": { "kind": "class", "name": "App" } }),
+        )
+        .expect("ordinary query");
+    assert!(ordinary.get("format").is_none(), "{ordinary}");
+
+    let explain = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({
+                "execution_mode": "explain",
+                "match": { "kind": "class", "name": "App" }
+            }),
+        )
+        .expect("explain query");
+    assert_eq!(explain["format"], "bifrost_code_query_explain/v1");
+    assert_eq!(explain["scheduling"]["selected"], "sequential");
+    assert!(explain.get("results").is_none(), "{explain}");
+
+    let profile = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": "queries/app-profile.rql" }),
+        )
+        .expect("profile query file");
+    assert_eq!(profile["format"], "bifrost_code_query_profile/v1");
+    assert_eq!(profile["result"], ordinary);
+    assert!(
+        profile["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "{profile}"
+    );
+    assert_eq!(profile["scheduling"]["peak_concurrency"], 1);
+}
+
+#[test]
 fn query_code_file_input_reports_validation_and_workspace_errors() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", "class App:\n    pass\n")
@@ -3820,6 +3873,88 @@ public class OverrideChild extends Base {
 }
 
 #[test]
+fn java_scan_usages_separates_interface_and_concrete_method_ranges() {
+    let runner = r#"package com.example;
+public class Runner {
+    Handler makeAnonymous() {
+        return new Handler() {
+            @Override public String handle(String value) { return value; }
+        };
+    }
+    String run() {
+        Handler handler = new ConsoleHandler();
+        ConsoleHandler direct = new ConsoleHandler();
+        return handler.handle(" Ada ") + ":" + direct.handle(" Grace ") + ":" + makeAnonymous().handle(" Linus ");
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Handler.java",
+            "package com.example; public interface Handler { String handle(String value); }\n",
+        )
+        .file(
+            "com/example/ConsoleHandler.java",
+            "package com.example; public class ConsoleHandler implements Handler { @Override public String handle(String value) { return value.trim(); } }\n",
+        )
+        .file("com/example/Runner.java", runner)
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let return_line = runner
+        .lines()
+        .find(|line| line.contains("return handler.handle"))
+        .expect("return line");
+    let ranges = return_line
+        .match_indices(".handle")
+        .map(|(byte, _)| {
+            let start = return_line[..byte].chars().count() + 2;
+            (start, start + "handle".chars().count())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(3, ranges.len());
+
+    for (symbol, expected_ranges, expected_total_hits) in [
+        ("com.example.Handler.handle", vec![ranges[0], ranges[2]], 3),
+        ("com.example.ConsoleHandler.handle", vec![ranges[1]], 2),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_reference",
+                &serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string(),
+            )
+            .expect("scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let usage = only_result(&value);
+        assert_eq!("found", usage["status"], "{symbol}: {value}");
+        assert_eq!(
+            expected_total_hits, usage["total_hits"],
+            "{symbol}: {value}"
+        );
+        assert_eq!(0, usage["unproven_hits"], "{symbol}: {value}");
+
+        let runner_hits = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|file| file["path"] == "com/example/Runner.java")
+            .and_then(|file| file["hits"].as_array())
+            .expect("Runner.java hits");
+        let actual_ranges = runner_hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit["column"].as_u64().unwrap() as usize,
+                    hit["end_column"].as_u64().unwrap() as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected_ranges, actual_ranges, "{symbol}: {value}");
+    }
+}
+
+#[test]
 fn scan_usages_java_varargs_calls_stay_narrow() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -4624,6 +4759,120 @@ void entry(Target target) {
     let usage = only_result(&value);
     assert_eq!(0, usage["total_hits"], "payload: {value}");
     assert_eq!(1, usage["unproven_hits"], "payload: {value}");
+}
+
+#[test]
+fn scan_usages_cpp_excludes_out_of_line_definitions_from_external_hits() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/service.h",
+            r#"#pragma once
+namespace example {
+int compute(int value);
+struct Service {
+    int run(int value);
+};
+}
+"#,
+        )
+        .file(
+            "src/service.cpp",
+            r#"#include "service.h"
+namespace example {
+int compute(int value) { return value + 1; }
+int Service::run(int value) { return compute(value); }
+}
+"#,
+        )
+        .file(
+            "src/main.cpp",
+            r#"#include "service.h"
+int use(example::Service& service) {
+    return service.run(example::compute(1));
+}
+"#,
+        )
+        .file(
+            "src/unresolved.cpp",
+            "int Service::run(int value) { return value; }\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (target, expected_total, definition_line, expected_column, token_len) in [
+        (
+            r#"{"path":"include/service.h","line":3,"column":5,"symbol":"example.compute"}"#,
+            2,
+            3,
+            33,
+            7,
+        ),
+        (
+            r#"{"path":"include/service.h","line":5,"column":9,"symbol":"example.Service.run"}"#,
+            1,
+            4,
+            20,
+            3,
+        ),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_location",
+                &format!(r#"{{"targets":[{target}],"include_tests":true}}"#),
+            )
+            .expect("C++ location scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let result = only_result(&value);
+
+        assert_eq!("found", result["status"], "payload: {value}");
+        assert_eq!(expected_total, result["total_hits"], "payload: {value}");
+        assert_eq!(1, result["definition_sites_excluded"], "payload: {value}");
+        assert_eq!("src/main.cpp", result["files"][0]["path"], "{value}");
+        assert_eq!(3, result["files"][0]["hits"][0]["line"], "{value}");
+        assert_eq!(
+            expected_column, result["files"][0]["hits"][0]["column"],
+            "{value}"
+        );
+        assert_eq!(
+            expected_column + token_len,
+            result["files"][0]["hits"][0]["end_column"],
+            "{value}"
+        );
+        assert!(
+            result["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .all(|file| file["path"] != "src/service.cpp"
+                    || file["hits"]
+                        .as_array()
+                        .expect("hits")
+                        .iter()
+                        .all(|hit| hit["line"] != definition_line)),
+            "out-of-line definition leaked into external usages: {value}"
+        );
+    }
+
+    let unresolved_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"include/service.h","line":5,"column":9,"symbol":"example.Service.run"}],"paths":["src/unresolved.cpp"],"include_tests":true}"#,
+        )
+        .expect("path-scoped unresolved definition scan succeeds");
+    let unresolved_value: Value =
+        serde_json::from_str(&unresolved_payload).expect("valid response");
+    let unresolved = only_result(&unresolved_value);
+    assert_eq!(0, unresolved["total_hits"], "{unresolved_value}");
+    assert_eq!(0, unresolved["unproven_hits"], "{unresolved_value}");
+    assert_eq!(
+        1, unresolved["definition_sites_excluded"],
+        "{unresolved_value}"
+    );
+    assert!(
+        unresolved["files"].as_array().is_none_or(Vec::is_empty),
+        "unresolved definition must not render as a usage row: {unresolved_value}"
+    );
 }
 
 #[test]

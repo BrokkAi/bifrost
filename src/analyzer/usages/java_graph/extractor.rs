@@ -8,9 +8,10 @@ use crate::analyzer::usages::java_graph::resolver::{
     bare_field_context_matches_target, bare_method_context_matches_target,
     constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
     is_declaration_name, is_ignored_type_context, java_method_signatures_match,
-    nested_type_for_owner, node_text, receiver_matches_target, resolve_field_access_type,
-    resolve_field_access_type_segments, resolve_non_nested_type_from_node, resolve_type_from_node,
-    resolve_type_segments, same_owner_context, seed_class_binding,
+    nested_type_for_owner, node_text, receiver_matches_target, receiver_type_matches_target,
+    resolve_field_access_type, resolve_field_access_type_segments,
+    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
+    same_owner_context, seed_class_binding,
 };
 use crate::analyzer::usages::java_graph::return_type::{
     FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
@@ -60,6 +61,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) class_ranges: ClassRangeIndex,
     pub(super) method_call_return_cache:
         RefCell<HashMap<MethodCallReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
+    pub(super) receiver_target_match_cache: RefCell<HashMap<String, ReceiverTargetMatch>>,
     pub(super) method_return_cache: &'a MethodReturnCache,
     pub(super) method_anonymous_return_cache: &'a MethodAnonymousReturnCache,
     pub(super) file_return_cache: &'a FileReturnCache,
@@ -114,6 +116,7 @@ pub(super) fn scan_file(
         limit_exceeded: state.limit_exceeded,
         class_ranges: ClassRangeIndex::build(analyzer, file),
         method_call_return_cache: RefCell::new(HashMap::default()),
+        receiver_target_match_cache: RefCell::new(HashMap::default()),
         method_return_cache: return_caches.method_return,
         method_anonymous_return_cache: return_caches.method_anonymous_return,
         file_return_cache: return_caches.file_return,
@@ -279,10 +282,11 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if ctx.spec.kind == TargetKind::Type {
             ctx.bindings.declare_shadow(binding_name.to_string());
         } else if let Some(resolved) = resolved_type.as_ref()
-            && ctx
-                .spec
-                .receiver_owner_fq_names
-                .contains(&resolved.fq_name())
+            && (ctx.spec.kind == TargetKind::Method
+                || ctx
+                    .spec
+                    .receiver_owner_fq_names
+                    .contains(&resolved.fq_name()))
         {
             ctx.bindings
                 .seed_symbol(binding_name.to_string(), resolved.fq_name());
@@ -308,10 +312,11 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .child_by_field_name("type")
         .and_then(|type_node| resolve_type_from_node(type_node, ctx));
     if let Some(resolved) = resolved
-        && ctx
-            .spec
-            .receiver_owner_fq_names
-            .contains(&resolved.fq_name())
+        && (ctx.spec.kind == TargetKind::Method
+            || ctx
+                .spec
+                .receiver_owner_fq_names
+                .contains(&resolved.fq_name()))
     {
         ctx.bindings
             .seed_symbol(binding_name.to_string(), resolved.fq_name());
@@ -634,16 +639,28 @@ fn method_reference_target_resolution(
     ctx: &mut ScanCtx<'_>,
 ) -> MethodReferenceTargetResolution {
     let owners = method_reference_owner_fq_names(receiver, ctx);
+    let receiver_matches = owners
+        .iter()
+        .filter_map(|owner| ctx.analyzer.definitions(owner).next())
+        .map(|owner| receiver_type_matches_target(&owner, ctx))
+        .collect::<Vec<_>>();
+    if receiver_matches
+        .iter()
+        .all(|outcome| *outcome == ReceiverTargetMatch::Incompatible)
+        && !receiver_matches.is_empty()
+    {
+        return MethodReferenceTargetResolution::NotTarget;
+    }
+    if !receiver_matches.contains(&ReceiverTargetMatch::Matched) {
+        return MethodReferenceTargetResolution::Unproven;
+    }
     let mut candidates = Vec::new();
     for owner in &owners {
         candidates.extend(method_reference_candidates_for_owner(owner, ctx));
     }
     let matching = candidates
         .iter()
-        .filter(|candidate| {
-            method_reference_candidate_has_target_owner(candidate, ctx)
-                && java_method_signatures_match(ctx.java, &ctx.spec.target, candidate)
-        })
+        .filter(|candidate| ctx.spec.targets.contains(*candidate))
         .count();
     if matching == 0 {
         return MethodReferenceTargetResolution::NotTarget;
@@ -653,14 +670,6 @@ fn method_reference_target_resolution(
     } else {
         MethodReferenceTargetResolution::Unproven
     }
-}
-
-fn method_reference_candidate_has_target_owner(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    let fqn = candidate.fq_name();
-    let Some((owner, _)) = fqn.rsplit_once('.') else {
-        return false;
-    };
-    ctx.spec.declaration_owner_fq_names.contains(owner)
 }
 
 fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> Vec<String> {

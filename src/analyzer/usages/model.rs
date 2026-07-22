@@ -19,7 +19,7 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// hierarchy) care about ordinary external `Reference` hits and override /
 /// implementation declarations. The LSP `textDocument/references` surface (IDE
 /// "find references") also wants import/re-export bindings and self-receiver
-/// references.
+/// references, plus definition sites used to connect declarations to bodies.
 /// Keeping all in one graph with a kind lets each consumer choose through
 /// [`UsageHitSurface`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -29,6 +29,9 @@ pub enum UsageHitKind {
     Import,
     Reexport,
     SelfReceiver,
+    /// A callable definition corresponding to a separate declaration. Definition
+    /// sites are editor-visible for navigation but are not runtime usages.
+    Definition,
     /// A declaration that overrides/implements the queried declaration.
     OverrideDeclaration,
 }
@@ -58,6 +61,7 @@ impl UsageHitKind {
             UsageHitKind::Import => "import",
             UsageHitKind::Reexport => "reexport",
             UsageHitKind::SelfReceiver => "self_receiver",
+            UsageHitKind::Definition => "definition",
             UsageHitKind::OverrideDeclaration => "override_declaration",
         }
     }
@@ -78,7 +82,10 @@ impl UsageHitKind {
         match self {
             UsageHitKind::Reference => None,
             UsageHitKind::OverrideDeclaration => Some("override_declaration"),
-            UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::SelfReceiver => None,
+            UsageHitKind::Import
+            | UsageHitKind::Reexport
+            | UsageHitKind::SelfReceiver
+            | UsageHitKind::Definition => None,
         }
     }
 }
@@ -139,6 +146,12 @@ impl UsageHit {
     /// Reclassify this hit as a self/this receiver reference.
     pub fn into_self_receiver(mut self) -> Self {
         self.kind = UsageHitKind::SelfReceiver;
+        self
+    }
+
+    /// Reclassify this hit as an editor-visible definition site.
+    pub fn into_definition(mut self) -> Self {
+        self.kind = UsageHitKind::Definition;
         self
     }
 
@@ -320,14 +333,20 @@ impl FuzzyResult {
         map.insert(target.clone(), hits);
         let mut unproven_map = HashMap::default();
         let mut unproven_total_map = HashMap::default();
-        let unproven_total = unproven.len();
+        let (external, editor_only): (Vec<_>, Vec<_>) = unproven
+            .into_iter()
+            .partition(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages));
+        let unproven_total = external.len();
         if unproven_total > 0 {
-            let capped = unproven
+            unproven_total_map.insert(target.clone(), unproven_total);
+        }
+        if unproven_total > 0 || !editor_only.is_empty() {
+            let capped = external
                 .into_iter()
+                .chain(editor_only)
                 .take(Self::MAX_UNPROVEN_HITS_PER_SYMBOL)
                 .collect();
             unproven_map.insert(target.clone(), capped);
-            unproven_total_map.insert(target, unproven_total);
         }
         FuzzyResult::Success {
             hits_by_overload: map,
@@ -666,6 +685,16 @@ mod tests {
             "override",
         )
         .into_override_declaration();
+        let definition = UsageHit::new(
+            project_file("Foo.cpp"),
+            18,
+            180,
+            190,
+            unit.clone(),
+            1.0,
+            "void Foo::target() {}",
+        )
+        .into_definition();
 
         let mut hits = BTreeSet::new();
         hits.insert(reference.clone());
@@ -673,6 +702,7 @@ mod tests {
         hits.insert(reexport.clone());
         hits.insert(self_receiver.clone());
         hits.insert(override_declaration.clone());
+        hits.insert(definition.clone());
         let result = FuzzyResult::success(unit, hits);
 
         assert_eq!(
@@ -688,6 +718,7 @@ mod tests {
                 import,
                 reexport,
                 self_receiver,
+                definition,
                 override_declaration,
             ]
             .into_iter()

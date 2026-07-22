@@ -1,5 +1,7 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
-use super::schema::{RqlForm, RqlFormClass, RqlProperty, resolve_rql_schema_version};
+use super::schema::{
+    CodeQueryExecutionMode, RqlForm, RqlFormClass, RqlProperty, resolve_rql_schema_version,
+};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
 use crate::schema_version::SchemaVersionResolution;
@@ -182,12 +184,18 @@ pub(crate) fn validate_policy_selector_expr(expr: &Expr) -> Result<(), QueryExpr
         if matches!(&current.kind, ExprKind::List(_))
             && let Some(head) = items.first()
             && let Some(label) = head.as_symbol()
-            && let Some(form @ (RqlForm::Limit | RqlForm::ResultDetail)) =
-                RqlForm::from_label(label)
+            && let Some(
+                form @ (RqlForm::Limit
+                | RqlForm::ResultDetail
+                | RqlForm::Explain
+                | RqlForm::Profile),
+            ) = RqlForm::from_label(label)
         {
             let (path, authored_label) = match form {
                 RqlForm::Limit => ("limit", "limit"),
                 RqlForm::ResultDetail => ("result_detail", "result-detail"),
+                RqlForm::Explain => ("execution_mode", "explain"),
+                RqlForm::Profile => ("execution_mode", "profile"),
                 _ => unreachable!("output-control forms were filtered above"),
             };
             return Err(QueryExprError {
@@ -270,6 +278,22 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 Value::String(result_detail_arg(&items[1])?),
             )
             .at(expr)?;
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Explain | RqlForm::Profile => {
+            expect_len(expr, items, 2, head)?;
+            let mut query = query_object(&items[1])?;
+            let mode = if form == RqlForm::Explain {
+                CodeQueryExecutionMode::Explain
+            } else {
+                CodeQueryExecutionMode::Profile
+            };
+            insert_unique(
+                &mut query,
+                "execution_mode",
+                Value::String(mode.label().to_string()),
+            )
+            .at(&items[0])?;
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Inside | RqlForm::NotInside => {
@@ -688,6 +712,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Language
         | RqlForm::Limit
         | RqlForm::ResultDetail
+        | RqlForm::Explain
+        | RqlForm::Profile
         | RqlForm::Inside
         | RqlForm::NotInside
         | RqlForm::Union
@@ -993,6 +1019,8 @@ mod tests {
                 "(union (call) (result-detail full (call)))",
                 "result-detail",
             ),
+            ("(explain (call))", "explain"),
+            ("(profile (call))", "profile"),
         ] {
             let expr = parse_query_expr(source).unwrap();
             let error = validate_policy_selector_expr(&expr).unwrap_err();
@@ -1198,6 +1226,20 @@ mod tests {
                 "match": { "kind": "call", "callee": { "name": "eval" } }
             }))
         );
+    }
+
+    #[test]
+    fn structural_query_sexp_lowers_execution_mode_wrappers() {
+        for (source, expected) in [
+            ("(explain (call))", "explain"),
+            ("(profile (call))", "profile"),
+        ] {
+            assert_eq!(canonical(source)["execution_mode"], expected, "{source}");
+        }
+
+        let source = "(profile (explain (call)))";
+        let error = CodeQuery::from_sexp(source).unwrap_err();
+        assert!(error.contains("duplicate S-expression field `execution_mode`"));
     }
 
     #[test]

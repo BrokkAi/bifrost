@@ -1,14 +1,16 @@
 # Bifrost Agent Plugin
 
-This package installs Bifrost's MCP server configuration as an agent plugin for
-Codex, Claude Code, and Cursor, and ships a generated Amp skill bundle. It does
-not bundle the Bifrost binary; it
-installs a launcher that resolves a released Bifrost binary and makes a
-multi-language code analysis subset of the `bifrost` MCP tools discoverable
-through each host's plugin or skill system. It also bundles the Brokk/Bifrost
-workflow skills and specialist agents so the plugin is a one-stop shop for code
-intelligence, GitHub issue work, and code review workflows in hosts that support
-the broader plugin package.
+This directory is the shared source for Bifrost integrations in Pi, Codex,
+Claude Code, Cursor, and Amp. Every host reuses the same launcher and pinned
+release metadata, but each distribution includes only the resources its host
+supports. The npm package `@brokk/bifrost-agent` contains the Pi extension and
+three generic code-intelligence skills. The Claude, Codex, and Cursor plugin
+manifests expose their host-specific MCP configuration, broader workflow skills,
+and specialist agents, while Amp uses its generated skill bundle.
+
+None of these distributions bundles the Bifrost binary. The launcher resolves a
+released Bifrost binary and makes a multi-language code-analysis subset of the
+`bifrost` MCP tools discoverable through each host's plugin or skill system.
 
 The Claude Code and Codex stable install name is `brokk`. Cursor uses the
 Cursor-facing plugin name `bifrost` so the package is discoverable as Bifrost in
@@ -67,6 +69,122 @@ binary:
 cargo build --bin bifrost
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" node plugins/bifrost-agent/bin/bifrost-launcher.mjs --root . --mcp "symbol|extended"
 ```
+
+## Pi Install
+
+Pi loads a native extension from this package. The extension resolves the same
+pinned, checksum-verified Bifrost binary as the other hosts, starts one stdio
+MCP child for the session's workspace, and closes the child on session shutdown
+or reload. Pi-visible tools use a `bifrost_` namespace, so Bifrost's canonical
+MCP `query_code` tool appears as `bifrost_query_code`. The extension adds a
+short system-prompt note that explains this host-specific rendering; the three
+canonical `bifrost-code-navigation`, `bifrost-code-reading`, and
+`bifrost-codebase-search` skills remain shared without Pi-specific copies.
+
+Install a local checkout after installing its package dependencies:
+
+```bash
+cd plugins/bifrost-agent
+npm install
+pi install "$(pwd)"
+```
+
+For development against this checkout's Rust binary:
+
+```bash
+cargo build --bin bifrost
+cd plugins/bifrost-agent
+npm install
+BIFROST_BINARY_PATH="$(cd ../.. && pwd)/target/debug/bifrost" pi -e "$(pwd)"
+```
+
+To install from GitHub before an npm release, clone the repository and install
+the package directory as a local Pi package:
+
+```bash
+git clone https://github.com/BrokkAi/bifrost.git
+cd bifrost/plugins/bifrost-agent
+npm install
+pi install "$(pwd)"
+```
+
+After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
+
+```bash
+pi install npm:@brokk/bifrost-agent@0.8.7
+```
+
+Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
+workspace. The default enables symbol navigation, structural queries, and file
+discovery/ranking. The settings list can also enable code-quality reports, Git
+history, raw text search, or JSON/XML transforms. It never offers Bifrost
+workspace-switching tools because Pi owns the session workspace.
+Selections are stored in separate canonical-workspace files under
+`<Pi agent directory>/bifrost/workspaces/` (normally
+`~/.pi/agent/bifrost/workspaces/`), so they survive new sessions without
+adding configuration to the repository or making concurrent workspaces rewrite
+the same settings document. If a settings file is malformed, interactive Pi
+reports the problem and starts with Bifrost disabled so `/bifrost` can repair
+the selection. Pi modes without a UI context report the failure through the
+extension error path and leave Bifrost unstarted instead of silently enabling
+defaults; Pi itself can continue without Bifrost.
+
+Changing a capability may restart the Bifrost child when it requires another
+existing MCP server toolset. Tools discovered earlier remain registered with Pi
+but are removed from Pi's active tool set when disabled or rejected by Pi's
+command-line tool filters. The namespace note is omitted when Pi accepts no
+Bifrost tools. A failed change before connection retirement leaves the prior
+connection and saved selection active. If retiring that connection fails, the
+saved selection remains but Bifrost tools are disabled because cleanup could
+not be confirmed. In interactive Pi, startup, reconnect, and background
+connection failures use Pi's error notifications; in modes without a UI
+context, startup failures use Pi's extension error path. The extension does not
+write directly into the TUI with `console.log` or `console.error`.
+
+Tool calls time out after 300 seconds; startup times out after 60 seconds.
+Cancellation stops the Pi request promptly, though the current Bifrost stdio
+server may finish analyzer work before it reads the MCP cancellation
+notification.
+
+Bifrost results follow Pi's normal two-level output handling. The TUI shows a
+five-visual-line preview and expands the bounded result with Pi's tool-output
+shortcut (`Ctrl+O` by default). The model receives at most the first 2,000 lines
+or 50 KB. When complete text exceeds that limit, the result includes the path
+to a dedicated temporary overflow file containing the full output.
+
+For a real-host smoke from the repository root, build Bifrost and ask Pi to
+exercise navigation plus both supported structural-query inputs:
+
+```bash
+cargo build --bin bifrost
+BIFROST_BINARY_PATH="$PWD/target/debug/bifrost" \
+BIFROST_LAUNCHER_AUTO_INSTALL=0 \
+pi --no-session -e "$PWD/plugins/bifrost-agent" -p \
+  'Use the Bifrost tools directly. First call bifrost_get_summaries for src/mcp_common.rs. Then call bifrost_query_code with inline canonical JSON fields match.kind=declaration and limit=1. Then call bifrost_query_code with only query_file="docs/fixtures/ten-minute-evaluation/queries/find-audit.rql". Report whether all three calls succeeded and include one repository-relative path from each result.'
+```
+
+Expect all three calls to succeed. The saved query should return
+`docs/fixtures/ten-minute-evaluation/src/app.py`; this also proves that
+`query_file` is resolved from Pi's explicit session workspace rather than from
+the installed package directory. Use Pi's JSON mode for protocol-level evidence
+when needed; Bifrost diagnostics remain on stderr and must not appear as JSON
+messages on stdout.
+
+Package maintainers should keep `package.json`, `package-lock.json`,
+`bifrost-release.json`, and the Rust crate version aligned. Validate the package before publication:
+
+```bash
+cd plugins/bifrost-agent
+npm ci
+npm run check
+npm test
+npm run test:packed
+npm pack --dry-run
+npm publish --dry-run
+```
+
+A real publication requires npm credentials and an unused matching version; the
+repository does not imply that npm publishing is configured automatically.
 
 ## Codex Install
 

@@ -146,12 +146,24 @@ export type RqlQueryResultItem =
 
 export interface RqlQueryResponse {
   text: string;
+  mode?: "results" | "explain" | "profile";
+  report?: unknown;
   results?: RqlQueryResultItem[];
 }
 
 export interface RqlQueryResult {
   text: string;
+  mode: "results" | "explain" | "profile";
+  report?: unknown;
   results: RqlQueryResultItem[];
+}
+
+export function formatRqlQueryOutput(response: RqlQueryResult): string {
+  if (response.mode !== "profile" || response.report === undefined) {
+    return response.text;
+  }
+
+  return `${response.text.trimEnd()}\n\nCodeQuery profile report:\n${JSON.stringify(response.report, null, 2)}\n`;
 }
 
 export interface RqlQueryFileGroup {
@@ -189,7 +201,12 @@ export async function runRqlQuery(
       );
       return undefined;
     }
-    return { text: response.text, results: response.results };
+    return {
+      text: response.text,
+      mode: response.mode ?? "results",
+      report: response.report,
+      results: response.results
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     runner.showError(`Bifrost RQL query failed: ${message}`);

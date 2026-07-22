@@ -39,7 +39,7 @@ import {
   releaseTargetFor
 } from "./provisioning";
 import type { RqlQueryDocument, RqlQueryResponse, RqlQueryResultItem } from "./rql_query";
-import { queryResultRange, runRqlQuery } from "./rql_query";
+import { formatRqlQueryOutput, queryResultRange, runRqlQuery } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
 import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
 import { RUNE_IR_LANGUAGE_ID, RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
@@ -219,9 +219,15 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
     return;
   }
 
+  if (response.mode !== "results") {
+    outputChannel?.appendLine(`\n[CodeQuery ${response.mode}]\n${formatRqlQueryOutput(response)}`);
+    outputChannel?.show(true);
+  }
   rqlQueryResults.update(response);
-  await vscode.commands.executeCommand("bifrost.queryResults.focus");
-  if (response.results.length === 0) {
+  if (response.mode !== "explain") {
+    await vscode.commands.executeCommand("bifrost.queryResults.focus");
+  }
+  if (response.mode === "results" && response.results.length === 0) {
     void vscode.window.showInformationMessage("Bifrost RQL query returned no results.");
   }
 }

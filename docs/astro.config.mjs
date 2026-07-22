@@ -112,6 +112,7 @@ export default defineConfig({
             { label: 'Agent Result Safety', slug: 'agent-result-safety' },
             { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'JSON CodeQuery', slug: 'code-query-json' },
+            { label: 'Explain and Profile', slug: 'code-query-explain-profile' },
             {
               label: 'Rune Query Language',
               items: [

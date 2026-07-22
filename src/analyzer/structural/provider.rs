@@ -3,14 +3,13 @@
 //!
 //! Follows the `import_analysis_provider()` idiom: `IAnalyzer` has a default
 //! `structural_search_providers()` returning nothing; each language analyzer
-//! whose adapter supplies a [`StructuralSpec`] exposes its inner
+//! whose adapter supplies a [`super::spec::StructuralSpec`] exposes its inner
 //! `TreeSitterAnalyzer` as a provider, and `MultiAnalyzer` concatenates its
 //! delegates'. Each provider covers exactly one language.
 
 use super::extract::extract_file_facts;
 use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
-use super::spec::StructuralSpec;
 use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use crate::analyzer::{Language, ProjectFile};
 use moka::sync::Cache;
@@ -35,6 +34,19 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// spec.
     fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>>;
 
+    /// Normalized facts plus the exact analyzer-generation cache outcome when
+    /// the provider can report it. Third-party providers may retain the
+    /// default `Unknown` outcome while still supplying facts normally.
+    fn structural_facts_with_outcome(
+        &self,
+        file: &ProjectFile,
+    ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
+        (
+            self.structural_facts(file),
+            StructuralFactsCacheOutcome::Unknown,
+        )
+    }
+
     /// How many extraction (parse + normalize) runs this provider has
     /// performed — i.e. facts-cache misses. Lets planner tests assert that
     /// pruning skipped a file and that repeated queries hit the cache.
@@ -47,6 +59,17 @@ pub trait StructuralSearchProvider: Send + Sync {
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
 
     fn structural_supports_role(&self, role: Role) -> bool;
+}
+
+/// Where one structural-facts lookup was satisfied. This distinguishes the
+/// analyzer-generation cache from request-local CodeQuery caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralFactsCacheOutcome {
+    MemoryHit,
+    PersistedHydration,
+    Extracted,
+    Unavailable,
+    Unknown,
 }
 
 /// Byte-budgeted facts cache keyed by file and validated by a hash of the
@@ -96,19 +119,28 @@ impl StructuralFactsCache {
         source: &str,
         load: impl FnOnce() -> Option<FileFacts>,
         extract: impl FnOnce() -> Option<FileFacts>,
-    ) -> Option<Arc<FileFacts>> {
+    ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
         let source_hash = hash_source(source);
         if let Some(entry) = self.cache.get(file)
             && entry.source_hash == source_hash
         {
-            return Some(Arc::clone(&entry.facts));
+            return (
+                Some(Arc::clone(&entry.facts)),
+                StructuralFactsCacheOutcome::MemoryHit,
+            );
         }
-        let facts = if let Some(facts) = load() {
+        let (facts, outcome) = if let Some(facts) = load() {
             self.hydrations.fetch_add(1, Ordering::Relaxed);
-            Arc::new(facts)
+            (
+                Arc::new(facts),
+                StructuralFactsCacheOutcome::PersistedHydration,
+            )
         } else {
             self.extractions.fetch_add(1, Ordering::Relaxed);
-            Arc::new(extract()?)
+            let Some(facts) = extract() else {
+                return (None, StructuralFactsCacheOutcome::Unavailable);
+            };
+            (Arc::new(facts), StructuralFactsCacheOutcome::Extracted)
         };
         self.cache.insert(
             file.clone(),
@@ -117,7 +149,7 @@ impl StructuralFactsCache {
                 facts: Arc::clone(&facts),
             }),
         );
-        Some(facts)
+        (Some(facts), outcome)
     }
 
     pub fn extraction_count(&self) -> u64 {
@@ -143,8 +175,19 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
     }
 
     fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>> {
-        let spec: &'static dyn StructuralSpec = self.adapter().structural_spec()?;
-        let source = self.file_source(file)?;
+        self.structural_facts_with_outcome(file).0
+    }
+
+    fn structural_facts_with_outcome(
+        &self,
+        file: &ProjectFile,
+    ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
+        let Some(spec) = self.adapter().structural_spec() else {
+            return (None, StructuralFactsCacheOutcome::Unavailable);
+        };
+        let Some(source) = self.file_source(file) else {
+            return (None, StructuralFactsCacheOutcome::Unavailable);
+        };
         let snapshot_key = self.structural_snapshot_key(file, &source);
         self.structural_cache().get_or_materialize(
             file,
@@ -191,5 +234,65 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.supports_role(role))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compact_graph::CompactRows;
+
+    fn empty_facts(source: &str) -> FileFacts {
+        FileFacts::new(
+            source.to_owned(),
+            vec![0],
+            Vec::new(),
+            CompactRows::from_parts(vec![0], Vec::new()),
+        )
+    }
+
+    #[test]
+    fn structural_facts_cache_reports_exact_materialization_outcomes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = ProjectFile::new(temp.path().to_path_buf(), "app.ts");
+        let source = "export function demo() {}\n";
+        let hydrated = StructuralFactsCache::new(1024 * 1024);
+
+        let (facts, outcome) = hydrated.get_or_materialize(
+            &file,
+            source,
+            || Some(empty_facts(source)),
+            || panic!("persisted hydration must avoid extraction"),
+        );
+        assert!(facts.is_some());
+        assert_eq!(outcome, StructuralFactsCacheOutcome::PersistedHydration);
+        assert_eq!(hydrated.hydration_count(), 1);
+        assert_eq!(hydrated.extraction_count(), 0);
+
+        let (facts, outcome) = hydrated.get_or_materialize(
+            &file,
+            source,
+            || panic!("memory hit must avoid persistence"),
+            || panic!("memory hit must avoid extraction"),
+        );
+        assert!(facts.is_some());
+        assert_eq!(outcome, StructuralFactsCacheOutcome::MemoryHit);
+        assert_eq!(hydrated.hydration_count(), 1);
+        assert_eq!(hydrated.extraction_count(), 0);
+
+        let extracted = StructuralFactsCache::new(1024 * 1024);
+        let (facts, outcome) =
+            extracted.get_or_materialize(&file, source, || None, || Some(empty_facts(source)));
+        assert!(facts.is_some());
+        assert_eq!(outcome, StructuralFactsCacheOutcome::Extracted);
+        assert_eq!(extracted.hydration_count(), 0);
+        assert_eq!(extracted.extraction_count(), 1);
+
+        let unavailable = StructuralFactsCache::new(1024 * 1024);
+        let (facts, outcome) = unavailable.get_or_materialize(&file, source, || None, || None);
+        assert!(facts.is_none());
+        assert_eq!(outcome, StructuralFactsCacheOutcome::Unavailable);
+        assert_eq!(unavailable.hydration_count(), 0);
+        assert_eq!(unavailable.extraction_count(), 1);
     }
 }

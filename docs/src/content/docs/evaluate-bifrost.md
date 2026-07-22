@@ -140,28 +140,9 @@ the `audit(...)` call at `src/app.py:5:12` and ends with one complete policy run
 
 <!-- policy-doc-test:human:ten-minute-audit -->
 ```text
-src/app.py:5:12: [warning] bifrost.example.review-audit-call: Review this direct audit call
-  finding: d3487ef4eec5e33c12d12de98086dc7043f0fd76221509292747ecdc9aab754b (strong)
-  analysis: match (definite, complete)
-  evidence: structural_match call
-  match anchor: strong structural_match src/app.py
-    semantic owner: python:src/app.py:canonical_ast_identity:[["function","handle"],["return",null],["call","audit"]]
-    selected source: b82212cae37708e517b4c19801ba9695e0d65de240ca51bb395e9cbb6bd6302f
-    occurrence ordinal: 0
-  match terminal: structural_match call; identity python:src/app.py:canonical_ast_identity:[["function","handle"],["return",null],["call","audit"]] at src/app.py:5:12
-  proof reason: direct_structural_match
-  classification: unclassified
-  proof: proven
-policy rule: bifrost.example.review-audit-call (Review direct audit calls)
-  policy hash: 9ba02503633473300a66dae5526d362c374d9136f437e6f0519eea56fd2ff273
-  analysis type: match
-  policy schema: 1 (explicit)
-  selector schema /analysis/selector: 2 (explicit)
-  endpoint dependencies: none
-  match directories: none
-  precedence: none
-  message: static - Review this direct audit call
-  severity: fixed warning
+[warning]  src/app.py:5:12
+    Review this direct audit call
+
 summary: 1 finding; 1 complete policy run
 ```
 

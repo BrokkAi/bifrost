@@ -37,8 +37,11 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 | `steps` | step array | Ordered typed transformations applied after structural matching. At most `16`. |
 | `limit` | integer | Maximum terminal results after pipeline deduplication. Defaults to `100`; valid range is `1` through `1000`. |
 | `result_detail` | string | `compact` by default or `full` for stable IDs and precise ranges. |
+| `execution_mode` | string | `results` by default, `explain` for planning without execution, or `profile` for results plus opt-in measurements. |
 
 Unknown fields are rejected rather than ignored.
+
+`execution_mode` is a root-only output control, like `limit` and `result_detail`. It cannot appear inside a `union`, `intersect`, or `except` operand. Ordinary `results` mode preserves the established result shape; the other modes return versioned report objects described in [Explain and Profile CodeQuery](/code-query-explain-profile/).
 
 When calling `query_code`, MCP clients may instead send a tool-call envelope such as `{ "query_file": "queries/audit.json" }`. That selector is not a `CodeQuery` field and must not be written inside the JSON file itself: the file contains the complete canonical query shown in this reference. The same tool-call input accepts `.rql` files, which lower through RQL before validation.
 
@@ -162,7 +165,7 @@ At every query-plan node, use exactly one source field: `match`, `union`, `inter
 
 `union` retains the first appearance of each exact typed endpoint in branch order. `intersect` retains endpoints present in every branch, in the first branch's order. `except` retains first-branch endpoints absent from every later branch. Endpoint identity comes from structured ranges and declaration/site identities, never rendered text.
 
-Union and intersection merge at most sixteen provenance traces in branch order. A trace or diagnostic inside composition includes a zero-based `branch` path; plain leaf queries omit it. Except retains provenance only from its positive first branch. Root-only `limit`, `result_detail`, and `schema_version` fields cannot appear inside operands, while structural `where`, `languages`, `inside`, and `not_inside` belong inside the branch containing `match`.
+Union and intersection merge at most sixteen provenance traces in branch order. A trace or diagnostic inside composition includes a zero-based `branch` path; plain leaf queries omit it. Except retains provenance only from its positive first branch. Root-only `limit`, `result_detail`, `execution_mode`, and `schema_version` fields cannot appear inside operands, while structural `where`, `languages`, `inside`, and `not_inside` belong inside the branch containing `match`.
 
 The public `limit` applies after the complete root set and common suffix. Execution budgets are shared across the request and fairly reserve work for later immediate operands. An incomplete operand sets `truncated: true` and produces a branch-labeled diagnostic rather than claiming a complete set. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
 

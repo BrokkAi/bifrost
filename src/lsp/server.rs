@@ -48,9 +48,10 @@ use crate::analyzer::policy::{
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
 };
-use crate::analyzer::structural::search::execute_with_cancellation;
+use crate::analyzer::structural::search::execute_request_with_cancellation;
 use crate::analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, CodeQueryResult, CodeQueryResultItem, CodeQueryResultValue,
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
+    CodeQueryResultValue,
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BuildProgressEvent, BuildProgressPhase, FilesystemProject,
@@ -1123,28 +1124,35 @@ fn handle_run_rql_query_request(
             success_message: "Query ready",
         },
         move |workspace, _project, _context, cancellation| {
-            let result = execute_with_cancellation(
+            let response = execute_request_with_cancellation(
                 workspace.analyzer(),
                 &query,
                 CodeQueryExecutionLimits::default(),
                 cancellation,
             );
+            // Avoid rendering and serializing a potentially large response
+            // after execution has already observed cancellation. The common
+            // request guard remains responsible for the race after this check.
             if cancellation.is_cancelled() {
                 return Err(RequestCancelled);
             }
-            Ok(run_rql_query_result(workspace, result))
+            Ok(run_rql_query_result(workspace, response))
         },
     )
 }
 
 fn run_rql_query_result(
     workspace: &WorkspaceAnalyzer,
-    query_result: CodeQueryResult,
+    response: CodeQueryResponse,
 ) -> RunRqlQueryResult {
     let workspace_root = workspace.analyzer().project().root();
-    let text = query_result.render_text();
+    let text = response.render_text();
+    let (mode, query_result, report) = response.into_parts();
+    let query_result = query_result.unwrap_or_default();
     RunRqlQueryResult {
         text,
+        mode: mode.label(),
+        report,
         results: query_result
             .results
             .into_iter()
@@ -1959,6 +1967,9 @@ struct RunRqlQueryParams {
 #[serde(rename_all = "camelCase")]
 struct RunRqlQueryResult {
     text: String,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<serde_json::Value>,
     results: Vec<RunRqlQueryResultItem>,
 }
 

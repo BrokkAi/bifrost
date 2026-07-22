@@ -18,7 +18,8 @@ use serde_json::ser::{CharEscape, Formatter};
 use super::PolicyReportDocument;
 
 pub use human::{
-    EscapedTerminalText, HumanRenderOptions, escape_terminal_text, write_policy_human,
+    EscapedTerminalText, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
+    escape_terminal_text, write_policy_human,
 };
 pub use sarif::{SarifToolIdentity, write_policy_sarif};
 
@@ -571,11 +572,11 @@ mod tests {
         assert_eq!(first, second);
         let finding = String::from_utf8(first).unwrap();
         assert!(
-            finding.starts_with("app.ts:1:8: [warning] test.render: Avoid target\n"),
+            finding.starts_with("[warning]  app.ts:1:8\n    Avoid target\n\n"),
             "unexpected human report:\n{finding}"
         );
-        assert!(finding.contains("  evidence: structural_match function\n"));
-        assert!(finding.contains("policy rule: test.render (Render)\n"));
+        assert!(!finding.contains("  evidence: structural_match function\n"));
+        assert!(!finding.contains("policy rule: test.render (Render)\n"));
         assert!(finding.contains("summary: 1 finding; 1 complete policy run\n"));
         assert!(!finding.contains('\u{001B}'));
 
@@ -593,7 +594,7 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("policy rule: test.render (Render)\n"));
+        assert!(!output.contains("policy rule: test.render (Render)\n"));
         assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
 
         let cancellation = CancellationToken::new();
@@ -640,8 +641,21 @@ mod tests {
         let note = "note: policy test.render inferred policy schema 1 and RQL schema 2\n";
         assert!(output.starts_with(note));
         assert_eq!(output.matches(note).count(), 1);
-        assert!(output.contains("policy rule: test.render (Render)\n"));
+        assert!(!output.contains("policy rule: test.render (Render)\n"));
         assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
+
+        let mut verbose = Vec::new();
+        write_policy_human(
+            &report,
+            &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+            &mut verbose,
+            usize::MAX,
+        )
+        .unwrap();
+        let verbose = String::from_utf8(verbose).unwrap();
+        assert!(verbose.starts_with(note));
+        assert_eq!(verbose.matches(note).count(), 1);
+        assert!(verbose.contains("policy rule: test.render (Render)\n"));
     }
 
     #[test]

@@ -6,15 +6,25 @@
 //! `limit` matches with captures, enclosing symbols, and capability
 //! diagnostics.
 
+use super::execution::plan::{
+    CodeQueryExplain, LogicalQueryOperator, LogicalQueryPlan, PhysicalQueryNodeId,
+    PhysicalQueryOperator, PhysicalQueryPlan,
+};
+use super::execution::profile::{
+    CodeQueryProfile, QueryCacheProfile, QueryExecutionProfile, QueryOperatorDisposition,
+    QueryOperatorProfile, QueryOperatorTermination, QueryOperatorWorkProfile,
+};
+use super::execution::scheduler::BoundedReadyScheduler;
 use super::facts::{FileFacts, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
+use super::provider::StructuralFactsCacheOutcome;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep,
-    ReferenceTraversalFilter, SetOperator,
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
+    CodeQueryExecutionMode, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryError,
+    QueryStep, ReferenceTraversalFilter, SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -49,7 +59,9 @@ use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
@@ -60,13 +72,132 @@ const MAX_FACT_NODES: usize = 2_000_000;
 const MAX_PIPELINE_ROWS: usize = 50_000;
 const MAX_PROVENANCE_TRACES: usize = 16;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
+const CODE_QUERY_SCHEDULER_WORKERS: usize = 2;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnionExecutionStrategy {
+    Auto,
+    Sequential,
+    Parallel,
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct CodeQueryResult {
     pub results: Vec<CodeQueryResultItem>,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<CodeQueryDiagnostic>,
+}
+
+/// The supported `query_code` response selected by the root execution mode.
+///
+/// The enum is deliberately untagged so the default `results` variant retains
+/// the exact existing serialized `CodeQueryResult` shape. Versioned `format`
+/// fields discriminate the two report variants.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum CodeQueryResponse {
+    Results(CodeQueryResult),
+    Explain(CodeQueryExplain),
+    Profile(Box<CodeQueryProfile>),
+}
+
+impl CodeQueryResponse {
+    pub const fn mode(&self) -> CodeQueryExecutionMode {
+        match self {
+            Self::Results(_) => CodeQueryExecutionMode::Results,
+            Self::Explain(_) => CodeQueryExecutionMode::Explain,
+            Self::Profile(_) => CodeQueryExecutionMode::Profile,
+        }
+    }
+
+    /// Return the ordinary result when this response executed the query.
+    pub fn result(&self) -> Option<&CodeQueryResult> {
+        match self {
+            Self::Results(result) => Some(result),
+            Self::Profile(profile) => Some(&profile.result),
+            Self::Explain(_) => None,
+        }
+    }
+
+    /// Render the complete structured report without first erasing its typed
+    /// field order through `serde_json::Value`.
+    #[doc(hidden)]
+    pub fn render_report_pretty(&self) -> Option<String> {
+        match self {
+            Self::Results(_) => None,
+            Self::Explain(explain) => Some(
+                serde_json::to_string_pretty(explain)
+                    .expect("the public CodeQuery explain model is serializable"),
+            ),
+            Self::Profile(profile) => Some(
+                serde_json::to_string_pretty(profile)
+                    .expect("the public CodeQuery profile model is serializable"),
+            ),
+        }
+    }
+
+    /// Consume this response into the common pieces needed by transports.
+    ///
+    /// The report is serialized before a profiled result is moved out, so the
+    /// structured profile keeps its complete nested `result` while callers can
+    /// also expose ordinary rows through transport-specific fields.
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        CodeQueryExecutionMode,
+        Option<CodeQueryResult>,
+        Option<serde_json::Value>,
+    ) {
+        match self {
+            Self::Results(result) => (CodeQueryExecutionMode::Results, Some(result), None),
+            Self::Explain(explain) => (
+                CodeQueryExecutionMode::Explain,
+                None,
+                Some(
+                    serde_json::to_value(explain)
+                        .expect("the public CodeQuery explain model is serializable"),
+                ),
+            ),
+            Self::Profile(profile) => {
+                let report = serde_json::to_value(&profile)
+                    .expect("the public CodeQuery profile model is serializable");
+                (
+                    CodeQueryExecutionMode::Profile,
+                    Some(profile.result),
+                    Some(report),
+                )
+            }
+        }
+    }
+
+    /// Human/agent-readable rendering. Structured JSON remains the canonical
+    /// report representation used by MCP, CLI, Python, and editor transports.
+    pub fn render_text(&self) -> String {
+        match self {
+            Self::Results(result) => result.render_text(),
+            Self::Explain(explain) => format!(
+                "CodeQuery explain (planning only):\n{}\n",
+                serde_json::to_string_pretty(explain)
+                    .expect("the public CodeQuery explain model is serializable")
+            ),
+            Self::Profile(profile) => {
+                let mut rendered = profile.result.render_text();
+                rendered.push_str(&format!(
+                    "\nCodeQuery profile: planning {} ns; execution {} ns; rendering {} ns; total {} ns; {} operator{}; peak concurrency {}.\n",
+                    profile.timings_ns.planning,
+                    profile.timings_ns.execution,
+                    profile.timings_ns.rendering,
+                    profile.timings_ns.total,
+                    profile.operators.len(),
+                    if profile.operators.len() == 1 { "" } else { "s" },
+                    profile.scheduling.peak_concurrency,
+                ));
+                rendered
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -125,6 +256,39 @@ pub struct CodeQueryResultItem {
     pub provenance: Vec<CodeQueryProvenance>,
     #[serde(skip_serializing_if = "is_false")]
     pub provenance_truncated: bool,
+}
+
+impl CodeQueryResultItem {
+    /// Build the shared, unstyled provenance summary used by text transports.
+    #[doc(hidden)]
+    pub fn provenance_summary(&self) -> Option<String> {
+        if self.provenance.is_empty() {
+            return None;
+        }
+
+        let mut branch_labels = Vec::new();
+        for trace in &self.provenance {
+            let label = format_branch_path(&trace.branch);
+            if !label.is_empty() && !branch_labels.contains(&label) {
+                branch_labels.push(label);
+            }
+        }
+        Some(format!(
+            "provenance: {} path{}{}{}",
+            self.provenance.len(),
+            if self.provenance.len() == 1 { "" } else { "s" },
+            if self.provenance_truncated {
+                " (truncated)"
+            } else {
+                ""
+            },
+            if branch_labels.is_empty() {
+                String::new()
+            } else {
+                format!("; branches {}", branch_labels.join(", "))
+            },
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -574,6 +738,19 @@ pub struct CodeQueryDiagnostic {
     pub message: String,
 }
 
+impl CodeQueryDiagnostic {
+    /// Build the shared, unstyled diagnostic label used by text transports.
+    #[doc(hidden)]
+    pub fn presentation_label(&self) -> String {
+        let kind = format!("{} [{}]", self.impact.as_str(), self.code.as_str());
+        if self.branch.is_empty() {
+            kind
+        } else {
+            format!("{kind} [branch {}]", format_branch_path(&self.branch))
+        }
+    }
+}
+
 /// A match found before rendering, held until the rendering pass (which
 /// truncates at `limit` and does enclosing-symbol lookups).
 type PendingMatch = (Language, ProjectFile, Arc<FileFacts>, FactMatch);
@@ -807,6 +984,10 @@ enum PipelineVia {
 struct ReferenceTraversalCache {
     inbound: HashMap<CodeUnit, Vec<ReferenceHit>>,
     outbound: HashMap<ProjectFile, Vec<ReferenceHit>>,
+    inbound_incomplete: HashSet<CodeUnit>,
+    outbound_incomplete: HashSet<ProjectFile>,
+    inbound_exhausted: HashSet<CodeUnit>,
+    outbound_exhausted: HashSet<ProjectFile>,
     reported_inbound: HashSet<CodeUnit>,
 }
 
@@ -1031,11 +1212,42 @@ impl DirectImportGraph {
             .map(|source| compact.nodes()[*source as usize].clone())
             .collect()
     }
+
+    fn importer_count(&self, file: &ProjectFile) -> usize {
+        let Some(compact) = &self.compact else {
+            return 0;
+        };
+        compact
+            .node_id(file)
+            .map_or(0, |target| compact.incoming(target).len())
+    }
+
+    fn forward_relation_complete(&self, files: &[ProjectFile]) -> bool {
+        files.iter().all(|file| self.forward.contains_key(file))
+    }
+
+    fn reverse_relation_complete(&self) -> bool {
+        self.complete && self.unsupported.is_empty()
+    }
 }
 
 /// Run `query` across every language provider the analyzer exposes.
 pub fn execute(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResult {
     execute_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
+}
+
+/// Honor the query's root execution mode through the public Rust surface.
+/// Ordinary callers that always want rows may continue to use [`execute`].
+pub fn execute_request(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResponse {
+    execute_request_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
+}
+
+pub fn execute_request_with_limits(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResponse {
+    execute_request_internal(analyzer, query, limits, None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1060,6 +1272,7 @@ pub(crate) struct DetailedCodeQueryResult {
     pub result: CodeQueryResult,
     pub work: CodeQueryExecutionWork,
     pub evidence: Vec<DetailedCodeQueryEvidence>,
+    pub profile: Option<QueryExecutionProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1184,7 +1397,7 @@ impl Default for CodeQueryExecutionLimits {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct CodeQueryExecutionBudget {
     scanned_files: usize,
     scanned_source_bytes: usize,
@@ -1192,6 +1405,278 @@ struct CodeQueryExecutionBudget {
     examined_references: usize,
     pipeline_rows: usize,
     provenance_steps: usize,
+    import_files_resolved: usize,
+    import_edges_resolved: usize,
+}
+
+impl CodeQueryExecutionBudget {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            scanned_files: self.scanned_files.saturating_sub(earlier.scanned_files),
+            scanned_source_bytes: self
+                .scanned_source_bytes
+                .saturating_sub(earlier.scanned_source_bytes),
+            fact_nodes: self.fact_nodes.saturating_sub(earlier.fact_nodes),
+            examined_references: self
+                .examined_references
+                .saturating_sub(earlier.examined_references),
+            pipeline_rows: self.pipeline_rows.saturating_sub(earlier.pipeline_rows),
+            provenance_steps: self
+                .provenance_steps
+                .saturating_sub(earlier.provenance_steps),
+            import_files_resolved: self
+                .import_files_resolved
+                .saturating_sub(earlier.import_files_resolved),
+            import_edges_resolved: self
+                .import_edges_resolved
+                .saturating_sub(earlier.import_edges_resolved),
+        }
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            scanned_files: self.scanned_files.saturating_add(other.scanned_files),
+            scanned_source_bytes: self
+                .scanned_source_bytes
+                .saturating_add(other.scanned_source_bytes),
+            fact_nodes: self.fact_nodes.saturating_add(other.fact_nodes),
+            examined_references: self
+                .examined_references
+                .saturating_add(other.examined_references),
+            pipeline_rows: self.pipeline_rows.saturating_add(other.pipeline_rows),
+            provenance_steps: self.provenance_steps.saturating_add(other.provenance_steps),
+            import_files_resolved: self
+                .import_files_resolved
+                .saturating_add(other.import_files_resolved),
+            import_edges_resolved: self
+                .import_edges_resolved
+                .saturating_add(other.import_edges_resolved),
+        }
+    }
+
+    fn fair_lanes(self) -> [usize; 4] {
+        [
+            self.scanned_files,
+            self.scanned_source_bytes,
+            self.fact_nodes.saturating_add(self.examined_references),
+            self.pipeline_rows.max(self.provenance_steps),
+        ]
+    }
+}
+
+#[derive(Debug)]
+struct FairSeedBudgetState {
+    usage: Vec<CodeQueryExecutionBudget>,
+    finished: Vec<bool>,
+    failed: bool,
+}
+
+#[derive(Debug)]
+struct FairSeedBudgetCoordinator {
+    base: CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    branch_count: usize,
+    cancellation: Option<CancellationToken>,
+    state: Mutex<FairSeedBudgetState>,
+    changed: Condvar,
+    wait_ns: AtomicU64,
+    waiters: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
+struct FairSeedBudgetLease {
+    coordinator: Arc<FairSeedBudgetCoordinator>,
+    branch: usize,
+}
+
+enum FairSeedBudgetAdmission {
+    Admitted,
+    Rejected(CodeQueryExecutionBudget),
+    Cancelled,
+}
+
+impl FairSeedBudgetCoordinator {
+    fn new(
+        base: CodeQueryExecutionBudget,
+        limits: CodeQueryExecutionLimits,
+        branch_count: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<Self> {
+        debug_assert!(branch_count >= 2);
+        Arc::new(Self {
+            base,
+            limits,
+            branch_count,
+            cancellation: cancellation.cloned(),
+            state: Mutex::new(FairSeedBudgetState {
+                usage: vec![CodeQueryExecutionBudget::default(); branch_count],
+                finished: vec![false; branch_count],
+                failed: false,
+            }),
+            changed: Condvar::new(),
+            wait_ns: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+        })
+    }
+
+    fn lease(self: &Arc<Self>, branch: usize) -> FairSeedBudgetLease {
+        debug_assert!(branch < self.branch_count);
+        FairSeedBudgetLease {
+            coordinator: Arc::clone(self),
+            branch,
+        }
+    }
+
+    fn maximum_pipeline_rows(&self) -> usize {
+        self.limits.max_pipeline_rows
+    }
+
+    fn limits_lanes(&self) -> [usize; 4] {
+        [
+            self.limits.max_scanned_files,
+            self.limits.max_scanned_source_bytes,
+            self.limits.max_fact_nodes,
+            self.limits.max_pipeline_rows,
+        ]
+    }
+
+    fn branch_allowance(&self, state: &FairSeedBudgetState, branch: usize) -> [usize; 4] {
+        let base = self.base.fair_lanes();
+        let limits = self.limits_lanes();
+        let mut used = base;
+        for earlier in 0..branch {
+            let remaining = self.branch_count.saturating_sub(earlier).max(1);
+            let earlier_allowance: [usize; 4] = std::array::from_fn(|lane| {
+                limits[lane].saturating_sub(used[lane]).div_ceil(remaining)
+            });
+            let actual = state.usage[earlier].fair_lanes();
+            for lane in 0..used.len() {
+                used[lane] = used[lane].saturating_add(if state.finished[earlier] {
+                    actual[lane]
+                } else {
+                    earlier_allowance[lane]
+                });
+            }
+        }
+        let remaining = self.branch_count.saturating_sub(branch).max(1);
+        std::array::from_fn(|lane| limits[lane].saturating_sub(used[lane]).div_ceil(remaining))
+    }
+
+    fn global_projected(
+        &self,
+        state: &FairSeedBudgetState,
+        branch: usize,
+        local_delta: CodeQueryExecutionBudget,
+    ) -> CodeQueryExecutionBudget {
+        state.usage[..branch]
+            .iter()
+            .copied()
+            .fold(self.base, CodeQueryExecutionBudget::saturating_add)
+            .saturating_add(local_delta)
+    }
+
+    fn committed_budget(&self) -> CodeQueryExecutionBudget {
+        let state = self.state.lock().expect("fair seed budget lock poisoned");
+        state
+            .usage
+            .iter()
+            .copied()
+            .fold(self.base, CodeQueryExecutionBudget::saturating_add)
+    }
+
+    fn wait_ns(&self) -> u64 {
+        self.wait_ns.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn waiting_branches(&self) -> usize {
+        self.waiters.load(Ordering::Acquire)
+    }
+
+    fn fail(&self) {
+        let mut state = self.state.lock().expect("fair seed budget lock poisoned");
+        state.failed = true;
+        self.changed.notify_all();
+    }
+}
+
+impl FairSeedBudgetLease {
+    fn budget_before_branch(&self) -> CodeQueryExecutionBudget {
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        state.usage[..self.branch].iter().copied().fold(
+            self.coordinator.base,
+            CodeQueryExecutionBudget::saturating_add,
+        )
+    }
+
+    fn admit(&self, projected_local: CodeQueryExecutionBudget) -> FairSeedBudgetAdmission {
+        let local_delta = projected_local.saturating_sub(self.coordinator.base);
+        let requested = local_delta.fair_lanes();
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        loop {
+            if state.failed {
+                return FairSeedBudgetAdmission::Cancelled;
+            }
+            if self
+                .coordinator
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return FairSeedBudgetAdmission::Cancelled;
+            }
+            let allowance = self.coordinator.branch_allowance(&state, self.branch);
+            if requested
+                .iter()
+                .zip(allowance)
+                .all(|(requested, allowance)| *requested <= allowance)
+            {
+                state.usage[self.branch] = local_delta;
+                return FairSeedBudgetAdmission::Admitted;
+            }
+            if state.finished[..self.branch]
+                .iter()
+                .all(|finished| *finished)
+            {
+                return FairSeedBudgetAdmission::Rejected(self.coordinator.global_projected(
+                    &state,
+                    self.branch,
+                    local_delta,
+                ));
+            }
+            let wait_started = Instant::now();
+            self.coordinator.waiters.fetch_add(1, Ordering::AcqRel);
+            let (next_state, _) = self
+                .coordinator
+                .changed
+                .wait_timeout(state, Duration::from_millis(2))
+                .expect("fair seed budget lock poisoned while waiting");
+            self.coordinator.waiters.fetch_sub(1, Ordering::AcqRel);
+            self.coordinator
+                .wait_ns
+                .fetch_add(elapsed_ns(wait_started), Ordering::Relaxed);
+            state = next_state;
+        }
+    }
+
+    fn finish(&self, local_budget: CodeQueryExecutionBudget) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        state.usage[self.branch] = local_budget.saturating_sub(self.coordinator.base);
+        state.finished[self.branch] = true;
+        self.coordinator.changed.notify_all();
+    }
 }
 
 #[derive(Clone)]
@@ -1199,6 +1684,10 @@ struct CachedSeedExecution {
     rows: Vec<PipelineRow>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     truncated: bool,
+    /// Whether the cached rows exhaust the seed relation, independently of
+    /// whether an enclosing limit can still return a semantically complete
+    /// response from a terminal-cap probe.
+    complete: Option<bool>,
 }
 
 struct QueryExecutionState<'a> {
@@ -1211,12 +1700,39 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     import_graph: Option<DirectImportGraph>,
+    cache_profile: Option<QueryCacheProfile>,
+    profile: Option<QueryExecutionProfile>,
+    parallel_seed_budget: Option<FairSeedBudgetLease>,
+    scheduler_workers: usize,
 }
 
 struct PlanExecution {
     rows: Vec<PipelineRow>,
     truncated: bool,
     cancelled: bool,
+    /// An intermediate authored pipeline step exhausted its budget, so the
+    /// remaining steps in that same suffix must not run.
+    pipeline_halted: bool,
+}
+
+struct ParallelSeedBranchResult {
+    execution: PlanExecution,
+    diagnostics: Vec<CodeQueryDiagnostic>,
+    seed_cache: HashMap<String, CachedSeedExecution>,
+    cache_profile: Option<QueryCacheProfile>,
+    operators: Vec<QueryOperatorProfile>,
+}
+
+struct ParallelUnionExecution {
+    execution: PlanExecution,
+    input_rows: usize,
+    rows_visited: usize,
+    rows_discarded: Option<usize>,
+    temporary_capacity_bytes_lower_bound: u64,
+    operator_truncated: bool,
+    dependency_wait_ns: u64,
+    scheduling_overhead_ns: u64,
+    merge_ns: u64,
 }
 
 #[doc(hidden)]
@@ -1228,6 +1744,7 @@ pub fn execute_with_limits(
     execute_code_query_detailed(analyzer, query, limits, None).result
 }
 
+#[cfg(test)]
 pub(crate) fn execute_with_cancellation(
     analyzer: &dyn IAnalyzer,
     query: &CodeQuery,
@@ -1237,13 +1754,103 @@ pub(crate) fn execute_with_cancellation(
     execute_code_query_detailed(analyzer, query, limits, Some(cancellation)).result
 }
 
+/// Execute a mode-aware query with explicit limits and cooperative cancellation.
+///
+/// Unlike protocol surfaces that translate cancellation into their own error
+/// response, a profiled Rust request returns its cancellation observations and
+/// cancellation-safe partial result to the caller.
+pub fn execute_request_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResponse {
+    execute_request_internal(analyzer, query, limits, Some(cancellation))
+}
+
+fn execute_request_internal(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> CodeQueryResponse {
+    match query.execution_mode {
+        CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
+            execute_code_query_detailed(analyzer, query, limits, cancellation).result,
+        ),
+        CodeQueryExecutionMode::Explain => match select_physical_plan(
+            query,
+            UnionExecutionStrategy::Auto,
+            CODE_QUERY_SCHEDULER_WORKERS,
+        ) {
+            Ok(physical_plan) => {
+                // The measured production Auto policy is sequential. Explain
+                // performs only lowering and physical selection: it does not
+                // construct an analyzer query scope or touch workspace data.
+                CodeQueryResponse::Explain(
+                    physical_plan.public_explain(query, CODE_QUERY_SCHEDULER_WORKERS),
+                )
+            }
+            Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
+        },
+        CodeQueryExecutionMode::Profile => {
+            let detailed = execute_internal(analyzer, query, limits, cancellation, None, true);
+            let DetailedCodeQueryResult {
+                result, profile, ..
+            } = detailed;
+            match profile {
+                Some(profile) => CodeQueryResponse::Profile(Box::new(
+                    CodeQueryProfile::from_internal(query, result, profile),
+                )),
+                // Programmatically constructed invalid plans retain the
+                // existing typed diagnostic instead of panicking while a
+                // decoded request always reaches the profiled branch above.
+                None => CodeQueryResponse::Results(result),
+            }
+        }
+    }
+}
+
 pub(crate) fn execute_code_query_detailed(
     analyzer: &dyn IAnalyzer,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, query, limits, cancellation, None)
+    execute_internal(analyzer, query, limits, cancellation, None, false)
+}
+
+/// Internal opt-in profile entry point used by the M2 measurement harness.
+/// Public query surfaces remain unchanged until the explicit M5 rollout.
+#[cfg(test)]
+pub(crate) fn execute_code_query_profiled(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> DetailedCodeQueryResult {
+    execute_internal(analyzer, query, limits, None, None, true)
+}
+
+/// M4 benchmark/test entry point. A forced strategy still passes through the
+/// same semantic eligibility gate as production; unsafe shapes stay serial.
+#[cfg(test)]
+pub(crate) fn execute_code_query_with_union_strategy(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    strategy: UnionExecutionStrategy,
+    capture_profile: bool,
+) -> DetailedCodeQueryResult {
+    execute_internal_with_strategy(
+        analyzer,
+        query,
+        limits,
+        None,
+        None,
+        capture_profile,
+        strategy,
+        CODE_QUERY_SCHEDULER_WORKERS,
+    )
 }
 
 #[cfg(test)]
@@ -1258,6 +1865,7 @@ fn execute_with_receiver_budget_for_test(
         CodeQueryExecutionLimits::default(),
         None,
         Some(receiver_budget),
+        false,
     )
     .result
 }
@@ -1268,29 +1876,53 @@ fn execute_internal(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
 ) -> DetailedCodeQueryResult {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+    execute_internal_with_strategy(
+        analyzer,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_internal_with_strategy(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+    union_strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+) -> DetailedCodeQueryResult {
+    // Keep repeated analyzer reads coherent and reusable even for direct API
+    // callers that do not already own a wider request scope. Nested scopes are
+    // supported and preserve an outer caller's store-error observation.
+    let _query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let request_started = capture_profile.then(Instant::now);
+    let planning_started = capture_profile.then(Instant::now);
+    if !capture_profile && cancellation.is_some_and(CancellationToken::is_cancelled) {
         return detailed_result_without_evidence(
             cancelled_query_result(),
             CodeQueryExecutionBudget::default(),
         );
     }
-    if let Err(error) = query.validate_steps() {
-        return detailed_result_without_evidence(
-            CodeQueryResult {
-                results: Vec::new(),
-                truncated: false,
-                diagnostics: vec![CodeQueryDiagnostic {
-                    code: CodeQueryDiagnosticCode::InvalidPlan,
-                    impact: CodeQueryDiagnosticImpact::Invalid,
-                    branch: Vec::new(),
-                    language: "workspace",
-                    message: error.to_string(),
-                }],
-            },
-            CodeQueryExecutionBudget::default(),
-        );
-    }
+    let physical_plan = match select_physical_plan(query, union_strategy, scheduler_workers) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return detailed_result_without_evidence(
+                invalid_plan_result(error),
+                CodeQueryExecutionBudget::default(),
+            );
+        }
+    };
+    let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
@@ -1302,27 +1934,30 @@ fn execute_internal(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         import_graph: None,
+        cache_profile: capture_profile.then(QueryCacheProfile::default),
+        profile: capture_profile
+            .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
+        parallel_seed_budget: None,
+        scheduler_workers,
     };
+    let mut profile_branch = state.profile.as_ref().map(|_| Vec::new());
+    let execution_started = capture_profile.then(Instant::now);
     let mut execution = execute_plan(
-        &query.plan,
+        &physical_plan,
+        physical_plan.root(),
         &mut state,
         limits,
-        Some(query.limit.saturating_add(1)),
+        None,
         &mut diagnostics,
+        &mut profile_branch,
     );
-    let mut cancelled =
-        execution.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
-    if cancelled {
-        execution.truncated = true;
-        push_cancelled_diagnostic(&mut diagnostics);
+    if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
+        profile.execution_ns = elapsed_ns(started);
     }
-
-    let terminal_truncated = execution.rows.len() > query.limit;
-    if terminal_truncated {
-        push_truncation_diagnostic(&mut diagnostics, &state.budget, query.limit);
-        execution.rows.truncate(query.limit);
-    }
-    let mut truncated = terminal_truncated || execution.truncated;
+    let execution_work_profile = capture_profile.then(|| execution_work_snapshot(state.budget));
+    let rendering_started = capture_profile.then(Instant::now);
+    let mut cancelled = execution.cancelled;
+    let mut truncated = execution.truncated;
     // Preserve the pre-composition response shape for a plain structural
     // query. Set plans retain their seed-only traces because the branch path
     // is meaningful provenance even when no semantic step follows the set.
@@ -1377,21 +2012,99 @@ fn execute_internal(
             &mut render_cache,
         ));
     }
+    let total_work = execution_work_snapshot(state.budget);
+    let work = public_execution_work(total_work);
+    if let Some(profile) = &mut state.profile {
+        let execution_work = execution_work_profile.unwrap_or_default();
+        profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
+        profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
+        profile.execution_work = execution_work;
+        profile.rendering_work = total_work.saturating_sub(execution_work);
+        profile.work = total_work;
+        profile.cache = state.cache_profile.unwrap_or_default();
+    }
+    let profile = state.profile;
     let detailed = DetailedCodeQueryResult {
         result: CodeQueryResult {
             results,
             truncated: truncated || cancelled,
             diagnostics,
         },
-        work: execution_work(state.budget),
+        work,
         evidence,
+        profile,
     };
     detailed.assert_invariants();
     detailed
 }
 
+fn select_physical_plan(
+    query: &CodeQuery,
+    strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+) -> Result<PhysicalQueryPlan, QueryError> {
+    let logical_plan = LogicalQueryPlan::lower(query)?;
+    let parallel_union = select_parallel_union(&logical_plan, strategy, scheduler_workers);
+    Ok(PhysicalQueryPlan::select_with_parallel_union(
+        logical_plan,
+        parallel_union,
+    ))
+}
+
+fn select_parallel_union(
+    logical_plan: &LogicalQueryPlan,
+    strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+) -> Option<super::execution::plan::LogicalQueryNodeId> {
+    if strategy == UnionExecutionStrategy::Sequential || scheduler_workers < 2 {
+        return None;
+    }
+    let LogicalQueryOperator::Limit { input, .. } =
+        logical_plan.node(logical_plan.root()).operator()
+    else {
+        return None;
+    };
+    let union = *input;
+    let LogicalQueryOperator::Set {
+        op: SetOperator::Union,
+        inputs,
+    } = logical_plan.node(union).operator()
+    else {
+        return None;
+    };
+    if inputs.len() != 2 || inputs[0] == inputs[1] {
+        return None;
+    }
+    inputs
+        .iter()
+        .all(|&input| {
+            matches!(
+                logical_plan.node(input).operator(),
+                LogicalQueryOperator::Seed(_)
+            )
+        })
+        .then_some(())?;
+
+    // The corrected M4 request-scoped, persistence-isolated A/B found no
+    // stable cold-and-warm crossover, even at 1,001 analyzed files. Retain the
+    // independently testable physical alternative, but keep production Auto
+    // on the conservative sequential implementation until a later workload
+    // supplies a measured selector with positive evidence.
+    (strategy == UnionExecutionStrategy::Parallel).then_some(union)
+}
+
 impl DetailedCodeQueryResult {
     fn assert_invariants(&self) {
+        if let Some(profile) = &self.profile {
+            assert!(
+                profile.peak_concurrency >= 1,
+                "an executed CodeQuery profile must observe at least one active operator"
+            );
+            assert!(
+                !profile.operators.is_empty(),
+                "an executed CodeQuery profile must contain operator observations"
+            );
+        }
         assert_eq!(
             self.result.results.len(),
             self.evidence.len(),
@@ -1527,22 +2240,40 @@ fn detailed_result_without_evidence(
 ) -> DetailedCodeQueryResult {
     let detailed = DetailedCodeQueryResult {
         result,
-        work: execution_work(budget),
+        work: public_execution_work(execution_work_snapshot(budget)),
         evidence: Vec::new(),
+        profile: None,
     };
     detailed.assert_invariants();
     detailed
 }
 
-fn execution_work(budget: CodeQueryExecutionBudget) -> CodeQueryExecutionWork {
-    let as_u64 = |value| u64::try_from(value).expect("usize fits in u64 on supported targets");
+fn public_execution_work(work: QueryOperatorWorkProfile) -> CodeQueryExecutionWork {
     CodeQueryExecutionWork {
+        scanned_files: work.scanned_files,
+        scanned_source_bytes: work.scanned_source_bytes,
+        fact_nodes: work.fact_nodes,
+        pipeline_rows: work.pipeline_rows,
+        examined_references: work.examined_references,
+    }
+}
+
+fn execution_work_snapshot(budget: CodeQueryExecutionBudget) -> QueryOperatorWorkProfile {
+    let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
+    QueryOperatorWorkProfile {
         scanned_files: as_u64(budget.scanned_files),
         scanned_source_bytes: as_u64(budget.scanned_source_bytes),
         fact_nodes: as_u64(budget.fact_nodes),
         pipeline_rows: as_u64(budget.pipeline_rows),
         examined_references: as_u64(budget.examined_references),
+        provenance_steps: as_u64(budget.provenance_steps),
+        import_files_resolved: as_u64(budget.import_files_resolved),
+        import_edges_resolved: as_u64(budget.import_edges_resolved),
     }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn detailed_evidence_for_pipeline_value(
@@ -2225,80 +2956,690 @@ fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandi
 }
 
 fn execute_plan(
-    plan: &CodeQueryPlan,
+    plan: &PhysicalQueryPlan,
+    node_id: PhysicalQueryNodeId,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
     terminal_cap: Option<usize>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    profile_branch: &mut Option<Vec<usize>>,
 ) -> PlanExecution {
-    if state
-        .cancellation
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: true,
+    let profiling = state.profile.is_some();
+    let invocation_started = profiling.then(Instant::now);
+    let physical_node = plan.node(node_id);
+    let physical_operator = physical_node.operator();
+    let logical_operator = plan.logical_node(node_id).operator();
+    let mut input_rows = 0;
+    let mut rows_visited = 0;
+    let mut relation_expansions = 0;
+    let mut rows_discarded = None;
+    let mut temporary_capacity_bytes_lower_bound = 0;
+    let mut disposition = QueryOperatorDisposition::Completed;
+    let mut self_truncated = false;
+    let mut dependency_execution_ns = 0u64;
+    let mut dependency_wait_ns = 0u64;
+    let mut merge_ns = 0u64;
+    let mut scheduling_overhead_ns = 0u64;
+    let mut terminations = profiling.then(Vec::new);
+    let mut work_started = profiling.then(|| execution_work_snapshot(state.budget));
+    let mut cache_started = state.cache_profile;
+    let mut own_diagnostic_start = diagnostics.len();
+
+    let execution = match (physical_operator, logical_operator) {
+        (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_seed(seed, terminal_cap, state, limits, diagnostics);
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
+        (
+            PhysicalQueryOperator::PipelineStep,
+            LogicalQueryOperator::Step {
+                step,
+                final_in_authored_suffix,
+                ..
+            },
+        ) => {
+            let dependency = physical_node.dependencies()[0];
+            let dependency_started = profiling.then(Instant::now);
+            let child = execute_plan(
+                plan,
+                dependency,
+                state,
+                limits,
+                None,
+                diagnostics,
+                profile_branch,
+            );
+            if let Some(started) = dependency_started {
+                dependency_execution_ns =
+                    dependency_execution_ns.saturating_add(elapsed_ns(started));
+            }
+            input_rows = child.rows.len();
+            work_started = profiling.then(|| execution_work_snapshot(state.budget));
+            cache_started = state.cache_profile;
+            own_diagnostic_start = diagnostics.len();
+            if child.cancelled {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::DependencyCancelled,
+                );
+                child
+            } else if child.pipeline_halted {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::DependencyPipelineHalted,
+                );
+                PlanExecution {
+                    pipeline_halted: !final_in_authored_suffix,
+                    ..child
+                }
+            } else {
+                let mut instrumentation = profiling.then(QueryStepInstrumentation::default);
+                let mut stepped = apply_plan_step(
+                    step,
+                    *final_in_authored_suffix,
+                    child.rows,
+                    state,
+                    limits,
+                    terminal_cap,
+                    diagnostics,
+                    instrumentation.as_mut(),
+                );
+                if let Some(instrumentation) = instrumentation {
+                    rows_visited = instrumentation.rows_visited;
+                    relation_expansions = instrumentation.relation_expansions;
+                    temporary_capacity_bytes_lower_bound =
+                        instrumentation.temporary_capacity_bytes_lower_bound;
+                }
+                if terminal_cap.is_some_and(|cap| stepped.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = stepped.truncated;
+                if stepped.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                stepped.truncated |= child.truncated;
+                stepped
+            }
+        }
+        (
+            PhysicalQueryOperator::ParallelUnion,
+            LogicalQueryOperator::Set {
+                op: SetOperator::Union,
+                ..
+            },
+        ) => {
+            let parallel = execute_parallel_seed_union(
+                plan,
+                physical_node.dependencies(),
+                state,
+                limits,
+                terminal_cap,
+                diagnostics,
+                profile_branch,
+                profiling,
+            );
+            input_rows = parallel.input_rows;
+            rows_visited = parallel.rows_visited;
+            rows_discarded = parallel.rows_discarded;
+            temporary_capacity_bytes_lower_bound = parallel.temporary_capacity_bytes_lower_bound;
+            self_truncated = parallel.operator_truncated;
+            dependency_wait_ns = parallel.dependency_wait_ns;
+            scheduling_overhead_ns = parallel.scheduling_overhead_ns;
+            merge_ns = parallel.merge_ns;
+            if self_truncated {
+                push_operator_termination(&mut terminations, QueryOperatorTermination::TerminalCap);
+            }
+            work_started = profiling.then(|| execution_work_snapshot(state.budget));
+            cache_started = state.cache_profile;
+            own_diagnostic_start = diagnostics.len();
+            if parallel.execution.cancelled {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::DependencyCancelled,
+                );
+            }
+            parallel.execution
+        }
+        (
+            PhysicalQueryOperator::SequentialUnion
+            | PhysicalQueryOperator::SequentialIntersection
+            | PhysicalQueryOperator::SequentialExcept,
+            LogicalQueryOperator::Set { op, .. },
+        ) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                debug_assert_eq!(
+                    physical_operator,
+                    match op {
+                        SetOperator::Union => PhysicalQueryOperator::SequentialUnion,
+                        SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
+                        SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
+                    }
+                );
+                let dependencies = physical_node.dependencies();
+                let mut branch_rows = Vec::with_capacity(dependencies.len());
+                let mut cancelled_child = None;
+                let mut truncated = false;
+                for (index, dependency) in dependencies.iter().copied().enumerate() {
+                    let branch_limits = fair_branch_limits(
+                        &state.budget,
+                        limits,
+                        dependencies.len().saturating_sub(index),
+                    );
+                    let diagnostic_start = diagnostics.len();
+                    if let Some(branch) = profile_branch.as_mut() {
+                        branch.push(index);
+                    }
+                    let dependency_started = profiling.then(Instant::now);
+                    let mut child = execute_plan(
+                        plan,
+                        dependency,
+                        state,
+                        branch_limits,
+                        None,
+                        diagnostics,
+                        profile_branch,
+                    );
+                    if let Some(started) = dependency_started {
+                        dependency_execution_ns =
+                            dependency_execution_ns.saturating_add(elapsed_ns(started));
+                    }
+                    if let Some(branch) = profile_branch.as_mut() {
+                        let popped = branch.pop();
+                        debug_assert_eq!(popped, Some(index));
+                    }
+                    input_rows = input_rows.saturating_add(child.rows.len());
+                    let prefix_started = profiling.then(Instant::now);
+                    prefix_branch_rows(&mut child.rows, index);
+                    prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
+                    if let Some(started) = prefix_started {
+                        merge_ns = merge_ns.saturating_add(elapsed_ns(started));
+                    }
+                    work_started = profiling.then(|| execution_work_snapshot(state.budget));
+                    cache_started = state.cache_profile;
+                    own_diagnostic_start = diagnostics.len();
+                    truncated |= child.truncated;
+                    if child.cancelled {
+                        push_operator_termination(
+                            &mut terminations,
+                            QueryOperatorTermination::DependencyCancelled,
+                        );
+                        cancelled_child = Some(child);
+                        break;
+                    }
+                    branch_rows.push(child.rows);
+                }
+                rows_visited = input_rows;
+                if let Some(child) = cancelled_child {
+                    disposition = QueryOperatorDisposition::Skipped;
+                    child
+                } else {
+                    let merge_started = profiling.then(Instant::now);
+                    let (mut rows, merge_measurement) =
+                        combine_set_rows(*op, branch_rows, profiling);
+                    if let Some(started) = merge_started {
+                        merge_ns = merge_ns.saturating_add(elapsed_ns(started));
+                    }
+                    if let Some(merge_measurement) = merge_measurement {
+                        rows_discarded = Some(merge_measurement.rows_discarded);
+                        temporary_capacity_bytes_lower_bound =
+                            merge_measurement.temporary_capacity_bytes_lower_bound;
+                    }
+                    if let Some(cap) = terminal_cap
+                        && rows.len() > cap
+                    {
+                        self_truncated = true;
+                        rows_discarded = Some(
+                            rows_discarded
+                                .unwrap_or_default()
+                                .saturating_add(rows.len() - cap),
+                        );
+                        push_operator_termination(
+                            &mut terminations,
+                            QueryOperatorTermination::TerminalCap,
+                        );
+                        rows.truncate(cap);
+                    }
+                    PlanExecution {
+                        rows,
+                        truncated,
+                        cancelled: false,
+                        pipeline_halted: false,
+                    }
+                }
+            }
+        }
+        (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
+            let dependency = physical_node.dependencies()[0];
+            let dependency_started = profiling.then(Instant::now);
+            let mut child = execute_plan(
+                plan,
+                dependency,
+                state,
+                limits,
+                Some(count.saturating_add(1)),
+                diagnostics,
+                profile_branch,
+            );
+            if let Some(started) = dependency_started {
+                dependency_execution_ns =
+                    dependency_execution_ns.saturating_add(elapsed_ns(started));
+            }
+            input_rows = child.rows.len();
+            rows_visited = input_rows;
+            rows_discarded = Some(0);
+            work_started = profiling.then(|| execution_work_snapshot(state.budget));
+            cache_started = state.cache_profile;
+            own_diagnostic_start = diagnostics.len();
+            let dependency_cancelled = child.cancelled;
+            let token_cancelled = state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled);
+            if dependency_cancelled || token_cancelled {
+                push_operator_termination(
+                    &mut terminations,
+                    if dependency_cancelled {
+                        QueryOperatorTermination::DependencyCancelled
+                    } else {
+                        QueryOperatorTermination::CancellationDuringWork
+                    },
+                );
+                if dependency_cancelled {
+                    disposition = QueryOperatorDisposition::Skipped;
+                } else if token_cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                child.cancelled = true;
+                child.truncated = true;
+                push_cancelled_diagnostic(diagnostics);
+            }
+            if child.rows.len() > *count {
+                self_truncated = true;
+                rows_discarded = Some(child.rows.len() - *count);
+                push_operator_termination(&mut terminations, QueryOperatorTermination::ResultLimit);
+                push_truncation_diagnostic(diagnostics, &state.budget, *count);
+                child.rows.truncate(*count);
+                child.truncated = true;
+            }
+            child
+        }
+        _ => unreachable!("physical operator must implement its logical query node"),
+    };
+
+    if profiling {
+        append_diagnostic_terminations(
+            &mut terminations,
+            &diagnostics[own_diagnostic_start.min(diagnostics.len())..],
+        );
+        if self_truncated
+            && terminations
+                .as_ref()
+                .is_some_and(|terminations| terminations.is_empty())
+        {
+            push_operator_termination(
+                &mut terminations,
+                QueryOperatorTermination::AnalysisIncomplete,
+            );
+        }
+        if execution.cancelled && disposition == QueryOperatorDisposition::Cancelled {
+            push_operator_termination(
+                &mut terminations,
+                QueryOperatorTermination::CancellationDuringWork,
+            );
+        }
+    }
+
+    if let (Some(profile), Some(started)) = (&mut state.profile, invocation_started) {
+        let total_elapsed_ns = elapsed_ns(started);
+        let work =
+            execution_work_snapshot(state.budget).saturating_sub(work_started.unwrap_or_default());
+        let cache = state
+            .cache_profile
+            .unwrap_or_default()
+            .saturating_sub(cache_started.unwrap_or_default());
+        profile.record(QueryOperatorProfile {
+            node: node_id,
+            branch: profile_branch.as_deref().unwrap_or_default().to_vec(),
+            operator: physical_operator,
+            disposition,
+            elapsed_ns: total_elapsed_ns
+                .saturating_sub(dependency_execution_ns)
+                .saturating_sub(dependency_wait_ns),
+            total_elapsed_ns,
+            dependency_execution_ns,
+            dependency_wait_ns,
+            merge_ns,
+            scheduling_overhead_ns,
+            input_rows,
+            rows_visited,
+            relation_expansions,
+            rows_discarded,
+            temporary_capacity_bytes_lower_bound,
+            work,
+            cache,
+            terminations: terminations.unwrap_or_default(),
+            output_rows: execution.rows.len(),
+            operator_truncated: self_truncated,
+            result_truncated: execution.truncated,
+            result_cancelled: execution.cancelled,
+        });
+    }
+    execution
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_parallel_seed_union(
+    plan: &PhysicalQueryPlan,
+    dependencies: &[PhysicalQueryNodeId],
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    terminal_cap: Option<usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    profile_branch: &Option<Vec<usize>>,
+    profiling: bool,
+) -> ParallelUnionExecution {
+    debug_assert_eq!(dependencies.len(), 2);
+    debug_assert!(dependencies.iter().all(|dependency| matches!(
+        plan.node(*dependency).operator(),
+        PhysicalQueryOperator::SeedScan
+    )));
+    debug_assert_ne!(dependencies[0], dependencies[1]);
+
+    let coordinator = FairSeedBudgetCoordinator::new(
+        state.budget,
+        limits,
+        dependencies.len(),
+        state.cancellation,
+    );
+    let analyzer = state.analyzer;
+    let cancellation = state.cancellation;
+    let receiver_budget_override = state.receiver_budget_override;
+    let scheduler_workers = state.scheduler_workers;
+    let base_budget = state.budget;
+    let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
+    let scheduled = BoundedReadyScheduler::new(scheduler_workers).run(
+        dependencies.len(),
+        cancellation,
+        |branch| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let lease = coordinator.lease(branch);
+                let mut branch_state = QueryExecutionState {
+                    analyzer,
+                    cancellation,
+                    receiver_budget_override,
+                    budget: base_budget,
+                    seed_cache: HashMap::default(),
+                    indexed_declarations: IndexedDeclarations::default(),
+                    reference_cache: ReferenceTraversalCache::default(),
+                    call_cache: CallTraversalCache::default(),
+                    import_graph: None,
+                    cache_profile: profiling.then(QueryCacheProfile::default),
+                    profile: profiling
+                        .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
+                    parallel_seed_budget: Some(lease.clone()),
+                    scheduler_workers,
+                };
+                let mut branch_diagnostics = Vec::new();
+                let mut branch_path = profiling.then(|| {
+                    let mut path = base_profile_branch.clone();
+                    path.push(branch);
+                    path
+                });
+                let execution = execute_plan(
+                    plan,
+                    dependencies[branch],
+                    &mut branch_state,
+                    limits,
+                    None,
+                    &mut branch_diagnostics,
+                    &mut branch_path,
+                );
+                lease.finish(branch_state.budget);
+                debug_assert!(branch_state.import_graph.is_none());
+                debug_assert!(branch_state.reference_cache.inbound.is_empty());
+                debug_assert!(branch_state.reference_cache.outbound.is_empty());
+                debug_assert!(branch_state.call_cache.incoming.is_empty());
+                debug_assert!(branch_state.call_cache.outgoing.is_empty());
+                let operators = branch_state
+                    .profile
+                    .take()
+                    .map(|profile| profile.operators)
+                    .unwrap_or_default();
+                ParallelSeedBranchResult {
+                    execution,
+                    diagnostics: branch_diagnostics,
+                    seed_cache: branch_state.seed_cache,
+                    cache_profile: branch_state.cache_profile,
+                    operators,
+                }
+            }));
+            match result {
+                Ok(result) => result,
+                Err(payload) => {
+                    coordinator.fail();
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        },
+    );
+
+    let mut scheduler_profile = scheduled.profile;
+    scheduler_profile.budget_wait_ns = coordinator.wait_ns();
+    let dependency_wait_ns = scheduler_profile.coordinator_wait_ns;
+    let scheduling_overhead_ns = scheduler_profile.dispatch_overhead_ns;
+    if let Some(profile) = &mut state.profile {
+        profile.record_scheduler_run(scheduler_profile);
+    }
+
+    let mut input_rows = 0usize;
+    let mut branch_rows = Vec::with_capacity(dependencies.len());
+    let mut truncated = false;
+    let mut cancelled_child = None;
+    let prefix_started = profiling.then(Instant::now);
+    for (branch, mut result) in scheduled.results.into_iter().enumerate() {
+        input_rows = input_rows.saturating_add(result.execution.rows.len());
+        let contributes_to_public_prefix = cancelled_child.is_none();
+        if contributes_to_public_prefix {
+            prefix_branch_rows(&mut result.execution.rows, branch);
+            prefix_branch_diagnostics(&mut result.diagnostics, branch);
+            diagnostics.append(&mut result.diagnostics);
+            truncated |= result.execution.truncated;
+        }
+
+        for (key, cached) in result.seed_cache {
+            assert!(
+                state.seed_cache.insert(key, cached).is_none(),
+                "parallel union eligibility requires distinct seed cache keys"
+            );
+        }
+        if let (Some(parent), Some(branch_cache)) = (&mut state.cache_profile, result.cache_profile)
+        {
+            *parent = parent.saturating_add(branch_cache);
+        }
+        if let Some(profile) = &mut state.profile {
+            profile.operators.extend(result.operators);
+        }
+        if contributes_to_public_prefix {
+            if result.execution.cancelled {
+                cancelled_child = Some(result.execution);
+            } else {
+                branch_rows.push(result.execution.rows);
+            }
+        }
+    }
+    state.budget = coordinator.committed_budget();
+    let mut merge_ns = prefix_started.map(elapsed_ns).unwrap_or(0);
+
+    if let Some(child) = cancelled_child {
+        return ParallelUnionExecution {
+            execution: child,
+            input_rows,
+            rows_visited: input_rows,
+            rows_discarded: None,
+            temporary_capacity_bytes_lower_bound: 0,
+            operator_truncated: false,
+            dependency_wait_ns,
+            scheduling_overhead_ns,
+            merge_ns,
         };
     }
 
-    let mut execution = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => execute_seed(
-            seed,
-            if plan.steps.is_empty() {
-                terminal_cap
-            } else {
-                None
-            },
-            state,
-            limits,
-            diagnostics,
-        ),
-        CodeQueryPlanSource::Set { op, branches } => {
-            let mut branch_rows = Vec::with_capacity(branches.len());
-            let mut truncated = false;
-            for (index, branch) in branches.iter().enumerate() {
-                let branch_limits =
-                    fair_branch_limits(&state.budget, limits, branches.len().saturating_sub(index));
-                let diagnostic_start = diagnostics.len();
-                let mut child = execute_plan(branch, state, branch_limits, None, diagnostics);
-                prefix_branch_rows(&mut child.rows, index);
-                prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
-                truncated |= child.truncated;
-                if child.cancelled {
-                    return child;
-                }
-                branch_rows.push(child.rows);
-            }
-            PlanExecution {
-                rows: combine_set_rows(*op, branch_rows),
-                truncated,
-                cancelled: false,
-            }
-        }
-    };
-
-    if execution.cancelled {
-        return execution;
+    let merge_started = profiling.then(Instant::now);
+    let (mut rows, merge_measurement) =
+        combine_set_rows(SetOperator::Union, branch_rows, profiling);
+    if let Some(started) = merge_started {
+        merge_ns = merge_ns.saturating_add(elapsed_ns(started));
     }
-    if !plan.steps.is_empty() {
-        let (rows, truncated, cancelled) = apply_plan_steps(
-            &plan.steps,
-            execution.rows,
-            state,
-            limits,
-            terminal_cap,
-            diagnostics,
-        );
-        execution.rows = rows;
-        execution.truncated |= truncated;
-        execution.cancelled = cancelled;
-    } else if let Some(cap) = terminal_cap
-        && execution.rows.len() > cap
+    let mut rows_discarded = merge_measurement
+        .as_ref()
+        .map(|measurement| measurement.rows_discarded);
+    let temporary_capacity_bytes_lower_bound = merge_measurement
+        .map(|measurement| measurement.temporary_capacity_bytes_lower_bound)
+        .unwrap_or_default();
+    let mut operator_truncated = false;
+    if let Some(cap) = terminal_cap
+        && rows.len() > cap
     {
-        execution.rows.truncate(cap);
+        operator_truncated = true;
+        rows_discarded = Some(
+            rows_discarded
+                .unwrap_or_default()
+                .saturating_add(rows.len() - cap),
+        );
+        rows.truncate(cap);
     }
-    execution
+    ParallelUnionExecution {
+        execution: PlanExecution {
+            rows,
+            truncated,
+            cancelled: false,
+            pipeline_halted: false,
+        },
+        input_rows,
+        rows_visited: input_rows,
+        rows_discarded,
+        temporary_capacity_bytes_lower_bound,
+        operator_truncated,
+        dependency_wait_ns,
+        scheduling_overhead_ns,
+        merge_ns,
+    }
+}
+
+fn push_operator_termination(
+    terminations: &mut Option<Vec<QueryOperatorTermination>>,
+    termination: QueryOperatorTermination,
+) {
+    if let Some(terminations) = terminations
+        && !terminations.contains(&termination)
+    {
+        terminations.push(termination);
+    }
+}
+
+fn append_diagnostic_terminations(
+    terminations: &mut Option<Vec<QueryOperatorTermination>>,
+    diagnostics: &[CodeQueryDiagnostic],
+) {
+    for diagnostic in diagnostics {
+        let termination = match diagnostic.code {
+            // Cancellation ownership is classified from the executor state
+            // below. A diagnostic can be emitted or replayed by a parent that
+            // only observed a cancelled dependency, so prose provenance is
+            // not sufficient to call it operator-local work.
+            CodeQueryDiagnosticCode::Cancelled => None,
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted => {
+                Some(QueryOperatorTermination::ExecutionBudget)
+            }
+            CodeQueryDiagnosticCode::PipelineBudgetExhausted => {
+                Some(QueryOperatorTermination::PipelineBudget)
+            }
+            CodeQueryDiagnosticCode::ImportGraphBudgetExhausted => {
+                Some(QueryOperatorTermination::ImportGraphBudget)
+            }
+            CodeQueryDiagnosticCode::ResultLimitReached => {
+                Some(QueryOperatorTermination::ResultLimit)
+            }
+            CodeQueryDiagnosticCode::CallRelationBudgetExhausted
+            | CodeQueryDiagnosticCode::CallRelationCandidateLimit
+            | CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated
+            | CodeQueryDiagnosticCode::ReferenceCandidateFilesTruncated
+            | CodeQueryDiagnosticCode::ReferenceCandidatesOmitted
+            | CodeQueryDiagnosticCode::ReferenceCallsiteLimit
+            | CodeQueryDiagnosticCode::UsesCandidateLimit
+            | CodeQueryDiagnosticCode::UsesCandidatesOmitted => {
+                Some(QueryOperatorTermination::AnalysisLimit)
+            }
+            CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+            | CodeQueryDiagnosticCode::MissingStructuralAdapter
+            | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
+            | CodeQueryDiagnosticCode::UsesParserUnsupported => {
+                Some(QueryOperatorTermination::UnsupportedAnalysis)
+            }
+            CodeQueryDiagnosticCode::SemanticResultsOmitted
+            | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+            | CodeQueryDiagnosticCode::CallRelationParseFailed
+            | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
+            | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
+            | CodeQueryDiagnosticCode::ReferenceAnalysisFailed => {
+                Some(QueryOperatorTermination::AnalysisIncomplete)
+            }
+            CodeQueryDiagnosticCode::InvalidPlan
+            | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
+            | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
+            | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
+            | CodeQueryDiagnosticCode::BroadQuery => None,
+        };
+        if let Some(termination) = termination {
+            push_operator_termination(terminations, termination);
+        }
+    }
+}
+
+fn cancelled_plan_execution() -> PlanExecution {
+    PlanExecution {
+        rows: Vec::new(),
+        truncated: true,
+        cancelled: true,
+        pipeline_halted: false,
+    }
 }
 
 fn execute_seed(
@@ -2309,12 +3650,27 @@ fn execute_seed(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
     let cache_key = seed.canonical_cache_key();
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
+    let parallel_budget = state.parallel_seed_budget.clone();
+    if parallel_budget.is_some() {
+        debug_assert!(
+            state.seed_cache.is_empty(),
+            "parallel seed branches start with disjoint empty request caches"
+        );
+    }
+    let pipeline_limit = parallel_budget
+        .as_ref()
+        .map_or(limits.max_pipeline_rows, |lease| {
+            lease.coordinator.maximum_pipeline_rows()
+        });
+    let budget_cap = pipeline_limit.saturating_sub(state.budget.pipeline_rows);
     let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
     let capped_by_budget = terminal_cap.is_none_or(|cap| budget_cap <= cap);
     if let Some(cached) = state.seed_cache.get(&cache_key).cloned() {
+        if let Some(profile) = &mut state.cache_profile {
+            profile
+                .seed_result
+                .record_hit(cached.complete, cached.rows.len());
+        }
         diagnostics.extend(cached.diagnostics);
         let mut rows = cached.rows;
         let locally_capped = capped_by_budget && rows.len() > desired_rows;
@@ -2328,7 +3684,11 @@ fn execute_seed(
             rows,
             truncated,
             cancelled: false,
+            pipeline_halted: false,
         };
+    }
+    if let Some(profile) = &mut state.cache_profile {
+        profile.seed_result.record_miss();
     }
     if desired_rows == 0 {
         push_pipeline_budget_diagnostic(diagnostics, &state.budget);
@@ -2336,6 +3696,7 @@ fn execute_seed(
             rows: Vec::new(),
             truncated: true,
             cancelled: false,
+            pipeline_halted: false,
         };
     }
 
@@ -2358,6 +3719,7 @@ fn execute_seed(
                 rows: Vec::new(),
                 truncated: true,
                 cancelled: true,
+                pipeline_halted: false,
             };
         }
         let language = crate::analyzer::common::language_for_file(&file);
@@ -2427,7 +3789,8 @@ fn execute_seed(
     let match_cap = desired_rows.saturating_add(usize::from(probing_budget));
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut truncated = false;
-    for (_path, language, provider, file) in candidates {
+    let mut cache_complete = state.cache_profile.as_ref().map(|_| true);
+    'candidates: for (_path, language, provider, file) in candidates {
         if state
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
@@ -2436,22 +3799,38 @@ fn execute_seed(
                 rows: Vec::new(),
                 truncated: true,
                 cancelled: true,
+                pipeline_halted: false,
             };
         }
         let Some(source) = provider.structural_source(&file) else {
             push_seed_provider_omission(diagnostics, language, &file, "indexed source snapshot");
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             continue;
         };
         let mut projected = state.budget;
         projected.scanned_files = projected.scanned_files.saturating_add(1);
         projected.scanned_source_bytes =
             projected.scanned_source_bytes.saturating_add(source.len());
-        if projected.scanned_files > limits.max_scanned_files
+        if let Some(lease) = &parallel_budget {
+            match lease.admit(projected) {
+                FairSeedBudgetAdmission::Admitted => {}
+                FairSeedBudgetAdmission::Rejected(global_projected) => {
+                    push_budget_diagnostic(diagnostics, &global_projected);
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    break;
+                }
+                FairSeedBudgetAdmission::Cancelled => {
+                    return cancelled_plan_execution();
+                }
+            }
+        } else if projected.scanned_files > limits.max_scanned_files
             || projected.scanned_source_bytes > limits.max_scanned_source_bytes
         {
             push_budget_diagnostic(diagnostics, &projected);
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             break;
         }
         state.budget.scanned_files = projected.scanned_files;
@@ -2459,7 +3838,32 @@ fn execute_seed(
         if !source_index.may_match(&source) {
             continue;
         }
-        let Some(facts) = provider.structural_facts(&file) else {
+        let facts = if state.cache_profile.is_some() {
+            let (facts, outcome) = provider.structural_facts_with_outcome(&file);
+            if let Some(profile) = &mut state.cache_profile {
+                match outcome {
+                    StructuralFactsCacheOutcome::MemoryHit => profile
+                        .seed_structural_facts
+                        .record_memory_hit(facts.is_some()),
+                    StructuralFactsCacheOutcome::PersistedHydration => {
+                        profile.seed_structural_facts.record_persisted_hydration()
+                    }
+                    StructuralFactsCacheOutcome::Extracted => {
+                        profile.seed_structural_facts.record_extraction();
+                    }
+                    StructuralFactsCacheOutcome::Unavailable => {
+                        profile.seed_structural_facts.record_unavailable();
+                    }
+                    StructuralFactsCacheOutcome::Unknown => {
+                        profile.seed_structural_facts.record_unknown();
+                    }
+                }
+            }
+            facts
+        } else {
+            provider.structural_facts(&file)
+        };
+        let Some(facts) = facts else {
             push_seed_provider_omission(
                 diagnostics,
                 language,
@@ -2467,32 +3871,75 @@ fn execute_seed(
                 "normalized structural facts",
             );
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             continue;
         };
         projected = state.budget;
         projected.fact_nodes = projected.fact_nodes.saturating_add(facts.nodes().len());
-        if projected
+        if let Some(lease) = &parallel_budget {
+            match lease.admit(projected) {
+                FairSeedBudgetAdmission::Admitted => {}
+                FairSeedBudgetAdmission::Rejected(global_projected) => {
+                    push_budget_diagnostic(diagnostics, &global_projected);
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    break;
+                }
+                FairSeedBudgetAdmission::Cancelled => {
+                    return cancelled_plan_execution();
+                }
+            }
+        } else if projected
             .fact_nodes
             .saturating_add(projected.examined_references)
             > limits.max_fact_nodes
         {
             push_budget_diagnostic(diagnostics, &projected);
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             break;
         }
         state.budget.fact_nodes = projected.fact_nodes;
         let remaining = match_cap.saturating_sub(pending.len());
-        pending.extend(
-            super::matcher::match_query(seed, &facts, remaining)
-                .into_iter()
-                .map(|fact_match| (language, file.clone(), Arc::clone(&facts), fact_match)),
-        );
-        if pending.len() >= match_cap {
+        let matches = super::matcher::match_query(seed, &facts, remaining);
+        if let Some(lease) = &parallel_budget {
+            for fact_match in matches {
+                let mut projected = state.budget;
+                projected.pipeline_rows = projected.pipeline_rows.saturating_add(1);
+                match lease.admit(projected) {
+                    FairSeedBudgetAdmission::Admitted => {
+                        state.budget.pipeline_rows = projected.pipeline_rows;
+                        pending.push((language, file.clone(), Arc::clone(&facts), fact_match));
+                    }
+                    FairSeedBudgetAdmission::Rejected(_) => {
+                        push_pipeline_budget_diagnostic(diagnostics, &lease.budget_before_branch());
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break 'candidates;
+                    }
+                    FairSeedBudgetAdmission::Cancelled => {
+                        return cancelled_plan_execution();
+                    }
+                }
+            }
+        } else {
+            pending.extend(
+                matches
+                    .into_iter()
+                    .map(|fact_match| (language, file.clone(), Arc::clone(&facts), fact_match)),
+            );
+        }
+        if parallel_budget.is_none() && pending.len() >= match_cap {
+            // The cap stopped the scan before the remaining candidates were
+            // examined. This can be enough for a root limit probe while still
+            // being unsafe to advertise as a complete reusable seed layer.
+            cache_complete = cache_complete.map(|_| false);
             break;
         }
     }
     if pending.len() > desired_rows {
         pending.truncate(desired_rows);
+        cache_complete = cache_complete.map(|_| false);
         if capped_by_budget {
             truncated = true;
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
@@ -2518,20 +3965,41 @@ fn execute_seed(
             }
         })
         .collect::<Vec<_>>();
-    state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+    let cache_complete = cache_complete.map(|complete| {
+        complete
+            && !truncated
+            && !diagnostics[diagnostic_start..]
+                .iter()
+                .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+    });
+    if parallel_budget.is_none() {
+        state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+    }
     state.seed_cache.insert(
         cache_key,
         CachedSeedExecution {
             rows: rows.clone(),
             diagnostics: diagnostics[diagnostic_start..].to_vec(),
             truncated,
+            complete: cache_complete,
         },
     );
+    if let Some(profile) = &mut state.cache_profile {
+        profile.seed_result.record_build(cache_complete);
+    }
     PlanExecution {
         rows,
         truncated,
         cancelled: false,
+        pipeline_halted: false,
     }
+}
+
+#[derive(Default)]
+struct QueryStepInstrumentation {
+    rows_visited: usize,
+    relation_expansions: usize,
+    temporary_capacity_bytes_lower_bound: u64,
 }
 
 fn push_seed_provider_omission(
@@ -2552,107 +4020,219 @@ fn push_seed_provider_omission(
     });
 }
 
-fn apply_plan_steps(
-    steps: &[QueryStep],
-    mut rows: Vec<PipelineRow>,
+#[allow(clippy::too_many_arguments)]
+fn apply_plan_step(
+    step: &QueryStep,
+    final_in_authored_suffix: bool,
+    rows: Vec<PipelineRow>,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
     terminal_cap: Option<usize>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> (Vec<PipelineRow>, bool, bool) {
+    instrumentation: Option<&mut QueryStepInstrumentation>,
+) -> PlanExecution {
     let mut truncated = false;
-    for (step_index, step) in steps.iter().enumerate() {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return (Vec::new(), true, true);
-        }
-        if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
-            let graph = state
-                .import_graph
-                .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
-            let graph_exhausted = if step == &QueryStep::ImportersOf {
-                ensure_complete_import_graph(
-                    state.analyzer,
-                    graph,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
-                )
-            } else {
-                let mut frontier = rows
-                    .iter()
-                    .filter_map(|row| match &row.value {
-                        PipelineValue::File(file) => Some(file.clone()),
-                        PipelineValue::StructuralMatch(_)
-                        | PipelineValue::Declaration(_)
-                        | PipelineValue::ReferenceSite(_)
-                        | PipelineValue::CallSite(_)
-                        | PipelineValue::ExpressionSite(_)
-                        | PipelineValue::ReceiverAnalysis(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                frontier.sort_by_key(rel_path_string);
-                frontier.dedup();
-                ensure_forward_import_edges(
-                    state.analyzer,
-                    graph,
-                    &frontier,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
-                )
-            };
-            if graph_exhausted {
-                truncated = true;
-                push_import_graph_budget_diagnostic(diagnostics, graph);
-            }
-        }
-        let last = step_index + 1 == steps.len();
-        let max_step_outputs = if last {
-            terminal_cap.unwrap_or(limits.max_pipeline_rows)
-        } else {
-            limits.max_pipeline_rows
+    if state
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: true,
+            pipeline_halted: false,
         };
-        let (next, exhausted, step_truncated) = apply_pipeline_step(
-            state.analyzer,
-            step,
-            rows,
-            state.import_graph.as_ref(),
-            Some(&mut state.indexed_declarations),
-            &mut state.reference_cache,
-            &mut state.call_cache,
-            &mut state.budget,
-            limits,
-            max_step_outputs,
-            state.cancellation,
-            diagnostics,
-            state.receiver_budget_override,
-        );
-        truncated |= step_truncated;
-        rows = next;
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            // A partially produced row is usable only after the final step:
-            // before then its value belongs to an intermediate domain and
-            // cannot satisfy the query's validated terminal contract.
-            return (if last { rows } else { Vec::new() }, true, true);
-        }
-        if exhausted {
-            truncated = true;
-            if state.budget.pipeline_rows >= limits.max_pipeline_rows
-                || state.budget.provenance_steps >= limits.max_pipeline_rows
+    }
+    if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
+        let graph = state
+            .import_graph
+            .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
+        let graph_exhausted = if step == &QueryStep::ImportersOf {
+            let cache_observation = state
+                .cache_profile
+                .as_ref()
+                .map(|_| (graph.complete, graph.reverse_relation_complete()));
+            if let (Some(profile), Some((cache_hit, cache_complete))) =
+                (&mut state.cache_profile, cache_observation)
             {
-                push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+                if cache_hit {
+                    let replayed_edges = rows
+                        .iter()
+                        .filter_map(|row| match &row.value {
+                            PipelineValue::File(file) => Some(graph.importer_count(file)),
+                            PipelineValue::StructuralMatch(_)
+                            | PipelineValue::Declaration(_)
+                            | PipelineValue::ReferenceSite(_)
+                            | PipelineValue::CallSite(_)
+                            | PipelineValue::ExpressionSite(_)
+                            | PipelineValue::ReceiverAnalysis(_) => None,
+                        })
+                        .sum();
+                    profile
+                        .import_reverse
+                        .record_hit(Some(cache_complete), replayed_edges);
+                } else {
+                    profile.import_reverse.record_miss();
+                }
             }
-            if !last {
-                rows.clear();
+            let import_work_before = state
+                .cache_profile
+                .as_ref()
+                .map(|_| (graph.resolved_files, graph.resolved_edges));
+            let exhausted = ensure_complete_import_graph(
+                state.analyzer,
+                graph,
+                limits.max_scanned_files,
+                limits.max_pipeline_rows,
+            );
+            if let Some((resolved_files_before, resolved_edges_before)) = import_work_before {
+                state.budget.import_files_resolved = state
+                    .budget
+                    .import_files_resolved
+                    .saturating_add(graph.resolved_files.saturating_sub(resolved_files_before));
+                state.budget.import_edges_resolved = state
+                    .budget
+                    .import_edges_resolved
+                    .saturating_add(graph.resolved_edges.saturating_sub(resolved_edges_before));
             }
-            break;
+            if cache_observation.is_some_and(|(cache_hit, _)| !cache_hit)
+                && let Some(profile) = &mut state.cache_profile
+            {
+                profile
+                    .import_reverse
+                    .record_build(Some(!exhausted && graph.reverse_relation_complete()));
+            }
+            exhausted
+        } else {
+            let mut frontier = rows
+                .iter()
+                .filter_map(|row| match &row.value {
+                    PipelineValue::File(file) => Some(file.clone()),
+                    PipelineValue::StructuralMatch(_)
+                    | PipelineValue::Declaration(_)
+                    | PipelineValue::ReferenceSite(_)
+                    | PipelineValue::CallSite(_)
+                    | PipelineValue::ExpressionSite(_)
+                    | PipelineValue::ReceiverAnalysis(_) => None,
+                })
+                .collect::<Vec<_>>();
+            frontier.sort_by_key(rel_path_string);
+            frontier.dedup();
+            let cache_observation = state.cache_profile.as_ref().map(|_| {
+                let cache_hit = frontier.iter().all(|file| {
+                    graph.forward.contains_key(file) || graph.unsupported.contains(file)
+                });
+                let cache_complete = cache_hit && graph.forward_relation_complete(&frontier);
+                let replayed_edges = frontier
+                    .iter()
+                    .filter_map(|file| graph.forward.get(file))
+                    .map(Vec::len)
+                    .sum();
+                (cache_hit, cache_complete, replayed_edges)
+            });
+            if let (Some(profile), Some((cache_hit, cache_complete, replayed_edges))) =
+                (&mut state.cache_profile, cache_observation)
+            {
+                if cache_hit {
+                    profile
+                        .import_forward
+                        .record_hit(Some(cache_complete), replayed_edges);
+                } else {
+                    profile.import_forward.record_miss();
+                }
+            }
+            let import_work_before = state
+                .cache_profile
+                .as_ref()
+                .map(|_| (graph.resolved_files, graph.resolved_edges));
+            let exhausted = ensure_forward_import_edges(
+                state.analyzer,
+                graph,
+                &frontier,
+                limits.max_scanned_files,
+                limits.max_pipeline_rows,
+            );
+            if let Some((resolved_files_before, resolved_edges_before)) = import_work_before {
+                state.budget.import_files_resolved = state
+                    .budget
+                    .import_files_resolved
+                    .saturating_add(graph.resolved_files.saturating_sub(resolved_files_before));
+                state.budget.import_edges_resolved = state
+                    .budget
+                    .import_edges_resolved
+                    .saturating_add(graph.resolved_edges.saturating_sub(resolved_edges_before));
+            }
+            if cache_observation.is_some_and(|(cache_hit, _, _)| !cache_hit)
+                && let Some(profile) = &mut state.cache_profile
+            {
+                profile.import_forward.record_build(Some(
+                    !exhausted && graph.forward_relation_complete(&frontier),
+                ));
+            }
+            exhausted
+        };
+        if graph_exhausted {
+            truncated = true;
+            push_import_graph_budget_diagnostic(diagnostics, graph);
         }
     }
-    (rows, truncated, false)
+    let max_step_outputs = if final_in_authored_suffix {
+        terminal_cap.unwrap_or(limits.max_pipeline_rows)
+    } else {
+        limits.max_pipeline_rows
+    };
+    let (mut rows, exhausted, step_truncated) = apply_pipeline_step(
+        state.analyzer,
+        step,
+        rows,
+        state.import_graph.as_ref(),
+        Some(&mut state.indexed_declarations),
+        &mut state.reference_cache,
+        &mut state.call_cache,
+        &mut state.budget,
+        limits,
+        max_step_outputs,
+        state.cancellation,
+        diagnostics,
+        state.receiver_budget_override,
+        &mut state.cache_profile,
+        instrumentation,
+    );
+    truncated |= step_truncated;
+    if state
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        // A partially produced row is usable only after the final step:
+        // before then its value belongs to an intermediate domain and
+        // cannot satisfy the query's validated terminal contract.
+        if !final_in_authored_suffix {
+            rows.clear();
+        }
+        return PlanExecution {
+            rows,
+            truncated: true,
+            cancelled: true,
+            pipeline_halted: false,
+        };
+    }
+    if exhausted {
+        truncated = true;
+        if state.budget.pipeline_rows >= limits.max_pipeline_rows
+            || state.budget.provenance_steps >= limits.max_pipeline_rows
+        {
+            push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        }
+        if !final_in_authored_suffix {
+            rows.clear();
+        }
+    }
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: exhausted && !final_in_authored_suffix,
+    }
 }
 
 fn fair_branch_limits(
@@ -2701,7 +4281,21 @@ fn prefix_branch_diagnostics(diagnostics: &mut [CodeQueryDiagnostic], branch: us
     }
 }
 
-fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec<PipelineRow> {
+struct SetMergeMeasurement {
+    rows_discarded: usize,
+    temporary_capacity_bytes_lower_bound: u64,
+}
+
+fn combine_set_rows(
+    op: SetOperator,
+    mut branches: Vec<Vec<PipelineRow>>,
+    measure: bool,
+) -> (Vec<PipelineRow>, Option<SetMergeMeasurement>) {
+    let input_rows = if measure {
+        branches.iter().map(Vec::len).sum::<usize>()
+    } else {
+        0
+    };
     match op {
         SetOperator::Union => {
             let mut output = Vec::new();
@@ -2717,7 +4311,14 @@ fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec
                     );
                 }
             }
-            output
+            let measurement = measure.then(|| SetMergeMeasurement {
+                rows_discarded: input_rows.saturating_sub(output.len()),
+                temporary_capacity_bytes_lower_bound: hash_capacity_bytes_lower_bound::<
+                    PipelineKey,
+                    usize,
+                >(indexes.capacity()),
+            });
+            (output, measurement)
         }
         SetOperator::Intersect => {
             let first = branches.remove(0);
@@ -2758,7 +4359,21 @@ fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec
                     );
                 }
             }
-            output
+            let measurement = measure.then(|| SetMergeMeasurement {
+                rows_discarded: input_rows.saturating_sub(output.len()),
+                temporary_capacity_bytes_lower_bound: later
+                    .iter()
+                    .map(|branch| {
+                        hash_capacity_bytes_lower_bound::<PipelineKey, PipelineRow>(
+                            branch.capacity(),
+                        )
+                    })
+                    .fold(0u64, u64::saturating_add)
+                    .saturating_add(hash_capacity_bytes_lower_bound::<PipelineKey, usize>(
+                        indexes.capacity(),
+                    )),
+            });
+            (output, measurement)
         }
         SetOperator::Except => {
             let first = branches.remove(0);
@@ -2767,12 +4382,27 @@ fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec
                 .flatten()
                 .map(|row| row.value.key())
                 .collect::<HashSet<_>>();
-            first
+            let output = first
                 .into_iter()
                 .filter(|row| !excluded.contains(&row.value.key()))
-                .collect()
+                .collect::<Vec<_>>();
+            let measurement = measure.then(|| SetMergeMeasurement {
+                rows_discarded: input_rows.saturating_sub(output.len()),
+                temporary_capacity_bytes_lower_bound: hash_capacity_bytes_lower_bound::<
+                    PipelineKey,
+                    (),
+                >(excluded.capacity()),
+            });
+            (output, measurement)
         }
     }
+}
+
+fn hash_capacity_bytes_lower_bound<K, V>(capacity: usize) -> u64 {
+    u64::try_from(
+        capacity.saturating_mul(std::mem::size_of::<K>().saturating_add(std::mem::size_of::<V>())),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn cancelled_query_result() -> CodeQueryResult {
@@ -2782,6 +4412,20 @@ fn cancelled_query_result() -> CodeQueryResult {
         results: Vec::new(),
         truncated: true,
         diagnostics,
+    }
+}
+
+fn invalid_plan_result(error: impl ToString) -> CodeQueryResult {
+    CodeQueryResult {
+        results: Vec::new(),
+        truncated: false,
+        diagnostics: vec![CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::InvalidPlan,
+            impact: CodeQueryDiagnosticImpact::Invalid,
+            branch: Vec::new(),
+            language: "workspace",
+            message: error.to_string(),
+        }],
     }
 }
 
@@ -2910,6 +4554,8 @@ fn apply_pipeline_step(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+    instrumentation: Option<&mut QueryStepInstrumentation>,
 ) -> (Vec<PipelineRow>, bool, bool) {
     let max_pipeline_rows = limits.max_pipeline_rows;
     let mut output = Vec::new();
@@ -2927,6 +4573,7 @@ fn apply_pipeline_step(
         QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
     )
     .then(|| ReceiverQueryService::new(analyzer));
+    let mut instrumentation = instrumentation;
 
     let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
@@ -2935,6 +4582,9 @@ fn apply_pipeline_step(
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return (output, true, receiver_truncated);
+        }
+        if let Some(instrumentation) = instrumentation.as_deref_mut() {
+            instrumentation.rows_visited = instrumentation.rows_visited.saturating_add(1);
         }
         let mut row_exhausted = false;
         if let (
@@ -2971,6 +4621,11 @@ fn apply_pipeline_step(
                     &mut trace_exhausted,
                     &mut receiver_truncated,
                 );
+                if let Some(instrumentation) = instrumentation.as_deref_mut() {
+                    instrumentation.relation_expansions = instrumentation
+                        .relation_expansions
+                        .saturating_add(expansions.len());
+                }
                 for expansion in expansions {
                     insert_pipeline_row(
                         &mut output,
@@ -3140,6 +4795,7 @@ fn apply_pipeline_step(
                     diagnostics,
                     max_pipeline_rows.saturating_sub(budget.pipeline_rows),
                     cancellation,
+                    cache_profile,
                 );
                 row_exhausted = reference_exhausted;
                 expansions
@@ -3159,6 +4815,7 @@ fn apply_pipeline_step(
                     max_step_outputs,
                     cancellation,
                     diagnostics,
+                    cache_profile,
                 );
                 row_exhausted = reference_exhausted;
                 expansions
@@ -3182,6 +4839,7 @@ fn apply_pipeline_step(
                     max_step_outputs,
                     cancellation,
                     diagnostics,
+                    cache_profile,
                 );
                 row_exhausted = call_exhausted;
                 expansions
@@ -3201,6 +4859,7 @@ fn apply_pipeline_step(
                     max_step_outputs,
                     cancellation,
                     diagnostics,
+                    cache_profile,
                 );
                 row_exhausted = call_exhausted;
                 expansions
@@ -3316,6 +4975,12 @@ fn apply_pipeline_step(
             _ => unreachable!("query step domains are validated before execution"),
         };
 
+        if let Some(instrumentation) = instrumentation.as_deref_mut() {
+            instrumentation.relation_expansions = instrumentation
+                .relation_expansions
+                .saturating_add(expansions.len());
+        }
+
         for expansion in expansions {
             if !expansion.budgeted && budget.pipeline_rows >= max_pipeline_rows {
                 exhausted = true;
@@ -3380,6 +5045,13 @@ fn apply_pipeline_step(
                 if count == 1 { "" } else { "s" }
             ),
         });
+    }
+    if let Some(instrumentation) = instrumentation {
+        let index_bytes = indexes.capacity().saturating_mul(
+            std::mem::size_of::<PipelineKey>().saturating_add(std::mem::size_of::<usize>()),
+        );
+        instrumentation.temporary_capacity_bytes_lower_bound =
+            u64::try_from(index_bytes).unwrap_or(u64::MAX);
     }
     (output, exhausted, receiver_truncated)
 }
@@ -3721,6 +5393,7 @@ fn call_declaration_expansions(
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::Callers(_));
     let diagnostic_start = diagnostics.len();
@@ -3755,6 +5428,7 @@ fn call_declaration_expansions(
             limits,
             cancellation,
             diagnostics,
+            cache_profile,
         );
         exhausted |= result.truncated || result.cancelled;
         for site in result
@@ -3885,6 +5559,7 @@ fn call_site_expansions(
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::CallSitesTo(_));
     let result = cached_call_relation(
@@ -3896,6 +5571,7 @@ fn call_site_expansions(
         limits,
         cancellation,
         diagnostics,
+        cache_profile,
     );
     let mut sites = result
         .sites
@@ -3924,15 +5600,32 @@ fn cached_call_relation(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> CallRelationResult {
     let results = if incoming {
         &mut cache.incoming
     } else {
         &mut cache.outgoing
     };
+    let layer = cache_profile.as_mut().map(|profile| {
+        if incoming {
+            &mut profile.incoming_call
+        } else {
+            &mut profile.outgoing_call
+        }
+    });
     let result = if let Some(result) = results.get(unit) {
+        if let Some(layer) = layer {
+            layer.record_hit(
+                Some(call_relation_result_complete(result)),
+                result.sites.len(),
+            );
+        }
         result.clone()
     } else {
+        if let Some(layer) = layer {
+            layer.record_miss();
+        }
         let relation_limits = CallRelationLimits {
             max_files: limits
                 .max_scanned_files
@@ -3971,6 +5664,14 @@ fn cached_call_relation(
         if budget_exhausted {
             push_budget_diagnostic(diagnostics, budget);
         }
+        if let Some(profile) = cache_profile {
+            let layer = if incoming {
+                &mut profile.incoming_call
+            } else {
+                &mut profile.outgoing_call
+            };
+            layer.record_build(Some(call_relation_result_complete(&result)));
+        }
         results.insert(unit.clone(), result.clone());
         result
     };
@@ -3992,16 +5693,19 @@ fn cached_call_relation(
     result
 }
 
-fn map_call_relation_diagnostic(
-    language: &'static str,
-    diagnostic: CallRelationDiagnostic,
-) -> CodeQueryDiagnostic {
-    debug_assert!(!diagnostic.context.is_empty());
-    debug_assert_eq!(
-        diagnostic.reason_kind.is_some(),
-        diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
-    );
-    let (code, impact) = match diagnostic.code {
+fn call_relation_result_complete(result: &CallRelationResult) -> bool {
+    !result.truncated
+        && !result.cancelled
+        && result.diagnostics.iter().all(|diagnostic| {
+            map_call_relation_diagnostic_code(diagnostic.code).1
+                != CodeQueryDiagnosticImpact::Incomplete
+        })
+}
+
+fn map_call_relation_diagnostic_code(
+    code: CallRelationDiagnosticCode,
+) -> (CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact) {
+    match code {
         CallRelationDiagnosticCode::BudgetExhausted => (
             CodeQueryDiagnosticCode::CallRelationBudgetExhausted,
             CodeQueryDiagnosticImpact::Incomplete,
@@ -4026,7 +5730,19 @@ fn map_call_relation_diagnostic(
             CodeQueryDiagnosticCode::CallRelationAnalysisFailed,
             CodeQueryDiagnosticImpact::Incomplete,
         ),
-    };
+    }
+}
+
+fn map_call_relation_diagnostic(
+    language: &'static str,
+    diagnostic: CallRelationDiagnostic,
+) -> CodeQueryDiagnostic {
+    debug_assert!(!diagnostic.context.is_empty());
+    debug_assert_eq!(
+        diagnostic.reason_kind.is_some(),
+        diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+    );
+    let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
     CodeQueryDiagnostic {
         code,
         impact,
@@ -4155,9 +5871,22 @@ fn inbound_reference_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     max_hits: usize,
     cancellation: Option<&CancellationToken>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
-    let mut exhausted = false;
-    if !cache.inbound.contains_key(&declaration.unit) {
+    let cache_hit = cache.inbound.contains_key(&declaration.unit);
+    let mut exhausted = cache_hit && cache.inbound_exhausted.contains(&declaration.unit);
+    if let Some(profile) = cache_profile {
+        if cache_hit {
+            profile.inbound_reference.record_hit(
+                Some(!cache.inbound_incomplete.contains(&declaration.unit)),
+                cache.inbound.get(&declaration.unit).map_or(0, Vec::len),
+            );
+        } else {
+            profile.inbound_reference.record_miss();
+        }
+    }
+    if !cache_hit {
+        let diagnostic_start = diagnostics.len();
         let remaining_files = limits
             .max_scanned_files
             .saturating_sub(budget.scanned_files);
@@ -4196,6 +5925,13 @@ fn inbound_reference_expansions(
         ) {
             push_budget_diagnostic(diagnostics, budget);
             cache.inbound.insert(declaration.unit.clone(), Vec::new());
+            if cache_profile.is_some() {
+                cache.inbound_incomplete.insert(declaration.unit.clone());
+            }
+            cache.inbound_exhausted.insert(declaration.unit.clone());
+            if let Some(profile) = cache_profile {
+                profile.inbound_reference.record_build(Some(false));
+            }
             return (Vec::new(), true);
         }
         let mut hits = Vec::new();
@@ -4348,6 +6084,21 @@ fn inbound_reference_expansions(
                     });
                 }
             }
+        }
+        let cache_complete = cache_profile.as_ref().map(|_| {
+            !exhausted
+                && !diagnostics[diagnostic_start..]
+                    .iter()
+                    .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+        });
+        if cache_complete == Some(false) {
+            cache.inbound_incomplete.insert(declaration.unit.clone());
+        }
+        if exhausted {
+            cache.inbound_exhausted.insert(declaration.unit.clone());
+        }
+        if let Some(profile) = cache_profile {
+            profile.inbound_reference.record_build(cache_complete);
         }
         cache.inbound.insert(declaration.unit.clone(), hits);
     }
@@ -4589,9 +6340,23 @@ fn outbound_reference_expansions(
     max_step_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
-    let mut exhausted = false;
-    if !cache.outbound.contains_key(declaration.unit.source()) {
+    let source_file = declaration.unit.source();
+    let cache_hit = cache.outbound.contains_key(source_file);
+    let mut exhausted = cache_hit && cache.outbound_exhausted.contains(source_file);
+    if let Some(profile) = cache_profile {
+        if cache_hit {
+            profile.outbound_reference.record_hit(
+                Some(!cache.outbound_incomplete.contains(source_file)),
+                cache.outbound.get(source_file).map_or(0, Vec::len),
+            );
+        } else {
+            profile.outbound_reference.record_miss();
+        }
+    }
+    if !cache_hit {
+        let diagnostic_start = diagnostics.len();
         let (hits, scan_exhausted) = scan_outbound_reference_hits(
             analyzer,
             declaration.unit.source(),
@@ -4602,9 +6367,22 @@ fn outbound_reference_expansions(
             diagnostics,
         );
         exhausted = scan_exhausted;
-        cache
-            .outbound
-            .insert(declaration.unit.source().clone(), hits);
+        let cache_complete = cache_profile.as_ref().map(|_| {
+            !scan_exhausted
+                && !diagnostics[diagnostic_start..]
+                    .iter()
+                    .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+        });
+        if cache_complete == Some(false) {
+            cache.outbound_incomplete.insert(source_file.clone());
+        }
+        if scan_exhausted {
+            cache.outbound_exhausted.insert(source_file.clone());
+        }
+        if let Some(profile) = cache_profile {
+            profile.outbound_reference.record_build(cache_complete);
+        }
+        cache.outbound.insert(source_file.clone(), hits);
     }
     let mut sites = Vec::new();
     let mut omitted = 0usize;
@@ -6317,51 +8095,17 @@ impl CodeQueryResult {
                         }
                     }
                 }
-                if !result.provenance.is_empty() {
-                    let mut branch_labels = Vec::new();
-                    for trace in &result.provenance {
-                        let label = format_branch_path(&trace.branch);
-                        if !label.is_empty() && !branch_labels.contains(&label) {
-                            branch_labels.push(label);
-                        }
-                    }
-                    out.push_str(&format!(
-                        "  provenance: {} path{}{}{}\n",
-                        result.provenance.len(),
-                        if result.provenance.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if result.provenance_truncated {
-                            " (truncated)"
-                        } else {
-                            ""
-                        },
-                        if branch_labels.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; branches {}", branch_labels.join(", "))
-                        },
-                    ));
+                if let Some(summary) = result.provenance_summary() {
+                    out.push_str(&format!("  {summary}\n"));
                 }
             }
         }
         for diagnostic in &self.diagnostics {
-            let label = format!(
-                "{} [{}]",
-                diagnostic.impact.as_str(),
-                diagnostic.code.as_str()
-            );
-            if diagnostic.branch.is_empty() {
-                out.push_str(&format!("{label}: {}\n", diagnostic.message));
-            } else {
-                out.push_str(&format!(
-                    "{label} [branch {}]: {}\n",
-                    format_branch_path(&diagnostic.branch),
-                    diagnostic.message
-                ));
-            }
+            out.push_str(&format!(
+                "{}: {}\n",
+                diagnostic.presentation_label(),
+                diagnostic.message
+            ));
         }
         out
     }
@@ -6402,7 +8146,9 @@ mod tests {
     use super::*;
     use crate::analyzer::structural::CodeQuery;
     use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
-    use crate::analyzer::{CodeUnitType, TestProject, TypescriptAnalyzer};
+    use crate::analyzer::{
+        CodeUnitType, JavaAnalyzer, PhpAnalyzer, TestProject, TypescriptAnalyzer,
+    };
     use serde_json::json;
     use std::cell::Cell;
     use std::path::PathBuf;
@@ -6418,6 +8164,331 @@ mod tests {
             language: "workspace",
             message: "prose deliberately carries no classification words".to_string(),
         }
+    }
+
+    #[test]
+    fn execution_work_snapshot_is_the_single_budget_projection() {
+        let snapshot = execution_work_snapshot(CodeQueryExecutionBudget {
+            scanned_files: 1,
+            scanned_source_bytes: 2,
+            fact_nodes: 3,
+            examined_references: 4,
+            pipeline_rows: 5,
+            provenance_steps: 6,
+            import_files_resolved: 7,
+            import_edges_resolved: 8,
+        });
+        assert_eq!(
+            snapshot,
+            QueryOperatorWorkProfile {
+                scanned_files: 1,
+                scanned_source_bytes: 2,
+                fact_nodes: 3,
+                pipeline_rows: 5,
+                examined_references: 4,
+                provenance_steps: 6,
+                import_files_resolved: 7,
+                import_edges_resolved: 8,
+            }
+        );
+        assert_eq!(
+            public_execution_work(snapshot),
+            CodeQueryExecutionWork {
+                scanned_files: 1,
+                scanned_source_bytes: 2,
+                fact_nodes: 3,
+                pipeline_rows: 5,
+                examined_references: 4,
+            }
+        );
+    }
+
+    fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
+        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v4");
+        assert_eq!(profile.peak_concurrency, 1);
+        assert_eq!(profile.scheduler.tasks_enqueued, 0);
+        assert_eq!(profile.scheduler.peak_concurrency, 0);
+        assert!(
+            profile
+                .planning_ns
+                .saturating_add(profile.execution_ns)
+                .saturating_add(profile.rendering_ns)
+                <= profile.total_elapsed_ns,
+            "named request phases must fit inside total request wall time"
+        );
+        for observation in &profile.operators {
+            assert_eq!(
+                observation.total_elapsed_ns,
+                observation
+                    .elapsed_ns
+                    .saturating_add(observation.dependency_execution_ns),
+                "operator self and inline dependency execution must reconcile"
+            );
+            assert_eq!(observation.dependency_wait_ns, 0);
+            assert_eq!(observation.scheduling_overhead_ns, 0);
+            assert!(observation.merge_ns <= observation.elapsed_ns);
+        }
+        let operator_work = profile
+            .operators
+            .iter()
+            .fold(QueryOperatorWorkProfile::default(), |work, observation| {
+                work.saturating_add(observation.work)
+            });
+        assert_eq!(operator_work, profile.execution_work);
+        assert_eq!(
+            profile
+                .execution_work
+                .saturating_add(profile.rendering_work),
+            profile.work
+        );
+    }
+
+    #[test]
+    fn public_explain_is_planning_only_and_exposes_shared_logical_dependencies() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/app.ts");
+        file.write("class Shared {}\n").expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_sexp(
+            "(explain (union (class :name \"Shared\") (class :name \"Shared\")))",
+        )
+        .expect("explain query");
+        let providers = analyzer.structural_search_providers();
+        let extractions_before = providers
+            .iter()
+            .map(|provider| provider.structural_extraction_count())
+            .sum::<u64>();
+
+        let CodeQueryResponse::Explain(explain) = execute_request(&analyzer, &query) else {
+            panic!("explain mode must return a planning report")
+        };
+
+        let extractions_after = providers
+            .iter()
+            .map(|provider| provider.structural_extraction_count())
+            .sum::<u64>();
+        assert_eq!(extractions_after, extractions_before);
+        assert_eq!(explain.scheduling.max_concurrency, 1);
+        assert!(matches!(
+            explain.scheduling.selected,
+            super::super::execution::plan::CodeQuerySelectedScheduling::Sequential
+        ));
+        let shared_set = explain
+            .logical_plan
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.operation,
+                    super::super::execution::plan::CodeQueryLogicalOperation::Set { .. }
+                )
+            })
+            .expect("logical set node");
+        assert_eq!(shared_set.dependencies.len(), 2);
+        assert_eq!(shared_set.dependencies[0], shared_set.dependencies[1]);
+    }
+
+    #[test]
+    fn public_profile_nests_the_exact_ordered_ordinary_result() {
+        let source = "class First {}\nclass Second {}\n";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/app.ts")
+            .write(source)
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let mut query =
+            CodeQuery::from_json(&json!({ "match": { "kind": "class" } })).expect("results query");
+        let CodeQueryResponse::Results(ordinary) = execute_request(&analyzer, &query) else {
+            panic!("default mode must return ordinary results")
+        };
+        let ordinary_json = serde_json::to_value(&ordinary).expect("serialize ordinary result");
+        assert_eq!(
+            serde_json::to_value(CodeQueryResponse::Results(ordinary))
+                .expect("serialize ordinary response"),
+            ordinary_json,
+            "default response must not add an enum envelope"
+        );
+
+        query.execution_mode = CodeQueryExecutionMode::Profile;
+        let expected_explain = select_physical_plan(
+            &query,
+            UnionExecutionStrategy::Auto,
+            CODE_QUERY_SCHEDULER_WORKERS,
+        )
+        .expect("profile query should select a plan")
+        .public_explain(&query, CODE_QUERY_SCHEDULER_WORKERS);
+        let CodeQueryResponse::Profile(profile) = execute_request(&analyzer, &query) else {
+            panic!("profile mode must return a profile")
+        };
+
+        assert_eq!(profile.explain, expected_explain);
+        assert_eq!(
+            serde_json::to_value(&profile.result).expect("serialize profiled result"),
+            ordinary_json
+        );
+        assert_eq!(profile.format, CodeQueryProfile::FORMAT);
+        assert!(!profile.operators.is_empty());
+        assert_eq!(profile.scheduling.peak_concurrency, 1);
+        assert!(profile.scheduling.bounded_dispatch.is_none());
+    }
+
+    #[test]
+    fn response_parts_preserve_each_public_wire_shape() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/app.ts")
+            .write("class Example {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let mut query =
+            CodeQuery::from_json(&json!({ "match": { "kind": "class" } })).expect("query");
+
+        for mode in [
+            CodeQueryExecutionMode::Results,
+            CodeQueryExecutionMode::Explain,
+            CodeQueryExecutionMode::Profile,
+        ] {
+            query.execution_mode = mode;
+            let response = execute_request(&analyzer, &query);
+            let serialized = serde_json::to_value(&response).expect("serialize response");
+            let pretty_report = response.render_report_pretty();
+            let (actual_mode, result, report) = response.into_parts();
+            assert_eq!(actual_mode, mode);
+            match mode {
+                CodeQueryExecutionMode::Results => {
+                    assert_eq!(
+                        serde_json::to_value(result.expect("ordinary result"))
+                            .expect("serialize ordinary result"),
+                        serialized
+                    );
+                    assert!(report.is_none());
+                    assert!(pretty_report.is_none());
+                }
+                CodeQueryExecutionMode::Explain => {
+                    assert!(result.is_none());
+                    assert_eq!(report.expect("explain report"), serialized);
+                    assert!(
+                        pretty_report
+                            .expect("pretty explain report")
+                            .starts_with("{\n  \"format\":")
+                    );
+                }
+                CodeQueryExecutionMode::Profile => {
+                    assert_eq!(
+                        serde_json::to_value(result.expect("profiled result"))
+                            .expect("serialize profiled result"),
+                        serialized["result"]
+                    );
+                    assert_eq!(report.expect("profile report"), serialized);
+                    assert!(
+                        pretty_report
+                            .expect("pretty profile report")
+                            .starts_with("{\n  \"format\":")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicates() {
+        let item = CodeQueryResultItem {
+            value: CodeQueryResultValue::File {
+                value: CodeQueryFile {
+                    path: "src/app.ts".to_string(),
+                    language: "typescript",
+                },
+            },
+            provenance: vec![
+                CodeQueryProvenance {
+                    branch: vec![1, 0],
+                    seed: CodeQueryResultRef::File {
+                        path: "src/app.ts".to_string(),
+                    },
+                    steps: Vec::new(),
+                },
+                CodeQueryProvenance {
+                    branch: vec![1, 0],
+                    seed: CodeQueryResultRef::File {
+                        path: "src/app.ts".to_string(),
+                    },
+                    steps: Vec::new(),
+                },
+                CodeQueryProvenance {
+                    branch: vec![0],
+                    seed: CodeQueryResultRef::File {
+                        path: "src/app.ts".to_string(),
+                    },
+                    steps: Vec::new(),
+                },
+            ],
+            provenance_truncated: true,
+        };
+        assert_eq!(
+            item.provenance_summary().as_deref(),
+            Some("provenance: 3 paths (truncated); branches 1.0, 0")
+        );
+        let diagnostic = CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::BroadQuery,
+            impact: CodeQueryDiagnosticImpact::Advisory,
+            branch: vec![1, 0],
+            language: "typescript",
+            message: "broad query".to_string(),
+        };
+        assert_eq!(
+            diagnostic.presentation_label(),
+            "advisory [broad_query] [branch 1.0]"
+        );
+
+        let rendered = CodeQueryResult {
+            results: vec![item],
+            truncated: false,
+            diagnostics: vec![diagnostic],
+        }
+        .render_text();
+        assert!(rendered.contains("  provenance: 3 paths (truncated); branches 1.0, 0\n"));
+        assert!(rendered.contains("advisory [broad_query] [branch 1.0]: broad query\n"));
+    }
+
+    #[test]
+    fn public_profile_retains_pre_execution_cancellation_observations() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/app.ts")
+            .write("class Cancelled {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "execution_mode": "profile",
+            "match": { "kind": "class" }
+        }))
+        .expect("profile query");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let CodeQueryResponse::Profile(profile) = execute_request_with_cancellation(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            &cancellation,
+        ) else {
+            panic!("pre-cancelled profile should retain its report")
+        };
+
+        assert_eq!(profile.result.completion(), CodeQueryCompletion::Cancelled);
+        assert!(profile.operators.iter().any(|operator| {
+            operator.result_cancelled
+                || matches!(
+                    operator.disposition,
+                    super::super::execution::profile::CodeQueryOperatorDisposition::Cancelled
+                )
+        }));
     }
 
     #[test]
@@ -6592,6 +8663,110 @@ mod tests {
     }
 
     #[test]
+    fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
+        let unit = CodeUnit::new(
+            ProjectFile::new(root, "src/missing.ts"),
+            CodeUnitType::Function,
+            "",
+            "caller",
+        );
+        let mut cache = CallTraversalCache::default();
+        let mut budget = CodeQueryExecutionBudget::default();
+        let mut diagnostics = Vec::new();
+        let mut profile = Some(QueryCacheProfile::default());
+
+        let built = cached_call_relation(
+            &analyzer,
+            &unit,
+            false,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut diagnostics,
+            &mut profile,
+        );
+        assert!(!built.truncated);
+        assert!(!built.cancelled);
+        assert!(
+            built.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+            })
+        );
+
+        let replayed = cached_call_relation(
+            &analyzer,
+            &unit,
+            false,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut diagnostics,
+            &mut profile,
+        );
+        assert_eq!(replayed.sites.len(), built.sites.len());
+        assert_eq!(replayed.diagnostics, built.diagnostics);
+        assert_eq!(replayed.truncated, built.truncated);
+        assert_eq!(replayed.cancelled, built.cancelled);
+
+        cache.incoming.insert(
+            unit.clone(),
+            CallRelationResult {
+                diagnostics: vec![CallRelationDiagnostic {
+                    code: CallRelationDiagnosticCode::ParseFailed,
+                    message: "parse failed".to_string(),
+                    context: "caller".to_string(),
+                    reason_kind: None,
+                }],
+                ..CallRelationResult::default()
+            },
+        );
+        let incoming = cached_call_relation(
+            &analyzer,
+            &unit,
+            true,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut diagnostics,
+            &mut profile,
+        );
+        assert!(!incoming.truncated);
+        assert!(!incoming.cancelled);
+
+        let profile = profile.expect("cache profile");
+        assert_eq!(profile.outgoing_call.lookups, 2);
+        assert_eq!(profile.outgoing_call.misses, 1);
+        assert_eq!(profile.outgoing_call.builds, 1);
+        assert_eq!(profile.outgoing_call.incomplete_builds, 1);
+        assert_eq!(profile.outgoing_call.complete_builds, 0);
+        assert_eq!(profile.outgoing_call.hits, 1);
+        assert_eq!(profile.outgoing_call.incomplete_hits, 1);
+        assert_eq!(profile.outgoing_call.complete_hits, 0);
+        assert_eq!(profile.incoming_call.lookups, 1);
+        assert_eq!(profile.incoming_call.hits, 1);
+        assert_eq!(profile.incoming_call.incomplete_hits, 1);
+        assert_eq!(profile.incoming_call.complete_hits, 0);
+
+        let advisory = CallRelationResult {
+            diagnostics: vec![CallRelationDiagnostic {
+                code: CallRelationDiagnosticCode::TargetsAmbiguous,
+                message: "ambiguous".to_string(),
+                context: "caller".to_string(),
+                reason_kind: None,
+            }],
+            ..CallRelationResult::default()
+        };
+        assert!(call_relation_result_complete(&advisory));
+    }
+
+    #[test]
     fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
         let root = std::env::temp_dir().join("bifrost-outbound-lookup-completeness");
         let file = ProjectFile::new(root, "src/app.ts");
@@ -6735,6 +8910,7 @@ mod tests {
             8,
             None,
             &mut diagnostics,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -6794,6 +8970,7 @@ mod tests {
             8,
             None,
             &mut diagnostics,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -6936,6 +9113,7 @@ mod tests {
             &mut diagnostics,
             8,
             None,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -6965,6 +9143,7 @@ mod tests {
             &mut diagnostics,
             8,
             None,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -7324,6 +9503,1029 @@ mod tests {
     }
 
     #[test]
+    fn sequential_profile_replays_a_shared_seed_for_each_union_branch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("export function shared() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({ "match": { "kind": "function", "name": "shared" } });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch],
+            "limit": 10
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(detailed.result.results.len(), 1);
+        let profile = detailed
+            .profile
+            .expect("valid execution should be profiled");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| {
+                    observation.operator == PhysicalQueryOperator::SequentialUnion
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| observation.operator == PhysicalQueryOperator::Limit)
+                .count(),
+            1
+        );
+        let seed_observations = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seed_observations.len(), 2);
+        assert_eq!(seed_observations[0].node, seed_observations[1].node);
+        assert_eq!(seed_observations[0].branch, vec![0]);
+        assert_eq!(seed_observations[1].branch, vec![1]);
+        assert!(
+            seed_observations.iter().all(|observation| {
+                observation.disposition == QueryOperatorDisposition::Completed
+            })
+        );
+        assert_eq!(seed_observations[0].cache.seed_result.lookups, 1);
+        assert_eq!(seed_observations[0].cache.seed_result.misses, 1);
+        assert_eq!(seed_observations[0].cache.seed_result.builds, 1);
+        assert_eq!(seed_observations[0].cache.seed_result.complete_builds, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.lookups, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.hits, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.complete_hits, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.replayed_items, 1);
+        assert_eq!(profile.cache.seed_result.lookups, 2);
+        assert_eq!(profile.cache.seed_result.misses, 1);
+        assert_eq!(profile.cache.seed_result.hits, 1);
+        assert_eq!(profile.cache.seed_result.complete_builds, 1);
+        assert_eq!(profile.cache.seed_result.complete_hits, 1);
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        assert_eq!(union.input_rows, 2);
+        assert_eq!(union.output_rows, 1);
+        assert_eq!(union.rows_discarded, Some(1));
+        assert!(union.temporary_capacity_bytes_lower_bound > 0);
+    }
+
+    #[test]
+    fn parallel_seed_union_matches_serial_fair_budget_roll_forward() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+            .write("export const left = 1;\n")
+            .expect("write left source");
+        ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+            .write(
+                "export function first() {}\nexport function second() {}\nexport function third() {}\n",
+            )
+            .expect("write right source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                {
+                    "where": ["left.ts"],
+                    "match": { "kind": "function", "name": "missing" }
+                },
+                {
+                    "where": ["right.ts"],
+                    "match": { "kind": "function" }
+                }
+            ],
+            "limit": 10
+        }))
+        .expect("query");
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        };
+
+        let sequential = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Sequential,
+            true,
+        );
+        let parallel = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Parallel,
+            true,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&parallel.result).expect("parallel result serializes"),
+            serde_json::to_value(&sequential.result).expect("sequential result serializes")
+        );
+        assert_eq!(parallel.work, sequential.work);
+        assert_eq!(parallel.evidence, sequential.evidence);
+        assert!(
+            !parallel.result.truncated,
+            "{:?}",
+            parallel.result.diagnostics
+        );
+        assert_eq!(parallel.result.results.len(), 3);
+
+        let profile = parallel.profile.expect("parallel profile");
+        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v4");
+        assert_eq!(profile.scheduler.worker_limit, 2);
+        assert_eq!(profile.scheduler.tasks_enqueued, 2);
+        assert_eq!(profile.scheduler.tasks_completed, 2);
+        assert!((1..=2).contains(&profile.peak_concurrency));
+        assert_eq!(profile.peak_concurrency, profile.scheduler.peak_concurrency);
+        let parallel_union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::ParallelUnion)
+            .expect("parallel union observation");
+        assert!(parallel_union.dependency_wait_ns > 0);
+        assert!(parallel_union.scheduling_overhead_ns > 0);
+        assert_eq!(
+            parallel_union.total_elapsed_ns,
+            parallel_union
+                .elapsed_ns
+                .saturating_add(parallel_union.dependency_wait_ns)
+        );
+        let operator_work = profile
+            .operators
+            .iter()
+            .fold(QueryOperatorWorkProfile::default(), |work, observation| {
+                work.saturating_add(observation.work)
+            });
+        assert_eq!(operator_work, profile.execution_work);
+        assert!(
+            sequential
+                .profile
+                .expect("sequential profile")
+                .operators
+                .iter()
+                .any(|observation| {
+                    observation.operator == PhysicalQueryOperator::SequentialUnion
+                })
+        );
+    }
+
+    #[test]
+    fn parallel_seed_union_matches_serial_budget_exhaustion() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+            .write("export function left_one() {}\nexport function left_two() {}\n")
+            .expect("write left source");
+        ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+            .write("export function right_one() {}\nexport function right_two() {}\n")
+            .expect("write right source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "where": ["left.ts"], "match": { "kind": "function" } },
+                { "where": ["right.ts"], "match": { "kind": "function" } }
+            ]
+        }))
+        .expect("query");
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        };
+
+        let sequential = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Sequential,
+            false,
+        );
+        let parallel = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Parallel,
+            false,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&parallel.result).expect("parallel result serializes"),
+            serde_json::to_value(&sequential.result).expect("sequential result serializes")
+        );
+        assert_eq!(parallel.work, sequential.work);
+        assert_eq!(parallel.evidence, sequential.evidence);
+        assert!(parallel.result.truncated);
+        assert_eq!(parallel.result.results.len(), 3);
+    }
+
+    #[test]
+    fn forced_parallel_keeps_shared_and_stepped_unions_serial() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("export function first() {}\nexport function second() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let shared = json!({ "match": { "kind": "function", "name": "first" } });
+        let stepped = CodeQuery::from_json(&json!({
+            "union": [
+                {
+                    "match": { "kind": "function", "name": "first" },
+                    "steps": [{ "op": "enclosing_decl" }]
+                },
+                {
+                    "match": { "kind": "function", "name": "second" },
+                    "steps": [{ "op": "enclosing_decl" }]
+                }
+            ]
+        }))
+        .expect("stepped query");
+        let shared = CodeQuery::from_json(&json!({
+            "union": [shared.clone(), shared]
+        }))
+        .expect("shared query");
+
+        for query in [&shared, &stepped] {
+            let profile = execute_code_query_with_union_strategy(
+                &analyzer,
+                query,
+                CodeQueryExecutionLimits::default(),
+                UnionExecutionStrategy::Parallel,
+                true,
+            )
+            .profile
+            .expect("profile");
+            assert_eq!(profile.scheduler.tasks_enqueued, 0);
+            assert!(profile.operators.iter().any(|observation| {
+                observation.operator == PhysicalQueryOperator::SequentialUnion
+            }));
+            assert!(!profile.operators.iter().any(|observation| {
+                observation.operator == PhysicalQueryOperator::ParallelUnion
+            }));
+        }
+    }
+
+    #[test]
+    fn absolute_exact_globs_cannot_panic_parallel_selection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("inside.ts"))
+            .write("export function inside() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+
+        for (left, right) in [
+            ("/outside/left.ts", "/outside/right.ts"),
+            ("C:/outside/left.ts", "D:/outside/right.ts"),
+        ] {
+            let query = CodeQuery::from_json(&json!({
+                "union": [
+                    {
+                        "where": [left],
+                        "languages": ["typescript"],
+                        "match": { "kind": "function" }
+                    },
+                    {
+                        "where": [right],
+                        "languages": ["typescript"],
+                        "match": { "kind": "function" }
+                    }
+                ]
+            }))
+            .expect("absolute globs remain valid query syntax");
+            let profile = execute_internal(
+                &analyzer,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                None,
+                true,
+            )
+            .profile
+            .expect("profile");
+            assert!(
+                profile.operators.iter().any(|operator| {
+                    operator.operator == PhysicalQueryOperator::SequentialUnion
+                })
+            );
+            assert!(
+                !profile
+                    .operators
+                    .iter()
+                    .any(|operator| { operator.operator == PhysicalQueryOperator::ParallelUnion })
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_bearing_parallel_union_runs_cancellation_safe_tasks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+            .write("export function left() {}\n")
+            .expect("write left source");
+        ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+            .write("export function right() {}\n")
+            .expect("write right source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "where": ["left.ts"], "match": { "kind": "function" } },
+                { "where": ["right.ts"], "match": { "kind": "function" } }
+            ]
+        }))
+        .expect("query");
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+
+        let detailed = execute_internal_with_strategy(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            Some(&cancellation),
+            None,
+            true,
+            UnionExecutionStrategy::Parallel,
+            2,
+        );
+
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
+        let profile = detailed.profile.expect("cancelled execution profile");
+        assert!(
+            profile
+                .operators
+                .iter()
+                .any(|operator| { operator.operator == PhysicalQueryOperator::ParallelUnion })
+        );
+        assert_eq!(profile.scheduler.tasks_started, 2);
+        assert_eq!(profile.scheduler.tasks_completed, 2);
+        assert!(profile.scheduler.tasks_observed_cancelled_before_start > 0);
+    }
+
+    #[test]
+    fn fair_budget_wait_is_released_by_cancellation_and_worker_failure() {
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        };
+        let projected = CodeQueryExecutionBudget {
+            pipeline_rows: 1,
+            ..CodeQueryExecutionBudget::default()
+        };
+
+        let cancellation = CancellationToken::default();
+        let coordinator = FairSeedBudgetCoordinator::new(
+            CodeQueryExecutionBudget::default(),
+            limits,
+            2,
+            Some(&cancellation),
+        );
+        let lease = coordinator.lease(1);
+        let cancelled_waiter = std::thread::spawn(move || lease.admit(projected));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator.waiting_branches() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "budget branch did not start waiting"
+            );
+            std::thread::yield_now();
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            cancelled_waiter.join().expect("cancelled waiter joins"),
+            FairSeedBudgetAdmission::Cancelled
+        ));
+
+        let coordinator =
+            FairSeedBudgetCoordinator::new(CodeQueryExecutionBudget::default(), limits, 2, None);
+        let lease = coordinator.lease(1);
+        let failed_waiter = std::thread::spawn(move || lease.admit(projected));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator.waiting_branches() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "budget branch did not start waiting"
+            );
+            std::thread::yield_now();
+        }
+        coordinator.fail();
+        assert!(matches!(
+            failed_waiter.join().expect("failed waiter joins"),
+            FairSeedBudgetAdmission::Cancelled
+        ));
+    }
+
+    #[test]
+    fn profile_marks_truncated_seed_materialization_and_replay_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("function first() {}\nfunction second() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({ "match": { "kind": "function" } });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits {
+                max_scanned_files: 1,
+                max_pipeline_rows: 2,
+                ..CodeQueryExecutionLimits::default()
+            },
+            None,
+            None,
+            true,
+        );
+
+        assert!(detailed.result.truncated);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.lookups, 2);
+        assert_eq!(profile.cache.seed_result.misses, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(profile.cache.seed_result.hits, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_hits, 1);
+        let seed_observations = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seed_observations.len(), 2);
+        assert_eq!(seed_observations[0].cache.seed_result.incomplete_builds, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.incomplete_hits, 1);
+        assert!(seed_observations.iter().all(|observation| {
+            observation
+                .terminations
+                .contains(&QueryOperatorTermination::PipelineBudget)
+        }));
+    }
+
+    #[test]
+    fn profile_does_not_call_a_terminal_cap_seed_cache_complete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("function first() {}\nfunction second() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "match": { "kind": "function" },
+            "limit": 1
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert_eq!(detailed.result.results.len(), 1);
+        assert!(detailed.result.truncated);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.misses, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(profile.cache.seed_result.complete_builds, 0);
+        let seed = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .expect("seed observation");
+        assert_eq!(seed.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(
+            seed.terminations,
+            vec![QueryOperatorTermination::TerminalCap]
+        );
+        let limit = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::Limit)
+            .expect("limit observation");
+        assert_eq!(
+            limit.terminations,
+            vec![QueryOperatorTermination::ResultLimit]
+        );
+    }
+
+    #[test]
+    fn profile_marks_unsupported_seed_materialization_and_replay_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("function target(options: object) {}\ntarget({ flag: true });\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({
+            "match": {
+                "kind": "call",
+                "kwargs": { "flag": { "kind": "boolean_literal" } }
+            }
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert!(matches!(
+            detailed.result.completion(),
+            CodeQueryCompletion::Incomplete { codes }
+                if codes.contains(&CodeQueryDiagnosticCode::UnsupportedStructuralFeature)
+        ));
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_hits, 1);
+        let seeds = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seeds.len(), 2);
+        assert!(seeds.iter().all(|observation| {
+            observation
+                .terminations
+                .contains(&QueryOperatorTermination::UnsupportedAnalysis)
+        }));
+    }
+
+    #[test]
+    fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.php"))
+            .write("<?php\nfunction target() {}\n")
+            .expect("write source");
+        let analyzer = PhpAnalyzer::from_project(TestProject::new(root, Language::Php));
+        let imports = json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "file_of" }, { "op": "imports_of" }]
+        });
+        let importers = json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [imports.clone(), imports, importers.clone(), importers]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert!(matches!(
+            detailed.result.completion(),
+            CodeQueryCompletion::Incomplete { codes }
+                if codes.contains(&CodeQueryDiagnosticCode::UnsupportedImportAnalysis)
+        ));
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.import_forward.lookups, 2);
+        assert_eq!(profile.cache.import_forward.misses, 1);
+        assert_eq!(profile.cache.import_forward.incomplete_builds, 1);
+        assert_eq!(profile.cache.import_forward.complete_builds, 0);
+        assert_eq!(profile.cache.import_forward.hits, 1);
+        assert_eq!(profile.cache.import_forward.incomplete_hits, 1);
+        assert_eq!(profile.cache.import_forward.complete_hits, 0);
+        assert_eq!(profile.cache.import_reverse.lookups, 2);
+        assert_eq!(profile.cache.import_reverse.misses, 1);
+        assert_eq!(profile.cache.import_reverse.incomplete_builds, 1);
+        assert_eq!(profile.cache.import_reverse.complete_builds, 0);
+        assert_eq!(profile.cache.import_reverse.hits, 1);
+        assert_eq!(profile.cache.import_reverse.incomplete_hits, 1);
+        assert_eq!(profile.cache.import_reverse.complete_hits, 0);
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| {
+                    observation.operator == PhysicalQueryOperator::PipelineStep
+                        && observation
+                            .terminations
+                            .contains(&QueryOperatorTermination::UnsupportedAnalysis)
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("export function left() {}\nexport function right() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "match": { "kind": "function", "name": "left" } },
+                { "match": { "kind": "function", "name": "right" } }
+            ]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert_eq!(detailed.result.results.len(), 2);
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Complete);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.lookups, 2);
+        assert_eq!(profile.cache.seed_result.misses, 2);
+        assert_eq!(profile.cache.seed_result.hits, 0);
+        assert_eq!(profile.cache.seed_result.complete_builds, 2);
+        assert_eq!(profile.cache.seed_structural_facts.lookups, 2);
+        assert_eq!(profile.cache.seed_structural_facts.extractions, 1);
+        assert_eq!(profile.cache.seed_structural_facts.memory_hits, 1);
+        assert_eq!(profile.cache.seed_structural_facts.replayed_files, 1);
+        let seed_observations = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seed_observations.len(), 2);
+        assert_eq!(seed_observations[0].branch, vec![0]);
+        assert_eq!(
+            seed_observations[0].cache.seed_structural_facts.extractions,
+            1
+        );
+        assert_eq!(
+            seed_observations[0].cache.seed_structural_facts.memory_hits,
+            0
+        );
+        assert_eq!(seed_observations[1].branch, vec![1]);
+        assert_eq!(
+            seed_observations[1].cache.seed_structural_facts.memory_hits,
+            1
+        );
+        assert_eq!(
+            seed_observations[1]
+                .cache
+                .seed_structural_facts
+                .replayed_files,
+            1
+        );
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        assert_eq!(union.input_rows, 2);
+        assert_eq!(union.rows_visited, 2);
+        assert_eq!(union.rows_discarded, Some(0));
+        assert!(union.temporary_capacity_bytes_lower_bound > 0);
+    }
+
+    #[test]
+    fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("bench/LeftHub.java"))
+            .write("package bench;\npublic class LeftHub {}\n")
+            .expect("write left hub");
+        ProjectFile::new(root.clone(), PathBuf::from("bench/RightHub.java"))
+            .write("package bench;\npublic class RightHub {}\n")
+            .expect("write right hub");
+        for name in ["One", "Two"] {
+            ProjectFile::new(root.clone(), PathBuf::from(format!("bench/Node{name}.java")))
+                .write(format!(
+                    "package bench;\nimport bench.LeftHub;\nimport bench.RightHub;\npublic class Node{name} {{}}\n"
+                ))
+                .expect("write importer");
+        }
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let branch = |name: &str| {
+            json!({
+                "where": [format!("bench/{name}.java")],
+                "languages": ["java"],
+                "match": { "kind": "class", "name": name },
+                "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+            })
+        };
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch("LeftHub"), branch("RightHub")]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert_eq!(detailed.result.results.len(), 2);
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Complete);
+        let public_work = detailed.work;
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(public_work.scanned_files, profile.work.scanned_files);
+        assert_eq!(
+            public_work.scanned_source_bytes,
+            profile.work.scanned_source_bytes
+        );
+        assert_eq!(public_work.fact_nodes, profile.work.fact_nodes);
+        assert_eq!(public_work.pipeline_rows, profile.work.pipeline_rows);
+        assert_eq!(
+            public_work.examined_references,
+            profile.work.examined_references
+        );
+        assert!(profile.work.import_files_resolved > 0);
+        assert!(profile.work.import_edges_resolved > 0);
+        assert_eq!(profile.cache.import_reverse.lookups, 2);
+        assert_eq!(profile.cache.import_reverse.misses, 1);
+        assert_eq!(profile.cache.import_reverse.complete_builds, 1);
+        assert_eq!(profile.cache.import_reverse.hits, 1);
+        assert_eq!(profile.cache.import_reverse.complete_hits, 1);
+        assert!(profile.cache.import_reverse.replayed_items > 0);
+        let import_steps = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.cache.import_reverse.lookups > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(import_steps.len(), 2);
+        assert_eq!(import_steps[0].branch, vec![0]);
+        assert_eq!(import_steps[0].cache.import_reverse.misses, 1);
+        assert_eq!(import_steps[0].cache.import_reverse.complete_builds, 1);
+        assert_eq!(import_steps[0].work.import_files_resolved, 4);
+        assert_eq!(import_steps[0].work.import_edges_resolved, 4);
+        assert_eq!(import_steps[1].branch, vec![1]);
+        assert_eq!(import_steps[1].cache.import_reverse.hits, 1);
+        assert_eq!(import_steps[1].cache.import_reverse.complete_hits, 1);
+        assert_eq!(import_steps[1].work.import_files_resolved, 0);
+        assert_eq!(import_steps[1].work.import_edges_resolved, 0);
+        assert!(import_steps.iter().all(|observation| {
+            observation.input_rows == 1
+                && observation.rows_visited == 1
+                && observation.relation_expansions == 2
+                && observation.output_rows == 2
+                && observation.rows_discarded.is_none()
+        }));
+    }
+
+    #[test]
+    fn profile_preserves_incomplete_reference_cache_state_for_a_sibling() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = "export function target() {}\nfunction one() { target(); }\nfunction two() { target(); }\n";
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write(source)
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "references_of" },
+                { "op": "file_of" }
+            ]
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits {
+                max_scanned_source_bytes: source.len().saturating_mul(2).saturating_add(4),
+                ..CodeQueryExecutionLimits::default()
+            },
+            None,
+            None,
+            true,
+        );
+
+        assert!(detailed.result.truncated);
+        assert!(
+            detailed
+                .result
+                .results
+                .iter()
+                .all(|item| { !matches!(item.value, CodeQueryResultValue::File { .. }) })
+        );
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.inbound_reference.lookups, 2);
+        assert_eq!(profile.cache.inbound_reference.misses, 1);
+        assert_eq!(profile.cache.inbound_reference.incomplete_builds, 1);
+        assert_eq!(profile.cache.inbound_reference.hits, 1);
+        assert_eq!(profile.cache.inbound_reference.incomplete_hits, 1);
+        let reference_steps = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.cache.inbound_reference.lookups > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(reference_steps.len(), 2);
+        assert!(
+            reference_steps
+                .iter()
+                .all(|observation| observation.result_truncated)
+        );
+        assert!(
+            reference_steps[0]
+                .terminations
+                .contains(&QueryOperatorTermination::AnalysisLimit)
+        );
+        assert!(
+            reference_steps[1]
+                .terminations
+                .contains(&QueryOperatorTermination::AnalysisIncomplete),
+            "sibling terminations: {:?}",
+            reference_steps[1].terminations
+        );
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| {
+                    observation
+                        .terminations
+                        .contains(&QueryOperatorTermination::DependencyPipelineHalted)
+                })
+                .count(),
+            2,
+            "neither branch may continue a known-incomplete reference layer"
+        );
+    }
+
+    #[test]
+    fn profile_attributes_root_limit_probe_to_the_limit_operator() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write(
+                "function one() {}\nfunction two() {}\nfunction three() {}\nfunction four() {}\n",
+            )
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({ "match": { "kind": "function" } });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch],
+            "limit": 2
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(detailed.result.results.len(), 2);
+        assert!(detailed.result.truncated);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        let limit = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::Limit)
+            .expect("limit observation");
+        assert!(limit.branch.is_empty());
+        assert_eq!(limit.disposition, QueryOperatorDisposition::Completed);
+        assert_eq!(limit.input_rows, 3);
+        assert_eq!(limit.output_rows, 2);
+        assert!(limit.operator_truncated);
+        assert!(limit.result_truncated);
+        assert!(!limit.result_cancelled);
+        assert_eq!(limit.rows_visited, 3);
+        assert_eq!(limit.rows_discarded, Some(1));
+        assert_eq!(
+            limit.terminations,
+            vec![QueryOperatorTermination::ResultLimit]
+        );
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        assert_eq!(union.input_rows, 8);
+        assert_eq!(union.output_rows, 3);
+        assert!(union.operator_truncated);
+        assert!(!union.result_truncated);
+        assert_eq!(union.rows_visited, 8);
+        assert_eq!(union.rows_discarded, Some(5));
+        assert!(union.temporary_capacity_bytes_lower_bound > 0);
+        assert_eq!(
+            union.terminations,
+            vec![QueryOperatorTermination::TerminalCap]
+        );
+    }
+
+    #[test]
+    fn skipped_set_profile_forwards_cancellation_safe_partial_cardinality() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write(
+                "function one() { sink(); }\nfunction two() { sink(); }\nfunction three() { sink(); }\n",
+            )
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({
+            "match": { "kind": "call" },
+            "steps": [{ "op": "enclosing_decl" }]
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed = (2..256)
+            .find_map(|checks| {
+                let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+                let detailed = execute_internal(
+                    &analyzer,
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    Some(&cancellation),
+                    None,
+                    true,
+                );
+                let profile = detailed.profile.as_ref()?;
+                let union = profile.operators.iter().find(|observation| {
+                    observation.operator == PhysicalQueryOperator::SequentialUnion
+                })?;
+                let limit = profile
+                    .operators
+                    .iter()
+                    .find(|observation| observation.operator == PhysicalQueryOperator::Limit)?;
+                (union.disposition == QueryOperatorDisposition::Skipped
+                    && union.output_rows > 0
+                    && union.output_rows == limit.input_rows)
+                    .then_some(detailed)
+            })
+            .expect("cancellation should interrupt a final branch step after a partial row");
+
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        let limit = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::Limit)
+            .expect("limit observation");
+        assert_eq!(union.disposition, QueryOperatorDisposition::Skipped);
+        assert!(union.result_cancelled);
+        assert_eq!(union.output_rows, limit.input_rows);
+        assert!(limit.result_cancelled);
+        assert_eq!(
+            union.terminations,
+            vec![QueryOperatorTermination::DependencyCancelled]
+        );
+        assert_eq!(
+            limit.terminations,
+            vec![QueryOperatorTermination::DependencyCancelled]
+        );
+        assert!(profile.operators.iter().any(|observation| {
+            observation.disposition == QueryOperatorDisposition::Cancelled
+                && observation
+                    .terminations
+                    .contains(&QueryOperatorTermination::CancellationDuringWork)
+        }));
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
+    }
+
+    #[test]
     fn detailed_execution_aligns_evidence_hashes_owners_and_direct_work() {
         let source = r#"export function handler(input: string) {
     sink(input);
@@ -7349,6 +10551,10 @@ mod tests {
         );
 
         assert_eq!(detailed.result.results.len(), 1);
+        assert!(
+            detailed.profile.is_none(),
+            "ordinary detailed execution should not pay profiling overhead"
+        );
         assert_eq!(detailed.evidence.len(), 1);
         let evidence = &detailed.evidence[0];
         assert_eq!(evidence.result_index, 0);

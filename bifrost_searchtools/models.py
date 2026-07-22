@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import ClassVar
+from typing import Any, ClassVar, Literal, cast, get_args
+
+
+CodeQueryExecutionMode = Literal["results", "explain", "profile"]
+_CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
+
+
+def _code_query_execution_mode(value: Any) -> CodeQueryExecutionMode | None:
+    if value is None:
+        return None
+    if value not in _CODE_QUERY_EXECUTION_MODES:
+        expected = ", ".join(repr(mode) for mode in _CODE_QUERY_EXECUTION_MODES)
+        raise ValueError(f"execution_mode must be one of {expected}, got {value!r}")
+    return cast(CodeQueryExecutionMode, value)
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -716,6 +729,728 @@ class CodeQueryResult:
             lines = ["No query results."]
         lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
         return "\n".join(lines).strip()
+
+
+def _extra_fields(data: dict[str, Any], known: set[str]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if key not in known}
+
+
+def _optional_int(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    return int(value) if value is not None else None
+
+
+@dataclass(frozen=True)
+class CodeQueryParsedQuery:
+    """The normalized query accepted by the planner.
+
+    ``source_kind`` and ``source`` preserve the typed query-plan root while the
+    common root controls and structural seed scope remain directly accessible.
+    ``extra`` intentionally retains future normalized fields without making the
+    top-level explain response untyped.
+    """
+
+    schema_version: int | None
+    source_kind: str | None
+    source: Any | None
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    where: list[str] = field(default_factory=list)
+    languages: list[str] = field(default_factory=list)
+    inside: dict[str, Any] | None = None
+    not_inside: dict[str, Any] | None = None
+    limit: int | None = None
+    result_detail: str | None = None
+    execution_mode: CodeQueryExecutionMode | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryParsedQuery:
+        source_kind = next(
+            (
+                candidate
+                for candidate in ("match", "union", "intersect", "except")
+                if candidate in data
+            ),
+            data.get("source_kind"),
+        )
+        source = data.get(source_kind) if source_kind is not None else data.get("source")
+        known = {
+            "schema_version",
+            "source_kind",
+            "source",
+            "match",
+            "union",
+            "intersect",
+            "except",
+            "steps",
+            "where",
+            "languages",
+            "inside",
+            "not_inside",
+            "limit",
+            "result_detail",
+            "execution_mode",
+        }
+        return cls(
+            schema_version=_optional_int(data, "schema_version"),
+            source_kind=str(source_kind) if source_kind is not None else None,
+            source=source,
+            steps=[dict(step) for step in data.get("steps", [])],
+            where=[str(path) for path in data.get("where", [])],
+            languages=[str(language) for language in data.get("languages", [])],
+            inside=dict(data["inside"]) if data.get("inside") is not None else None,
+            not_inside=(
+                dict(data["not_inside"])
+                if data.get("not_inside") is not None
+                else None
+            ),
+            limit=_optional_int(data, "limit"),
+            result_detail=data.get("result_detail"),
+            execution_mode=_code_query_execution_mode(data.get("execution_mode")),
+            extra=_extra_fields(data, known),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryLogicalOperation:
+    kind: CodeQueryLogicalOperationKind
+    seed: CodeQueryParsedQuery | None = None
+    step: dict[str, Any] | None = None
+    set_operator: str | None = None
+    count: int | None = None
+    final_in_authored_suffix: bool | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryLogicalOperation:
+        kind = CodeQueryLogicalOperationKind(data["kind"])
+        seed = data.get("seed")
+        step = data.get("step")
+        known = {
+            "kind",
+            "seed",
+            "step",
+            "op",
+            "count",
+            "final_in_authored_suffix",
+        }
+        return cls(
+            kind=kind,
+            seed=(
+                CodeQueryParsedQuery.from_dict(dict(seed))
+                if isinstance(seed, dict)
+                else None
+            ),
+            step=dict(step) if isinstance(step, dict) else None,
+            set_operator=str(data["op"]) if data.get("op") is not None else None,
+            count=_optional_int(data, "count"),
+            final_in_authored_suffix=(
+                bool(data["final_in_authored_suffix"])
+                if data.get("final_in_authored_suffix") is not None
+                else None
+            ),
+            extra=_extra_fields(data, known),
+        )
+
+
+class CodeQueryLogicalOperationKind(StrEnum):
+    SEED = "seed"
+    STEP = "step"
+    SET = "set"
+    LIMIT = "limit"
+
+
+@dataclass(frozen=True)
+class CodeQueryLogicalNode:
+    id: int
+    operation: CodeQueryLogicalOperation
+    output_kind: str
+    dependencies: list[int] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryLogicalNode:
+        return cls(
+            id=int(data["id"]),
+            operation=CodeQueryLogicalOperation.from_dict(data["operation"]),
+            output_kind=str(data["output_kind"]),
+            dependencies=[int(node) for node in data.get("dependencies", [])],
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryLogicalPlan:
+    root: int
+    nodes: list[CodeQueryLogicalNode]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryLogicalPlan:
+        return cls(
+            root=int(data["root"]),
+            nodes=[
+                CodeQueryLogicalNode.from_dict(node)
+                for node in data.get("nodes", [])
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryPhysicalNode:
+    id: int
+    logical_node: int
+    operator: CodeQueryPhysicalOperator
+    output_kind: str
+    dependencies: list[int] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryPhysicalNode:
+        known = {"id", "logical_node", "operator", "output_kind", "dependencies"}
+        return cls(
+            id=int(data["id"]),
+            logical_node=int(data["logical_node"]),
+            operator=CodeQueryPhysicalOperator(data["operator"]),
+            output_kind=str(data["output_kind"]),
+            dependencies=[int(node) for node in data.get("dependencies", [])],
+            extra=_extra_fields(data, known),
+        )
+
+
+class CodeQueryPhysicalOperator(StrEnum):
+    SEED_SCAN = "seed_scan"
+    PIPELINE_STEP = "pipeline_step"
+    SEQUENTIAL_UNION = "sequential_union"
+    PARALLEL_UNION = "parallel_union"
+    SEQUENTIAL_INTERSECTION = "sequential_intersection"
+    SEQUENTIAL_EXCEPT = "sequential_except"
+    LIMIT = "limit"
+
+
+@dataclass(frozen=True)
+class CodeQueryPhysicalPlan:
+    root: int
+    nodes: list[CodeQueryPhysicalNode]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryPhysicalPlan:
+        return cls(
+            root=int(data["root"]),
+            nodes=[
+                CodeQueryPhysicalNode.from_dict(node)
+                for node in data.get("nodes", [])
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryExplainScheduling:
+    policy: CodeQuerySchedulingPolicy
+    selected: CodeQuerySelectedScheduling
+    max_concurrency: int
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryExplainScheduling:
+        known = {"policy", "selected", "max_concurrency"}
+        return cls(
+            policy=CodeQuerySchedulingPolicy(data["policy"]),
+            selected=CodeQuerySelectedScheduling(data["selected"]),
+            max_concurrency=int(data["max_concurrency"]),
+            extra=_extra_fields(data, known),
+        )
+
+
+class CodeQuerySchedulingPolicy(StrEnum):
+    AUTO = "auto"
+
+
+class CodeQuerySelectedScheduling(StrEnum):
+    SEQUENTIAL = "sequential"
+    PARALLEL = "parallel"
+
+
+@dataclass(frozen=True)
+class CodeQueryExplain:
+    FORMAT: ClassVar[str] = "bifrost_code_query_explain/v1"
+
+    format: str
+    query_schema_version: int
+    parsed_query: CodeQueryParsedQuery
+    logical_plan: CodeQueryLogicalPlan
+    physical_plan: CodeQueryPhysicalPlan
+    scheduling: CodeQueryExplainScheduling
+    rendered_text: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any], rendered_text: str | None = None
+    ) -> CodeQueryExplain:
+        if data.get("format") != cls.FORMAT:
+            raise ValueError(f"unsupported code-query explain format: {data.get('format')!r}")
+        known = {
+            "format",
+            "query_schema_version",
+            "parsed_query",
+            "logical_plan",
+            "physical_plan",
+            "scheduling",
+        }
+        return cls(
+            format=cls.FORMAT,
+            query_schema_version=int(data["query_schema_version"]),
+            parsed_query=CodeQueryParsedQuery.from_dict(data["parsed_query"]),
+            logical_plan=CodeQueryLogicalPlan.from_dict(data["logical_plan"]),
+            physical_plan=CodeQueryPhysicalPlan.from_dict(data["physical_plan"]),
+            scheduling=CodeQueryExplainScheduling.from_dict(data["scheduling"]),
+            rendered_text=rendered_text,
+            extra=_extra_fields(data, known),
+        )
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        return (
+            f"Code query plan: {len(self.logical_plan.nodes)} logical node(s), "
+            f"{len(self.physical_plan.nodes)} physical node(s); "
+            f"selected {self.scheduling.selected}."
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryProfileTimings:
+    planning: int
+    execution: int
+    rendering: int
+    total: int
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileTimings:
+        return cls(
+            planning=int(data.get("planning", 0)),
+            execution=int(data.get("execution", 0)),
+            rendering=int(data.get("rendering", 0)),
+            total=int(data.get("total", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryProfileWork:
+    scanned_files: int = 0
+    scanned_source_bytes: int = 0
+    fact_nodes: int = 0
+    pipeline_rows: int = 0
+    examined_references: int = 0
+    provenance_steps: int = 0
+    import_files_resolved: int = 0
+    import_edges_resolved: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileWork:
+        return cls(
+            scanned_files=int(data.get("scanned_files", 0)),
+            scanned_source_bytes=int(data.get("scanned_source_bytes", 0)),
+            fact_nodes=int(data.get("fact_nodes", 0)),
+            pipeline_rows=int(data.get("pipeline_rows", 0)),
+            examined_references=int(data.get("examined_references", 0)),
+            provenance_steps=int(data.get("provenance_steps", 0)),
+            import_files_resolved=int(data.get("import_files_resolved", 0)),
+            import_edges_resolved=int(data.get("import_edges_resolved", 0)),
+        )
+
+
+class CodeQueryCacheMetricsKind(StrEnum):
+    COMPLETE_VALUE = "complete_value"
+    STRUCTURAL_FACTS = "structural_facts"
+
+
+@dataclass(frozen=True)
+class CodeQueryProfileCacheCounters:
+    kind: CodeQueryCacheMetricsKind = CodeQueryCacheMetricsKind.COMPLETE_VALUE
+    lookups: int = 0
+    hits: int = 0
+    misses: int = 0
+    builds: int = 0
+    waits: int = 0
+    wait_ns: int = 0
+    complete_hits: int = 0
+    incomplete_hits: int = 0
+    complete_builds: int = 0
+    incomplete_builds: int = 0
+    unknown_outcomes: int = 0
+    replayed_items: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileCacheCounters:
+        counters = {
+            "lookups",
+            "hits",
+            "misses",
+            "builds",
+            "waits",
+            "wait_ns",
+            "complete_hits",
+            "incomplete_hits",
+            "complete_builds",
+            "incomplete_builds",
+            "unknown_outcomes",
+            "replayed_items",
+        }
+        return cls(
+            kind=CodeQueryCacheMetricsKind(data["kind"]),
+            **{key: int(data.get(key, 0)) for key in counters},
+            extra=_extra_fields(data, {"kind", *counters}),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryStructuralFactsCacheCounters:
+    kind: CodeQueryCacheMetricsKind = CodeQueryCacheMetricsKind.STRUCTURAL_FACTS
+    lookups: int = 0
+    memory_hits: int = 0
+    persisted_hydrations: int = 0
+    extractions: int = 0
+    unavailable: int = 0
+    unknown_outcomes: int = 0
+    replayed_files: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any]
+    ) -> CodeQueryStructuralFactsCacheCounters:
+        counters = {
+            "lookups",
+            "memory_hits",
+            "persisted_hydrations",
+            "extractions",
+            "unavailable",
+            "unknown_outcomes",
+            "replayed_files",
+        }
+        return cls(
+            kind=CodeQueryCacheMetricsKind(data["kind"]),
+            **{key: int(data.get(key, 0)) for key in counters},
+            extra=_extra_fields(data, {"kind", *counters}),
+        )
+
+
+CodeQueryCacheMetrics = (
+    CodeQueryProfileCacheCounters | CodeQueryStructuralFactsCacheCounters
+)
+
+
+class CodeQueryCacheLayerKind(StrEnum):
+    SEED_RESULT = "seed_result"
+    SEED_STRUCTURAL_FACTS = "seed_structural_facts"
+    INBOUND_REFERENCE = "inbound_reference"
+    OUTBOUND_REFERENCE = "outbound_reference"
+    INCOMING_CALL = "incoming_call"
+    OUTGOING_CALL = "outgoing_call"
+    IMPORT_FORWARD = "import_forward"
+    IMPORT_REVERSE = "import_reverse"
+
+
+@dataclass(frozen=True)
+class CodeQueryProfileCacheLayer:
+    layer: CodeQueryCacheLayerKind
+    metrics: CodeQueryCacheMetrics
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileCacheLayer:
+        layer = CodeQueryCacheLayerKind(data["layer"])
+        metrics_data = data.get("metrics")
+        if not isinstance(metrics_data, dict):
+            raise ValueError("cache layer metrics must be a nested object")
+        metrics_kind = CodeQueryCacheMetricsKind(metrics_data.get("kind"))
+        expected_kind = (
+            CodeQueryCacheMetricsKind.STRUCTURAL_FACTS
+            if layer is CodeQueryCacheLayerKind.SEED_STRUCTURAL_FACTS
+            else CodeQueryCacheMetricsKind.COMPLETE_VALUE
+        )
+        if metrics_kind is not expected_kind:
+            raise ValueError(
+                f"cache layer {layer.value!r} requires metrics kind "
+                f"{expected_kind.value!r}, got {metrics_kind.value!r}"
+            )
+        metrics: CodeQueryCacheMetrics
+        if metrics_kind is CodeQueryCacheMetricsKind.STRUCTURAL_FACTS:
+            metrics = CodeQueryStructuralFactsCacheCounters.from_dict(metrics_data)
+        else:
+            metrics = CodeQueryProfileCacheCounters.from_dict(metrics_data)
+        return cls(
+            layer=layer,
+            metrics=metrics,
+            extra=_extra_fields(data, {"layer", "metrics"}),
+        )
+
+
+def _code_query_cache_layers(
+    data: dict[str, Any],
+) -> list[CodeQueryProfileCacheLayer]:
+    if "cache_layers" not in data:
+        raise ValueError("cache_layers is required")
+    value = data["cache_layers"]
+    if not isinstance(value, list):
+        raise ValueError("cache_layers must be a list")
+    layers: list[CodeQueryProfileCacheLayer] = []
+    for index, layer in enumerate(value):
+        if not isinstance(layer, dict):
+            raise ValueError(f"cache_layers[{index}] must be an object")
+        try:
+            layers.append(CodeQueryProfileCacheLayer.from_dict(layer))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid cache_layers[{index}]: {error}") from error
+    return layers
+
+
+@dataclass(frozen=True)
+class CodeQueryBoundedDispatchProfile:
+    worker_limit: int = 0
+    workers_spawned: int = 0
+    tasks_enqueued: int = 0
+    tasks_started: int = 0
+    tasks_completed: int = 0
+    tasks_observed_cancelled_before_start: int = 0
+    queue_wait_ns: int = 0
+    budget_wait_ns: int = 0
+    coordinator_wait_ns: int = 0
+    dispatch_overhead_ns: int = 0
+    peak_concurrency: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryBoundedDispatchProfile:
+        fields = {
+            "worker_limit",
+            "workers_spawned",
+            "tasks_enqueued",
+            "tasks_started",
+            "tasks_completed",
+            "tasks_observed_cancelled_before_start",
+            "queue_wait_ns",
+            "budget_wait_ns",
+            "coordinator_wait_ns",
+            "dispatch_overhead_ns",
+            "peak_concurrency",
+        }
+        return cls(
+            **{key: int(data.get(key, 0)) for key in fields},
+            extra=_extra_fields(data, fields),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryProfileScheduling:
+    peak_concurrency: int
+    bounded_dispatch: CodeQueryBoundedDispatchProfile | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileScheduling:
+        bounded_dispatch = data.get("bounded_dispatch")
+        return cls(
+            peak_concurrency=int(data.get("peak_concurrency", 0)),
+            bounded_dispatch=(
+                CodeQueryBoundedDispatchProfile.from_dict(bounded_dispatch)
+                if isinstance(bounded_dispatch, dict)
+                else None
+            ),
+            extra=_extra_fields(data, {"peak_concurrency", "bounded_dispatch"}),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryOperatorTimings:
+    elapsed: int = 0
+    total: int = 0
+    dependency_execution: int = 0
+    dependency_wait: int = 0
+    merge: int = 0
+    scheduling_overhead: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryOperatorTimings:
+        fields = {
+            "elapsed",
+            "total",
+            "dependency_execution",
+            "dependency_wait",
+            "merge",
+            "scheduling_overhead",
+        }
+        return cls(
+            **{key: int(data.get(key, 0)) for key in fields},
+            extra=_extra_fields(data, fields),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryOperatorObservation:
+    node: int
+    branch: list[int]
+    operator: CodeQueryPhysicalOperator
+    disposition: CodeQueryOperatorDisposition
+    timings_ns: CodeQueryOperatorTimings
+    input_rows: int
+    rows_visited: int
+    relation_expansions: int
+    rows_discarded: int | None
+    output_rows: int
+    temporary_capacity_bytes_lower_bound: int
+    work: CodeQueryProfileWork
+    cache_layers: list[CodeQueryProfileCacheLayer]
+    terminations: list[CodeQueryOperatorTermination]
+    operator_truncated: bool
+    result_truncated: bool
+    result_cancelled: bool
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryOperatorObservation:
+        known = {
+            "node",
+            "branch",
+            "operator",
+            "disposition",
+            "timings_ns",
+            "input_rows",
+            "rows_visited",
+            "relation_expansions",
+            "rows_discarded",
+            "temporary_capacity_bytes_lower_bound",
+            "work",
+            "cache_layers",
+            "terminations",
+            "output_rows",
+            "operator_truncated",
+            "result_truncated",
+            "result_cancelled",
+        }
+        return cls(
+            node=int(data["node"]),
+            branch=[int(index) for index in data.get("branch", [])],
+            operator=CodeQueryPhysicalOperator(data["operator"]),
+            disposition=CodeQueryOperatorDisposition(data["disposition"]),
+            timings_ns=CodeQueryOperatorTimings.from_dict(data["timings_ns"]),
+            input_rows=int(data.get("input_rows", 0)),
+            rows_visited=int(data.get("rows_visited", 0)),
+            relation_expansions=int(data.get("relation_expansions", 0)),
+            rows_discarded=_optional_int(data, "rows_discarded"),
+            output_rows=int(data.get("output_rows", 0)),
+            temporary_capacity_bytes_lower_bound=int(
+                data.get("temporary_capacity_bytes_lower_bound", 0)
+            ),
+            work=CodeQueryProfileWork.from_dict(data.get("work", {})),
+            cache_layers=_code_query_cache_layers(data),
+            terminations=[
+                CodeQueryOperatorTermination(reason)
+                for reason in data.get("terminations", [])
+            ],
+            operator_truncated=bool(data.get("operator_truncated", False)),
+            result_truncated=bool(data.get("result_truncated", False)),
+            result_cancelled=bool(data.get("result_cancelled", False)),
+            extra=_extra_fields(data, known),
+        )
+
+
+class CodeQueryOperatorDisposition(StrEnum):
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+
+
+class CodeQueryOperatorTermination(StrEnum):
+    CANCELLATION_BEFORE_WORK = "cancellation_before_work"
+    CANCELLATION_DURING_WORK = "cancellation_during_work"
+    DEPENDENCY_CANCELLED = "dependency_cancelled"
+    DEPENDENCY_PIPELINE_HALTED = "dependency_pipeline_halted"
+    TERMINAL_CAP = "terminal_cap"
+    RESULT_LIMIT = "result_limit"
+    EXECUTION_BUDGET = "execution_budget"
+    PIPELINE_BUDGET = "pipeline_budget"
+    IMPORT_GRAPH_BUDGET = "import_graph_budget"
+    ANALYSIS_LIMIT = "analysis_limit"
+    UNSUPPORTED_ANALYSIS = "unsupported_analysis"
+    ANALYSIS_INCOMPLETE = "analysis_incomplete"
+
+
+@dataclass(frozen=True)
+class CodeQueryProfile:
+    FORMAT: ClassVar[str] = "bifrost_code_query_profile/v1"
+
+    format: str
+    result: CodeQueryResult
+    explain: CodeQueryExplain
+    timings_ns: CodeQueryProfileTimings
+    work: CodeQueryProfileWork
+    cache_layers: list[CodeQueryProfileCacheLayer]
+    scheduling: CodeQueryProfileScheduling
+    operators: list[CodeQueryOperatorObservation]
+    rendered_text: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any], rendered_text: str | None = None
+    ) -> CodeQueryProfile:
+        if data.get("format") != cls.FORMAT:
+            raise ValueError(f"unsupported code-query profile format: {data.get('format')!r}")
+        known = {
+            "format",
+            "result",
+            "explain",
+            "timings_ns",
+            "work",
+            "cache_layers",
+            "scheduling",
+            "operators",
+        }
+        return cls(
+            format=cls.FORMAT,
+            result=CodeQueryResult.from_dict(data["result"]),
+            explain=CodeQueryExplain.from_dict(data["explain"]),
+            timings_ns=CodeQueryProfileTimings.from_dict(data.get("timings_ns", {})),
+            work=CodeQueryProfileWork.from_dict(data.get("work", {})),
+            cache_layers=_code_query_cache_layers(data),
+            scheduling=CodeQueryProfileScheduling.from_dict(
+                data.get("scheduling", {})
+            ),
+            operators=[
+                CodeQueryOperatorObservation.from_dict(operator)
+                for operator in data.get("operators", [])
+            ],
+            rendered_text=rendered_text,
+            extra=_extra_fields(data, known),
+        )
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        return (
+            f"{self.result.render_text()}\n\n"
+            f"Profile: {len(self.operators)} operator(s), "
+            f"{self.timings_ns.total} ns total, "
+            f"peak concurrency {self.scheduling.peak_concurrency}."
+        )
+
+
+CodeQueryResponse = CodeQueryResult | CodeQueryExplain | CodeQueryProfile
+
+
+def parse_code_query_response(
+    data: dict[str, Any], rendered_text: str | None = None
+) -> CodeQueryResponse:
+    format_name = data.get("format")
+    if format_name is None:
+        return CodeQueryResult.from_dict(data, rendered_text=rendered_text)
+    if format_name == CodeQueryExplain.FORMAT:
+        return CodeQueryExplain.from_dict(data, rendered_text=rendered_text)
+    if format_name == CodeQueryProfile.FORMAT:
+        return CodeQueryProfile.from_dict(data, rendered_text=rendered_text)
+    raise ValueError(f"unsupported code-query response format: {format_name!r}")
 
 
 @dataclass(frozen=True)

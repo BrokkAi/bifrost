@@ -17,6 +17,7 @@ pub mod mcp_common;
 pub mod mcp_core;
 pub mod mcp_extended;
 pub mod mcp_nlp;
+pub mod mcp_property_fuzzer;
 pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
@@ -52,6 +53,11 @@ mod workspace_document;
 pub use analyzer::policy;
 pub use analyzer::usages;
 
+pub use analyzer::structural::{
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,
+    CodeQueryProfile, CodeQueryResponse, execute_request, execute_request_with_cancellation,
+    execute_request_with_limits,
+};
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,

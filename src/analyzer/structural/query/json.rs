@@ -19,6 +19,10 @@ impl CodeQuery {
             "result_detail".to_string(),
             json!(self.result_detail.label()),
         );
+        object.insert(
+            "execution_mode".to_string(),
+            json!(self.execution_mode.label()),
+        );
         Value::Object(object)
     }
 
@@ -94,8 +98,12 @@ pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
 }
 
 impl CodeQuerySeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(seed_to_json(self))
+    }
+
     pub(crate) fn canonical_cache_key(&self) -> String {
-        serde_json::to_string(&Value::Object(seed_to_json(self)))
+        serde_json::to_string(&self.to_canonical_json())
             .expect("canonical CodeQuery seed is serializable")
     }
 }
@@ -176,6 +184,12 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         }
     }
     Value::Object(object)
+}
+
+impl QueryStep {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        query_step_to_json(self)
+    }
 }
 
 fn kind_list_to_json(kinds: &[NormalizedKind]) -> Value {

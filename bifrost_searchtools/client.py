@@ -10,11 +10,12 @@ from pathlib import Path
 import sys
 import threading
 from types import ModuleType
-from typing import Any, overload
+from typing import Any, get_args, overload
 
 from .models import (
     CommitAnalysisResult,
     CodeQualityReport,
+    CodeQueryExecutionMode,
     FileSummariesResult,
     DefinitionByReferenceLookupResult,
     DeclarationLookupResult,
@@ -28,7 +29,7 @@ from .models import (
     MostRelevantFilesResult,
     RefreshResult,
     RenameSymbolResult,
-    CodeQueryResult,
+    CodeQueryResponse,
     SearchFileContentsResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -43,6 +44,7 @@ from .models import (
     WorkspaceResult,
     XmlSelectResult,
     XmlSkimResult,
+    parse_code_query_response,
 )
 
 
@@ -68,6 +70,9 @@ class SymbolKindFilter(StrEnum):
 class MostRelevantFilesRankingMode(StrEnum):
     HISTORY_IMPORTS = "history_imports"
     USAGE_GRAPH = "usage_graph"
+
+
+_CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))
 
 
 class XmlSelectOutput(StrEnum):
@@ -200,7 +205,8 @@ class SearchToolsClient:
         limit: int | None = None,
         result_detail: str | None = None,
         schema_version: int | None = None,
-    ) -> CodeQueryResult:
+        execution_mode: CodeQueryExecutionMode | None = None,
+    ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
         Version 2 starts with normalized syntactic structure or a typed set of
@@ -216,7 +222,17 @@ class SearchToolsClient:
         scope arguments apply only with ``pattern``. ``where`` accepts project-relative globs or absolute
         in-workspace paths/globs. ``result_detail="full"`` adds stable IDs and
         precise ranges; compact mode retains minimal pipeline provenance.
+        ``execution_mode="results"`` returns ordinary matches,
+        ``execution_mode="explain"`` returns the parsed, logical, and selected
+        physical plan without executing it, and ``execution_mode="profile"``
+        executes the query and returns both results and structured observations.
         """
+        if (
+            execution_mode is not None
+            and execution_mode not in _CODE_QUERY_EXECUTION_MODES
+        ):
+            accepted = ", ".join(sorted(_CODE_QUERY_EXECUTION_MODES))
+            raise ValueError(f"execution_mode must be one of: {accepted}")
         sources = {
             "match": pattern,
             "union": union,
@@ -253,8 +269,10 @@ class SearchToolsClient:
             arguments["result_detail"] = result_detail
         if schema_version is not None:
             arguments["schema_version"] = schema_version
+        if execution_mode is not None:
+            arguments["execution_mode"] = execution_mode
         payload = self._call_tool_payload("query_code", arguments)
-        return CodeQueryResult.from_dict(
+        return parse_code_query_response(
             payload.structured,
             rendered_text=payload.rendered_text,
         )

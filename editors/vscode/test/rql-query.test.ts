@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   RQL_LANGUAGE_ID,
   RUN_RQL_QUERY_METHOD,
+  formatRqlQueryOutput,
   groupRqlQueryResults,
   queryResultDescription,
   queryResultIcon,
@@ -58,6 +59,55 @@ void test("runs unsaved RQL editor text and returns typed results", async () => 
   assert.ok(response);
   assert.deepEqual(requests, [[RUN_RQL_QUERY_METHOD, { query: '(class :name "UnsavedClass")' }]]);
   assert.equal(response.results[0].path, "src/app.py");
+  assert.equal(response.mode, "results");
+});
+
+void test("accepts planning-only explain responses without result rows", async () => {
+  const response = await runRqlQuery(
+    { languageId: RQL_LANGUAGE_ID, text: "(explain (class))" },
+    runner({
+      sendRequest: () =>
+        Promise.resolve({
+          text: "CodeQuery explain\n",
+          mode: "explain",
+          report: { format: "bifrost_code_query_explain/v1" },
+          results: []
+        })
+    })
+  );
+
+  assert.ok(response);
+  assert.equal(response.mode, "explain");
+  assert.deepEqual(response.results, []);
+  assert.deepEqual(response.report, { format: "bifrost_code_query_explain/v1" });
+});
+
+void test("retains profiled ordinary results for navigation", async () => {
+  const response = await runRqlQuery(
+    { languageId: RQL_LANGUAGE_ID, text: "(profile (class))" },
+    runner({
+      sendRequest: () =>
+        Promise.resolve({
+          text: "1 result\n\nCodeQuery profile\n",
+          mode: "profile",
+          report: { format: "bifrost_code_query_profile/v1" },
+          results: [
+            {
+              uri: "file:///workspace/src/app.py",
+              path: "src/app.py",
+              result_type: "file",
+              language: "python"
+            }
+          ]
+        })
+    })
+  );
+
+  assert.ok(response);
+  assert.equal(response.mode, "profile");
+  assert.equal(response.results.length, 1);
+  assert.match(formatRqlQueryOutput(response), /CodeQuery profile report:/);
+  assert.match(formatRqlQueryOutput(response), /bifrost_code_query_profile\/v1/);
 });
 
 void test("warns without issuing a request when Bifrost is not ready", async () => {

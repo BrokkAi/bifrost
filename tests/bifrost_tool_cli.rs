@@ -628,6 +628,63 @@ fn query_code_tool_returns_structural_matches() {
 }
 
 #[test]
+fn query_code_tool_returns_versioned_explain_and_profile_reports() {
+    let explain = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(fixture_root())
+        .arg("--tool")
+        .arg("query_code")
+        .arg("--args")
+        .arg(r#"{"execution_mode":"explain","match":{"kind":"class","name":"A"}}"#)
+        .output()
+        .expect("run query_code explain");
+    assert!(
+        explain.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    let explain: Value = serde_json::from_slice(&explain.stdout).expect("explain JSON output");
+    assert_eq!(
+        explain["structuredContent"]["format"],
+        "bifrost_code_query_explain/v1"
+    );
+    assert_eq!(
+        explain["structuredContent"]["scheduling"]["selected"],
+        "sequential"
+    );
+    assert!(explain["structuredContent"].get("results").is_none());
+
+    let profile = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(fixture_root())
+        .arg("--tool")
+        .arg("query_code")
+        .arg("--args")
+        .arg(r#"{"execution_mode":"profile","match":{"kind":"class","name":"A"}}"#)
+        .output()
+        .expect("run query_code profile");
+    assert!(
+        profile.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&profile.stderr)
+    );
+    let profile: Value = serde_json::from_slice(&profile.stdout).expect("profile JSON output");
+    assert_eq!(
+        profile["structuredContent"]["format"],
+        "bifrost_code_query_profile/v1"
+    );
+    assert_eq!(
+        profile["structuredContent"]["result"]["results"][0]["kind"],
+        "class"
+    );
+    assert!(
+        profile["structuredContent"]["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty())
+    );
+}
+
+#[test]
 fn query_file_runs_rql_from_the_current_workspace() {
     let root = TempDir::new().expect("workspace");
     fs::write(root.path().join("app.py"), "class App:\n    pass\n").expect("source file");

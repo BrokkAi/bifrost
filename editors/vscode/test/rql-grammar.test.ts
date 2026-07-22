@@ -152,6 +152,12 @@ void test("highlights registered underscore predicate aliases", async () => {
   assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
 });
 
+void test("highlights explain and profile execution controls", async () => {
+  const tokens = tokenizeGrammar(await grammar(), "(explain (class)) (profile (call))");
+  assertScoped(tokens, "explain", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "profile", "support.function.wrapper.bifrost-rql");
+});
+
 void test("highlights semantic traversal forms and options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),

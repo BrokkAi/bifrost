@@ -47,6 +47,48 @@ if (cursorManifest.version !== cargoVersion) {
   );
 }
 
+const piManifestPath = "plugins/bifrost-agent/package.json";
+const piManifest = JSON.parse(fs.readFileSync(piManifestPath, "utf8"));
+if (piManifest.version !== cargoVersion) {
+  throw new Error(
+    `${piManifestPath} version ${piManifest.version} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+assert.deepStrictEqual(
+  piManifest.pi?.extensions,
+  ["./extensions/bifrost.ts"],
+  `${piManifestPath} should expose the native Bifrost Pi extension`,
+);
+assert.deepStrictEqual(
+  piManifest.pi?.skills,
+  [
+    "./skills/bifrost-code-navigation",
+    "./skills/bifrost-code-reading",
+    "./skills/bifrost-codebase-search",
+  ],
+  `${piManifestPath} should expose exactly the three canonical code-intelligence skills`,
+);
+assert.deepStrictEqual(
+  piManifest.dependencies?.["@modelcontextprotocol/sdk"],
+  "1.29.0",
+  `${piManifestPath} should pin the reviewed MCP SDK`,
+);
+assert.deepStrictEqual(
+  piManifest.peerDependencies?.["@earendil-works/pi-tui"],
+  "*",
+  `${piManifestPath} should use Pi's host-provided TUI`,
+);
+for (const packageFile of [
+  "plugins/bifrost-agent/extensions/bifrost.ts",
+  "plugins/bifrost-agent/extensions/bifrost-capabilities.ts",
+  "plugins/bifrost-agent/extensions/bifrost-session.ts",
+  "plugins/bifrost-agent/extensions/bifrost-settings.ts",
+  "plugins/bifrost-agent/extensions/mcp-adapter.ts",
+  "plugins/bifrost-agent/package-lock.json",
+]) {
+  fs.accessSync(packageFile, fsConstants.R_OK);
+}
+
 const sharedManifestFields = [
   "homepage",
   "repository",

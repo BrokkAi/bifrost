@@ -1,9 +1,9 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResult,
-    CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection, StringPredicate,
-    render_source_rune_ir,
+    CodeQuery, CodeQueryExecutionMode, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource,
+    CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
+    StringPredicate, render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -659,7 +659,7 @@ fn parse_query_input(line: &str) -> Result<Value, String> {
 }
 
 fn should_colorize_repl() -> bool {
-    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    super::stdout_supports_color()
 }
 
 fn loaded_query_text(value: &Value) -> String {
@@ -684,6 +684,7 @@ fn query_summary_text(query: &CodeQuery) -> String {
     let mut parts = vec![plan_summary_text(&query.plan)];
     parts.push(format!("limit {}", query.limit));
     parts.push(format!("detail {}", query.result_detail.label()));
+    parts.push(format!("mode {}", query.execution_mode.label()));
     parts.join("; ")
 }
 
@@ -784,7 +785,36 @@ fn predicate_summary(field: &str, predicate: &StringPredicate) -> String {
 
 fn run_query(service: &SearchToolsService, value: &Value, use_color: bool) -> String {
     match service.query_code_result(value.clone()) {
-        Ok(output) => render_code_query_repl_output(&output, use_color),
+        Ok(response) => match response.mode() {
+            CodeQueryExecutionMode::Results => render_code_query_repl_output(
+                response
+                    .result()
+                    .expect("results mode has an ordinary result"),
+                use_color,
+            ),
+            CodeQueryExecutionMode::Explain => format!(
+                "CodeQuery explain (planning only):\n{}",
+                response
+                    .render_report_pretty()
+                    .expect("explain mode has a structured report")
+            ),
+            CodeQueryExecutionMode::Profile => {
+                let mut rendered = render_code_query_repl_output(
+                    response
+                        .result()
+                        .expect("profile mode has an ordinary result"),
+                    use_color,
+                );
+                rendered.push_str("\nCodeQuery profile report:\n");
+                rendered.push_str(
+                    &response
+                        .render_report_pretty()
+                        .expect("profile mode has a structured report"),
+                );
+                rendered.push('\n');
+                rendered
+            }
+        },
         Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
@@ -884,51 +914,14 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     }
                 }
             }
-            if !result.provenance.is_empty() {
-                let mut branch_labels = Vec::new();
-                for trace in &result.provenance {
-                    let label = format_branch_path(&trace.branch);
-                    if !label.is_empty() && !branch_labels.contains(&label) {
-                        branch_labels.push(label);
-                    }
-                }
-                out.push_str(&format!(
-                    "  provenance: {} path{}{}{}\n",
-                    result.provenance.len(),
-                    if result.provenance.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    if result.provenance_truncated {
-                        " (truncated)"
-                    } else {
-                        ""
-                    },
-                    if branch_labels.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; branches {}", branch_labels.join(", "))
-                    },
-                ));
+            if let Some(summary) = result.provenance_summary() {
+                out.push_str(&format!("  {summary}\n"));
             }
         }
     }
 
     for diagnostic in &output.diagnostics {
-        let kind = format!(
-            "{} [{}]",
-            diagnostic.impact.as_str(),
-            diagnostic.code.as_str()
-        );
-        let label = if diagnostic.branch.is_empty() {
-            format!("{kind}:")
-        } else {
-            format!(
-                "{kind} [branch {}]:",
-                format_branch_path(&diagnostic.branch)
-            )
-        };
+        let label = format!("{}:", diagnostic.presentation_label());
         out.push_str(&format!(
             "{} {}\n",
             paint(Style::new().fg(Color::Yellow), &label, use_color),
@@ -995,14 +988,6 @@ fn render_code_query_match(out: &mut String, matched: &CodeQueryMatch, use_color
             )
         ));
     }
-}
-
-fn format_branch_path(branch: &[usize]) -> String {
-    branch
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 fn sanitize_terminal_text(text: &str) -> String {
@@ -1361,6 +1346,38 @@ mod tests {
         session.process_line(r#"(call :callee (name "eval"))"#, None);
         let (_flow, output) = session.process_line(":validate", None);
         assert_eq!(output, "Query is valid.");
+    }
+
+    #[test]
+    fn code_query_repl_runs_explain_and_profile_modes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(temp.path().join("app.py"), "class App:\n    pass\n").expect("write source");
+        let service = SearchToolsService::new_without_semantic_index(temp.path().to_path_buf())
+            .expect("search service");
+        let mut session = ReplSession::new();
+
+        let (_, loaded) = session.process_line("(explain (class :name \"App\"))", None);
+        assert!(loaded.contains("mode explain"), "{loaded}");
+        let (_, canonical) = session.process_line(":json", None);
+        assert!(
+            canonical.contains("\"execution_mode\": \"explain\""),
+            "{canonical}"
+        );
+        let (_, explain) = session.process_line(":run", Some(&service));
+        assert!(explain.contains("planning only"), "{explain}");
+        assert!(
+            explain.contains("bifrost_code_query_explain/v1"),
+            "{explain}"
+        );
+
+        session.process_line("(profile (class :name \"App\"))", None);
+        let (_, profile) = session.process_line(":run", Some(&service));
+        assert!(profile.contains("class App"), "{profile}");
+        assert!(profile.contains("CodeQuery profile report:"), "{profile}");
+        assert!(profile.contains("\"result\""), "{profile}");
+        assert!(profile.contains("\"cache_layers\""), "{profile}");
+        assert!(profile.contains("\"operators\""), "{profile}");
+        assert!(profile.contains("\"peak_concurrency\": 1"), "{profile}");
     }
 
     #[test]

@@ -1,0 +1,65 @@
+{
+  "name": "@brokk/bifrost-agent",
+  "version": "0.8.7",
+  "description": "Bifrost code intelligence tools and skills for Pi",
+  "keywords": [
+    "pi-package",
+    "bifrost",
+    "code-intelligence",
+    "mcp"
+  ],
+  "type": "module",
+  "license": "LGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrokkAi/bifrost.git",
+    "directory": "plugins/bifrost-agent"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "bin/bifrost-launcher.mjs",
+    "bin/bifrost-launcher.d.mts",
+    "bifrost-release.json",
+    "extensions/**/*.ts",
+    "skills/bifrost-code-navigation/SKILL.md",
+    "skills/bifrost-code-reading/SKILL.md",
+    "skills/bifrost-codebase-search/SKILL.md",
+    "README.md",
+    "LICENSE.md",
+    "GPL-3.0.md",
+    "SOURCE.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/bifrost.ts"
+    ],
+    "skills": [
+      "./skills/bifrost-code-navigation",
+      "./skills/bifrost-code-reading",
+      "./skills/bifrost-codebase-search"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit && npm run check:package",
+    "check:package": "node test/package-contents.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:packed": "node test/packed-install.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "@types/node": "26.1.1",
+    "typebox": "1.1.38",
+    "typescript": "7.0.2"
+  }
+}

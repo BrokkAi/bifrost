@@ -28,18 +28,57 @@ use super::{
     should_escape_text_character,
 };
 
-/// Human output options for schema version 1.
-///
-/// Schema version 1 intentionally has no color mode. Output is plain text and
-/// byte-for-byte stable whether it is written to a terminal, pipe, or file.
+/// Amount of policy audit detail included in human output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct HumanRenderOptions;
+pub enum HumanRenderDetail {
+    /// A compact, scan-oriented finding list.
+    #[default]
+    Concise,
+    /// The complete finding evidence, provenance, and rule manifest.
+    Verbose,
+}
+
+/// Resolved presentation style for human output.
+///
+/// The renderer never detects terminals or reads environment variables. CLI
+/// callers resolve those concerns before selecting a style.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HumanRenderColor {
+    /// Stable ASCII text without terminal control sequences.
+    #[default]
+    Plain,
+    /// ANSI severity colors and Unicode status symbols.
+    Ansi,
+}
+
+/// Deterministic human output options for schema version 1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HumanRenderOptions {
+    detail: HumanRenderDetail,
+    color: HumanRenderColor,
+}
+
+impl HumanRenderOptions {
+    pub const fn new(detail: HumanRenderDetail, color: HumanRenderColor) -> Self {
+        Self { detail, color }
+    }
+
+    pub const fn detail(self) -> HumanRenderDetail {
+        self.detail
+    }
+
+    pub const fn color(self) -> HumanRenderColor {
+        self.color
+    }
+}
 
 /// Write a deterministic, terminal-safe summary of a canonical report.
 pub fn write_policy_human<W: Write>(
     report: &PolicyReportDocument,
-    _options: &HumanRenderOptions,
+    options: &HumanRenderOptions,
     output: W,
     max_serialized_bytes: usize,
 ) -> Result<u64, PolicyRenderError> {
@@ -89,7 +128,12 @@ pub fn write_policy_human<W: Write>(
 
     for run in report.runs() {
         for finding in run.findings() {
-            write_finding(&mut output, finding)?;
+            match options.detail() {
+                HumanRenderDetail::Concise => {
+                    write_concise_finding(&mut output, finding, options.color())?
+                }
+                HumanRenderDetail::Verbose => write_finding(&mut output, finding, options.color())?,
+            }
         }
         write_run_diagnostics(&mut output, run)?;
         if !run.completion().is_complete() || run.diagnostics_truncated() {
@@ -109,11 +153,12 @@ pub fn write_policy_human<W: Write>(
     }
 
     // Keep each explicit-schema finding stanza anchored by its clickable
-    // location. Descriptor details follow findings rather than preceding the
-    // first one, while zero-finding reports still retain the complete rule
-    // contract before their summary.
-    for rule in report.rules() {
-        write_rule_detail(&mut output, rule)?;
+    // location. In the audit view, descriptor details follow findings rather
+    // than preceding the first one; the concise view omits rule contracts.
+    if options.detail() == HumanRenderDetail::Verbose {
+        for rule in report.rules() {
+            write_rule_detail(&mut output, rule)?;
+        }
     }
 
     write_summary(&mut output, report)?;
@@ -121,15 +166,62 @@ pub fn write_policy_human<W: Write>(
     Ok(output.bytes_written())
 }
 
+fn write_concise_finding<W: Write>(
+    output: &mut BoundedWriter<W>,
+    finding: &PolicyFinding,
+    color: HumanRenderColor,
+) -> Result<(), PolicyRenderError> {
+    write_severity_marker(output, finding.severity(), color)?;
+    write!(output, "  ").map_err(map_io_error)?;
+    write_location(output, finding.primary()).map_err(map_io_error)?;
+    if let Some(symbol) = concise_terminal_symbol(finding) {
+        write!(output, "  {}", escape_terminal_text(symbol)).map_err(map_io_error)?;
+    }
+    writeln!(output).map_err(map_io_error)?;
+    writeln!(output, "    {}", escape_terminal_text(finding.message())).map_err(map_io_error)?;
+    writeln!(output).map_err(map_io_error)
+}
+
+fn write_severity_marker<W: Write>(
+    output: &mut BoundedWriter<W>,
+    severity: FindingSeverity,
+    color: HumanRenderColor,
+) -> Result<(), PolicyRenderError> {
+    if color == HumanRenderColor::Plain {
+        return write!(output, "[{}]", finding_severity(severity)).map_err(map_io_error);
+    }
+    let (ansi, symbol) = match severity {
+        FindingSeverity::Unrated => ("\u{001B}[37m", "?"),
+        FindingSeverity::Note => ("\u{001B}[36m", "ℹ"),
+        FindingSeverity::Warning => ("\u{001B}[33m", "⚠"),
+        FindingSeverity::Error => ("\u{001B}[31m", "✖"),
+    };
+    write!(output, "{ansi}{symbol}\u{001B}[0m").map_err(map_io_error)
+}
+
+fn concise_terminal_symbol(finding: &PolicyFinding) -> Option<&str> {
+    let PolicyFindingEvidence::Match { evidence } = finding.evidence() else {
+        return None;
+    };
+    match evidence.terminal() {
+        PolicyQueryResultRef::Declaration { fq_name, .. } => Some(fq_name),
+        PolicyQueryResultRef::ReferenceSite { target_fq_name, .. } => Some(target_fq_name),
+        PolicyQueryResultRef::CallSite { callee_fq_name, .. } => Some(callee_fq_name),
+        _ => None,
+    }
+}
+
 fn write_finding<W: Write>(
     output: &mut BoundedWriter<W>,
     finding: &PolicyFinding,
+    color: HumanRenderColor,
 ) -> Result<(), PolicyRenderError> {
     write_location(output, finding.primary()).map_err(map_io_error)?;
+    write!(output, ": ").map_err(map_io_error)?;
+    write_verbose_severity(output, finding.severity(), color)?;
     writeln!(
         output,
-        ": [{}] {}: {}",
-        finding_severity(finding.severity()),
+        " {}: {}",
         escape_terminal_text(finding.policy_id().as_str()),
         escape_terminal_text(finding.message()),
     )
@@ -303,6 +395,24 @@ fn write_finding<W: Write>(
         }
     }
     Ok(())
+}
+
+fn write_verbose_severity<W: Write>(
+    output: &mut BoundedWriter<W>,
+    severity: FindingSeverity,
+    color: HumanRenderColor,
+) -> Result<(), PolicyRenderError> {
+    let label = finding_severity(severity);
+    if color == HumanRenderColor::Plain {
+        return write!(output, "[{label}]").map_err(map_io_error);
+    }
+    let ansi = match severity {
+        FindingSeverity::Unrated => "\u{001B}[37m",
+        FindingSeverity::Note => "\u{001B}[36m",
+        FindingSeverity::Warning => "\u{001B}[33m",
+        FindingSeverity::Error => "\u{001B}[31m",
+    };
+    write!(output, "{ansi}[{label}]\u{001B}[0m").map_err(map_io_error)
 }
 
 fn write_schema_inference_notes<W: Write>(

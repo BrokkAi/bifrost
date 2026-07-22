@@ -4920,12 +4920,15 @@ fn scan_usages_backend(
                     .flat_map(BTreeSet::into_iter)
                     .collect();
                 let filtered_unproven = filter_and_dedupe_hits(analyzer, &overloads, unproven_hits);
+                let definition_sites_excluded = filtered
+                    .definition_sites_excluded
+                    .saturating_add(filtered_unproven.definition_sites_excluded);
 
                 let state = SymbolUsageRenderState::new(
                     symbol,
                     resolved_definition.clone(),
                     truncated,
-                    filtered.definition_sites_excluded,
+                    definition_sites_excluded,
                     filtered.hits,
                     unproven_total,
                     filtered_unproven.hits,
@@ -5631,6 +5634,10 @@ fn filter_and_dedupe_hits(
         HashMap::default();
     let mut definition_sites_excluded = 0usize;
     for hit in hits {
+        if hit.kind == UsageHitKind::Definition {
+            definition_sites_excluded += 1;
+            continue;
+        }
         // Import and self-receiver hits are for editor references, not the
         // call-graph/relevance rendering here.
         if !hit.kind.included_in(UsageHitSurface::ExternalUsages) {

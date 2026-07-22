@@ -1,5 +1,6 @@
 use crate::analyzer::structural::query::schema::{
-    ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryStepField, reference_kind_label,
+    ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryField,
+    QueryStepField, reference_kind_label,
 };
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
@@ -321,12 +322,16 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Set example: {{\"union\":[{{\"match\":{{\"kind\":\"class\",\"name\":\"Legacy\"}}}},{{\"match\":{{\"kind\":\"class\",\"name\":\"Replacement\"}}}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Set example: {{\"union\":[{{\"match\":{{\"kind\":\"class\",\"name\":\"Legacy\"}}}},{{\"match\":{{\"kind\":\"class\",\"name\":\"Replacement\"}}}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
     let mut query_code_properties =
         query_plan_properties(&pattern_schema_description, &query_step_variants);
+    let execution_modes = ALL_CODE_QUERY_EXECUTION_MODES
+        .iter()
+        .map(|mode| mode.label())
+        .collect::<Vec<_>>();
     query_code_properties.extend(
         json!({
             "limit": {
@@ -341,6 +346,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "enum": ["compact", "full"],
                 "default": "compact",
                 "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, line/column ranges, decorator ranges, and capture ranges."
+            },
+            "execution_mode": {
+                "type": "string",
+                "enum": execution_modes,
+                "default": "results",
+                "description": QueryField::ExecutionMode.description()
             },
             "schema_version": {
                 "type": "integer",
@@ -368,6 +379,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let query_file_exclusions = query_code_properties
+        .keys()
+        .filter(|field| field.as_str() != "query_file")
+        .map(|field| json!({ "required": [field] }))
+        .collect::<Vec<_>>();
     vec![
         tool_descriptor(
             "query_code",
@@ -382,20 +398,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     {
                         "required": ["query_file"],
                         "not": {
-                            "anyOf": [
-                                { "required": ["where"] },
-                                { "required": ["languages"] },
-                                { "required": ["match"] },
-                                { "required": ["union"] },
-                                { "required": ["intersect"] },
-                                { "required": ["except"] },
-                                { "required": ["inside"] },
-                                { "required": ["not_inside"] },
-                                { "required": ["steps"] },
-                                { "required": ["limit"] },
-                                { "required": ["result_detail"] },
-                                { "required": ["schema_version"] }
-                            ]
+                            "anyOf": query_file_exclusions
                         }
                     }
                 ],
@@ -711,6 +714,14 @@ mod tests {
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
             json!([2])
         );
+        assert_eq!(
+            query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
+            json!(["results", "explain", "profile"])
+        );
+        assert_eq!(
+            query_code["inputSchema"]["properties"]["execution_mode"]["default"],
+            "results"
+        );
         for op in ["union", "intersect", "except"] {
             let composition = &query_code["inputSchema"]["properties"][op];
             assert_eq!(composition["minItems"], 2);
@@ -722,6 +733,10 @@ mod tests {
             false
         );
         let nested_plan = &query_code["inputSchema"]["$defs"]["queryPlan"];
+        assert!(
+            nested_plan["properties"].get("execution_mode").is_none(),
+            "execution mode is a root-only query control"
+        );
         for field in [
             "match",
             "inside",
@@ -768,6 +783,21 @@ mod tests {
                 .collect()
             );
         }
+        let query_file_variant = &query_code["inputSchema"]["oneOf"][1];
+        let excluded = query_file_variant["not"]["anyOf"]
+            .as_array()
+            .expect("query_file exclusions")
+            .iter()
+            .map(|entry| entry["required"][0].as_str().expect("excluded field name"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let inline_properties = query_code["inputSchema"]["properties"]
+            .as_object()
+            .expect("query_code properties")
+            .keys()
+            .map(String::as_str)
+            .filter(|field| *field != "query_file")
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(excluded, inline_properties);
     }
 
     #[test]

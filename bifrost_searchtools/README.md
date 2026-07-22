@@ -62,7 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
-| `query_code(pattern=None, *, union=None, intersect=None, except_=None, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure, compose compatible typed branches, and apply semantic steps. |
+| `query_code(pattern=None, *, union=None, intersect=None, except_=None, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None, execution_mode=None)` | Query normalized code structure, compose compatible typed branches, and optionally explain or profile execution. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -142,6 +142,20 @@ declarations. Results are tagged as structural matches, declarations, reference
 sites, call sites, expression sites, or files.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
+
+Omit `execution_mode` (or pass `"results"`) for the ordinary
+`CodeQueryResult`. Pass `execution_mode="explain"` to receive a
+`CodeQueryExplain` containing the normalized query, logical DAG, selected
+physical plan, and scheduling decision without executing the query. Pass
+`execution_mode="profile"` to execute it and receive a `CodeQueryProfile`;
+its `.result` is the ordinary typed result, while `.explain`, `.timings_ns`,
+`.work`, `.cache_layers`, `.scheduling`, and `.operators` expose structured
+observations. Profile timings are elapsed nanoseconds, and
+`temporary_capacity_bytes_lower_bound` is deliberately only a lower-bound
+container-capacity estimate. In the public v1 profile contract, top-level and
+per-operator `.cache_layers` are lists of `{layer, metrics}` records. The nested
+`metrics` object has `kind="structural_facts"` for `seed_structural_facts` and
+`kind="complete_value"` for every other layer.
 
 For decorated or annotated declarations, `node_range` is the matched normalized
 node's parser-backed range. `decorator_ranges` are the decorator or annotation
