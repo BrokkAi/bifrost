@@ -20748,6 +20748,96 @@ fn scala_imported_type_prefers_plain_class_over_companion_object_definition() {
 }
 
 #[test]
+fn scala_self_type_resolves_to_same_file_declaration() {
+    // chisel's IgnoreSeqInBundle shape (issue #1058): a self-type reference
+    // must resolve to a same-file, same-package declaration — not fall
+    // through to the import-boundary heuristic.
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Mixins.scala",
+            "package app\n\ntrait IgnoreSeqInBundle {\n  this: Bundle =>\n  def ignoreSeq: Boolean = true\n}\n\nabstract class Bundle\n",
+        )
+        .build();
+
+    let line = "  this: Bundle =>";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Mixins.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "Bundle")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Bundle", "{value}");
+}
+
+#[test]
+fn scala_self_type_resolves_when_declaration_follows_a_closed_package_block() {
+    // chisel Aggregate.scala shape (issue #1058): a closed nested
+    // `package experimental { }` block, then a top-level declaration.
+    // The declaration belongs to the file's outer package; indexing it
+    // under the closed block's package makes every reference to it fail.
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Mixins.scala",
+            "package app\n\ntrait IgnoreSeqInBundle {\n  this: Bundle =>\n  def ignoreSeq: Boolean = true\n}\n\npackage experimental {\n  class Foo\n}\n\nabstract class Bundle\n",
+        )
+        .build();
+
+    let line = "  this: Bundle =>";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Mixins.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "Bundle")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Bundle", "{value}");
+}
+
+#[test]
+fn scala_self_type_resolves_despite_cross_build_twin_declarations() {
+    // The chisel Aggregate.scala layout: identical package/fq names in
+    // parallel cross-build source trees.
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "core/src/main/scala/app/Mixins.scala",
+            "package app\n\ntrait IgnoreSeqInBundle {\n  this: Bundle =>\n  def ignoreSeq: Boolean = true\n}\n\nabstract class Bundle\n",
+        )
+        .file(
+            "core/src/main/scala-2/app/Mixins.scala",
+            "package app\n\ntrait IgnoreSeqInBundle {\n  this: Bundle =>\n  def ignoreSeq: Boolean = true\n}\n\nabstract class Bundle\n",
+        )
+        .build();
+
+    let line = "  this: Bundle =>";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"core/src/main/scala/app/Mixins.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "Bundle")
+        ),
+    );
+
+    let result = &value["results"][0];
+    // Identical fq names across cross-build trees correctly report
+    // ambiguity with both variants offered.
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let paths: Vec<&str> = result["definitions"]
+        .as_array()
+        .expect("definitions")
+        .iter()
+        .filter_map(|definition| definition["path"].as_str())
+        .collect();
+    assert_eq!(paths.len(), 2, "{value}");
+}
+
+#[test]
 fn scala_constructor_call_resolves_to_primary_constructor_identity() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
