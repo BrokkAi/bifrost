@@ -25,7 +25,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 11:04Z) Implemented the measured direct-import topology, snapshot ownership/lifecycle telemetry, typed differential/lifecycle tests, and Ky/Express importer benchmark cases; captured paired scan-only/Auto evidence on both pinned repositories.
 - [x] (2026-07-22 11:32Z) Ran the Milestone 3 five-perspective guided review. It confirmed eager first-use Auto admission, duplicated failed-build fallback work, incomplete MultiAnalyzer generation identity, fixed-budget ownership, construction-memory, live-overlay replay, parser strictness, and cleanup findings.
 - [x] (2026-07-22 12:19Z) Resolved every confirmed Milestone 3 review finding: request-scoped Auto admission, partial-work fallback reuse, all-delegate generation identity, configured budget ownership, conservative construction preflight, post-replay generation rejection, strict benchmark parsing, and derived-layer-specific public telemetry all pass focused validation and all-target/all-feature Clippy.
-- [ ] Complete Milestone 3 using the measured promotion criteria, run focused tests, run guided review, fix confirmed findings, update this plan, and commit.
+- [x] (2026-07-22 12:36Z) Completed Milestone 3 with clean-commit Gson evidence: 262 files/1,005 import edges, 112 exact results, warm median 335.5 to 263.2 ms, first/warm 2.16x, zero warm import resolution, and 20,262 retained bytes (0.44% of the persisted structural-facts payload).
 - [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
 - [ ] Run cargo fmt --check, all-target/all-feature Clippy, and the complete nlp,python feature-enabled test gate.
 - [ ] Open a draft PR, temporarily enable the benchmark workflow on the PR branch, collect the Ubuntu artifact, record baseline figures, and remove the temporary workflow trigger.
@@ -86,6 +86,15 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: A workspace-wide derived layer cannot use only `MultiAnalyzer::project()` as its source identity; a mutable overlay on any non-primary delegate can change import edges. The cache identity is now the ordered generation vector of every delegate, while update, update_all, and clone-with-project still allocate fresh owners.
   Evidence: `multi_analyzer_tracks_every_delegate_overlay_generation` mutates the TypeScript delegate while Java remains first and observes a rebuild rather than a stale hit.
+
+- Observation: Rebuilding only `bifrost_benchmark` can silently execute an older sibling `target/debug/bifrost` server. The first attempted clean reports showed eager first-request topology builds even though the in-process tests proved request-scoped deferral; rebuilding both binaries restored the expected first fallback and warmup build.
+  Evidence: the stale-server Express/Ky reports under `issue920-*-derived-clean-{scan,auto}` and `issue920-express-derived-clean-auto-r2` are invalid and must not be cited. The valid v3/Gson reports were collected only after `cargo build --bin bifrost --bin bifrost_benchmark`.
+
+- Observation: Moving Auto construction into the first warmup exposed a benchmark aggregation gap: `warmup_transition` recognized posting-index builds but discarded derived-layer builds. The benchmark now recognizes both transition families and preserves the complete direct-import build profile.
+  Evidence: `warmup_transition_keeps_posting_and_derived_layer_builds` passes, and the clean Gson Auto report records the 262-file/1,005-edge topology build under `warmup_transition` rather than mislabeling it as first or warm work.
+
+- Observation: Express remains a useful small-path corroboration but is too fast for the stricter absolute latency arm to be stable: repeated final-code runs moved its scan warm median between 12.9 and 15.7 ms while Auto stayed near 4.7-4.8 ms. The larger pinned Gson importer case gives decisive promotion evidence without relying on local timing noise.
+  Evidence: valid Express v3 reports and the clean Gson pair at `da8862e8`; Gson improves by 72.297 ms while preserving 112 results.
 
 ## Decision Log
 
@@ -153,8 +162,8 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: Reuse is observable runner state and cannot honestly be inferred from CodeQuery syntax.
   Date/Author: 2026-07-22 / Codex.
 
-- Decision: Promote only `DirectImportTopology` as a snapshot-local derived relation. Express's `try-render-importers` case reduced warm median from 16.306 ms to 5.514 ms, eliminated warm import resolution, retained 7,093 bytes, and held first/warm to 9.10x; Ky corroborated the reuse shape but not the stricter 10 ms absolute latency arm.
-  Rationale: Express meets the 50% physical-work, stricter 20%-or-10-ms latency, 25% retained-memory, and 10x cold/warm gates on the same pinned checkout and machine.
+- Decision: Promote only `DirectImportTopology` as a snapshot-local derived relation. The final representative is `gson-class-importers`: warm median fell from 335.459 ms to 263.162 ms, warm import resolution fell from 262 files/1,005 edges to zero, retained memory was 20,262 bytes, and first/warm was 2.16x. Express and Ky remain smaller corroborating cases.
+  Rationale: Gson passes the 50% physical-work, stricter 20%-or-10-ms latency, 25% retained-memory, and 10x cold/warm gates decisively on the same pinned checkout and machine; the checked-in case makes that evidence reproducible in scheduled runs.
   Date/Author: 2026-07-22 / Codex.
 
 - Decision: Keep owner/member, hierarchy, reference, and call relations request-local. Their current payloads include proof tier, ambiguity, site or call kind, source range, typed endpoints, and partial/unsupported state that a bare dense graph cannot reproduce; no retained-byte or cross-request benchmark passed the promotion gate.
@@ -167,7 +176,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. The checked-in manifest now has 12 correctness-checked query cases across all ten pinned languages and all six workload classes. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
+Milestone 1 is complete. The checked-in manifest now has 13 correctness-checked query cases across all ten pinned languages and all six workload classes, including the later-added representative Gson importer workload. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
 
 The local pre-index report passed all cases. First/warm median milliseconds were: Gson exact 58.2/8.9, Gson regex 55.8/9.0, Gson containment 65.6/18.3, Gin 35.4/3.9, fmt broad 248.2/178.3, Express 34.8/3.2, Ky typed 29.7/3.3, Click 51.3/6.0, serde_json 25.8/3.2, FastRoute 21.6/1.9, Scala XML 32.8/3.3, and Dapper 69.4/13.0. These are local development-build figures, not the final Ubuntu comparison.
 
@@ -175,7 +184,7 @@ Milestone 2 is implementation- and guided-review-complete. The posting index ret
 
 The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satisfies the Milestone 2 promotion gates. For `workspace-exact-sql-mapper-class`, scan-only first/warm median/p95 was 217.6/107.4/245.1 ms and Auto was 208.9/26.0/26.8 ms, a 4.13x warm-median improvement with an 8.04x first-to-warm ratio. Indexed warm execution reduced candidate/examined facts from 49,181 to 27, materialized facts from 49,181 to 24,269, and inspected source bytes from 1,159,390 to 917,649. The transition warmup built over 157 files and 85,325 facts in 210.9 ms; the retained index was 1,979,756 bytes versus 12,215,566 normalized-facts bytes, or 16.2%. Both paths returned the same 27 results without truncation or diagnostics.
 
-Milestone 3's measured implementation and guided-review corrections are complete; only refreshed clean-commit benchmark evidence remains before closing the milestone. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Auto defers one-shot requests, rejected builds suppress same-or-tighter retries, partial failed-build work becomes the exact request-local fallback, and every delegate generation participates in MultiAnalyzer invalidation. Owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
+Milestone 3 is complete. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Auto defers one-shot requests, rejected builds suppress same-or-tighter retries, partial failed-build work becomes the exact request-local fallback, and every delegate generation participates in MultiAnalyzer invalidation. The clean Gson pair passes every promotion threshold; owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -569,6 +578,29 @@ Milestone 3 guided-review fix validation:
     # 56 pass; the direct-import layer decodes to CodeQueryDerivedLayerCacheCounters
     BIFROST_CODE_QUERY_BENCH_SMALL_FILES=2 BIFROST_CODE_QUERY_BENCH_LARGE_FILES=3 BIFROST_CODE_QUERY_BENCH_ITERATIONS=1 cargo test --lib code_query_execution_profile_measurement -- --ignored --nocapture
     # 1 pass with cold deferred fallback, first-reuse build, and later-hit assertions
+
+Milestone 3 final clean representative pair:
+
+    implementation commit = da8862e8be52f6b2ba8a6bbbb6ee9d3a98b0b6e6
+    repository = google/gson at ed2397502708ebaba53643e5c3d60e0974d7045f
+    machine = local Apple arm64 development build
+    case = gson-class-importers; result cardinality = 112; truncated = false; diagnostics = []
+    scan report = .cache/issue920-gson-derived-clean-scan/run-20260722T123348Z.json
+    auto report = .cache/issue920-gson-derived-clean-auto/run-20260722T123357Z.json
+    scan first/median/p95 = 878.521/335.459/539.716 ms
+    auto first/median/p95 = 567.408/263.162/353.730 ms; warm improvement = 21.55% and 72.297 ms; first/median = 2.16x
+    scan first and warm import work = 262 files / 1,005 edges
+    auto first admission = 1 miss / 0 builds / 1 fallback; work = 262 files / 1,005 edges
+    auto warmup transition = 1 miss / 1 complete build / 0 fallbacks; build = 262 files / 1,005 edges / 31.299 ms
+    auto warm = 1 complete hit / 0 import files / 0 import edges; replayed topology payload = 1,005 edges
+    retained topology bytes = 20,262
+    persisted structural-facts payload census = 4,648,408 bytes across 262 snapshots; topology/payload = 0.44%
+
+Invalid local timing artifacts that must not be cited:
+
+    .cache/issue920-ky-derived-clean-auto and .cache/.cache/issue920-ky-derived-clean-scan
+    .cache/issue920-express-derived-clean-{scan,auto,auto-r2,scan-r2}
+    # These used a stale target/debug/bifrost even though the benchmark runner itself was rebuilt.
 
 ## Interfaces and Dependencies
 
