@@ -59,8 +59,8 @@
         ],
         "configuration": "./language-configuration.json",
         "icon": {
-          "light": "./icons/bifrost-rql.png",
-          "dark": "./icons/bifrost-rql.png"
+          "light": "./icons/bifrost-rql-light.svg",
+          "dark": "./icons/bifrost-rql-dark.svg"
         }
       },
       {
@@ -89,8 +89,8 @@
         ],
         "configuration": "./language-configuration.json",
         "icon": {
-          "light": "./icons/bifrost-rql.png",
-          "dark": "./icons/bifrost-rql.png"
+          "light": "./icons/bifrost-rune-ir-light.svg",
+          "dark": "./icons/bifrost-rune-ir-dark.svg"
         }
       }
     ],

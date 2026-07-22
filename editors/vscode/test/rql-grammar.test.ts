@@ -40,8 +40,8 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
       extensions: [".rql"],
       configuration: "./language-configuration.json",
       icon: {
-        light: "./icons/bifrost-rql.png",
-        dark: "./icons/bifrost-rql.png"
+        light: "./icons/bifrost-rql-light.svg",
+        dark: "./icons/bifrost-rql-dark.svg"
       }
     },
     {
@@ -60,8 +60,8 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
       extensions: [".rune"],
       configuration: "./language-configuration.json",
       icon: {
-        light: "./icons/bifrost-rql.png",
-        dark: "./icons/bifrost-rql.png"
+        light: "./icons/bifrost-rune-ir-light.svg",
+        dark: "./icons/bifrost-rune-ir-dark.svg"
       }
     }
   ]);

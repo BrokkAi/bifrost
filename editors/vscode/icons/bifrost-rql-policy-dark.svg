@@ -1,17 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Bifrost RQL policy">
-  <path
-    d="M10 3h30l14 14v44H10z"
-    fill="#252526"
-    stroke="#f0f0f0"
-    stroke-linejoin="round"
-    stroke-width="3"
-  />
-  <path d="M40 3v14h14" fill="#333337" stroke="#f0f0f0" stroke-linejoin="round" stroke-width="3" />
-  <g fill="#ff463d" stroke="#090909" stroke-linejoin="round" stroke-width="2.6">
-    <path d="M25 35C17 33 13 27 14 20c.5-4 2.7-7.7 6-10-1 6 1 10 5 13-3 2-4 7 0 12z" />
-    <path d="M39 35c8-2 12-8 11-15-.5-4-2.7-7.7-6-10 1 6-1 10-5 13 3 2 4 7 0 12z" />
-    <path d="M18 42c1-12 7-20 14-22 7 2 13 10 14 22-4 5-9 8-14 8s-10-3-14-8z" />
-    <path d="M18 38c4 4 9 6 14 6s10-2 14-6v6c-4 4-9 6-14 6s-10-2-14-6z" />
-    <path d="M29 19h6v34l-3 3-3-3z" />
+  <defs>
+    <mask id="page-cutout" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="#fff" />
+      <g transform="translate(-2 5) scale(1.25 1)" fill="#000" stroke="#000" stroke-linejoin="round" stroke-width="5">
+        <path d="M25 35C17 33 13 27 14 20c.5-4 2.7-7.7 6-10-1 6 1 10 5 13-3 2-4 7 0 12z" />
+        <path d="M39 35c8-2 12-8 11-15-.5-4-2.7-7.7-6-10 1 6-1 10-5 13 3 2 4 7 0 12z" />
+        <path d="M18 42c1-12 7-20 14-22 7 2 13 10 14 22-4 5-9 8-14 8s-10-3-14-8z" />
+        <path d="M29 19h6v34l-3 3-3-3z" />
+      </g>
+    </mask>
+  </defs>
+  <g mask="url(#page-cutout)">
+    <path d="M4 3h27l11 11v38H4z" fill="#e8e8ea" />
+    <path d="M31 3v11h11z" fill="#aeb0b5" />
+  </g>
+  <g transform="translate(-2 5) scale(1.25 1)">
+    <path d="M25 35C17 33 13 27 14 20c.5-4 2.7-7.7 6-10-1 6 1 10 5 13-3 2-4 7 0 12z" fill="#74d7e5" />
+    <path d="M39 35c8-2 12-8 11-15-.5-4-2.7-7.7-6-10 1 6-1 10-5 13 3 2 4 7 0 12z" fill="#74d7e5" />
+    <path d="M18 42c1-12 7-20 14-22 7 2 13 10 14 22-4 5-9 8-14 8s-10-3-14-8z" fill="#32b8c6" />
+    <path d="M18 38c4 4 9 6 14 6s10-2 14-6v6c-4 4-9 6-14 6s-10-2-14-6z" fill="#1d7f8b" />
+    <path d="M29 19h6v34l-3 3-3-3z" fill="#c8f7fb" />
   </g>
 </svg>
