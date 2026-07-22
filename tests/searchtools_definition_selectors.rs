@@ -722,8 +722,10 @@ class JobSrv {
         source.contains("def create: Action[AnyContent]"),
         "{source}"
     );
+    assert!(source.contains("jobSrv"), "{source}");
     assert!(
-        source.contains("jobSrv\n                  .submit"),
+        source
+            .contains(".submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))"),
         "{source}"
     );
     assert!(!source.contains("class PublicJob"), "{source}");
@@ -731,7 +733,7 @@ class JobSrv {
     let reference_args = serde_json::json!({
         "references": [{
             "symbol": "org.thp.thehive.connector.cortex.controllers.v0.JobCtrl",
-            "context": "jobSrv\n                  .submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))",
+            "context": ".submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))",
             "target": "submit"
         }]
     })

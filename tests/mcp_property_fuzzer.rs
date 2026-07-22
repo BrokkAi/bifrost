@@ -617,8 +617,10 @@ fn issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture() {
         source.contains("def create: Action[AnyContent]"),
         "{source}"
     );
+    assert!(source.contains("jobSrv"), "{source}");
     assert!(
-        source.contains("jobSrv\n                  .submit"),
+        source
+            .contains(".submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))"),
         "{source}"
     );
     assert!(!source.contains("class PublicJob"), "{source}");
