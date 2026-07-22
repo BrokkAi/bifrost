@@ -49,6 +49,7 @@ The observable result is twenty-five clean completed repository records, five pe
 - [x] (2026-07-22 12:20-05:00) Exhaustive review of the interrupted ZIO record found one new legitimate exact-identity defect. Created and solely assigned #1086 before implementation. A two-source-set reduction proves that path-qualified Scala 2 `Tracer.Type` loses six anonymous-refinement references only when a Scala 3 same-FQN replica is present. The structured repair retains the source-local constructed base, makes exact direct type members authoritative before export/ancestor ambiguity, and keeps a third-file ambiguous consumer fail-closed; focused Rust and MCP behavior coverage passes.
 - [x] (2026-07-22 12:55-05:00) Published the integrated Scala fixes at `4589dd98`, proved #1073 and #1086 with clean persisted exact witnesses, and completed the corrected five-repository corpus. Its 47 raw missing rows were independently matched one-for-one to source bytes and targets: 26 import qualifiers, 8 nested qualifiers, 9 #128 cross-language skips, and 4 #419/#499 trait/default skips, with zero Jonathan-actionable rows. Closed #661, #663, #664, #1073, and #1086 with final evidence and recorded the language summary.
 - [x] Complete, publish, close owned issues for, and summarize the Scala task-ranked leg.
+- [x] (2026-07-22 16:30-05:00) Recovered the campaign after a machine crash at clean pushed head `9620eb8f`. The live `tasks.py` selector still returns Fastjson2, Hutool, LanguageTool, Halo, and Dubbo in that task-count order; all five clones remain at their pinned heads with no tracked changes, and no stale differential process survives. The operator reports a completed Fastjson2 leg and an interrupted LanguageTool inverse phase. Filesystem reconciliation found a durable five-envelope zero-missing Java artifact only at historical head `d675ad92`, but no current-head envelope for either repository. Because shared and Java analyzer changes landed after that historical head, all five repositories rerun at `9620eb8f`; the unchanged persisted caches accelerate recovery but do not substitute for new envelopes. All new temporary artifacts use `/mnt/optane/tmp/bifrost-fird/` as explicitly requested.
 - [ ] Complete, publish, close owned issues for, and summarize the Java task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Python task-ranked leg.
 - [ ] Verify the twenty-five-record matrix, compact manifests, issue states, clean worktree, and equality of local HEAD, local `origin/master`, and remote `refs/heads/master`.
@@ -183,11 +184,11 @@ Java and Python remain. Historical fixes and issue closures in those languages r
 
 ## Context and Orientation
 
-Work in `/mnt/optane/tmp/bifrost-burndown-3` on the existing `bifrost-burndown-3` branch. Do not create or switch branches, rebase, or open a pull request. Commit only files changed for this campaign. Before publication, fetch `origin/master`, merge it into the current branch without rebasing if necessary, repeat proportionate local gates, and push the integrated `HEAD` directly to `origin/master`.
+Work in `/mnt/optane/bifrost-fird` on the existing `bifrost-fird` branch. Do not create or switch branches, rebase, or open a pull request. Commit only files changed for this campaign. Before publication, fetch `origin/master`, merge it into the current branch without rebasing if necessary, repeat proportionate local gates, and push the integrated `HEAD` directly to `origin/master`.
 
 The differential CLI is `src/bin/bifrost_reference_differential.rs`; the engine and JSONL schema are in `src/reference_differential/mod.rs`. Forward definition resolution lives under `src/analyzer/usages/get_definition/`; inverse reference logic lives in `src/analyzer/usages/` and its language modules. `tests/common/inline_project.rs::InlineTestProject` is the preferred harness for small behavior reductions.
 
-Canonical clones are below `/home/jonathan/Projects/brokkbench/clones`, which resolves to `/mnt/T9/repo-clones`. Task selection and all corpus eligibility reads go through `/home/jonathan/Projects/brokkbench/tasks.py`; do not manually read or reimplement filters over its task stores. Durable differential artifacts and logs belong under `/mnt/optane/tmp/reference-differential`; compact manifests and narrative summaries belong under `.agents/docs/reference-differential/`.
+Canonical clones are below `/home/jonathan/Projects/brokkbench/clones`, which resolves to `/mnt/T9/repo-clones`. Task selection and all corpus eligibility reads go through `/home/jonathan/Projects/brokkbench/tasks.py`; do not manually read or reimplement filters over its task stores. For this resumed campaign, durable differential artifacts and logs belong under `/mnt/optane/tmp/bifrost-fird/`; compact manifests and narrative summaries belong under `.agents/docs/reference-differential/`.
 
 The authoritative task-ranked selections are:
 
@@ -264,7 +265,7 @@ The campaign is complete only when all five language boundaries pass, the compac
 
 ## Artifacts and Notes
 
-Keep raw JSONL, logs, exact records, row ledgers, and checksums under `/mnt/optane/tmp/reference-differential`. Check in only compact manifests and narrative summaries under `.agents/docs/reference-differential/`. Historical LOC-ranked artifacts and their issue fixes remain valuable regression inputs, but every final manifest must label them non-authoritative for this task-ranked objective.
+Keep resumed raw JSONL, logs, exact records, row ledgers, and checksums under `/mnt/optane/tmp/bifrost-fird/`. Check in only compact manifests and narrative summaries under `.agents/docs/reference-differential/`. Historical LOC-ranked artifacts and their issue fixes remain valuable regression inputs, but every final manifest must label them non-authoritative for this task-ranked objective.
 
 ## Interfaces and Dependencies
 
@@ -281,3 +282,5 @@ Revision note (2026-07-22): Recorded local completion of the three #661 inverse 
 Revision note (2026-07-22): Recorded the invalid persisted-cache publication attempt, #1073 analyzer-epoch cutover, and newly assigned #1086 physical source-set identity repair before the corrected Scala publication boundary.
 
 Revision note (2026-07-22): Recorded the completed Scala publication at `4589dd98`, the exhaustive zero-actionable 47-row ledger, clean persisted #1073/#1086 witnesses, five issue closures, and the transition to Java.
+
+Revision note (2026-07-22): Recovered the campaign after the machine crash, revalidated the live task-ranked Java selection and pinned clones, recorded the interrupted LanguageTool boundary, moved resumed temporary output to the operator-requested `/mnt/optane/tmp/bifrost-fird/`, and corrected the current worktree path.
