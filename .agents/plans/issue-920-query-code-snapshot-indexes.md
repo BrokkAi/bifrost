@@ -32,7 +32,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 14:52Z) Rebased cleanly onto current origin/master `433bc4a2`, rebuilt identity-matched binaries at `b4469d20`, and repeated formatting, Clippy, the complete Rust matrix, and all 56 Python tests successfully. Three final-head Gson scan/Auto pairs preserved correctness and topology hits but produced only 15.23%, 8.15%, and 2.07% warm-median improvements, so the local latency promotion is now explicitly unproven pending the required Ubuntu artifact.
 - [x] (2026-07-22 15:40Z) Opened draft PR #1078, captured the authorized PR-event artifact, rejected its synthetic merge-commit identity as non-final, and captured exact-branch Ubuntu Auto run 29932651323 plus scan-only run 29933850688 at `e5057b97`; both covered 10 repositories and 16 correct QueryCode cases with no scenario failures.
 - [x] (2026-07-22 15:51Z) Applied the Ubuntu decision: production Auto no longer acquires `DirectImportTopology`, while the forced differential path remains tested. Fixed the discovered cold-contract gap by priming durable structural facts in an untimed scan-only process before starting the fresh measured process; focused structural, benchmark, comparison, manifest, CLI, and end-to-end suites pass.
-- [ ] Commit the Ubuntu-driven correction, collect corrected exact-head Ubuntu Auto and scan-only artifacts, record the final figures, and remove the temporary workflow trigger and dispatch selector.
+- [x] (2026-07-22 16:21Z) Committed the Ubuntu-driven correction at `b7409455`, captured corrected exact-head Auto run 29935713091 and scan-only run 29936770096, recorded the final figures, removed the temporary workflow trigger and dispatch selector, and restored the two passing workflow-policy tests.
 - [ ] Audit every issue acceptance criterion against current code, tests, benchmark artifacts, and PR state.
 
 ## Surprises & Discoveries
@@ -243,7 +243,7 @@ The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satis
 
 Milestone 3 measurement is complete. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in forced differential tests. Its clean checkpoint pair passed every threshold, but three final-head local repeats failed to reproduce the required latency gain and the exact-head Ubuntu pair showed a 74.8% warm regression. Production Auto therefore no longer acquires or retains it; the forced path remains for exactness and lifecycle regression coverage. Owner/member, hierarchy, reference, and call relations also remain request-local because their complete typed payload and performance case did not justify promotion.
 
-The post-milestone guided review is locally complete. Cache rejection handoff, atomic overlay generations, request-scoped posting admission, post-replay generation validation, bounded allocation preflight, generation-bound import fallback, Pareto-scoped rejection caching, and opaque provider ownership close the lifecycle and architecture gaps found by the reviewers. Benchmark evidence is protected by a checkout build-identity handshake, strict cache-layer decoding, non-vacuous witnesses, subset-report exclusion, and an environment-variance-independent cold/warm invariant. The initial exact-head Ubuntu artifact exposed one remaining benchmark-contract defect—durable facts were described but not primed—and the failed topology promotion. Both are corrected locally; the remaining work is an exact-head Ubuntu rerun, removal of temporary workflow controls, and the final acceptance audit.
+The post-milestone guided review is locally complete. Cache rejection handoff, atomic overlay generations, request-scoped posting admission, post-replay generation validation, bounded allocation preflight, generation-bound import fallback, Pareto-scoped rejection caching, and opaque provider ownership close the lifecycle and architecture gaps found by the reviewers. Benchmark evidence is protected by a checkout build-identity handshake, strict cache-layer decoding, non-vacuous witnesses, subset-report exclusion, and an environment-variance-independent cold/warm invariant. The initial exact-head Ubuntu artifact exposed one remaining benchmark-contract defect—durable facts were described but not primed—and the failed topology promotion. The corrected exact-head pair now proves deterministic hydration, no topology retention, and a posting-index representative that clears every promotion gate. Temporary workflow controls are removed; only the final acceptance and repository-gate audit remains.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -723,6 +723,22 @@ Local validation after topology non-retention and deterministic facts priming (d
     Gson importer scan/Auto warm median = 178.4/181.2 ms; both use request-local 262-file/1,005-edge resolution
     Gson Auto topology lifecycle and retained bytes = all zero; results = 112; no truncation/diagnostics
     focused tests = 67 structural search + 7 QueryCode parser + 10 end-to-end benchmark + 13 compare + 10 manifest + 3 CLI, all pass
+
+Final corrected exact-head Ubuntu pair:
+
+    implementation commit = b74094554a0613ea57e0850353be3d8aa6cd5a5e
+    Auto run = https://github.com/BrokkAi/bifrost/actions/runs/29935713091
+    scan-only run = https://github.com/BrokkAi/bifrost/actions/runs/29936770096
+    Auto report = /private/tmp/bifrost-920-final-auto-hIa3zx/run-20260722T160829Z.json
+    scan report = /private/tmp/bifrost-920-final-scan-Kmn8sd/run-20260722T161929Z.json
+    both reports = exact embedded SHA, 10 repositories, 16 successful QueryCode cases, 69 first persisted hydrations, 0 first extractions, no cold ratio above 10x
+    Dapper workspace scan first/median/p95 = 357.492/182.850/184.623 ms
+    Dapper workspace Auto first/median/p95 = 456.401/47.482/48.118 ms; first/median = 9.612x
+    Dapper warm improvement = 135.369 ms and 74.03%; examined facts = 49,181 to 27; inspected source bytes = 1,159,390 to 917,649
+    Dapper retained posting bytes = 1,975,945 of 12,215,566 build-facts bytes, or 16.18%; result cardinality = 27; no truncation/diagnostics
+    production topology activity across every Auto QueryCode phase = zero; Gson importer used request-local 262-file/1,005-edge resolution and returned 112 exact results
+    Auto maximum first/warm ratio across the complete corpus = 9.612x
+    workflow policy after removing temporary trigger and selector = 2 passed
 
 Invalid local timing artifacts that must not be cited:
 
