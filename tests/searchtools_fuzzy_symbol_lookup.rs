@@ -66,36 +66,82 @@ export class Greeter {
 }
 
 #[test]
-fn javascript_double_sigil_names_are_searchable() {
-    // angular.js shape: `$$`-prefixed private names — the first `$` is
-    // followed by another `$`, which is still an unsatisfiable anchor
-    // position and must be escaped too.
-    let project = InlineTestProject::with_language(Language::JavaScript)
+fn scala_case_class_and_companion_in_object_index_under_the_object() {
+    // http4s Message.EntityStreamException shape: case class + companion
+    // inside an object — the import path `org.http4s.Message.EntityStreamException`
+    // must find the case class.
+    let project = InlineTestProject::with_language(Language::Scala)
         .file(
-            "src/ng/animateRunner.js",
-            "export function $$AnimateRunnerFactoryProvider(host) {\n  this.host = host;\n}\n",
+            "src/Message.scala",
+            "package org.http4s\n\ntrait Message\n\nobject Message {\n  final case class EntityStreamException(msg: String) extends Exception(msg)\n\n  object EntityStreamException {\n    def createWithDefaultMsg(maxBytes: Long): EntityStreamException = ???\n  }\n}\n",
         )
         .build();
-    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
 
     let search = search_symbols(
         &analyzer,
         SearchSymbolsParams {
-            patterns: vec!["$$AnimateRunnerFactoryProvider".to_string()],
+            patterns: vec!["EntityStreamException".to_string()],
             include_tests: true,
             limit: 20,
         },
     );
-    let file = search
+    let symbols: Vec<String> = search
         .files
         .iter()
-        .find(|file| file.path == "src/ng/animateRunner.js")
-        .unwrap_or_else(|| panic!("missing animateRunner.js: {search:#?}"));
+        .flat_map(|file| {
+            file.classes
+                .iter()
+                .chain(file.functions.iter())
+                .chain(file.fields.iter())
+                .map(|hit| hit.symbol.clone())
+        })
+        .collect();
     assert!(
-        file.functions
+        symbols
             .iter()
-            .any(|hit| hit.symbol == "$$AnimateRunnerFactoryProvider"),
-        "expected $$AnimateRunnerFactoryProvider: {search:#?}"
+            .any(|symbol| symbol == "org.http4s.Message.EntityStreamException"),
+        "case class must be indexed under the natural import path: {symbols:?}"
+    );
+}
+
+#[test]
+fn javascript_double_sigil_names_are_searchable() {
+    // http4s Message.EntityStreamException shape: case class + companion
+    // inside an object — the import path `org.http4s.Message.EntityStreamException`
+    // must find the case class.
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Message.scala",
+            "package org.http4s\n\ntrait Message\n\nobject Message {\n  final case class EntityStreamException(msg: String) extends Exception(msg)\n\n  object EntityStreamException {\n    def createWithDefaultMsg(maxBytes: Long): EntityStreamException = ???\n  }\n}\n",
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["EntityStreamException".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    let symbols: Vec<String> = search
+        .files
+        .iter()
+        .flat_map(|file| {
+            file.classes
+                .iter()
+                .chain(file.functions.iter())
+                .chain(file.fields.iter())
+                .map(|hit| hit.symbol.clone())
+        })
+        .collect();
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol == "org.http4s.Message.EntityStreamException"),
+        "case class must be indexed under the natural import path: {symbols:?}"
     );
 }
 
