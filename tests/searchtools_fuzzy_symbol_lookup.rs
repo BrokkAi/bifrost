@@ -66,6 +66,84 @@ export class Greeter {
 }
 
 #[test]
+fn typescript_constructor_assigned_field_is_indexed_and_searchable() {
+    // Mirrors the JavaScript constructor-field pass: without it, TS
+    // constructor-assigned properties resolve in scan_usages but are
+    // invisible to search_symbols (the #1059 shape on TS).
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/poller.ts",
+            "export class FeatureFlagsPoller {\n  constructor(cacheProvider: unknown) {\n    this.cacheProvider = cacheProvider;\n  }\n}\n",
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["cacheProvider".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    let poller = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/poller.ts")
+        .unwrap_or_else(|| panic!("missing poller.ts in {search:#?}"));
+    assert!(
+        poller
+            .fields
+            .iter()
+            .any(|hit| hit.symbol == "FeatureFlagsPoller.cacheProvider" && hit.line == 3),
+        "expected FeatureFlagsPoller.cacheProvider on constructor assignment line: {search:#?}"
+    );
+}
+
+#[test]
+fn javascript_sigil_prefixed_field_is_searchable_by_literal_pattern() {
+    // dayjs shape (issue #1059): a `$`-prefixed constructor-assigned field
+    // must be searchable — the raw pattern used to compile as an
+    // unsatisfiable regex (`$` = end anchor mid-pattern).
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/index.js",
+            r#"export class Dayjs {
+  constructor(cfg) {
+    this.$L = cfg.locale;
+    this.$utils = cfg.utils;
+  }
+}
+"#,
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    for pattern in ["$L", "Dayjs.$L"] {
+        let search = search_symbols(
+            &analyzer,
+            SearchSymbolsParams {
+                patterns: vec![pattern.to_string()],
+                include_tests: true,
+                limit: 20,
+            },
+        );
+        let index = search
+            .files
+            .iter()
+            .find(|file| file.path == "src/index.js")
+            .unwrap_or_else(|| panic!("missing index.js for pattern {pattern}: {search:#?}"));
+        assert!(
+            index
+                .fields
+                .iter()
+                .any(|hit| hit.symbol == "Dayjs.$L" && hit.line == 3),
+            "expected Dayjs.$L for pattern {pattern}: {search:#?}"
+        );
+    }
+}
+
+#[test]
 fn javascript_object_literal_method_is_searchable_as_function_symbol() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

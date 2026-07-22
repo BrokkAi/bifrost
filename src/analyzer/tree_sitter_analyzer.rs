@@ -4589,7 +4589,7 @@ where
                 format!(".*?{}.*?", regex::escape(pattern))
             }
         } else {
-            pattern.to_string()
+            escape_sigil_anchors(pattern)
         };
         let compiled = RegexBuilder::new(&pattern)
             .case_insensitive(true)
@@ -5692,6 +5692,34 @@ fn literal_ascii_search_substring(pattern: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
     .then_some(pattern)
+}
+
+/// Escape anchor metacharacters only where they form part of an identifier
+/// token. A `$` directly followed by a word character (JS/PHP/Ruby sigils:
+/// `$L`, `$utils`, `$global`) is unsatisfiable as an end-of-haystack anchor,
+/// so escaping it cannot change any pattern that matches today; likewise a
+/// `^` directly after a word character is unsatisfiable as a start anchor.
+/// Intentional regex (groups, classes, real anchors) is left untouched.
+fn escape_sigil_anchors(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut escaped = String::with_capacity(pattern.len());
+    for (index, ch) in chars.iter().enumerate() {
+        let prev_is_word =
+            index > 0 && (chars[index - 1].is_alphanumeric() || chars[index - 1] == '_');
+        let next_is_word = chars
+            .get(index + 1)
+            .is_some_and(|next| next.is_alphanumeric() || *next == '_');
+        let unsatisfiable = match ch {
+            '$' => next_is_word,
+            '^' => prev_is_word,
+            _ => false,
+        };
+        if unsatisfiable {
+            escaped.push('\\');
+        }
+        escaped.push(*ch);
+    }
+    escaped
 }
 
 fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
