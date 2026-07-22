@@ -4,8 +4,8 @@ use brokk_bifrost::analyzer::semantic::{
     CallableReferenceKind, CallableTargetResolution, CancellationToken, ControlEdgeKind,
     DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind,
     ProcedureKind, ProcedureSemantics, SemanticBudget, SemanticBudgetDimension, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
-    SemanticOutcome, SemanticRequest,
+    SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticLanguage, SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -1614,10 +1614,7 @@ fn rust_match_evaluates_the_subject_before_guarded_arm_selection() {
 
 #[test]
 fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "rust/implicit_calls.rs",
-            r#"
+    let source = r#"
                 fn implicit_operations(
                     left: Number,
                     right: Number,
@@ -1631,8 +1628,9 @@ fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
                     let _field = holder.field;
                     holder.method();
                 }
-            "#,
-        )
+            "#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("rust/implicit_calls.rs", source)
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/implicit_calls.rs");
@@ -1697,6 +1695,23 @@ fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
             SemanticGapKind::Unknown,
         );
     }
+    let procedure = procedure_named(&graph, "implicit_operations", ProcedureKind::Function);
+    let method_call = exact_call_site(procedure, source, "holder.method()");
+    let receiver_adjustment_gap = procedure
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.point == method_call.point
+                && gap.subject == SemanticGapSubject::Point
+                && gap.capability == SemanticCapability::Calls
+        })
+        .expect("method call must retain its receiver-adjustment gap");
+    assert!(
+        receiver_adjustment_gap
+            .impacts
+            .contains(SemanticGapImpact::CallEvaluation),
+        "omitted Deref/DerefMut calls must weaken caller-side evaluation",
+    );
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());
@@ -14472,14 +14487,16 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
                 == Some("limitations")
         })
         .expect("missing Scala limitations procedure");
-    for (call_source, expected_capabilities) in [
+    for (call_source, expected_capabilities, deferred_weakens_call_evaluation) in [
         (
             "consume(delayed())",
             &[SemanticCapability::DeferredExecution][..],
+            false,
         ),
         (
             "consume { firstDeferred(); secondDeferred() }",
             &[SemanticCapability::DeferredExecution][..],
+            true,
         ),
         (
             "Future { spawned() }",
@@ -14487,6 +14504,7 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
                 SemanticCapability::DeferredExecution,
                 SemanticCapability::ConcurrentSpawn,
             ][..],
+            true,
         ),
     ] {
         let call = limitations
@@ -14509,15 +14527,25 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
             "each Scala source argument must remain one semantic actual for {call_source}"
         );
         for capability in expected_capabilities {
-            assert!(
-                limitations.gaps().iter().any(|gap| {
+            let gap = limitations
+                .gaps()
+                .iter()
+                .find(|gap| {
                     gap.point == call.point
                         && gap.subject == SemanticGapSubject::CallSite(call.id)
                         && gap.capability == *capability
                         && gap.kind == SemanticGapKind::Unknown
-                }),
-                "missing CallSite-scoped {capability:?} gap for {call_source}"
-            );
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing CallSite-scoped {capability:?} gap for {call_source}")
+                });
+            if *capability == SemanticCapability::DeferredExecution {
+                assert_eq!(
+                    gap.impacts.contains(SemanticGapImpact::CallEvaluation),
+                    deferred_weakens_call_evaluation,
+                    "DeferredExecution impact must reflect whether {call_source} withheld caller-side evaluation",
+                );
+            }
         }
     }
     assert!(limitations.call_sites().iter().any(|call| {
@@ -15012,6 +15040,98 @@ fn scala_constructor_direct_call_conformance() {
         caller_name: "root",
         call: "new ConstructedBox(7)",
     });
+}
+
+#[test]
+fn scala_bodyless_templates_evaluate_parent_arguments_and_surface_parent_call_gaps() {
+    const SOURCE: &str = r#"
+        package conformance
+
+        def classParentArgument(): Int = 1
+        def objectParentArgument(): Int = 2
+        class Base(value: Int)
+        class Derived extends Base(classParentArgument())
+        object Singleton extends Base(objectParentArgument())
+    "#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/BodylessParents.scala", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/BodylessParents.scala");
+
+    for (name, kind, declaration, argument_call) in [
+        (
+            "Derived",
+            ProcedureKind::Constructor,
+            "class Derived extends Base",
+            "classParentArgument()",
+        ),
+        (
+            "Singleton",
+            ProcedureKind::Initializer,
+            "object Singleton extends Base",
+            "objectParentArgument()",
+        ),
+    ] {
+        let entry_alias = format!("{name}_entry");
+        let call_alias = format!("{name}_parent_call");
+        let exit_alias = format!("{name}_exit");
+        graph
+            .bind(
+                entry_alias.clone(),
+                PointSelector::new(declaration)
+                    .procedure(name)
+                    .effect("entry"),
+            )
+            .bind(
+                call_alias.clone(),
+                PointSelector::new(argument_call)
+                    .procedure(name)
+                    .effect("invoke"),
+            )
+            .bind(
+                exit_alias.clone(),
+                PointSelector::new(declaration)
+                    .procedure(name)
+                    .effect("normal_exit"),
+            );
+        graph.assert_reachable(&entry_alias, &call_alias);
+        graph.assert_reachable(&call_alias, &exit_alias);
+
+        let procedure = procedure_named(&graph, name, kind);
+        exact_call_site(procedure, SOURCE, argument_call);
+        assert!(
+            procedure.gaps().iter().all(|gap| {
+                gap.capability != SemanticCapability::NormalControlFlow
+                    || gap.kind != SemanticGapKind::Unsupported
+            }),
+            "bodyless template {name} must not be lowered as an unsupported expression",
+        );
+
+        let parent_call_gap = procedure
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.point == procedure.entry_point()
+                    && gap.subject == SemanticGapSubject::Point
+                    && gap.capability == SemanticCapability::Calls
+                    && gap.kind == SemanticGapKind::Unsupported
+            })
+            .unwrap_or_else(|| panic!("missing parent-initialization call gap for {name}"));
+        for impact in [
+            SemanticGapImpact::ValueFlow,
+            SemanticGapImpact::ReturnTransfer,
+            SemanticGapImpact::CallEvaluation,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+            SemanticGapImpact::Aliasing,
+        ] {
+            assert!(
+                parent_call_gap.impacts.contains(impact),
+                "parent-initialization call gap for {name} must affect {impact:?}",
+            );
+        }
+    }
 }
 
 #[test]

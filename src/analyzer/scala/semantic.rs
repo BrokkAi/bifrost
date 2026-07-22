@@ -12,7 +12,7 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{ProjectFile, ScalaAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"scala-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"scala-cfg-v2";
 
 impl_program_semantics_provider!(ScalaAnalyzer, ScalaSemanticLowerer);
 
@@ -588,15 +588,39 @@ fn lower_procedure<'tree>(
             "Scala object, trait, or unconditional-given initialization is demand scheduled",
         )?;
     }
-    if spec.kind == ProcedureKind::Constructor && spec.properties.is_synthetic {
-        context.add_gap(
-            &mut builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unsupported,
-            "implicit superclass and mixin constructor invocations are not emitted as call sites",
-        )?;
+    let extends_clause = if spec.properties.is_synthetic {
+        spec.callable.child_by_field_name("extend")
+    } else {
+        None
+    };
+    let parent_arguments = extends_clause
+        .map(parent_argument_expressions)
+        .unwrap_or_default();
+    if spec.properties.is_synthetic
+        && (spec.kind == ProcedureKind::Constructor || extends_clause.is_some())
+    {
+        let detail =
+            "implicit superclass and mixin initialization calls are not emitted as call sites";
+        if extends_clause.is_some() {
+            context.session.add_gap_with_impacts(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapImpacts::CALL_EVALUATION,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        } else {
+            context.add_gap(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        }
         context.add_gap(
             &mut builder,
             entry,
@@ -628,14 +652,29 @@ fn lower_procedure<'tree>(
         )?;
         EdgeTarget::normal(implicit_return)
     };
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
-
-    let mut pending = vec![Work::Expression {
-        node: spec.body,
-        entry: body_entry,
-        next: body_next,
-        scope: function_scope,
-    }];
+    // `callable_shape` retains a bodyless template's declaration as its source
+    // anchor. Its structured parent-constructor arguments still execute before
+    // the template body, while the declaration itself is not an expression.
+    let bodyless_template = spec.properties.is_synthetic && spec.body.id() == spec.callable.id();
+    let mut pending = if bodyless_template {
+        context.edge(&mut builder, body_entry, body_next)?;
+        Vec::new()
+    } else {
+        vec![Work::Expression {
+            node: spec.body,
+            entry: body_entry,
+            next: body_next,
+            scope: function_scope,
+        }]
+    };
+    context.schedule_expressions(
+        &mut builder,
+        entry,
+        &parent_arguments,
+        EdgeTarget::normal(body_entry),
+        function_scope,
+        &mut pending,
+    )?;
     let mut drive_error = None;
     while let Some(initial) = pending.pop() {
         if let Err(error) =
@@ -1824,18 +1863,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         if !argument_nodes.is_empty() {
-            self.add_gap(
-                builder,
-                invoke,
-                SemanticGapSubject::CallSite(call_site),
-                SemanticCapability::DeferredExecution,
-                SemanticGapKind::Unknown,
-                if has_structured_argument {
-                    "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved"
-                } else {
-                    "argument evaluation strictness depends on the resolved Scala parameter signature"
-                },
-            )?;
+            let detail = if has_structured_argument {
+                "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved"
+            } else {
+                "argument evaluation strictness depends on the resolved Scala parameter signature"
+            };
+            if has_structured_argument {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+                    SemanticGapKind::Unknown,
+                    detail,
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapKind::Unknown,
+                    detail,
+                )?;
+            }
         }
         if is_future_like_call(self.source, callable) {
             self.add_gap(
@@ -2525,6 +2577,17 @@ fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
     named_children(node)
         .into_iter()
         .filter(|child| is_runtime_node(child.kind()))
+        .collect()
+}
+
+/// Return executable expressions from structured parent-constructor argument
+/// lists. Curried trailing lists are unfielded children of `extends_clause`,
+/// so collect every direct `arguments` child in source order.
+fn parent_argument_expressions(extends_clause: Node<'_>) -> Vec<Node<'_>> {
+    named_children(extends_clause)
+        .into_iter()
+        .filter(|child| child.kind() == "arguments")
+        .flat_map(runtime_expression_children)
         .collect()
 }
 

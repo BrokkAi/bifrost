@@ -654,8 +654,11 @@ fn merge_quality(current: SnapshotQuality, incoming: SnapshotQuality) -> Snapsho
     match (current, incoming) {
         (Cancelled, _) | (_, Cancelled) => Cancelled,
         (Truncated, _) | (_, Truncated) => Truncated,
-        (Unsupported(capability), _) => Unsupported(capability),
-        (_, Unsupported(capability)) => Unsupported(capability),
+        // The public outcome can carry only one unsupported capability. Use
+        // stable capability order so aggregation is independent of traversal
+        // and gap-emission order.
+        (Unsupported(left), Unsupported(right)) => Unsupported(left.min(right)),
+        (Unsupported(capability), _) | (_, Unsupported(capability)) => Unsupported(capability),
         (Unknown, _) | (_, Unknown) => Unknown,
         (Unproven, _) | (_, Unproven) => Unproven,
         (Ambiguous, _) | (_, Ambiguous) => Ambiguous,
@@ -1841,6 +1844,16 @@ mod tests {
     use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn unsupported_snapshot_quality_uses_stable_capability_order() {
+        let deferred = SnapshotQuality::Unsupported(SemanticCapability::DeferredExecution);
+        let cleanup = SnapshotQuality::Unsupported(SemanticCapability::CleanupControlFlow);
+
+        let expected = SnapshotQuality::Unsupported(SemanticCapability::CleanupControlFlow);
+        assert_eq!(merge_quality(deferred, cleanup), expected);
+        assert_eq!(merge_quality(cleanup, deferred), expected);
+    }
 
     #[test]
     fn cancelled_dispatch_precedes_a_failed_call_transfer_projection_charge() {

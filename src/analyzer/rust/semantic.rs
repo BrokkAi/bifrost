@@ -16,7 +16,7 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{ProjectFile, RustAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"rust-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"rust-cfg-v2";
 
 impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
 
@@ -2025,11 +2025,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "method dispatch may use a trait implementation after autoderef; receiver type and complete implementation coverage require type refinement",
             )?;
-            self.add_gap(
+            self.session.add_gap_with_impacts(
                 builder,
                 invoke,
                 SemanticGapSubject::Point,
                 SemanticCapability::Calls,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
                 SemanticGapKind::Unknown,
                 "method receiver autoderef and autoref adjustments may invoke Deref or DerefMut and are not emitted as call sites",
             )?;

@@ -907,7 +907,11 @@ impl SemanticGapImpacts {
         .with(SemanticGapImpact::HeapWrite);
     const RETURN_TRANSFER: Self = Self::VALUE.with(SemanticGapImpact::ReturnTransfer);
     const CONTROL_FLOW: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
-    const CALL_EVALUATION: Self = Self::CONTROL_FLOW.with(SemanticGapImpact::CallEvaluation);
+    /// Conservative downstream profile for an omitted call evaluation.
+    ///
+    /// A call that is absent from the IR may affect produced values, aliases,
+    /// heap reads and writes, return transfer, and caller-side evaluation.
+    pub const CALL_EVALUATION: Self = Self::CONTROL_FLOW.with(SemanticGapImpact::CallEvaluation);
 
     pub const fn single(impact: SemanticGapImpact) -> Self {
         Self(impact.bit())
@@ -954,9 +958,19 @@ impl SemanticGapImpacts {
             | SemanticCapability::StaticMemory
             | SemanticCapability::IndexMemory
             | SemanticCapability::Captures => Self::MEMORY,
-            SemanticCapability::Calls
-            | SemanticCapability::CallableReferences
-            | SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
+            // A call-site-scoped omission leaves call-dependent values and
+            // aliases open, but it does not by itself weaken retained target
+            // coverage or caller-side evaluation. Broader Calls gaps and
+            // callable/deferred producer gaps need adapter-authored impacts
+            // for any specific downstream consequence.
+            SemanticCapability::Calls => match subject {
+                SemanticGapSubject::CallSite(_) => Self::VALUE,
+                _ => Self::NONE,
+            },
+            SemanticCapability::CallableReferences | SemanticCapability::DeferredExecution => {
+                Self::NONE
+            }
+            SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
             SemanticCapability::DynamicDispatch => {
                 Self::single(SemanticGapImpact::DispatchCoverage)
             }
@@ -964,7 +978,6 @@ impl SemanticGapImpacts {
             | SemanticCapability::ExceptionalCallContinuation
             | SemanticCapability::AsyncSuspendResume
             | SemanticCapability::GeneratorSuspension
-            | SemanticCapability::DeferredExecution
             | SemanticCapability::ResourceManagement => Self::CALL_EVALUATION,
         };
         let subject_impacts = match subject {
@@ -4915,18 +4928,36 @@ mod tests {
             ),
             SemanticGapImpacts::CONTROL_FLOW,
         );
-        for capability in [
+        let call_impacts = SemanticGapImpacts::for_gap(
             SemanticCapability::Calls,
+            SemanticGapSubject::CallSite(CallSiteId::new(0)),
+        );
+        assert_eq!(call_impacts, SemanticGapImpacts::VALUE);
+        assert!(!call_impacts.contains(SemanticGapImpact::DispatchCoverage));
+        assert!(!call_impacts.contains(SemanticGapImpact::CallEvaluation));
+        assert_eq!(
+            SemanticGapImpacts::for_gap(SemanticCapability::Calls, SemanticGapSubject::Procedure,),
+            SemanticGapImpacts::NONE,
+        );
+        for capability in [
             SemanticCapability::CallableReferences,
-            SemanticCapability::ConcurrentSpawn,
+            SemanticCapability::DeferredExecution,
         ] {
             let impacts = SemanticGapImpacts::for_gap(
                 capability,
                 SemanticGapSubject::CallSite(CallSiteId::new(0)),
             );
-            assert_eq!(impacts, SemanticGapImpacts::CALL_EVALUATION);
+            assert_eq!(impacts, SemanticGapImpacts::NONE);
             assert!(!impacts.contains(SemanticGapImpact::DispatchCoverage));
+            assert!(!impacts.contains(SemanticGapImpact::CallEvaluation));
         }
+        assert_eq!(
+            SemanticGapImpacts::for_gap(
+                SemanticCapability::ConcurrentSpawn,
+                SemanticGapSubject::CallSite(CallSiteId::new(0)),
+            ),
+            SemanticGapImpacts::CALL_EVALUATION,
+        );
         let assignment =
             SemanticGapImpacts::for_gap(SemanticCapability::Assignments, SemanticGapSubject::Point);
         assert!(assignment.contains(SemanticGapImpact::ValueFlow));
@@ -5895,7 +5926,6 @@ mod tests {
                 SemanticGapImpact::ValueFlow,
             ),
             (SemanticCapability::Captures, SemanticGapImpact::ValueFlow),
-            (SemanticCapability::Calls, SemanticGapImpact::CallEvaluation),
             (
                 SemanticCapability::NormalCallContinuation,
                 SemanticGapImpact::CallEvaluation,

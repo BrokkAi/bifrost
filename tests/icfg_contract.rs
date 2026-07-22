@@ -954,13 +954,17 @@ fn go_defer_gap_downgrades_only_return_paths_that_cross_it() {
             &mut SemanticRequest::new(&mut budget, &cancellation),
         )
         .expect("Go defer ICFG snapshot");
-    assert!(matches!(
-        outcome,
-        SemanticOutcome::Unsupported {
-            capability: brokk_bifrost::analyzer::semantic::SemanticCapability::CleanupControlFlow,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &outcome,
+            SemanticOutcome::Unsupported {
+                capability:
+                    brokk_bifrost::analyzer::semantic::SemanticCapability::CleanupControlFlow,
+                ..
+            }
+        ),
+        "unexpected Go defer ICFG outcome: {outcome:#?}",
+    );
 }
 
 #[test]

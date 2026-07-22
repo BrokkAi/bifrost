@@ -1668,11 +1668,11 @@ impl IcfgGraph {
                 (false, false) => "unproven/partial",
             };
             panic!(
-                "expected {:?} edge from {source_alias:?} to {:?} to be {expected_label}, got {}/{}\n\n{}",
+                "expected {:?} edge from {source_alias:?} to {:?} to be {expected_label}, got {:#?}/{:#?}\n\n{}",
                 expected.kind,
                 expected.endpoint,
-                edge.proof.label(),
-                edge.completeness.label(),
+                edge.proof,
+                edge.completeness,
                 self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
             );
         }
