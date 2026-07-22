@@ -416,6 +416,25 @@ fn register_rust_macro(
     Some(code_unit)
 }
 
+/// Index the items written inside an item-position macro invocation
+/// (`cfg_rt! { pub mod coop; }`, `cfg_coop! { pub struct RestoreOnPending(...); ... }`)
+/// exactly as if the macro braces were absent.
+///
+/// tokio and similar crates wrap whole modules and free items in
+/// conditional-compilation macros defined in *another* file, so the invoked
+/// macro's `macro_rules!` definition is not visible here. Rather than relying
+/// on a name allowlist, we reparse the token-tree interior as Rust items and,
+/// when it genuinely parses as well-formed items (the robustness gate in
+/// `rust_reparsed_items_are_indexable`), run the ordinary declaration
+/// visitation over the result. Expression-position macros (`println!(...)`,
+/// `matches!(...)`) never reach here because they live inside function bodies,
+/// not at item position, and their token soup fails the parse gate anyway.
+///
+/// Range fidelity: the interior is reparsed inside a *padded* copy of the file
+/// where the entire prefix is replaced by spaces with newlines preserved, so
+/// every node's byte offset and line number matches the original file exactly.
+/// This lets the existing visitors (which derive ranges from node positions via
+/// `node_range`) run unchanged and still slice the correct source text.
 fn visit_rust_macro_invocation_definitions(
     file: &ProjectFile,
     source: &str,
@@ -428,12 +447,17 @@ fn visit_rust_macro_invocation_definitions(
     let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
         return;
     };
-    if !rust_latest_visible_rules_item_macro(
+    // Use the structured macro-rules knowledge we have. If this file defines the
+    // invoked macro and proves it does NOT replay its item input faithfully, the
+    // braces do not expand to the items inside, so indexing them would be a lie
+    // (`Some(false)` -> suppress). Otherwise -- proven faithful (`Some(true)`) or
+    // the definition lives in another file and is unknown here (`None`) -- admit
+    // the interior and let the parse gate below be the arbiter.
+    if rust_latest_visible_rules_item_macro(
         item_macro_definitions,
         invoked_macro,
         node.start_byte(),
-    )
-    .unwrap_or(false)
+    ) == Some(false)
     {
         return;
     }
@@ -441,65 +465,197 @@ fn visit_rust_macro_invocation_definitions(
     let Some(arguments) = rust_macro_invocation_arguments(node) else {
         return;
     };
-
-    let mut cursor = arguments.walk();
-    let mut window: [Option<Node<'_>>; 4] = [None, None, None, None];
-    for child in arguments.children(&mut cursor) {
-        if let Some((macro_rules, name_node, body_node)) = rust_embedded_macro_match(window, source)
-        {
-            let end_node = if child.kind() == ";" {
-                child
-            } else {
-                body_node
-            };
-            visit_rust_embedded_macro(
-                file,
-                source,
-                macro_rules,
-                name_node,
-                end_node,
-                parent,
-                package_name,
-                parsed,
-            );
-        }
-
-        window.rotate_left(1);
-        window[3] = Some(child);
+    let Some((interior_start, interior_end)) = rust_macro_token_tree_interior(arguments) else {
+        return;
+    };
+    let Some((padded, tree)) = rust_reparse_macro_items(source, interior_start, interior_end)
+    else {
+        return;
+    };
+    let root = tree.root_node();
+    if !rust_reparsed_items_are_indexable(root) {
+        return;
     }
 
-    if let Some((macro_rules, name_node, body_node)) = rust_embedded_macro_match(window, source) {
-        visit_rust_embedded_macro(
+    // First pass: bind imports declared inside the block so impls can resolve
+    // their owners, and expose re-exports (`pub use`) to import resolution --
+    // exactly as the top-level file walk does.
+    let mut interior_binder = ImportBinder::empty();
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if child.kind() == "use_declaration" {
+            let imports = rust_imports_from_use_declaration(child, &padded);
+            for import in &imports {
+                super::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
+            }
+            parsed
+                .import_statements
+                .extend(imports.iter().map(|import| import.raw_snippet.clone()));
+            parsed.imports.extend(imports);
+        }
+    }
+
+    // Second pass: index every item as if the macro braces were absent. Nested
+    // item-position macros (tokio nests `cfg_rt!` inside `cfg_coop!`) recurse
+    // through the `macro_invocation` arm of `visit_rust_macro_item`.
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        visit_rust_macro_item(
             file,
-            source,
-            macro_rules,
-            name_node,
-            body_node,
+            &padded,
+            child,
             parent,
             package_name,
+            item_macro_definitions,
+            &interior_binder,
             parsed,
         );
     }
 }
 
-fn rust_embedded_macro_match<'tree>(
-    window: [Option<Node<'tree>>; 4],
-    source: &str,
-) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>)> {
-    let [
-        Some(macro_rules),
-        Some(bang),
-        Some(name_node),
-        Some(body_node),
-    ] = window
-    else {
+/// Byte range `[start, end)` of a `token_tree`'s interior, excluding its
+/// delimiters. Returns `None` if the node is not a delimited token tree.
+fn rust_macro_token_tree_interior(token_tree: Node<'_>) -> Option<(usize, usize)> {
+    let open = token_tree.child(0)?;
+    let close = token_tree.child(token_tree.child_count().checked_sub(1)?)?;
+    if !matches!(open.kind(), "(" | "[" | "{") || !matches!(close.kind(), ")" | "]" | "}") {
         return None;
-    };
-    (rust_is_macro_rules_token(macro_rules, source)
-        && bang.kind() == "!"
-        && rust_is_identifier_like(name_node)
-        && body_node.kind() == "token_tree")
-        .then_some((macro_rules, name_node, body_node))
+    }
+    let start = open.end_byte();
+    let end = close.start_byte();
+    (start <= end).then_some((start, end))
+}
+
+/// Reparse the token-tree interior `[start, end)` as Rust items inside a padded
+/// copy of `source`. The prefix `[0, start)` is replaced byte-for-byte with
+/// spaces (newlines preserved) so that every node position in the reparse --
+/// byte offset and line number -- is identical to the original file.
+fn rust_reparse_macro_items(
+    source: &str,
+    interior_start: usize,
+    interior_end: usize,
+) -> Option<(String, Tree)> {
+    let bytes = source.as_bytes();
+    let prefix = bytes.get(..interior_start)?;
+    let interior = bytes.get(interior_start..interior_end)?;
+    let mut padded = Vec::with_capacity(interior_end);
+    padded.extend(
+        prefix
+            .iter()
+            .map(|&b| if b == b'\n' { b'\n' } else { b' ' }),
+    );
+    padded.extend_from_slice(interior);
+    // The prefix is now pure ASCII (spaces + newlines) and the interior is a
+    // char-boundary substring of valid UTF-8, so the result is valid UTF-8.
+    let padded = String::from_utf8(padded).ok()?;
+    let tree = super::lexical_scope::parse_rust_tree(&padded)?;
+    Some((padded, tree))
+}
+
+/// Robustness gate: the reparsed interior is only indexed when it consists
+/// entirely of well-formed Rust items (plus benign comments/attributes) with no
+/// ERROR or MISSING nodes anywhere. This rejects expression-macro arguments
+/// (`vec![1, 2, 3]`, `matches!(x, Some(_))`, `println!("struct Foo")`) whose
+/// interiors are not item streams, while admitting real item blocks -- including
+/// `thread_local! { static FOO: ...; }`, which correctly yields a static.
+fn rust_reparsed_items_are_indexable(root: Node<'_>) -> bool {
+    if root.has_error() {
+        return false;
+    }
+    let mut cursor = root.walk();
+    let mut saw_item = false;
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "line_comment" | "block_comment" | "attribute_item" | "inner_attribute_item" => {}
+            kind if rust_is_indexable_item_kind(kind) => saw_item = true,
+            _ => return false,
+        }
+    }
+    saw_item
+}
+
+fn rust_is_indexable_item_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "mod_item"
+            | "use_declaration"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "impl_item"
+            | "macro_definition"
+            | "macro_invocation"
+            | "extern_crate_declaration"
+    )
+}
+
+/// Dispatch a single reparsed item to the same visitor the top-level and module
+/// walks use. `use_declaration`s are bound by the caller's first pass; nested
+/// `macro_invocation`s recurse so arbitrarily nested item-position macros index.
+#[allow(clippy::too_many_arguments)]
+fn visit_rust_macro_item(
+    file: &ProjectFile,
+    source: &str,
+    child: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    item_macro_definitions: &[RustRulesItemMacroDefinition],
+    impl_binder: &ImportBinder,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    match child.kind() {
+        "use_declaration" => {}
+        "struct_item" | "enum_item" | "trait_item" => {
+            visit_rust_class_like(file, source, child, parent, package_name, parsed);
+        }
+        "mod_item" => {
+            visit_rust_module(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                item_macro_definitions,
+                parsed,
+            );
+        }
+        "function_item" => {
+            visit_rust_function(file, source, child, parent, package_name, parsed);
+        }
+        "const_item" | "static_item" => {
+            visit_rust_field(file, source, child, parent, package_name, parsed);
+        }
+        "type_item" => {
+            visit_rust_alias(file, source, child, parent, package_name, parsed);
+        }
+        "macro_definition" => {
+            visit_rust_macro(file, source, child, parent, package_name, parsed);
+        }
+        "impl_item" => {
+            visit_rust_impl(file, source, child, package_name, impl_binder, parsed);
+        }
+        "macro_invocation" => {
+            visit_rust_macro_invocation_definitions(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                item_macro_definitions,
+                parsed,
+            );
+        }
+        _ => {}
+    }
 }
 
 pub(super) fn rust_unqualified_macro_invocation_name<'a>(
@@ -520,10 +676,6 @@ pub(super) fn rust_macro_invocation_arguments(node: Node<'_>) -> Option<Node<'_>
         node.named_children(&mut cursor)
             .find(|child| child.kind() == "token_tree")
     })
-}
-
-fn rust_is_macro_rules_token(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "identifier" && rust_node_text(node, source).trim() == "macro_rules"
 }
 
 fn rust_is_identifier_like(node: Node<'_>) -> bool {
@@ -939,43 +1091,12 @@ fn rust_attribute_meta_pattern_is_safe(attribute: Node<'_>, source: &str) -> boo
     saw_meta
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_rust_embedded_macro(
-    file: &ProjectFile,
-    source: &str,
-    start_node: Node<'_>,
-    name_node: Node<'_>,
-    end_node: Node<'_>,
-    parent: Option<&CodeUnit>,
-    package_name: &str,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> Option<CodeUnit> {
-    let name = rust_node_text(name_node, source).trim();
-    if name.is_empty() {
-        return None;
-    }
-
-    register_rust_macro(
-        file,
-        name,
-        package_name,
-        parent,
-        rust_range_from_nodes(start_node, end_node),
-        format!("macro_rules! {name}"),
-        parsed,
-    )
-}
-
 fn rust_range_from_node(node: Node<'_>) -> Range {
-    rust_range_from_nodes(node, node)
-}
-
-fn rust_range_from_nodes(start_node: Node<'_>, end_node: Node<'_>) -> Range {
     Range {
-        start_byte: start_node.start_byte(),
-        end_byte: end_node.end_byte(),
-        start_line: start_node.start_position().row + 1,
-        end_line: end_node.end_position().row + 1,
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
     }
 }
 
