@@ -1,12 +1,21 @@
 use super::*;
+use std::sync::Arc;
+
 use crate::analyzer::Language;
+use crate::hash::HashSet;
+
+use super::super::capabilities::{SemanticCapabilities, SemanticCapability};
 
 use super::super::ids::{
-    AdapterSemanticsVersion, ConfigurationFingerprint, ContentIdentity, DeclarationLocator,
-    DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint, SemanticIrVersion,
-    SemanticLanguage, SourceAnchor, SourcePosition, SourceRevision, SourceSpan, WorkspaceMountId,
+    AdapterSemanticsVersion, AllocationId, BlockId, CallSiteId, CaptureId,
+    ConfigurationFingerprint, ContentIdentity, ControlEdgeId, DeclarationLocator,
+    DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint, EvidenceId,
+    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
+    SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole, SourceAnchor,
+    SourceMappingId, SourcePosition, SourceRevision, SourceSpan, ValueId, WorkspaceMountId,
     WorkspaceRelativePath,
 };
+use super::super::provider::{SemanticBudget, SemanticWork};
 
 fn key_with_language(language: SemanticLanguage) -> SemanticArtifactKey {
     SemanticArtifactKey::new(

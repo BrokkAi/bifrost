@@ -1,4 +1,13 @@
-use super::*;
+use crate::hash::{HashMap, HashSet};
+
+use super::super::capabilities::{CapabilitySupport, SemanticCapabilities, SemanticCapability};
+use super::super::ids::{
+    AllocationId, BlockId, CallSiteId, CaptureId, DeclarationSegmentKind, EvidenceId,
+    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
+    SemanticLocator, SemanticRole, SourceMappingId, ValueId,
+};
+use super::super::provider::SemanticWork;
+use super::model::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Boundaries {
