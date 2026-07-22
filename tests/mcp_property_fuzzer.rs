@@ -42,6 +42,7 @@ fn facts(
         identifier: identifier.to_string(),
         display_fq: fq_name.to_string(),
         kind,
+        language: brokk_bifrost::Language::Scala,
         file_index: 0,
         ranges,
         child_indexes,
