@@ -41,6 +41,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 21:50Z) Rejected run 29956839833 as an unusually fast provisional baseline after two exact-current-head replays produced the same broad slowdown signature. Promoted the complete run 29959610518 artifact instead: it has no regressions against either the immediately preceding current-head artifact or the earlier representative run 29955662059.
 - [x] (2026-07-22 22:15Z) Traced the remaining strict-run instability to `build_full_scala_usage_edges` deep-cloning the analyzer-cached full Scala graph on every warm dead-code request. Returned the cached `Arc` through the generic dead-code graph consumer instead; two fresh-process pinned `scala-xml` runs measured stable 737.4 ms and 743.3 ms medians instead of alternating between roughly 1.8 s and 2.4 s.
 - [x] (2026-07-22 22:50Z) Traced the `serde-json-rs get_definition` bimodality to delayed file-watcher events forcing `update_all` and rebuilding Rust's reference context between measured samples. Benchmark MCP children now use the existing manual-update model for their immutable pinned checkouts while production MCP sessions continue to watch by default; the real-child profile test and a full local serde target run prove no watcher work enters timed samples.
+- [x] (2026-07-22 22:56Z) Refetched and rebased the complete branch without conflict onto origin/master `88a8d2a9`, including the new concurrent read-only store implementation. The focused 39 benchmark tests, 11 MCP/watcher unit tests, formatting, all-target/all-feature Clippy, and an exact-identity serde profile pass on the rebased head; the ten definition samples remain tightly grouped at 24.4-25.0 ms.
 
 ## Surprises & Discoveries
 
@@ -87,7 +88,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Evidence: Actions runs 29958615453, 29959610518, and 29960771358; `full_usage_edge_builder_returns_the_cached_graph_handle`; local reports `run-20260722T221324Z.json` and `run-20260722T221427Z.json`.
 
 - Observation: `serde-json-rs get_definition` was bimodal because the benchmark's live file watcher occasionally observed four delayed paths and requested a full refresh during a measured iteration. That discarded Rust's cached reference context and changed an otherwise 23-57 ms warm request into a 395-1,012 ms rebuild. The pinned checkout itself is immutable for the run, so this work is benchmark contamination rather than the product behavior being measured.
-  Evidence: Actions runs 29962572037 and 29960771358; local pre-fix profile `/private/tmp/bifrost-serde-definition.6Wku1i`; post-fix profile `/private/tmp/bifrost-serde-manual.yFU2v5`, whose ten measured definition requests stayed between 24.5 and 25.7 ms and contain no `SearchToolsService::apply_watcher_delta` scope.
+  Evidence: Actions runs 29962572037 and 29960771358; local pre-fix profile `/private/tmp/bifrost-serde-definition.6Wku1i`; post-fix profiles `/private/tmp/bifrost-serde-manual.yFU2v5` and `/private/tmp/bifrost-serde-rebased.zsIu6p`, whose measured definition requests stay within 1.2 ms and contain no `SearchToolsService::apply_watcher_delta` scope.
 
 - Observation: `scoped_fact_nodes` cannot be counted on a scan-only path without materializing files that exact source anchors excluded. The profile now reports zero when that total is unavailable and separately records `admitted_fact_nodes`, the compatibility-budget denominator available on both scan and indexed paths.
   Evidence: the Dapper scan admitted 49,181 facts after source filtering while the complete indexed scope contained 85,325 facts.
@@ -791,6 +792,23 @@ Post-baseline watcher isolation validation (dirty implementation tree, Apple arm
     # all seven target scenarios pass; get_definition median = 25.0 ms; ten samples = 24.5-25.7 ms
     # only warmup 1 builds RustAnalyzer::build_reference_context; no profile contains SearchToolsService::apply_watcher_delta or a full refresh
     report = /private/tmp/bifrost-serde-manual.yFU2v5/run-20260722T224815Z.json
+
+Rebased-head watcher isolation validation:
+
+    origin/master = 88a8d2a9a0250dd886102e7237e37fb3715e1db9
+    rebased head = 8cf90415511d79344876907fd829d968355d0a2f
+    cargo fmt --check
+    git diff --check
+    # pass
+    scripts/with-isolated-cargo-target.sh /Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy --all-targets --all-features -- -D warnings
+    # pass; isolated target removed automatically
+    cargo test --test benchmark_compare --test benchmark_manifest --test benchmark_workflow_policy --test bifrost_benchmark_cli --test bifrost_benchmark_run
+    # 14 + 10 + 2 + 3 + 10 pass
+    cargo test --lib mcp_common::tests
+    cargo test --lib searchtools_service::watcher_startup_tests
+    # 4 + 7 pass
+    report = /private/tmp/bifrost-serde-rebased.zsIu6p/run-20260722T225554Z.json
+    # exact binary/head identity; all seven serde scenarios pass; ten definition samples = 24.4-25.0 ms; no watcher/full-refresh profile scope
 
 Invalid local timing artifacts that must not be cited:
 
