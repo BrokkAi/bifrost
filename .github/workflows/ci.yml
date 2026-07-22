@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  licenses:
-    name: dependency licenses
+  repository-policy:
+    name: repository policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -20,6 +20,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.96.0
+          components: rustfmt
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -31,6 +32,9 @@ jobs:
           cargo install --locked cargo-about --version 0.9.1 --features cli
           cargo install --locked cargo-deny --version 0.20.2
 
+      - name: Check formatting
+        run: cargo fmt --check
+
       - name: Check all-feature license policy
         run: cargo deny --config licenses/deny.toml --locked check licenses
 
@@ -40,67 +44,11 @@ jobs:
           node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
           cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
 
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.96.0
-          components: rustfmt
-
-      - name: cargo fmt --check
-        run: cargo fmt --check
-
-  crate-package:
-    name: crate package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.96.0
-
-      - name: Build publishable crate
-        run: cargo package --locked
-
-      - name: Enforce compressed crate size budget
-        shell: bash
-        env:
-          MAX_CRATE_BYTES: '10000000'
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          archives=(target/package/brokk-bifrost-*.crate)
-          if (( ${#archives[@]} != 1 )); then
-            echo "Expected one packaged crate, found ${#archives[@]}" >&2
-            exit 1
-          fi
-          actual_bytes=$(wc -c < "${archives[0]}")
-          echo "Packaged crate: ${actual_bytes} bytes (budget: ${MAX_CRATE_BYTES})"
-          if (( actual_bytes > MAX_CRATE_BYTES )); then
-            echo "Packaged crate exceeds the temporary vendoring size budget" >&2
-            exit 1
-          fi
-
-  release-scripts:
-    name: release scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-
       - name: Test release scripts
         run: node --test scripts/check-release-version.test.mjs
+
+      - name: Check publishable crate
+        run: scripts/check-crate-package.sh
 
   # This cross-platform launcher smoke is integration-like. Run it after master
   # updates; release packaging repeats the focused launcher tests before upload.
