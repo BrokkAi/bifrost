@@ -326,8 +326,8 @@ pub(super) fn resolve_cpp(
     };
     match reference {
         Some(CppReferenceNode::Type(_)) => unreachable!("type references returned above"),
-        Some(CppReferenceNode::Constructor(constructor)) => {
-            resolve_cpp_constructor(ctx, constructor)
+        Some(CppReferenceNode::Construction(construction)) => {
+            resolve_cpp_construction_type(ctx, construction)
         }
         Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, call),
         Some(CppReferenceNode::Field(field)) => resolve_cpp_field(ctx, field, None, None),
@@ -444,7 +444,7 @@ pub(super) fn parse_cpp_tree(source: &str) -> Option<Tree> {
 #[derive(Clone, Copy)]
 enum CppReferenceNode<'tree> {
     Type(Node<'tree>),
-    Constructor(Node<'tree>),
+    Construction(Node<'tree>),
     Call(Node<'tree>),
     Field(Node<'tree>),
     Identifier(Node<'tree>),
@@ -537,7 +537,7 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
 
     match current.kind() {
         "new_expression" | "compound_literal_expression" => {
-            Some(CppReferenceNode::Constructor(current))
+            Some(CppReferenceNode::Construction(current))
         }
         "call_expression" => Some(CppReferenceNode::Call(current)),
         "field_expression" => Some(CppReferenceNode::Field(current)),
@@ -1313,15 +1313,16 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             resolve_cpp_field(ctx, function, call_arity, call_arg_types.as_deref())
         }
         "type_identifier" | "template_type" | "scoped_type_identifier" => {
-            resolve_cpp_constructor(ctx, call)
+            resolve_cpp_construction_type(ctx, call)
         }
         "qualified_identifier" => {
             let text = cpp_callable_reference_text(function, ctx.source);
-            let constructor = resolve_cpp_constructor(ctx, call);
-            let constructor_boundary =
-                constructor.status == DefinitionLookupStatus::UnresolvableImportBoundary;
-            if constructor.status != DefinitionLookupStatus::NoDefinition && !constructor_boundary {
-                return constructor;
+            let construction = resolve_cpp_construction_type(ctx, call);
+            let construction_boundary =
+                construction.status == DefinitionLookupStatus::UnresolvableImportBoundary;
+            if construction.status != DefinitionLookupStatus::NoDefinition && !construction_boundary
+            {
+                return construction;
             }
             let mut candidates = cpp_visible_name_candidates(
                 ctx.analyzer,
@@ -1388,8 +1389,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     }
                 }
             }
-            if constructor_boundary {
-                return constructor;
+            if construction_boundary {
+                return construction;
             }
             if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, &text) {
                 return boundary(format!(
@@ -1529,29 +1530,6 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         ctx.support,
                         unit,
                     );
-                    for owner in &owners {
-                        let constructors =
-                            cpp_prefer_declaration_candidates(cpp_member_candidates_lazy(
-                                ctx,
-                                vec![owner.clone()],
-                                owner.identifier(),
-                                call_arity,
-                                || {
-                                    cpp_call_argument_types(
-                                        ctx.analyzer,
-                                        ctx.support,
-                                        ctx.visibility,
-                                        ctx.file,
-                                        ctx.source,
-                                        ctx.root,
-                                        call,
-                                    )
-                                },
-                            ));
-                        if !constructors.is_empty() {
-                            return cpp_callable_candidates_outcome(constructors);
-                        }
-                    }
                     return candidates_outcome(owners);
                 }
                 CppBareCallTargetResolution::CallableShadow => {
@@ -1696,11 +1674,11 @@ fn cpp_callable_reference_text(node: Node<'_>, source: &str) -> String {
     cpp_node_text(name, source).to_string()
 }
 
-fn resolve_cpp_constructor(
+fn resolve_cpp_construction_type(
     ctx: CppLookupCtx<'_, '_>,
-    constructor: Node<'_>,
+    construction: Node<'_>,
 ) -> DefinitionLookupOutcome {
-    let Some(type_node) = cpp_constructor_type_node(constructor) else {
+    let Some(type_node) = cpp_constructor_type_node(construction) else {
         return no_definition("no_reference_text", "C++ constructor call has no type");
     };
     let text = normalize_cpp_type_text(cpp_node_text(type_node, ctx.source));
@@ -1737,38 +1715,12 @@ fn resolve_cpp_constructor(
     sort_units(&mut owners);
     owners.dedup();
 
-    for owner in &owners {
-        let constructors = cpp_member_candidates_lazy(
-            ctx,
-            vec![owner.clone()],
-            owner.identifier(),
-            ctx.visibility
-                .call_arity_evidence(ctx.file, constructor, ctx.source)
-                .exact(),
-            || {
-                cpp_call_argument_types(
-                    ctx.analyzer,
-                    ctx.support,
-                    ctx.visibility,
-                    ctx.file,
-                    ctx.source,
-                    ctx.root,
-                    constructor,
-                )
-            },
-        );
-        let constructors = cpp_prefer_declaration_candidates(constructors);
-        if !constructors.is_empty() {
-            return candidates_outcome(constructors);
-        }
-    }
-
+    // C++ constructors do not have names. The focused token in `Service(args)`,
+    // `Service{args}`, or `new Service(args)` names the constructed type, so
+    // ordinary navigation belongs to that type. Constructor-call attribution
+    // remains a separate usage-graph concern.
     if !owners.is_empty() {
         return candidates_outcome(owners);
-    }
-    let text = normalize_cpp_type_text(cpp_node_text(type_node, ctx.source));
-    if text.is_empty() {
-        return no_definition("no_reference_text", "C++ type reference is blank");
     }
     resolve_cpp_type_without_focused_qualifier(
         ctx.analyzer,
@@ -1779,23 +1731,6 @@ fn resolve_cpp_constructor(
         type_node,
         &text,
     )
-}
-
-fn cpp_prefer_declaration_candidates(candidates: Vec<CodeUnit>) -> Vec<CodeUnit> {
-    let preferred: Vec<_> = candidates
-        .iter()
-        .filter(|unit| cpp_source_is_header(unit))
-        .cloned()
-        .collect();
-    if preferred.is_empty() {
-        candidates
-    } else {
-        preferred
-    }
-}
-
-fn cpp_source_is_header(unit: &CodeUnit) -> bool {
-    cpp_source_path_is_header(unit.source())
 }
 
 fn cpp_source_path_is_header(source: &ProjectFile) -> bool {

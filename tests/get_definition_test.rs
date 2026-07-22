@@ -18417,23 +18417,23 @@ template <typename T> using selected = choice<T, Shared>;
 }
 
 #[test]
-fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
+fn cpp_constructor_call_resolves_to_constructed_type_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
-            "service.h",
-            "namespace example { class Repository {}; class Service { public: explicit Service(Repository& repository); }; }\n",
+            "include/service.h",
+            "#pragma once\nnamespace example {\nclass Repository {};\nclass Service {\npublic:\n    explicit Service(Repository& repository);\n};\n}\n",
         )
         .file(
-            "service.cpp",
-            "#include \"service.h\"\nnamespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }\n",
+            "src/service.cpp",
+            "#include \"service.h\"\nnamespace example {\nService::Service(Repository& repository) {}\nService build_service(Repository& repository) {\n    return Service(repository);\n}\n}\n",
         )
         .build();
 
-    let line = "namespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }";
-    let value = lookup_declaration_with_definition_key(
+    let line = "    return Service(repository);";
+    let value = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"service.cpp","line":2,"column":{}}}]}}"#,
+            r#"{{"references":[{{"path":"src/service.cpp","line":5,"column":{}}}]}}"#,
             column_of(line, "Service(repository)")
         ),
     );
@@ -18441,14 +18441,20 @@ fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "example.Service.Service",
+        result["definitions"][0]["fqn"], "example.Service",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "service.h", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "include/service.h",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
+    assert_eq!(result["definitions"][0]["start_column"], 7, "{value}");
+    assert_eq!(result["definitions"][0]["end_column"], 14, "{value}");
 }
 
 #[test]
-fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
+fn cpp_braced_constructor_call_resolves_to_constructed_type_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
             "target.h",
@@ -18461,7 +18467,7 @@ fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
         .build();
 
     let line = "namespace ns { Target make() { return Target{1}; } }";
-    let value = lookup_declaration_with_definition_key(
+    let value = lookup(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -18471,11 +18477,7 @@ fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "ns.Target.Target",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["signature"], "(int)", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Target", "{value}");
     assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
 }
 
@@ -21046,10 +21048,7 @@ void construct() { widget(); }
     assert_eq!(results[2]["status"], "no_declaration", "{value}");
     assert_eq!(results[3]["status"], "no_declaration", "{value}");
     assert_eq!(results[4]["status"], "resolved", "{value}");
-    assert_eq!(
-        results[4]["definitions"][0]["fqn"], "widget.widget",
-        "{value}"
-    );
+    assert_eq!(results[4]["definitions"][0]["fqn"], "widget", "{value}");
 
     let definition_references = [starts[0], starts[1], starts[4]]
         .into_iter()
@@ -21059,12 +21058,20 @@ void construct() { widget(); }
         project.root(),
         &json!({"references": definition_references}).to_string(),
     );
-    for result in definition_value["results"]
+    let definition_results = definition_value["results"]
         .as_array()
-        .expect("definition results")
-    {
+        .expect("definition results");
+    for result in &definition_results[..2] {
         assert_eq!(result["status"], "no_definition", "{definition_value}");
     }
+    assert_eq!(
+        definition_results[2]["status"], "resolved",
+        "{definition_value}"
+    );
+    assert_eq!(
+        definition_results[2]["definitions"][0]["fqn"], "widget",
+        "{definition_value}"
+    );
 }
 
 #[test]
