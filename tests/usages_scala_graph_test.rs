@@ -9172,10 +9172,13 @@ trait Schedule { type State; type Future }
 abstract class Internal extends Schedule
 trait PollingMetric { type In }
 trait Metric { trait UnsafeAPI }
+trait MetricWithInput { trait UnsafeAPI { type In } }
+trait AliasScope
 trait LeftState { type State }
 trait RightState { type State }
 trait InnerState { type State }
 class Inner { class State }
+class UnsafeAPI { type In }
 
 object Uses {
   val schedule = new Internal {
@@ -9211,6 +9214,39 @@ object Uses {
     val metric = new Metric {
       val unsafe = new UnsafeAPI {
         def update(in: In): Unit = () // positive-nested-refinement
+      }
+    }
+  }
+
+  val nestedInput = new PollingMetric {
+    type In = String
+    val metric = new MetricWithInput {
+      val unsafe = new UnsafeAPI {
+        override type In = Boolean
+        val current: In = true // positive-nearest-nested-constructor
+      }
+    }
+
+    val anonymousAliasScope = new AliasScope {
+      type UnsafeAPI = refinement.UnsafeAPI
+      val blocked = new UnsafeAPI {
+        override type In = Boolean
+        val current: In = true // negative-anonymous-constructor-alias
+      }
+    }
+
+    def aliasBarrier(): Unit = {
+      type UnsafeAPI = refinement.UnsafeAPI
+      val blocked = new UnsafeAPI {
+        override type In = Boolean
+        val current: In = true // negative-local-constructor-alias
+      }
+    }
+
+    def parameterBarrier[UnsafeAPI](): Unit = {
+      val blocked = new UnsafeAPI {
+        type In = Boolean
+        val current: In = true // negative-local-constructor-parameter
       }
     }
   }
@@ -9337,6 +9373,31 @@ object Uses {
             .result,
     );
     assert_hit_count_by_snippet(&input_hits, "positive-nested-refinement", 1);
+    for marker in [
+        "positive-nearest-nested-constructor",
+        "negative-local-constructor-alias",
+        "negative-local-constructor-parameter",
+        "negative-anonymous-constructor-alias",
+    ] {
+        assert_no_hit_contains(&input_hits, marker);
+    }
+
+    let nested_input = definition(&analyzer, "refinement.MetricWithInput.UnsafeAPI.In");
+    let nested_input_hits = authoritative_scala_hits(&analyzer, &nested_input);
+    assert_hit_count_by_snippet(&nested_input_hits, "positive-nearest-nested-constructor", 1);
+    assert_no_hit_contains(&nested_input_hits, "negative-local-constructor");
+    assert_no_hit_contains(&nested_input_hits, "negative-anonymous-constructor-alias");
+    let constructor_decoy = definition(&analyzer, "refinement.UnsafeAPI.In");
+    let constructor_decoy_hits = authoritative_scala_hits(&analyzer, &constructor_decoy);
+    assert_no_hit_contains(
+        &constructor_decoy_hits,
+        "positive-nearest-nested-constructor",
+    );
+    assert_no_hit_contains(&constructor_decoy_hits, "negative-local-constructor");
+    assert_no_hit_contains(
+        &constructor_decoy_hits,
+        "negative-anonymous-constructor-alias",
+    );
 
     let decoy_state = definition(&analyzer, "decoy.State");
     let decoy_state_hits = authoritative_scala_hits(&analyzer, &decoy_state);
@@ -9381,6 +9442,10 @@ object Uses {
         "negative-refinement-type-parameter",
         "negative-mixin-ambiguity",
         "negative-duplicate-physical-base",
+        "positive-nearest-nested-constructor",
+        "negative-local-constructor-alias",
+        "negative-local-constructor-parameter",
+        "negative-anonymous-constructor-alias",
     ] {
         assert!(
             !rendered.contains(marker),

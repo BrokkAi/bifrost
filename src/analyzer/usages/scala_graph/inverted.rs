@@ -6616,46 +6616,64 @@ impl ScalaScan<'_, '_> {
     /// Resolve an anonymous base which may itself be a nested type inherited
     /// from a surrounding anonymous base (for example `Metric.UnsafeAPI`).
     fn constructed_type_declaration_for_boundary(&self, instance: Node<'_>) -> Option<CodeUnit> {
-        if let Some(owner) = constructed_type_declaration(instance, self) {
-            return Some(owner);
-        }
-        let type_node = constructed_type_node(instance)?;
-        let path = scala_type_lookup_segments(type_node, self.source);
-        let [name] = path.as_slice() else {
-            return None;
-        };
-
+        let mut templates = Vec::new();
         let mut current = instance.parent();
         while let Some(node) = current {
             if node.kind() == "template_body" {
-                let enclosing_owner =
-                    if let Some(outer_instance) = scala_anonymous_instance_for_template(node) {
-                        constructed_type_declaration(outer_instance, self)?
-                    } else if let Some(named_owner) = scala_named_template_owner(node) {
-                        self.class_ranges
-                            .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
-                            .cloned()?
-                    } else {
-                        current = node.parent();
-                        continue;
-                    };
-                match self.types.exact_lexical_type_namespace(
-                    self.scala,
-                    std::iter::once(enclosing_owner),
-                    name,
-                    false,
-                ) {
-                    ScalaTypeNamespaceResolution::Resolved(target) => {
-                        return exact_constructed_type_target(type_node, target, name, self);
-                    }
-                    ScalaTypeNamespaceResolution::NoMatch => {}
-                    ScalaTypeNamespaceResolution::AuthoritativeMiss
-                    | ScalaTypeNamespaceResolution::Ambiguous => return None,
-                }
+                templates.push(node);
             }
             current = node.parent();
         }
-        None
+        templates.reverse();
+
+        let mut exact_owners = Vec::new();
+        for template in templates {
+            if let Some(outer_instance) = scala_anonymous_instance_for_template(template) {
+                let owner = self
+                    .constructed_type_declaration_against_owners(outer_instance, &exact_owners)?;
+                exact_owners.push(owner);
+            } else if let Some(named_owner) = scala_named_template_owner(template) {
+                let owner = self
+                    .class_ranges
+                    .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
+                    .cloned()?;
+                exact_owners.push(owner);
+            }
+        }
+        self.constructed_type_declaration_against_owners(instance, &exact_owners)
+    }
+
+    fn constructed_type_declaration_against_owners(
+        &self,
+        instance: Node<'_>,
+        exact_owners_outer_first: &[CodeUnit],
+    ) -> Option<CodeUnit> {
+        let type_node = constructed_type_node(instance)?;
+        let path = scala_type_lookup_segments(type_node, self.source);
+        let [name] = path.as_slice() else {
+            return constructed_type_declaration(instance, self);
+        };
+        let local_binding = scala_nearest_unindexed_type_binding(self.source, type_node, name);
+        if local_binding.is_some() {
+            return None;
+        }
+
+        for owner in exact_owners_outer_first.iter().rev() {
+            match self.types.exact_lexical_type_namespace(
+                self.scala,
+                std::iter::once(owner.clone()),
+                name,
+                false,
+            ) {
+                ScalaTypeNamespaceResolution::Resolved(target) => {
+                    return exact_constructed_type_target(type_node, target, name, self);
+                }
+                ScalaTypeNamespaceResolution::NoMatch => {}
+                ScalaTypeNamespaceResolution::AuthoritativeMiss
+                | ScalaTypeNamespaceResolution::Ambiguous => return None,
+            }
+        }
+        constructed_type_declaration(instance, self)
     }
 
     fn visible_type(&self, node: Node<'_>, name: &str) -> Option<String> {

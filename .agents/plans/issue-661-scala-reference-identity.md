@@ -15,6 +15,8 @@ After this change, the public Scala symbols usage tools will find three kinds of
 - [x] (2026-07-22 13:53Z) After all review fixes, ran formatting and `cargo test --features nlp,python --test usages_scala_graph_test`; all 144 tests passed.
 - [x] (2026-07-22 13:54Z) Ran `cargo clippy --all-targets --all-features -- -D warnings`; it completed without warnings.
 - [x] (2026-07-22 13:57Z) Completed independent review and limited the final commit scope to this plan, the two Scala graph implementation files, and the behavior test file.
+- [x] (2026-07-22 14:18Z) Fixed the post-commit review finding for nested-constructor precedence with iterative outer-to-inner exact owner resolution; focused and all 144 Scala graph tests pass, and clippy is clean.
+- [x] (2026-07-22 14:23Z) Rebuilt the follow-up release candidate and replayed all thirteen production rows with ephemeral caches; all were `consistent` with inverse hits and zero missing rows.
 
 ## Surprises & Discoveries
 
@@ -32,6 +34,9 @@ After this change, the public Scala symbols usage tools will find three kinds of
 
 - Observation: An intervening anonymous base can itself be an inherited nested type whose ordinary lexical constructor lookup has no owner context.
   Evidence: ZIO's `new UnsafeAPI` is inherited from the surrounding anonymous `Metric`; resolving the nearest exact surrounding template namespace first recovers `Metric.UnsafeAPI`, after which ordinary constructor validation retains the same exact `CodeUnit`.
+
+- Observation: Trying ordinary import/package constructor resolution before enclosing exact namespaces lets an unrelated source-backed decoy steal an inherited nested constructor name.
+  Evidence: With both a top-level `UnsafeAPI` and `MetricWithInput.UnsafeAPI`, the constructor inside the anonymous metric must select the latter. Parser-proven method aliases, method type parameters, and anonymous aliases must instead stop resolution before either tier.
 
 ## Decision Log
 
@@ -51,11 +56,15 @@ After this change, the public Scala symbols usage tools will find three kinds of
   Rationale: A nearer anonymous inherited member or named direct/inherited member owns the unqualified type name. Named local templates without an indexed exact span fail closed because their member identity cannot be proven.
   Date/Author: 2026-07-22 / Codex
 
+- Decision: Build enclosing template owners iteratively from outermost to innermost, then resolve each one-segment anonymous constructor nearest-owner-first before consulting imports or packages.
+  Rationale: Deeper nested constructors depend on exact owners established farther out, while lexical owner order and local parser-proven barriers must beat same-name global declarations. The iterative construction remains stack-safe for deeply nested templates.
+  Date/Author: 2026-07-22 / Codex
+
 ## Outcomes & Retrospective
 
 The inverse scanner now preserves exact identity for anonymous refined type members, unqualified type-alias construction, and same-source JVM/native companion constants. The focused behavior matrix covers direct, inherited, outward-nested, before-declaration, renamed-import, physical-duplicate, mixin, local-shadow, and third-file ambiguity cases through both `UsageFinder` and `scan_usages_by_reference`.
 
-The final feature-enabled Scala graph integration target passed all 144 tests, and clippy passed with all targets, all features, and warnings denied. All thirteen production witnesses completed as `consistent` with a non-null inverse hit and zero missing/actionable rows. The final ephemeral report is `/tmp/issue-661-exact-final2-19c92da5.jsonl`, with SHA-256 `f05a63500e3b6393106b26923977e0da94a06f23c6b858f6a8c64df2823a453e`.
+The post-follow-up feature-enabled Scala graph integration target passed all 144 tests, and clippy passed with all targets, all features, and warnings denied. All thirteen production witnesses completed as `consistent` with a non-null inverse hit and zero missing/actionable rows. The superseding follow-up report is `/tmp/issue-661-exact-followup-6a4fc429.jsonl`, with SHA-256 `5816da9681c8de20398a549da51d34b15c8db1ca57be271138e83f22421c168e`.
 
 ## Context and Orientation
 
