@@ -6,7 +6,7 @@ use crate::analyzer::{
     ParameterMetadata, Range, SignatureMetadata,
 };
 use regex::Regex;
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Clone)]
 pub(super) struct ScopeInfo {
@@ -1082,6 +1082,14 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
+        // A file-scope object-like macro sentinel the parser cannot see (issue
+        // #941, e.g. `BEGIN_NS`/`END_NS`) makes tree-sitter recover the region it
+        // prefixes as a bogus `function_definition` that swallows real namespaces,
+        // classes, and members. Reparse the swallowed interior as C++ items so the
+        // ordinary declaration visitors index it with byte/line-exact ownership.
+        if self.visit_sentinel_macro_region(node, scope) {
+            return;
+        }
         if let Some((class_node, name)) =
             recover_exported_class_function_definition(node, self.source)
         {
@@ -1146,6 +1154,37 @@ impl<'a> CppVisitor<'a> {
             node: body,
             scope: scope.clone(),
         }));
+    }
+
+    /// Recover the declarations swallowed by a bare begin/end macro-sentinel pair
+    /// (issue #941). When `node` is the bogus `function_definition` tree-sitter
+    /// emits for a sentinel-prefixed region, reparse the interior after the
+    /// sentinel identifier as real C++ items -- in a padded copy of the file so
+    /// every reparsed node keeps its original byte/line position -- and run the
+    /// ordinary container visitation over the result. Returns `true` when it fired
+    /// (the caller must then skip normal function processing). Nested sentinel
+    /// regions recover recursively: the reparsed interior is walked through the
+    /// same `visit_function_definition` path, so a sentinel inside the region hits
+    /// this recovery again.
+    fn visit_sentinel_macro_region(&mut self, node: Node<'_>, scope: &ScopeInfo) -> bool {
+        let Some((start, end)) = cpp_sentinel_macro_region(node, self.source) else {
+            return false;
+        };
+        let Some((_padded, tree)) = cpp_reparse_region_items(self.source, start, end) else {
+            return false;
+        };
+        let root = tree.root_node();
+        if !cpp_reparsed_items_are_indexable(root, self.source) {
+            return false;
+        }
+        self.visit_container(
+            root,
+            &scope.package_name,
+            scope.module.clone(),
+            scope.class_unit.clone(),
+            scope.template_signature.clone(),
+        );
+        true
     }
 
     fn visit_declaration<'tree>(
@@ -3229,6 +3268,164 @@ fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(cpp_contains_namespace_definition)
+}
+
+/// Detect the bogus `function_definition` that tree-sitter recovers for a region
+/// prefixed by an object-like macro sentinel the parser cannot see (issue #941),
+/// and return the byte range `[start, end)` of the swallowed interior to reparse.
+///
+/// The measured shape (`BEGIN_NS\nnamespace X { struct A { void m(); }; }`) is a
+/// `function_definition` whose first named child is the sentinel mis-read as the
+/// return `type` (a bare all-caps `type_identifier`), followed by the mis-lexed
+/// item keyword, an `ERROR`, and a `compound_statement` holding the real items.
+/// `start` is the end of the sentinel identifier -- everything after it is the
+/// genuine source. `end` is the node's end, extended across any trailing empty
+/// `;` statement the mis-parse displaced past the node (the class/struct closing
+/// semicolon), so the reparse sees a complete, brace-balanced item.
+///
+/// False-positive guard: the candidate must itself carry an `ERROR`/`MISSING`
+/// node (`has_error`). A well-formed function definition never does -- not even
+/// one whose return type is an all-caps typedef like `DWORD foo() { ... }` -- so
+/// real callables are never reparsed as items. The clean-reparse-to-items gate in
+/// `cpp_reparsed_items_are_indexable` is the final arbiter.
+fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usize)> {
+    if node.kind() != "function_definition" || !node.has_error() {
+        return None;
+    }
+    let first = node.named_child(0)?;
+    if first.kind() != "type_identifier" {
+        return None;
+    }
+    let sentinel = normalize_cpp_whitespace(node_text(first, source));
+    if sentinel.is_empty() || !cpp_export_macro_token(&sentinel) {
+        return None;
+    }
+    // Consecutive begin/end sentinels stack: `END_NS BEGIN_NS namespace two {...}`
+    // makes the trailing sentinel of one region and the leading sentinel of the
+    // next both land as bare macro-token identifiers ahead of the real content.
+    // Advance past every leading macro-token identifier so the reparse begins at
+    // genuine source rather than another sentinel that would re-form the bogus
+    // shape and fail the reparse gate.
+    let mut start = first.end_byte();
+    let mut index = 1;
+    while let Some(child) = node.named_child(index) {
+        if matches!(child.kind(), "identifier" | "type_identifier")
+            && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(child, source)))
+        {
+            start = child.end_byte();
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = node.end_byte();
+    let mut sibling = node.next_named_sibling();
+    while let Some(current) = sibling {
+        if !cpp_is_stray_semicolon(current, source) {
+            break;
+        }
+        end = current.end_byte();
+        sibling = current.next_named_sibling();
+    }
+    (start < end).then_some((start, end))
+}
+
+/// An empty `;` statement: the displaced closing semicolon of a struct/class that
+/// the sentinel mis-parse split off past the bogus function node.
+fn cpp_is_stray_semicolon(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "expression_statement"
+        && node.named_child_count() == 0
+        && node_text(node, source).trim() == ";"
+}
+
+/// Reparse the region `[start, end)` of `source` as C++ inside a padded copy: the
+/// prefix `[0, start)` is replaced byte-for-byte with spaces (newlines preserved)
+/// so every reparsed node keeps its original byte offset and line number. The
+/// existing visitors read node text from the original source, which is identical
+/// to the padded interior, so ranges and ownership stay byte/line-exact. Mirrors
+/// the Rust #1015 `rust_reparse_macro_items` technique.
+fn cpp_reparse_region_items(source: &str, start: usize, end: usize) -> Option<(String, Tree)> {
+    let bytes = source.as_bytes();
+    let prefix = bytes.get(..start)?;
+    let interior = bytes.get(start..end)?;
+    let mut padded = Vec::with_capacity(end);
+    padded.extend(
+        prefix
+            .iter()
+            .map(|&b| if b == b'\n' { b'\n' } else { b' ' }),
+    );
+    padded.extend_from_slice(interior);
+    let padded = String::from_utf8(padded).ok()?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&padded, None)?;
+    Some((padded, tree))
+}
+
+/// Robustness gate adapting #1015's `rust_reparsed_items_are_indexable`: the
+/// reparsed interior is indexed only when every top-level named node is a
+/// well-formed C++ item (or a comment) and at least one real item is present.
+/// Expression/statement soup surfaces as a top-level `ERROR` or
+/// `expression_statement`, neither of which is an item kind, so it is rejected.
+///
+/// Unlike the Rust gate, this does NOT reject on `root.has_error()`: a nested
+/// begin/end sentinel inside the region (e.g. `namespace outer { BEGIN_NS ...`
+/// swallowed by a preceding dangling sentinel) reparses to a real
+/// `namespace_definition` whose body still holds a bogus `function_definition`,
+/// so the subtree legitimately carries an error. Container items are admitted
+/// even with an internal error; the inner bogus function is recovered recursively
+/// when `visit_function_definition` walks it. Each recursion strips at least one
+/// leading sentinel, so the region strictly shrinks and recovery terminates.
+///
+/// A top-level `function_definition` is the one place we stay strict: it is
+/// admitted only when it is clean or is itself a sentinel candidate. A function
+/// that has an error and is not a sentinel is a real callable with a broken body,
+/// so we refuse the whole reparse and let the ordinary path handle it (preserving
+/// its real return type rather than re-deriving an implicit one).
+fn cpp_reparsed_items_are_indexable(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    let mut saw_item = false;
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "comment" => {}
+            "function_definition" => {
+                if child.has_error() && cpp_sentinel_macro_region(child, source).is_none() {
+                    return false;
+                }
+                saw_item = true;
+            }
+            kind if cpp_is_indexable_item_kind(kind) => saw_item = true,
+            _ => return false,
+        }
+    }
+    saw_item
+}
+
+fn cpp_is_indexable_item_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "namespace_definition"
+            | "class_specifier"
+            | "struct_specifier"
+            | "union_specifier"
+            | "enum_specifier"
+            | "function_definition"
+            | "template_declaration"
+            | "declaration"
+            | "field_declaration"
+            | "alias_declaration"
+            | "type_definition"
+            | "using_declaration"
+            | "linkage_specification"
+            | "preproc_def"
+            | "preproc_function_def"
+            | "preproc_include"
+            | "preproc_if"
+            | "preproc_ifdef"
+            | "preproc_call"
+    )
 }
 
 #[cfg(test)]
