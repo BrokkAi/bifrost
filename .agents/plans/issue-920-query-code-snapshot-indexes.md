@@ -36,9 +36,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 18:04Z) Rebased the complete 17-commit series onto origin/master `1584751d`, preserving master's structural-search module split across `search/{mod,results,expansions,tests}.rs`. The rebased branch passed formatting, warnings-denied all-target/all-feature Clippy, the complete feature-enabled Rust gate, all 56 Python tests, and final-head service, selector, cross-language, planner, and VS Code suites.
 - [x] (2026-07-22 18:04Z) Audited every issue acceptance criterion against current code, differential/lifecycle tests, the corrected exact-head Ubuntu artifacts, and draft PR #1078. The PR is mergeable, temporary workflow controls are absent, production retains only the posting index justified by the Dapper result, and the stale VS Code profile-v1 assertion discovered by CI now verifies the v2 contract locally.
 - [x] (2026-07-22 18:19Z) Addressed all platform-specific feedback from CI run 29945261659 without lint suppressions: summary helper re-exports now exist only for their `nlp`/test consumers, and the benchmark test's `json` macro import is Unix-gated with its only callers. Featureless and all-feature Clippy, the affected no-feature summary unit test, and all ten benchmark-run integration tests pass locally; the macOS host cannot complete an MSVC cross-build because `lib.exe` is unavailable, so the refreshed Windows jobs remain the final cross-target verification.
-- [x] (2026-07-22 21:10Z) Removed the repository-root issue scratch `.cache`, added the root-only ignore rule, rebased through origin/master `1c07b8ad`, and fixed the benchmark-discovered Scala companion self-type regression with an inline test and an exact `scala-xml` reproduction. The final master delta after measurement changed only the unrelated MCP property-fuzzer plan.
+- [x] (2026-07-22 21:10Z) Removed the repository-root issue scratch `.cache`, added the root-only ignore rule, rebased through origin/master `cbf1476a`, and fixed the benchmark-discovered Scala companion self-type regression with an inline test and an exact `scala-xml` reproduction. The final master deltas after measurement changed only unrelated MCP-fuzzer and reference-differential planning artifacts.
 - [x] (2026-07-22 21:10Z) Captured the final-head full Ubuntu artifact from run 29956839833: 10 repositories, 92 successful scenarios, 16 clean QueryCode cases, and no subset markers. Added the ordinary 50 ms absolute noise arm to the 10x cold/warm gate after five clean full runs straddled the ratio boundary by only 1-11 ms; the original eager-build regression still exceeds the combined gate by 91 ms.
 - [x] (2026-07-22 21:50Z) Rejected run 29956839833 as an unusually fast provisional baseline after two exact-current-head replays produced the same broad slowdown signature. Promoted the complete run 29959610518 artifact instead: it has no regressions against either the immediately preceding current-head artifact or the earlier representative run 29955662059.
+- [x] (2026-07-22 22:15Z) Traced the remaining strict-run instability to `build_full_scala_usage_edges` deep-cloning the analyzer-cached full Scala graph on every warm dead-code request. Returned the cached `Arc` through the generic dead-code graph consumer instead; two fresh-process pinned `scala-xml` runs measured stable 737.4 ms and 743.3 ms medians instead of alternating between roughly 1.8 s and 2.4 s.
 
 ## Surprises & Discoveries
 
@@ -80,6 +81,9 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: A single successful full run can be an unrepresentatively fast timing baseline. Against provisional run 29956839833, exact-current-head runs 29958615453 and 29959610518 reported 27 and 21 timing regressions despite identical analyzer and harness execution code and 92/92 successful scenarios. Ninety of 92 timings rose in the latter report, while direct comparison from 29958615453 to 29959610518 and from representative run 29955662059 to 29959610518 reported no regressions.
   Evidence: the three Actions artifacts and commit-scoped diff from `3ed81cc5` to `ba488b66`, whose only executable-code change was benchmark comparison policy.
+
+- Observation: The residual `scala-xml dead_code_smells` regression was deterministic within a process but bimodal across processes: identical-code runs measured about 1.8 s or 2.4 s. Scala's analyzer cache already held the full `UsageEdges` behind `Arc`, but the public full-graph helper dereferenced and deep-cloned the complete edge and call-site maps on every warm request.
+  Evidence: Actions runs 29958615453, 29959610518, and 29960771358; `full_usage_edge_builder_returns_the_cached_graph_handle`; local reports `run-20260722T221324Z.json` and `run-20260722T221427Z.json`.
 
 - Observation: `scoped_fact_nodes` cannot be counted on a scan-only path without materializing files that exact source anchors excluded. The profile now reports zero when that total is unavailable and separately records `admitted_fact_nodes`, the compatibility-budget denominator available on both scan and indexed paths.
   Evidence: the Dapper scan admitted 49,181 facts after source filtering while the complete indexed scope contained 85,325 facts.
@@ -248,6 +252,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Decision: Promote full run 29959610518 instead of the initially selected run 29956839833.
   Rationale: A baseline should be a representative complete artifact, not the fastest observed runner. The replacement has zero correctness failures and no timing regressions against both an adjacent current-head run and the earlier representative #920 candidate, whereas two current-head replays showed that the provisional artifact encoded broadly optimistic timings.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Preserve the analyzer-owned `Arc<UsageEdges>` through Scala's full-graph helper and make the generic dead-code consumer borrow either owned or shared graph results.
+  Rationale: The graph is immutable and generation-bound, so cloning its full BTreeMap and call-site payload provides no isolation. Sharing removes the unstable allocator-heavy warm path while retaining ownership and cache invalidation semantics.
   Date/Author: 2026-07-22 / Codex.
 
 ## Outcomes & Retrospective

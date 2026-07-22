@@ -18,6 +18,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAna
 use crate::hash::HashSet;
 use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -1141,14 +1142,15 @@ struct FqnBulkGraphRequest<'a, 's> {
     skipped: &'s mut Vec<String>,
 }
 
-fn analyze_fqn_candidates_with_usage_graph<BuildEdges, NodePredicate, BuildFinding>(
+fn analyze_fqn_candidates_with_usage_graph<BuildEdges, BuiltEdges, NodePredicate, BuildFinding>(
     request: FqnBulkGraphRequest<'_, '_>,
     node_predicate: NodePredicate,
     build_edges: BuildEdges,
     build_finding: BuildFinding,
 ) -> Vec<DeadCodeFinding>
 where
-    BuildEdges: FnOnce(&HashSet<String>, &HashSet<String>) -> Option<UsageEdges>,
+    BuildEdges: FnOnce(&HashSet<String>, &HashSet<String>) -> Option<BuiltEdges>,
+    BuiltEdges: Borrow<UsageEdges>,
     NodePredicate: Fn(&CodeUnit) -> bool,
     BuildFinding: Fn(
         &dyn IAnalyzer,
@@ -1204,9 +1206,10 @@ where
         }
         return Vec::new();
     };
+    let edges = edges.borrow();
 
     let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, language);
-    let incoming = incoming_usage_by_callee(&edges);
+    let incoming = incoming_usage_by_callee(edges);
 
     candidates
         .iter()
