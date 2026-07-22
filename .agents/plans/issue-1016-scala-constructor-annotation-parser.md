@@ -1,0 +1,238 @@
+# Fix Scala annotated-constructor parsing for issue #1016
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. Maintain this document in accordance with `.agents/PLANS.md`.
+
+## Purpose / Big Picture
+
+Bifrost currently misparses some Scala classes whose primary constructor follows an annotation such as `@Inject()`. For TheHive's `JobCtrl`, the parser ends the class declaration immediately after the annotation. Bifrost consequently returns only two lines from `get_symbol_sources`, omits the constructor parameters and methods from the class range, and cannot resolve a reference whose context is copied from the missing body.
+
+After this change, the same class is parsed as one complete declaration. `get_symbol_sources` returns the constructor and body, nested methods remain inside the class range, and `get_definitions_by_reference` can find `jobSrv.submit` from exact context inside `JobCtrl`. This behavior is demonstrated by analyzer, property-fuzzer, and SearchTools integration tests built from the issue's exact Scala source.
+
+## Progress
+
+- [x] (2026-07-22 11:05Z) Reproduced the existing property-fuzzer violation and confirmed the installed `tree-sitter-scala` is 0.25.1.
+- [x] (2026-07-22 11:05Z) Located upstream's constructor-annotation grammar fix and selected the first immutable generated-parser commit containing it.
+- [x] (2026-07-22 11:05Z) Chose vendoring over a git dependency so crates.io packages, wheels, and binaries all compile the same corrected parser.
+- [x] (2026-07-22 11:13Z) Vendored the fixed generated parser, recorded its checksums, and compiled it through Bifrost's root crate.
+- [x] (2026-07-22 11:13Z) Routed every Scala parser consumer through the internal language binding and explicitly invalidated persisted Scala analysis.
+- [x] (2026-07-22 11:24Z) Added exact analyzer, property-fuzzer, and SearchTools regressions; all three focused tests pass against the vendored parser.
+- [x] (2026-07-22 12:00Z) Added the vendored MIT notice, byte-compared regenerated notices, passed `cargo deny`, and verified the packaged crate contains and builds the vendored parser snapshot.
+- [x] (2026-07-22 12:00Z) Replayed Chisel's exact `VCSSpec` record with ephemeral cache and confirmed its distinct grammar error remains unchanged.
+- [x] (2026-07-22 12:28Z) Passed the complete all-feature unit/integration suite and coherent-toolchain doc phase, repeated all-feature clippy, and completed the final multi-angle review with no blocking findings.
+- [x] (2026-07-22 12:48Z) Marked the 1.1-million-line vendored parse table as generated and disabled textual diffs for it, keeping reviews and repository language statistics usable without adding release-time generation machinery.
+- [x] (2026-07-22 12:54Z) Filed the distinct Chisel `VCSSpec` grammar failure as #1068, rebased cleanly onto current `origin/master`, and passed the focused regressions again.
+- [x] (2026-07-22 12:54Z) Addressed guided-review findings by private-prefixing all native Scala grammar symbols, proving coexistence with published 0.25.1, and adding a PR package-build gate with a 10,000,000-byte compressed-size budget.
+- [x] (2026-07-22 15:45Z) Rebased after master independently vendored the Scala grammar for #1073; consolidated both declarative fixes onto the v0.25.1 grammar, regenerated with pinned `tree-sitter-cli` 0.25.9, and retained Bifrost's private root build so packaged crates contain the patched parser.
+- [x] (2026-07-22 16:15Z) Passed the combined #1016/#1073 raw-parser and analyzer regressions, all 147 Scala usage-graph tests, all-target/all-feature clippy, deterministic notices, and an 8,071,956-byte packaged-crate build.
+
+## Surprises & Discoveries
+
+- Observation: The released `tree-sitter-scala` 0.25.1 parser truncates `class JobCtrl @Inject() (` because it can consume the following constructor parameter list as part of the annotation.
+  Evidence: `cargo test --test mcp_property_fuzzer i1_fires_on_truncated_jobctrl_scala_fixture -- --nocapture` passes only because the test currently expects `declaration-truncated-at-parse-error`.
+
+- Observation: Upstream fixed the ambiguity after its latest 0.26.0 crate release, so no published crate contains the correction.
+  Evidence: grammar commit `6f9d7bc93ee153719d0d785e63e0fc77d333dad7` introduces a dedicated constructor-annotation rule; generated commit `a68000002745b94eec61cef741efe7cede4ff465` is the first immutable parser snapshot containing it.
+
+- Observation: The Chisel confirmation has a different syntax shape, `class VCSSpec extends BackendSpec`, despite producing the same severe adjacent-ERROR signature.
+  Evidence: `svsim/src/test/scala/BackendSpec.scala` at corpus commit `e639b4f69e90ecf3f14c25b898fda9d1eadf3cc1` has no constructor annotation. Its replay is evidence about the newer parser snapshot, not permission to add source-range recovery to this issue.
+
+- Observation: The current analysis epoch hashes grammar ABI, node-kind names, and field names but not parser tables.
+  Evidence: `src/analyzer/store/epoch.rs::hash_grammar` cannot guarantee that a grammar conflict-resolution change invalidates persisted rows. The Scala salt must therefore be bumped explicitly.
+
+- Observation: The connected Bifrost code-intelligence plugin is rooted at its installed plugin cache rather than this worktree and returns false negatives for repository files.
+  Evidence: plugin git operations reported `/Users/dave/.codex/plugins/cache/bifrost/brokk/0.8.7` as the project root. Repository exploration for this issue uses direct worktree reads until that separate tooling defect is addressed.
+
+- Observation: The existing worktree `target` consumed 6.9 GiB and the first regression build failed while writing an incremental dependency graph, despite the volume reporting free space.
+  Evidence: Cargo returned `No space left on device (os error 28)`; `cargo clean` removed 9,599 regenerable build files before validation resumed.
+
+- Observation: Neither recorded corpus checkout is mounted in this environment.
+  Evidence: `/mnt/optane/usagebench/repos/chipsalliance__chisel` and `/mnt/optane/usagebench/repos/TheHive-Project__TheHive` are both absent. The checked-in TheHive fixture proves acceptance; the Chisel replay requires an exact temporary sparse checkout during final validation.
+
+- Observation: The fixed parser does not clear the separate Chisel `VCSSpec` truncation.
+  Evidence: an ephemeral replay against `chipsalliance/chisel` commit `e639b4f69e90ecf3f14c25b898fda9d1eadf3cc1` still reports one `declaration-truncated-at-parse-error` violation for `svsimTests.VCSSpec`, with the declaration at bytes 376-409 followed by an `ERROR` at bytes 410-22749. The class has no annotated constructor, so this is separate follow-up evidence rather than a reason to widen issue #1016.
+
+- Observation: Vendoring the generated parser substantially increases the crate archive but still packages successfully.
+  Evidence: `cargo package --allow-dirty` packaged 1,490 files, 69.1 MiB uncompressed and 9.3 MiB compressed, then built the packaged crate without a git dependency. The archive remains close enough to crates.io's normal size ceiling that replacing the snapshot with the first fixed published grammar crate should remain an explicit follow-up.
+
+- Observation: macOS all-feature tests require the same PyO3 dynamic-lookup linker flags already used by CI.
+  Evidence: without `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`, the `python` feature test binaries fail to link unresolved CPython symbols. Re-running with the workflow's macOS flags links successfully.
+
+- Observation: A second fuzzer regression still encoded the old parser failure after the primary issue fixture was updated.
+  Evidence: the complete suite failed `i1_fires_on_annotated_constructor_scala_fixture`, whose `JobSrv` excerpt uses an annotated constructor parameter. The test now asserts a complete `JobSrv` source and no invariant violation; both issue-#1016 fuzzer cases pass.
+
+- Observation: This host initially mixed rustup Cargo/rustc with Homebrew rustdoc.
+  Evidence: all unit and integration suites passed, then the doc phase emitted E0514 because rustdoc rejected dependencies built by the other toolchain. Re-running `cargo test --features nlp,python --doc` with `/Users/dave/.cargo/bin` first on `PATH` passed, proving the remaining phase with a coherent toolchain.
+
+- Observation: Removing the published grammar as a production dependency allows a downstream crate to link both native implementations.
+  Evidence: both upstream grammars export `tree_sitter_scala` and five identically named external-scanner functions. The coexistence regression now deliberately links published 0.25.1 beside Bifrost: the control parser truncates `JobCtrl`, while Bifrost's private-prefixed parser returns the complete body.
+- Observation: Cargo treats a vendored subtree containing its own `Cargo.toml` as a nested package boundary and omitted the C runtime files from Bifrost's archive once the path dependency was removed.
+  Evidence: the first consolidated `cargo package` archived 8.1 MB but failed verification because `vendor/tree-sitter-scala/src/parser.c` and `scanner.c` were absent. Removing the unused nested Rust wrapper made the root package own the grammar files; excluding agent-only and unused vendor assets then produced a verified 8,071,956-byte archive.
+
+## Decision Log
+
+- Decision: Fix the parser grammar rather than widening Bifrost declaration ranges or scanning source text.
+  Rationale: A widened range would not restore members swallowed by an `ERROR` node and would make exact-range keyed analyzer facts inconsistent. The repository explicitly requires structured parser/resolver fixes.
+  Date/Author: 2026-07-22 / Codex and user.
+
+- Decision: Vendor the full grammar fork derived from release commit `a067c39163b62b19e76cea17476f3188da8c9e51`, combine #1073's soft-keyword patch with upstream constructor fix `6f9d7bc93ee153719d0d785e63e0fc77d333dad7`, and regenerate with pinned `tree-sitter-cli` 0.25.9.
+  Rationale: Master independently landed the #1073 fork while this plan was executing. One combined declarative grammar avoids competing Scala parser snapshots; upstream generated commit `a68000002745b94eec61cef741efe7cede4ff465` remains the immutable reference for the constructor fix. The root build remains necessary because Cargo replaces a packaged path dependency with the published, unpatched crates.io version.
+  Date/Author: 2026-07-22 / Codex and user.
+
+- Decision: Retain master's full declarative grammar fork, while Bifrost's root build compiles only `parser.c`, `scanner.c`, and the three required headers.
+  Rationale: The additional grammar inputs make the combined #1016/#1073 parser reproducible. Runtime compilation and packaging remain independent of the nested grammar crate so crates.io artifacts cannot fall back to published 0.25.1.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Append `tree-sitter-scala-bifrost-patches-1016-1073-2026-07` to the Scala analysis-epoch salt.
+  Rationale: Parser-table behavior may change without changing ABI, node kinds, or fields, so explicit invalidation is required.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Treat a residual Chisel `VCSSpec` truncation as separate follow-up evidence.
+  Rationale: It does not use an annotated constructor. This issue must not grow a broad range-repair fallback to hide a distinct grammar failure.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Keep the generated `parser.c` checked in, but mark it `linguist-generated=true -diff` in `.gitattributes`.
+  Rationale: The exact upstream file is 32.4 MB in a checkout but compresses to about 1.52 MB. Generating it during Cargo builds or only during release would introduce a pinned tree-sitter CLI and a second build state for a temporary vendor snapshot; generated-file attributes remove review noise while retaining ordinary, reproducible source builds.
+  Date/Author: 2026-07-22 / Codex and user.
+
+- Decision: Compile the vendored grammar under a private archive name and preprocessor-prefix all six exported symbols.
+  Rationale: Native library search and symbol resolution must not let a downstream dependency on published `tree-sitter-scala` replace or mix Bifrost's pinned parser and scanner. The published crate remains only an exact-version development dependency used as the coexistence control.
+  Date/Author: 2026-07-22 / Codex and user.
+
+- Decision: Gate pull requests at 10,000,000 compressed crate bytes while vendoring remains.
+  Rationale: After consolidating #1016 with #1073 and excluding the agent-only `.agents/` namespace, the verified package is 8,071,956 bytes. Building the publishable archive in ordinary CI catches package omissions and leaves explicit margin below the registry ceiling instead of discovering growth only at release time.
+  Date/Author: 2026-07-22 / Codex and user.
+
+## Outcomes & Retrospective
+
+The vendored parser fixes the exact TheHive acceptance workflow without changing declaration extraction, public APIs, or response shapes. `JobCtrl` now includes its annotated primary constructor and complete body, `JobCtrl.create` is indexed as its child, `PublicJob` remains a separate declaration, and SearchTools resolves the in-body `jobSrv.submit` reference to the inline `JobSrv.submit` definition.
+
+The parser's immutable release base, both declarative patches, pinned generator, source URLs, and MIT license are recorded. The publishable crate includes the patched grammar source, generated runtime inputs, license, and provenance while excluding unused generated metadata and the repository's agent-only namespace. Supplemental notices reproduce the vendored license, and the 8,071,956-byte package builds from its archive. PR CI rejects growth beyond 10,000,000 bytes while vendoring remains.
+
+The Chisel replay remains one severe adjacent-`ERROR` violation with the same range as before. Because `VCSSpec` has no annotated constructor, it should be diagnosed independently; no analyzer range repair or source-text fallback was added here.
+
+The final guided review found no security or duplication changes to apply, but it identified native symbol collision and late package-size failure risks. Both are resolved: build-time macro aliases isolate the language function and all scanner exports, an integration executable links the old published grammar beside Bifrost as a behavioral control, and PR CI builds and measures the publishable archive. All Scala consumers still share one private Rust language binding, the cache epoch explicitly changes, and the acceptance tests exercise public SearchTools behavior.
+
+## Context and Orientation
+
+`tree-sitter` is the incremental parsing runtime. A language grammar supplies a generated C parser and an exported language function that returns the runtime's Scala language descriptor. Bifrost compiles the vendored function and scanner exports under private `brokk_bifrost_` names; published `tree-sitter-scala` 0.25.1 is linked only by the coexistence regression.
+
+`src/analyzer/mod.rs` selects a tree-sitter language for each Bifrost `Language`. Scala-specific analyzers and usage resolvers also construct parsers directly. Every current Scala call site refers to `tree_sitter_scala::LANGUAGE`; all of them must instead use one private binding owned by `src/analyzer/scala/language.rs` so the vendored implementation cannot drift between consumers.
+
+`src/analyzer/scala/declarations.rs` converts tree-sitter declarations into Bifrost `CodeUnit` ranges. It already contains structured recovery for malformed indentation trees. That recovery is intentionally unchanged: issue #1016 originates in the grammar's constructor-annotation ambiguity, before declaration extraction receives a correct class node.
+
+`src/analyzer/store/epoch.rs` computes a per-language analysis epoch used to hide stale persisted rows and trigger reanalysis. A manual Scala salt change ensures caches produced by the old parser are not reused.
+
+`tests/mcp_property_fuzzer.rs` contains the exact 109-line TheHive source and a test that currently expects the truncation invariant to fire. `tests/common/inline_project.rs` supplies `InlineTestProject`, which creates small temporary workspaces without handwritten path management. The shared issue fixture will remain a source file under `tests/fixtures/scala-issue-1016/JobCtrl.scala`; tests can load it with `include_str!` and install it through `InlineTestProject`.
+
+`scripts/generate-supplemental-third-party-notices.mjs` supplements Cargo-generated license reports for bundled native source. Once Scala is no longer represented as a Cargo package, this script must read the vendored MIT license directly and render its immutable upstream source URL. CI compares its output byte-for-byte with `licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt`.
+
+## Plan of Work
+
+Retain the full `vendor/tree-sitter-scala` grammar fork merged by #1073, derived from upstream release commit `a067c39163b62b19e76cea17476f3188da8c9e51`. Apply upstream constructor-fix commit `6f9d7bc93ee153719d0d785e63e0fc77d333dad7` to `grammar.js`, record both patches in `BIFROST_PATCH.md`, and regenerate with `tree-sitter-cli` 0.25.9. Do not hand-edit generated C, JSON, or headers.
+
+Add a root `build.rs`. It must compile the two C files as C11 with `vendor/tree-sitter-scala/src` on the include path, use `-Wno-unused` where supported, add `-utf-8` under MSVC, and name the static library `brokk-bifrost-tree-sitter-scala`. Use preprocessor aliases to prefix the language function and all five external-scanner exports with `brokk_bifrost_`. Emit `cargo:rerun-if-changed` for both C files and all three headers.
+
+In `Cargo.toml`, remove `tree-sitter-scala` from production dependencies, add the existing compatible `tree-sitter-language` crate as a direct dependency, and add `cc` under `[build-dependencies]`. Keep exact published 0.25.1 only as a development dependency for the native coexistence regression. Regenerate `Cargo.lock`. Do not add a git dependency or a production crates.io fallback.
+
+Create `src/analyzer/scala/language.rs`. Declare the generated C function in an `unsafe extern "C"` block and expose `pub(crate) const LANGUAGE: tree_sitter_language::LanguageFn` using `LanguageFn::from_raw`. Register the module in `src/analyzer/scala/mod.rs`. Replace every `tree_sitter_scala::LANGUAGE` use under `src/` with this constant, importing it through the Scala module rather than duplicating extern declarations.
+
+Append `tree-sitter-scala-bifrost-patches-1016-1073-2026-07` to the Scala salt in `src/analyzer/store/epoch.rs` and explain that it covers parser-table changes not represented by the structural grammar fingerprint.
+
+Move the TheHive source from its inline constant into `tests/fixtures/scala-issue-1016/JobCtrl.scala`. Preserve the original AGPL header. Update the fuzzer regression to load that fixture and assert no issue-#1016 truncation violation. Add direct declaration assertions showing the class range contains its constructor and body, `JobCtrl.create` is a child declaration, and the following `PublicJob` remains independent.
+
+Add SearchTools integration coverage using the exact fixture plus a minimal inline `JobSrv.scala`. Assert that `get_symbol_sources` returns `def create` and `jobSrv.submit` for `JobCtrl` but excludes `PublicJob`. Then call `get_definitions_by_reference` with exact body context and target `submit`; assert that it resolves the stub's `JobSrv.submit` declaration instead of returning `target_not_found`.
+
+Add one compact Scala parser/analyzer regression covering the three upstream whitespace forms `@Inject()(...)`, `@ann() (...)`, and `@ann ()(...)`. The assertion must be behavioral: each class contains its constructor parameter and body declaration, not merely that a grammar registry contains a rule name.
+
+Generalize the supplemental notice renderer so a section can have either Cargo package metadata or explicit vendored-source metadata. Read `vendor/tree-sitter-scala/LICENSE`, identify the immutable v0.25.1 source commit, and describe the Bifrost-patched parser as compiled into every release target. Regenerate the tracked supplemental notice.
+
+Run the focused tests and inspect failures before broad validation. Replay the TheHive fuzzer record with ephemeral cache. If the Chisel corpus checkout is available, replay `svsimTests.VCSSpec`; record whether it clears. A residual Chisel error does not authorize widening ranges or adding a mini-parser and does not block the annotated-constructor acceptance criteria.
+
+Finally, validate formatting, lints, all-feature tests, license policy, generated notices, and crate packaging. Inspect the packaged file list to prove the vendored parser, headers, license, and provenance are included. Review the complete branch diff for security, duplication, intent, operational, and architectural concerns; fix all confirmed issues and update this living plan.
+
+## Concrete Steps
+
+Run all commands from `/Users/dave/.codex/worktrees/3cb7/bifrost`.
+
+Verify the checked-in grammar's immutable release base and the exact upstream constructor patch before regeneration. Run `npx --yes tree-sitter-cli@0.25.9 generate` only from `vendor/tree-sitter-scala`; never generate from a moving upstream branch.
+
+After dependency and build integration:
+
+    cargo check --locked
+    cargo test --test scala_analyzer_test
+
+After regression tests:
+
+    cargo test --test mcp_property_fuzzer issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture -- --nocapture
+    cargo test --test searchtools_definition_selectors issue_1016 -- --nocapture
+
+Use the actual final test names if Rust's test-module organization requires a different prefix, and update this section immediately.
+
+Generate and compare notices:
+
+    node scripts/generate-supplemental-third-party-notices.mjs /tmp/issue-1016-supplemental-notices.txt
+    cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/issue-1016-supplemental-notices.txt
+    cargo deny --config licenses/deny.toml --locked check licenses
+
+Run release-quality Rust checks:
+
+    cargo fmt --check
+    scripts/with-isolated-cargo-target.sh env PATH="/Users/dave/.cargo/bin:$PATH" cargo clippy --all-targets --all-features -- -D warnings
+    scripts/with-isolated-cargo-target.sh env RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo test --features nlp,python
+    scripts/with-isolated-cargo-target.sh env PATH="/Users/dave/.cargo/bin:$PATH" RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo test --features nlp,python --doc
+
+The explicit macOS linker flags match CI's PyO3 configuration. The separate doc invocation records the coherent-toolchain rerun required by this host after the complete unit/integration invocation had already passed every non-doc suite.
+
+Validate the publishable package:
+
+    cargo package --allow-dirty --list
+    cargo package --allow-dirty
+
+The package list must contain `build.rs`, the full reproducible grammar fork under `vendor/tree-sitter-scala/`, `LICENSE`, and `BIFROST_PATCH.md`. `cargo package` must compile without attempting to resolve production `tree-sitter-scala` from git or crates.io.
+
+## Validation and Acceptance
+
+The focused fuzzer regression fails before the parser replacement because it detects a declaration ending immediately before a sibling `ERROR` node. It passes afterward with no `declaration-truncated-at-parse-error` violation for `JobCtrl`.
+
+The source integration test must observe one `JobCtrl` source whose text includes its constructor parameters, `def create`, and `jobSrv.submit`, while excluding the following top-level `PublicJob`. This proves the fix neither truncates nor overextends the class range.
+
+The definition-by-reference integration test must resolve target `submit` from exact context copied from `JobCtrl.create` to the inline `JobSrv.submit` declaration. Any `invalid_location`, `target_not_found`, or context mismatch fails acceptance.
+
+All existing Scala analyzer tests, the complete `nlp,python` suite, all-feature clippy with warnings denied, license checks, supplemental-notice comparison, and `cargo package` must pass. Cross-platform CI remains the final proof that the upstream-equivalent C build compiles on Linux, macOS, and Windows.
+
+## Idempotence and Recovery
+
+The vendored release base and both declarative patches are recorded. If regeneration is interrupted, review `git status` and rerun the pinned generator from the vendor directory. Never regenerate with an unpinned CLI or from upstream `master`.
+
+Cargo and test commands are repeatable. Use `scripts/with-isolated-cargo-target.sh` for isolated validation so temporary build output is removed automatically. Do not create manually named Bifrost target directories under `/tmp`.
+
+If crate packaging omits a vendored file, adjust the package include rules only after inspecting `cargo package --list`; do not add a network dependency as a workaround. If either focused grammar regression fails, stop and compare `grammar.js`, `BIFROST_PATCH.md`, and the pinned generator output before changing analyzer code.
+
+## Artifacts and Notes
+
+Upstream grammar fix:
+
+    https://github.com/tree-sitter/tree-sitter-scala/commit/6f9d7bc93ee153719d0d785e63e0fc77d333dad7
+
+First generated parser commit containing that fix:
+
+    https://github.com/tree-sitter/tree-sitter-scala/commit/a68000002745b94eec61cef741efe7cede4ff465
+
+Issue and exact user-visible failure:
+
+    https://github.com/BrokkAi/bifrost/issues/1016
+    get_symbol_sources(JobCtrl) currently reports lines 25-26 only.
+    get_definitions_by_reference(... target="submit") currently reports target_not_found.
+
+## Interfaces and Dependencies
+
+No public MCP, Python, or Rust API changes. The private internal interface added in `src/analyzer/scala/language.rs` is:
+
+    pub(crate) const LANGUAGE: tree_sitter_language::LanguageFn
+
+The root build script exports the same native symbol and static-library identity previously supplied transitively by the grammar crate:
+
+    tree_sitter_scala() -> *const ()
+    static library name: tree-sitter-scala
+
+The direct dependency set changes from published `tree-sitter-scala` to `tree-sitter-language` plus build dependency `cc`. The shared `tree-sitter = "0.25.10"` runtime remains unchanged because it supports the generated parser's ABI.

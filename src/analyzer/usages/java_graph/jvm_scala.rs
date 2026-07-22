@@ -72,7 +72,7 @@ fn scan_scala_file(
 
     let mut parser = Parser::new();
     if parser
-        .set_language(&tree_sitter_scala::LANGUAGE.into())
+        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
         .is_err()
     {
         return;

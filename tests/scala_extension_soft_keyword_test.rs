@@ -35,44 +35,6 @@ fn location_at(path: &str, source: &str, start: usize) -> Value {
 }
 
 #[test]
-fn scala_extension_is_contextual_between_identifier_and_definition() {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_scala::LANGUAGE.into())
-        .expect("load Scala grammar");
-
-    let scala2_tree = parser.parse(SCALA2_SOURCE, None).expect("parse Scala 2");
-    assert!(
-        !scala2_tree.root_node().has_error(),
-        "Scala 2 `extension` identifier must parse without recovery:\n{}",
-        scala2_tree.root_node().to_sexp()
-    );
-    let scala2_tree = scala2_tree.root_node().to_sexp();
-    assert!(
-        scala2_tree.contains("left: (identifier"),
-        "`extension` must remain an expression identifier:\n{scala2_tree}"
-    );
-
-    let scala3 = r#"object Syntax:
-  extension (value: String)
-    def twice: String = value + value
-"#;
-    let scala3_tree = parser.parse(scala3, None).expect("parse Scala 3");
-    assert!(
-        !scala3_tree.root_node().has_error(),
-        "Scala 3 extension definition must remain valid:\n{}",
-        scala3_tree.root_node().to_sexp()
-    );
-    assert!(
-        scala3_tree
-            .root_node()
-            .to_sexp()
-            .contains("extension_definition"),
-        "Scala 3 syntax must retain its structured extension node"
-    );
-}
-
-#[test]
 fn scala_extension_identifier_preserves_nested_symbol_round_trip() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/Enrichments.scala", SCALA2_SOURCE)

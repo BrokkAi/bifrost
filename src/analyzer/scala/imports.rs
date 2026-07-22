@@ -667,7 +667,7 @@ mod tests {
     fn parsed_export(source: &str) -> ScalaExportInfo {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .expect("Scala parser");
         let tree = parser.parse(source, None).expect("Scala syntax tree");
         let mut stack = vec![tree.root_node()];

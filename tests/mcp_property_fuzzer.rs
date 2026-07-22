@@ -14,6 +14,10 @@ use brokk_bifrost::mcp_property_fuzzer::{
 use brokk_bifrost::{AnalyzerConfig, CodeUnitType, ParseError, ParseErrorKind, Range};
 use common::InlineTestProject;
 
+/// Verbatim `cortex/connector/.../controllers/v0/JobCtrl.scala` from
+/// TheHive-Project/TheHive @ d390a031 (AGPL-3.0), as reported in issue #1016.
+const ISSUE_1016_JOBCTRL: &str = include_str!("fixtures/scala-issue-1016/JobCtrl.scala");
+
 fn range(text: &str, needle: &str, end: Option<&str>) -> Range {
     let start_byte = text.find(needle).expect("needle present");
     let end_byte = match end {
@@ -320,49 +324,39 @@ fn i1_silent_on_healthy_scala_fixture() {
     );
 }
 
-/// The miniature of issue #1016: a Scala class whose annotated, multi-line
-/// constructor takes tree-sitter-scala's error-recovery path, leaving the
-/// class's recorded range truncated at the constructor while its members
-/// index below. The excerpt is the first 60 lines (plus closing brace) of
+/// A second issue #1016 shape: an annotated, multi-line constructor with an
+/// annotated parameter after the original TheHive imports. The excerpt is the
+/// first 60 lines (plus closing brace) of
 /// `cortex/connector/.../services/JobSrv.scala` from TheHive-Project/TheHive
-/// (AGPL-3.0), the corpus repository #1016 was filed against; probing showed
-/// the truncation is a joint property of the import block, the
-/// `@Named("cortex-actor")` constructor-parameter annotation, and the
-/// following body tokens, so paraphrased fixtures did not reproduce it.
-///
-/// While the analyzer truncates the range, the engine must report the class's
-/// out-of-range members under I1 with the `container-range-misses-member`
-/// shape; when #1016 is fixed this test flips to asserting silence — update
-/// it as part of that fix.
+/// (AGPL-3.0), the corpus repository #1016 was filed against. The fixed parser
+/// must keep the body members inside `JobSrv` and leave I1 silent.
 #[test]
-fn i1_fires_on_annotated_constructor_scala_fixture() {
+fn issue_1016_i1_accepts_annotated_constructor_parameter_scala_fixture() {
     let project = InlineTestProject::new()
         .file("src/JobSrv.scala", ISSUE_1016_JOBSRV_EXCERPT)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let report =
         run_invariants(workspace.analyzer(), &fuzzer_config("scala")).expect("run invariants");
-    let violation = report
-        .violations
-        .iter()
-        .find(|violation| violation.shape == "container-range-misses-member")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected the #1016 annotated-constructor range violation; report:\n{}",
-                serde_json::to_string_pretty(&report).expect("report json")
-            )
-        });
     assert!(
-        violation.symbol.ends_with(".observableJobSrv")
-            || violation.symbol.ends_with(".reportObservableSrv"),
-        "exemplar should be an out-of-range JobSrv member: {violation:?}"
+        report.violations.is_empty(),
+        "{}",
+        serde_json::to_string_pretty(&report.violations).expect("violations json")
     );
-    assert_eq!(
-        violation.evidence["parent"]["fq_name"]
-            .as_str()
-            .expect("parent fq_name"),
-        "org.thp.thehive.connector.cortex.services.JobSrv"
+
+    let analyzer = workspace.analyzer();
+    let job_srv = analyzer
+        .get_definitions("org.thp.thehive.connector.cortex.services.JobSrv")
+        .into_iter()
+        .find(|unit| unit.is_class())
+        .expect("JobSrv class");
+    let source = analyzer.get_source(&job_srv, false).expect("JobSrv source");
+    assert!(
+        source.contains("@Named(\"cortex-actor\") cortexActor: ActorRef"),
+        "{source}"
     );
+    assert!(source.contains("val observableJobSrv"), "{source}");
+    assert!(source.contains("val reportObservableSrv"), "{source}");
 }
 
 /// First 60 lines of `JobSrv.scala` (TheHive-Project/TheHive @ d390a031,
@@ -581,150 +575,77 @@ fn i1_silent_on_scala_auxiliary_constructor_fixture() {
     );
 }
 
-/// The verbatim `cortex/connector/.../controllers/v0/JobCtrl.scala` (109
-/// lines) from TheHive-Project/TheHive @ d390a031 (AGPL-3.0) — the file named
-/// in issue #1016. tree-sitter-scala truncates the `class_definition` at the
-/// annotated constructor and a sibling ERROR node swallows the remaining ~4 KB
-/// of the file, so neither `JobCtrl`'s methods nor the following `PublicJob`
-/// class index at all. Paraphrased fixtures do not reproduce this (see
-/// ISSUE_1016_JOBSRV_EXCERPT for why); the engine must therefore flag the
-/// truncation via the parse-error-boundary shape, since containment has no
-/// members left to check. When #1016 is fixed this flips to asserting
-/// silence — update it as part of that fix.
+/// Issue #1016's exact severe-grade fixture must parse as two complete classes.
 #[test]
-fn i1_fires_on_truncated_jobctrl_scala_fixture() {
+fn issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture() {
     let project = InlineTestProject::new()
         .file("src/JobCtrl.scala", ISSUE_1016_JOBCTRL)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let report =
         run_invariants(workspace.analyzer(), &fuzzer_config("scala")).expect("run invariants");
-    assert_eq!(
-        report.violations.len(),
-        1,
+    assert!(
+        report.violations.is_empty(),
         "{}",
         serde_json::to_string_pretty(&report.violations).expect("violations json")
     );
-    let violation = &report.violations[0];
-    assert_eq!(violation.shape, "declaration-truncated-at-parse-error");
+
+    let analyzer = workspace.analyzer();
+    let job_ctrl = analyzer
+        .get_definitions("org.thp.thehive.connector.cortex.controllers.v0.JobCtrl")
+        .into_iter()
+        .find(|unit| unit.is_class())
+        .expect("JobCtrl class");
+    let create = analyzer
+        .get_definitions("org.thp.thehive.connector.cortex.controllers.v0.JobCtrl.create")
+        .into_iter()
+        .next()
+        .expect("JobCtrl.create");
+    let public_job = analyzer
+        .get_definitions("org.thp.thehive.connector.cortex.controllers.v0.PublicJob")
+        .into_iter()
+        .find(|unit| unit.is_class())
+        .expect("PublicJob class");
+
+    let source = analyzer
+        .get_source(&job_ctrl, false)
+        .expect("JobCtrl source");
     assert!(
-        violation.symbol.ends_with("JobCtrl"),
-        "exemplar should be the truncated JobCtrl class: {violation:?}"
+        source.contains("override val entrypoint: Entrypoint"),
+        "{source}"
+    );
+    assert!(
+        source.contains("def create: Action[AnyContent]"),
+        "{source}"
+    );
+    assert!(source.contains("jobSrv"), "{source}");
+    assert!(
+        source
+            .contains(".submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))"),
+        "{source}"
+    );
+    assert!(!source.contains("class PublicJob"), "{source}");
+
+    let class_range = analyzer.ranges(&job_ctrl)[0];
+    let create_range = analyzer.ranges(&create)[0];
+    let public_job_range = analyzer.ranges(&public_job)[0];
+    assert!(
+        class_range.start_byte <= create_range.start_byte
+            && class_range.end_byte >= create_range.end_byte,
+        "JobCtrl range {class_range:?} must contain create {create_range:?}"
+    );
+    assert!(
+        class_range.end_byte <= public_job_range.start_byte,
+        "JobCtrl range {class_range:?} must not consume PublicJob {public_job_range:?}"
+    );
+    assert_eq!(
+        analyzer
+            .parent_of(&create)
+            .as_ref()
+            .map(|unit| unit.fq_name()),
+        Some("org.thp.thehive.connector.cortex.controllers.v0.JobCtrl".to_string())
     );
 }
-
-/// Verbatim `JobCtrl.scala` (TheHive-Project/TheHive @ d390a031, AGPL-3.0);
-/// see the test above.
-const ISSUE_1016_JOBCTRL: &str = r#"package org.thp.thehive.connector.cortex.controllers.v0
-
-import com.google.inject.name.Named
-import org.thp.scalligraph.controllers.{Entrypoint, FieldsParser}
-import org.thp.scalligraph.models.{Database, UMapping}
-import org.thp.scalligraph.query._
-import org.thp.scalligraph.traversal.TraversalOps._
-import org.thp.scalligraph.traversal.{IteratorOutput, Traversal}
-import org.thp.scalligraph.{AuthorizationError, EntityIdOrName, ErrorHandler}
-import org.thp.thehive.connector.cortex.controllers.v0.Conversion._
-import org.thp.thehive.connector.cortex.models.{Job, RichJob}
-import org.thp.thehive.connector.cortex.services.JobOps._
-import org.thp.thehive.connector.cortex.services.JobSrv
-import org.thp.thehive.controllers.v0.Conversion._
-import org.thp.thehive.controllers.v0.{OutputParam, PublicData, QueryCtrl}
-import org.thp.thehive.models.{Observable, Permissions, RichCase, RichObservable}
-import org.thp.thehive.services.ObservableOps._
-import org.thp.thehive.services.ObservableSrv
-import play.api.libs.json.JsObject
-import play.api.mvc.{Action, AnyContent, Results}
-
-import javax.inject.{Inject, Singleton}
-import scala.concurrent.{ExecutionContext, Future}
-
-@Singleton
-class JobCtrl @Inject() (
-    override val entrypoint: Entrypoint,
-    override val db: Database,
-    jobSrv: JobSrv,
-    observableSrv: ObservableSrv,
-    errorHandler: ErrorHandler,
-    implicit val ec: ExecutionContext,
-    @Named("v0") override val queryExecutor: QueryExecutor,
-    override val publicData: PublicJob
-) extends QueryCtrl {
-  def get(jobId: String): Action[AnyContent] =
-    entrypoint("get job")
-      .authRoTransaction(db) { implicit request => implicit graph =>
-        jobSrv
-          .get(EntityIdOrName(jobId))
-          .visible
-          .richJob
-          .getOrFail("Job")
-          .map(job => Results.Ok(job.toJson))
-      }
-
-  def create: Action[AnyContent] =
-    entrypoint("create job")
-      .extract("analyzerId", FieldsParser[String].on("analyzerId"))
-      .extract("cortexId", FieldsParser[String].on("cortexId"))
-      .extract("artifactId", FieldsParser[String].on("artifactId"))
-      .extract("parameters", FieldsParser.jsObject.optional.on("parameters"))
-      .asyncAuth { implicit request =>
-        if (request.isPermitted(Permissions.manageAnalyse)) {
-          val analyzerId: String           = request.body("analyzerId")
-          val cortexId: String             = request.body("cortexId")
-          val parameters: Option[JsObject] = request.body("parameters")
-          db.roTransaction { implicit graph =>
-            val artifactId: String = request.body("artifactId")
-            for {
-              o <- observableSrv.get(EntityIdOrName(artifactId)).can(Permissions.manageAnalyse).richObservable.getOrFail("Observable")
-              c <- observableSrv.get(EntityIdOrName(artifactId)).`case`.getOrFail("Case")
-            } yield (o, c)
-          }.fold(
-            error => errorHandler.onServerError(request, error),
-            {
-              case (o, c) =>
-                jobSrv
-                  .submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))
-                  .map(j => Results.Created(j.toJson))
-            }
-          )
-        } else Future.failed(AuthorizationError("Job creation not allowed"))
-      }
-}
-
-@Singleton
-class PublicJob @Inject() (jobSrv: JobSrv) extends PublicData with JobRenderer {
-  override val entityName: String = "job"
-  override val initialQuery: Query =
-    Query.init[Traversal.V[Job]]("listJob", (graph, authContext) => jobSrv.startTraversal(graph).visible(authContext))
-  override val getQuery: ParamQuery[EntityIdOrName] = Query.initWithParam[EntityIdOrName, Traversal.V[Job]](
-    "getJob",
-    (idOrName, graph, authContext) => jobSrv.get(idOrName)(graph).visible(authContext)
-  )
-  override def pageQuery(limitedCountThreshold: Long): ParamQuery[OutputParam] =
-    Query.withParam[OutputParam, Traversal.V[Job], IteratorOutput](
-      "page",
-      {
-        case (OutputParam(from, to, _, withParents), jobSteps, authContext) if withParents > 0 =>
-          jobSteps.richPage(from, to, withTotal = true, limitedCountThreshold)(_.richJobWithCustomRenderer(jobParents(_)(authContext))(authContext))
-        case (range, jobSteps, authContext) =>
-          jobSteps.richPage(range.from, range.to, withTotal = true, limitedCountThreshold)(
-            _.richJob(authContext).domainMap((_, None: Option[(RichObservable, RichCase)]))
-          )
-      }
-    )
-  override val outputQuery: Query = Query.outputWithContext[RichJob, Traversal.V[Job]]((jobSteps, authContext) => jobSteps.richJob(authContext))
-  override val extraQueries: Seq[ParamQuery[_]] = Seq(
-    Query[Traversal.V[Observable], Traversal.V[Job]]("jobs", (observables, _) => observables.jobs)
-  )
-  override val publicProperties: PublicProperties = PublicPropertyListBuilder[Job]
-    .property("analyzerId", UMapping.string)(_.rename("workerId").readonly)
-    .property("cortexId", UMapping.string.optional)(_.field.readonly)
-    .property("startDate", UMapping.date)(_.field.readonly)
-    .property("status", UMapping.string)(_.field.readonly)
-    .property("analyzerDefinition", UMapping.string)(_.rename("workerDefinition").readonly)
-    .build
-}
-"#;
 
 // ---------------------------------------------------------------------------
 // `--rerun` config reconstruction (`src/mcp_property_fuzzer/rerun.rs`)
