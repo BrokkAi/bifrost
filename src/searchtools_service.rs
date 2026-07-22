@@ -803,9 +803,8 @@ impl SearchToolsService {
         arguments: Value,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(crate::analyzer::structural::execute_request(
-            snapshot.analyzer(),
-            &query,
+        Ok(crate::analyzer::structural::execute_workspace_request(
+            snapshot, &query,
         ))
     }
 

@@ -3388,6 +3388,7 @@ fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncomplet
         }
         CodeQueryDiagnosticCode::ResultLimitReached => PolicyIncompleteReason::QueryResultLimit,
         CodeQueryDiagnosticCode::SemanticResultsOmitted
+        | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
         | CodeQueryDiagnosticCode::CallRelationParseFailed
         | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
         | CodeQueryDiagnosticCode::CallRelationAnalysisFailed

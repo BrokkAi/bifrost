@@ -5,8 +5,6 @@
 //! block invocation).  This adapter lowers only tree-sitter-structured control
 //! and calls, and records the remaining decisions as exact semantic gaps.
 
-use std::sync::Arc;
-
 use tree_sitter::Node;
 
 use crate::analyzer::semantic::cfg::{
@@ -21,16 +19,7 @@ use crate::hash::{HashMap, HashSet};
 
 const ADAPTER_VERSION: &[u8] = b"ruby-cfg-v1";
 
-impl ProgramSemanticsProvider for RubyAnalyzer {
-    fn materialize(
-        &self,
-        file: &ProjectFile,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-        self.inner
-            .materialize_semantics_with_lowerer(&RubySemanticLowerer, file, request)
-    }
-}
+impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
 #[derive(Default)]
 struct BodyComponents<'tree> {
@@ -196,11 +185,6 @@ fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     node.named_children(&mut cursor).collect()
 }
 
-fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor).collect()
-}
-
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RubyLoweringError> {
     node.child_by_field_name(field)
         .ok_or_else(|| missing_field(node, field))
@@ -213,10 +197,6 @@ fn missing_field(node: Node<'_>, field: &str) -> RubyLoweringError {
         node.start_byte(),
         node.end_byte()
     ))
-}
-
-fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    source.get(node.byte_range())
 }
 
 fn is_short_circuit_binary(source: &str, node: Node<'_>) -> bool {
@@ -337,10 +317,7 @@ impl<'source, 'request> LocalBindingCollector<'source, 'request> {
     }
 
     fn charge(&mut self, delta: SemanticWork) -> Result<(), RubyLoweringError> {
-        let candidate = self
-            .work
-            .checked_add(delta)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+        let candidate = self.work.conservative_add(delta);
         if let Err(exceeded) = self.budget.check(candidate) {
             return Err(RubyLoweringError::Budget(exceeded, Box::new(candidate)));
         }
@@ -607,23 +584,6 @@ fn callable_parameters<'tree>(callable: Node<'tree>, body: Node<'tree>) -> Optio
     })
 }
 
-fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {
-    let start_position = node.start_position();
-    let end_position = node.end_position();
-    let start = SourcePosition::new(
-        u32::try_from(node.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start_position.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start_position.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = SourcePosition::new(
-        u32::try_from(node.end_byte()).map_err(|_| "source end exceeds u32")?,
-        u32::try_from(end_position.row).map_err(|_| "source end line exceeds u32")?,
-        u32::try_from(end_position.column).map_err(|_| "source end column exceeds u32")?,
-    );
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
-}
-
 fn source_anchor_between(
     start_node: Node<'_>,
     end_node: Node<'_>,
@@ -742,11 +702,11 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 Err(RubyLoweringError::Cancelled(work)) => {
                     return Ok(SemanticOutcome::Cancelled {
                         partial: None,
-                        work: sum_work(binding_work, *work),
+                        work: sum_lowering_work(binding_work, *work),
                     });
                 }
                 Err(RubyLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_work(binding_work, *work);
+                    let work = sum_lowering_work(binding_work, *work);
                     let exceeded = budget.check(work).err().unwrap_or(exceeded);
                     return Ok(SemanticOutcome::ExceededBudget {
                         partial: None,
@@ -758,7 +718,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                     return Err(SemanticProviderError::internal(detail));
                 }
             };
-            binding_work = sum_work(binding_work, collection.work);
+            binding_work = sum_lowering_work(binding_work, collection.work);
             if let Err(exceeded) = budget.check(binding_work) {
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
@@ -772,74 +732,23 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
             });
         }
 
-        let mut procedures = Vec::with_capacity(specs.len());
-        let mut observed = binding_work;
-        for (spec, local_bindings) in specs.iter().zip(&bindings_by_procedure) {
-            if cancellation.is_cancelled() {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: observed,
-                });
-            }
-            let mut staged_budget = budget.clone();
-            if let Err(exceeded) = staged_budget.charge(observed) {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work: observed,
-                });
-            }
-            match lower_procedure(
-                prepared,
-                spec,
-                &local_bindings.timeline,
-                local_bindings.has_parameter_defaults,
-                &staged_budget,
-                cancellation,
-            ) {
-                Ok((parts, work)) => {
-                    let candidate = sum_work(observed, work);
-                    if let Err(exceeded) = budget.check(candidate) {
-                        return Ok(SemanticOutcome::ExceededBudget {
-                            partial: None,
-                            exceeded,
-                            work: candidate,
-                        });
-                    }
-                    observed = candidate;
-                    procedures.push(parts);
-                }
-                Err(RubyLoweringError::Cancelled(work)) => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work: sum_work(observed, *work),
-                    });
-                }
-                Err(RubyLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_work(observed, *work);
-                    let exceeded = budget.check(work).err().unwrap_or(exceeded);
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                Err(RubyLoweringError::Invalid(detail)) => {
-                    return Err(SemanticProviderError::internal(detail));
-                }
-            }
-        }
-
-        Ok(SemanticOutcome::Complete {
-            value: procedures,
-            work: observed,
-        })
+        lower_procedure_batch(
+            specs.iter().zip(&bindings_by_procedure),
+            binding_work,
+            budget,
+            cancellation,
+            |(spec, local_bindings), staged_budget, cancellation| {
+                lower_procedure(
+                    prepared,
+                    spec,
+                    &local_bindings.timeline,
+                    local_bindings.has_parameter_defaults,
+                    staged_budget,
+                    cancellation,
+                )
+            },
+        )
     }
-}
-
-fn sum_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
 }
 
 fn ruby_capabilities() -> SemanticCapabilities {
@@ -910,11 +819,6 @@ struct ProcedureEnumerationFrame<'tree> {
 struct SyntheticBodyScope {
     procedure: ProcedureId,
     callable_path: usize,
-}
-
-struct DeclarationPathEntry {
-    parent: Option<usize>,
-    segment: DeclarationSegment,
 }
 
 fn enumerate_procedures<'tree>(
@@ -1006,7 +910,7 @@ fn enumerate_procedures<'tree>(
                 SemanticRole::Procedure,
                 anchor,
             );
-            let candidate = sum_work(preflight, procedure_identity_preflight(&locator));
+            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
             if let Err(exceeded) = budget.check(candidate) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
@@ -1209,6 +1113,7 @@ fn callable_shape<'tree>(
             is_static,
             is_synthetic: synthetic,
             invocation: immediate,
+            ..ProcedureProperties::default()
         },
         attach_lexical_parent: attach,
     })
@@ -1272,91 +1177,7 @@ fn is_initializer_member_declaration(node: Node<'_>) -> bool {
     )
 }
 
-fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
-    }
-}
-
-fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let ordinal = *siblings.entry(key.clone()).or_default();
-    *siblings.get_mut(&key).expect("inserted sibling ordinal") += 1;
-    ordinal
-}
-
-fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
-}
-
-#[derive(Debug)]
-enum RubyLoweringError {
-    Cancelled(Box<SemanticWork>),
-    Budget(SemanticBudgetExceeded, Box<SemanticWork>),
-    Invalid(String),
-}
-
-impl From<SemanticBudgetExceeded> for RubyLoweringError {
-    fn from(error: SemanticBudgetExceeded) -> Self {
-        Self::Budget(error, Box::default())
-    }
-}
+type RubyLoweringError = ProcedureLoweringError;
 
 #[derive(Debug, Clone, Copy)]
 struct EdgeTarget {
@@ -1397,12 +1218,6 @@ enum Work<'tree> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PointMetadata {
-    source: SourceMappingId,
-    evidence: EvidenceId,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
     id: CleanupRegionId,
     body: Node<'tree>,
@@ -1420,24 +1235,16 @@ struct RubyControlFrame {
 
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
-    locator: SemanticLocator,
+    session: ProcedureLoweringSession<'targets>,
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
     procedure_runtime_body_node_id: usize,
     reuse_first_statement_entry: bool,
     nonlocal_cleanup_label: Option<Box<str>>,
-    point_metadata: Vec<PointMetadata>,
-    next_source: usize,
-    next_evidence: usize,
-    next_value: usize,
-    next_call_site: usize,
-    next_gap: usize,
     next_control_label: usize,
-    source_occurrences: HashMap<(usize, usize), u32>,
     cleanups: Vec<CleanupRegion<'tree>>,
     controls: HashMap<ScopeFrameId, Box<[RubyControlFrame]>>,
     local_bindings: &'targets LocalBindingTimeline,
-    cancellation: &'targets CancellationToken,
 }
 
 fn lower_procedure<'tree, 'request>(
@@ -1448,64 +1255,23 @@ fn lower_procedure<'tree, 'request>(
     budget: &SemanticBudget,
     cancellation: &'request CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), RubyLoweringError> {
-    let base_source = SourceMappingId::new(0);
-    let base_evidence = EvidenceId::new(0);
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
         spec.locator.clone(),
         spec.kind,
-        base_source,
-        base_evidence,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
     );
     parts.lexical_parent = spec.lexical_parent;
     parts.properties = spec.properties;
-    parts.source_mappings.push(SourceMapping {
-        id: base_source,
-        locator: spec.locator.clone(),
-        kind: SourceMappingKind::Exact,
-    });
-    parts.evidence_rows.push(Evidence {
-        id: base_evidence,
-        proof: ProofStatus::Proven,
-        completeness: EvidenceCompleteness::Complete,
-        sources: Box::new([base_source]),
-    });
-
-    let mut builder = ProcedureCfgBuilder::new(parts, budget)?;
-    let entry = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::Entry,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let normal_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::NormalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let exceptional_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::ExceptionalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let function_scope = builder.push_scope(
-        None,
-        ScopeBinding::Function {
-            return_target: normal_exit,
-            throw_target: exceptional_exit,
-        },
-    );
+    let ProcedureLoweringStart {
+        mut builder,
+        session,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        function_scope,
+    } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let runtime_body = if matches!(spec.body.kind(), "block" | "do_block") {
         spec.body.child_by_field_name("body").unwrap_or(spec.body)
     } else {
@@ -1513,7 +1279,7 @@ fn lower_procedure<'tree, 'request>(
     };
     let mut context = LoweringContext {
         source: prepared.source(),
-        locator: spec.locator.clone(),
+        session,
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
         procedure_runtime_body_node_id: runtime_body.id(),
@@ -1522,24 +1288,10 @@ fn lower_procedure<'tree, 'request>(
             ProcedureKind::Lambda | ProcedureKind::Closure
         ),
         nonlocal_cleanup_label: None,
-        point_metadata: vec![
-            PointMetadata {
-                source: base_source,
-                evidence: base_evidence,
-            };
-            3
-        ],
-        next_source: 1,
-        next_evidence: 1,
-        next_value: 0,
-        next_call_site: 0,
-        next_gap: 0,
         next_control_label: 0,
-        source_occurrences: HashMap::default(),
         cleanups: Vec::new(),
         controls: HashMap::default(),
         local_bindings,
-        cancellation,
     };
     context.controls.insert(function_scope, Box::new([]));
 
@@ -1747,7 +1499,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         work: Work<'tree>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
-        if self.cancellation.is_cancelled() {
+        if self.session.cancellation().is_cancelled() {
             return Err(RubyLoweringError::Cancelled(Box::default()));
         }
         match work {
@@ -3037,47 +2789,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
 
-        let call_site = CallSiteId::new(
-            u32::try_from(self.next_call_site)
-                .map_err(|_| RubyLoweringError::Invalid("too many call sites".into()))?,
-        );
         let argument_nodes = call_arguments(node);
         let attached_block = node.child_by_field_name("block");
         let argument_count = argument_nodes.len() + usize::from(attached_block.is_some());
         let arguments = (0..argument_count)
             .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.add_call_site(SemanticCallSite {
-            id: call_site,
-            point: invoke,
-            callee,
-            receiver,
-            arguments: arguments.into_boxed_slice(),
-            result: Some(result),
-            thrown: Some(thrown),
-            declared_targets: resolution.clone(),
-            target_evidence: metadata.evidence,
-            normal_continuation: ControlContinuation::Target(normal),
-            exceptional_continuation: ControlContinuation::Target(exceptional),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_call_site += 1;
-        self.append_effect(builder, invoke, SemanticEffect::Invoke { call_site })?;
-        self.append_effect(
+        let call_site = self.session.add_call_site(
             builder,
-            normal,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Normal,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Exceptional,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: arguments.into_iter().map(Into::into).collect(),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
             },
         )?;
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
@@ -3230,11 +2959,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         has_block: bool,
     ) -> Result<(), RubyLoweringError> {
         if has_block && method != Some("define_method") {
-            self.add_gap(
+            self.session.add_gap_with_impacts(
                 builder,
                 point,
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::DeferredExecution,
+                SemanticGapImpacts::CALL_EVALUATION,
                 SemanticGapKind::Unknown,
                 "an attached Ruby block is a separate callable whose invocation timing depends on the callee",
             )?;
@@ -3857,41 +3587,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
-        let call_site = CallSiteId::new(
-            u32::try_from(self.next_call_site)
-                .map_err(|_| RubyLoweringError::Invalid("too many call sites".into()))?,
-        );
-        builder.add_call_site(SemanticCallSite {
-            id: call_site,
-            point: invoke,
-            callee,
-            receiver: None,
-            arguments: Box::new([]),
-            result: Some(result),
-            thrown: Some(thrown),
-            declared_targets: resolution.clone(),
-            target_evidence: metadata.evidence,
-            normal_continuation: ControlContinuation::Target(normal),
-            exceptional_continuation: ControlContinuation::Target(exceptional),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_call_site += 1;
-        self.append_effect(builder, invoke, SemanticEffect::Invoke { call_site })?;
-        self.append_effect(
+        let call_site = self.session.add_call_site(
             builder,
-            normal,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Normal,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Exceptional,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: None,
+                arguments: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
             },
         )?;
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
@@ -4213,12 +3920,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let (cleanup_entry, created) =
                 builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
             if created {
-                if cleanup_entry.index() != self.point_metadata.len() {
-                    return Err(RubyLoweringError::Invalid(
-                        "cleanup specialization broke dense point allocation".into(),
-                    ));
-                }
-                self.point_metadata.push(metadata);
+                self.session.register_point(
+                    cleanup_entry,
+                    metadata,
+                    "cleanup specialization broke dense point allocation",
+                )?;
                 stack.push(Work::Statement {
                     node: region.body,
                     entry: cleanup_entry,
@@ -4290,10 +3996,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, RubyLoweringError> {
         let range = (start.start_byte(), end.end_byte());
-        let occurrence = self.source_occurrences.entry(range).or_default();
+        let occurrence = self.session.next_source_occurrence(range.0, range.1);
         let anchor =
-            source_anchor_between(start, end, *occurrence).map_err(RubyLoweringError::Invalid)?;
-        *occurrence += 1;
+            source_anchor_between(start, end, occurrence).map_err(RubyLoweringError::Invalid)?;
         let metadata = self.add_mapping(builder, anchor)?;
         self.add_point_with_metadata(builder, metadata, effects)
     }
@@ -4305,10 +4010,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         child: Node<'tree>,
     ) -> Result<ProgramPointId, RubyLoweringError> {
         let range = (node.start_byte(), child.start_byte());
-        let occurrence = self.source_occurrences.entry(range).or_default();
+        let occurrence = self.session.next_source_occurrence(range.0, range.1);
         let anchor =
-            callable_source_anchor(node, child, *occurrence).map_err(RubyLoweringError::Invalid)?;
-        *occurrence += 1;
+            callable_source_anchor(node, child, occurrence).map_err(RubyLoweringError::Invalid)?;
         let metadata = self.add_mapping(builder, anchor)?;
         self.add_point_with_metadata(builder, metadata, Vec::new())
     }
@@ -4329,18 +4033,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         metadata: PointMetadata,
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, RubyLoweringError> {
-        let events = effects
-            .into_iter()
-            .map(|effect| SemanticEvent::new(effect, metadata.source, metadata.evidence))
-            .collect();
-        let point = builder.add_point(events, metadata.source, metadata.evidence)?;
-        if point.index() != self.point_metadata.len() {
-            return Err(RubyLoweringError::Invalid(
-                "program-point allocation is not dense".into(),
-            ));
-        }
-        self.point_metadata.push(metadata);
-        Ok(point)
+        self.session.add_point(builder, metadata, effects)
     }
 
     fn mapping(
@@ -4349,12 +4042,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, RubyLoweringError> {
         let range = node.byte_range();
-        let occurrence = self
-            .source_occurrences
-            .entry((range.start, range.end))
-            .or_default();
-        let anchor = source_anchor(node, *occurrence).map_err(RubyLoweringError::Invalid)?;
-        *occurrence += 1;
+        let occurrence = self.session.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(RubyLoweringError::Invalid)?;
         self.add_mapping(builder, anchor)
     }
 
@@ -4372,45 +4061,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         anchor: SourceAnchor,
         mapping_kind: SourceMappingKind,
     ) -> Result<PointMetadata, RubyLoweringError> {
-        let source = SourceMappingId::new(
-            u32::try_from(self.next_source)
-                .map_err(|_| RubyLoweringError::Invalid("too many source mappings".into()))?,
-        );
-        let evidence = EvidenceId::new(
-            u32::try_from(self.next_evidence)
-                .map_err(|_| RubyLoweringError::Invalid("too many evidence rows".into()))?,
-        );
-        let locator = SemanticLocator::new(
-            self.locator.mount(),
-            self.locator.path().clone(),
-            self.locator.language(),
-            self.locator.declaration().clone(),
-            SemanticRole::ProgramPoint,
-            anchor,
-        );
-        builder.add_source_mapping(SourceMapping {
-            id: source,
-            locator,
-            kind: mapping_kind,
-        })?;
-        builder.add_evidence(Evidence {
-            id: evidence,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            sources: Box::new([source]),
-        })?;
-        self.next_source += 1;
-        self.next_evidence += 1;
-        Ok(PointMetadata { source, evidence })
+        self.session.add_mapping(builder, anchor, mapping_kind)
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, RubyLoweringError> {
-        self.point_metadata
-            .get(point.index())
-            .copied()
-            .ok_or_else(|| {
-                RubyLoweringError::Invalid(format!("missing metadata for program point {point}"))
-            })
+        self.session.metadata(point)
     }
 
     fn value(
@@ -4419,19 +4074,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         kind: SemanticValueKind,
     ) -> Result<ValueId, RubyLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = ValueId::new(
-            u32::try_from(self.next_value)
-                .map_err(|_| RubyLoweringError::Invalid("too many semantic values".into()))?,
-        );
-        builder.add_value(SemanticValue {
-            id,
-            kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_value += 1;
-        Ok(id)
+        self.session.add_value(builder, point, kind)
     }
 
     fn append_effect(
@@ -4440,12 +4083,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         effect: SemanticEffect,
     ) -> Result<(), RubyLoweringError> {
-        let metadata = self.metadata(point)?;
-        builder.append_event(
-            point,
-            SemanticEvent::new(effect, metadata.source, metadata.evidence),
-        )?;
-        Ok(())
+        self.session.append_effect(builder, point, effect)
     }
 
     fn add_gap(
@@ -4457,24 +4095,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         kind: SemanticGapKind,
         detail: &str,
     ) -> Result<(), RubyLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = SemanticGapId::new(
-            u32::try_from(self.next_gap)
-                .map_err(|_| RubyLoweringError::Invalid("too many semantic gaps".into()))?,
-        );
-        builder.add_gap(SemanticGap {
-            id,
-            point,
-            subject,
-            capability,
-            kind,
-            budget: None,
-            detail: detail.into(),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_gap += 1;
-        self.append_effect(builder, point, SemanticEffect::Gap { gap: id })
+        self.session
+            .add_gap(builder, point, subject, capability, kind, detail)?;
+        Ok(())
     }
 
     fn edge(
@@ -4483,15 +4106,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         source_point: ProgramPointId,
         target: EdgeTarget,
     ) -> Result<(), RubyLoweringError> {
-        let metadata = self.metadata(source_point)?;
-        builder.add_edge(ControlEdge {
-            source_point,
-            target_point: target.point,
-            kind: target.kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        Ok(())
+        self.session
+            .add_edge(builder, source_point, target.point, target.kind)
     }
 }
 

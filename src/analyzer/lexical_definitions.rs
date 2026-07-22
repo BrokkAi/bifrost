@@ -109,7 +109,7 @@ pub(crate) fn formal_parameter_slots(
         };
         let receiver = binding.kind == DeclarationKind::ReceiverParameter;
         let declaration_range = node_range(binding.declaration);
-        let variadic = is_variadic_parameter(language, binding.declaration.kind());
+        let variadic = is_variadic_parameter(language, binding.declaration);
         let can_share_slot = language != Language::Go;
         if can_share_slot
             && let Some(slot) = slots.last_mut()
@@ -368,14 +368,17 @@ fn parameter_roots<'tree>(
     (ordinary_roots, receiver_roots)
 }
 
-fn is_variadic_parameter(language: Language, kind: &str) -> Option<FormalVariadicKind> {
+fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<FormalVariadicKind> {
     use FormalVariadicKind::{Both, Keyword, Positional};
+    let kind = parameter.kind();
     match language {
         Language::Java => (kind == "spread_parameter").then_some(Positional),
         Language::Go => (kind == "variadic_parameter_declaration").then_some(Positional),
-        Language::JavaScript | Language::TypeScript => {
-            (kind == "rest_pattern").then_some(Positional)
-        }
+        Language::JavaScript | Language::TypeScript => (kind == "rest_pattern"
+            || parameter
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.kind() == "rest_pattern"))
+        .then_some(Positional),
         Language::Python => match kind {
             "list_splat_pattern" => Some(Positional),
             "dictionary_splat_pattern" => Some(Keyword),

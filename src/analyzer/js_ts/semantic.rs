@@ -2,18 +2,21 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{Language, ProjectFile};
-use crate::hash::HashMap;
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{Language, ProjectFile, Range};
+use crate::hash::{HashMap, HashSet};
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-cfg-v1";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-cfg-v1";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v6";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v7";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -100,7 +103,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 prepared.dialect()
             )));
         }
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
+        let mut specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
             ProcedureEnumeration::Complete(specs) => specs,
             ProcedureEnumeration::ExceededBudget { exceeded, work } => {
                 return Ok(SemanticOutcome::ExceededBudget {
@@ -116,74 +119,76 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 });
             }
         };
+        if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        for index in 0..specs.len() {
+            if cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: SemanticWork::default(),
+                });
+            }
+            let parent = specs[index]
+                .lexical_parent
+                .and_then(|parent| specs.get(parent.index()));
+            let can_capture_receiver = parent.is_some_and(|parent| {
+                parent.captures_receiver
+                    || (!parent.properties.is_static
+                        && matches!(
+                            parent.kind,
+                            ProcedureKind::Method
+                                | ProcedureKind::Constructor
+                                | ProcedureKind::Function
+                        ))
+            });
+            specs[index].captures_receiver &= can_capture_receiver;
+        }
         if cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
                 work: SemanticWork::default(),
             });
         }
-        let mut procedures = Vec::with_capacity(specs.len());
-        let mut observed = SemanticWork::default();
-
-        for spec in &specs {
-            if cancellation.is_cancelled() {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: observed,
-                });
-            }
-            let mut staged_budget = budget.clone();
-            if let Err(exceeded) = staged_budget.charge(observed) {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work: observed,
-                });
-            }
-            match lower_procedure(prepared, spec, &staged_budget, cancellation) {
-                Ok((parts, work)) => {
-                    let candidate = sum_work(observed, work);
-                    if let Err(exceeded) = budget.check(candidate) {
-                        return Ok(SemanticOutcome::ExceededBudget {
-                            partial: None,
-                            exceeded,
-                            work: candidate,
-                        });
-                    }
-                    observed = candidate;
-                    procedures.push(parts);
-                }
-                Err(TsLoweringError::Cancelled(work)) => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work: sum_work(observed, *work),
-                    });
-                }
-                Err(TsLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_work(observed, *work);
-                    let exceeded = budget.check(work).err().unwrap_or(exceeded);
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                Err(TsLoweringError::Invalid(detail)) => {
-                    return Err(SemanticProviderError::internal(detail));
-                }
-            }
-        }
-
-        Ok(SemanticOutcome::Complete {
-            value: procedures,
-            work: observed,
-        })
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.callable.id(),
+                    NestedProcedureTarget {
+                        id: spec.id,
+                        receiver_capture_destination: spec
+                            .captures_receiver
+                            .then_some(RECEIVER_CAPTURE_DESTINATION),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut bound_capture_targets = HashSet::default();
+        lower_procedure_batch(
+            &specs,
+            SemanticWork::default(),
+            budget,
+            cancellation,
+            |spec, staged_budget, cancellation| {
+                let capture_binding_expected = bound_capture_targets.contains(&spec.id);
+                let lowered = lower_procedure(
+                    prepared,
+                    spec,
+                    &procedure_targets,
+                    capture_binding_expected,
+                    staged_budget,
+                    cancellation,
+                )?;
+                bound_capture_targets
+                    .extend(lowered.0.captures.iter().map(|capture| capture.target));
+                Ok(lowered)
+            },
+        )
     }
-}
-
-fn sum_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
 }
 
 fn js_ts_capabilities() -> SemanticCapabilities {
@@ -208,6 +213,14 @@ fn js_ts_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::FieldMemory,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::NormalControlFlow,
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::NonLocalControl,
@@ -220,7 +233,6 @@ fn js_ts_capabilities() -> SemanticCapabilities {
     builder.build()
 }
 
-#[derive(Clone)]
 struct ProcedureSpec<'tree> {
     id: ProcedureId,
     body: Node<'tree>,
@@ -229,6 +241,31 @@ struct ProcedureSpec<'tree> {
     kind: ProcedureKind,
     properties: ProcedureProperties,
     callable: Node<'tree>,
+    captures_receiver: bool,
+}
+
+impl ReceiverCaptureSpec for ProcedureSpec<'_> {
+    fn lexical_parent(&self) -> Option<ProcedureId> {
+        self.lexical_parent
+    }
+
+    fn relays_receiver_capture(&self) -> bool {
+        self.kind == ProcedureKind::Lambda
+    }
+
+    fn captures_receiver(&self) -> bool {
+        self.captures_receiver
+    }
+
+    fn require_receiver_capture(&mut self) {
+        self.captures_receiver = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NestedProcedureTarget {
+    id: ProcedureId,
+    receiver_capture_destination: Option<MemoryLocationId>,
 }
 
 enum ProcedureEnumeration<'tree> {
@@ -244,11 +281,6 @@ struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
     lexical_parent: Option<ProcedureId>,
     declaration_path: usize,
-}
-
-struct DeclarationPathEntry {
-    parent: Option<usize>,
-    segment: DeclarationSegment,
 }
 
 fn enumerate_procedures<'tree>(
@@ -343,7 +375,7 @@ fn enumerate_procedures<'tree>(
                 SemanticRole::Procedure,
                 anchor,
             );
-            let candidate = sum_work(preflight, procedure_identity_preflight(&locator));
+            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
             if let Err(exceeded) = budget.check(candidate) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
@@ -351,6 +383,14 @@ fn enumerate_procedures<'tree>(
                 });
             }
             preflight = candidate;
+            let captures_receiver = if kind == ProcedureKind::Lambda {
+                match body_contains_free_this(body, cancellation) {
+                    Ok(captures_receiver) => captures_receiver,
+                    Err(LoweringCancelled) => return Ok(ProcedureEnumeration::Cancelled),
+                }
+            } else {
+                false
+            };
             specs.push(ProcedureSpec {
                 id,
                 body,
@@ -359,6 +399,7 @@ fn enumerate_procedures<'tree>(
                 kind,
                 properties,
                 callable: node,
+                captures_receiver,
             });
             child_parent = Some(id);
             child_path = push_declaration_path(&mut declaration_paths, child_path, segment);
@@ -375,85 +416,6 @@ fn enumerate_procedures<'tree>(
         }
     }
     Ok(ProcedureEnumeration::Complete(specs))
-}
-
-/// Minimum retained identity work reserved by `ProcedureCfgBuilder::new` for
-/// one enumerated procedure. This is a preflight only: the builder accounts
-/// the same rows and strings exactly when lowering, so callers must not add
-/// this estimate to the returned artifact work.
-fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        // Two empty adjacency offset arrays, one evidence source, and three
-        // retained locator copies (procedure, locator index, source mapping).
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
-    }
-}
-
-fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let ordinal = *siblings.entry(key.clone()).or_default();
-    *siblings.get_mut(&key).expect("inserted sibling ordinal") += 1;
-    ordinal
-}
-
-fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -630,22 +592,12 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
+            ..ProcedureProperties::default()
         },
     ))
 }
 
-#[derive(Debug)]
-enum TsLoweringError {
-    Cancelled(Box<SemanticWork>),
-    Budget(SemanticBudgetExceeded, Box<SemanticWork>),
-    Invalid(String),
-}
-
-impl From<SemanticBudgetExceeded> for TsLoweringError {
-    fn from(error: SemanticBudgetExceeded) -> Self {
-        Self::Budget(error, Box::default())
-    }
-}
+type TsLoweringError = ProcedureLoweringError;
 
 #[derive(Debug, Clone, Copy)]
 struct EdgeTarget {
@@ -700,12 +652,6 @@ enum Work<'tree> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PointMetadata {
-    source: SourceMappingId,
-    evidence: EvidenceId,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
     id: CleanupRegionId,
     body: Node<'tree>,
@@ -714,103 +660,63 @@ struct CleanupRegion<'tree> {
 
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
-    locator: SemanticLocator,
-    point_metadata: Vec<PointMetadata>,
-    next_source: usize,
-    next_evidence: usize,
-    next_value: usize,
-    next_call_site: usize,
-    next_gap: usize,
-    source_occurrences: HashMap<(usize, usize), u32>,
+    session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    receiver: Option<ValueId>,
+    captured_receiver: Option<ValueId>,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     abruptness: HashMap<usize, bool>,
     cleanups: Vec<CleanupRegion<'tree>>,
-    cancellation: &'targets CancellationToken,
 }
 
-fn lower_procedure<'tree>(
+struct LocalBinding {
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
+}
+
+fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    capture_binding_expected: bool,
     budget: &SemanticBudget,
-    cancellation: &CancellationToken,
+    cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), TsLoweringError> {
-    let base_source = SourceMappingId::new(0);
-    let base_evidence = EvidenceId::new(0);
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
         spec.locator.clone(),
         spec.kind,
-        base_source,
-        base_evidence,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
     );
     parts.lexical_parent = spec.lexical_parent;
     parts.properties = spec.properties;
-    parts.source_mappings.push(SourceMapping {
-        id: base_source,
-        locator: spec.locator.clone(),
-        kind: SourceMappingKind::Exact,
-    });
-    parts.evidence_rows.push(Evidence {
-        id: base_evidence,
-        proof: ProofStatus::Proven,
-        completeness: EvidenceCompleteness::Complete,
-        sources: Box::new([base_source]),
-    });
-
-    let mut builder = ProcedureCfgBuilder::new(parts, budget)?;
-    let entry = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::Entry,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let normal_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::NormalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let exceptional_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::ExceptionalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let function_scope = builder.push_scope(
-        None,
-        ScopeBinding::Function {
-            return_target: normal_exit,
-            throw_target: exceptional_exit,
-        },
-    );
+    let ProcedureLoweringStart {
+        mut builder,
+        session,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        function_scope,
+    } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
         prepared,
-        locator: spec.locator.clone(),
-        point_metadata: vec![
-            PointMetadata {
-                source: base_source,
-                evidence: base_evidence,
-            };
-            3
-        ],
-        next_source: 1,
-        next_evidence: 1,
-        next_value: 0,
-        next_call_site: 0,
-        next_gap: 0,
-        source_occurrences: HashMap::default(),
+        session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
+        captured_receiver: None,
+        procedure_targets,
         abruptness: HashMap::default(),
         cleanups: Vec::new(),
-        cancellation,
     };
+    context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.emit_captured_receiver(&mut builder, entry, spec, capture_binding_expected)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
     if spec.properties.is_generator {
         context.add_gap(
             &mut builder,
@@ -841,7 +747,18 @@ fn lower_procedure<'tree>(
         }
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let source =
+            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: value,
+            },
+        )?;
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -913,6 +830,405 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_captured_receiver(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+        capture_binding_expected: bool,
+    ) -> Result<(), TsLoweringError> {
+        let Some(lexical_parent) = spec.lexical_parent.filter(|_| spec.captures_receiver) else {
+            return Ok(());
+        };
+        let metadata = self.value_mapping(builder, spec.callable)?;
+        let (value, location) =
+            self.session
+                .add_receiver_capture_input(builder, entry, metadata, lexical_parent)?;
+        if !capture_binding_expected {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::MemoryLocation(location),
+                SemanticCapability::Captures,
+                SemanticGapKind::Unsupported,
+                "lexical receiver capture source is not represented by the parent procedure",
+            )?;
+        }
+        self.captured_receiver = Some(value);
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), TsLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(TsLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if is_js_ts_nested_execution_boundary(node, body) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "variable_declarator"
+                && let Some(name) = node.child_by_field_name("name")
+                && name.kind() == "identifier"
+                && let Some(text) = node_text(self.prepared.source(), name)
+                && let Some((scope_start, scope_end)) = js_ts_local_scope(node)
+            {
+                if self.locals.get(text).is_some_and(|bindings| {
+                    bindings.iter().any(|binding| {
+                        binding.scope_start == scope_start && binding.scope_end == scope_end
+                    })
+                }) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                let metadata = self.value_mapping(builder, name)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals
+                    .entry(text.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| binding.scope_start <= byte && byte < binding.scope_end)
+            .min_by_key(|binding| binding.scope_end - binding.scope_start)
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let initializers = named_children(node)
+            .into_iter()
+            .filter(|child| child.kind() == "variable_declarator")
+            .filter_map(|declarator| {
+                let name = declarator.child_by_field_name("name")?;
+                let initializer = declarator.child_by_field_name("value")?;
+                (name.kind() == "identifier").then_some((declarator, name, initializer))
+            })
+            .collect::<Vec<_>>();
+        if initializers.is_empty() {
+            return self.edge(builder, entry, next);
+        }
+
+        let expression_entries = initializers
+            .iter()
+            .map(|(_, _, initializer)| self.point(builder, *initializer, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminals = initializers
+            .iter()
+            .map(|(declarator, _, _)| self.point(builder, *declarator, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
+        for (index, (_, name, initializer)) in initializers.iter().enumerate().rev() {
+            let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
+                TsLoweringError::Invalid("local declaration has invalid name range".into())
+            })?;
+            let target = self
+                .local_at(target_name, name.start_byte())
+                .ok_or_else(|| {
+                    TsLoweringError::Invalid("local declaration was not preindexed".into())
+                })?;
+            let value =
+                self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
+            self.append_effect(
+                builder,
+                terminals[index],
+                SemanticEffect::Assignment { target, value },
+            )?;
+            self.append_effect(
+                builder,
+                terminals[index],
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: value,
+                    target,
+                },
+            )?;
+            let following = expression_entries
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(next);
+            self.edge(builder, terminals[index], following)?;
+            stack.push(Work::Expression {
+                node: *initializer,
+                entry: expression_entries[index],
+                next: EdgeTarget::normal(terminals[index]),
+                scope,
+            });
+        }
+        Ok(())
+    }
+
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let value = self.expression_value(builder, right, expression_value_kind(right))?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value,
+            },
+        )?;
+
+        let evaluations = if left.kind() == "identifier" {
+            let name = node_text(self.prepared.source(), left).ok_or_else(|| {
+                TsLoweringError::Invalid("assignment has invalid target range".into())
+            })?;
+            let local = self.local_at(name, left.start_byte());
+            let target = local.or_else(|| self.parameters.get(name).copied());
+            if let Some(target) = target {
+                let kind = if local.is_some() {
+                    ValueFlowKind::Local
+                } else {
+                    ValueFlowKind::Parameter
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: value,
+                        target,
+                    },
+                )?;
+            }
+            vec![right]
+        } else if left.kind() == "member_expression" {
+            let object = required_field(left, "object")?;
+            let property = required_field(left, "property")?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field {
+                    base,
+                    member: self.memory_member_locator(property)?,
+                },
+            )?;
+            self.add_field_identity_gap(builder, terminal, location)?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            vec![object, right]
+        } else if left.kind() == "subscript_expression" {
+            let object = required_field(left, "object")?;
+            let index = required_field(left, "index")?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let index_value =
+                self.expression_value(builder, index, expression_value_kind(index))?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index_value),
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value,
+                },
+            )?;
+            vec![object, index, right]
+        } else {
+            named_children(node)
+                .into_iter()
+                .filter(|child| child.kind() != "comment")
+                .collect()
+        };
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+        procedure_kind: ProcedureKind,
+        properties: ProcedureProperties,
+    ) -> Result<(), TsLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots(
+            self.prepared.dialect().language(),
+            self.prepared.tree().root_node(),
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            let node = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let metadata = self.value_mapping(builder, node)?;
+            let receiver_slot = slot.receiver || slot.names.iter().any(|name| name == "this");
+            if receiver_slot {
+                let receiver = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(receiver);
+            } else {
+                let parameter = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                for name in slot.names {
+                    self.parameters.insert(name.into_boxed_str(), parameter);
+                }
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| TsLoweringError::Invalid("too many formal parameters".into()))?;
+            }
+        }
+
+        if self.receiver.is_none()
+            && !properties.is_static
+            && matches!(
+                procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Function
+            )
+        {
+            let metadata = self.value_mapping(builder, callable)?;
+            self.receiver = Some(self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, TsLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), TsLoweringError> {
+        let source = if node.kind() == "this" {
+            self.captured_receiver
+                .map(|source| (source, ValueFlowKind::Local))
+                .or_else(|| {
+                    self.receiver
+                        .map(|source| (source, ValueFlowKind::Receiver))
+                })
+        } else if node.kind() == "identifier" {
+            let name = node_text(self.prepared.source(), node);
+            name.and_then(|name| {
+                self.local_at(name, node.start_byte())
+                    .map(|source| (source, ValueFlowKind::Local))
+                    .or_else(|| {
+                        self.parameters
+                            .get(name)
+                            .copied()
+                            .map(|source| (source, ValueFlowKind::Parameter))
+                    })
+            })
+        } else {
+            None
+        };
+        if let Some((source, kind)) = source
+            && source != target
+        {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn schedule_default_parameters(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -974,7 +1290,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         work: Work<'tree>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
-        if self.cancellation.is_cancelled() {
+        if self.session.cancellation().is_cancelled() {
             return Err(TsLoweringError::Cancelled(Box::default()));
         }
         match work {
@@ -1243,7 +1559,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .or_else(|| first_named_child(node))
                 {
                     let point = self.point(builder, node, Vec::new())?;
+                    let source = self.expression_value(
+                        builder,
+                        value_node,
+                        expression_value_kind(value_node),
+                    )?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Return,
+                            source,
+                            target: value,
+                        },
+                    )?;
                     self.append_effect(
                         builder,
                         point,
@@ -1473,8 +1803,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "explicit resource-management cleanup is not yet lowered",
                     )?;
                 }
-                let initializers = declaration_initializers(node);
-                self.schedule_expressions(builder, entry, &initializers, next, scope, stack)
+                self.local_declaration(builder, node, entry, next, scope, stack)
             }
             "function_declaration"
             | "generator_function_declaration"
@@ -1545,6 +1874,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
         let chain_skip = chain_skip.or_else(|| continuous_optional_chain(node).then_some(next));
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        if matches!(node.kind(), "identifier" | "this") {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
         match node.kind() {
             "call_expression" | "new_expression" => {
                 self.call_expression(builder, node, entry, next, scope, chain_skip, stack)
@@ -1712,11 +2045,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression" if has_child_kind(node, "using") => {
                 self.resource_assignment(builder, node, entry, scope, stack)
             }
+            "assignment_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
             "member_expression" | "subscript_expression" => {
                 self.member_expression(builder, node, entry, next, scope, chain_skip, stack)
             }
-            "assignment_expression"
-            | "augmented_assignment_expression"
+            "augmented_assignment_expression"
             | "unary_expression"
             | "update_expression"
             | "binary_expression"
@@ -1796,6 +2131,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let object = required_field(node, "object")?;
         let access = self.point(builder, node, Vec::new())?;
         self.implicit_exception_gap(builder, access, node)?;
+        if node.kind() == "subscript_expression" {
+            let index = required_field(node, "index")?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let index_value =
+                self.expression_value(builder, index, expression_value_kind(index))?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let location = self.session.add_memory_location(
+                builder,
+                access,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index_value),
+                },
+            )?;
+            self.append_effect(
+                builder,
+                access,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+        } else {
+            let property = required_field(node, "property")?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let location = self.session.add_memory_location(
+                builder,
+                access,
+                MemoryLocationKind::Field {
+                    base,
+                    member: self.memory_member_locator(property)?,
+                },
+            )?;
+            self.add_field_identity_gap(builder, access, location)?;
+            self.append_effect(
+                builder,
+                access,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    result,
+                },
+            )?;
+        }
         self.edge(builder, access, next)?;
 
         let index = (node.kind() == "subscript_expression")
@@ -2436,17 +2817,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
+        let callee = self.expression_value(builder, function, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let (callable_kind, receiver) = if node.kind() == "new_expression" {
             (CallableReferenceKind::Constructor, None)
         } else if function.kind() == "member_expression"
             || function.kind() == "subscript_expression"
         {
+            let object = required_field(function, "object")?;
             (
                 CallableReferenceKind::BoundMethod,
-                Some(self.value(builder, invoke, SemanticValueKind::Receiver)?),
+                Some(self.expression_value(builder, object, expression_value_kind(object))?),
             )
         } else {
             (CallableReferenceKind::Function, None)
@@ -2470,51 +2852,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
-        let call_site = CallSiteId::new(
-            u32::try_from(self.next_call_site)
-                .map_err(|_| TsLoweringError::Invalid("too many call sites".into()))?,
-        );
         let argument_nodes = node
             .child_by_field_name("arguments")
             .map(named_children)
             .unwrap_or_default();
-        let mut arguments = Vec::with_capacity(argument_nodes.len());
-        for _ in &argument_nodes {
-            arguments.push(self.value(builder, invoke, SemanticValueKind::Temporary)?);
+        let arguments = argument_nodes
+            .iter()
+            .map(|argument| {
+                let value =
+                    self.expression_value(builder, *argument, expression_value_kind(*argument))?;
+                Ok(if argument.kind() == "spread_element" {
+                    SemanticCallArgument {
+                        value,
+                        expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                    }
+                } else {
+                    SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                })
+            })
+            .collect::<Result<Vec<_>, TsLoweringError>>()?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: arguments.into_boxed_slice(),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        if node.kind() == "new_expression" {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
-        builder.add_call_site(SemanticCallSite {
-            id: call_site,
-            point: invoke,
-            callee,
-            receiver,
-            arguments: arguments.into_boxed_slice(),
-            result: Some(result),
-            thrown: Some(thrown),
-            declared_targets: resolution.clone(),
-            target_evidence: metadata.evidence,
-            normal_continuation: ControlContinuation::Target(normal),
-            exceptional_continuation: ControlContinuation::Target(exceptional),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_call_site += 1;
-        self.append_effect(builder, invoke, SemanticEffect::Invoke { call_site })?;
-        self.append_effect(
-            builder,
-            normal,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Normal,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Exceptional,
-            },
-        )?;
         self.edge(
             builder,
             invoke,
@@ -2726,14 +3100,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), TsLoweringError> {
-        let result = self.value(builder, entry, SemanticValueKind::Callable)?;
-        let resolution = CallableTargetResolution::Unknown;
+        let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
+        let target = self.procedure_targets.get(&node.id()).copied();
+        let resolution = target
+            .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
+            .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(entry)?;
         let kind = if node.kind() == "arrow_function" {
             CallableReferenceKind::Lambda
         } else {
             CallableReferenceKind::Function
         };
+        let environment =
+            if target.is_some_and(|target| target.receiver_capture_destination.is_some()) {
+                Some(self.session.add_allocation(
+                    builder,
+                    entry,
+                    result,
+                    AllocationKind::ClosureEnvironment,
+                )?)
+            } else {
+                None
+            };
         let effect = SemanticEffect::CallableCreation {
             result,
             callable: CallableValue {
@@ -2741,18 +3129,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 targets: resolution.clone(),
                 target_evidence: metadata.evidence,
                 bound_receiver: None,
-                environment: None,
+                environment,
             },
         };
         self.append_effect(builder, entry, effect)?;
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Value(result),
-            SemanticCapability::CallableReferences,
-            SemanticGapKind::Unknown,
-            "nested callable target mapping is not yet published",
-        )?;
+        if let (Some(target), Some(environment), Some(captured), Some(destination)) = (
+            target,
+            environment,
+            self.receiver.or(self.captured_receiver),
+            target.and_then(|target| target.receiver_capture_destination),
+        ) {
+            self.session.add_capture(
+                builder,
+                entry,
+                result,
+                target.id,
+                environment,
+                CaptureSource::Value(captured),
+                destination,
+                CaptureMode::Value,
+            )?;
+        }
+        if resolution == CallableTargetResolution::Unknown {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unknown,
+                "nested callable target mapping is not yet published",
+            )?;
+        }
         self.edge(builder, entry, next)
     }
 
@@ -2849,7 +3256,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let mut stack = vec![(node, false)];
         while let Some((current, expanded)) = stack.pop() {
-            if self.cancellation.is_cancelled() {
+            if self.session.cancellation().is_cancelled() {
                 return Err(TsLoweringError::Cancelled(Box::default()));
             }
             if self.abruptness.contains_key(&current.id()) {
@@ -2952,7 +3359,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let mut stack = vec![body];
         while let Some(current) = stack.pop() {
-            if self.cancellation.is_cancelled() {
+            if self.session.cancellation().is_cancelled() {
                 return Err(TsLoweringError::Cancelled(Box::default()));
             }
             if current.kind() == "break_statement"
@@ -2974,7 +3381,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn has_potential_break(&self, body: Node<'tree>) -> Result<bool, TsLoweringError> {
         let mut stack = vec![body];
         while let Some(current) = stack.pop() {
-            if self.cancellation.is_cancelled() {
+            if self.session.cancellation().is_cancelled() {
                 return Err(TsLoweringError::Cancelled(Box::default()));
             }
             if current.kind() == "break_statement" {
@@ -3089,12 +3496,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let (entry, created) =
                 builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
             if created {
-                if entry.index() != self.point_metadata.len() {
-                    return Err(TsLoweringError::Invalid(
-                        "cleanup specialization broke dense point allocation".into(),
-                    ));
-                }
-                self.point_metadata.push(metadata);
+                self.session.register_point(
+                    entry,
+                    metadata,
+                    "cleanup specialization broke dense point allocation",
+                )?;
                 let body_next = if next.kind == ControlEdgeKind::Normal {
                     next
                 } else {
@@ -3166,18 +3572,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, TsLoweringError> {
         let metadata = self.mapping(builder, node)?;
-        let events = effects
-            .into_iter()
-            .map(|effect| SemanticEvent::new(effect, metadata.source, metadata.evidence))
-            .collect();
-        let point = builder.add_point(events, metadata.source, metadata.evidence)?;
-        if point.index() != self.point_metadata.len() {
-            return Err(TsLoweringError::Invalid(
-                "program-point allocation is not dense".into(),
-            ));
-        }
-        self.point_metadata.push(metadata);
-        Ok(point)
+        self.session.add_point(builder, metadata, effects)
     }
 
     fn mapping(
@@ -3186,51 +3581,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, TsLoweringError> {
         let range = node.byte_range();
-        let occurrence = self
-            .source_occurrences
-            .entry((range.start, range.end))
-            .or_default();
-        let anchor = source_anchor(node, *occurrence).map_err(TsLoweringError::Invalid)?;
-        *occurrence += 1;
-        let source = SourceMappingId::new(
-            u32::try_from(self.next_source)
-                .map_err(|_| TsLoweringError::Invalid("too many source mappings".into()))?,
-        );
-        let evidence = EvidenceId::new(
-            u32::try_from(self.next_evidence)
-                .map_err(|_| TsLoweringError::Invalid("too many evidence rows".into()))?,
-        );
-        let locator = SemanticLocator::new(
-            self.locator.mount(),
-            self.locator.path().clone(),
-            self.locator.language(),
-            self.locator.declaration().clone(),
-            SemanticRole::ProgramPoint,
+        let occurrence = self.session.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(TsLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, TsLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn memory_member_locator(&self, node: Node<'tree>) -> Result<SemanticLocator, TsLoweringError> {
+        let procedure = self.session.locator();
+        let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
+        Ok(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
             anchor,
-        );
-        builder.add_source_mapping(SourceMapping {
-            id: source,
-            locator,
-            kind: SourceMappingKind::Exact,
-        })?;
-        builder.add_evidence(Evidence {
-            id: evidence,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            sources: Box::new([source]),
-        })?;
-        self.next_source += 1;
-        self.next_evidence += 1;
-        Ok(PointMetadata { source, evidence })
+        ))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), TsLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "field occurrence is structured, but its declaration identity is not yet resolved",
+        )?;
+        Ok(())
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, TsLoweringError> {
-        self.point_metadata
-            .get(point.index())
-            .copied()
-            .ok_or_else(|| {
-                TsLoweringError::Invalid(format!("missing metadata for program point {point}"))
-            })
+        self.session.metadata(point)
     }
 
     fn value(
@@ -3239,19 +3640,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         kind: SemanticValueKind,
     ) -> Result<ValueId, TsLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = ValueId::new(
-            u32::try_from(self.next_value)
-                .map_err(|_| TsLoweringError::Invalid("too many semantic values".into()))?,
-        );
-        builder.add_value(SemanticValue {
-            id,
-            kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_value += 1;
-        Ok(id)
+        self.session.add_value(builder, point, kind)
     }
 
     fn append_effect(
@@ -3260,12 +3649,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         effect: SemanticEffect,
     ) -> Result<(), TsLoweringError> {
-        let metadata = self.metadata(point)?;
-        builder.append_event(
-            point,
-            SemanticEvent::new(effect, metadata.source, metadata.evidence),
-        )?;
-        Ok(())
+        self.session.append_effect(builder, point, effect)
     }
 
     fn add_gap(
@@ -3277,24 +3661,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         kind: SemanticGapKind,
         detail: &str,
     ) -> Result<(), TsLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = SemanticGapId::new(
-            u32::try_from(self.next_gap)
-                .map_err(|_| TsLoweringError::Invalid("too many semantic gaps".into()))?,
-        );
-        builder.add_gap(SemanticGap {
-            id,
-            point,
-            subject,
-            capability,
-            kind,
-            budget: None,
-            detail: detail.into(),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_gap += 1;
-        self.append_effect(builder, point, SemanticEffect::Gap { gap: id })
+        self.session
+            .add_gap(builder, point, subject, capability, kind, detail)?;
+        Ok(())
     }
 
     fn add_resource_cleanup_gaps(
@@ -3335,26 +3704,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         source_point: ProgramPointId,
         target: EdgeTarget,
     ) -> Result<(), TsLoweringError> {
-        let metadata = self.metadata(source_point)?;
-        builder.add_edge(ControlEdge {
-            source_point,
-            target_point: target.point,
-            kind: target.kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        Ok(())
+        self.session
+            .add_edge(builder, source_point, target.point, target.kind)
     }
 }
 
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
-}
-
-fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor).collect()
 }
 
 fn default_parameter_values(node: Node<'_>) -> Vec<Node<'_>> {
@@ -3471,25 +3828,81 @@ fn missing_field(node: Node<'_>, field: &str) -> TsLoweringError {
     ))
 }
 
-fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    source.get(node.byte_range())
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
 }
 
-fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {
-    let start = node.start_position();
-    let end = node.end_position();
-    let start = SourcePosition::new(
-        u32::try_from(node.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = SourcePosition::new(
-        u32::try_from(node.end_byte()).map_err(|_| "source end exceeds u32")?,
-        u32::try_from(end.row).map_err(|_| "source end line exceeds u32")?,
-        u32::try_from(end.column).map_err(|_| "source end column exceeds u32")?,
-    );
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
+fn js_ts_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
+    let is_var = node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "variable_declaration");
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let is_scope = if is_var {
+            matches!(
+                parent.kind(),
+                "program"
+                    | "function_declaration"
+                    | "generator_function_declaration"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_static_block"
+            )
+        } else {
+            matches!(
+                parent.kind(),
+                "program"
+                    | "statement_block"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "switch_body"
+                    | "catch_clause"
+            )
+        };
+        if is_scope {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn body_contains_free_this(
+    body: Node<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, LoweringCancelled> {
+    let mut found = false;
+    try_walk_named_tree_preorder(body, true, |node| {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        if is_js_ts_nested_execution_boundary(node, body) {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if node.kind() == "this" {
+            found = true;
+            return Ok(WalkControl::Break);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        kind if is_callable_kind(kind) => SemanticValueKind::Callable,
+        "number" | "string" | "template_string" | "true" | "false" | "null" | "undefined" => {
+            SemanticValueKind::Constant
+        }
+        _ => SemanticValueKind::Temporary,
+    }
 }
 
 fn is_callable_kind(kind: &str) -> bool {
@@ -3502,6 +3915,24 @@ fn is_callable_kind(kind: &str) -> bool {
             | "arrow_function"
             | "method_definition"
     )
+}
+
+fn is_js_ts_nested_execution_boundary(node: Node<'_>, traversal_root: Node<'_>) -> bool {
+    if is_callable_kind(node.kind()) && node.kind() != "method_definition" {
+        return true;
+    }
+    if node.kind() == "class_static_block" {
+        return true;
+    }
+    node.parent().is_some_and(|parent| {
+        (parent.kind() == "method_definition"
+            && !(node.id() == traversal_root.id() && field_matches(parent, "body", node))
+            && !field_matches(parent, "name", node))
+            || (matches!(
+                parent.kind(),
+                "field_definition" | "public_field_definition"
+            ) && field_matches(parent, "value", node))
+    })
 }
 
 fn is_runtime_leaf(kind: &str) -> bool {
@@ -3622,5 +4053,43 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Break => "break",
         CompletionKind::Continue => "continue",
         CompletionKind::Yield => "yield",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_this_scan_honors_cancellation() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar must load");
+        let tree = parser
+            .parse(
+                "function value() { const first = 1; const second = 2; return this; }",
+                None,
+            )
+            .expect("TypeScript source must parse");
+        let mut body = None;
+        crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "statement_block" {
+                    body = Some(node);
+                    WalkControl::Break
+                } else {
+                    WalkControl::Continue
+                }
+            },
+        );
+
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+        assert_eq!(
+            body_contains_free_this(body.expect("function body"), &cancellation),
+            Err(LoweringCancelled)
+        );
     }
 }

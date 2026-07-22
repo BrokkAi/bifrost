@@ -365,7 +365,7 @@ impl CallRelationService {
     pub(crate) fn dispatch_at_bounded(
         analyzer: &dyn IAnalyzer,
         location: &ExactCallLocation,
-        exact_source: Arc<String>,
+        exact_source: Arc<str>,
         limits: CallRelationLimits,
         cancellation: Option<&CancellationToken>,
     ) -> CallDispatchLookup {
@@ -673,7 +673,10 @@ impl CallRelationService {
                 ..CallRelationResult::default()
             };
         }
-        let Some(source) = analyzer.indexed_source(caller.source()).map(Arc::new) else {
+        let Some(source) = analyzer
+            .indexed_source(caller.source())
+            .map(Arc::<str>::from)
+        else {
             return CallRelationResult {
                 diagnostics: vec![CallRelationDiagnostic::analysis_failed(
                     format!("indexed source is unavailable for {}", caller.source()),
@@ -821,7 +824,7 @@ struct CallReferenceResolutionBatch {
 fn resolve_call_references_with_source(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    source: Arc<String>,
+    source: Arc<str>,
     tree: &tree_sitter::Tree,
     references: &[Range],
     cancellation: Option<&CancellationToken>,
@@ -1204,7 +1207,7 @@ fn python_receiver_resolves_to_class(
     }
     let is_class = analyzer
         .indexed_source(&site.file)
-        .map(Arc::new)
+        .map(Arc::<str>::from)
         .and_then(|source| {
             resolve_definition_batch_with_source(
                 analyzer,
@@ -1339,7 +1342,7 @@ mod tests {
                 file,
                 call_span: call_span(source, "inner()"),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1365,7 +1368,7 @@ mod tests {
                 file: ProjectFile::new(fixture.project_root(), "Example.java"),
                 call_span: call_span(source, "helper()"),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1412,7 +1415,7 @@ void caller(ns::Widget& receiver) {
                     file: ProjectFile::new(fixture.project_root(), "calls.cpp"),
                     call_span: call_span(source, call),
                 },
-                Arc::new(source.to_string()),
+                Arc::from(source),
                 generous_limits(),
                 None,
             );
@@ -1444,7 +1447,7 @@ void caller() {
                 file: ProjectFile::new(fixture.project_root(), "calls.cpp"),
                 call_span: call_span(source, "callable()"),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1486,7 +1489,7 @@ int caller() { return local_target(1); }
                 file: ProjectFile::new(fixture.project_root(), "caller.c"),
                 call_span: call_span(caller_source, "local_target(1)"),
             },
-            Arc::new(caller_source.to_string()),
+            Arc::from(caller_source),
             generous_limits(),
             None,
         );
@@ -1518,7 +1521,7 @@ end
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, "target"),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1552,7 +1555,7 @@ end
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, call),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1583,7 +1586,7 @@ end
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, call),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1631,7 +1634,7 @@ end
                     file: ProjectFile::new(fixture.project_root(), "example.rb"),
                     call_span: call_span(source, call),
                 },
-                Arc::new(source.to_string()),
+                Arc::from(source),
                 generous_limits(),
                 None,
             );
@@ -1660,7 +1663,7 @@ end
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, call),
             },
-            Arc::new(source.to_string()),
+            Arc::from(source),
             generous_limits(),
             None,
         );
@@ -1770,11 +1773,9 @@ object Calls {
 
     #[test]
     fn exact_dispatch_keeps_cancellation_budget_and_truncation_independent() {
-        let source = Arc::new("function target() {}\ntarget();\n".to_string());
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::TypeScript,
-            &[("sample.ts", source.as_str())],
-        );
+        let source: Arc<str> = Arc::from("function target() {}\ntarget();\n");
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::TypeScript, &[("sample.ts", &source)]);
         let location = ExactCallLocation {
             file: ProjectFile::new(fixture.project_root(), "sample.ts"),
             call_span: call_span(&source, "target()"),

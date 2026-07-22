@@ -49,7 +49,7 @@ use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
 };
-use crate::analyzer::structural::search::execute_request_with_cancellation;
+use crate::analyzer::structural::search::execute_workspace_request_with_cancellation;
 use crate::analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
     CodeQueryResultValue,
@@ -1144,8 +1144,8 @@ fn handle_run_rql_query_request(
             success_message: "Query ready",
         },
         move |workspace, _project, _context, cancellation| {
-            let response = execute_request_with_cancellation(
-                workspace.analyzer(),
+            let response = execute_workspace_request_with_cancellation(
+                workspace,
                 &query,
                 CodeQueryExecutionLimits::default(),
                 cancellation,
