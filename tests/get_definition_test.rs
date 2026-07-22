@@ -253,6 +253,14 @@ product.label
         name_value["results"][0]["definitions"][0]["kind"], "function",
         "{name_value}"
     );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["start_column"], 16,
+        "{name_value}"
+    );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["end_column"], 20,
+        "{name_value}"
+    );
 
     let label_line = "product.label";
     let label_value = lookup(
@@ -268,6 +276,14 @@ product.label
     );
     assert_eq!(
         label_value["results"][0]["definitions"][0]["fqn"], "Product.label",
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["start_column"], 17,
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["end_column"], 22,
         "{label_value}"
     );
 }
@@ -18401,23 +18417,23 @@ template <typename T> using selected = choice<T, Shared>;
 }
 
 #[test]
-fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
+fn cpp_constructor_call_resolves_to_constructed_type_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
-            "service.h",
-            "namespace example { class Repository {}; class Service { public: explicit Service(Repository& repository); }; }\n",
+            "include/service.h",
+            "#pragma once\nnamespace example {\nclass Repository {};\nclass Service {\npublic:\n    explicit Service(Repository& repository);\n};\n}\n",
         )
         .file(
-            "service.cpp",
-            "#include \"service.h\"\nnamespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }\n",
+            "src/service.cpp",
+            "#include \"service.h\"\nnamespace example {\nService::Service(Repository& repository) {}\nService build_service(Repository& repository) {\n    return Service(repository);\n}\n}\n",
         )
         .build();
 
-    let line = "namespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }";
-    let value = lookup_declaration_with_definition_key(
+    let line = "    return Service(repository);";
+    let value = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"service.cpp","line":2,"column":{}}}]}}"#,
+            r#"{{"references":[{{"path":"src/service.cpp","line":5,"column":{}}}]}}"#,
             column_of(line, "Service(repository)")
         ),
     );
@@ -18425,14 +18441,20 @@ fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "example.Service.Service",
+        result["definitions"][0]["fqn"], "example.Service",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "service.h", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "include/service.h",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
+    assert_eq!(result["definitions"][0]["start_column"], 7, "{value}");
+    assert_eq!(result["definitions"][0]["end_column"], 14, "{value}");
 }
 
 #[test]
-fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
+fn cpp_braced_constructor_call_resolves_to_constructed_type_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
             "target.h",
@@ -18445,7 +18467,7 @@ fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
         .build();
 
     let line = "namespace ns { Target make() { return Target{1}; } }";
-    let value = lookup_declaration_with_definition_key(
+    let value = lookup(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -18455,11 +18477,7 @@ fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "ns.Target.Target",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["signature"], "(int)", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Target", "{value}");
     assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
 }
 
@@ -18868,7 +18886,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["signature"], "(DataReader &)",
+        result["definitions"][0]["signature"], "(const DataReader &)",
         "{value}"
     );
 }
@@ -18908,7 +18926,7 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
     assert_eq!(result["definitions"][0]["signature"], "()", "{value}");
     assert_eq!(
-        result["definitions"][1]["signature"], "(DataReader &)",
+        result["definitions"][1]["signature"], "(const DataReader &)",
         "{value}"
     );
 
@@ -18960,7 +18978,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_argument_type() {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["signature"], "(DataReader &)",
+        result["definitions"][0]["signature"], "(const DataReader &)",
         "{value}"
     );
 }
@@ -19066,6 +19084,59 @@ fn assert_cpp_format_overload_definitions(value: &Value, expected_signature_frag
 }
 
 #[test]
+fn cpp_string_literal_selects_const_char_pointer_overload() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/worker.h",
+            r#"#pragma once
+namespace precision {
+int select(int value);
+int select(const char* value);
+}
+"#,
+        )
+        .file(
+            "src/worker.cpp",
+            r#"#include "worker.h"
+namespace precision {
+int select(int value) { return value; }
+int select(const char* value) { return value[0]; }
+}
+"#,
+        )
+        .file(
+            "src/consumer.cpp",
+            r#"#include "worker.h"
+int consume() {
+    return precision::select("name");
+}
+"#,
+        )
+        .build();
+
+    let line = "    return precision::select(\"name\");";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/consumer.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "select")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    let definitions = result["definitions"].as_array().unwrap();
+    assert_eq!(1, definitions.len(), "{value}");
+    assert_eq!("src/worker.cpp", definitions[0]["path"], "{value}");
+    assert!(
+        definitions[0]["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.contains("const char")),
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -19099,10 +19170,13 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["signature"], "(DataReader &)",
+        result["definitions"][0]["signature"], "(const DataReader &)",
         "{value}"
     );
-    assert_eq!(result["definitions"][1]["signature"], "(char *)", "{value}");
+    assert_eq!(
+        result["definitions"][1]["signature"], "(const char *)",
+        "{value}"
+    );
 }
 
 #[test]
@@ -19863,6 +19937,7 @@ void run() {
     detail::vformat_to(out, 0, 0, 0);
 }
 #include "format-inl.h"
+#include "missing-config.h"
 "#;
     let format_inline = r#"
 #define FMT_FUNC
@@ -20973,10 +21048,7 @@ void construct() { widget(); }
     assert_eq!(results[2]["status"], "no_declaration", "{value}");
     assert_eq!(results[3]["status"], "no_declaration", "{value}");
     assert_eq!(results[4]["status"], "resolved", "{value}");
-    assert_eq!(
-        results[4]["definitions"][0]["fqn"], "widget.widget",
-        "{value}"
-    );
+    assert_eq!(results[4]["definitions"][0]["fqn"], "widget", "{value}");
 
     let definition_references = [starts[0], starts[1], starts[4]]
         .into_iter()
@@ -20986,12 +21058,20 @@ void construct() { widget(); }
         project.root(),
         &json!({"references": definition_references}).to_string(),
     );
-    for result in definition_value["results"]
+    let definition_results = definition_value["results"]
         .as_array()
-        .expect("definition results")
-    {
+        .expect("definition results");
+    for result in &definition_results[..2] {
         assert_eq!(result["status"], "no_definition", "{definition_value}");
     }
+    assert_eq!(
+        definition_results[2]["status"], "resolved",
+        "{definition_value}"
+    );
+    assert_eq!(
+        definition_results[2]["definitions"][0]["fqn"], "widget",
+        "{definition_value}"
+    );
 }
 
 #[test]

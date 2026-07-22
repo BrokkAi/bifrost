@@ -1074,6 +1074,34 @@ fn i1c_silent_when_go_embedded_field_reinserts_the_type_keyword() {
     assert_eq!(summary.i1c_source_text_checks, 1);
 }
 
+// The re-insertion can also land on the declaration line of a multi-line
+// block (doc-comment expansion puts it last): the circl Nonce shape.
+#[test]
+fn i1c_silent_when_go_type_reinsertion_lands_on_the_declaration_line() {
+    let input = I1Input {
+        files: vec![I1File {
+            path: "cipher/ascon/vector.go".to_string(),
+            text: Some("package ascon\n\ntype vector struct {\n\t// Nonce is a public random value associated with the report.\n\tNonce [NonceSize]byte\n}\n".to_string()),
+            parse_errors: Some(vec![]),
+        }],
+        symbols: vec![],
+    };
+    let records = vec![record(
+        "i1c",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "vector.Nonce".to_string(),
+        },
+        json!({"sources": [{"label": "vector.Nonce", "path": "cipher/ascon/vector.go", "start_line": 4, "end_line": 5, "text": "\t// Nonce is a public random value associated with the report.\n\ttype Nonce [NonceSize]byte"}]}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i1c(&refs(&records), &input, "go", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(summary.i1c_source_text_checks, 1);
+}
+
 // The bfg InvocableBFG.processFor shape: the reported range's last line is
 // blank and the returned text faithfully carries it. The comparison must not
 // lose that trailing blank line to a join/re-split round trip.
@@ -1266,4 +1294,35 @@ fn go_blank_identifiers_are_excluded_from_probing() {
         summary.symbols_excluded_blank_identifier > 0,
         "blank identifier should be excluded: {summary:?}"
     );
+}
+
+// Module units are named after their file, not a symbol in it; selector
+// spellings for them are the I1(b) module naming convention, not contract
+// checks (the react-hook-form `path#tsx` → no_definition drift shape).
+#[test]
+fn ts_module_units_are_excluded_from_spelling_probes() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/utils.ts",
+            "import { readFileSync } from 'node:fs';\n\nexport function helper(): number {\n  return readFileSync.length;\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("ts"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    let summary = report.probe_summary.as_ref().expect("probe summary");
+    assert!(
+        summary.symbols_excluded_module_spelling > 0,
+        "module unit should be excluded from spelling probes: {summary:?}"
+    );
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
 }

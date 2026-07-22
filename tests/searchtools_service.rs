@@ -1702,7 +1702,7 @@ void PYBIND11_MODULE(Net& net, DataReaderFromMemoryCopy& dr) {
         "{value}"
     );
     assert_eq!(
-        "(DataReader &)", result["definitions"][0]["signature"],
+        "(const DataReader &)", result["definitions"][0]["signature"],
         "{value}"
     );
 }
@@ -1760,7 +1760,7 @@ void PYBIND11_MODULE(Net& net, const char* mem) {
         "{value}"
     );
     assert_eq!(
-        "(DataReader &)", result["definitions"][0]["signature"],
+        "(const DataReader &)", result["definitions"][0]["signature"],
         "{value}"
     );
 }
@@ -4624,7 +4624,7 @@ end
 "#
     );
     let project = InlineTestProject::with_language(Language::Ruby)
-        .file("app/user.rb", source)
+        .file("app/user.rb", source.clone())
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
@@ -4644,12 +4644,25 @@ end
     assert_eq!("User.save", usage["symbol"], "payload: {value}");
     assert_eq!(1, usage["total_hits"], "payload: {value}");
     let hits = usage["files"][0]["hits"].as_array().unwrap();
-    assert!(
-        hits.iter().any(|hit| hit["snippet"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(expected_hit)),
-        "expected {expected_hit} hit: {value}"
+    let hit = hits
+        .iter()
+        .find(|hit| {
+            hit["snippet"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_hit)
+        })
+        .unwrap_or_else(|| panic!("expected {expected_hit} hit: {value}"));
+    let line = source
+        .lines()
+        .nth(hit["line"].as_u64().unwrap() as usize - 1)
+        .expect("hit line");
+    let expected_column = line.rfind("save").expect("save token") + 1;
+    assert_eq!(hit["column"], expected_column, "payload: {value}");
+    assert_eq!(
+        hit["end_column"],
+        expected_column + "save".len(),
+        "payload: {value}"
     );
 }
 
@@ -4664,6 +4677,15 @@ fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
         "user.public_send(:save)\n    user.public_send(:missing, :save)",
         "account.public_send(:save)",
         "user.public_send(:save)",
+    );
+}
+
+#[test]
+fn scan_usages_mcp_call_selects_static_quoted_ruby_symbol_content() {
+    assert_ruby_user_save_scan_usages_hit(
+        "user.public_send(:\"save\")",
+        "account.public_send(:\"save\")",
+        "user.public_send(:\"save\")",
     );
 }
 
@@ -4741,6 +4763,29 @@ product.label
                 snippets.iter().any(|snippet| snippet.contains(expected)),
                 "expected {expected} usage: {value}"
             );
+        }
+        if symbol == "Product.name" {
+            let exact_hits: Vec<_> = result["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+                .collect();
+            for (snippet, column, end_column) in [
+                ("alias_method :label, :name", 25, 29),
+                ("product.name", 9, 13),
+            ] {
+                let hit = exact_hits
+                    .iter()
+                    .find(|hit| {
+                        hit["snippet"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(snippet))
+                    })
+                    .unwrap_or_else(|| panic!("missing {snippet}: {value}"));
+                assert_eq!(hit["column"], column, "payload: {value}");
+                assert_eq!(hit["end_column"], end_column, "payload: {value}");
+            }
         }
     }
 
@@ -5021,6 +5066,98 @@ int use(example::Service& service) {
         unresolved["files"].as_array().is_none_or(Vec::is_empty),
         "unresolved definition must not render as a usage row: {unresolved_value}"
     );
+}
+
+#[test]
+fn cpp_string_literal_overload_is_narrow_at_public_location_boundaries() {
+    let header = r#"#pragma once
+namespace precision {
+int select(int value);
+int select(const char* value);
+}
+"#;
+    let implementation = r#"#include "worker.h"
+namespace precision {
+int select(int value) { return value; }
+int select(const char* value) { return value[0]; }
+}
+"#;
+    let consumer = r#"#include "worker.h"
+int consume() {
+    return precision::select("name");
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/worker.h", header)
+        .file("src/worker.cpp", implementation)
+        .file("src/consumer.cpp", consumer)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let call_line = "    return precision::select(\"name\");";
+    let definitions_payload = service
+        .call_tool_json(
+            "get_definitions_by_location",
+            &serde_json::json!({
+                "references": [{
+                    "path": "src/consumer.cpp",
+                    "line": line_of(consumer, call_line),
+                    "column": call_line.find("select").unwrap() + 1,
+                }]
+            })
+            .to_string(),
+        )
+        .expect("definition lookup succeeds");
+    let definitions: Value = serde_json::from_str(&definitions_payload).unwrap();
+    let definition_result = &definitions["results"][0];
+    assert_eq!("resolved", definition_result["status"], "{definitions}");
+    assert_eq!(
+        1,
+        definition_result["definitions"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        "src/worker.cpp", definition_result["definitions"][0]["path"],
+        "{definitions}"
+    );
+    assert!(
+        definition_result["definitions"][0]["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.contains("const char")),
+        "{definitions}"
+    );
+
+    for (declaration_line, expected_status, expected_hits) in [
+        ("int select(int value);", "verified_absent", 0),
+        ("int select(const char* value);", "found", 1),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_location",
+                &serde_json::json!({
+                    "targets": [{
+                        "path": "include/worker.h",
+                        "line": line_of(header, declaration_line),
+                        "column": declaration_line.find("select").unwrap() + 1,
+                    }],
+                    "include_tests": true,
+                })
+                .to_string(),
+            )
+            .expect("usage scan succeeds");
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+        assert_eq!(expected_status, result["status"], "{value}");
+        assert_eq!(expected_hits, result["total_hits"], "{value}");
+        if expected_hits == 1 {
+            assert_eq!("src/consumer.cpp", result["files"][0]["path"], "{value}");
+            assert_eq!(
+                line_of(consumer, call_line),
+                result["files"][0]["hits"][0]["line"],
+                "{value}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -5347,6 +5484,19 @@ Shop::Discount.default
     assert_eq!("Shop$Discount", result["symbol"], "payload: {value}");
     assert_eq!("found", result["status"], "payload: {value}");
     assert_eq!(2, result["total_hits"], "payload: {value}");
+    let autoload = result["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .find(|hit| {
+            hit["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("autoload :Discount"))
+        })
+        .unwrap_or_else(|| panic!("missing autoload hit: {value}"));
+    assert_eq!(autoload["column"], 13, "payload: {value}");
+    assert_eq!(autoload["end_column"], 21, "payload: {value}");
 }
 
 #[test]

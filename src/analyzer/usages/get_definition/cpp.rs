@@ -6,7 +6,7 @@ use crate::analyzer::declaration_range::{
 };
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_parameter_type_text,
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 
@@ -326,8 +326,8 @@ pub(super) fn resolve_cpp(
     };
     match reference {
         Some(CppReferenceNode::Type(_)) => unreachable!("type references returned above"),
-        Some(CppReferenceNode::Constructor(constructor)) => {
-            resolve_cpp_constructor(ctx, constructor)
+        Some(CppReferenceNode::Construction(construction)) => {
+            resolve_cpp_construction_type(ctx, construction)
         }
         Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, call),
         Some(CppReferenceNode::Field(field)) => resolve_cpp_field(ctx, field, None, None),
@@ -444,7 +444,7 @@ pub(super) fn parse_cpp_tree(source: &str) -> Option<Tree> {
 #[derive(Clone, Copy)]
 enum CppReferenceNode<'tree> {
     Type(Node<'tree>),
-    Constructor(Node<'tree>),
+    Construction(Node<'tree>),
     Call(Node<'tree>),
     Field(Node<'tree>),
     Identifier(Node<'tree>),
@@ -537,7 +537,7 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
 
     match current.kind() {
         "new_expression" | "compound_literal_expression" => {
-            Some(CppReferenceNode::Constructor(current))
+            Some(CppReferenceNode::Construction(current))
         }
         "call_expression" => Some(CppReferenceNode::Call(current)),
         "field_expression" => Some(CppReferenceNode::Field(current)),
@@ -1313,13 +1313,16 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             resolve_cpp_field(ctx, function, call_arity, call_arg_types.as_deref())
         }
         "type_identifier" | "template_type" | "scoped_type_identifier" => {
-            resolve_cpp_constructor(ctx, call)
+            resolve_cpp_construction_type(ctx, call)
         }
         "qualified_identifier" => {
             let text = cpp_callable_reference_text(function, ctx.source);
-            let constructor = resolve_cpp_constructor(ctx, call);
-            if constructor.status != DefinitionLookupStatus::NoDefinition {
-                return constructor;
+            let construction = resolve_cpp_construction_type(ctx, call);
+            let construction_boundary =
+                construction.status == DefinitionLookupStatus::UnresolvableImportBoundary;
+            if construction.status != DefinitionLookupStatus::NoDefinition && !construction_boundary
+            {
+                return construction;
             }
             let mut candidates = cpp_visible_name_candidates(
                 ctx.analyzer,
@@ -1385,6 +1388,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         return cpp_callable_candidates_outcome(candidates);
                     }
                 }
+            }
+            if construction_boundary {
+                return construction;
             }
             if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, &text) {
                 return boundary(format!(
@@ -1524,29 +1530,6 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         ctx.support,
                         unit,
                     );
-                    for owner in &owners {
-                        let constructors =
-                            cpp_prefer_declaration_candidates(cpp_member_candidates_lazy(
-                                ctx,
-                                vec![owner.clone()],
-                                owner.identifier(),
-                                call_arity,
-                                || {
-                                    cpp_call_argument_types(
-                                        ctx.analyzer,
-                                        ctx.support,
-                                        ctx.visibility,
-                                        ctx.file,
-                                        ctx.source,
-                                        ctx.root,
-                                        call,
-                                    )
-                                },
-                            ));
-                        if !constructors.is_empty() {
-                            return cpp_callable_candidates_outcome(constructors);
-                        }
-                    }
                     return candidates_outcome(owners);
                 }
                 CppBareCallTargetResolution::CallableShadow => {
@@ -1691,11 +1674,11 @@ fn cpp_callable_reference_text(node: Node<'_>, source: &str) -> String {
     cpp_node_text(name, source).to_string()
 }
 
-fn resolve_cpp_constructor(
+fn resolve_cpp_construction_type(
     ctx: CppLookupCtx<'_, '_>,
-    constructor: Node<'_>,
+    construction: Node<'_>,
 ) -> DefinitionLookupOutcome {
-    let Some(type_node) = cpp_constructor_type_node(constructor) else {
+    let Some(type_node) = cpp_constructor_type_node(construction) else {
         return no_definition("no_reference_text", "C++ constructor call has no type");
     };
     let text = normalize_cpp_type_text(cpp_node_text(type_node, ctx.source));
@@ -1732,38 +1715,12 @@ fn resolve_cpp_constructor(
     sort_units(&mut owners);
     owners.dedup();
 
-    for owner in &owners {
-        let constructors = cpp_member_candidates_lazy(
-            ctx,
-            vec![owner.clone()],
-            owner.identifier(),
-            ctx.visibility
-                .call_arity_evidence(ctx.file, constructor, ctx.source)
-                .exact(),
-            || {
-                cpp_call_argument_types(
-                    ctx.analyzer,
-                    ctx.support,
-                    ctx.visibility,
-                    ctx.file,
-                    ctx.source,
-                    ctx.root,
-                    constructor,
-                )
-            },
-        );
-        let constructors = cpp_prefer_declaration_candidates(constructors);
-        if !constructors.is_empty() {
-            return candidates_outcome(constructors);
-        }
-    }
-
+    // C++ constructors do not have names. The focused token in `Service(args)`,
+    // `Service{args}`, or `new Service(args)` names the constructed type, so
+    // ordinary navigation belongs to that type. Constructor-call attribution
+    // remains a separate usage-graph concern.
     if !owners.is_empty() {
         return candidates_outcome(owners);
-    }
-    let text = normalize_cpp_type_text(cpp_node_text(type_node, ctx.source));
-    if text.is_empty() {
-        return no_definition("no_reference_text", "C++ type reference is blank");
     }
     resolve_cpp_type_without_focused_qualifier(
         ctx.analyzer,
@@ -1774,23 +1731,6 @@ fn resolve_cpp_constructor(
         type_node,
         &text,
     )
-}
-
-fn cpp_prefer_declaration_candidates(candidates: Vec<CodeUnit>) -> Vec<CodeUnit> {
-    let preferred: Vec<_> = candidates
-        .iter()
-        .filter(|unit| cpp_source_is_header(unit))
-        .cloned()
-        .collect();
-    if preferred.is_empty() {
-        candidates
-    } else {
-        preferred
-    }
-}
-
-fn cpp_source_is_header(unit: &CodeUnit) -> bool {
-    cpp_source_path_is_header(unit.source())
 }
 
 fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
@@ -2462,6 +2402,7 @@ struct CppType {
     name: String,
     unit: Option<CodeUnit>,
     indirection: i32,
+    pointee_const: bool,
     alias_unit: Option<CodeUnit>,
 }
 
@@ -2478,6 +2419,7 @@ impl CppType {
             name: name.clone(),
             unit: cpp_resolve_type_unit(analyzer, visibility, file, &name),
             indirection,
+            pointee_const: false,
             alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
         }
     }
@@ -2487,6 +2429,7 @@ impl CppType {
             name: cpp_name_for(&unit),
             unit: Some(unit),
             indirection,
+            pointee_const: false,
             alias_unit: None,
         }
     }
@@ -2496,6 +2439,7 @@ impl CppType {
             name: self.name.clone(),
             unit: self.unit.clone(),
             indirection: self.indirection,
+            pointee_const: self.pointee_const,
         }
     }
 }
@@ -2557,8 +2501,13 @@ fn cpp_expression_type(
 ) -> Option<CppType> {
     match node.kind() {
         "number_literal" | "true" | "false" | "char_literal" | "string_literal"
-        | "unary_expression" => cpp_literal_type_name(node, source)
-            .map(|name| CppType::from_text(analyzer, visibility, file, name, 0)),
+        | "unary_expression" => cpp_literal_arg_type(node, source).map(|literal| CppType {
+            unit: cpp_resolve_type_unit(analyzer, visibility, file, &literal.name),
+            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &literal.name),
+            name: literal.name,
+            indirection: literal.indirection,
+            pointee_const: literal.pointee_const,
+        }),
         "identifier" => {
             let name = cpp_node_text(node, source);
             let ctx = CppLookupCtx {
@@ -2655,6 +2604,7 @@ fn cpp_field_declared_type(
         name,
         unit,
         indirection,
+        pointee_const: false,
     })
 }
 
@@ -3641,6 +3591,7 @@ fn cpp_seed_binding(
                 name: name.clone(),
                 unit,
                 indirection: 0,
+                pointee_const: false,
                 alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
             }
         })

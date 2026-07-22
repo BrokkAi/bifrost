@@ -385,6 +385,7 @@ impl NodeKey for UsageNodeKey {
 }
 
 /// Aggregated result of an inverted edge build, keyed by node-key type `K`.
+#[derive(Clone)]
 pub(crate) struct UsageEdges<K = String> {
     /// `(caller, callee) -> call sites`. The site count is the edge weight
     /// (distinct `(file, line, caller)` sites); sites are sorted by `(path, line)`.

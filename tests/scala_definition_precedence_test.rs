@@ -2780,3 +2780,354 @@ class Spec extends FixtureTestSuite {
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
+
+#[test]
+fn scala_task_ranked_forward_precedence_keeps_import_term_and_declared_receiver_roles() {
+    let source = r#"package app
+
+import external.annotations.{Scope => ExternalScope}
+import model.Counters.{PollCounters}
+import BenchmarkUtil._
+
+trait Scope
+trait Runnable { def run(): Unit }
+trait HubLike { def subscribe: Int => String }
+object BenchmarkUtil { def catsRepeat[A](count: Int)(value: A): A = value }
+object H2Transport { trait Writer { def reset(value: Int): Unit } }
+final class ConcreteWriter extends H2Transport.Writer {
+  override def reset(value: Int): Unit = ()
+}
+
+object ConcreteWriter { def apply(): ConcreteWriter = new ConcreteWriter }
+
+object Consumer { final class PollCounters }
+
+object Paths {
+  type TPath = List[Int]
+  object TPath { def apply(value: Int): TPath = List(value) }
+  val path = TPath(1)
+}
+
+final class Consumer {
+  protected lazy val writer: H2Transport.Writer = ConcreteWriter()
+  val repeated = catsRepeat(1)("direct")
+  val nested = new Runnable { override def run(): Unit = { catsRepeat(2)("nested"); () } }
+  def build: HubLike = new HubLike { def subscribe: Int => String = n => catsRepeat(n)("lambda") }
+  object NestedFactory {
+    def build: HubLike = new HubLike { def subscribe: Int => String = n => catsRepeat(n)("object") }
+  }
+  val counters: PollCounters = null
+  def close(): Unit = writer.reset(1)
+  def catsRepeat[A](count: Int)(value: A): A = value
+}
+"#;
+    let forge_source = r#"package app
+import external.syntax.all.*
+sealed trait ForgeType
+object ForgeType { val all: List[ForgeType] = Nil }
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .file("app/ForgeType.scala", forge_source)
+        .file(
+            "model/Counters.scala",
+            "package model\nobject Counters { final class PollCounters }\n",
+        )
+        .build();
+    let references = [
+        location_in(
+            "app/Use.scala",
+            source,
+            source.find("Scope =>").expect("renamed external selector"),
+        ),
+        location_in(
+            "app/ForgeType.scala",
+            forge_source,
+            forge_source.find("all.*").expect("external wildcard owner"),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("repeated = catsRepeat")
+                .expect("enclosing callable")
+                + "repeated = ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("{ catsRepeat(2)")
+                .expect("anonymous lexical callable")
+                + 2,
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("=> catsRepeat(n)")
+                .expect("anonymous lambda lexical callable")
+                + "=> ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("=> catsRepeat(n)(\"object\")")
+                .expect("nested object lexical callable")
+                + "=> ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("counters: PollCounters")
+                .expect("explicit imported type")
+                + "counters: ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source.find("path = TPath").expect("term application") + "path = ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source.find("writer.reset").expect("typed receiver member") + "writer.".len(),
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    }
+    for (result, expected) in results[2..].iter().zip([
+        "app.Consumer.catsRepeat",
+        "app.Consumer.catsRepeat",
+        "app.Consumer.catsRepeat",
+        "app.Consumer.catsRepeat",
+        "model.Counters$.PollCounters",
+        "app.Paths$.TPath$.apply",
+        "app.H2Transport$.Writer.reset",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_explicit_type_import_precedence_respects_lexical_depth() {
+    let source = r#"package app
+
+import ext.Member
+
+final class DirectOwner {
+  final class Member
+  val direct: Member = null
+}
+
+trait Base { final class Member }
+final class InheritedOwner extends Base {
+  val inherited: Member = null
+}
+
+final class BlockOwner {
+  final class Member
+  def choose = {
+    import block.Member
+    val selected: Member = null
+    selected
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .file("ext/Member.scala", "package ext\nfinal class Member\n")
+        .file("block/Member.scala", "package block\nfinal class Member\n")
+        .build();
+    let references = [
+        location_in(
+            "app/Use.scala",
+            source,
+            source.find("direct: Member").expect("direct nested type") + "direct: ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("inherited: Member")
+                .expect("inherited nested type")
+                + "inherited: ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("selected: Member")
+                .expect("block-local imported type")
+                + "selected: ".len(),
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    for (result, expected) in value["results"]
+        .as_array()
+        .expect("definition results")
+        .iter()
+        .zip(["app.DirectOwner.Member", "app.Base.Member", "block.Member"])
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_import_selectors_distinguish_indexed_targets_aliases_and_boundaries() {
+    let source = r#"package app
+
+import model.Counters.{PollCounters}
+import render.ConsoleRenderer.{default => renderDefault}
+import external.annotations.{Scope => ExternalScope}
+import org.scalafmt.interfaces.PositionException
+
+object FormattingProvider { object scalafmt }
+object Use
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .file(
+            "model/Counters.scala",
+            "package model\nobject Counters { final class PollCounters }\n",
+        )
+        .file(
+            "app/model/Counters.scala",
+            "package app.model\nobject Counters { final class PollCounters }\n",
+        )
+        .file(
+            "render/ConsoleRenderer.scala",
+            "package render\nobject ConsoleRenderer { val default: Int = 1 }\n",
+        )
+        .build();
+    let default_selector = source
+        .find("default =>")
+        .expect("renamed original selector");
+    let references = [
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("PollCounters}")
+                .expect("nested indexed selector"),
+        ),
+        location_in("app/Use.scala", source, default_selector),
+        location_in(
+            "app/Use.scala",
+            source,
+            default_selector + "default => ".len(),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source.find("Scope =>").expect("external original selector"),
+        ),
+        location_in(
+            "app/Use.scala",
+            source,
+            source
+                .find("scalafmt.interfaces")
+                .expect("external qualified import owner"),
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.model.Counters$.PollCounters",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "render.ConsoleRenderer$.default",
+        "{value}"
+    );
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    for result in &results[3..] {
+        assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    }
+}
+
+#[test]
+fn scala_coalesced_type_and_val_remains_a_term_call_target() {
+    let source = r#"package app
+
+object Dual {
+  type Factory = Int
+  val Factory: Int => Int = value => value + 1
+  val made = Factory(0)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Dual.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [location_in(
+            "app/Dual.scala",
+            source,
+            source.find("made = Factory").expect("dual term call") + "made = ".len(),
+        )]})
+        .to_string(),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Dual$.Factory",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_annotated_type_alias_does_not_hide_initializer_receiver_type() {
+    let source = r#"package app
+
+object Use {
+  final class Target { def ping(): Unit = () }
+  type Alias = Target
+  val receiver: Alias = new Target
+  val result = receiver.ping()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [location_in(
+            "app/Use.scala",
+            source,
+            source.find("receiver.ping").expect("aliased receiver") + "receiver.".len(),
+        )]})
+        .to_string(),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Use$.Target.ping",
+        "{value}"
+    );
+}

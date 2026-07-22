@@ -5041,6 +5041,58 @@ fn cpp_graph_filters_same_arity_free_function_overloads_by_argument_type() {
 }
 
 #[test]
+fn cpp_graph_filters_string_literal_to_const_char_pointer_overload() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/worker.h",
+            r#"#pragma once
+namespace precision {
+int select(int value);
+int select(const char* value);
+}
+"#,
+        ),
+        (
+            "src/worker.cpp",
+            r#"#include "worker.h"
+namespace precision {
+int select(int value) { return value; }
+int select(const char* value) { return value[0]; }
+}
+"#,
+        ),
+        (
+            "src/consumer.cpp",
+            r#"#include "worker.h"
+int consume() {
+    return precision::select("name");
+}
+"#,
+        ),
+    ]);
+    let int_overload = function_definition_with_signature(&analyzer, "select", "(int)");
+    let string_overload = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.short_name() == "select"
+            && slash_path(unit.source()) == "include/worker.h"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("char"))
+    });
+
+    let string_hits = usage_hits(&analyzer, &string_overload);
+    assert_eq!(1, string_hits.len(), "{string_hits:#?}");
+    assert_hit_contains(
+        &string_hits,
+        "src/consumer.cpp",
+        "precision::select(\"name\")",
+    );
+
+    let int_hits = usage_hits(&analyzer, &int_overload);
+    assert_no_hit_contains(&int_hits, "precision::select(\"name\")");
+}
+
+#[test]
 fn cpp_graph_keeps_unknown_argument_overload_calls_conservative() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -13648,7 +13700,7 @@ void* construct_without_default_exact() { return new Gadget(1, 2); }
                 "void* construct_default() { return new Widget(1); }",
                 "Widget",
             ),
-            "demo.Widget.Widget",
+            "demo.Widget",
         ),
         (
             fixture_token_range(
@@ -13669,7 +13721,7 @@ void* construct_without_default_exact() { return new Gadget(1, 2); }
                 .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some(expected_fqn)),
-            "forward lookup must select the logical callable before its definition-only inverse query: {forward:#?}"
+            "forward lookup must preserve the public navigation identity before the definition-only inverse query: {forward:#?}"
         );
     }
 
@@ -14292,12 +14344,12 @@ void wrong_namespace() {
         (
             "    Constructed(); // positive-constructor-function-only",
             "Constructed",
-            constructor.fq_name(),
+            constructed.fq_name(),
         ),
         (
             "    model::Constructed(); // positive-qualified-constructor-function-only",
             "Constructed",
-            constructor.fq_name(),
+            constructed.fq_name(),
         ),
         (
             "    Late(); // positive-before-later-function",

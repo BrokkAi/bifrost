@@ -151,6 +151,8 @@ pub struct ScalaAnalyzer {
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
+    full_usage_edges:
+        Cache<Arc<[String]>, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
     project_types_build_count: Arc<AtomicUsize>,
     scala_query_parse_count: Arc<AtomicUsize>,
     scala_query_walk_count: Arc<AtomicUsize>,
@@ -249,6 +251,8 @@ impl ScalaAnalyzer {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone.project_types = Arc::new(OnceLock::new());
+        clone.full_usage_edges =
+            build_weighted_cache(self.memo_budget / 8, weight_scala_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
@@ -278,6 +282,7 @@ impl ScalaAnalyzer {
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
+            full_usage_edges: build_weighted_cache(memo_budget / 8, weight_scala_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
             scala_query_walk_count: Arc::new(AtomicUsize::new(0)),
@@ -305,6 +310,17 @@ impl ScalaAnalyzer {
         self.initialize_project_types(|| {
             self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
         })
+    }
+
+    pub(crate) fn full_usage_edges(
+        &self,
+        nodes: &HashSet<String>,
+        build: impl FnOnce() -> crate::analyzer::usages::inverted_edges::UsageEdges,
+    ) -> Arc<crate::analyzer::usages::inverted_edges::UsageEdges> {
+        let mut sorted_nodes = nodes.iter().cloned().collect::<Vec<_>>();
+        sorted_nodes.sort_unstable();
+        let key: Arc<[String]> = sorted_nodes.into();
+        self.full_usage_edges.get_with(key, || Arc::new(build()))
     }
 
     pub(crate) fn record_query_parse(&self) {
@@ -441,6 +457,41 @@ impl ScalaAnalyzer {
             }
         }
     }
+}
+
+fn weight_scala_usage_edges(
+    key: &Arc<[String]>,
+    edges: &Arc<crate::analyzer::usages::inverted_edges::UsageEdges>,
+) -> u32 {
+    use std::mem::size_of;
+
+    let key_bytes = size_of::<Arc<[String]>>()
+        + key
+            .iter()
+            .map(|item| size_of::<String>() + item.len())
+            .sum::<usize>();
+    let edge_bytes = edges
+        .edges
+        .iter()
+        .map(|((caller, callee), sites)| {
+            caller.len()
+                + callee.len()
+                + sites
+                    .iter()
+                    .map(|site| {
+                        size_of::<crate::analyzer::usages::inverted_edges::CallSite>()
+                            + site.path.len()
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    let summary_bytes = edges
+        .truncated
+        .keys()
+        .chain(edges.unproven_inbound.keys())
+        .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
+        .sum::<usize>();
+    (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
 }
 
 impl TestDetectionProvider for ScalaAnalyzer {}

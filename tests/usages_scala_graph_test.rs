@@ -6932,6 +6932,231 @@ class Other {
 }
 
 #[test]
+fn scala_constructor_inferred_receivers_keep_fields_and_inherited_members_in_nested_scopes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Receivers.scala",
+            r#"package model
+
+case class QuickItem(id: String, label: String)
+
+class ReportBuilder(path: String, line: Int, enabled: Boolean) {
+  def setResult(value: Int): Int = value
+}
+
+class Batch(seed: Int, enabled: Boolean) {
+  val rebuildIndex: List[Int] => Int = _.sum
+}
+
+abstract class Access[Reporter, Compiler](seed: Int) {
+  def interrupt[B](default: B, token: Int)(run: Compiler => B)(implicit reporter: Reporter): B =
+    default
+}
+final class ConcreteAccess(seed: Int)(ec: Int) extends Access[String, String](seed)
+
+abstract class Scanner[A] {
+  def scan(value: A, state: Null): Unit = ()
+}
+
+class OtherReportBuilder {
+  def setResult(value: Int): Int = value + 1
+}
+class OtherBatch {
+  val rebuildIndex: List[Int] => Int = _ => -1
+}
+abstract class OtherAccess[A] {
+  def interrupt[B](default: B, token: Int)(run: A => B)(implicit reporter: String): B =
+    run(null.asInstanceOf[A])
+}
+final class OtherConcreteAccess extends OtherAccess[String]
+abstract class OtherScanner[A] {
+  def scan(value: A, state: Null): Unit = ()
+}
+final class OtherConcreteScanner extends OtherScanner[String]
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+
+import model.*
+
+class NewProjectProvider {
+  def run(seed: Int): Int = {
+    val parentDir =
+      QuickItem(id = "..", label = "parent")
+    val reportBuilder =
+      new ReportBuilder("path", seed, enabled = true)
+    Option(seed).map {
+      case value if value >= 0 =>
+        reportBuilder.setResult(value) + parentDir.id.length // positive-local-members
+      case _ => 0
+    }.getOrElse(0)
+  }
+}
+
+abstract class Service {
+  val buildTargetClasses = new Batch(1, enabled = true)
+
+  def focus(seed: Int): Unit = {
+    Option(seed).foreach { platform =>
+      buildTargetClasses.rebuildIndex(List(platform)) // positive-applied-field
+    }
+  }
+}
+
+case class Presentation(seed: Int) {
+  implicit val reporter: String = "reporter"
+  val compilerAccess =
+    new ConcreteAccess(seed)(1)
+
+  def hints(token: Int): Int =
+    compilerAccess.interrupt(0, token)(_.length) // positive-inherited-access
+}
+
+class Provider {
+  private class ConcreteScanner(seed: Int) extends Scanner[String]
+
+  def find(seed: Int): Unit = {
+    val scanner = new ConcreteScanner(seed)
+    scanner.scan("value", null) // positive-inherited-scanner
+  }
+}
+
+class Unrelated {
+  implicit val reporter: String = "reporter"
+
+  def run(seed: Int): Unit = {
+    val reportBuilder = new OtherReportBuilder
+    val buildTargetClasses = new OtherBatch
+    val compilerAccess = new OtherConcreteAccess
+    val scanner = new OtherConcreteScanner
+    reportBuilder.setResult(seed) // negative-other-report
+    buildTargetClasses.rebuildIndex(List(seed)) // negative-other-field
+    compilerAccess.interrupt(seed, 0)(_.length) // negative-other-access
+    scanner.scan("value", null) // negative-other-scanner
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("model.QuickItem.id", "positive-local-members"),
+        ("model.ReportBuilder.setResult", "positive-local-members"),
+        ("model.Batch.rebuildIndex", "positive-applied-field"),
+        ("model.Access.interrupt", "positive-inherited-access"),
+        ("model.Scanner.scan", "positive-inherited-scanner"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-other-");
+    }
+}
+
+#[test]
+fn scala_declared_alias_receivers_and_unqualified_parameterless_values_resolve_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Schedule.scala",
+            r#"package model
+
+trait Schedule[-Env, -In, +Out] {
+  type State
+  def whileOutput(predicate: Out => Boolean): Schedule[Env, In, Out] = this
+  def addDelay(delay: Out => Int): Schedule[Env, In, Out] = this
+}
+
+object Schedule {
+  val elapsed: Schedule.WithState[Int, Any, Any, Int] = null
+  val forever: Schedule.WithState[Long, Any, Any, Int] = null
+
+  def during(limit: Int): Schedule[Any, Any, Int] =
+    elapsed.whileOutput(_ < limit) // positive-declared-alias-while
+
+  def spaced(delay: Int): Schedule[Any, Any, Int] =
+    forever.addDelay(_ => delay) // positive-declared-alias-delay
+
+  type WithState[State0, -Env, -In0, +Out0] = Schedule[Env, In0, Out0] { type State = State0 }
+}
+
+trait OtherSchedule[A] {
+  def whileOutput(predicate: A => Boolean): OtherSchedule[A] = this
+  def addDelay(delay: A => Int): OtherSchedule[A] = this
+}
+object OtherSchedule {
+  val elapsed: OtherSchedule[Int] = new OtherSchedule[Int] {}
+  val forever: OtherSchedule[Int] = new OtherSchedule[Int] {}
+  val a = elapsed.whileOutput(_ > 0) // negative-other-while
+  val b = forever.addDelay(_ => 1) // negative-other-delay
+}
+"#,
+        ),
+        (
+            "model/RandomApi.scala",
+            r#"package model
+
+trait RandomApi {
+  def nextDouble: Double
+  def nextFloat: Float
+}
+
+object RandomApi {
+  val nextDouble: Int = 1
+  val nextFloat: Int = 1
+
+  private final case class Live(seed: Int) extends RandomApi {
+    def nextDouble: Double = 0.5
+    def nextFloat: Float = 0.25f
+
+    def betweenDouble(min: Double, max: Double): Double =
+      betweenDoubleWith(min, max)(nextDouble) // positive-next-double-value
+
+    def betweenFloat(min: Float, max: Float): Float =
+      betweenFloatWith(min, max)(nextFloat) // positive-next-float-value
+
+    def shadow(nextDouble: Double): Double =
+      betweenDoubleWith(0.0, 1.0)(nextDouble) // negative-other-local-double
+  }
+
+  private def betweenDoubleWith(min: Double, max: Double)(next: Double): Double = next
+  private def betweenFloatWith(min: Float, max: Float)(next: Float): Float = next
+
+  final class Other extends RandomApi {
+    override def nextDouble: Double = 1.0
+    override def nextFloat: Float = 1.0f
+    def useDouble(value: Double => Double): Double = value(nextDouble) // negative-other-double
+    def useFloat(value: Float => Float): Float = value(nextFloat) // negative-other-float
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        (
+            "model.RandomApi$.Live.nextDouble",
+            "positive-next-double-value",
+        ),
+        (
+            "model.RandomApi$.Live.nextFloat",
+            "positive-next-float-value",
+        ),
+        (
+            "model.Schedule.whileOutput",
+            "positive-declared-alias-while",
+        ),
+        ("model.Schedule.addDelay", "positive-declared-alias-delay"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-other-");
+    }
+}
+
+#[test]
 fn scala_graph_respects_local_shadowing() {
     let consumer_source = r#"
 package app
@@ -8936,6 +9161,526 @@ object Ambiguous {
                 .result,
         );
         assert_no_hit_contains(&alias_hits, "negative-physical-alias-ambiguity");
+    }
+}
+
+#[test]
+fn scala_usage_finder_bridges_anonymous_refinement_type_members() {
+    let source = r#"package refinement
+import decoy.{State, In}
+trait Schedule { type State; type Future }
+abstract class Internal extends Schedule
+trait PollingMetric { type In }
+trait Metric { trait UnsafeAPI }
+trait MetricWithInput { trait UnsafeAPI { type In } }
+trait AliasScope
+trait LeftState { type State }
+trait RightState { type State }
+trait InnerState { type State }
+class Inner { class State }
+class UnsafeAPI { type In }
+
+object Uses {
+  val schedule = new Internal {
+    val before: Future = "" // positive-refinement-before-declaration
+    override type State = Boolean // negative-refinement-declaration-name
+    override type Future = String
+    val initial: State = true // positive-refinement-val
+    def step(state: State): Either[State, Int] = Left(state) // positive-refinement-param-return
+    def typeParam[State](state: State): State = state // negative-refinement-type-parameter
+
+    class DirectNamed {
+      type State = String
+      val current: State = "" // negative-named-direct-boundary
+    }
+    class InheritedNamed extends InnerState {
+      val current: State = "" // negative-named-inherited-boundary
+    }
+    val innerAnonymous = new InnerState {
+      val current: State = "" // positive-anonymous-inherited-precedence
+    }
+    val innerNestedClass = new Inner {
+      val current: State = null // positive-anonymous-nested-class-precedence
+    }
+
+    val blocked = new Metric {
+      type State = String
+      val local: State = "" // negative-nearest-pure-local-alias
+    }
+  }
+
+  val polling = new PollingMetric {
+    type In = List[Any]
+    val metric = new Metric {
+      val unsafe = new UnsafeAPI {
+        def update(in: In): Unit = () // positive-nested-refinement
+      }
+    }
+  }
+
+  val nestedInput = new PollingMetric {
+    type In = String
+    val metric = new MetricWithInput {
+      val unsafe = new UnsafeAPI {
+        override type In = Boolean
+        val current: In = true // positive-nearest-nested-constructor
+      }
+    }
+
+    val anonymousAliasScope = new AliasScope {
+      type UnsafeAPI = refinement.UnsafeAPI
+      val blocked = new UnsafeAPI {
+        override type In = Boolean
+        val current: In = true // negative-anonymous-constructor-alias
+      }
+    }
+
+    def aliasBarrier(): Unit = {
+      type UnsafeAPI = refinement.UnsafeAPI
+      val blocked = new UnsafeAPI {
+        override type In = Boolean
+        val current: In = true // negative-local-constructor-alias
+      }
+    }
+
+    def parameterBarrier[UnsafeAPI](): Unit = {
+      val blocked = new UnsafeAPI {
+        type In = Boolean
+        val current: In = true // negative-local-constructor-parameter
+      }
+    }
+  }
+
+  def blockLocal(): Unit = {
+    type State = String
+    val local: State = "" // negative-method-local-alias
+  }
+
+  val ambiguous = new LeftState with RightState {
+    override type State = String
+    val current: State = "" // negative-mixin-ambiguity
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("refinement/Uses.scala", source),
+        (
+            "decoy/Aliases.scala",
+            "package decoy\ntype State = Long\ntype In = Long\n",
+        ),
+        (
+            "duplicates/One.scala",
+            "package duplicates\ntrait Base { type Value }\n",
+        ),
+        (
+            "duplicates/Two.scala",
+            "package duplicates\ntrait Base { type Value }\n",
+        ),
+        (
+            "duplicates/Uses.scala",
+            r#"package duplicates
+object Uses {
+  val value = new Base {
+    type Value = String
+    val current: Value = "" // negative-duplicate-physical-base
+  }
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+
+    let state = definition(&analyzer, "refinement.Schedule.State");
+    assert!(analyzer.is_type_alias(&state));
+    let state_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&state),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_count_by_snippet(&state_hits, "positive-refinement-val", 1);
+    assert_hit_count_by_snippet(&state_hits, "positive-refinement-param-return", 2);
+    assert_no_hit_contains(&state_hits, "negative-nearest-pure-local-alias");
+    assert_no_hit_contains(&state_hits, "negative-method-local-alias");
+    assert_no_hit_contains(&state_hits, "negative-refinement-declaration-name");
+    assert_no_hit_contains(&state_hits, "negative-refinement-type-parameter");
+    for marker in [
+        "negative-named-direct-boundary",
+        "negative-named-inherited-boundary",
+        "positive-anonymous-inherited-precedence",
+        "positive-anonymous-nested-class-precedence",
+    ] {
+        assert_no_hit_contains(&state_hits, marker);
+    }
+
+    let inherited_state = definition(&analyzer, "refinement.InnerState.State");
+    let inherited_hits = authoritative_scala_hits(&analyzer, &inherited_state);
+    assert_no_hit_contains(&inherited_hits, "negative-named-inherited-boundary");
+    assert_hit_count_by_snippet(
+        &inherited_hits,
+        "positive-anonymous-inherited-precedence",
+        1,
+    );
+    let nested_class = definition(&analyzer, "refinement.Inner.State");
+    assert_hit_count_by_snippet(
+        &authoritative_scala_hits(&analyzer, &nested_class),
+        "positive-anonymous-nested-class-precedence",
+        1,
+    );
+
+    let future = definition(&analyzer, "refinement.Schedule.Future");
+    let future_hits = authoritative_scala_hits(&analyzer, &future);
+    assert_hit_count_by_snippet(&future_hits, "positive-refinement-before-declaration", 1);
+
+    for ambiguous_member in [
+        definition(&analyzer, "refinement.LeftState.State"),
+        definition(&analyzer, "refinement.RightState.State"),
+    ] {
+        assert_no_hit_contains(
+            &authoritative_scala_hits(&analyzer, &ambiguous_member),
+            "negative-mixin-ambiguity",
+        );
+    }
+    let duplicate_members = analyzer.get_definitions("duplicates.Base.Value");
+    assert_eq!(duplicate_members.len(), 2);
+    for duplicate_member in duplicate_members {
+        assert_no_hit_contains(
+            &authoritative_scala_hits(&analyzer, &duplicate_member),
+            "negative-duplicate-physical-base",
+        );
+    }
+
+    let input = definition(&analyzer, "refinement.PollingMetric.In");
+    assert!(analyzer.is_type_alias(&input));
+    let input_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&input),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_count_by_snippet(&input_hits, "positive-nested-refinement", 1);
+    for marker in [
+        "positive-nearest-nested-constructor",
+        "negative-local-constructor-alias",
+        "negative-local-constructor-parameter",
+        "negative-anonymous-constructor-alias",
+    ] {
+        assert_no_hit_contains(&input_hits, marker);
+    }
+
+    let nested_input = definition(&analyzer, "refinement.MetricWithInput.UnsafeAPI.In");
+    let nested_input_hits = authoritative_scala_hits(&analyzer, &nested_input);
+    assert_hit_count_by_snippet(&nested_input_hits, "positive-nearest-nested-constructor", 1);
+    assert_no_hit_contains(&nested_input_hits, "negative-local-constructor");
+    assert_no_hit_contains(&nested_input_hits, "negative-anonymous-constructor-alias");
+    let constructor_decoy = definition(&analyzer, "refinement.UnsafeAPI.In");
+    let constructor_decoy_hits = authoritative_scala_hits(&analyzer, &constructor_decoy);
+    assert_no_hit_contains(
+        &constructor_decoy_hits,
+        "positive-nearest-nested-constructor",
+    );
+    assert_no_hit_contains(&constructor_decoy_hits, "negative-local-constructor");
+    assert_no_hit_contains(
+        &constructor_decoy_hits,
+        "negative-anonymous-constructor-alias",
+    );
+
+    let decoy_state = definition(&analyzer, "decoy.State");
+    let decoy_state_hits = authoritative_scala_hits(&analyzer, &decoy_state);
+    assert_no_hit_contains(&decoy_state_hits, "positive-refinement");
+    let decoy_input = definition(&analyzer, "decoy.In");
+    assert_no_hit_contains(
+        &authoritative_scala_hits(&analyzer, &decoy_input),
+        "positive-nested-refinement",
+    );
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["refinement.Schedule.State", "refinement.PollingMetric.In"],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    let rendered = mcp.to_string();
+    for marker in [
+        "positive-refinement-val",
+        "positive-refinement-param-return",
+        "positive-nested-refinement",
+    ] {
+        assert!(
+            rendered.contains(marker),
+            "MCP result omitted {marker}: {mcp}"
+        );
+    }
+    for marker in [
+        "negative-nearest-pure-local-alias",
+        "negative-method-local-alias",
+    ] {
+        assert!(
+            !rendered.contains(marker),
+            "MCP result leaked {marker}: {mcp}"
+        );
+    }
+    for marker in [
+        "negative-refinement-declaration-name",
+        "negative-refinement-type-parameter",
+        "negative-mixin-ambiguity",
+        "negative-duplicate-physical-base",
+        "positive-nearest-nested-constructor",
+        "negative-local-constructor-alias",
+        "negative-local-constructor-parameter",
+        "negative-anonymous-constructor-alias",
+    ] {
+        assert!(
+            !rendered.contains(marker),
+            "MCP result leaked {marker}: {mcp}"
+        );
+    }
+}
+
+#[test]
+fn scala_usage_finder_records_unqualified_type_alias_constructor() {
+    let source = r#"package aliases
+trait ExternalKey[A]
+trait SocketOptionCompanionPlatform {
+  type Key[A] = ExternalKey[A]
+  val UnixSocketDeleteIfExists: Key[Boolean] = new Key[Boolean] { // positive-unqualified-alias-constructor
+    def name(): String = "FS2_UNIX_DELETE_IF_EXISTS"
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("aliases/SocketOptions.scala", source),
+        ("decoy/Key.scala", "package decoy\nclass Key[A]\n"),
+    ]);
+    let alias = definition(&analyzer, "aliases.SocketOptionCompanionPlatform.Key");
+    assert!(analyzer.is_type_alias(&alias));
+    let alias_hits = authoritative_scala_hits(&analyzer, &alias);
+    assert_hit_count_by_snippet(&alias_hits, "positive-unqualified-alias-constructor", 2);
+
+    let underlying = definition(&analyzer, "aliases.ExternalKey");
+    let underlying_hits = authoritative_scala_hits(&analyzer, &underlying);
+    assert_no_hit_contains(&underlying_hits, "positive-unqualified-alias-constructor");
+    let decoy = definition(&analyzer, "decoy.Key");
+    let decoy_hits = authoritative_scala_hits(&analyzer, &decoy);
+    assert_no_hit_contains(&decoy_hits, "positive-unqualified-alias-constructor");
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["aliases.SocketOptionCompanionPlatform.Key"],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(mcp["results"][0]["status"], "found", "{mcp}");
+    assert_eq!(mcp["results"][0]["total_hits"], 2, "{mcp}");
+
+    let (_renamed_project, renamed_analyzer) = scala_analyzer_with_files(&[
+        (
+            "aliases/Definitions.scala",
+            "package aliases\ntrait ExternalKey[A]\ntrait Platform { type Key[A] = ExternalKey[A] }\n",
+        ),
+        (
+            "consumer/Renamed.scala",
+            r#"package consumer
+import aliases.Platform.{Key as AliasKey}
+object Renamed {
+  val value: AliasKey[Boolean] = new AliasKey[Boolean] {} // positive-renamed-alias-constructor
+}
+"#,
+        ),
+    ]);
+    let renamed_alias = definition(&renamed_analyzer, "aliases.Platform.Key");
+    assert_hit_count_by_snippet(
+        &authoritative_scala_hits(&renamed_analyzer, &renamed_alias),
+        "positive-renamed-alias-constructor",
+        2,
+    );
+
+    let (_duplicate_project, duplicate_analyzer) = scala_analyzer_with_files(&[
+        (
+            "one/Platform.scala",
+            "package duplicate\ntrait Platform { type Key[A] = List[A] }\n",
+        ),
+        (
+            "two/Platform.scala",
+            "package duplicate\ntrait Platform { type Key[A] = List[A] }\n",
+        ),
+        (
+            "consumer/Uses.scala",
+            r#"package consumer
+import duplicate.Platform.Key
+object Uses {
+  val value: Key[Int] = new Key[Int] {} // negative-duplicate-physical-alias
+}
+"#,
+        ),
+    ]);
+    let duplicate_aliases = duplicate_analyzer.get_definitions("duplicate.Platform.Key");
+    assert_eq!(duplicate_aliases.len(), 2);
+    for duplicate_alias in duplicate_aliases {
+        assert_no_hit_contains(
+            &authoritative_scala_hits(&duplicate_analyzer, &duplicate_alias),
+            "negative-duplicate-physical-alias",
+        );
+    }
+}
+
+#[test]
+fn scala_explicit_companion_imports_keep_same_fqn_targets_source_exact() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+object RingBuffer {{
+  val STATE_FULL = 1
+  val STATE_RESERVED = 2
+}}
+class RingBuffer {{
+  import RingBuffer.{{STATE_FULL, STATE_RESERVED}}
+  private var state = 0
+  def full(): Unit = state = STATE_FULL // {platform}-full
+  def reserved(): Unit = state = STATE_RESERVED // {platform}-reserved
+  def shadow(STATE_FULL: Int): Int = STATE_FULL // {platform}-local-shadow
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let native = replica("native");
+    let external = r#"package consumer
+import replica.RingBuffer.{STATE_FULL, STATE_RESERVED}
+object External {
+  val full = STATE_FULL // negative-third-file-full
+  val reserved = STATE_RESERVED // negative-third-file-reserved
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/RingBuffer.scala", &jvm),
+        ("native/replica/RingBuffer.scala", &native),
+        ("consumer/External.scala", external),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+
+    for (member, marker_suffix) in [("STATE_FULL", "full"), ("STATE_RESERVED", "reserved")] {
+        let fqn = format!("replica.RingBuffer$.{member}");
+        let mut targets = analyzer.get_definitions(&fqn);
+        targets.sort();
+        assert_eq!(
+            targets.len(),
+            2,
+            "expected JVM and native targets for {fqn}"
+        );
+
+        for (platform, path) in [
+            ("jvm", "jvm/replica/RingBuffer.scala"),
+            ("native", "native/replica/RingBuffer.scala"),
+        ] {
+            let target = targets
+                .iter()
+                .find(|target| rel_path_string(target.source()) == path)
+                .unwrap_or_else(|| panic!("missing {path} target for {fqn}"));
+            let target_hits = hits(
+                UsageFinder::new()
+                    .with_authoritative_scope(true)
+                    .query_with_provider(
+                        &analyzer,
+                        std::slice::from_ref(target),
+                        Some(&provider),
+                        100,
+                        100,
+                    )
+                    .result,
+            );
+            assert_hit_contains(&target_hits, &format!("{platform}-{marker_suffix}"));
+            let other = if platform == "jvm" { "native" } else { "jvm" };
+            assert_no_hit_contains(&target_hits, &format!("{other}-{marker_suffix}"));
+            assert_no_hit_contains(&target_hits, "negative-third-file");
+            assert_no_hit_contains(&target_hits, &format!("{platform}-local-shadow"));
+        }
+
+        let grouped_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(&analyzer, &targets, Some(&provider), 100, 100)
+                .result,
+        );
+        for platform in ["jvm", "native"] {
+            assert_hit_contains(&grouped_hits, &format!("{platform}-{marker_suffix}"));
+        }
+        assert_no_hit_contains(&grouped_hits, "negative-third-file");
+    }
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": [
+                "replica.RingBuffer$.STATE_FULL",
+                "replica.RingBuffer$.STATE_RESERVED"
+            ],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    let rendered = mcp.to_string();
+    for marker in ["jvm-full", "native-full", "jvm-reserved", "native-reserved"] {
+        assert!(
+            rendered.contains(marker),
+            "MCP result omitted {marker}: {mcp}"
+        );
+    }
+    assert!(
+        !rendered.contains("negative-third-file"),
+        "MCP result leaked ambiguous third-file imports: {mcp}"
+    );
+    assert!(
+        !rendered.contains("local-shadow"),
+        "MCP result leaked locally shadowed constants: {mcp}"
+    );
+
+    let (_mixed_project, mixed_analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/replica/Mixed.scala",
+            r#"package replica
+object Mixed { val FLAG = 1 }
+class UsesMixed {
+  import Mixed.FLAG
+  val value = FLAG // negative-mixed-field-function-replicas
+}
+"#,
+        ),
+        (
+            "native/replica/Mixed.scala",
+            "package replica\nobject Mixed { def FLAG: Int = 2 }\n",
+        ),
+    ]);
+    let mixed_targets = mixed_analyzer.get_definitions("replica.Mixed$.FLAG");
+    assert_eq!(mixed_targets.len(), 2);
+    for mixed_target in mixed_targets {
+        assert_no_hit_contains(
+            &authoritative_scala_hits(&mixed_analyzer, &mixed_target),
+            "negative-mixed-field-function-replicas",
+        );
     }
 }
 

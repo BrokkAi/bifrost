@@ -2,9 +2,11 @@ use std::sync::{Arc, OnceLock};
 
 use tree_sitter::{Node, Tree};
 
-use crate::analyzer::common::{language_for_file, source_identifier_for_target};
+use crate::analyzer::common::{
+    language_for_file, language_for_target, source_identifier_for_target,
+};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
 
 pub(crate) struct DeclarationNameRangeContext {
@@ -125,7 +127,11 @@ pub(crate) fn code_unit_declaration_name_range_for_range(
         declaration_source_identifier(code_unit),
         content,
     )?;
-    Some(node_byte_range(name_node))
+    Some(if language_for_target(code_unit) == Language::Ruby {
+        crate::analyzer::ruby::ruby_semantic_identifier_range(name_node, content)
+    } else {
+        node_byte_range(name_node)
+    })
 }
 
 /// TypeScript uses a `$static` suffix in its internal member names to keep

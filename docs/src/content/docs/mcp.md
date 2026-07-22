@@ -126,6 +126,6 @@ bifrost --root /path/to/project --install-skills --target project
 See [CLI](../cli/#install-agent-skills) for `--target global`,
 `--skills-root`, `--mode`, `--skill-set`, `--dry-run`, and `--force`.
 
-Use the host-specific pages for Codex, Claude Code, Cursor, OpenCode, Zed Agent,
-Amp, and Antigravity setup flows. The intended external manual client is the
-official MCP Inspector.
+Use the host-specific pages for Pi, Codex, Claude Code, Cursor, OpenCode, Zed
+Agent, Amp, and Antigravity setup flows. The intended external manual client is
+the official MCP Inspector.

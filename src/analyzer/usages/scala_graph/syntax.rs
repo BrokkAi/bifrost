@@ -10,6 +10,7 @@ pub(crate) struct ScalaSourceFacts {
     pub(crate) callable_alternatives_by_range:
         HashMap<(usize, usize), ScalaCallableSourceAlternative>,
     pub(crate) field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
+    pub(crate) type_alias_paths_by_range: HashMap<(usize, usize), Vec<String>>,
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
     pub(crate) enum_ranges: HashSet<(usize, usize)>,
     pub(crate) case_class_ranges: HashSet<(usize, usize)>,
@@ -230,6 +231,17 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         .insert((node.start_byte(), node.end_byte()), path);
                 }
             }
+            "type_definition" => {
+                if let Some(path) = node
+                    .child_by_field_name("type")
+                    .map(|type_node| scala_alias_underlying_type_path(type_node, source))
+                    .filter(|segments| !segments.is_empty())
+                {
+                    facts
+                        .type_alias_paths_by_range
+                        .insert((node.start_byte(), node.end_byte()), path);
+                }
+            }
             "function_definition" | "function_declaration" => {
                 if node.kind() == "function_declaration" {
                     facts
@@ -359,6 +371,27 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         stack.extend(node.named_children(&mut cursor));
     }
     Some(facts)
+}
+
+fn scala_alias_underlying_type_path(type_node: Node<'_>, source: &str) -> Vec<String> {
+    if type_node.kind() != "compound_type" {
+        return scala_type_lookup_segments(type_node, source);
+    }
+
+    let mut cursor = type_node.walk();
+    let mut candidates = type_node
+        .named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "refinement" | "structural_type"))
+        .map(|child| scala_type_lookup_segments(child, source))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() == 1 {
+        candidates.pop().expect("one compound alias base")
+    } else {
+        Vec::new()
+    }
 }
 
 fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSourceFacts) {
