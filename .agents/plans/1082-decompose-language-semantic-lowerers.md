@@ -15,8 +15,11 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
 - [x] (2026-07-22 19:23Z) Chose a one-way private module topology and recorded the implementation and validation strategy in this plan.
 - [x] (2026-07-22 19:31Z) Captured exact pre-refactor semantic-render digests, artifact-key fingerprints, and `SemanticWork` rows for representative Java, JavaScript, JSX, TypeScript, and TSX fixtures with a temporary test probe.
 - [x] (2026-07-22 19:43Z) Decomposed `src/analyzer/java/semantic.rs` into six private modules; `cargo check --all-targets`, the exact five-dialect equivalence probe, `semantic_provider_contract`, Java-filtered language/value contracts, and `git diff --check` passed.
-- [ ] Commit the validated Java milestone.
-- [ ] Decompose `src/analyzer/js_ts/semantic.rs`, preserve the single shared JavaScript/TypeScript lowerer, run focused JS/TS validation, review the move-only diff, and commit the milestone.
+- [x] (2026-07-22 19:44Z) Committed the validated Java milestone as `80fbfe3f`.
+- [x] (2026-07-22 19:52Z) Decomposed `src/analyzer/js_ts/semantic.rs` into the same six private language-local modules while retaining one shared flavor-driven lowerer.
+- [x] (2026-07-22 19:52Z) Re-ran the exact five-dialect equivalence probe after both splits; every render digest, artifact key, and `SemanticWork` field matched the pre-refactor baseline, then removed the temporary probe and its fixed temp project.
+- [x] (2026-07-22 19:52Z) Ran the unchanged `semantic_language_conformance` (130 passed), `semantic_value_language_contract` (13 passed), and `semantic_provider_contract` (11 passed) suites plus `cargo check --all-targets` and `git diff --check`.
+- [ ] Commit the validated shared JS/TS milestone.
 - [ ] Run all unchanged semantic contract suites with `nlp,python`, the full formatter and clippy gates, and the full feature-enabled test suite.
 - [ ] Run specialist reviews over the final diff, address confirmed findings, update this plan, push the branch, and open a ready-for-review pull request that fixes #1082.
 
@@ -61,6 +64,8 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
 Implementation is not complete yet. At completion this section will record the final module sizes, validation evidence, review results, PR URL, and any remaining follow-up such as the unbound Bifrost workspace tooling problem.
 
 The Java milestone now replaces the 3,657-line monolith with `control.rs` (2,331 lines), `inventory.rs` (176), `mod.rs` (276), `syntax.rs` (505), `tests.rs` (35), and `values.rs` (358). The representative Java artifact retained render digest `4e0bd646...cf1c`, key fingerprint `0a787864...2e8d`, and every original work counter. No Java consumer path or adapter byte changed.
+
+The JS/TS milestone replaces the 4,095-line monolith with `control.rs` (2,687 lines), `inventory.rs` (187), `mod.rs` (322), `syntax.rs` (530), `tests.rs` (35), and `values.rs` (354). The existing `JsTsSemanticLowerer` constructors and all JavaScript/TypeScript adapter bytes remain unchanged. Exact artifact equivalence passed for `.js`, `.jsx`, `.ts`, and `.tsx` as well as the already-split Java adapter.
 
 ## Context and Orientation
 
@@ -157,4 +162,4 @@ No new external dependency or public interface is permitted. `impl_program_seman
 
 Child modules are private. Inventory records and cross-module inherent methods may use `pub(super)` because that visibility stops at the language's `semantic` parent. Do not use `pub(crate)` merely to cross a sibling boundary, do not re-export child implementation modules, and do not introduce a common Java/JS statement or expression layer.
 
-Revision note (2026-07-22 19:43Z): Recorded completion and validation of the Java module milestone, including exact artifact equivalence and the resulting module sizes.
+Revision note (2026-07-22 19:52Z): Recorded the completed shared JS/TS split, exact five-dialect equivalence after both moves, and all three unchanged semantic contract suite results.
