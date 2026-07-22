@@ -1477,9 +1477,13 @@ fn assert_profile_cache_contract(sample: &ExecutionSample, spec: &CaseSpec) {
     let reverse = profile.cache.import_reverse;
     if spec.shared_dependency == Some("complete direct import graph") {
         assert_eq!(reverse.lookups, 2, "{} import lookups", spec.name);
+        let topology = profile.cache.direct_import_topology;
+        assert_eq!(topology.lookups, 2, "{} topology lookups", spec.name);
+        let topology_built = topology.builds == 1;
         let (expected_misses, expected_builds, expected_hits, expected_replayed) =
             match sample.cache_state {
                 CacheState::FreshAnalyzerFirstRequest => (1, 1, 1, 1),
+                CacheState::SameAnalyzerLaterRequest if topology_built => (1, 1, 1, 1),
                 CacheState::SameAnalyzerLaterRequest => (0, 0, 2, 2),
             };
         assert_eq!(
@@ -1508,26 +1512,34 @@ fn assert_profile_cache_contract(sample: &ExecutionSample, spec: &CaseSpec) {
             "{} relevant reverse edges replayed",
             spec.name
         );
-        let topology = profile.cache.direct_import_topology;
-        assert_eq!(topology.lookups, 2, "{} topology lookups", spec.name);
+        let (topology_misses, topology_builds, topology_hits, topology_fallbacks) =
+            match sample.cache_state {
+                CacheState::FreshAnalyzerFirstRequest => (2, 0, 0, 2),
+                CacheState::SameAnalyzerLaterRequest if topology_built => (1, 1, 1, 0),
+                CacheState::SameAnalyzerLaterRequest => (0, 0, 2, 0),
+            };
         assert_eq!(
-            topology.misses, expected_misses,
+            topology.misses, topology_misses,
             "{} topology misses",
             spec.name
         );
         assert_eq!(
-            topology.builds, expected_builds,
+            topology.builds, topology_builds,
             "{} topology builds",
             spec.name
         );
-        assert_eq!(topology.hits, expected_hits, "{} topology hits", spec.name);
+        assert_eq!(topology.hits, topology_hits, "{} topology hits", spec.name);
         assert_eq!(
             topology.unavailable, 0,
             "{} topology unavailable",
             spec.name
         );
-        assert_eq!(topology.fallbacks, 0, "{} topology fallbacks", spec.name);
-        if sample.cache_state == CacheState::FreshAnalyzerFirstRequest {
+        assert_eq!(
+            topology.fallbacks, topology_fallbacks,
+            "{} topology fallbacks",
+            spec.name
+        );
+        if expected_builds == 1 {
             let build = profile
                 .operators
                 .iter()
@@ -1545,15 +1557,29 @@ fn assert_profile_cache_contract(sample: &ExecutionSample, spec: &CaseSpec) {
                 "{} import edges resolved",
                 spec.name
             );
+        }
+        if topology_built {
+            assert_eq!(
+                topology.build_files,
+                u64::try_from(spec.expected_branch_results.saturating_add(2)).unwrap_or(u64::MAX),
+                "{} topology build files",
+                spec.name
+            );
+            assert_eq!(
+                topology.build_edges,
+                u64::try_from(spec.expected_branch_results.saturating_mul(2)).unwrap_or(u64::MAX),
+                "{} topology build edges",
+                spec.name
+            );
         } else {
             assert_eq!(
                 topology.build_files, 0,
-                "{} warm topology build files",
+                "{} topology build files",
                 spec.name
             );
             assert_eq!(
                 topology.build_edges, 0,
-                "{} warm topology build edges",
+                "{} topology build edges",
                 spec.name
             );
         }

@@ -2,9 +2,9 @@ use super::*;
 use crate::analyzer::structural::CodeQuery;
 use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
 use crate::analyzer::{
-    AnalyzerConfig, CSharpAnalyzer, CodeUnitType, CppAnalyzer, GoAnalyzer, JavaAnalyzer,
-    JavascriptAnalyzer, OverlayProject, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, TestProject, TypescriptAnalyzer, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CodeUnitType, CppAnalyzer, GoAnalyzer,
+    JavaAnalyzer, JavascriptAnalyzer, MultiAnalyzer, OverlayProject, PhpAnalyzer, PythonAnalyzer,
+    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TestProject, TypescriptAnalyzer, WorkspaceAnalyzer,
 };
 use serde_json::json;
 use std::cell::Cell;
@@ -291,6 +291,92 @@ fn snapshot_import_topology_matches_request_local_and_reuses_across_requests() {
 }
 
 #[test]
+fn auto_import_topology_builds_only_after_observing_reuse() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "bench/Target.java")
+        .write("package bench; public class Target {}\n")
+        .expect("write target");
+    ProjectFile::new(root.clone(), "bench/Consumer.java")
+        .write("package bench; import bench.Target; public class Consumer {}\n")
+        .expect("write consumer");
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+    let limits = CodeQueryExecutionLimits::default();
+
+    let scan = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::ScanOnly,
+    );
+    let first = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&first.result).expect("first Auto result"),
+        serde_json::to_value(&scan.result).expect("scan result")
+    );
+    let first_profile = first.profile.expect("first Auto profile");
+    assert_eq!(first_profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(first_profile.cache.direct_import_topology.misses, 1);
+    assert_eq!(first_profile.cache.direct_import_topology.fallbacks, 1);
+
+    let built = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&built.result).expect("built Auto result"),
+        serde_json::to_value(&scan.result).expect("scan result")
+    );
+    assert_eq!(
+        built
+            .profile
+            .expect("built Auto profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1
+    );
+
+    let hit = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&hit.result).expect("hit Auto result"),
+        serde_json::to_value(&scan.result).expect("scan result")
+    );
+    assert_eq!(
+        hit.profile
+            .expect("hit Auto profile")
+            .cache
+            .direct_import_topology
+            .hits,
+        1
+    );
+}
+
+#[test]
 fn snapshot_import_topology_resets_on_update_and_mutable_overlay_generation() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -508,6 +594,92 @@ fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
 }
 
 #[test]
+fn multi_analyzer_tracks_every_delegate_overlay_generation() {
+    let java_temp = tempfile::tempdir().expect("Java temp dir");
+    let java_root = java_temp.path().canonicalize().expect("Java root");
+    ProjectFile::new(java_root.clone(), "Extra.java")
+        .write("public class Extra {}\n")
+        .expect("write Java source");
+    let java_project = Arc::new(OverlayProject::new(Arc::new(TestProject::new(
+        java_root,
+        Language::Java,
+    ))));
+    let java = JavaAnalyzer::new(Arc::clone(&java_project) as Arc<dyn crate::analyzer::Project>);
+
+    let ts_temp = tempfile::tempdir().expect("TypeScript temp dir");
+    let ts_root = ts_temp.path().canonicalize().expect("TypeScript root");
+    ProjectFile::new(ts_root.clone(), "before.ts")
+        .write("export class Before {}\n")
+        .expect("write before target");
+    ProjectFile::new(ts_root.clone(), "after.ts")
+        .write("export class After {}\n")
+        .expect("write after target");
+    let consumer = ProjectFile::new(ts_root.clone(), "consumer.ts");
+    consumer
+        .write("import { Before } from './before'; export class Consumer extends Before {}\n")
+        .expect("write TypeScript consumer");
+    let ts_project = Arc::new(OverlayProject::new(Arc::new(TestProject::new(
+        ts_root,
+        Language::TypeScript,
+    ))));
+    let typescript =
+        TypescriptAnalyzer::new(Arc::clone(&ts_project) as Arc<dyn crate::analyzer::Project>);
+    let analyzer = MultiAnalyzer::new(BTreeMap::from([
+        (Language::Java, AnalyzerDelegate::Java(java)),
+        (
+            Language::TypeScript,
+            AnalyzerDelegate::TypeScript(typescript),
+        ),
+    ]));
+    let limits = CodeQueryExecutionLimits::default();
+
+    let before = import_query(
+        &analyzer,
+        "typescript",
+        "before.ts",
+        "Before",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(before.result.results.len(), 1);
+    assert_eq!(
+        before
+            .profile
+            .expect("initial multi profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1
+    );
+
+    assert!(ts_project.set(
+        consumer.abs_path(),
+        "import { After } from './after'; export class Consumer extends After {}\n".to_string(),
+    ));
+    let after = import_query(
+        &analyzer,
+        "typescript",
+        "after.ts",
+        "After",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(after.result.results.len(), 1);
+    assert_eq!(
+        after
+            .profile
+            .expect("revised multi profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1,
+        "a non-primary delegate generation must invalidate the workspace topology"
+    );
+}
+
+#[test]
 fn auto_import_topology_budget_fallback_matches_request_local_response() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -535,6 +707,23 @@ fn auto_import_topology_budget_fallback_matches_request_local_response() {
         limits,
         StructuralAccessMode::ScanOnly,
     );
+    let admitted = import_query(
+        &analyzer,
+        "ruby",
+        "c.rb",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&admitted.result).expect("admission result"),
+        serde_json::to_value(&scan.result).expect("request-local result")
+    );
+    let admitted_profile = admitted.profile.expect("admission profile");
+    assert_eq!(admitted_profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(admitted_profile.cache.direct_import_topology.fallbacks, 1);
+
     let automatic = import_query(
         &analyzer,
         "ruby",
@@ -554,6 +743,92 @@ fn auto_import_topology_budget_fallback_matches_request_local_response() {
     assert_eq!(profile.cache.direct_import_topology.over_budget, 1);
     assert_eq!(profile.cache.direct_import_topology.fallbacks, 1);
     assert_eq!(profile.cache.direct_import_topology.complete_builds, 0);
+
+    let suppressed = import_query(
+        &analyzer,
+        "ruby",
+        "c.rb",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&suppressed.result).expect("suppressed result"),
+        serde_json::to_value(&scan.result).expect("request-local result")
+    );
+    let suppressed = suppressed.profile.expect("suppressed profile");
+    assert_eq!(suppressed.cache.direct_import_topology.builds, 0);
+    assert_eq!(suppressed.cache.direct_import_topology.unavailable, 0);
+    assert_eq!(suppressed.cache.direct_import_topology.fallbacks, 1);
+}
+
+#[test]
+fn late_topology_edge_limit_reuses_partial_work_for_fallback() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "target.ts")
+        .write("export class Target {}\n")
+        .expect("write target");
+    for index in 0..4 {
+        ProjectFile::new(root.clone(), format!("consumer_{index}.ts"))
+            .write(format!(
+                "import {{ Target }} from './target'; export class Consumer{index} extends Target {{}}\n"
+            ))
+            .expect("write consumer");
+    }
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let limits = CodeQueryExecutionLimits {
+        max_pipeline_rows: 3,
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    let scan = import_query(
+        &analyzer,
+        "typescript",
+        "target.ts",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::ScanOnly,
+    );
+    let admission = import_query(
+        &analyzer,
+        "typescript",
+        "target.ts",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&admission.result).expect("admission response"),
+        serde_json::to_value(&scan.result).expect("scan response")
+    );
+    let fallback = import_query(
+        &analyzer,
+        "typescript",
+        "target.ts",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&fallback.result).expect("fallback response"),
+        serde_json::to_value(&scan.result).expect("scan response")
+    );
+    let profile = fallback.profile.expect("late fallback profile");
+    assert_eq!(profile.cache.direct_import_topology.over_budget, 1);
+    assert_eq!(profile.cache.direct_import_topology.fallbacks, 1);
+    assert!(
+        profile.work.import_files_resolved
+            <= u64::try_from(limits.max_scanned_files).unwrap_or(u64::MAX)
+    );
+    assert!(
+        profile.work.import_edges_resolved
+            <= u64::try_from(limits.max_pipeline_rows).unwrap_or(u64::MAX)
+    );
 }
 
 #[test]

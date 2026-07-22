@@ -23,7 +23,8 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 09:55Z) Completed Milestone 2 implementation and its three-specialist guided review; fixed construction peak-memory, finalization/selection cancellation, duplicate retained-byte accounting, scoped-versus-admitted telemetry, narrow-scope build cost, live-overlay freshness, and cold-ratio findings.
 - [x] (2026-07-22 10:16Z) Captured paired clean-commit Dapper scan-only and Auto reports at commit 4c480b6d; the workspace query reduced warm median from 107.4 ms to 26.0 ms, examined facts from 49,181 to 27, and retained 1,979,756 bytes (16.2% of normalized-facts bytes).
 - [x] (2026-07-22 11:04Z) Implemented the measured direct-import topology, snapshot ownership/lifecycle telemetry, typed differential/lifecycle tests, and Ky/Express importer benchmark cases; captured paired scan-only/Auto evidence on both pinned repositories.
-- [x] (2026-07-22 11:32Z) Ran the Milestone 3 five-perspective guided review. It confirmed eager first-use Auto admission, duplicated failed-build fallback work, incomplete MultiAnalyzer generation identity, fixed-budget ownership, construction-memory, live-overlay replay, parser strictness, and cleanup findings; review fixes remain in progress.
+- [x] (2026-07-22 11:32Z) Ran the Milestone 3 five-perspective guided review. It confirmed eager first-use Auto admission, duplicated failed-build fallback work, incomplete MultiAnalyzer generation identity, fixed-budget ownership, construction-memory, live-overlay replay, parser strictness, and cleanup findings.
+- [x] (2026-07-22 12:19Z) Resolved every confirmed Milestone 3 review finding: request-scoped Auto admission, partial-work fallback reuse, all-delegate generation identity, configured budget ownership, conservative construction preflight, post-replay generation rejection, strict benchmark parsing, and derived-layer-specific public telemetry all pass focused validation and all-target/all-feature Clippy.
 - [ ] Complete Milestone 3 using the measured promotion criteria, run focused tests, run guided review, fix confirmed findings, update this plan, and commit.
 - [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
 - [ ] Run cargo fmt --check, all-target/all-feature Clippy, and the complete nlp,python feature-enabled test gate.
@@ -76,6 +77,15 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: The complete direct-import topology is tiny relative to the already-persisted structural facts but should remain snapshot-local. Express retained 7,093 bytes versus 2,259,214 serialized structural-facts payload bytes (0.31%); no restart-benefit or serialization/invalidation evidence exists for a second persisted layer.
   Evidence: `.cache/issue920/express-js/.brokk/bifrost_cache.db` read-only payload census and the paired Express reports.
+
+- Observation: Auto admission must count complete query requests, not sibling branches inside one composed query. Otherwise two identical import branches turn a one-off request into an eager whole-workspace build and reproduce the cold-start regression the admission policy was designed to avoid.
+  Evidence: `deferred_derived_builds` is request-local, while `SnapshotDerivedLayerCache` records one reuse opportunity per generation; the tiny ignored benchmark now proves cold topology `2 misses / 0 builds / 2 fallbacks`, followed by one build and then hits.
+
+- Observation: A failed retained-topology build can preserve exact work for the request-local fallback because both paths use the same `RequestLocalDirectImportGraph`. Charging only the additional fallback work keeps file/edge limits honest and avoids resolving the same imports twice in one request.
+  Evidence: `late_topology_edge_limit_reuses_partial_work_for_fallback` matches the scan response and keeps aggregate resolved files/edges within the public request limits.
+
+- Observation: A workspace-wide derived layer cannot use only `MultiAnalyzer::project()` as its source identity; a mutable overlay on any non-primary delegate can change import edges. The cache identity is now the ordered generation vector of every delegate, while update, update_all, and clone-with-project still allocate fresh owners.
+  Evidence: `multi_analyzer_tracks_every_delegate_overlay_generation` mutates the TypeScript delegate while Java remains first and observes a rebuild rather than a stale hit.
 
 ## Decision Log
 
@@ -131,7 +141,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: LSP overlays must remain mutable, while a monotonic generation prevents an old positive or negative posting from serving after an in-place edit. The owner still changes on ordinary analyzer update/update_all/clone-with-project boundaries.
   Date/Author: 2026-07-22 / Codex.
 
-- Decision: Production `Auto` scans the first viable whole-provider use, records reuse interest for that exact source generation, and builds on a later viable use. `IndexedRequired` still builds immediately for deterministic differential tests.
+- Decision: Production `Auto` scans the first viable query request, records reuse interest for that exact source-generation vector, and builds on a later viable request. Sibling branches in the same request share the deferral decision. `IndexedRequired` still builds immediately for deterministic differential tests.
   Rationale: This avoids imposing whole-workspace construction on one-shot queries and satisfies the measured first-to-warm retention gate. The benchmark preserves the transition's build work instead of hiding it in discarded warmup observations.
   Date/Author: 2026-07-22 / Codex.
 
@@ -165,7 +175,7 @@ Milestone 2 is implementation- and guided-review-complete. The posting index ret
 
 The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satisfies the Milestone 2 promotion gates. For `workspace-exact-sql-mapper-class`, scan-only first/warm median/p95 was 217.6/107.4/245.1 ms and Auto was 208.9/26.0/26.8 ms, a 4.13x warm-median improvement with an 8.04x first-to-warm ratio. Indexed warm execution reduced candidate/examined facts from 49,181 to 27, materialized facts from 49,181 to 24,269, and inspected source bytes from 1,159,390 to 917,649. The transition warmup built over 157 files and 85,325 facts in 210.9 ms; the retained index was 1,979,756 bytes versus 12,215,566 normalized-facts bytes, or 16.2%. Both paths returned the same 27 results without truncation or diagnostics.
 
-Milestone 3's measured implementation is complete and its guided-review corrections are in progress. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
+Milestone 3's measured implementation and guided-review corrections are complete; only refreshed clean-commit benchmark evidence remains before closing the milestone. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Auto defers one-shot requests, rejected builds suppress same-or-tighter retries, partial failed-build work becomes the exact request-local fallback, and every delegate generation participates in MultiAnalyzer invalidation. Owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -539,6 +549,26 @@ Milestone 3 focused validation before guided-review fixes:
     # pass
     BIFROST_CODE_QUERY_BENCH_SMALL_FILES=2 BIFROST_CODE_QUERY_BENCH_LARGE_FILES=3 BIFROST_CODE_QUERY_BENCH_ITERATIONS=1 cargo test --lib code_query_execution_profile_measurement -- --ignored --nocapture
     # 1 pass after updating the cold-versus-warm snapshot lifecycle contract
+
+Milestone 3 guided-review fix validation:
+
+    cargo check --all-targets --all-features
+    cargo clippy --all-targets --all-features -- -D warnings
+    # pass
+    cargo test topology --lib
+    # 11 pass, including Auto admission, partial fallback reuse, lifecycle, and topology memory preflight
+    cargo test multi_analyzer_tracks_every_delegate_overlay_generation --lib
+    cargo test multi_workspace_derived_cache_uses_configured_budget_share --lib
+    # 1 + 1 pass
+    cargo test profile_parser --lib
+    cargo test public_profile_projects_stable_metrics_and_omits_internal_evidence --lib
+    # 4 + 1 pass; missing derived-layer fields are rejected and generic cache layers omit derived-only counters
+    cargo test derived --lib
+    # 16 pass
+    uv run --python 3.12 --with maturin python -m unittest python_tests.test_searchtools_client
+    # 56 pass; the direct-import layer decodes to CodeQueryDerivedLayerCacheCounters
+    BIFROST_CODE_QUERY_BENCH_SMALL_FILES=2 BIFROST_CODE_QUERY_BENCH_LARGE_FILES=3 BIFROST_CODE_QUERY_BENCH_ITERATIONS=1 cargo test --lib code_query_execution_profile_measurement -- --ignored --nocapture
+    # 1 pass with cold deferred fallback, first-reuse build, and later-hit assertions
 
 ## Interfaces and Dependencies
 

@@ -256,31 +256,6 @@ struct FactsCacheWire {
     replayed_files: u64,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct DerivedLayerCacheWire {
-    lookups: u64,
-    hits: u64,
-    misses: u64,
-    builds: u64,
-    waits: u64,
-    wait_ns: u64,
-    complete_hits: u64,
-    incomplete_hits: u64,
-    complete_builds: u64,
-    incomplete_builds: u64,
-    unknown_outcomes: u64,
-    cancelled: u64,
-    unavailable: u64,
-    over_budget: u64,
-    fallbacks: u64,
-    replayed_items: u64,
-    build_files: u64,
-    build_edges: u64,
-    build_ns: u64,
-    retained_bytes: u64,
-}
-
 fn parse_profile(
     case: &QueryCodeBenchmarkCase,
     tool_result: &Value,
@@ -342,15 +317,19 @@ fn parse_profile(
         .cache_layers
         .iter()
         .find(|layer| layer.layer == "direct_import_topology")
-        .map(|layer| serde_json::from_value::<DerivedLayerCacheWire>(layer.metrics.clone()))
-        .transpose()
-        .map_err(|error| {
+        .ok_or_else(|| {
             format!(
-                "query_code case `{}` returned invalid direct_import_topology metrics: {error}",
+                "query_code case `{}` profile is missing direct_import_topology cache metrics",
                 case.id
             )
-        })?
-        .unwrap_or_default();
+        })?;
+    let topology: QueryCodeDerivedLayerMetrics = serde_json::from_value(topology.metrics.clone())
+        .map_err(|error| {
+        format!(
+            "query_code case `{}` returned invalid direct_import_topology metrics: {error}",
+            case.id
+        )
+    })?;
 
     Ok((
         profile.result,
@@ -376,28 +355,7 @@ fn parse_profile(
                 unknown_outcomes: facts.unknown_outcomes,
                 replayed_files: facts.replayed_files,
             },
-            direct_import_topology: QueryCodeDerivedLayerMetrics {
-                lookups: topology.lookups,
-                hits: topology.hits,
-                misses: topology.misses,
-                builds: topology.builds,
-                waits: topology.waits,
-                wait_ns: topology.wait_ns,
-                complete_hits: topology.complete_hits,
-                incomplete_hits: topology.incomplete_hits,
-                complete_builds: topology.complete_builds,
-                incomplete_builds: topology.incomplete_builds,
-                unknown_outcomes: topology.unknown_outcomes,
-                cancelled: topology.cancelled,
-                unavailable: topology.unavailable,
-                over_budget: topology.over_budget,
-                fallbacks: topology.fallbacks,
-                replayed_items: topology.replayed_items,
-                build_files: topology.build_files,
-                build_edges: topology.build_edges,
-                build_ns: topology.build_ns,
-                retained_bytes: topology.retained_bytes,
-            },
+            direct_import_topology: topology,
             access_path: Some(parse_access_path(&profile.access_path)?),
         },
     ))
@@ -832,6 +790,28 @@ mod tests {
     }
 
     #[test]
+    fn profile_parser_requires_derived_layer_lifecycle_contract() {
+        let mut missing_layer = profiled_query_response();
+        missing_layer["structuredContent"]["cache_layers"]
+            .as_array_mut()
+            .expect("cache layers")
+            .retain(|layer| layer["layer"] != "direct_import_topology");
+        let error = parse_profile(&benchmark_case(), &missing_layer)
+            .expect_err("profile must include the derived-layer lifecycle");
+        assert!(error.contains("missing direct_import_topology"), "{error}");
+
+        let mut missing_counter = profiled_query_response();
+        missing_counter["structuredContent"]["cache_layers"][1]["metrics"]
+            .as_object_mut()
+            .expect("topology metrics")
+            .remove("fallbacks");
+        let error = parse_profile(&benchmark_case(), &missing_counter)
+            .expect_err("profile must include every required lifecycle counter");
+        assert!(error.contains("invalid direct_import_topology"), "{error}");
+        assert!(error.contains("fallbacks"), "{error}");
+    }
+
+    #[test]
     fn failed_case_exposes_no_partial_timings() {
         let report = failure_report(
             &benchmark_case(),
@@ -899,8 +879,23 @@ mod tests {
                             "kind": "complete_value",
                             "lookups": 1,
                             "hits": 1,
+                            "misses": 0,
+                            "builds": 0,
+                            "waits": 0,
+                            "wait_ns": 0,
                             "complete_hits": 1,
+                            "incomplete_hits": 0,
+                            "complete_builds": 0,
+                            "incomplete_builds": 0,
+                            "unknown_outcomes": 0,
+                            "cancelled": 0,
+                            "unavailable": 0,
+                            "over_budget": 0,
+                            "fallbacks": 0,
                             "replayed_items": 2,
+                            "build_files": 0,
+                            "build_edges": 0,
+                            "build_ns": 0,
                             "retained_bytes": 512
                         }
                     }

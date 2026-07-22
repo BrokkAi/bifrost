@@ -316,6 +316,18 @@ pub(crate) struct QueryCacheLayerProfile {
     pub(crate) complete_builds: u64,
     pub(crate) incomplete_builds: u64,
     pub(crate) unknown_outcomes: u64,
+    /// Cached payload items made available to the consumer before
+    /// relation-specific filtering and projection. This can exceed emitted
+    /// rows; `relation_expansions` records post-filter expansions separately.
+    pub(crate) replayed_items: u64,
+}
+
+/// Snapshot-derived values share complete-value hit/build semantics but have
+/// additional admission, construction, and fallback outcomes that do not
+/// belong on request-local seed/reference/call caches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct QueryDerivedLayerProfile {
+    common: QueryCacheLayerProfile,
     pub(crate) cancelled: u64,
     pub(crate) unavailable: u64,
     pub(crate) over_budget: u64,
@@ -324,10 +336,20 @@ pub(crate) struct QueryCacheLayerProfile {
     pub(crate) build_edges: u64,
     pub(crate) build_ns: u64,
     pub(crate) retained_bytes: u64,
-    /// Cached payload items made available to the consumer before
-    /// relation-specific filtering and projection. This can exceed emitted
-    /// rows; `relation_expansions` records post-filter expansions separately.
-    pub(crate) replayed_items: u64,
+}
+
+impl std::ops::Deref for QueryDerivedLayerProfile {
+    type Target = QueryCacheLayerProfile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+
+impl std::ops::DerefMut for QueryDerivedLayerProfile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.common
+    }
 }
 
 /// Exact outcomes for structural-facts lookups performed by seed scans.
@@ -418,14 +440,6 @@ impl QueryCacheLayerProfile {
                 .incomplete_builds
                 .saturating_add(other.incomplete_builds),
             unknown_outcomes: self.unknown_outcomes.saturating_add(other.unknown_outcomes),
-            cancelled: self.cancelled.saturating_add(other.cancelled),
-            unavailable: self.unavailable.saturating_add(other.unavailable),
-            over_budget: self.over_budget.saturating_add(other.over_budget),
-            fallbacks: self.fallbacks.saturating_add(other.fallbacks),
-            build_files: self.build_files.saturating_add(other.build_files),
-            build_edges: self.build_edges.saturating_add(other.build_edges),
-            build_ns: self.build_ns.saturating_add(other.build_ns),
-            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
             replayed_items: self.replayed_items.saturating_add(other.replayed_items),
         }
     }
@@ -474,6 +488,29 @@ impl QueryCacheLayerProfile {
             unknown_outcomes: self
                 .unknown_outcomes
                 .saturating_sub(earlier.unknown_outcomes),
+            replayed_items: self.replayed_items.saturating_sub(earlier.replayed_items),
+        }
+    }
+}
+
+impl QueryDerivedLayerProfile {
+    pub(crate) fn saturating_add(self, other: Self) -> Self {
+        Self {
+            common: self.common.saturating_add(other.common),
+            cancelled: self.cancelled.saturating_add(other.cancelled),
+            unavailable: self.unavailable.saturating_add(other.unavailable),
+            over_budget: self.over_budget.saturating_add(other.over_budget),
+            fallbacks: self.fallbacks.saturating_add(other.fallbacks),
+            build_files: self.build_files.saturating_add(other.build_files),
+            build_edges: self.build_edges.saturating_add(other.build_edges),
+            build_ns: self.build_ns.saturating_add(other.build_ns),
+            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
+        }
+    }
+
+    pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            common: self.common.saturating_sub(earlier.common),
             cancelled: self.cancelled.saturating_sub(earlier.cancelled),
             unavailable: self.unavailable.saturating_sub(earlier.unavailable),
             over_budget: self.over_budget.saturating_sub(earlier.over_budget),
@@ -482,7 +519,6 @@ impl QueryCacheLayerProfile {
             build_edges: self.build_edges.saturating_sub(earlier.build_edges),
             build_ns: self.build_ns.saturating_sub(earlier.build_ns),
             retained_bytes: self.retained_bytes.saturating_sub(earlier.retained_bytes),
-            replayed_items: self.replayed_items.saturating_sub(earlier.replayed_items),
         }
     }
 }
@@ -499,7 +535,7 @@ pub(crate) struct QueryCacheProfile {
     pub(crate) outgoing_call: QueryCacheLayerProfile,
     pub(crate) import_forward: QueryCacheLayerProfile,
     pub(crate) import_reverse: QueryCacheLayerProfile,
-    pub(crate) direct_import_topology: QueryCacheLayerProfile,
+    pub(crate) direct_import_topology: QueryDerivedLayerProfile,
 }
 
 impl QueryCacheProfile {
@@ -811,7 +847,7 @@ pub enum CodeQueryProfileCacheLayer {
         metrics: CodeQueryProfileCacheCounters,
     },
     DirectImportTopology {
-        metrics: CodeQueryProfileCacheCounters,
+        metrics: CodeQueryDerivedLayerCacheCounters,
     },
 }
 
@@ -845,7 +881,7 @@ impl CodeQueryProfileCacheLayer {
                 metrics: CodeQueryProfileCacheCounters::from_internal(profile.import_reverse),
             },
             Self::DirectImportTopology {
-                metrics: CodeQueryProfileCacheCounters::from_internal(
+                metrics: CodeQueryDerivedLayerCacheCounters::from_internal(
                     profile.direct_import_topology,
                 ),
             },
@@ -867,14 +903,6 @@ pub struct CodeQueryProfileCacheCounters {
     pub complete_builds: u64,
     pub incomplete_builds: u64,
     pub unknown_outcomes: u64,
-    pub cancelled: u64,
-    pub unavailable: u64,
-    pub over_budget: u64,
-    pub fallbacks: u64,
-    pub build_files: u64,
-    pub build_edges: u64,
-    pub build_ns: u64,
-    pub retained_bytes: u64,
     pub replayed_items: u64,
 }
 
@@ -893,6 +921,52 @@ impl CodeQueryProfileCacheCounters {
             complete_builds: counters.complete_builds,
             incomplete_builds: counters.incomplete_builds,
             unknown_outcomes: counters.unknown_outcomes,
+            replayed_items: counters.replayed_items,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQueryDerivedLayerCacheCounters {
+    pub kind: CodeQueryCacheMetricsKind,
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub builds: u64,
+    pub waits: u64,
+    pub wait_ns: u64,
+    pub complete_hits: u64,
+    pub incomplete_hits: u64,
+    pub complete_builds: u64,
+    pub incomplete_builds: u64,
+    pub unknown_outcomes: u64,
+    pub replayed_items: u64,
+    pub cancelled: u64,
+    pub unavailable: u64,
+    pub over_budget: u64,
+    pub fallbacks: u64,
+    pub build_files: u64,
+    pub build_edges: u64,
+    pub build_ns: u64,
+    pub retained_bytes: u64,
+}
+
+impl CodeQueryDerivedLayerCacheCounters {
+    fn from_internal(counters: QueryDerivedLayerProfile) -> Self {
+        Self {
+            kind: CodeQueryCacheMetricsKind::CompleteValue,
+            lookups: counters.lookups,
+            hits: counters.hits,
+            misses: counters.misses,
+            builds: counters.builds,
+            waits: counters.waits,
+            wait_ns: counters.wait_ns,
+            complete_hits: counters.complete_hits,
+            incomplete_hits: counters.incomplete_hits,
+            complete_builds: counters.complete_builds,
+            incomplete_builds: counters.incomplete_builds,
+            unknown_outcomes: counters.unknown_outcomes,
+            replayed_items: counters.replayed_items,
             cancelled: counters.cancelled,
             unavailable: counters.unavailable,
             over_budget: counters.over_budget,
@@ -901,7 +975,6 @@ impl CodeQueryProfileCacheCounters {
             build_edges: counters.build_edges,
             build_ns: counters.build_ns,
             retained_bytes: counters.retained_bytes,
-            replayed_items: counters.replayed_items,
         }
     }
 }
@@ -1187,16 +1260,19 @@ mod public_contract_tests {
             replayed_files: 2,
             ..QuerySeedStructuralFactsCacheProfile::default()
         };
-        profile.cache.direct_import_topology = QueryCacheLayerProfile {
-            lookups: 1,
-            misses: 1,
-            builds: 1,
-            complete_builds: 1,
+        profile.cache.direct_import_topology = QueryDerivedLayerProfile {
+            common: QueryCacheLayerProfile {
+                lookups: 1,
+                misses: 1,
+                builds: 1,
+                complete_builds: 1,
+                ..QueryCacheLayerProfile::default()
+            },
             build_files: 2,
             build_edges: 1,
             build_ns: 44,
             retained_bytes: 256,
-            ..QueryCacheLayerProfile::default()
+            ..QueryDerivedLayerProfile::default()
         };
         profile.record_scheduler_run(SchedulerRunProfile {
             worker_limit: 2,
@@ -1322,14 +1398,6 @@ mod public_contract_tests {
                     "complete_builds": 0,
                     "incomplete_builds": 0,
                     "unknown_outcomes": 0,
-                    "cancelled": 0,
-                    "unavailable": 0,
-                    "over_budget": 0,
-                    "fallbacks": 0,
-                    "build_files": 0,
-                    "build_edges": 0,
-                    "build_ns": 0,
-                    "retained_bytes": 0,
                     "replayed_items": 3
                 }
             })

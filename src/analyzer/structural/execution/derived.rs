@@ -11,7 +11,7 @@ use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
-use crate::hash::{HashMap, HashSet, map_with_capacity};
+use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 
 /// The semantic family of one reusable, immutable query-execution layer.
@@ -138,8 +138,10 @@ pub(crate) enum DerivedLayerAcquisition {
 }
 
 struct DerivedLayerGeneration {
-    source_generation: u64,
+    source_generations: Box<[u64]>,
     values: Arc<CompleteValueCache<DerivedLayerRequest, DerivedLayer>>,
+    auto_reuse_requests: HashSet<DerivedLayerRequest>,
+    auto_rejections: HashMap<DerivedLayerRequest, (usize, usize)>,
 }
 
 /// Snapshot-owned complete derived values with generation-safe single-flight.
@@ -169,41 +171,52 @@ impl SnapshotDerivedLayerCache {
         ))
     }
 
-    fn values_for(
+    fn with_generation<T>(
         &self,
-        source_generation: u64,
-    ) -> Option<Arc<CompleteValueCache<DerivedLayerRequest, DerivedLayer>>> {
+        source_generations: &[u64],
+        use_generation: impl FnOnce(&mut DerivedLayerGeneration) -> T,
+    ) -> Option<T> {
         let mut generation = self
             .generation
             .lock()
             .expect("snapshot derived-layer generation mutex poisoned");
         match generation.as_ref() {
-            Some(current) if current.source_generation > source_generation => return None,
-            Some(current) if current.source_generation == source_generation => {
-                return Some(Arc::clone(&current.values));
+            Some(current) if current.source_generations.as_ref() > source_generations => {
+                return None;
             }
+            Some(current) if current.source_generations.as_ref() == source_generations => {}
             Some(_) | None => {
                 *generation = Some(DerivedLayerGeneration {
-                    source_generation,
+                    source_generations: source_generations.into(),
                     values: self.new_values(),
+                    auto_reuse_requests: HashSet::default(),
+                    auto_rejections: HashMap::default(),
                 });
             }
         }
-        Some(Arc::clone(
-            &generation
-                .as_ref()
-                .expect("derived-layer generation was initialized")
-                .values,
+        Some(use_generation(
+            generation
+                .as_mut()
+                .expect("derived-layer generation was initialized"),
         ))
+    }
+
+    fn values_for(
+        &self,
+        source_generations: &[u64],
+    ) -> Option<Arc<CompleteValueCache<DerivedLayerRequest, DerivedLayer>>> {
+        self.with_generation(source_generations, |generation| {
+            Arc::clone(&generation.values)
+        })
     }
 
     pub(crate) fn get_ready(
         &self,
         request: DerivedLayerRequest,
-        source_generation: u64,
+        source_generations: &[u64],
         cancellation: &CancellationToken,
     ) -> Option<Arc<DerivedLayer>> {
-        self.values_for(source_generation)
+        self.values_for(source_generations)
             .and_then(|values| values.get_ready(&request, cancellation))
     }
 
@@ -211,15 +224,52 @@ impl SnapshotDerivedLayerCache {
         self.max_retained_bytes
     }
 
+    /// Auto avoids constructing a whole-workspace relation for a one-off
+    /// query. The first viable request records reuse interest and falls back;
+    /// a later request for the same snapshot and representation may build.
+    pub(crate) fn observe_auto_reuse_opportunity(
+        &self,
+        request: DerivedLayerRequest,
+        source_generations: &[u64],
+        max_files: usize,
+        max_edges: usize,
+    ) -> bool {
+        self.with_generation(source_generations, |generation| {
+            if generation.auto_rejections.get(&request).is_some_and(
+                |(rejected_files, rejected_edges)| {
+                    max_files <= *rejected_files && max_edges <= *rejected_edges
+                },
+            ) {
+                return false;
+            }
+            !generation.auto_reuse_requests.insert(request)
+        })
+        .unwrap_or(false)
+    }
+
+    pub(crate) fn record_auto_rejection(
+        &self,
+        request: DerivedLayerRequest,
+        source_generations: &[u64],
+        max_files: usize,
+        max_edges: usize,
+    ) {
+        let _ = self.with_generation(source_generations, |generation| {
+            generation
+                .auto_rejections
+                .insert(request, (max_files, max_edges));
+        });
+    }
+
     pub(crate) fn acquire(
         &self,
         request: DerivedLayerRequest,
-        source_generation: u64,
+        source_generations: &[u64],
         cancellation: &CancellationToken,
         build: impl FnOnce() -> DerivedLayerBuildOutcome,
         generation_is_current: impl Fn() -> bool,
     ) -> DerivedLayerAcquisition {
-        let Some(values) = self.values_for(source_generation) else {
+        let Some(values) = self.values_for(source_generations) else {
             return DerivedLayerAcquisition::Unavailable {
                 reason: "derived-layer source generation is older than the cache owner".to_string(),
                 over_budget: false,
@@ -317,14 +367,14 @@ impl SnapshotDerivedLayerCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn len_for_test(&self, source_generation: u64) -> u64 {
-        self.values_for(source_generation)
+    pub(crate) fn len_for_test(&self, source_generations: &[u64]) -> u64 {
+        self.values_for(source_generations)
             .map_or(0, |values| values.len_for_test())
     }
 
     #[cfg(test)]
-    fn waiting_count_for_test(&self, source_generation: u64) -> usize {
-        self.values_for(source_generation)
+    fn waiting_count_for_test(&self, source_generations: &[u64]) -> usize {
+        self.values_for(source_generations)
             .map_or(0, |values| values.waiting_count_for_test())
     }
 }
@@ -340,6 +390,11 @@ pub(crate) struct DirectImportTopologyLimits {
     pub(crate) max_files: usize,
     pub(crate) max_edges: usize,
     pub(crate) max_retained_bytes: u64,
+}
+
+pub(crate) struct DirectImportTopologyBuild {
+    pub(crate) outcome: DerivedLayerBuildOutcome,
+    pub(crate) fallback: Option<RequestLocalDirectImportGraph>,
 }
 
 /// Complete import resolution for every analyzed file in one declared support
@@ -368,31 +423,52 @@ impl DirectImportTopology {
         )
     }
 
-    pub(crate) fn importers_of(&self, file: &ProjectFile) -> Option<Vec<ProjectFile>> {
+    #[cfg(test)]
+    fn importers_of(&self, file: &ProjectFile) -> Option<Vec<ProjectFile>> {
         if !self.reverse_relation_complete() {
             return None;
         }
-        let target = self.graph.node_id(file)?;
-        Some(
-            self.graph
-                .incoming(target)
-                .iter()
-                .map(|source| self.graph.nodes()[*source as usize].clone())
-                .collect(),
-        )
+        Some(self.known_importers_of(file))
     }
 
-    pub(crate) fn importer_count(&self, file: &ProjectFile) -> Option<usize> {
-        if !self.reverse_relation_complete() {
-            return None;
-        }
+    pub(crate) fn known_importers_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        let Some(target) = self.graph.node_id(file) else {
+            return Vec::new();
+        };
+        self.graph
+            .incoming(target)
+            .iter()
+            .map(|source| self.graph.nodes()[*source as usize].clone())
+            .collect()
+    }
+
+    pub(crate) fn import_count(&self, file: &ProjectFile) -> Option<usize> {
+        let source = self.graph.node_id(file)?;
+        self.supported_sources[source as usize].then(|| self.graph.outgoing(source).len())
+    }
+
+    pub(crate) fn known_importer_count(&self, file: &ProjectFile) -> usize {
         self.graph
             .node_id(file)
-            .map(|target| self.graph.incoming(target).len())
+            .map_or(0, |target| self.graph.incoming(target).len())
     }
 
     pub(crate) fn reverse_relation_complete(&self) -> bool {
         self.supported_sources.iter().all(|supported| *supported)
+    }
+
+    pub(crate) fn unsupported_languages(&self) -> Vec<Language> {
+        let mut languages = self
+            .graph
+            .nodes()
+            .iter()
+            .zip(&self.supported_sources)
+            .filter(|(_, supported)| !**supported)
+            .map(|(file, _)| crate::analyzer::common::language_for_file(file))
+            .collect::<Vec<_>>();
+        languages.sort();
+        languages.dedup();
+        languages
     }
 
     pub(crate) fn resolved_files(&self) -> usize {
@@ -412,7 +488,7 @@ pub(crate) fn build_direct_import_topology(
     analyzer: &dyn IAnalyzer,
     cancellation: &CancellationToken,
     limits: DirectImportTopologyLimits,
-) -> DerivedLayerBuildOutcome {
+) -> DirectImportTopologyBuild {
     let started = Instant::now();
     let mut metrics = DerivedLayerBuildMetrics::default();
     let mut files = analyzer.analyzed_files();
@@ -420,133 +496,130 @@ pub(crate) fn build_direct_import_topology(
     files.dedup();
     if files.len() > limits.max_files || u32::try_from(files.len()).is_err() {
         metrics.elapsed_ns = elapsed_ns(started);
-        return DerivedLayerBuildOutcome::Unavailable {
-            reason: format!(
-                "direct import topology file limit exceeded: {} > {}",
-                files.len(),
-                limits.max_files
-            ),
-            over_budget: true,
-            metrics,
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Unavailable {
+                reason: format!(
+                    "direct import topology file limit exceeded: {} > {}",
+                    files.len(),
+                    limits.max_files
+                ),
+                over_budget: true,
+                metrics,
+            },
+            fallback: None,
         };
     }
     if cancellation.is_cancelled() {
         metrics.elapsed_ns = elapsed_ns(started);
-        return DerivedLayerBuildOutcome::Cancelled { metrics };
-    }
-
-    let mut file_ids = map_with_capacity(files.len());
-    for (index, file) in files.iter().enumerate() {
-        file_ids.insert(file.clone(), index as u32);
-    }
-    let analyzed: HashSet<_> = files.iter().cloned().collect();
-    let mut supported_sources = vec![false; files.len()];
-    let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-    for file in &files {
-        if cancellation.is_cancelled() {
-            metrics.elapsed_ns = elapsed_ns(started);
-            return DerivedLayerBuildOutcome::Cancelled { metrics };
-        }
-        if analyzer.import_analysis_provider_for_file(file).is_some() {
-            groups
-                .entry(crate::analyzer::common::language_for_file(file))
-                .or_default()
-                .push(file.clone());
-        } else {
-            metrics.resolved_files = metrics.resolved_files.saturating_add(1);
-        }
-    }
-
-    let mut edges = Vec::new();
-    for grouped_files in groups.values_mut() {
-        grouped_files.sort_by_key(rel_path_string);
-        let Some(provider) = grouped_files
-            .first()
-            .and_then(|file| analyzer.import_analysis_provider_for_file(file))
-        else {
-            continue;
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Cancelled { metrics },
+            fallback: None,
         };
-        if cancellation.is_cancelled() {
-            metrics.elapsed_ns = elapsed_ns(started);
-            return DerivedLayerBuildOutcome::Cancelled { metrics };
-        }
-        let bulk_infos = provider.import_infos_for_files(grouped_files);
-        if cancellation.is_cancelled() {
-            metrics.elapsed_ns = elapsed_ns(started);
-            return DerivedLayerBuildOutcome::Cancelled { metrics };
-        }
-        for file in grouped_files.iter() {
-            if cancellation.is_cancelled() {
-                metrics.elapsed_ns = elapsed_ns(started);
-                return DerivedLayerBuildOutcome::Cancelled { metrics };
-            }
-            let source_id = file_ids[file];
-            supported_sources[source_id as usize] = true;
-            let imports = bulk_infos
-                .as_ref()
-                .and_then(|infos| infos.get(file))
-                .cloned()
-                .unwrap_or_else(|| provider.import_info_of(file));
-            let mut targets =
-                crate::analyzer::resolve_imported_files_from_infos(provider, file, &imports)
-                    .into_iter()
-                    .filter(|target| analyzed.contains(target))
-                    .collect::<Vec<_>>();
-            targets.sort_by_key(rel_path_string);
-            targets.dedup();
-            if edges.len().saturating_add(targets.len()) > limits.max_edges {
-                metrics.elapsed_ns = elapsed_ns(started);
-                metrics.resolved_edges = u64::try_from(edges.len()).unwrap_or(u64::MAX);
-                return DerivedLayerBuildOutcome::Unavailable {
-                    reason: format!(
+    }
+
+    let maximum_working_bytes = limits.max_retained_bytes.saturating_mul(3);
+    if RequestLocalDirectImportGraph::fixed_working_bytes(&files) > maximum_working_bytes {
+        metrics.elapsed_ns = elapsed_ns(started);
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Unavailable {
+                reason: "direct import topology construction-byte limit exceeded".to_string(),
+                over_budget: true,
+                metrics,
+            },
+            fallback: None,
+        };
+    }
+
+    let mut request_graph = RequestLocalDirectImportGraph::from_files(files);
+    let (exhausted, construction_over_budget) = request_graph.resolve_complete_for_snapshot(
+        analyzer,
+        limits.max_files,
+        limits.max_edges,
+        cancellation,
+        maximum_working_bytes,
+    );
+    metrics.resolved_files = u64::try_from(request_graph.resolved_files()).unwrap_or(u64::MAX);
+    metrics.resolved_edges = u64::try_from(request_graph.resolved_edges()).unwrap_or(u64::MAX);
+    if cancellation.is_cancelled() {
+        metrics.elapsed_ns = elapsed_ns(started);
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Cancelled { metrics },
+            fallback: None,
+        };
+    }
+    if exhausted {
+        metrics.elapsed_ns = elapsed_ns(started);
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Unavailable {
+                reason: if construction_over_budget {
+                    "direct import topology construction-byte limit exceeded".to_string()
+                } else {
+                    format!(
                         "direct import topology edge limit exceeded: more than {}",
                         limits.max_edges
-                    ),
-                    over_budget: true,
-                    metrics,
-                };
-            }
-            edges.extend(
-                targets
-                    .iter()
-                    .filter_map(|target| file_ids.get(target).copied())
-                    .map(|target_id| (source_id, target_id)),
-            );
-            metrics.resolved_files = metrics.resolved_files.saturating_add(1);
-        }
-    }
-    metrics.resolved_edges = u64::try_from(edges.len()).unwrap_or(u64::MAX);
-    if cancellation.is_cancelled() {
-        metrics.elapsed_ns = elapsed_ns(started);
-        return DerivedLayerBuildOutcome::Cancelled { metrics };
+                    )
+                },
+                over_budget: true,
+                metrics,
+            },
+            fallback: Some(request_graph),
+        };
     }
 
-    let graph = CompactDirectedGraph::from_indexed_nodes(files, file_ids, edges);
-    let retained_bytes = (size_of::<DirectImportTopology>()
-        .saturating_sub(size_of::<CompactDirectedGraph<ProjectFile>>())
-        as u64)
-        .saturating_add(graph.estimated_bytes())
-        .saturating_add(supported_sources.len() as u64);
+    let retained_bytes = request_graph.estimated_topology_retained_bytes();
+    let projected_working_bytes = request_graph
+        .estimated_working_bytes()
+        .saturating_add(retained_bytes);
+    if retained_bytes > limits.max_retained_bytes || projected_working_bytes > maximum_working_bytes
+    {
+        metrics.elapsed_ns = elapsed_ns(started);
+        metrics.retained_bytes = retained_bytes;
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Unavailable {
+                reason: format!(
+                    "direct import topology retained-byte limit exceeded: {retained_bytes} > {}",
+                    limits.max_retained_bytes
+                ),
+                over_budget: true,
+                metrics,
+            },
+            fallback: Some(request_graph),
+        };
+    }
+
+    request_graph.freeze();
+    let retained_bytes = request_graph
+        .compact
+        .as_ref()
+        .map(|graph| {
+            (size_of::<DirectImportTopology>()
+                .saturating_sub(size_of::<CompactDirectedGraph<ProjectFile>>()) as u64)
+                .saturating_add(graph.estimated_bytes())
+                .saturating_add(request_graph.all_files.len() as u64)
+        })
+        .expect("complete import graph was frozen");
     metrics.elapsed_ns = elapsed_ns(started);
     metrics.retained_bytes = retained_bytes;
     if retained_bytes > limits.max_retained_bytes {
-        return DerivedLayerBuildOutcome::Unavailable {
-            reason: format!(
-                "direct import topology retained-byte limit exceeded: {retained_bytes} > {}",
-                limits.max_retained_bytes
-            ),
-            over_budget: true,
-            metrics,
+        return DirectImportTopologyBuild {
+            outcome: DerivedLayerBuildOutcome::Unavailable {
+                reason: format!(
+                    "direct import topology retained-byte limit exceeded: {retained_bytes} > {}",
+                    limits.max_retained_bytes
+                ),
+                over_budget: true,
+                metrics,
+            },
+            fallback: Some(request_graph),
         };
     }
-    DerivedLayerBuildOutcome::Complete {
-        layer: DerivedLayer::DirectImportTopology(DirectImportTopology {
-            graph,
-            supported_sources: supported_sources.into_boxed_slice(),
-            resolved_files: usize::try_from(metrics.resolved_files).unwrap_or(usize::MAX),
-            retained_bytes,
-        }),
-        metrics,
+    let topology = request_graph.into_topology(retained_bytes);
+    DirectImportTopologyBuild {
+        outcome: DerivedLayerBuildOutcome::Complete {
+            layer: DerivedLayer::DirectImportTopology(topology),
+            metrics,
+        },
+        fallback: None,
     }
 }
 
@@ -561,6 +634,7 @@ pub(crate) struct RequestLocalDirectImportGraph {
     analyzed: HashSet<ProjectFile>,
     resolved_files: usize,
     resolved_edges: usize,
+    forward_target_capacity: usize,
     complete: bool,
 }
 
@@ -568,11 +642,83 @@ impl RequestLocalDirectImportGraph {
     pub(crate) fn new(analyzer: &dyn IAnalyzer) -> Self {
         let mut all_files = analyzer.analyzed_files();
         all_files.sort_by_key(rel_path_string);
+        all_files.dedup();
+        Self::from_files(all_files)
+    }
+
+    fn from_files(all_files: Vec<ProjectFile>) -> Self {
         let analyzed = all_files.iter().cloned().collect();
         Self {
             all_files,
             analyzed,
             ..Self::default()
+        }
+    }
+
+    fn fixed_working_bytes(files: &[ProjectFile]) -> u64 {
+        (size_of::<Self>() as u64).saturating_add((files.len() as u64).saturating_mul(
+            (size_of::<ProjectFile>() * 4 + size_of::<(ProjectFile, Vec<ProjectFile>)>() * 2 + 4)
+                as u64,
+        ))
+    }
+
+    fn estimated_working_bytes(&self) -> u64 {
+        (size_of::<Self>() as u64)
+            .saturating_add(
+                (self.all_files.capacity() as u64).saturating_mul(size_of::<ProjectFile>() as u64),
+            )
+            .saturating_add(
+                (self.analyzed.capacity() as u64)
+                    .saturating_mul((size_of::<ProjectFile>() + 1) as u64),
+            )
+            .saturating_add(
+                (self.forward.capacity() as u64)
+                    .saturating_mul((size_of::<(ProjectFile, Vec<ProjectFile>)>() + 1) as u64),
+            )
+            .saturating_add(
+                (self.unsupported.capacity() as u64)
+                    .saturating_mul((size_of::<ProjectFile>() + 1) as u64),
+            )
+            .saturating_add(
+                (self.forward_target_capacity as u64)
+                    .saturating_mul(size_of::<ProjectFile>() as u64),
+            )
+            .saturating_add(
+                self.compact
+                    .as_ref()
+                    .map_or(0, CompactDirectedGraph::estimated_bytes),
+            )
+    }
+
+    fn estimated_topology_retained_bytes(&self) -> u64 {
+        (size_of::<DirectImportTopology>()
+            .saturating_sub(size_of::<CompactDirectedGraph<ProjectFile>>()) as u64)
+            .saturating_add(
+                CompactDirectedGraph::<ProjectFile>::estimated_bytes_for_parts(
+                    self.all_files.len(),
+                    self.analyzed.capacity(),
+                    self.resolved_edges,
+                ),
+            )
+            .saturating_add(self.all_files.len() as u64)
+    }
+
+    fn into_topology(mut self, retained_bytes: u64) -> DirectImportTopology {
+        let graph = self
+            .compact
+            .take()
+            .expect("complete request-local import graph must be frozen");
+        let supported_sources = graph
+            .nodes()
+            .iter()
+            .map(|file| !self.unsupported.contains(file))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        DirectImportTopology {
+            graph,
+            supported_sources,
+            resolved_files: self.resolved_files,
+            retained_bytes,
         }
     }
 
@@ -693,12 +839,39 @@ impl RequestLocalDirectImportGraph {
             return false;
         }
         let files = self.all_files.clone();
-        let exhausted = self.ensure_forward(analyzer, &files, max_files, max_edges, cancellation);
+        let (exhausted, _) =
+            self.ensure_forward_inner(analyzer, &files, max_files, max_edges, cancellation, None);
         if !exhausted {
             self.complete = true;
         }
         self.freeze();
         exhausted
+    }
+
+    fn resolve_complete_for_snapshot(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        max_files: usize,
+        max_edges: usize,
+        cancellation: &CancellationToken,
+        maximum_working_bytes: u64,
+    ) -> (bool, bool) {
+        if self.complete {
+            return (false, false);
+        }
+        let files = self.all_files.clone();
+        let outcome = self.ensure_forward_inner(
+            analyzer,
+            &files,
+            max_files,
+            max_edges,
+            Some(cancellation),
+            Some(maximum_working_bytes),
+        );
+        if !outcome.0 {
+            self.complete = true;
+        }
+        outcome
     }
 
     pub(crate) fn ensure_forward(
@@ -709,6 +882,19 @@ impl RequestLocalDirectImportGraph {
         max_edges: usize,
         cancellation: Option<&CancellationToken>,
     ) -> bool {
+        self.ensure_forward_inner(analyzer, files, max_files, max_edges, cancellation, None)
+            .0
+    }
+
+    fn ensure_forward_inner(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        files: &[ProjectFile],
+        max_files: usize,
+        max_edges: usize,
+        cancellation: Option<&CancellationToken>,
+        maximum_working_bytes: Option<u64>,
+    ) -> (bool, bool) {
         let mut pending = files
             .iter()
             .filter(|file| !self.forward.contains_key(*file) && !self.unsupported.contains(*file))
@@ -717,7 +903,7 @@ impl RequestLocalDirectImportGraph {
         pending.sort_by_key(rel_path_string);
         pending.dedup();
         if pending.is_empty() {
-            return false;
+            return (false, false);
         }
 
         let available_files = max_files.saturating_sub(self.resolved_files);
@@ -729,7 +915,7 @@ impl RequestLocalDirectImportGraph {
         let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in pending {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return true;
+                return (true, false);
             }
             if analyzer.import_analysis_provider_for_file(&file).is_some() {
                 groups
@@ -740,6 +926,11 @@ impl RequestLocalDirectImportGraph {
                 self.resolved_files += 1;
                 self.unsupported.insert(file);
                 self.compact = None;
+                if maximum_working_bytes
+                    .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
+                {
+                    return (true, true);
+                }
             }
         }
 
@@ -752,12 +943,12 @@ impl RequestLocalDirectImportGraph {
                 continue;
             };
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return true;
+                return (true, false);
             }
             let bulk_infos = provider.import_infos_for_files(grouped_files);
             for file in grouped_files.iter() {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return true;
+                    return (true, false);
                 }
                 let imports = bulk_infos
                     .as_ref()
@@ -779,11 +970,19 @@ impl RequestLocalDirectImportGraph {
                 }
                 self.resolved_files += 1;
                 self.resolved_edges += targets.len();
+                self.forward_target_capacity = self
+                    .forward_target_capacity
+                    .saturating_add(targets.capacity());
                 self.forward.insert(file.clone(), targets);
                 self.compact = None;
+                if maximum_working_bytes
+                    .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
+                {
+                    return (true, true);
+                }
             }
         }
-        exhausted
+        (exhausted, false)
     }
 }
 
@@ -828,7 +1027,7 @@ mod tests {
 
         let first = cache.acquire(
             request,
-            1,
+            &[1],
             &cancellation,
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -845,7 +1044,7 @@ mod tests {
         ));
         let second = cache.acquire(
             request,
-            1,
+            &[1],
             &cancellation,
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -862,7 +1061,7 @@ mod tests {
         ));
         let changed = cache.acquire(
             request,
-            2,
+            &[2],
             &cancellation,
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -878,7 +1077,7 @@ mod tests {
             }
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 2);
-        assert_eq!(cache.len_for_test(2), 1);
+        assert_eq!(cache.len_for_test(&[2]), 1);
     }
 
     #[test]
@@ -890,7 +1089,7 @@ mod tests {
 
         let current = cache.acquire(
             request,
-            2,
+            &[2],
             &cancellation,
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -908,7 +1107,7 @@ mod tests {
 
         let delayed = cache.acquire(
             request,
-            1,
+            &[1],
             &cancellation,
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -921,12 +1120,12 @@ mod tests {
             DerivedLayerAcquisition::Unavailable { .. }
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 1);
-        assert_eq!(cache.len_for_test(1), 0);
-        assert_eq!(cache.len_for_test(2), 1);
+        assert_eq!(cache.len_for_test(&[1]), 0);
+        assert_eq!(cache.len_for_test(&[2]), 1);
 
         let hit = cache.acquire(
             request,
-            2,
+            &[2],
             &cancellation,
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -950,17 +1149,23 @@ mod tests {
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancelled = CancellationToken::default();
         cancelled.cancel();
-        let acquisition = cache.acquire(request, 1, &cancelled, || complete_layer(128), || true);
+        let acquisition = cache.acquire(request, &[1], &cancelled, || complete_layer(128), || true);
         assert!(matches!(
             acquisition,
             DerivedLayerAcquisition::Cancelled { .. }
         ));
-        assert_eq!(cache.len_for_test(1), 0);
+        assert_eq!(cache.len_for_test(&[1]), 0);
 
         let cancellation = CancellationToken::default();
-        let stale = cache.acquire(request, 1, &cancellation, || complete_layer(128), || false);
+        let stale = cache.acquire(
+            request,
+            &[1],
+            &cancellation,
+            || complete_layer(128),
+            || false,
+        );
         assert!(matches!(stale, DerivedLayerAcquisition::Unavailable { .. }));
-        assert_eq!(cache.len_for_test(1), 0);
+        assert_eq!(cache.len_for_test(&[1]), 0);
     }
 
     #[test]
@@ -970,7 +1175,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let first = cache.acquire(
             request,
-            1,
+            &[1],
             &cancellation,
             || DerivedLayerBuildOutcome::Unavailable {
                 reason: "incomplete".to_string(),
@@ -980,7 +1185,13 @@ mod tests {
             || true,
         );
         assert!(matches!(first, DerivedLayerAcquisition::Unavailable { .. }));
-        let retry = cache.acquire(request, 1, &cancellation, || complete_layer(128), || true);
+        let retry = cache.acquire(
+            request,
+            &[1],
+            &cancellation,
+            || complete_layer(128),
+            || true,
+        );
         assert!(matches!(
             retry,
             DerivedLayerAcquisition::Ready {
@@ -992,7 +1203,7 @@ mod tests {
 
     fn wait_for_follower(cache: &SnapshotDerivedLayerCache, source_generation: u64) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.waiting_count_for_test(source_generation) == 0 {
+        while cache.waiting_count_for_test(&[source_generation]) == 0 {
             assert!(
                 Instant::now() < deadline,
                 "same-key derived request did not enter the single-flight wait"
@@ -1014,7 +1225,7 @@ mod tests {
         let leader = thread::spawn(move || {
             leader_cache.acquire(
                 request,
-                1,
+                &[1],
                 &CancellationToken::default(),
                 || {
                     leader_builds.fetch_add(1, Ordering::Relaxed);
@@ -1034,7 +1245,7 @@ mod tests {
         let follower = thread::spawn(move || {
             follower_cache.acquire(
                 request,
-                1,
+                &[1],
                 &follower_token,
                 || {
                     follower_builds.fetch_add(1, Ordering::Relaxed);
@@ -1064,7 +1275,7 @@ mod tests {
 
         let hit = cache.acquire(
             request,
-            1,
+            &[1],
             &CancellationToken::default(),
             || {
                 builds.fetch_add(1, Ordering::Relaxed);
@@ -1082,8 +1293,9 @@ mod tests {
         assert_eq!(builds.load(Ordering::Relaxed), 1);
     }
 
-    fn completed_topology(outcome: DerivedLayerBuildOutcome) -> DirectImportTopology {
-        match outcome {
+    fn completed_topology(build: DirectImportTopologyBuild) -> DirectImportTopology {
+        assert!(build.fallback.is_none());
+        match build.outcome {
             DerivedLayerBuildOutcome::Complete {
                 layer: DerivedLayer::DirectImportTopology(topology),
                 ..
@@ -1202,11 +1414,46 @@ mod tests {
         );
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DerivedLayerBuildOutcome::Unavailable {
                 over_budget: true,
                 ..
             }
         ));
+        assert!(outcome.fallback.is_some());
+    }
+
+    #[test]
+    fn topology_construction_preflights_fixed_memory_before_resolution() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "bench/Target.java")
+            .write("package bench; public class Target {}\n")
+            .expect("write target");
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+
+        let build = build_direct_import_topology(
+            &analyzer,
+            &CancellationToken::default(),
+            DirectImportTopologyLimits {
+                max_files: 100,
+                max_edges: 100,
+                max_retained_bytes: 1,
+            },
+        );
+
+        assert!(matches!(
+            build.outcome,
+            DerivedLayerBuildOutcome::Unavailable {
+                over_budget: true,
+                metrics: DerivedLayerBuildMetrics {
+                    resolved_files: 0,
+                    resolved_edges: 0,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(build.fallback.is_none());
     }
 }

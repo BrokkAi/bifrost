@@ -10,10 +10,10 @@ pub use plan::{
 };
 pub use profile::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
-    CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
-    CodeQueryOperatorTimings, CodeQueryProfile, CodeQueryProfileCacheCounters,
-    CodeQueryProfileCacheLayer, CodeQueryProfileScheduling, CodeQueryProfileTimings,
-    CodeQueryProfileWork, CodeQueryStructuralFactsCacheCounters,
+    CodeQueryDerivedLayerCacheCounters, CodeQueryOperatorDisposition, CodeQueryOperatorObservation,
+    CodeQueryOperatorTermination, CodeQueryOperatorTimings, CodeQueryProfile,
+    CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer, CodeQueryProfileScheduling,
+    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQueryStructuralFactsCacheCounters,
 };
 
 #[cfg(test)]

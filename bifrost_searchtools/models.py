@@ -1077,14 +1077,6 @@ class CodeQueryProfileCacheCounters:
     complete_builds: int = 0
     incomplete_builds: int = 0
     unknown_outcomes: int = 0
-    cancelled: int = 0
-    unavailable: int = 0
-    over_budget: int = 0
-    fallbacks: int = 0
-    build_files: int = 0
-    build_edges: int = 0
-    build_ns: int = 0
-    retained_bytes: int = 0
     replayed_items: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -1102,6 +1094,43 @@ class CodeQueryProfileCacheCounters:
             "complete_builds",
             "incomplete_builds",
             "unknown_outcomes",
+            "replayed_items",
+        }
+        return cls(
+            kind=CodeQueryCacheMetricsKind(data["kind"]),
+            **{key: int(data.get(key, 0)) for key in counters},
+            extra=_extra_fields(data, {"kind", *counters}),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryDerivedLayerCacheCounters(CodeQueryProfileCacheCounters):
+    cancelled: int = 0
+    unavailable: int = 0
+    over_budget: int = 0
+    fallbacks: int = 0
+    build_files: int = 0
+    build_edges: int = 0
+    build_ns: int = 0
+    retained_bytes: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryDerivedLayerCacheCounters:
+        common = {
+            "lookups",
+            "hits",
+            "misses",
+            "builds",
+            "waits",
+            "wait_ns",
+            "complete_hits",
+            "incomplete_hits",
+            "complete_builds",
+            "incomplete_builds",
+            "unknown_outcomes",
+            "replayed_items",
+        }
+        derived = {
             "cancelled",
             "unavailable",
             "over_budget",
@@ -1110,8 +1139,8 @@ class CodeQueryProfileCacheCounters:
             "build_edges",
             "build_ns",
             "retained_bytes",
-            "replayed_items",
         }
+        counters = common | derived
         return cls(
             kind=CodeQueryCacheMetricsKind(data["kind"]),
             **{key: int(data.get(key, 0)) for key in counters},
@@ -1152,7 +1181,9 @@ class CodeQueryStructuralFactsCacheCounters:
 
 
 CodeQueryCacheMetrics = (
-    CodeQueryProfileCacheCounters | CodeQueryStructuralFactsCacheCounters
+    CodeQueryProfileCacheCounters
+    | CodeQueryDerivedLayerCacheCounters
+    | CodeQueryStructuralFactsCacheCounters
 )
 
 
@@ -1194,6 +1225,8 @@ class CodeQueryProfileCacheLayer:
         metrics: CodeQueryCacheMetrics
         if metrics_kind is CodeQueryCacheMetricsKind.STRUCTURAL_FACTS:
             metrics = CodeQueryStructuralFactsCacheCounters.from_dict(metrics_data)
+        elif layer is CodeQueryCacheLayerKind.DIRECT_IMPORT_TOPOLOGY:
+            metrics = CodeQueryDerivedLayerCacheCounters.from_dict(metrics_data)
         else:
             metrics = CodeQueryProfileCacheCounters.from_dict(metrics_data)
         return cls(

@@ -25,6 +25,33 @@ pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
 }
 
+/// Analyzer-snapshot-owned query caches. The container is public only because
+/// `IAnalyzer` is an extension boundary; concrete cache representations remain
+/// crate-private and can evolve without coupling external analyzers to query
+/// execution internals.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct AnalyzerSnapshotCaches {
+    derived_layers: crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache,
+}
+
+impl AnalyzerSnapshotCaches {
+    pub(crate) fn new(derived_layer_budget_bytes: u64) -> Self {
+        Self {
+            derived_layers:
+                crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::new(
+                    derived_layer_budget_bytes,
+                ),
+        }
+    }
+
+    pub(crate) fn derived_layers(
+        &self,
+    ) -> &crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache {
+        &self.derived_layers
+    }
+}
+
 impl AnalyzerQueryContext {
     pub(crate) fn record_store_error(&self, error: StoreError) {
         let mut slot = self
@@ -369,10 +396,17 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Snapshot-owned immutable derived query layers. Concrete analyzers keep
     /// the default when they cannot bind a complete snapshot lifecycle.
     #[doc(hidden)]
-    fn snapshot_derived_layer_cache(
-        &self,
-    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+    fn snapshot_caches(&self) -> Option<&AnalyzerSnapshotCaches> {
         None
+    }
+
+    /// Monotonic source generations covered by the snapshot-owned derived
+    /// layer cache. A composite analyzer overrides this with one ordered entry
+    /// per delegate so a change outside its primary project cannot reuse stale
+    /// workspace-wide relations.
+    #[doc(hidden)]
+    fn snapshot_source_generations(&self) -> Box<[u64]> {
+        Box::new([self.project().analysis_generation()])
     }
 
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {

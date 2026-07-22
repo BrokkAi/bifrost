@@ -22,6 +22,7 @@ from bifrost_searchtools import (
     CodeQueryCompletionKind,
     CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact,
+    CodeQueryDerivedLayerCacheCounters,
     CodeQueryExecutionMode,
     CodeQueryExpressionSite,
     CodeQueryExplain,
@@ -368,6 +369,10 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertEqual(
             response.cache_layers[2].layer,
             CodeQueryCacheLayerKind.DIRECT_IMPORT_TOPOLOGY,
+        )
+        self.assertIsInstance(
+            response.cache_layers[2].metrics,
+            CodeQueryDerivedLayerCacheCounters,
         )
         self.assertEqual(response.cache_layers[2].metrics.build_files, 3)
         self.assertEqual(response.cache_layers[2].metrics.build_edges, 2)

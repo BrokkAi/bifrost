@@ -280,7 +280,10 @@ impl WorkspaceAnalyzer {
             1 => Self::Single(Box::new(
                 delegates.into_values().next().expect("checked len"),
             )),
-            _ => Self::Multi(Box::new(MultiAnalyzer::new(delegates))),
+            _ => Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
+                delegates,
+                config.memo_cache_budget_bytes() / 8,
+            ))),
         })
     }
 
@@ -472,6 +475,42 @@ mod tests {
         assert!(analyzer.definitions("Missing").next().is_none());
         assert!(context.store_error().is_none());
         analyzer.end_query(&context);
+    }
+
+    #[test]
+    fn multi_workspace_derived_cache_uses_configured_budget_share() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            root,
+            BTreeSet::from([Language::Java, Language::TypeScript]),
+        ));
+        let config = AnalyzerConfig {
+            memo_cache_budget_bytes: Some(1024 * 1024),
+            ..AnalyzerConfig::default()
+        };
+        let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), config);
+        assert_eq!(
+            workspace
+                .analyzer()
+                .snapshot_caches()
+                .expect("multi workspace caches")
+                .derived_layers()
+                .max_retained_bytes(),
+            128 * 1024
+        );
+
+        let overlay = Arc::new(OverlayProject::new(project));
+        let snapshot = workspace.clone_with_project(overlay as Arc<dyn Project>);
+        assert_eq!(
+            snapshot
+                .analyzer()
+                .snapshot_caches()
+                .expect("snapshot caches")
+                .derived_layers()
+                .max_retained_bytes(),
+            128 * 1024
+        );
     }
 
     #[test]

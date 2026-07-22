@@ -886,10 +886,11 @@ struct QueryExecutionState<'a> {
     call_cache: CallTraversalCache,
     import_graph: Option<RequestLocalDirectImportGraph>,
     direct_import_layer: Option<Arc<DerivedLayer>>,
-    direct_import_layer_generation: Option<u64>,
+    direct_import_layer_generations: Option<Box<[u64]>>,
+    deferred_derived_builds: HashSet<DerivedLayerRequest>,
     cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
-    observed_structural_indexes: Option<Arc<Mutex<HashSet<usize>>>>,
+    observed_snapshot_values: Option<Arc<Mutex<HashSet<usize>>>>,
     access_mode: StructuralAccessMode,
     access_failure: Option<String>,
     parallel_seed_budget: Option<FairSeedBudgetLease>,
@@ -915,14 +916,14 @@ impl DirectImportAccess<'_> {
     fn importers_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
         match self {
             Self::RequestLocal(graph) => graph.importers_of(file),
-            Self::Snapshot(topology) => topology.importers_of(file).unwrap_or_default(),
+            Self::Snapshot(topology) => topology.known_importers_of(file),
         }
     }
 
     fn unsupported_languages(&self) -> Vec<Language> {
         match self {
             Self::RequestLocal(graph) => graph.unsupported_languages(),
-            Self::Snapshot(_) => Vec::new(),
+            Self::Snapshot(topology) => topology.unsupported_languages(),
         }
     }
 }
@@ -1251,12 +1252,12 @@ fn execute_internal_with_strategy(
         call_cache: CallTraversalCache::default(),
         import_graph: None,
         direct_import_layer: None,
-        direct_import_layer_generation: None,
+        direct_import_layer_generations: None,
+        deferred_derived_builds: HashSet::default(),
         cache_profile: capture_profile.then(QueryCacheProfile::default),
         profile: capture_profile
             .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
-        observed_structural_indexes: capture_profile
-            .then(|| Arc::new(Mutex::new(HashSet::default()))),
+        observed_snapshot_values: capture_profile.then(|| Arc::new(Mutex::new(HashSet::default()))),
         access_mode,
         access_failure: None,
         parallel_seed_budget: None,
@@ -2577,7 +2578,7 @@ fn execute_parallel_seed_union(
     let cancellation = state.cancellation;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
-    let observed_structural_indexes = state.observed_structural_indexes.clone();
+    let observed_snapshot_values = state.observed_snapshot_values.clone();
     let scheduler_workers = state.scheduler_workers;
     let base_budget = state.budget;
     let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
@@ -2601,11 +2602,12 @@ fn execute_parallel_seed_union(
                     call_cache: CallTraversalCache::default(),
                     import_graph: None,
                     direct_import_layer: None,
-                    direct_import_layer_generation: None,
+                    direct_import_layer_generations: None,
+                    deferred_derived_builds: HashSet::default(),
                     cache_profile: profiling.then(QueryCacheProfile::default),
                     profile: profiling
                         .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
-                    observed_structural_indexes: observed_structural_indexes.clone(),
+                    observed_snapshot_values: observed_snapshot_values.clone(),
                     access_mode,
                     access_failure: None,
                     parallel_seed_budget: Some(lease.clone()),
@@ -2629,7 +2631,8 @@ fn execute_parallel_seed_union(
                 lease.finish(branch_state.budget);
                 debug_assert!(branch_state.import_graph.is_none());
                 debug_assert!(branch_state.direct_import_layer.is_none());
-                debug_assert!(branch_state.direct_import_layer_generation.is_none());
+                debug_assert!(branch_state.direct_import_layer_generations.is_none());
+                debug_assert!(branch_state.deferred_derived_builds.is_empty());
                 debug_assert!(branch_state.reference_cache.inbound.is_empty());
                 debug_assert!(branch_state.reference_cache.outbound.is_empty());
                 debug_assert!(branch_state.call_cache.incoming.is_empty());
@@ -3067,7 +3070,7 @@ fn prepare_seed_access(
                 }
                 let first_observation =
                     state
-                        .observed_structural_indexes
+                        .observed_snapshot_values
                         .as_ref()
                         .is_some_and(|observed| {
                             observed
@@ -3692,9 +3695,13 @@ fn acquire_direct_import_layer(
     state: &mut QueryExecutionState<'_>,
     request: DerivedLayerRequest,
     limits: CodeQueryExecutionLimits,
-    build_if_missing: bool,
+    layer_requested: bool,
 ) -> Option<DerivedLayerLifecycle> {
-    let Some(cache) = state.analyzer.snapshot_derived_layer_cache() else {
+    let Some(cache) = state
+        .analyzer
+        .snapshot_caches()
+        .map(crate::analyzer::AnalyzerSnapshotCaches::derived_layers)
+    else {
         if let Some(profile) = &mut state.cache_profile {
             let topology = &mut profile.direct_import_topology;
             topology.lookups = topology.lookups.saturating_add(1);
@@ -3702,7 +3709,7 @@ fn acquire_direct_import_layer(
             topology.unavailable = topology.unavailable.saturating_add(1);
             topology.fallbacks = topology.fallbacks.saturating_add(1);
         }
-        if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+        if layer_requested && state.access_mode == StructuralAccessMode::IndexedRequired {
             state
                 .access_failure
                 .get_or_insert_with(|| "analyzer has no snapshot derived-layer cache".to_string());
@@ -3711,17 +3718,28 @@ fn acquire_direct_import_layer(
     };
     let uncancelled = CancellationToken::default();
     let cancellation = state.cancellation.unwrap_or(&uncancelled);
-    let source_generation = state.analyzer.project().analysis_generation();
+    let source_generations = state.analyzer.snapshot_source_generations();
     if state
-        .direct_import_layer_generation
-        .is_some_and(|generation| generation != source_generation)
+        .direct_import_layer_generations
+        .as_deref()
+        .is_some_and(|generations| generations != source_generations.as_ref())
     {
         state.direct_import_layer = None;
-        state.direct_import_layer_generation = None;
+        state.direct_import_layer_generations = None;
     }
-    let ready = cache.get_ready(request, source_generation, cancellation);
+    let ready = cache.get_ready(request, &source_generations, cancellation);
+    let mut fallback_graph = None;
+    let remaining_import_files = limits
+        .max_scanned_files
+        .saturating_sub(state.budget.import_files_resolved);
+    let remaining_import_edges = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.import_edges_resolved);
     let acquisition = match ready {
-        Some(layer) if state.analyzer.project().analysis_generation() == source_generation => {
+        Some(layer)
+            if state.analyzer.snapshot_source_generations().as_ref()
+                == source_generations.as_ref() =>
+        {
             DerivedLayerAcquisition::Ready {
                 layer,
                 lifecycle: DerivedLayerLifecycle::Hit,
@@ -3735,7 +3753,19 @@ fn acquire_direct_import_layer(
             wait: Default::default(),
             build: DerivedLayerBuildMetrics::default(),
         },
-        None if !build_if_missing => {
+        None if !layer_requested
+            || (state.access_mode == StructuralAccessMode::Auto
+                && (state.deferred_derived_builds.contains(&request)
+                    || !cache.observe_auto_reuse_opportunity(
+                        request,
+                        &source_generations,
+                        remaining_import_files,
+                        remaining_import_edges,
+                    ))) =>
+        {
+            if layer_requested && state.access_mode == StructuralAccessMode::Auto {
+                state.deferred_derived_builds.insert(request);
+            }
             if let Some(profile) = &mut state.cache_profile {
                 let topology = &mut profile.direct_import_topology;
                 topology.lookups = topology.lookups.saturating_add(1);
@@ -3746,20 +3776,22 @@ fn acquire_direct_import_layer(
         }
         None => cache.acquire(
             request,
-            source_generation,
+            &source_generations,
             cancellation,
             || {
-                build_direct_import_topology(
+                let build = build_direct_import_topology(
                     state.analyzer,
                     cancellation,
                     DirectImportTopologyLimits {
-                        max_files: limits.max_scanned_files,
-                        max_edges: limits.max_pipeline_rows,
+                        max_files: remaining_import_files,
+                        max_edges: remaining_import_edges,
                         max_retained_bytes: cache.max_retained_bytes(),
                     },
-                )
+                );
+                fallback_graph = build.fallback;
+                build.outcome
             },
-            || state.analyzer.project().analysis_generation() == source_generation,
+            || state.analyzer.snapshot_source_generations().as_ref() == source_generations.as_ref(),
         ),
     };
 
@@ -3788,7 +3820,8 @@ fn acquire_direct_import_layer(
 
     match acquisition {
         DerivedLayerAcquisition::Ready { lifecycle, .. }
-            if state.analyzer.project().analysis_generation() != source_generation =>
+            if state.analyzer.snapshot_source_generations().as_ref()
+                != source_generations.as_ref() =>
         {
             if let Some(profile) = &mut state.cache_profile {
                 let topology = &mut profile.direct_import_topology;
@@ -3799,13 +3832,13 @@ fn acquire_direct_import_layer(
                     .builds
                     .saturating_add(u64::from(lifecycle == DerivedLayerLifecycle::Built));
             }
-            if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+            if layer_requested && state.access_mode == StructuralAccessMode::IndexedRequired {
                 state.access_failure.get_or_insert_with(|| {
                     "derived-layer source generation changed before selection".to_string()
                 });
             }
             state.direct_import_layer = None;
-            state.direct_import_layer_generation = None;
+            state.direct_import_layer_generations = None;
             None
         }
         DerivedLayerAcquisition::Ready {
@@ -3830,7 +3863,7 @@ fn acquire_direct_import_layer(
                 }
                 let first_observation =
                     state
-                        .observed_structural_indexes
+                        .observed_snapshot_values
                         .as_ref()
                         .is_some_and(|observed| {
                             observed
@@ -3845,7 +3878,7 @@ fn acquire_direct_import_layer(
                 }
             }
             state.direct_import_layer = Some(layer);
-            state.direct_import_layer_generation = Some(source_generation);
+            state.direct_import_layer_generations = Some(source_generations);
             Some(lifecycle)
         }
         DerivedLayerAcquisition::Cancelled { .. } => {
@@ -3858,7 +3891,7 @@ fn acquire_direct_import_layer(
                     topology.builds = topology.builds.saturating_add(1);
                 }
             }
-            if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+            if layer_requested && state.access_mode == StructuralAccessMode::IndexedRequired {
                 state.access_failure.get_or_insert_with(|| {
                     "direct import topology acquisition cancelled".to_string()
                 });
@@ -3870,6 +3903,17 @@ fn acquire_direct_import_layer(
             over_budget,
             ..
         } => {
+            if let Some(graph) = fallback_graph {
+                state.import_graph = Some(graph);
+            }
+            if over_budget && state.access_mode == StructuralAccessMode::Auto {
+                cache.record_auto_rejection(
+                    request,
+                    &source_generations,
+                    remaining_import_files,
+                    remaining_import_edges,
+                );
+            }
             if let Some(profile) = &mut state.cache_profile {
                 let topology = &mut profile.direct_import_topology;
                 topology.misses = topology.misses.saturating_add(1);
@@ -3880,7 +3924,7 @@ fn acquire_direct_import_layer(
                     topology.builds = topology.builds.saturating_add(1);
                 }
             }
-            if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+            if layer_requested && state.access_mode == StructuralAccessMode::IndexedRequired {
                 state.access_failure.get_or_insert(reason);
             }
             None
@@ -3889,14 +3933,14 @@ fn acquire_direct_import_layer(
 }
 
 fn discard_stale_direct_import_layer(state: &mut QueryExecutionState<'_>, required: bool) {
-    let Some(layer_generation) = state.direct_import_layer_generation else {
+    let Some(layer_generations) = state.direct_import_layer_generations.as_deref() else {
         return;
     };
-    if state.analyzer.project().analysis_generation() == layer_generation {
+    if state.analyzer.snapshot_source_generations().as_ref() == layer_generations {
         return;
     }
     state.direct_import_layer = None;
-    state.direct_import_layer_generation = None;
+    state.direct_import_layer_generations = None;
     if let Some(profile) = &mut state.cache_profile {
         let topology = &mut profile.direct_import_topology;
         topology.unavailable = topology.unavailable.saturating_add(1);
@@ -3951,6 +3995,7 @@ fn apply_plan_step(
     }
     let mut use_snapshot_imports = false;
     let mut snapshot_lifecycle = None;
+    let mut snapshot_relation_complete = true;
     if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
         if state.access_mode != StructuralAccessMode::ScanOnly {
             let request = derived_layer_request
@@ -3969,8 +4014,9 @@ fn apply_plan_step(
                 && topology.resolved_edges() <= limits.max_pipeline_rows;
             let relation_complete =
                 step == &QueryStep::ImportsOf || topology.reverse_relation_complete();
-            use_snapshot_imports = within_request_budget && relation_complete;
-            if !use_snapshot_imports {
+            use_snapshot_imports = within_request_budget;
+            snapshot_relation_complete = relation_complete;
+            if !within_request_budget || !relation_complete {
                 record_direct_import_fallback(
                     state,
                     "complete direct import topology cannot satisfy this request",
@@ -3989,9 +4035,9 @@ fn apply_plan_step(
                 .iter()
                 .filter_map(|row| match &row.value {
                     PipelineValue::File(file) if step == &QueryStep::ImportersOf => {
-                        topology.importer_count(file)
+                        Some(topology.known_importer_count(file))
                     }
-                    PipelineValue::File(file) => topology.imports_of(file).map(|edges| edges.len()),
+                    PipelineValue::File(file) => topology.import_count(file),
                     PipelineValue::StructuralMatch(_)
                     | PipelineValue::Declaration(_)
                     | PipelineValue::ReferenceSite(_)
@@ -4008,9 +4054,9 @@ fn apply_plan_step(
                 };
                 if snapshot_lifecycle == Some(DerivedLayerLifecycle::Built) {
                     relation.record_miss();
-                    relation.record_build(Some(true));
+                    relation.record_build(Some(snapshot_relation_complete));
                 } else {
-                    relation.record_hit(Some(true), replayed_edges);
+                    relation.record_hit(Some(snapshot_relation_complete), replayed_edges);
                 }
             }
         } else {
@@ -4047,12 +4093,18 @@ fn apply_plan_step(
                 }
                 let resolved_files_before = graph.resolved_files();
                 let resolved_edges_before = graph.resolved_edges();
-                let exhausted = graph.ensure_complete(
-                    state.analyzer,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
-                    state.cancellation,
+                let max_files = graph.resolved_files().saturating_add(
+                    limits
+                        .max_scanned_files
+                        .saturating_sub(state.budget.import_files_resolved),
                 );
+                let max_edges = graph.resolved_edges().saturating_add(
+                    limits
+                        .max_pipeline_rows
+                        .saturating_sub(state.budget.import_edges_resolved),
+                );
+                let exhausted =
+                    graph.ensure_complete(state.analyzer, max_files, max_edges, state.cancellation);
                 state.budget.import_files_resolved = state
                     .budget
                     .import_files_resolved
@@ -4106,11 +4158,21 @@ fn apply_plan_step(
                 }
                 let resolved_files_before = graph.resolved_files();
                 let resolved_edges_before = graph.resolved_edges();
+                let max_files = graph.resolved_files().saturating_add(
+                    limits
+                        .max_scanned_files
+                        .saturating_sub(state.budget.import_files_resolved),
+                );
+                let max_edges = graph.resolved_edges().saturating_add(
+                    limits
+                        .max_pipeline_rows
+                        .saturating_sub(state.budget.import_edges_resolved),
+                );
                 let exhausted = graph.ensure_forward(
                     state.analyzer,
                     &frontier,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
+                    max_files,
+                    max_edges,
                     state.cancellation,
                 );
                 state.budget.import_files_resolved = state
@@ -4159,7 +4221,10 @@ fn apply_plan_step(
             .as_ref()
             .map(DirectImportAccess::RequestLocal)
     };
-    let (mut rows, exhausted, step_truncated) = apply_pipeline_step(
+    let selected_layer_generations = use_snapshot_imports
+        .then(|| state.direct_import_layer_generations.clone())
+        .flatten();
+    let (mut rows, mut exhausted, mut step_truncated) = apply_pipeline_step(
         state.analyzer,
         state.workspace,
         step,
@@ -4177,6 +4242,27 @@ fn apply_plan_step(
         &mut state.cache_profile,
         instrumentation,
     );
+    if let Some(selected_generations) = selected_layer_generations
+        && state.analyzer.snapshot_source_generations().as_ref() != selected_generations.as_ref()
+    {
+        rows.clear();
+        exhausted = true;
+        step_truncated = true;
+        state.direct_import_layer = None;
+        state.direct_import_layer_generations = None;
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "source generation changed during direct import topology replay; retry the query for a coherent snapshot".to_string(),
+        });
+        if state.access_mode == StructuralAccessMode::IndexedRequired {
+            state.access_failure.get_or_insert_with(|| {
+                "direct import topology became stale during replay".to_string()
+            });
+        }
+    }
     truncated |= step_truncated;
     if state
         .cancellation

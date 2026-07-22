@@ -231,11 +231,10 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     )
 }
 
-#[derive(Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
-    derived_layer_cache:
-        Arc<crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache>,
+    snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
+    derived_layer_budget_bytes: u64,
     global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
     global_usage_definition_index_build_count: Arc<AtomicUsize>,
     global_usage_definition_index_build_lock: Arc<Mutex<()>>,
@@ -243,11 +242,18 @@ pub struct MultiAnalyzer {
     global_usage_definition_fallback: GlobalUsageDefinitionIndex,
 }
 
+impl Default for MultiAnalyzer {
+    fn default() -> Self {
+        Self::new(BTreeMap::new())
+    }
+}
+
 impl Clone for MultiAnalyzer {
     fn clone(&self) -> Self {
         Self {
             delegates: self.delegates.clone(),
-            derived_layer_cache: Arc::clone(&self.derived_layer_cache),
+            snapshot_caches: Arc::clone(&self.snapshot_caches),
+            derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
             global_usage_definition_index_build_count: Arc::clone(
                 &self.global_usage_definition_index_build_count,
@@ -263,12 +269,22 @@ impl Clone for MultiAnalyzer {
 
 impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
+        Self::new_with_derived_layer_budget(
+            delegates,
+            crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES,
+        )
+    }
+
+    pub(crate) fn new_with_derived_layer_budget(
+        delegates: BTreeMap<Language, AnalyzerDelegate>,
+        derived_layer_budget_bytes: u64,
+    ) -> Self {
         Self {
             delegates,
-            derived_layer_cache: Arc::new(
-                crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::default(
-                ),
-            ),
+            snapshot_caches: Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
+                derived_layer_budget_bytes,
+            )),
+            derived_layer_budget_bytes,
             global_usage_definition_index: Arc::new(OnceLock::new()),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
@@ -297,10 +313,10 @@ impl MultiAnalyzer {
                     (*language, delegate.clone_with_project(Arc::clone(&project)))
                 })
                 .collect(),
-            derived_layer_cache: Arc::new(
-                crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::default(
-                ),
-            ),
+            snapshot_caches: Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
+                self.derived_layer_budget_bytes,
+            )),
+            derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             global_usage_definition_index: Arc::new(OnceLock::new()),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
@@ -513,7 +529,7 @@ impl IAnalyzer for MultiAnalyzer {
                 }
             })
             .collect();
-        Self::new(delegates)
+        Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes)
     }
 
     fn update_all(&self) -> Self {
@@ -524,7 +540,7 @@ impl IAnalyzer for MultiAnalyzer {
             .into_par_iter()
             .map(|(language, delegate)| (*language, delegate.update_all()))
             .collect();
-        Self::new(delegates)
+        Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes)
     }
 
     fn project(&self) -> &dyn Project {
@@ -1055,10 +1071,15 @@ impl IAnalyzer for MultiAnalyzer {
             .collect()
     }
 
-    fn snapshot_derived_layer_cache(
-        &self,
-    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
-        Some(&self.derived_layer_cache)
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(&self.snapshot_caches)
+    }
+
+    fn snapshot_source_generations(&self) -> Box<[u64]> {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().project().analysis_generation())
+            .collect()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -1132,6 +1153,22 @@ mod tests {
         )));
         assert!(!is_js_ts_config_file(&project_file("package.json")));
         assert!(!is_js_ts_config_file(&project_file("src/app.ts")));
+    }
+
+    #[test]
+    fn default_multi_analyzer_preserves_the_default_derived_layer_budget() {
+        let analyzer = MultiAnalyzer::default();
+        assert_eq!(
+            analyzer.derived_layer_budget_bytes,
+            crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES
+        );
+        assert_eq!(
+            analyzer
+                .snapshot_caches
+                .derived_layers()
+                .max_retained_bytes(),
+            analyzer.derived_layer_budget_bytes
+        );
     }
 
     #[test]

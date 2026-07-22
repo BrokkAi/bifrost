@@ -37,13 +37,14 @@ pub mod spec;
 
 pub use execution::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
-    CodeQueryExplain, CodeQueryExplainScheduling, CodeQueryLogicalNode, CodeQueryLogicalOperation,
-    CodeQueryLogicalPlan, CodeQueryOperatorDisposition, CodeQueryOperatorObservation,
-    CodeQueryOperatorTermination, CodeQueryOperatorTimings, CodeQueryPhysicalNode,
-    CodeQueryPhysicalOperator, CodeQueryPhysicalPlan, CodeQueryProfile,
-    CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer, CodeQueryProfileScheduling,
-    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQuerySchedulingPolicy,
-    CodeQuerySelectedScheduling, CodeQueryStructuralFactsCacheCounters,
+    CodeQueryDerivedLayerCacheCounters, CodeQueryExplain, CodeQueryExplainScheduling,
+    CodeQueryLogicalNode, CodeQueryLogicalOperation, CodeQueryLogicalPlan,
+    CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
+    CodeQueryOperatorTimings, CodeQueryPhysicalNode, CodeQueryPhysicalOperator,
+    CodeQueryPhysicalPlan, CodeQueryProfile, CodeQueryProfileCacheCounters,
+    CodeQueryProfileCacheLayer, CodeQueryProfileScheduling, CodeQueryProfileTimings,
+    CodeQueryProfileWork, CodeQuerySchedulingPolicy, CodeQuerySelectedScheduling,
+    CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
