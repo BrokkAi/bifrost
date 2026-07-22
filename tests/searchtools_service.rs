@@ -6044,7 +6044,7 @@ exports.measure = function() {
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
 
-    for (symbol, expected_line) in [("parse", 7), ("ExportedClass", 8), ("actualValue", 9)] {
+    for (symbol, expected_line) in [("parse", 7), ("actualValue", 9)] {
         let args = serde_json::json!({
             "symbols": [symbol],
             "include_tests": true,
@@ -6062,14 +6062,43 @@ exports.measure = function() {
         );
     }
 
-    let payload = service
-        .call_tool_json(
-            "scan_usages_by_reference",
-            r#"{"symbols":["exportedName"],"include_tests":true,"paths":["exports.js"]}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(only_result(&value)["total_hits"], 0, "payload: {value}");
+    // #1088: `ExportedClass` and `exportedName` each collide with a commonjs
+    // re-export alias sharing their terminal name (`exports.types =
+    // { ExportedClass }` and `exports.alias = { exportedName: actualValue }`
+    // register their own `types.ExportedClass` / `alias.exportedName`
+    // declarations). Bare-name resolution now surfaces that genuine ambiguity
+    // instead of silently picking the class/function declaration, matching
+    // every other bare-name spelling collision this tool already reports.
+    for (symbol, other_selector) in [
+        ("ExportedClass", "exports.js#types.ExportedClass"),
+        ("exportedName", "exports.js#alias.exportedName"),
+    ] {
+        let args = serde_json::json!({
+            "symbols": [symbol],
+            "include_tests": true,
+            "paths": ["exports.js"],
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args.to_string())
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+        assert_eq!(result["status"], "ambiguous", "payload: {value}");
+        let candidates = result["candidate_targets"].as_array().unwrap();
+        assert_eq!(2, candidates.len(), "payload: {value}");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == &format!("exports.js#{symbol}")),
+            "payload: {value}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == other_selector),
+            "payload: {value}"
+        );
+    }
 
     let payload = service
         .call_tool_json(

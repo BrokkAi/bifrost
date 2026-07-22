@@ -1767,6 +1767,18 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// Backs `IAnalyzer::lookup_candidates_by_identifier`, the sole bare-name
+    /// resolution path keyed on the terminal identifier. Its membership must
+    /// match `definition_lookup_order_candidate_sql`'s `(in_declarations = 1
+    /// OR in_definition_lookup = 1)`, not the `in_declarations`-only
+    /// membership `declaration_candidate_sql` uses elsewhere: a spelling the
+    /// fq lookup path resolves (which already consults that wider
+    /// membership) must be visible here too, or bare-name ambiguity silently
+    /// drops definition-lookup-only units (e.g. JS/TS object-literal
+    /// properties) that the fq spelling resolves fine (#1088). This widening
+    /// is scoped to resolution only — declaration listings
+    /// (get_all_declarations, search, summaries) still use the unchanged
+    /// `in_declarations`-only surfaces by design (#397).
     pub fn declaration_candidate_rows_by_identifier_for_langs(
         &self,
         langs: &[String],
@@ -1776,7 +1788,15 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = declaration_candidate_sql("units.lang = ?1 AND units.identifier = ?2");
+        let sql = candidate_rows_sql_with_membership(
+            "units",
+            "FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+            "units.lang = ?1 AND units.identifier = ?2",
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+            "units.blob_oid, units.unit_key",
+        );
         let rows = candidate_rows_for_languages(
             &tx,
             langs.iter().map(String::as_str),

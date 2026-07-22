@@ -4441,7 +4441,11 @@ where
             .into_iter()
             .filter(|unit| unit.identifier() == identifier)
             .collect();
-        matches.extend(self.dirty_units_matching(false, |unit| unit.identifier() == identifier));
+        // `true`: dirty (edited-but-not-yet-persisted) file state must offer
+        // the same membership as the widened SQL query above, or unsaved
+        // edits to a definition-lookup-only unit would regress to invisible
+        // while its persisted counterpart resolves.
+        matches.extend(self.dirty_units_matching(true, |unit| unit.identifier() == identifier));
         matches.extend(
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
                 unit.identifier() == identifier

@@ -219,11 +219,7 @@ pub(super) fn resolve_file_anchored_symbol_sources(
         }
         _ => {
             let matches: Vec<_> = groups.into_iter().map(|(selector, _)| selector).collect();
-            SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
-                target: input.to_string(),
-                note: ambiguous_symbol_selector_note(&matches),
-                matches,
-            })
+            SourceLookupOutcome::Ambiguous(capped_ambiguous_symbol(input, matches))
         }
     }
 }

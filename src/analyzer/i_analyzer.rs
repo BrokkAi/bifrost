@@ -244,11 +244,14 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn lookup_candidates_by_short_name(&self, _symbol: &str) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
     }
-    /// Candidate declarations whose persisted terminal identifier (the leaf
-    /// display name, e.g. `bar` for `pkg.Foo.bar`) equals `identifier`. Backed
-    /// by the partial `idx_code_units_lang_identifier_declarations` index, so it
-    /// reaches members by their bare name. Implementations that cannot answer
-    /// cheaply return an empty set; callers retain their broader lookup path.
+    /// Candidate declarations *or definition-lookup-only units* (#1088: a
+    /// spelling the fq lookup path resolves must be visible here too, or
+    /// bare-name ambiguity silently drops it) whose persisted terminal
+    /// identifier (the leaf display name, e.g. `bar` for `pkg.Foo.bar`)
+    /// equals `identifier`. Backed by the partial
+    /// `idx_code_units_lang_identifier_lookup` index. Implementations that
+    /// cannot answer cheaply return an empty set; callers retain their
+    /// broader lookup path.
     fn lookup_candidates_by_identifier(&self, _identifier: &str) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
     }

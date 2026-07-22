@@ -752,6 +752,18 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
+    // #1088: every other language wrapper (TypeScript, Ruby, PHP, Go, Python,
+    // C#, C++, Java, Rust, Scala) forwards this to the shared
+    // `lookup_declarations_by_identifier`; JavaScript never did, so bare-name
+    // identifier resolution silently returned nothing for JS delegates and
+    // fell through to whatever another language/analyzer's `definitions()`
+    // exact-match happened to find (dayjs's `formats`: a JS locale field's
+    // bare identifier lookup returned empty, so the TypeScript `ILocale`
+    // interface member won by default with no ambiguity ever reported).
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_declarations_by_identifier(identifier)
+    }
+
     fn search_symbol_candidates(
         &self,
         pattern: &str,
