@@ -471,6 +471,15 @@ impl ProjectTypes {
         }
     }
 
+    fn declaration_parent(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+        match &self.structural_parent_by_unit {
+            Some(parents) => parents.get(unit).cloned(),
+            None => scala
+                .structural_parent_of(unit)
+                .or_else(|| scala.parent_of(unit)),
+        }
+    }
+
     pub(crate) fn exact_type_declaration_for_owner_context(
         &self,
         fqn: &str,
@@ -3299,9 +3308,7 @@ impl ProjectTypes {
         segments: &[String],
     ) -> Option<String> {
         let (first, rest) = segments.split_first()?;
-        let mut scope = scala
-            .structural_parent_of(declaration)
-            .or_else(|| scala.parent_of(declaration));
+        let mut scope = self.declaration_parent(scala, declaration);
         let mut seen = HashSet::default();
         while let Some(owner) = scope {
             if !seen.insert(owner.clone()) {
@@ -3333,9 +3340,7 @@ impl ProjectTypes {
                     return Some(resolved);
                 }
             }
-            scope = scala
-                .structural_parent_of(&owner)
-                .or_else(|| scala.parent_of(&owner));
+            scope = self.declaration_parent(scala, &owner);
         }
         self.resolve_type_in_declaration_context(scala, resolver, segments)
     }
@@ -4027,9 +4032,7 @@ impl ProjectTypes {
             };
         }
 
-        let mut scope = scala
-            .structural_parent_of(declaration)
-            .or_else(|| scala.parent_of(declaration));
+        let mut scope = self.declaration_parent(scala, declaration);
         let mut seen = HashSet::default();
         while let Some(owner) = scope {
             if !seen.insert(owner.clone()) {
@@ -4067,9 +4070,7 @@ impl ProjectTypes {
             } else if !roots.is_empty() {
                 return None;
             }
-            scope = scala
-                .structural_parent_of(&owner)
-                .or_else(|| scala.parent_of(&owner));
+            scope = self.declaration_parent(scala, &owner);
         }
 
         self.resolve_qualified_stable_type_unit_at(scala, resolver, path, false, None)
@@ -9694,8 +9695,8 @@ fn resolve_receiver_type_declaration_node(
         .types
         .canonical_receiver_type(ctx.scala, &declaration.fq_name())?;
     let owner_context = ctx
-        .scala
-        .structural_parent_of(&declaration)
+        .types
+        .exact_structural_parent(ctx.scala, &declaration)
         .unwrap_or_else(|| declaration.clone());
     match ctx
         .types

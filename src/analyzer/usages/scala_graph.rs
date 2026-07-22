@@ -526,6 +526,11 @@ object Use {
             .all_declarations()
             .map(|unit| unit.fq_name())
             .collect();
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            lru_after_warm,
+            "declaration cataloging must not hydrate through the LRU path"
+        );
         let _edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
             .expect("scala usage graph should build");
         assert_eq!(
