@@ -438,13 +438,13 @@ jobs:
           --cache-dir "${RUNNER_TEMP}/bifrost-agent-cold-cache"
 
   sync-agent-plugin-release-metadata:
-    name: sync generated agent plugin metadata
+    name: sync generated release metadata
     needs: [vscode, agent-plugin-release-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     concurrency:
-      group: agent-plugin-release-metadata-master
+      group: release-metadata-master
       cancel-in-progress: false
     steps:
       - name: Checkout master
@@ -477,11 +477,15 @@ jobs:
         run: >
           node scripts/prepare-vscode-extension-manifest.mjs
           --version "${{ steps.tag.outputs.version }}"
+          --manifest editors/vscode/package.json
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
       - name: Regenerate Amp skill bundle
         run: node scripts/generate-amp-skill-bundle.mjs
+
+      - name: Validate synchronized release projections
+        run: node scripts/sync-release-version.mjs --check
 
       - name: Validate agent plugin manifests
         run: node scripts/check-codex-plugin-manifest.mjs
@@ -491,9 +495,12 @@ jobs:
         run: |
           allowed_canonical="plugins/bifrost-agent/bifrost-release.json"
           allowed_amp="plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json"
+          allowed_vscode="editors/vscode/package.json"
           while IFS= read -r changed_file; do
             [ -z "$changed_file" ] && continue
-            if [ "$changed_file" != "$allowed_canonical" ] && [ "$changed_file" != "$allowed_amp" ]; then
+            if [ "$changed_file" != "$allowed_canonical" ] && \
+              [ "$changed_file" != "$allowed_amp" ] && \
+              [ "$changed_file" != "$allowed_vscode" ]; then
               echo "Refusing to commit unexpected generated change: $changed_file" >&2
               exit 1
             fi
@@ -507,8 +514,9 @@ jobs:
             exit 0
           fi
           git add -- plugins/bifrost-agent/bifrost-release.json \
-            plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json
+            plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json \
+            editors/vscode/package.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: sync agent plugin release metadata for ${{ steps.tag.outputs.name }}"
+          git commit -m "chore: sync release metadata for ${{ steps.tag.outputs.name }}"
           git push origin HEAD:master
