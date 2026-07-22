@@ -35,6 +35,8 @@ The observable result is twenty-five clean completed repository records, five pe
 - [x] (2026-07-22 02:05-05:00) Published the first Rust residual-repair checkpoint through `b58b8932` and reran all five explicit task-ranked repositories. The clean artifact `/mnt/optane/tmp/reference-differential/rust-task-top5-b58b8932-final.jsonl` (SHA-256 `f14c8775338b524340c273ff89f54583d47b4d2752b9b22e18eb4021a33f094c`) contains 140 raw rows: Stado 0, Tokio 19, tracing 62, Comrak 40, and toml_edit 19.
 - [x] (2026-07-22 03:00-05:00) Exhaustively dispositioned those 140 rows. Tokio's 19 and Comrak's 40 are nonacceptance artifacts. The 21 legitimate rows are three Criterion bare nominal references (#1050), nine tracing and five toml_edit independent Cargo-target identity errors (#1042), three serde_spanned bare module constants shadowed by associated constants (#991), and one child-module extern-prelude root captured by a parent sibling module (#992). Existing issues were open and assigned to `jbellis`; evidence comments were posted before implementation.
 - [x] (2026-07-22 04:10-05:00) Completed final implementation review and local acceptance for the Rust residual repair. Structured fixes preserve physical Cargo-target identity in both directions, restore module-value and extern-prelude precedence, and keep same-FQN expansion within the declaration namespace. Formatting, diff hygiene, the 605-test definition suite, 196-test inverse suite, 17-test residual suite, 8-test differential suite, candidate-bounded guard, isolated all-target/all-feature Clippy with warnings denied, and the complete isolated `cargo test --features nlp,python` matrix all pass. Publication and the clean pushed-head five-repository proof remain.
+- [x] (2026-07-22 04:20-05:00) Published the residual repair at integrated head `c7b8fa62` and completed a clean five-repository audit. The artifact `/mnt/optane/tmp/reference-differential/rust-task-top5-c7b8fa62-final.jsonl` (SHA-256 `93e4791ec38b076255366202fc7690ffd0fb7bcee87bde3e091c771438164677`) has 120 raw rows: Stado 0, Tokio 20, tracing 51, Comrak 40, and toml_edit 9. Exact old/new projection comparison proved that all 21 planned legitimate rows plus one additional corrected `ser::value` module identity disappeared and all 118 common residuals were byte-identical.
+- [x] (2026-07-22 04:30-05:00) The same audit found two added legitimate rows. Created and assigned #1060 before repairing same-FQN expansion that broadened Tokio's exact `Self::Future` impl identity, and created and assigned #1061 before repairing nested inline-module `self` identity in tracing-appender. Both implementations are structured: exact same-file lexical-Self definitions remain authoritative while other-file Cargo replicas remain eligible, and lowercase `self` uses tree-sitter ancestry plus the exact inline-module declaration range. The 610-test definition suite, 196-test inverse suite, 17-test residual suite, 8-test differential suite, candidate-bounded guard, formatting, and diff hygiene pass; publication gates remain.
 - [ ] Complete, publish, close owned issues for, and summarize the Rust task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Scala task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Java task-ranked leg.
@@ -82,6 +84,9 @@ The observable result is twenty-five clean completed repository records, five pe
 - Observation: Rust 2015 extern-prelude handling must distinguish the source binding from the Cargo route.
   Evidence: `extern crate toml_edit as edit; edit::de::from_str()` binds `edit` lexically but Cargo metadata is keyed by `toml_edit`. Final review caught the mismatch before publication; the structured ancestor-scope lookup now returns the underlying crate name and examines only direct items in visible scopes.
 
+- Observation: A clean pushed-head differential can expose a new defect even when every planned baseline defect disappeared.
+  Evidence: The `c7b8fa62` artifact removed all 21 legitimate `b58b8932` rows, but added Tokio's `Self::Future` same-FQN ambiguity and tracing-appender's nested `self` parent-module identity. Exact reruns and old/new projection comparison separated these two defects from 118 byte-identical nonacceptance rows; issues #1060 and #1061 own the repairs.
+
 ## Decision Log
 
 - Decision: Treat all previous LOC-ranked language records as regression evidence only and rerun all five requested languages.
@@ -122,6 +127,10 @@ The observable result is twenty-five clean completed repository records, five pe
 
 - Decision: Preserve physical declaration identity before applying Cargo scope, but expand only within the same Rust declaration namespace.
   Rationale: Same-FQN declarations in independent auto-targets must remain available for physical routing, while legal type/value collisions such as a struct and constructor-shaped function must not become ambiguous. Namespace filtering and a direct collision regression make both constraints explicit.
+  Date/Author: 2026-07-22 / Codex
+
+- Decision: Treat structured lexical identity as authoritative within its physical source file before broadening candidates for Cargo routing.
+  Rationale: Associated declarations from multiple impls can legally share the analyzer FQN in one file, whereas replicas in other files are required to disambiguate independent Cargo roots. Preserving the exact same-file `Self` result and admitting only other-file replicas satisfies both constraints. Lowercase `self` likewise resolves first to the nearest inline `mod_item` by exact declaration range, falling through to external-module routing only when no inline module encloses the site.
   Date/Author: 2026-07-22 / Codex
 
 ## Outcomes & Retrospective

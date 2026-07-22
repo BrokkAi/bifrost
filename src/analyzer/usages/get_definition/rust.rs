@@ -275,20 +275,38 @@ fn rust_scope_forward_candidates_to_cargo_target(
     if outcome.definitions.is_empty() {
         return outcome;
     }
+    // `Self` resolution already carries the exact enclosing impl identity in
+    // the CodeUnit signature. Same-file declarations can nevertheless share
+    // its analyzer FQN (for example impls for `T` and `&[T]`). Preserve every
+    // exact outcome from those files while still admitting other-file replicas
+    // for the Cargo target router to select between independent roots.
+    let exact_lexical_self_files = if matches!(&scope, RustCargoReferenceScope::LexicalSelf) {
+        outcome
+            .definitions
+            .iter()
+            .map(|definition| definition.source().clone())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::default()
+    };
     let mut expanded = outcome.definitions.clone();
     for definition in &outcome.definitions {
         expanded.extend(
             support
                 .fqn(&definition.fq_name())
                 .into_iter()
-                .filter(|candidate| rust_same_declaration_namespace(rust, definition, candidate)),
+                .filter(|candidate| {
+                    !exact_lexical_self_files.contains(candidate.source())
+                        && rust_same_declaration_namespace(rust, definition, candidate)
+                }),
         );
         expanded.extend(
             support
                 .file_identifier(file, definition.identifier())
                 .into_iter()
                 .filter(|candidate| {
-                    candidate.fq_name() == definition.fq_name()
+                    !exact_lexical_self_files.contains(candidate.source())
+                        && candidate.fq_name() == definition.fq_name()
                         && rust_same_declaration_namespace(rust, definition, candidate)
                 }),
         );
@@ -1979,6 +1997,13 @@ fn rust_focused_prefix_resolution_outcome(
     resolved_fqn: Option<&str>,
 ) -> DefinitionLookupOutcome {
     let root_name = rust_node_text(root, source).trim();
+    if role == RustFocusedPathRole::Owner && focused_path == focused_text && root_name == "self" {
+        let lexical_module =
+            rust_enclosing_inline_module_candidates(analyzer, support, file, source, root);
+        if !lexical_module.is_empty() {
+            return candidates_outcome(lexical_module);
+        }
+    }
     let binder = lexical_scope::visible_import_binder_at(source, site.focus_start_byte);
     // An inline module does not bring its own name into scope inside its body:
     // `mod serde_json { serde_json::Value }` names the extern-prelude crate (or
@@ -2157,6 +2182,45 @@ fn rust_focused_prefix_resolution_outcome(
             "focused Rust path segment `{focused_text}` did not resolve to an indexed definition"
         ),
     )
+}
+
+fn rust_enclosing_inline_module_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+) -> Vec<CodeUnit> {
+    let mut ancestor = root.parent();
+    let module = loop {
+        let Some(node) = ancestor else {
+            return Vec::new();
+        };
+        if node.kind() == "mod_item" {
+            break node;
+        }
+        ancestor = node.parent();
+    };
+    let Some(name_node) = module.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = support
+        .file_identifier(file, name)
+        .into_iter()
+        .filter(CodeUnit::is_module)
+        .filter(|candidate| {
+            analyzer.ranges(candidate).iter().any(|range| {
+                range.start_byte == module.start_byte() && range.end_byte == module.end_byte()
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn rust_visible_extern_crate_binding(

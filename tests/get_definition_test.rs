@@ -5343,6 +5343,80 @@ mod child {
 }
 
 #[test]
+fn rust_self_path_prefix_resolves_nearest_inline_module_identity() {
+    let source = r#"
+pub struct NonBlockingBuilder;
+
+impl Default for NonBlockingBuilder {
+    fn default() -> Self { Self }
+}
+
+pub fn parent_scope() {
+    let _ = self::NonBlockingBuilder::default();
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn exercise() {
+        let _ = self::NonBlockingBuilder::default();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"appender\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "pub mod non_blocking;\n")
+        .file("src/non_blocking.rs", source)
+        .build();
+
+    let reference = source
+        .rfind("self::NonBlockingBuilder")
+        .expect("lexical self module prefix");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/non_blocking.rs", source, reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/non_blocking.rs",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "non_blocking.test",
+        "{value}"
+    );
+
+    let parent_reference = source
+        .find("self::NonBlockingBuilder")
+        .expect("external parent module prefix");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/non_blocking.rs", source, parent_reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "non_blocking", "{value}");
+}
+
+#[test]
 fn rust_same_fqn_expansion_preserves_type_namespace_for_local_module_paths() {
     let source = r#"
 mod types {
@@ -5907,6 +5981,61 @@ impl Service for Svc {
         );
         assert_eq!(result["definitions"][0]["kind"], kind, "{value}");
     }
+}
+
+#[test]
+fn rust_self_associated_type_preserves_exact_same_file_impl_owner() {
+    let source = r#"
+trait Service {
+    type Future;
+    fn call(&self) -> Self::Future;
+}
+
+struct SocketAddr;
+struct First;
+struct Second;
+
+impl Service for SocketAddr {
+    type Future = First;
+    fn call(&self) -> Self::Future { First }
+}
+
+impl Service for &[SocketAddr] {
+    type Future = Second;
+    fn call(&self) -> Self::Future { Second }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"self-impl-identity\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", source)
+        .build();
+
+    let reference = source
+        .find("Self::Future { First }")
+        .expect("exact Self associated type reference")
+        + "Self::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "SocketAddr.Future",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "impl Service for SocketAddr::type Future = First;",
+        "{value}"
+    );
 }
 
 #[test]
