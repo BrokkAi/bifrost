@@ -18,6 +18,7 @@ export const DOWNLOAD_TIMEOUT_MS = 60_000;
 export const EXTRACTION_TIMEOUT_MS = 60_000;
 export const VERSION_PROBE_TIMEOUT_MS = 10_000;
 export const STARTUP_MARGIN_MS = 30_000;
+const CHILD_SIGNAL_GRACE_MS = 4_000;
 export const MINIMUM_MCP_STARTUP_TIMEOUT_MS =
   DOWNLOAD_TIMEOUT_MS + EXTRACTION_TIMEOUT_MS + VERSION_PROBE_TIMEOUT_MS + STARTUP_MARGIN_MS;
 export const SUPPORTED_TARGETS = [
@@ -769,13 +770,47 @@ export function spawnBifrost(binaryPath, args, options = {}) {
     env: options.env ?? process.env,
     stdio: "inherit"
   });
-  child.on("error", (error) => {
+  let forwardedSignal = null;
+  let forcedKillTimer = null;
+  const signalHandlers = new Map(
+    ["SIGINT", "SIGTERM"].map((signal) => [
+      signal,
+      () => {
+        if (child.exitCode === null && child.signalCode === null) {
+          forwardedSignal ??= signal;
+          child.kill(signal);
+          forcedKillTimer ??= setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGKILL");
+            }
+          }, CHILD_SIGNAL_GRACE_MS);
+        }
+      }
+    ])
+  );
+  const removeSignalHandlers = () => {
+    if (forcedKillTimer) {
+      clearTimeout(forcedKillTimer);
+      forcedKillTimer = null;
+    }
+    for (const [signal, handler] of signalHandlers) {
+      process.off(signal, handler);
+    }
+  };
+  for (const [signal, handler] of signalHandlers) {
+    process.on(signal, handler);
+  }
+
+  child.once("error", (error) => {
+    removeSignalHandlers();
     console.error(`Bifrost launcher failed to start ${binaryPath}: ${formatCause(error)}`);
     process.exitCode = 1;
   });
-  child.on("exit", (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
+  child.once("exit", (code, signal) => {
+    removeSignalHandlers();
+    const exitSignal = signal ?? forwardedSignal;
+    if (exitSignal) {
+      process.kill(process.pid, exitSignal);
       return;
     }
     process.exit(code ?? 1);

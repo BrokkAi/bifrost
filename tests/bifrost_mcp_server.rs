@@ -1,3 +1,6 @@
+mod common;
+
+use common::InlineTestProject;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -2343,7 +2346,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     )
     .expect("write replacement fixture");
 
-    let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -2359,11 +2362,15 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
             "params": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": { "roots": { "listChanged": true } },
-                "clientInfo": { "name": "roots-test", "version": "0.1.0" }
+                "clientInfo": { "name": "codex-mcp-client", "version": "0.145.0" }
             }
         }),
     );
     assert_eq!(initialize["result"]["serverInfo"]["name"], "bifrost");
+    assert!(
+        initialize["result"]["capabilities"]["experimental"].is_null(),
+        "standard roots must take precedence over Codex metadata: {initialize}"
+    );
 
     write_line(
         &mut stdin,
@@ -2415,13 +2422,62 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
             "method": "tools/call",
             "params": {
                 "name": "search_symbols",
-                "arguments": { "patterns": ["ClientWorkspace"] }
+                "arguments": { "patterns": ["ClientWorkspace"] },
+                "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-precedence")
             }
         }),
     );
     assert_eq!(search["result"]["isError"], false, "{search}");
     assert!(search.to_string().contains("ClientWorkspace"), "{search}");
     assert!(!search.to_string().contains("PluginOnly"), "{search}");
+
+    let rejected_activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "activate_workspace",
+                "arguments": { "workspace_path": plugin_dir.path().display().to_string() }
+            }
+        }),
+    );
+    assert_eq!(
+        rejected_activation["result"]["isError"], true,
+        "MCP roots must remain the only workspace authority: {rejected_activation}"
+    );
+    assert!(
+        rejected_activation["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("controlled by MCP client roots")),
+        "{rejected_activation}"
+    );
+
+    let still_bound_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ClientWorkspace"] }
+            }
+        }),
+    );
+    assert_eq!(
+        still_bound_search["result"]["isError"], false,
+        "a rejected activation must leave the approved root active: {still_bound_search}"
+    );
+    assert!(
+        still_bound_search.to_string().contains("ClientWorkspace"),
+        "{still_bound_search}"
+    );
 
     write_line(
         &mut stdin,
@@ -2442,7 +2498,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
             "method": "tools/call",
             "params": {
                 "name": "search_symbols",
-                "arguments": { "patterns": ["ClientWorkspace"] }
+                "arguments": { "patterns": ["ClientWorkspace"] },
+                "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-refresh")
             }
         }),
     );
@@ -2531,18 +2588,415 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
 }
 
 #[test]
-fn rootless_mcp_without_client_roots_stays_unbound() {
+fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
     let plugin_dir = TempDir::new().expect("plugin dir");
     fs::write(
         plugin_dir.path().join("PluginOnly.java"),
         "class PluginOnly {}\n",
     )
     .expect("write plugin fixture");
+    let workspace = InlineTestProject::new()
+        .file("CodexWorkspace.java", "class CodexWorkspace {}\n")
+        .build();
+    let replacement = InlineTestProject::new()
+        .file("SecondWorkspace.java", "class SecondWorkspace {}\n")
+        .build();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let before_initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(0, workspace.root(), "codex-test-thread", "CodexWorkspace"),
+    );
+    assert_eq!(before_initialize["error"]["code"], -32603);
+    assert!(
+        before_initialize["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "Codex metadata must not grant workspace authority before capability negotiation: {before_initialize}"
+    );
+
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_initialize_request(1),
+    );
+    assert_eq!(
+        initialize["result"]["capabilities"]["experimental"]["codex/sandbox-state-meta"],
+        json!({}),
+        "{initialize}"
+    );
+
+    write_line(&mut stdin, codex_handshake_message("initialized"));
+
+    let search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(2, workspace.root(), "codex-test-thread", "CodexWorkspace"),
+    );
+    assert_eq!(search["result"]["isError"], false, "{search}");
+    assert!(search.to_string().contains("CodexWorkspace"), "{search}");
+
+    let rejected_activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "activate_workspace",
+                "arguments": { "workspace_path": plugin_dir.path().display().to_string() },
+                "_meta": codex_sandbox_metadata(
+                    workspace.root(),
+                    "codex-test-thread"
+                )
+            }
+        }),
+    );
+    assert_eq!(
+        rejected_activation["result"]["isError"], true,
+        "sandbox metadata must remain the only workspace authority: {rejected_activation}"
+    );
+    assert!(
+        rejected_activation["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|message| message.contains("controlled by Codex sandbox metadata")),
+        "{rejected_activation}"
+    );
+
+    let plugin_scope_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(2_1, workspace.root(), "codex-test-thread", "PluginOnly"),
+    );
+    assert_eq!(
+        plugin_scope_search["result"]["structuredContent"]["files"],
+        json!([]),
+        "plugin cwd content must not enter workspace scope: {plugin_scope_search}"
+    );
+
+    let replacement_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(
+            3,
+            replacement.root(),
+            "codex-test-thread",
+            "SecondWorkspace",
+        ),
+    );
+    assert_eq!(
+        replacement_search["result"]["isError"], false,
+        "{replacement_search}"
+    );
+    assert!(
+        replacement_search.to_string().contains("SecondWorkspace"),
+        "{replacement_search}"
+    );
+
+    let old_scope_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(
+            3_1,
+            replacement.root(),
+            "codex-test-thread",
+            "CodexWorkspace",
+        ),
+    );
+    assert_eq!(
+        old_scope_search["result"]["structuredContent"]["files"],
+        json!([]),
+        "old workspace must not remain queryable: {old_scope_search}"
+    );
+
+    let mut invalid_request = codex_search_symbols_call(
+        4,
+        replacement.root(),
+        "codex-test-thread",
+        "SecondWorkspace",
+    );
+    invalid_request["params"]["_meta"]["codex/sandbox-state-meta"]["sandboxCwd"] =
+        json!("https://example.com/not-a-workspace");
+    let invalid = round_trip(&mut stdin, &mut reader, &mut stderr, invalid_request);
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Invalid Codex sandbox workspace metadata")),
+        "{invalid}"
+    );
+
+    let rebound = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(
+            5,
+            replacement.root(),
+            "codex-test-thread",
+            "SecondWorkspace",
+        ),
+    );
+    assert_eq!(rebound["result"]["isError"], false, "{rebound}");
+
+    let unavailable_root = replacement.root().join("missing-workspace");
+    let unavailable = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(
+            5_1,
+            &unavailable_root,
+            "codex-test-thread",
+            "SecondWorkspace",
+        ),
+    );
+    assert_eq!(unavailable["error"]["code"], -32602, "{unavailable}");
+    assert!(
+        unavailable["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("client workspace root")),
+        "a failed replacement must surface the unusable root: {unavailable}"
+    );
+
+    let rebound_after_failure = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_search_symbols_call(
+            5_2,
+            replacement.root(),
+            "codex-test-thread",
+            "SecondWorkspace",
+        ),
+    );
+    assert_eq!(
+        rebound_after_failure["result"]["isError"], false,
+        "a failed replacement must leave the old root revoked but allow a later valid bind: {rebound_after_failure}"
+    );
+
+    let duplicate_initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5_3,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "roots": { "listChanged": true } },
+                "clientInfo": { "name": "replacement-client", "version": "1" }
+            }
+        }),
+    );
+    assert_eq!(
+        duplicate_initialize["error"]["code"], -32600,
+        "duplicate initialize must not replace the connection authority: {duplicate_initialize}"
+    );
+
+    let missing = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["SecondWorkspace"] }
+            }
+        }),
+    );
+    assert_eq!(missing["error"]["code"], -32603, "{missing}");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "{missing}"
+    );
+    assert!(
+        !plugin_dir.path().join(".brokk/bifrost_cache.db").exists(),
+        "plugin cwd must not become analyzer storage"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+    let mut logs = String::new();
+    stderr.read_to_string(&mut logs).expect("read stderr");
+    assert!(
+        logs.contains("workspace_protocol=codex-sandbox-state"),
+        "{logs}"
+    );
+    assert!(logs.contains("source=codex/sandbox-state-meta"), "{logs}");
+    assert!(logs.contains("thread_id=codex-test-thread"), "{logs}");
+    assert!(logs.contains("reason=metadata changed"), "{logs}");
+    assert!(logs.contains("reason=metadata invalid"), "{logs}");
+    assert!(logs.contains("reason=metadata missing"), "{logs}");
+    assert!(logs.contains("failed workspace bind"), "{logs}");
+    assert!(!logs.contains("permissionProfile"), "{logs}");
+    assert!(!logs.contains("writableRoots"), "{logs}");
+}
+
+#[test]
+fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::new()
+        .file("FirstCallWorkspace.java", "class FirstCallWorkspace {}\n")
+        .build();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_initialize_request(1),
+    );
+    assert_eq!(
+        initialize["result"]["capabilities"]["experimental"]["codex/sandbox-state-meta"],
+        json!({}),
+        "{initialize}"
+    );
+    write_line(&mut stdin, codex_handshake_message("initialized"));
+
+    let rejected_activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "activate_workspace",
+                "arguments": { "workspace_path": plugin_dir.path().display().to_string() },
+                "_meta": codex_sandbox_metadata(workspace.root(), "first-call-activation")
+            }
+        }),
+    );
+    assert_eq!(
+        rejected_activation["result"]["isError"], true,
+        "the first metadata-bearing call must not escape its sandbox: {rejected_activation}"
+    );
+
+    let active_workspace = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get_active_workspace",
+                "arguments": {},
+                "_meta": codex_sandbox_metadata(workspace.root(), "first-call-activation")
+            }
+        }),
+    );
+    let active_path = active_workspace["result"]["structuredContent"]["workspace_path"]
+        .as_str()
+        .expect("active workspace path");
+    assert_same_canonical_path(active_path, workspace.root());
+    assert!(
+        !plugin_dir.path().join(".brokk/bifrost_cache.db").exists(),
+        "rejected activation must not create analyzer state in the escaped root"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn explicit_mcp_root_ignores_codex_sandbox_state() {
+    let explicit_workspace = InlineTestProject::new()
+        .file("ExplicitWorkspace.java", "class ExplicitWorkspace {}\n")
+        .build();
+    let conflicting_workspace = InlineTestProject::new()
+        .file("MetadataWorkspace.java", "class MetadataWorkspace {}\n")
+        .build();
+    let mut child = spawn_server(explicit_workspace.root(), "symbol", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        codex_initialize_request(1),
+    );
+    assert!(
+        initialize["result"]["capabilities"]["experimental"].is_null(),
+        "explicit roots must not negotiate metadata binding: {initialize}"
+    );
+    write_line(&mut stdin, codex_handshake_message("initialized"));
+
+    let search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ExplicitWorkspace"] },
+                "_meta": codex_sandbox_metadata(conflicting_workspace.root(), "explicit-root")
+            }
+        }),
+    );
+    assert_eq!(search["result"]["isError"], false, "{search}");
+    assert!(search.to_string().contains("ExplicitWorkspace"), "{search}");
+    assert!(
+        !search.to_string().contains("MetadataWorkspace"),
+        "{search}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    fs::write(
+        plugin_dir.path().join("PluginOnly.java"),
+        "class PluginOnly {}\n",
+    )
+    .expect("write plugin fixture");
+    let workspace = InlineTestProject::new()
+        .file("CompatibleWorkspace.java", "class CompatibleWorkspace {}\n")
+        .build();
     let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let initialize = initialize_session(&mut stdin, &mut reader, &mut stderr);
+    assert_eq!(
+        initialize["result"]["capabilities"]["experimental"]["codex/sandbox-state-meta"],
+        json!({}),
+        "{initialize}"
+    );
 
     let tools = round_trip(
         &mut stdin,
@@ -2566,15 +3020,14 @@ fn rootless_mcp_without_client_roots_stays_unbound() {
             "method": "tools/call",
             "params": {
                 "name": "search_symbols",
-                "arguments": { "patterns": ["PluginOnly"] }
+                "arguments": { "patterns": ["CompatibleWorkspace"] },
+                "_meta": codex_sandbox_metadata(workspace.root(), "compatible-client")
             }
         }),
     );
-    assert_eq!(search["error"]["code"], -32603, "{search}");
+    assert_eq!(search["result"]["isError"], false, "{search}");
     assert!(
-        search["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not bound to a workspace")),
+        search.to_string().contains("CompatibleWorkspace"),
         "{search}"
     );
     assert!(
@@ -2586,8 +3039,12 @@ fn rootless_mcp_without_client_roots_stays_unbound() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
-fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr: &mut impl Read) {
-    round_trip(
+fn initialize_session(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+) -> Value {
+    let initialize = round_trip(
         stdin,
         reader,
         stderr,
@@ -2606,6 +3063,75 @@ fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr:
         stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
+    initialize
+}
+
+fn codex_handshake_message(name: &str) -> Value {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/mcp/codex-sandbox-state-handshake.json"
+    ))
+    .expect("parse recorded Codex MCP handshake fixture");
+    fixture
+        .get(name)
+        .unwrap_or_else(|| panic!("recorded Codex MCP handshake has no {name} message"))
+        .clone()
+}
+
+fn codex_initialize_request(id: i64) -> Value {
+    let mut request = codex_handshake_message("initialize");
+    request["id"] = json!(id);
+    request
+}
+
+fn codex_search_symbols_call(
+    id: i64,
+    root: &std::path::Path,
+    thread_id: &str,
+    pattern: &str,
+) -> Value {
+    let sandbox_cwd = url::Url::from_directory_path(root)
+        .expect("sandbox cwd file URI")
+        .to_string();
+    let mut request = codex_handshake_message("toolCall");
+    request["id"] = json!(id);
+    assert_eq!(
+        replace_fixture_placeholder(&mut request, "__BIFROST_SANDBOX_CWD__", &sandbox_cwd,),
+        2,
+        "recorded Codex tool call must contain sandboxCwd and writableRoots placeholders"
+    );
+    assert_eq!(
+        replace_fixture_placeholder(&mut request, "__BIFROST_THREAD_ID__", thread_id),
+        1,
+        "recorded Codex tool call must contain one thread id placeholder"
+    );
+    assert_eq!(
+        replace_fixture_placeholder(&mut request, "__BIFROST_SYMBOL_PATTERN__", pattern),
+        1,
+        "recorded Codex tool call must contain one search pattern placeholder"
+    );
+    request
+}
+
+fn replace_fixture_placeholder(value: &mut Value, placeholder: &str, replacement: &str) -> usize {
+    match value {
+        Value::String(text) if text == placeholder => {
+            *text = replacement.to_owned();
+            1
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .map(|value| replace_fixture_placeholder(value, placeholder, replacement))
+            .sum(),
+        Value::Object(fields) => fields
+            .values_mut()
+            .map(|value| replace_fixture_placeholder(value, placeholder, replacement))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn codex_sandbox_metadata(root: &std::path::Path, thread_id: &str) -> Value {
+    codex_search_symbols_call(0, root, thread_id, "unused")["params"]["_meta"].clone()
 }
 
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {

@@ -29,7 +29,7 @@ BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" codex
 
 Start a fresh Codex session after installing the plugin so the MCP server configuration is loaded at startup. The packaged plugin uses `symbol|extended`, so it exposes both symbol navigation and `query_code`.
 
-Installing the plugin automatically registers its packaged MCP server. Do not add a second manual Bifrost MCP entry for the same plugin. The launcher keeps package command resolution separate from analyzer scope: without an explicit override, Bifrost requests the active task directory through the standard MCP roots capability. Codex builds that do not yet advertise roots leave Bifrost unbound instead of analyzing the plugin cache; `BIFROST_WORKSPACE_ROOT` is the temporary explicit override for those builds.
+Installing the plugin automatically registers its packaged MCP server. Do not add a second manual Bifrost MCP entry for the same plugin. The launcher keeps package command resolution separate from analyzer scope: without an explicit override, Bifrost prefers standard MCP roots. On a rootless connection whose client did not advertise roots, Bifrost offers the `codex/sandbox-state-meta` extension. Current Codex accepts that capability and supplies the active task directory on each analyzer tool call. Bifrost binds that exact directory, follows later task-directory changes, and never analyzes the plugin cache. `BIFROST_WORKSPACE_ROOT` remains an authoritative explicit override for fixed-project or older-host configurations.
 
 If the first launch needs to download the pinned Bifrost release, prepare it from a normal host shell before opening that fresh session:
 
