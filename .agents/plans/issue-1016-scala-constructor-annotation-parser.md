@@ -16,8 +16,9 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 - [x] (2026-07-22 11:13Z) Vendored the fixed generated parser, recorded its checksums, and compiled it through Bifrost's root crate.
 - [x] (2026-07-22 11:13Z) Routed every Scala parser consumer through the internal language binding and explicitly invalidated persisted Scala analysis.
 - [x] (2026-07-22 11:24Z) Added exact analyzer, property-fuzzer, and SearchTools regressions; all three focused tests pass against the vendored parser.
-- [ ] Update third-party notices and verify crate packaging (completed: notice generator and tracked notice; remaining: packaged-crate inspection and build).
-- [ ] Run focused tests, all-feature lint/tests, corpus replays, and the final multi-angle review.
+- [x] (2026-07-22 12:00Z) Added the vendored MIT notice, byte-compared regenerated notices, passed `cargo deny`, and verified the packaged crate contains and builds the vendored parser snapshot.
+- [x] (2026-07-22 12:00Z) Replayed Chisel's exact `VCSSpec` record with ephemeral cache and confirmed its distinct grammar error remains unchanged.
+- [x] (2026-07-22 12:28Z) Passed the complete all-feature unit/integration suite and coherent-toolchain doc phase, repeated all-feature clippy, and completed the final multi-angle review with no blocking findings.
 
 ## Surprises & Discoveries
 
@@ -41,6 +42,21 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 
 - Observation: Neither recorded corpus checkout is mounted in this environment.
   Evidence: `/mnt/optane/usagebench/repos/chipsalliance__chisel` and `/mnt/optane/usagebench/repos/TheHive-Project__TheHive` are both absent. The checked-in TheHive fixture proves acceptance; the Chisel replay requires an exact temporary sparse checkout during final validation.
+
+- Observation: The fixed parser does not clear the separate Chisel `VCSSpec` truncation.
+  Evidence: an ephemeral replay against `chipsalliance/chisel` commit `e639b4f69e90ecf3f14c25b898fda9d1eadf3cc1` still reports one `declaration-truncated-at-parse-error` violation for `svsimTests.VCSSpec`, with the declaration at bytes 376-409 followed by an `ERROR` at bytes 410-22749. The class has no annotated constructor, so this is separate follow-up evidence rather than a reason to widen issue #1016.
+
+- Observation: Vendoring the generated parser substantially increases the crate archive but still packages successfully.
+  Evidence: `cargo package --allow-dirty` packaged 1,490 files, 69.1 MiB uncompressed and 9.3 MiB compressed, then built the packaged crate without a git dependency. The archive remains close enough to crates.io's normal size ceiling that replacing the snapshot with the first fixed published grammar crate should remain an explicit follow-up.
+
+- Observation: macOS all-feature tests require the same PyO3 dynamic-lookup linker flags already used by CI.
+  Evidence: without `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`, the `python` feature test binaries fail to link unresolved CPython symbols. Re-running with the workflow's macOS flags links successfully.
+
+- Observation: A second fuzzer regression still encoded the old parser failure after the primary issue fixture was updated.
+  Evidence: the complete suite failed `i1_fires_on_annotated_constructor_scala_fixture`, whose `JobSrv` excerpt uses an annotated constructor parameter. The test now asserts a complete `JobSrv` source and no invariant violation; both issue-#1016 fuzzer cases pass.
+
+- Observation: This host initially mixed rustup Cargo/rustc with Homebrew rustdoc.
+  Evidence: all unit and integration suites passed, then the doc phase emitted E0514 because rustdoc rejected dependencies built by the other toolchain. Re-running `cargo test --features nlp,python --doc` with `/Users/dave/.cargo/bin` first on `PATH` passed, proving the remaining phase with a coherent toolchain.
 
 ## Decision Log
 
@@ -66,7 +82,13 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 
 ## Outcomes & Retrospective
 
-Implementation has not started. At completion, record the observed TheHive behavior, whether the newer parser also clears Chisel's distinct error, package-validation results, review findings, and any remaining work.
+The vendored parser fixes the exact TheHive acceptance workflow without changing declaration extraction, public APIs, or response shapes. `JobCtrl` now includes its annotated primary constructor and complete body, `JobCtrl.create` is indexed as its child, `PublicJob` remains a separate declaration, and SearchTools resolves the in-body `jobSrv.submit` reference to the inline `JobSrv.submit` definition.
+
+The immutable parser snapshot, build inputs, checksums, source URL, and MIT license are recorded and included in the publishable crate. Supplemental notices reproduce the vendored license, license policy passes, and the package builds from its archive. The main operational cost is the 9.3 MiB compressed crate, which is acceptable for this temporary snapshot but leaves little registry-size headroom.
+
+The Chisel replay remains one severe adjacent-`ERROR` violation with the same range as before. Because `VCSSpec` has no annotated constructor, it should be diagnosed independently; no analyzer range repair or source-text fallback was added here.
+
+Final review found no blocking security, duplication, intent, operational, or architectural defects. The native build has no network step, pins immutable generated input with checksums and licensing, and mirrors upstream's C11, warning, and MSVC UTF-8 flags. All Scala consumers share one private language binding, the cache epoch explicitly changes, and the acceptance tests exercise public SearchTools behavior. The compressed package size is the only follow-up risk noted above.
 
 ## Context and Orientation
 
@@ -133,8 +155,11 @@ Generate and compare notices:
 Run release-quality Rust checks:
 
     cargo fmt --check
-    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --features nlp,python
+    scripts/with-isolated-cargo-target.sh env PATH="/Users/dave/.cargo/bin:$PATH" cargo clippy --all-targets --all-features -- -D warnings
+    scripts/with-isolated-cargo-target.sh env RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo test --features nlp,python
+    scripts/with-isolated-cargo-target.sh env PATH="/Users/dave/.cargo/bin:$PATH" RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo test --features nlp,python --doc
+
+The explicit macOS linker flags match CI's PyO3 configuration. The separate doc invocation records the coherent-toolchain rerun required by this host after the complete unit/integration invocation had already passed every non-doc suite.
 
 Validate the publishable package:
 

@@ -323,49 +323,39 @@ fn i1_silent_on_healthy_scala_fixture() {
     );
 }
 
-/// The miniature of issue #1016: a Scala class whose annotated, multi-line
-/// constructor takes tree-sitter-scala's error-recovery path, leaving the
-/// class's recorded range truncated at the constructor while its members
-/// index below. The excerpt is the first 60 lines (plus closing brace) of
+/// A second issue #1016 shape: an annotated, multi-line constructor with an
+/// annotated parameter after the original TheHive imports. The excerpt is the
+/// first 60 lines (plus closing brace) of
 /// `cortex/connector/.../services/JobSrv.scala` from TheHive-Project/TheHive
-/// (AGPL-3.0), the corpus repository #1016 was filed against; probing showed
-/// the truncation is a joint property of the import block, the
-/// `@Named("cortex-actor")` constructor-parameter annotation, and the
-/// following body tokens, so paraphrased fixtures did not reproduce it.
-///
-/// While the analyzer truncates the range, the engine must report the class's
-/// out-of-range members under I1 with the `container-range-misses-member`
-/// shape; when #1016 is fixed this test flips to asserting silence — update
-/// it as part of that fix.
+/// (AGPL-3.0), the corpus repository #1016 was filed against. The fixed parser
+/// must keep the body members inside `JobSrv` and leave I1 silent.
 #[test]
-fn i1_fires_on_annotated_constructor_scala_fixture() {
+fn issue_1016_i1_accepts_annotated_constructor_parameter_scala_fixture() {
     let project = InlineTestProject::new()
         .file("src/JobSrv.scala", ISSUE_1016_JOBSRV_EXCERPT)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let report =
         run_invariants(workspace.analyzer(), &fuzzer_config("scala")).expect("run invariants");
-    let violation = report
-        .violations
-        .iter()
-        .find(|violation| violation.shape == "container-range-misses-member")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected the #1016 annotated-constructor range violation; report:\n{}",
-                serde_json::to_string_pretty(&report).expect("report json")
-            )
-        });
     assert!(
-        violation.symbol.ends_with(".observableJobSrv")
-            || violation.symbol.ends_with(".reportObservableSrv"),
-        "exemplar should be an out-of-range JobSrv member: {violation:?}"
+        report.violations.is_empty(),
+        "{}",
+        serde_json::to_string_pretty(&report.violations).expect("violations json")
     );
-    assert_eq!(
-        violation.evidence["parent"]["fq_name"]
-            .as_str()
-            .expect("parent fq_name"),
-        "org.thp.thehive.connector.cortex.services.JobSrv"
+
+    let analyzer = workspace.analyzer();
+    let job_srv = analyzer
+        .get_definitions("org.thp.thehive.connector.cortex.services.JobSrv")
+        .into_iter()
+        .find(|unit| unit.is_class())
+        .expect("JobSrv class");
+    let source = analyzer.get_source(&job_srv, false).expect("JobSrv source");
+    assert!(
+        source.contains("@Named(\"cortex-actor\") cortexActor: ActorRef"),
+        "{source}"
     );
+    assert!(source.contains("val observableJobSrv"), "{source}");
+    assert!(source.contains("val reportObservableSrv"), "{source}");
 }
 
 /// First 60 lines of `JobSrv.scala` (TheHive-Project/TheHive @ d390a031,
@@ -633,9 +623,9 @@ fn issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture() {
     );
     assert!(!source.contains("class PublicJob"), "{source}");
 
-    let class_range = analyzer.ranges(&job_ctrl)[0].clone();
-    let create_range = analyzer.ranges(&create)[0].clone();
-    let public_job_range = analyzer.ranges(&public_job)[0].clone();
+    let class_range = analyzer.ranges(&job_ctrl)[0];
+    let create_range = analyzer.ranges(&create)[0];
+    let public_job_range = analyzer.ranges(&public_job)[0];
     assert!(
         class_range.start_byte <= create_range.start_byte
             && class_range.end_byte >= create_range.end_byte,
