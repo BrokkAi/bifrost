@@ -1554,7 +1554,7 @@ void PYBIND11_MODULE(Net& net, DataReaderFromMemoryCopy& dr) {
         "{value}"
     );
     assert_eq!(
-        "(DataReader &)", result["definitions"][0]["signature"],
+        "(const DataReader &)", result["definitions"][0]["signature"],
         "{value}"
     );
 }
@@ -1612,7 +1612,7 @@ void PYBIND11_MODULE(Net& net, const char* mem) {
         "{value}"
     );
     assert_eq!(
-        "(DataReader &)", result["definitions"][0]["signature"],
+        "(const DataReader &)", result["definitions"][0]["signature"],
         "{value}"
     );
 }
@@ -4873,6 +4873,98 @@ int use(example::Service& service) {
         unresolved["files"].as_array().is_none_or(Vec::is_empty),
         "unresolved definition must not render as a usage row: {unresolved_value}"
     );
+}
+
+#[test]
+fn cpp_string_literal_overload_is_narrow_at_public_location_boundaries() {
+    let header = r#"#pragma once
+namespace precision {
+int select(int value);
+int select(const char* value);
+}
+"#;
+    let implementation = r#"#include "worker.h"
+namespace precision {
+int select(int value) { return value; }
+int select(const char* value) { return value[0]; }
+}
+"#;
+    let consumer = r#"#include "worker.h"
+int consume() {
+    return precision::select("name");
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/worker.h", header)
+        .file("src/worker.cpp", implementation)
+        .file("src/consumer.cpp", consumer)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let call_line = "    return precision::select(\"name\");";
+    let definitions_payload = service
+        .call_tool_json(
+            "get_definitions_by_location",
+            &serde_json::json!({
+                "references": [{
+                    "path": "src/consumer.cpp",
+                    "line": line_of(consumer, call_line),
+                    "column": call_line.find("select").unwrap() + 1,
+                }]
+            })
+            .to_string(),
+        )
+        .expect("definition lookup succeeds");
+    let definitions: Value = serde_json::from_str(&definitions_payload).unwrap();
+    let definition_result = &definitions["results"][0];
+    assert_eq!("resolved", definition_result["status"], "{definitions}");
+    assert_eq!(
+        1,
+        definition_result["definitions"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        "src/worker.cpp", definition_result["definitions"][0]["path"],
+        "{definitions}"
+    );
+    assert!(
+        definition_result["definitions"][0]["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.contains("const char")),
+        "{definitions}"
+    );
+
+    for (declaration_line, expected_status, expected_hits) in [
+        ("int select(int value);", "verified_absent", 0),
+        ("int select(const char* value);", "found", 1),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_location",
+                &serde_json::json!({
+                    "targets": [{
+                        "path": "include/worker.h",
+                        "line": line_of(header, declaration_line),
+                        "column": declaration_line.find("select").unwrap() + 1,
+                    }],
+                    "include_tests": true,
+                })
+                .to_string(),
+            )
+            .expect("usage scan succeeds");
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+        assert_eq!(expected_status, result["status"], "{value}");
+        assert_eq!(expected_hits, result["total_hits"], "{value}");
+        if expected_hits == 1 {
+            assert_eq!("src/consumer.cpp", result["files"][0]["path"], "{value}");
+            assert_eq!(
+                line_of(consumer, call_line),
+                result["files"][0]["hits"][0]["line"],
+                "{value}"
+            );
+        }
+    }
 }
 
 #[test]

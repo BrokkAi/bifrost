@@ -6,6 +6,7 @@ pub(in crate::analyzer::usages) struct CppArgType {
     pub name: String,
     pub unit: Option<CodeUnit>,
     pub indirection: i32,
+    pub pointee_const: bool,
 }
 
 pub(in crate::analyzer::usages) fn cpp_signature_param_types(
@@ -38,61 +39,83 @@ pub(in crate::analyzer::usages) fn cpp_parameter_type_text(parameter: &str) -> S
     {
         text = before.trim();
     }
+    let pointee_const = pointer_depth > 0 && cpp_type_text_pointee_is_const(text);
     format!(
-        "{}{}",
+        "{}{}{}",
+        if pointee_const { "const " } else { "" },
         normalize_cpp_type_name(text),
         "*".repeat(pointer_depth as usize)
     )
 }
 
 pub(in crate::analyzer::usages) fn normalize_cpp_type_name(text: &str) -> String {
-    strip_tag_type_prefix(
-        normalize_cpp_whitespace(text)
-            .trim_start_matches("const ")
-            .trim_end_matches('*')
-            .trim_end_matches('&')
-            .trim(),
-    )
-    .to_string()
+    let normalized = normalize_cpp_whitespace(text);
+    let base = cpp_type_text_base(&normalized)
+        .trim_start_matches("const ")
+        .trim();
+    strip_tag_type_prefix(base.strip_suffix(" const").unwrap_or(base)).to_string()
 }
 
 pub(in crate::analyzer::usages) fn cpp_type_text_pointer_depth(text: &str) -> i32 {
+    cpp_type_text_shape(text).1
+}
+
+fn cpp_type_text_shape(text: &str) -> (usize, i32) {
     let mut depth = 0i32;
-    let mut bracket = 0i32;
-    for ch in text.chars() {
+    let mut nesting = 0i32;
+    let mut base_end = text.len();
+    for (offset, ch) in text.char_indices() {
         match ch {
-            '<' | '(' | '[' => bracket += 1,
-            '>' | ')' | ']' => bracket -= 1,
-            '*' if bracket <= 0 => depth += 1,
+            '<' | '(' | '[' => nesting += 1,
+            '>' | ')' | ']' => nesting -= 1,
+            '*' if nesting <= 0 => {
+                base_end = base_end.min(offset);
+                depth += 1;
+            }
+            '&' if nesting <= 0 => base_end = base_end.min(offset),
             _ => {}
         }
     }
-    depth
+    (base_end, depth)
 }
 
-pub(in crate::analyzer::usages) fn cpp_literal_type_name(
+pub(in crate::analyzer::usages) fn cpp_literal_arg_type(
     node: Node<'_>,
     source: &str,
-) -> Option<&'static str> {
+) -> Option<CppArgType> {
+    let scalar = |name: &str| CppArgType {
+        name: name.to_string(),
+        unit: None,
+        indirection: 0,
+        pointee_const: false,
+    };
     match node.kind() {
         "number_literal" => {
             let text = cpp_node_text(node, source);
             if cpp_number_literal_is_float(text) {
-                Some("double")
+                Some(scalar("double"))
             } else {
-                Some("int")
+                Some(scalar("int"))
             }
         }
-        "true" | "false" => Some("bool"),
-        "char_literal" => Some("char"),
-        "string_literal" => None,
+        "true" | "false" => Some(scalar("bool")),
+        "char_literal" => Some(scalar("char")),
+        "string_literal" => {
+            let text = cpp_node_text(node, source).trim_start();
+            (text.starts_with('"') || text.starts_with("R\"")).then(|| CppArgType {
+                name: "char".to_string(),
+                unit: None,
+                indirection: 1,
+                pointee_const: true,
+            })
+        }
         "unary_expression" => {
             let operator = node.child_by_field_name("operator")?;
             let inner = node
                 .child_by_field_name("argument")
                 .or_else(|| node.named_child(0))?;
             matches!(operator.kind(), "+" | "-")
-                .then(|| cpp_literal_type_name(inner, source))
+                .then(|| cpp_literal_arg_type(inner, source))
                 .flatten()
         }
         _ => None,
@@ -142,11 +165,24 @@ fn cpp_param_matches_arg(
     if cpp_type_text_pointer_depth(param) != arg.indirection {
         return false;
     }
+    if arg.pointee_const && !cpp_type_text_pointee_is_const(param) {
+        return false;
+    }
     let param_name = normalize_cpp_type_name(param);
     match (resolve_type(&param_name), arg.unit.as_ref()) {
         (Some(param_unit), Some(arg_unit)) => assignable(arg_unit, &param_unit),
         _ => param_name == arg.name,
     }
+}
+
+fn cpp_type_text_pointee_is_const(text: &str) -> bool {
+    let normalized = normalize_cpp_whitespace(text);
+    let base = cpp_type_text_base(&normalized).trim();
+    base.starts_with("const ") || base.ends_with(" const")
+}
+
+fn cpp_type_text_base(text: &str) -> &str {
+    text[..cpp_type_text_shape(text).0].trim()
 }
 
 pub(in crate::analyzer::usages) fn cpp_split_top_level_commas(
@@ -288,6 +324,7 @@ mod tests {
                 name: "std::string".to_string(),
                 unit: None,
                 indirection: 0,
+                pointee_const: false,
             })],
             &|_| None,
             &|_, _| false,
@@ -306,6 +343,7 @@ mod tests {
                 name: "Arg".to_string(),
                 unit: Some(arg.clone()),
                 indirection: 0,
+                pointee_const: false,
             })],
             &|name| (name == "Param").then(|| param.clone()),
             &|from, to| from == &arg && to == &param,
@@ -325,12 +363,69 @@ mod tests {
                 name: "int".to_string(),
                 unit: None,
                 indirection: 0,
+                pointee_const: false,
             })],
             &|_| None,
             &|_, _| false,
         );
         assert_eq!(1, filtered.len());
         assert_eq!("void take(int value)", filtered[0].signature().unwrap());
+    }
+
+    #[test]
+    fn cpp_filter_candidates_uses_const_string_literal_pointer_evidence() {
+        let literal = Some(CppArgType {
+            name: "char".to_string(),
+            unit: None,
+            indirection: 1,
+            pointee_const: true,
+        });
+        let direct = cpp_filter_candidates_by_args(
+            vec![
+                function("select", "int select(int value)"),
+                function("select", "int select(const char* value)"),
+            ],
+            std::slice::from_ref(&literal),
+            &|_| None,
+            &|_, _| false,
+        );
+        assert_eq!(1, direct.len());
+        assert_eq!(
+            "int select(const char* value)",
+            direct[0].signature().unwrap()
+        );
+
+        for candidates in [
+            vec![
+                function("select", "int select(int value)"),
+                function("select", "int select(char* value)"),
+            ],
+            vec![
+                function("format", "int format(int value)"),
+                function("format", "int format(std::string value)"),
+            ],
+        ] {
+            let filtered = cpp_filter_candidates_by_args(
+                candidates.clone(),
+                std::slice::from_ref(&literal),
+                &|_| None,
+                &|_, _| false,
+            );
+            assert_eq!(
+                candidates, filtered,
+                "unmodeled or invalid conversions must remain conservative"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_parameter_type_keeps_pointer_const_distinct_from_pointee_const() {
+        assert_eq!("char*", cpp_parameter_type_text("char * const value"));
+        assert_eq!(
+            "const char*",
+            cpp_parameter_type_text("const char * const value")
+        );
+        assert_eq!("char", normalize_cpp_type_name("char * const"));
     }
 
     #[test]
@@ -356,6 +451,7 @@ mod tests {
                 name: "double".to_string(),
                 unit: None,
                 indirection: 0,
+                pointee_const: false,
             })],
             &|_| None,
             &|_, _| false,

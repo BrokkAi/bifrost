@@ -18348,7 +18348,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["signature"], "(DataReader &)",
+        result["definitions"][0]["signature"], "(const DataReader &)",
         "{value}"
     );
 }
@@ -18388,7 +18388,7 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
     assert_eq!(result["definitions"][0]["signature"], "()", "{value}");
     assert_eq!(
-        result["definitions"][1]["signature"], "(DataReader &)",
+        result["definitions"][1]["signature"], "(const DataReader &)",
         "{value}"
     );
 
@@ -18440,7 +18440,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_argument_type() {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["signature"], "(DataReader &)",
+        result["definitions"][0]["signature"], "(const DataReader &)",
         "{value}"
     );
 }
@@ -18546,6 +18546,59 @@ fn assert_cpp_format_overload_definitions(value: &Value, expected_signature_frag
 }
 
 #[test]
+fn cpp_string_literal_selects_const_char_pointer_overload() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/worker.h",
+            r#"#pragma once
+namespace precision {
+int select(int value);
+int select(const char* value);
+}
+"#,
+        )
+        .file(
+            "src/worker.cpp",
+            r#"#include "worker.h"
+namespace precision {
+int select(int value) { return value; }
+int select(const char* value) { return value[0]; }
+}
+"#,
+        )
+        .file(
+            "src/consumer.cpp",
+            r#"#include "worker.h"
+int consume() {
+    return precision::select("name");
+}
+"#,
+        )
+        .build();
+
+    let line = "    return precision::select(\"name\");";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/consumer.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "select")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    let definitions = result["definitions"].as_array().unwrap();
+    assert_eq!(1, definitions.len(), "{value}");
+    assert_eq!("src/worker.cpp", definitions[0]["path"], "{value}");
+    assert!(
+        definitions[0]["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.contains("const char")),
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -18579,10 +18632,13 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["signature"], "(DataReader &)",
+        result["definitions"][0]["signature"], "(const DataReader &)",
         "{value}"
     );
-    assert_eq!(result["definitions"][1]["signature"], "(char *)", "{value}");
+    assert_eq!(
+        result["definitions"][1]["signature"], "(const char *)",
+        "{value}"
+    );
 }
 
 #[test]

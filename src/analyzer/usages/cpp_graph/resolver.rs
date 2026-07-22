@@ -514,6 +514,7 @@ impl CppScanBinding {
             name,
             unit: self.unit.clone(),
             indirection: self.indirection,
+            pointee_const: false,
         })
     }
 }
