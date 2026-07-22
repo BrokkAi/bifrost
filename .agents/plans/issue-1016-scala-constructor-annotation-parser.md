@@ -15,7 +15,7 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 - [x] (2026-07-22 11:05Z) Chose vendoring over a git dependency so crates.io packages, wheels, and binaries all compile the same corrected parser.
 - [x] (2026-07-22 11:13Z) Vendored the fixed generated parser, recorded its checksums, and compiled it through Bifrost's root crate.
 - [x] (2026-07-22 11:13Z) Routed every Scala parser consumer through the internal language binding and explicitly invalidated persisted Scala analysis.
-- [ ] Add exact analyzer, property-fuzzer, and SearchTools regressions.
+- [x] (2026-07-22 11:24Z) Added exact analyzer, property-fuzzer, and SearchTools regressions; all three focused tests pass against the vendored parser.
 - [ ] Update third-party notices and verify crate packaging (completed: notice generator and tracked notice; remaining: packaged-crate inspection and build).
 - [ ] Run focused tests, all-feature lint/tests, corpus replays, and the final multi-angle review.
 
@@ -38,6 +38,9 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 
 - Observation: The existing worktree `target` consumed 6.9 GiB and the first regression build failed while writing an incremental dependency graph, despite the volume reporting free space.
   Evidence: Cargo returned `No space left on device (os error 28)`; `cargo clean` removed 9,599 regenerable build files before validation resumed.
+
+- Observation: Neither recorded corpus checkout is mounted in this environment.
+  Evidence: `/mnt/optane/usagebench/repos/chipsalliance__chisel` and `/mnt/optane/usagebench/repos/TheHive-Project__TheHive` are both absent. The checked-in TheHive fixture proves acceptance; the Chisel replay requires an exact temporary sparse checkout during final validation.
 
 ## Decision Log
 
@@ -116,7 +119,7 @@ After dependency and build integration:
 
 After regression tests:
 
-    cargo test --test mcp_property_fuzzer i1_accepts_annotated_constructor_jobctrl_scala_fixture -- --nocapture
+    cargo test --test mcp_property_fuzzer issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture -- --nocapture
     cargo test --test searchtools_definition_selectors issue_1016 -- --nocapture
 
 Use the actual final test names if Rust's test-module organization requires a different prefix, and update this section immediately.

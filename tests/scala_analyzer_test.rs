@@ -293,6 +293,47 @@ fn scala_class_name_ignores_annotation_and_extends_nodes() {
 }
 
 #[test]
+fn issue_1016_scala_annotated_constructor_whitespace_forms_keep_parameters_and_bodies() {
+    let project = inline_scala_project(&[(
+        "ai/brokk/Annotated.scala",
+        r#"
+        package ai.brokk
+
+        class A @Inject()(x: Int) {
+          def first: Int = x
+        }
+
+        class B @ann() (x: Int) {
+          def second: Int = x
+        }
+
+        class C @ann ()(x: Int) {
+          def third: Int = x
+        }
+        "#,
+    )]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+
+    for (class_name, method_name) in [("A", "first"), ("B", "second"), ("C", "third")] {
+        let class = definition(&analyzer, &format!("ai.brokk.{class_name}"));
+        let method = definition(&analyzer, &format!("ai.brokk.{class_name}.{method_name}"));
+        let source = analyzer
+            .get_source(&class, false)
+            .unwrap_or_else(|| panic!("missing source for {class_name}"));
+
+        assert!(source.contains("x: Int"), "{class_name}: {source}");
+        assert!(
+            source.contains(&format!("def {method_name}")),
+            "{class_name}: {source}"
+        );
+        assert_eq!(
+            analyzer.parent_of(&method).as_ref().map(CodeUnit::fq_name),
+            Some(format!("ai.brokk.{class_name}"))
+        );
+    }
+}
+
+#[test]
 fn test_simple_constructor_in_class_definition() {
     let project = inline_scala_project(&[(
         "ai/brokk/Foo.scala",

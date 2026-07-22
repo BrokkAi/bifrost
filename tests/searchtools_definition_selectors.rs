@@ -7,6 +7,8 @@ use std::sync::{LazyLock, Mutex};
 
 static LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+const ISSUE_1016_JOBCTRL: &str = include_str!("fixtures/scala-issue-1016/JobCtrl.scala");
+
 fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
     let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
@@ -626,6 +628,88 @@ class JobSrv @Inject() (
             .iter()
             .any(|source| source["text"].as_str().unwrap().contains("def submit")),
         "{result}"
+    );
+}
+
+#[test]
+fn issue_1016_scala_annotated_constructor_supports_sources_and_body_reference_context() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "org/thp/thehive/connector/cortex/controllers/v0/JobCtrl.scala",
+            ISSUE_1016_JOBCTRL,
+        )
+        .file(
+            "org/thp/thehive/connector/cortex/services/JobSrv.scala",
+            r#"package org.thp.thehive.connector.cortex.services
+
+class JobSrv {
+  def submit(
+      cortexId: String,
+      analyzerId: String,
+      observable: Any,
+      richCase: Any,
+      parameters: Any
+  ): Unit = ()
+}
+"#,
+        )
+        .build();
+
+    let source_result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.thp.thehive.connector.cortex.controllers.v0.JobCtrl"]}"#,
+    );
+    assert_eq!(
+        source_result["sources"].as_array().map(Vec::len),
+        Some(1),
+        "{source_result}"
+    );
+    assert_eq!(
+        source_result["ambiguous"].as_array().map(Vec::len),
+        Some(0),
+        "{source_result}"
+    );
+    assert_eq!(
+        source_result["not_found"].as_array().map(Vec::len),
+        Some(0),
+        "{source_result}"
+    );
+    let source = source_result["sources"][0]["text"]
+        .as_str()
+        .expect("JobCtrl source text");
+    assert!(
+        source.contains("override val entrypoint: Entrypoint"),
+        "{source}"
+    );
+    assert!(
+        source.contains("def create: Action[AnyContent]"),
+        "{source}"
+    );
+    assert!(
+        source.contains("jobSrv\n                  .submit"),
+        "{source}"
+    );
+    assert!(!source.contains("class PublicJob"), "{source}");
+
+    let reference_args = serde_json::json!({
+        "references": [{
+            "symbol": "org.thp.thehive.connector.cortex.controllers.v0.JobCtrl",
+            "context": "jobSrv\n                  .submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))",
+            "target": "submit"
+        }]
+    })
+    .to_string();
+    let reference_result = call_tool(&project, "get_definitions_by_reference", &reference_args);
+    let result = &reference_result["results"][0];
+    assert_eq!(result["status"], "resolved", "{reference_result}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions.iter().any(|definition| {
+                definition["fqn"] == "org.thp.thehive.connector.cortex.services.JobSrv.submit"
+            })),
+        "{reference_result}"
     );
 }
 
