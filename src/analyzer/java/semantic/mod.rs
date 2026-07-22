@@ -168,6 +168,8 @@ fn java_capabilities() -> SemanticCapabilities {
 mod control;
 mod inventory;
 mod syntax;
+#[cfg(test)]
+mod tests;
 mod values;
 
 use control::lower_procedure;

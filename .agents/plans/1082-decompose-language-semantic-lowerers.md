@@ -15,13 +15,15 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
 - [x] (2026-07-22 19:23Z) Chose a one-way private module topology and recorded the implementation and validation strategy in this plan.
 - [x] (2026-07-22 19:31Z) Captured exact pre-refactor semantic-render digests, artifact-key fingerprints, and `SemanticWork` rows for representative Java, JavaScript, JSX, TypeScript, and TSX fixtures with a temporary test probe.
 - [x] (2026-07-22 19:43Z) Decomposed `src/analyzer/java/semantic.rs` into six private modules; `cargo check --all-targets`, the exact five-dialect equivalence probe, `semantic_provider_contract`, Java-filtered language/value contracts, and `git diff --check` passed.
-- [x] (2026-07-22 19:44Z) Committed the validated Java milestone as `80fbfe3f`.
+- [x] (2026-07-22 19:44Z) Committed the validated Java milestone, now `de6948ab` after rebasing onto the final review base.
 - [x] (2026-07-22 19:52Z) Decomposed `src/analyzer/js_ts/semantic.rs` into the same six private language-local modules while retaining one shared flavor-driven lowerer.
 - [x] (2026-07-22 19:52Z) Re-ran the exact five-dialect equivalence probe after both splits; every render digest, artifact key, and `SemanticWork` field matched the pre-refactor baseline, then removed the temporary probe and its fixed temp project.
 - [x] (2026-07-22 19:52Z) Ran the unchanged `semantic_language_conformance` (130 passed), `semantic_value_language_contract` (13 passed), and `semantic_provider_contract` (11 passed) suites plus `cargo check --all-targets` and `git diff --check`.
-- [ ] Commit the validated shared JS/TS milestone.
-- [ ] Run all unchanged semantic contract suites with `nlp,python`, the full formatter and clippy gates, and the full feature-enabled test suite.
-- [ ] Run specialist reviews over the final diff, address confirmed findings, update this plan, push the branch, and open a ready-for-review pull request that fixes #1082.
+- [x] (2026-07-22 19:52Z) Committed the validated shared JS/TS milestone, now `d39874b7` after rebasing onto the final review base.
+- [x] (2026-07-22 20:08Z) Passed `cargo fmt --all -- --check`, full-feature clippy with warnings denied, all three unchanged semantic contract suites, and the complete `nlp,python` feature-enabled test suite in the repository's self-cleaning isolated Cargo target.
+- [x] (2026-07-22 20:08Z) Fetched and rebased cleanly onto live `origin/master` at `3bd7c9e8`; `git diff --check` remained clean and no language-semantic visibility expanded beyond the existing JS/TS facade constructors.
+- [x] (2026-07-22 20:14Z) Completed security, duplication, intent, operations, and architecture reviews. Restored the two moved cancellation test modules after reviewers identified missing `#[cfg(test)] mod tests;` declarations; both tests and the corrected full-feature clippy graph pass.
+- [ ] Commit the review fix and final plan, push the branch, and open a ready-for-review pull request that fixes #1082.
 
 ## Surprises & Discoveries
 
@@ -35,7 +37,16 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
   Evidence: control methods call local/value/effect helpers, while local-declaration and assignment lowering schedule `Work` items. The plan keeps scheduling methods in `control.rs`, moves state-only value and effect helpers to `values.rs`, and keeps the small shared state types in the parent `mod.rs`.
 
 - Observation: On this macOS host, `cargo test --features nlp,python` currently fails while linking the library because CPython symbols are unresolved; the same equivalence test passes without optional features.
-  Evidence: the linker reported undefined `_Py*` symbols before the temporary test ran. This is an environment invocation issue rather than a semantic-adapter failure and must be resolved or clearly separated from the feature-independent #1082 validation before push.
+  Evidence: the linker reported undefined `_Py*` symbols before the temporary test ran. The repository's documented macOS extension-module invocation, `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`, resolved the host linkage and the complete feature-enabled suite then passed.
+
+- Observation: The shell initially paired rustup `cargo` and `rustc` with Homebrew `cargo-clippy`, whose LLVM patch versions differed even though the Rust version and commit matched.
+  Evidence: clippy failed while reading an incompatible native object until `PATH` was pinned to the rustup 1.96.0 toolchain; the exact required `cargo clippy --all-targets --all-features -- -D warnings` command then passed.
+
+- Observation: Repeated shared-target feature and linker configurations had accumulated 48.1 GiB of generated Cargo artifacts and exhausted the temporary volume late in the broad test gate.
+  Evidence: `du -sh target` reported 46 GiB and the first unrestricted rerun ended with `StorageFull` during two unrelated tempdir tests. `cargo clean` removed 48.1 GiB, and the final complete run passed in `scripts/with-isolated-cargo-target.sh`, which removed its target afterward.
+
+- Observation: Moving an inline `#[cfg(test)] mod tests` body into `tests.rs` also requires declaring that private child module in the parent; a source file alone is not discovered by Rust's module system.
+  Evidence: duplication and intent reviewers found that both new `tests.rs` files were initially orphaned. Adding `#[cfg(test)] mod tests;` to each facade restored discovery, and `cargo test --lib free_this_scan_honors_cancellation` ran and passed both tests.
 
 ## Decision Log
 
@@ -61,11 +72,15 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
 
 ## Outcomes & Retrospective
 
-Implementation is not complete yet. At completion this section will record the final module sizes, validation evidence, review results, PR URL, and any remaining follow-up such as the unbound Bifrost workspace tooling problem.
+Implementation, local validation, and specialist review are complete. Publication remains; at completion this section will record the PR URL. The only tooling follow-up is the Bifrost MCP installation being unbound to this worktree with no exposed activation tool.
 
 The Java milestone now replaces the 3,657-line monolith with `control.rs` (2,331 lines), `inventory.rs` (176), `mod.rs` (276), `syntax.rs` (505), `tests.rs` (35), and `values.rs` (358). The representative Java artifact retained render digest `4e0bd646...cf1c`, key fingerprint `0a787864...2e8d`, and every original work counter. No Java consumer path or adapter byte changed.
 
 The JS/TS milestone replaces the 4,095-line monolith with `control.rs` (2,687 lines), `inventory.rs` (187), `mod.rs` (322), `syntax.rs` (530), `tests.rs` (35), and `values.rs` (354). The existing `JsTsSemanticLowerer` constructors and all JavaScript/TypeScript adapter bytes remain unchanged. Exact artifact equivalence passed for `.js`, `.jsx`, `.ts`, and `.tsx` as well as the already-split Java adapter.
+
+The final acceptance evidence is exact rather than merely compilation-based: the representative five-dialect render digests, artifact-key fingerprints, and every `SemanticWork` counter match the pre-refactor baseline; `semantic_language_conformance` passed 130 tests, `semantic_value_language_contract` passed 13, and `semantic_provider_contract` passed 11. Full-feature clippy passed with warnings denied, and the complete `cargo test --features nlp,python -- --test-threads=1` run passed outside the process-restricted sandbox in a self-cleaning isolated target. After review restored the two moved test-module declarations, both cancellation tests passed and all-target/all-feature clippy passed again against the corrected module graph.
+
+Five read-only specialist passes covered security, duplication/cohesion, issue intent, operations, and architecture. They found one medium test-discovery omission and no remaining findings after its correction. Reviewers independently confirmed unchanged adapter identities and capabilities, byte-equivalent moved logic, narrow visibility, one shared flavor-driven JS/TS lowerer, one-way private seams, and no build, platform, or packaging regression.
 
 ## Context and Orientation
 
@@ -136,9 +151,9 @@ Formatting and validation commands are safe to repeat. Isolated Cargo runs must 
 
 ## Artifacts and Notes
 
-The branch starts from:
+The branch originally started from `7de07c8c` and was rebased before final review. Its current base is:
 
-    origin/master 7de07c8c Merge remote-tracking branch 'origin/master'
+    origin/master 3bd7c9e8 M4 tier-2 tail: keras/Ocelot triage
 
 The relevant history is:
 
@@ -162,4 +177,4 @@ No new external dependency or public interface is permitted. `impl_program_seman
 
 Child modules are private. Inventory records and cross-module inherent methods may use `pub(super)` because that visibility stops at the language's `semantic` parent. Do not use `pub(crate)` merely to cross a sibling boundary, do not re-export child implementation modules, and do not introduce a common Java/JS statement or expression layer.
 
-Revision note (2026-07-22 19:52Z): Recorded the completed shared JS/TS split, exact five-dialect equivalence after both moves, and all three unchanged semantic contract suite results.
+Revision note (2026-07-22 20:14Z): Recorded all five specialist reviews, the corrected private test-module declarations, and the post-fix focused tests and full-feature clippy result.
