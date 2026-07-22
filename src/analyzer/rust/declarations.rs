@@ -128,7 +128,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
     parsed
 }
 
-pub(super) fn rust_package_name(file: &ProjectFile) -> String {
+pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel
         .components()

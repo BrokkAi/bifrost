@@ -1197,7 +1197,9 @@ fn rust_visible_import_resolution(
     // Rust resolves names one lexical scope at a time. A function-local glob
     // that supplies a name therefore wins over a module-level glob; only when
     // the inner glob does not export that name do we continue outward.
-    for binder in lexical_scope::visible_import_binders_at(source, reference_byte) {
+    for (scope_start, binder) in
+        lexical_scope::visible_import_binders_with_scopes_at(source, reference_byte)
+    {
         let explicitly_bound = rust_binder_has_external_binding(&binder, reference);
         let mut expected_fqns = HashSet::default();
         if explicitly_bound {
@@ -1206,13 +1208,30 @@ fn rust_visible_import_resolution(
                     continue;
                 }
                 let imported = binding.imported_name.as_deref().unwrap_or(reference);
-                if let Some(package) = rust.resolve_module_package(file, &binding.module_specifier)
-                {
+                if let Some(package) = resolve_import_package_scoped(
+                    rust,
+                    file,
+                    source,
+                    scope_start,
+                    &binding.module_specifier,
+                ) {
                     expected_fqns.insert(format!("{package}.{imported}"));
                 }
             }
         }
-        let targets = rust_forward_import_targets(rust, file, &binder, reference);
+        let mut targets = rust_forward_import_targets(rust, file, &binder, reference);
+        // `self`/`super` imports that resolve within the current file: the
+        // standard target resolution looks in the file's parent package and
+        // misses them, so steer them to the current file directly.
+        for (local_name, binding) in &binder.bindings {
+            if local_name != reference || binding.kind != ImportKind::Named {
+                continue;
+            }
+            let imported = binding.imported_name.as_deref().unwrap_or(reference);
+            if import_resolves_within_file(file, source, scope_start, &binding.module_specifier) {
+                targets.push((file.clone(), imported.to_string()));
+            }
+        }
         let mut candidates = Vec::new();
         for (target_file, target_name) in targets {
             candidates.extend(rust_import_target_candidates(
@@ -1247,6 +1266,69 @@ fn rust_visible_import_resolution(
         }
     }
     RustVisibleImportResolution::Unbound
+}
+
+/// Resolve an import's module specifier to its package, scope-aware:
+/// `self`/`super` prefixes resolve against the lexical module the import
+/// statement lives in (file package + inline `mod` path at the binder's
+/// scope start), so `use super::X` from a nested module means the parent
+/// inline module — not the file's parent package, which is where the
+/// file-level resolver incorrectly looked (#1074: `use super::ProgUpdate`
+/// from `mod tests` claimed the same-file type "is not indexed").
+fn resolve_import_package_scoped(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    module_specifier: &str,
+) -> Option<String> {
+    let first = module_specifier.split("::").next()?;
+    if !matches!(first, "self" | "super") {
+        return rust.resolve_module_package(file, module_specifier);
+    }
+    let file_package = crate::analyzer::rust::rust_package_name(file);
+    let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
+    let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
+    let segments: Vec<&str> = module_specifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    crate::analyzer::rust::resolve_rust_module_segments_with_crate(
+        &lexical_package,
+        &crate_package,
+        &segments,
+    )
+}
+
+/// True when a `self`/`super` import's module specifier resolves to the
+/// current file's own package — i.e. the import targets a declaration in
+/// this file, which the file-level target resolution (looking in the file's
+/// parent package) cannot see.
+fn import_resolves_within_file(
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    module_specifier: &str,
+) -> bool {
+    let Some(first) = module_specifier.split("::").next() else {
+        return false;
+    };
+    if !matches!(first, "self" | "super") {
+        return false;
+    }
+    let file_package = crate::analyzer::rust::rust_package_name(file);
+    let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
+    let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
+    let segments: Vec<&str> = module_specifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    crate::analyzer::rust::resolve_rust_module_segments_with_crate(
+        &lexical_package,
+        &crate_package,
+        &segments,
+    )
+    .is_some_and(|resolved| resolved == file_package)
 }
 
 fn rust_import_target_candidates(
