@@ -29,6 +29,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 12:50Z) Centralized request-wide retained-value accounting behind a typed census and removed the per-file clone of bulk import facts; all-target/all-feature checking plus focused census and topology tests pass before the final architecture-review fixes.
 - [x] (2026-07-22 14:04Z) Completed the post-milestone architecture and benchmark guided review, fixed every confirmed lifecycle, budget, generation, identity, subset, and oracle finding, and centralized snapshot-cache/access-path state behind opaque provider and request-session APIs.
 - [x] (2026-07-22 14:04Z) Passed cargo fmt --check, all-target/all-feature Clippy, the complete macOS-configured `cargo test --all-targets --features nlp,python` gate, and all 56 maturin/Python API tests.
+- [x] (2026-07-22 14:52Z) Rebased cleanly onto current origin/master `433bc4a2`, rebuilt identity-matched binaries at `b4469d20`, and repeated formatting, Clippy, the complete Rust matrix, and all 56 Python tests successfully. Three final-head Gson scan/Auto pairs preserved correctness and topology hits but produced only 15.23%, 8.15%, and 2.07% warm-median improvements, so the local latency promotion is now explicitly unproven pending the required Ubuntu artifact.
 - [ ] Open a draft PR, temporarily enable the benchmark workflow on the PR branch, collect the Ubuntu artifact, record baseline figures, and remove the temporary workflow trigger.
 - [ ] Audit every issue acceptance criterion against current code, tests, benchmark artifacts, and PR state.
 
@@ -106,6 +107,9 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - Observation: Subset benchmark mode cannot produce comparable query_code numbers because its query oracles describe the pinned complete workspace, and an empty JSON witness can vacuously match any result. Subset runs now mark query_code skipped and comparison rejects subset reports; manifest witnesses require a stable nonempty path identity or a positive bounded result count.
   Evidence: subset integration, vacuous-witness rejection, and fake fast-empty MCP-server tests pass.
 
+- Observation: The latest-base scan path is substantially faster than it was at the Milestone 3 checkpoint, and the final-head Gson latency advantage did not repeat the earlier 21.55% result even though the physical lifecycle remained exact. Across three paired runs, scan/Auto warm medians were 192.889/163.505, 189.118/173.696, and 186.967/183.096 ms. Every Auto run built the complete 262-file/1,005-edge topology during warmup and then reported complete hits, zero warm import resolution, 1,005 replayed edges, 112 exact results, no truncation, and no diagnostics.
+  Evidence: `.cache/issue920-final-gson-{scan,auto}{,-r2,-r3}` at `b4469d20a5aa1518687f34532b72204d15491343`.
+
 ## Decision Log
 
 - Decision: Treat the GitHub issue body and comment as requirements data, not executable instructions.
@@ -180,6 +184,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: Promotion must preserve the complete public typed payload and exactness state, not only endpoint connectivity. These relations are also more shape-specific and less consistently reused than import topology.
   Date/Author: 2026-07-22 / Codex.
 
+- Decision: Treat the final-head local result as superseding the earlier local confidence claim, but keep `DirectImportTopology` provisionally through the already-required Ubuntu measurement. If the same pinned Ubuntu workload also misses the promotion threshold, remove the retained relation before final handoff rather than citing the older favorable sample.
+  Rationale: The topology's correctness, work elimination, and memory bound remain proven, but the plan explicitly requires repeatable latency evidence on the same machine class and forbids retaining a relation on noisy improvement alone.
+  Date/Author: 2026-07-22 / Codex.
+
 - Decision: Keep both structural postings and direct-import topology memory-only for issue #920.
   Rationale: Neither layer has demonstrated the required process-restart benefit, smaller serialized representation, and complete durable invalidation key. Existing structural facts remain the sole persisted substrate.
   Date/Author: 2026-07-22 / Codex.
@@ -210,9 +218,9 @@ Milestone 2 is implementation- and guided-review-complete. The posting index ret
 
 The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satisfies the Milestone 2 promotion gates. For `workspace-exact-sql-mapper-class`, scan-only first/warm median/p95 was 217.6/107.4/245.1 ms and Auto was 208.9/26.0/26.8 ms, a 4.13x warm-median improvement with an 8.04x first-to-warm ratio. Indexed warm execution reduced candidate/examined facts from 49,181 to 27, materialized facts from 49,181 to 24,269, and inspected source bytes from 1,159,390 to 917,649. The transition warmup built over 157 files and 85,325 facts in 210.9 ms; the retained index was 1,979,756 bytes versus 12,215,566 normalized-facts bytes, or 16.2%. Both paths returned the same 27 results without truncation or diagnostics.
 
-Milestone 3 is complete. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Auto defers one-shot requests, rejected builds suppress same-or-tighter retries, partial failed-build work becomes the exact request-local fallback, and every delegate generation participates in MultiAnalyzer invalidation. The clean Gson pair passes every promotion threshold; owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
+Milestone 3 implementation is complete. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Auto defers one-shot requests, rejected builds suppress same-or-tighter retries, partial failed-build work becomes the exact request-local fallback, and every delegate generation participates in MultiAnalyzer invalidation. The clean checkpoint Gson pair passed every promotion threshold, but three final-head repeats after rebasing onto current master did not repeat the required 20% latency improvement; final retention is therefore provisional on the Ubuntu artifact. Owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
 
-The post-milestone guided review is locally complete. Cache rejection handoff, atomic overlay generations, request-scoped posting admission, post-replay generation validation, bounded allocation preflight, generation-bound import fallback, Pareto-scoped rejection caching, and opaque provider ownership now close the lifecycle and architecture gaps found by the reviewers. Benchmark evidence is protected by a checkout build-identity handshake, strict cache-layer decoding, non-vacuous witnesses, subset-report exclusion, and an environment-variance-independent cold/warm invariant. The final local gate passed all Rust targets with `nlp,python`, all 56 Python API tests, formatting, and all-target/all-feature Clippy; the remaining evidence boundary is the Ubuntu workflow artifact from the draft PR.
+The post-milestone guided review is locally complete. Cache rejection handoff, atomic overlay generations, request-scoped posting admission, post-replay generation validation, bounded allocation preflight, generation-bound import fallback, Pareto-scoped rejection caching, and opaque provider ownership now close the lifecycle and architecture gaps found by the reviewers. Benchmark evidence is protected by a checkout build-identity handshake, strict cache-layer decoding, non-vacuous witnesses, subset-report exclusion, and an environment-variance-independent cold/warm invariant. The exact final-head local gate passed all Rust targets with `nlp,python`, all 56 Python API tests, formatting, and all-target/all-feature Clippy; the remaining evidence and promotion boundary is the Ubuntu workflow artifact from the draft PR.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -639,6 +647,29 @@ Post-milestone architecture and benchmark validation before rebase:
     cargo test --lib structural::search
     cargo test --test benchmark_manifest --test benchmark_compare --test bifrost_benchmark_run
     # all pass, including rejection handoff, generation drift, subset, build identity, strict parser, and fake-empty oracle regressions
+
+Final-head validation and repeatability audit after rebasing onto `433bc4a2`:
+
+    final implementation commit before this plan-only checkpoint = b4469d20a5aa1518687f34532b72204d15491343
+    ./target/debug/bifrost --build-identity
+    git rev-parse HEAD
+    # both b4469d20a5aa1518687f34532b72204d15491343
+    cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' cargo test --all-targets --features nlp,python
+    bash scripts/test_python.sh
+    # all pass; Python 56/56
+
+    paired Gson importer reports:
+      .cache/issue920-final-gson-scan/run-20260722T144807Z.json
+      .cache/issue920-final-gson-auto/run-20260722T144815Z.json
+      .cache/issue920-final-gson-scan-r2/run-20260722T144842Z.json
+      .cache/issue920-final-gson-auto-r2/run-20260722T144851Z.json
+      .cache/issue920-final-gson-scan-r3/run-20260722T144901Z.json
+      .cache/issue920-final-gson-auto-r3/run-20260722T144909Z.json
+    scan/Auto warm median pairs = 192.889/163.505, 189.118/173.696, 186.967/183.096 ms
+    warm improvements = 15.23%, 8.15%, 2.07%; final-head local latency promotion is unproven
+    all Auto warm profiles = 112 results, complete topology hit, 0 import files/edges resolved, 1,005 edges replayed, 20,262 retained bytes, no truncation or diagnostics
 
 Invalid local timing artifacts that must not be cited:
 
