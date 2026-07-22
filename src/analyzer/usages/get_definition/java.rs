@@ -409,16 +409,13 @@ pub(crate) fn resolve_java(
 
 pub(crate) fn resolve_java_bounded(
     analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
+    session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
 ) -> BoundedJavaResolution<DefinitionLookupOutcome> {
-    let session = JavaResolutionSession::bounded(support, budget, cancellation);
-    resolve_java_in_session(analyzer, &session, file, source, tree, site)
+    resolve_java_in_session(analyzer, session, file, source, tree, site)
 }
 
 fn resolve_java_in_session(
@@ -638,6 +635,7 @@ fn java_type_lookup_node_fqn(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_declaration_name_type(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -1293,20 +1291,19 @@ fn resolve_java_bare_identifier(
         name,
         node.start_byte(),
     );
-    if !locally_bound {
-        if let Some(owner) = session.enclosing_unit(analyzer, file, node.start_byte()) {
-            let outcome = java_member_candidates(
-                analyzer,
-                session,
-                &owner,
-                name,
-                JavaMemberLookupKind::Field,
-                false,
-                None,
-            );
-            if outcome.status != DefinitionLookupStatus::NoDefinition {
-                return outcome;
-            }
+    if !locally_bound && let Some(owner) = session.enclosing_unit(analyzer, file, node.start_byte())
+    {
+        let outcome = java_member_candidates(
+            analyzer,
+            session,
+            &owner,
+            name,
+            JavaMemberLookupKind::Field,
+            false,
+            None,
+        );
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
+            return outcome;
         }
     }
     if locally_bound {
@@ -1686,6 +1683,7 @@ fn java_nested_type_from_context(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_type_of_identifier_before(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -1840,6 +1838,7 @@ fn java_seed_active_path(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_seed_scope_declarations(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -2288,34 +2287,10 @@ fn java_identifier_type_text_before(
     before_byte: usize,
 ) -> Option<String> {
     let mut found = None;
-    collect_java_type_text_binding_before(
-        session,
-        java,
-        file,
-        source,
-        root,
-        name,
-        before_byte,
-        &mut found,
-    );
-    found
-}
-
-fn collect_java_type_text_binding_before(
-    session: &JavaResolutionSession<'_>,
-    java: &JavaAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    name: &str,
-    before_byte: usize,
-    found: &mut Option<String>,
-) {
-    let root = node;
     let mut next = Some(root);
     while let Some(node) = next {
         if !session.charge_scope_step() {
-            return;
+            return found;
         }
         if node.start_byte() >= before_byte {
             next = java_next_named_preorder(root, node, false);
@@ -2328,14 +2303,14 @@ fn collect_java_type_text_binding_before(
                     let mut cursor = node.walk();
                     for child in node.named_children(&mut cursor) {
                         if !session.charge_scope_step() {
-                            return;
+                            return found;
                         }
                         if child.kind() == "variable_declarator"
                             && let Some(name_node) = child.child_by_field_name("name")
                             && name_node.start_byte() < before_byte
                             && java_node_text(name_node, source) == name
                         {
-                            *found = Some(type_text.to_string());
+                            found = Some(type_text.to_string());
                         }
                     }
                 }
@@ -2346,7 +2321,7 @@ fn collect_java_type_text_binding_before(
                     && java_node_text(name_node, source) == name
                     && let Some(type_node) = node.child_by_field_name("type")
                 {
-                    *found = Some(
+                    found = Some(
                         normalize_java_type_text(java_node_text(type_node, source)).to_string(),
                     );
                 }
@@ -2360,8 +2335,9 @@ fn collect_java_type_text_binding_before(
             .resolve_type_name_in_file(java, file, name)
             .is_some()
     {
-        *found = Some(name.to_string());
+        found = Some(name.to_string());
     }
+    found
 }
 
 fn java_field_type_text_from_signature(signature: &str, field: &str) -> Option<String> {

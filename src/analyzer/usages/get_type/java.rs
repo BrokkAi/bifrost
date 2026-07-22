@@ -4,10 +4,8 @@ use crate::analyzer::usages::get_definition::{
     java::{BoundedJavaResolution, JavaResolutionSession, java_type_lookup_resolution_in_session},
     java_type_lookup_resolution,
 };
-use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile};
-use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
 pub(crate) fn resolve_java_type(
@@ -53,18 +51,14 @@ pub(crate) fn resolve_java_type(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_java_type_bounded(
     analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
+    session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
 ) -> BoundedJavaResolution<TypeLookupOutcome> {
-    let session = JavaResolutionSession::bounded(support, budget, cancellation);
     let Some(tree) = tree else {
         return session.finish(no_type(
             "java_parse_failed",
@@ -73,7 +67,7 @@ pub(crate) fn resolve_java_type_bounded(
     };
     let Some(resolution) = java_type_lookup_resolution_in_session(
         analyzer,
-        &session,
+        session,
         file,
         source,
         tree.root_node(),

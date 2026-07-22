@@ -11,7 +11,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupOutcome, DefinitionLookupStatus,
-    java::{BoundedJavaResolution, resolve_java_bounded},
+    java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
     js_ts::parse_js_ts_tree,
     parse_tree_for_language, resolve_reference_site_with_line_starts,
 };
@@ -113,6 +113,23 @@ struct PreparedJavaReceiverFile {
     source: String,
     tree: tree_sitter::Tree,
     line_starts: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct JavaReceiverResolutionInput<'a> {
+    source: &'a str,
+    tree: &'a tree_sitter::Tree,
+    line_starts: &'a [usize],
+}
+
+impl PreparedJavaReceiverFile {
+    fn resolution_input(&self) -> JavaReceiverResolutionInput<'_> {
+        JavaReceiverResolutionInput {
+            source: &self.source,
+            tree: &self.tree,
+            line_starts: &self.line_starts,
+        }
+    }
 }
 
 enum SemanticReceiverGate {
@@ -875,9 +892,7 @@ impl<'a> ReceiverQueryService<'a> {
                 self.analyzer,
                 &self.definitions,
                 file,
-                &prepared.source,
-                &prepared.line_starts,
-                &prepared.tree,
+                prepared.resolution_input(),
                 member_node,
                 ledger.remaining_budget(),
                 cancellation,
@@ -923,9 +938,7 @@ impl<'a> ReceiverQueryService<'a> {
             self.analyzer,
             &self.definitions,
             file,
-            &prepared.source,
-            &prepared.line_starts,
-            &prepared.tree,
+            prepared.resolution_input(),
             query_node,
             ledger.remaining_budget(),
             cancellation,
@@ -1003,9 +1016,7 @@ impl<'a> ReceiverQueryService<'a> {
                     self.analyzer,
                     &self.definitions,
                     file,
-                    &prepared.source,
-                    &prepared.line_starts,
-                    &prepared.tree,
+                    prepared.resolution_input(),
                     context_node,
                     ledger.remaining_budget(),
                     cancellation,
@@ -1042,9 +1053,7 @@ impl<'a> ReceiverQueryService<'a> {
                 self.analyzer,
                 &self.definitions,
                 file,
-                &prepared.source,
-                &prepared.line_starts,
-                &prepared.tree,
+                prepared.resolution_input(),
                 factory_node,
                 ledger.remaining_budget(),
                 cancellation,
@@ -1077,9 +1086,7 @@ impl<'a> ReceiverQueryService<'a> {
             self.analyzer,
             &self.definitions,
             file,
-            &prepared.source,
-            &prepared.line_starts,
-            &prepared.tree,
+            prepared.resolution_input(),
             query_node,
             ledger.remaining_budget(),
             cancellation,
@@ -1109,7 +1116,6 @@ impl<'a> ReceiverQueryService<'a> {
 
         let analysis = match operation {
             ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
-                let max_targets = ledger.remaining_budget().max_targets;
                 let values = java_receiver_values(
                     workspace,
                     &points_to,
@@ -1118,7 +1124,6 @@ impl<'a> ReceiverQueryService<'a> {
                     type_reference,
                     cancellation,
                     &mut ledger,
-                    max_targets,
                 )?;
                 let (values, truncated) = match values {
                     JavaCompatibilityOutcome::Complete(values) => values,
@@ -1496,8 +1501,8 @@ fn java_receiver_values(
     type_reference: bool,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-    limit: usize,
 ) -> Result<JavaCompatibilityOutcome<(Vec<ReceiverValue>, bool)>, ReceiverQueryError> {
+    let limit = ledger.remaining_budget().max_targets;
     let mut allocations = Vec::new();
     let mut allocations_truncated = false;
     let mut current_receiver = false;
@@ -1630,9 +1635,7 @@ fn java_definition_at(
     analyzer: &dyn IAnalyzer,
     definitions: &AnalyzerDefinitionLookup<'_>,
     file: &ProjectFile,
-    source: &str,
-    line_starts: &[usize],
-    tree: &tree_sitter::Tree,
+    input: JavaReceiverResolutionInput<'_>,
     node: Node<'_>,
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
@@ -1652,7 +1655,7 @@ fn java_definition_at(
         scope_nodes: 1,
         ..ReceiverAnalysisWork::default()
     };
-    let Some(site) = java_reference_site(file, source, line_starts, node) else {
+    let Some(site) = java_reference_site(file, input.source, input.line_starts, node) else {
         return BoundedJavaResolution::Complete {
             value: DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::InvalidLocation,
@@ -1671,15 +1674,14 @@ fn java_definition_at(
     }
     let mut compatibility_budget = budget;
     compatibility_budget.max_scope_nodes -= 1;
+    let session = JavaResolutionSession::bounded(definitions, compatibility_budget, cancellation);
     prepend_java_preprocessing_work(resolve_java_bounded(
         analyzer,
-        definitions,
+        &session,
         file,
-        source,
-        Some(tree),
+        input.source,
+        Some(input.tree),
         &site,
-        compatibility_budget,
-        cancellation,
     ))
 }
 
@@ -1687,9 +1689,7 @@ fn java_type_outcome_at(
     analyzer: &dyn IAnalyzer,
     definitions: &AnalyzerDefinitionLookup<'_>,
     file: &ProjectFile,
-    source: &str,
-    line_starts: &[usize],
-    tree: &tree_sitter::Tree,
+    input: JavaReceiverResolutionInput<'_>,
     node: Node<'_>,
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
@@ -1709,7 +1709,7 @@ fn java_type_outcome_at(
         scope_nodes: 1,
         ..ReceiverAnalysisWork::default()
     };
-    let Some(site) = java_reference_site(file, source, line_starts, node) else {
+    let Some(site) = java_reference_site(file, input.source, input.line_starts, node) else {
         return BoundedJavaResolution::Complete {
             value: TypeLookupOutcome {
                 status: TypeLookupStatus::InvalidLocation,
@@ -1728,15 +1728,14 @@ fn java_type_outcome_at(
     }
     let mut compatibility_budget = budget;
     compatibility_budget.max_scope_nodes -= 1;
+    let session = JavaResolutionSession::bounded(definitions, compatibility_budget, cancellation);
     prepend_java_preprocessing_work(resolve_java_type_bounded(
         analyzer,
-        definitions,
+        &session,
         file,
-        source,
-        Some(tree),
+        input.source,
+        Some(input.tree),
         &site,
-        compatibility_budget,
-        cancellation,
     ))
 }
 
@@ -2735,6 +2734,11 @@ class Sample {
         let service = ReceiverQueryService::from_workspace(&workspace);
         let tree = parse_tree_for_language(&file, Language::Java, &source).expect("Java tree");
         let line_starts = compute_line_starts(&source);
+        let resolution_input = JavaReceiverResolutionInput {
+            source: &source,
+            tree: &tree,
+            line_starts: &line_starts,
+        };
         let root_node = tree.root_node();
         let range = marker_range(&source, "value.target");
         let invocation =
@@ -2749,9 +2753,7 @@ class Sample {
             service.analyzer,
             &service.definitions,
             &file,
-            &source,
-            &line_starts,
-            &tree,
+            resolution_input,
             root_node,
             no_preprocessing_budget,
             None,
@@ -2769,9 +2771,7 @@ class Sample {
             service.analyzer,
             &service.definitions,
             &file,
-            &source,
-            &line_starts,
-            &tree,
+            resolution_input,
             root_node,
             ReceiverAnalysisBudget::default(),
             Some(&preprocessing_cancellation),
@@ -2785,9 +2785,7 @@ class Sample {
             service.analyzer,
             &service.definitions,
             &file,
-            &source,
-            &line_starts,
-            &tree,
+            resolution_input,
             root_node,
             ReceiverAnalysisBudget {
                 max_scope_nodes: 1,
@@ -2817,9 +2815,7 @@ class Sample {
             service.analyzer,
             &service.definitions,
             &file,
-            &source,
-            &line_starts,
-            &tree,
+            resolution_input,
             node,
             budget,
             None,
@@ -2842,9 +2838,7 @@ class Sample {
             service.analyzer,
             &service.definitions,
             &file,
-            &source,
-            &line_starts,
-            &tree,
+            resolution_input,
             node,
             ReceiverAnalysisBudget::default(),
             Some(&cancellation),
@@ -3015,7 +3009,6 @@ class Sample {
             false,
             None,
             &mut ledger,
-            1,
         )
         .expect("bounded allocation projection");
         assert!(
@@ -3134,7 +3127,6 @@ class Sample {
             false,
             None,
             &mut cartesian_ledger,
-            cartesian_limit,
         )
         .expect("bounded Cartesian allocation projection");
         assert!(
