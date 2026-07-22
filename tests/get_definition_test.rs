@@ -253,6 +253,14 @@ product.label
         name_value["results"][0]["definitions"][0]["kind"], "function",
         "{name_value}"
     );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["start_column"], 16,
+        "{name_value}"
+    );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["end_column"], 20,
+        "{name_value}"
+    );
 
     let label_line = "product.label";
     let label_value = lookup(
@@ -268,6 +276,14 @@ product.label
     );
     assert_eq!(
         label_value["results"][0]["definitions"][0]["fqn"], "Product.label",
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["start_column"], 17,
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["end_column"], 22,
         "{label_value}"
     );
 }

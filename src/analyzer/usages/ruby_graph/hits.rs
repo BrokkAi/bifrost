@@ -13,20 +13,21 @@ pub(super) fn record_usage_hit(
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
+    let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, source);
+    let start_byte = range.start_byte;
+    let end_byte = range.end_byte;
     if start_byte >= end_byte {
         return;
     }
     let line_idx = find_line_index_for_offset(line_starts, start_byte);
     let snippet = trimmed_snippet_around_line(source, line_starts, line_idx, SNIPPET_CONTEXT_LINES);
-    let range = Range {
+    let enclosing_range = Range {
         start_byte,
         end_byte,
         start_line: line_idx,
         end_line: line_idx,
     };
-    let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+    let Some(enclosing) = analyzer.enclosing_code_unit(file, &enclosing_range) else {
         return;
     };
     hits.insert(usage_hit(
@@ -42,20 +43,21 @@ pub(super) fn record_unproven_usage_hit(
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
+    let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, source);
+    let start_byte = range.start_byte;
+    let end_byte = range.end_byte;
     if start_byte >= end_byte {
         return;
     }
     let line_idx = find_line_index_for_offset(line_starts, start_byte);
     let snippet = trimmed_snippet_around_line(source, line_starts, line_idx, SNIPPET_CONTEXT_LINES);
-    let range = Range {
+    let enclosing_range = Range {
         start_byte,
         end_byte,
         start_line: line_idx,
         end_line: line_idx,
     };
-    let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+    let Some(enclosing) = analyzer.enclosing_code_unit(file, &enclosing_range) else {
         return;
     };
     hits.insert(
