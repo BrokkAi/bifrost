@@ -82,17 +82,7 @@ fn run_case(
             Ok(observation)
         }) {
             Ok(observation) => {
-                if warmup_transition.is_none()
-                    && observation
-                        .metrics
-                        .access_path
-                        .as_ref()
-                        .is_some_and(|access| {
-                            access.index_builds > 0
-                                || access.index_unavailable > 0
-                                || access.index_cancelled > 0
-                        })
-                {
+                if warmup_transition.is_none() && observes_warmup_transition(&observation.metrics) {
                     warmup_transition = Some(observation.metrics.clone());
                 }
                 warmup_durations_ms.push(observation.duration_ms);
@@ -141,6 +131,16 @@ fn run_case(
     );
     report.profile_artifacts = profile_artifacts;
     report
+}
+
+fn observes_warmup_transition(metrics: &QueryCodeProfileMetrics) -> bool {
+    let topology = metrics.direct_import_topology;
+    topology.builds > 0
+        || topology.unavailable > 0
+        || topology.cancelled > 0
+        || metrics.access_path.as_ref().is_some_and(|access| {
+            access.index_builds > 0 || access.index_unavailable > 0 || access.index_cancelled > 0
+        })
 }
 
 /// A failed correctness oracle makes every timing from the case unusable.
@@ -809,6 +809,24 @@ mod tests {
             .expect_err("profile must include every required lifecycle counter");
         assert!(error.contains("invalid direct_import_topology"), "{error}");
         assert!(error.contains("fallbacks"), "{error}");
+    }
+
+    #[test]
+    fn warmup_transition_keeps_posting_and_derived_layer_builds() {
+        let (_, mut metrics) =
+            parse_profile(&benchmark_case(), &profiled_query_response()).expect("profile");
+        assert!(!observes_warmup_transition(&metrics));
+
+        metrics.direct_import_topology.builds = 1;
+        assert!(observes_warmup_transition(&metrics));
+
+        metrics.direct_import_topology.builds = 0;
+        metrics
+            .access_path
+            .as_mut()
+            .expect("access path")
+            .index_unavailable = 1;
+        assert!(observes_warmup_transition(&metrics));
     }
 
     #[test]
