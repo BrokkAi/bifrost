@@ -68,7 +68,7 @@ The Rust crate, the `bifrost` binary, the Python wheel, and the agent/editor
 plugin release metadata are versioned **together** and cut from a **single tag**.
 `Cargo.toml` is the committed source of truth for the release version:
 `pyproject.toml` inherits it via maturin's `dynamic = ["version"]`, and
-`scripts/sync-release-version.mjs` copies it into the plugin and editor metadata
+`scripts/release-version.mjs sync` copies it into the plugin and editor metadata
 that require literal JSON versions.
 
 Rust third-party license HTML is generated rather than committed. Release
@@ -86,7 +86,7 @@ checked during release prep. Before tagging a release, edit only `Cargo.toml`,
 then run:
 
 ```bash
-node scripts/sync-release-version.mjs
+node scripts/release-version.mjs sync
 ```
 
 That script updates these committed version fields:
@@ -120,7 +120,7 @@ archive checksums:
 - `plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json`
 
 Those checksum-bearing files must match the actual release archives.
-`scripts/sync-release-version.mjs` only copies the current
+`scripts/release-version.mjs sync` only copies the current
 `plugins/bifrost-agent/bifrost-release.json` checksums into the VS Code manifest
 when that release metadata is already on the same version as `Cargo.toml`. The
 `release.yml` workflow prepares checksum metadata from the built `.sha256`
@@ -141,7 +141,7 @@ To cut a release:
    regenerate and validate the generated plugin bundles:
 
    ```bash
-   node scripts/sync-release-version.mjs --check
+   node scripts/release-version.mjs check
    node scripts/generate-codex-skill-bundle.mjs
    node scripts/generate-amp-skill-bundle.mjs
    node scripts/check-codex-plugin-manifest.mjs
@@ -188,7 +188,7 @@ GitHub Actions allowlist entry is needed.
 
 - The crate version in `Cargo.toml` is the single source of truth for the Rust
   crate, Python package, and release-aligned plugin/editor metadata. Never add a
-  `version` to `pyproject.toml`; run `node scripts/sync-release-version.mjs` to
+  `version` to `pyproject.toml`; run `node scripts/release-version.mjs sync` to
   update JSON metadata from `Cargo.toml`.
 - The Tree-sitter grammar crate versions are intentionally not forced to share
   the same numeric version. The policy is documented in `Cargo.toml`.

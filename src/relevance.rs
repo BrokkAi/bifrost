@@ -2490,6 +2490,8 @@ mod tests {
                 "user.name=Test User",
                 "-c",
                 "user.email=test@example.com",
+                "-c",
+                "commit.gpgSign=false",
                 "merge",
                 "--no-ff",
                 "feature",
