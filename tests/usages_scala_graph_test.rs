@@ -6952,7 +6952,7 @@ abstract class Access[Reporter, Compiler](seed: Int) {
   def interrupt[B](default: B, token: Int)(run: Compiler => B)(implicit reporter: Reporter): B =
     default
 }
-final class ConcreteAccess(seed: Int) extends Access[String, String](seed)
+final class ConcreteAccess(seed: Int)(ec: Int) extends Access[String, String](seed)
 
 abstract class Scanner[A] {
   def scan(value: A, state: Null): Unit = ()
@@ -7007,7 +7007,8 @@ abstract class Service {
 
 case class Presentation(seed: Int) {
   implicit val reporter: String = "reporter"
-  val compilerAccess = new ConcreteAccess(seed)
+  val compilerAccess =
+    new ConcreteAccess(seed)(1)
 
   def hints(token: Int): Int =
     compilerAccess.interrupt(0, token)(_.length) // positive-inherited-access
@@ -7068,10 +7069,8 @@ trait Schedule[-Env, -In, +Out] {
 }
 
 object Schedule {
-  val elapsed: Schedule.WithState[Int, Any, Any, Int] =
-    new Schedule[Any, Any, Int] { type State = Int }
-  val forever: Schedule.WithState[Long, Any, Any, Int] =
-    new Schedule[Any, Any, Int] { type State = Long }
+  val elapsed: Schedule.WithState[Int, Any, Any, Int] = null
+  val forever: Schedule.WithState[Long, Any, Any, Int] = null
 
   def during(limit: Int): Schedule[Any, Any, Int] =
     elapsed.whileOutput(_ < limit) // positive-declared-alias-while
@@ -7079,8 +7078,7 @@ object Schedule {
   def spaced(delay: Int): Schedule[Any, Any, Int] =
     forever.addDelay(_ => delay) // positive-declared-alias-delay
 
-  type WithState[State0, -Env, -In0, +Out0] =
-    Schedule[Env, In0, Out0] { type State = State0 }
+  type WithState[State0, -Env, -In0, +Out0] = Schedule[Env, In0, Out0] { type State = State0 }
 }
 
 trait OtherSchedule[A] {

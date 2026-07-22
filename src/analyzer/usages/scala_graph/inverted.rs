@@ -103,6 +103,12 @@ pub(super) enum ScalaResolvedReference {
 }
 
 pub(super) trait ScalaReferenceSink {
+    fn may_match_name(&self, _name: &str) -> bool {
+        true
+    }
+
+    fn register_imports(&mut self, _imports: &[crate::analyzer::ImportInfo]) {}
+
     fn record(
         &mut self,
         target: ScalaResolvedReference,
@@ -462,6 +468,15 @@ impl ProjectTypes {
         match &self.structural_parent_by_unit {
             Some(parents) => parents.get(unit).cloned(),
             None => scala.structural_parent_of(unit),
+        }
+    }
+
+    fn declaration_parent(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+        match &self.structural_parent_by_unit {
+            Some(parents) => parents.get(unit).cloned(),
+            None => scala
+                .structural_parent_of(unit)
+                .or_else(|| scala.parent_of(unit)),
         }
     }
 
@@ -3293,9 +3308,7 @@ impl ProjectTypes {
         segments: &[String],
     ) -> Option<String> {
         let (first, rest) = segments.split_first()?;
-        let mut scope = scala
-            .structural_parent_of(declaration)
-            .or_else(|| scala.parent_of(declaration));
+        let mut scope = self.declaration_parent(scala, declaration);
         let mut seen = HashSet::default();
         while let Some(owner) = scope {
             if !seen.insert(owner.clone()) {
@@ -3327,9 +3340,7 @@ impl ProjectTypes {
                     return Some(resolved);
                 }
             }
-            scope = scala
-                .structural_parent_of(&owner)
-                .or_else(|| scala.parent_of(&owner));
+            scope = self.declaration_parent(scala, &owner);
         }
         self.resolve_type_in_declaration_context(scala, resolver, segments)
     }
@@ -4021,9 +4032,7 @@ impl ProjectTypes {
             };
         }
 
-        let mut scope = scala
-            .structural_parent_of(declaration)
-            .or_else(|| scala.parent_of(declaration));
+        let mut scope = self.declaration_parent(scala, declaration);
         let mut seen = HashSet::default();
         while let Some(owner) = scope {
             if !seen.insert(owner.clone()) {
@@ -4061,9 +4070,7 @@ impl ProjectTypes {
             } else if !roots.is_empty() {
                 return None;
             }
-            scope = scala
-                .structural_parent_of(&owner)
-                .or_else(|| scala.parent_of(&owner));
+            scope = self.declaration_parent(scala, &owner);
         }
 
         self.resolve_qualified_stable_type_unit_at(scala, resolver, path, false, None)
@@ -6370,6 +6377,7 @@ pub(super) fn scan_scala_query_file(
     let types = scala.project_types();
     let package = super::resolver::package_name_of(scala, file).unwrap_or_default();
     let imports = scala.import_info_of(file);
+    sink.register_imports(&imports);
     let resolver = Arc::new(NameResolver::for_file_with_facts(
         scala,
         Some(file),
@@ -6830,6 +6838,24 @@ fn record_reference(
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) {
+    if node.kind() == "type_identifier"
+        && !is_extractor_reference(node)
+        && !is_infix_pattern_operator(node)
+    {
+        let lookup = scala_qualified_type_root(node);
+        let segments = scala_type_lookup_segments(lookup, ctx.source);
+        if !segments
+            .iter()
+            .any(|segment| ctx.sink.may_match_name(segment))
+        {
+            return;
+        }
+    }
+    if let Some(name) = reference_lookup_name(node, ctx.source)
+        && !ctx.sink.may_match_name(name)
+    {
+        return;
+    }
     match node.kind() {
         // A type reference in any type position: param/return types, `extends`,
         // and the type child of `new Foo()`. Construction is covered here without
@@ -7674,6 +7700,25 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+fn reference_lookup_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let node = match node.kind() {
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            let function = invocation_function_reference(function);
+            if function.kind() == "field_expression" {
+                function.child_by_field_name("field")?
+            } else {
+                function
+            }
+        }
+        "infix_expression" | "postfix_expression" => node.child_by_field_name("operator")?,
+        "identifier" | "operator_identifier" => node,
+        _ => return None,
+    };
+    let name = node_text(node, source).trim();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Resolve an explicit member import whose owner is a parser-proven local
@@ -9098,7 +9143,7 @@ fn record_override_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
         return;
     }
     let name = node_text(name_node, ctx.source).trim();
-    if name.is_empty() {
+    if name.is_empty() || !ctx.sink.may_match_name(name) {
         return;
     }
     let Some(owner) = ctx.enclosing_class(name_node.start_byte()) else {
@@ -9346,7 +9391,10 @@ fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<C
 }
 
 /// The fqn of the type constructed by a `new Foo()` value expression.
-fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+fn constructed_type(mut node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+    while node.kind() == "call_expression" {
+        node = node.child_by_field_name("function")?;
+    }
     if node.kind() != "instance_expression" {
         return None;
     }
@@ -9647,8 +9695,8 @@ fn resolve_receiver_type_declaration_node(
         .types
         .canonical_receiver_type(ctx.scala, &declaration.fq_name())?;
     let owner_context = ctx
-        .scala
-        .structural_parent_of(&declaration)
+        .types
+        .exact_structural_parent(ctx.scala, &declaration)
         .unwrap_or_else(|| declaration.clone());
     match ctx
         .types
