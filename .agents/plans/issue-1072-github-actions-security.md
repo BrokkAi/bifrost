@@ -17,12 +17,13 @@ The user explicitly does not want Dependabot or Renovate update pull requests. P
 - [x] (2026-07-22 19:42Z) Ran zizmor 1.28.0 against the unmodified workflows and grouped its medium/high findings: mutable Action refs, inherited permissions, persisted checkout credentials, and publishing cache reuse.
 - [x] (2026-07-22 19:42Z) Agreed with the user to omit Dependabot/Renovate and enforce a pinned offline zizmor policy instead.
 - [x] (2026-07-22 19:42Z) Re-synchronized branch `brokk/issue-1072-harden-github-actions-permissions` to `origin/master` at `38b3bedb` before implementation.
+- [x] (2026-07-22 20:23Z) Rebased all three reviewed checkpoints onto current `origin/master` at `c4430031` and reran the complete final validation set successfully.
 - [x] (2026-07-22 19:55Z) Resolved and verified the immutable commit corresponding to all nineteen currently selected external Action repositories and recorded readable upstream refs beside every pin.
 - [x] (2026-07-22 19:55Z) Applied least-privilege permissions, credential isolation, Slack secret scoping, privileged-cache removal, setup-node cache disabling, and immutable Action pins across all eight workflows.
 - [x] (2026-07-22 20:00Z) Added the pinned local/CI zizmor command, generic readable-pin policy test, early quick-policy gate, and contributor-facing security documentation without an update bot.
 - [x] (2026-07-22 19:55Z) Validated Milestone 1 with zizmor, YAML parsing, release-policy tests, the benchmark workflow policy test, rustfmt, immutable-ref search, and diff checks.
 - [x] (2026-07-22 20:00Z) Validated the complete workflow surface and checkpointed both implementation milestones independently.
-- [ ] Run the five guided specialist reviews, triage findings, and prepare the reviewed branch for a pull request.
+- [x] (2026-07-22 20:18Z) Ran all five guided specialist reviews, deduplicated two related scanner-provenance findings plus one pin-consistency finding, applied the validated remediations, and prepared the reviewed branch for handoff.
 
 ## Surprises & Discoveries
 
@@ -40,6 +41,12 @@ The user explicitly does not want Dependabot or Renovate update pull requests. P
 
 - Observation: Generic YAML loading and zizmor both accepted a duplicated checkout input introduced during the credential-isolation pass, while actionlint rejected it precisely.
   Evidence: actionlint 1.7.12 identified the duplicate `persist-credentials` key in `docs.yml`; removing the duplicate produced a clean rerun. Keeping actionlint as an independent final check adds useful coverage even though zizmor is the single enforced CI scanner.
+
+- Observation: Pinning the setup Action alone did not make the scanner bootstrap immutable.
+  Evidence: three specialist reviewers independently noted that `setup-uv` selected the latest uv release by default and `uvx zizmor@1.28.0` had no checked-in artifact hashes. The review remediation pins uv 0.11.31, supplies the reviewed Linux archive SHA-256 to the quick gate, and resolves zizmor through a dedicated hash-bearing lockfile.
+
+- Observation: Per-line pin validation did not prevent a partial manual update from leaving one Action repository on two different reviewed commits.
+  Evidence: the architecture review constructed the drift scenario. The generic policy test now groups external references case-insensitively by `owner/repository` and rejects inconsistent SHA/comment tuples without maintaining a hard-coded inventory.
 
 ## Decision Log
 
@@ -63,13 +70,21 @@ The user explicitly does not want Dependabot or Renovate update pull requests. P
   Rationale: changing default token permissions or enabling mandatory SHA pins is an external administrative mutation. The code change will make both settings safe to enable, then the final handoff will request separate authorization.
   Date/Author: 2026-07-22 / Codex.
 
+- Decision: Treat the security gate's own executable bootstrap as part of the provenance boundary.
+  Rationale: a policy scanner cannot credibly enforce immutable dependencies while selecting its runner or package artifact through mutable resolution. Exact uv inputs, a reviewed platform checksum, a hash-bearing zizmor lock, isolated execution, and two-minute step timeouts make both content and failure behavior explicit.
+  Date/Author: 2026-07-22 / Codex after security, DevOps, and architecture review.
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. All existing Action dependencies now execute at verified immutable commits; workflows default to read-only permissions; publishing OIDC is scoped to the crate publish job; and checkout credentials, release caches, setup-node caches, the benchmark Slack webhook, and the metadata-push token now follow their narrow trust boundaries. Zizmor reports no medium-or-higher findings, all eight YAML files parse, eleven release-policy tests and two benchmark-policy tests pass, rustfmt is clean, the mutable-ref search prints nothing, and `git diff --check` passes.
 
 The first Rust test attempt exhausted the nearly full local disk during a cold compile. The repository cleanup helper removed only its reviewed older-than-24-hours Bifrost temporary candidates, skipped newer/live/open directories, and freed enough space for the unchanged command to pass. This was an environment limitation rather than a source failure.
 
-Milestone 2 is complete. `quick-policy` installs pinned uv and executes the offline zizmor audit before downloading Rust or Node toolchains, so workflow-security failures stop the expensive fan-out early. A Node-built-ins-only test independently requires immutable hashes plus readable comments, and `SECURITY.md` documents both checks and the deliberate no-bot update policy. Final validation passes all sixteen Node policy tests, release metadata validation, zizmor with zero medium-or-higher findings, rustfmt, the two benchmark workflow tests, actionlint 1.7.12, all eight YAML parses, immutable-ref search, and diff checks. Specialist review remains.
+Milestone 2 is complete. `quick-policy` installs exact, checksum-verified uv and executes hash-locked zizmor before downloading Rust or Node toolchains, so workflow-security failures stop the expensive fan-out early. A Node-built-ins-only test independently requires immutable hashes, readable comments, and one consistent pin per Action repository; `SECURITY.md` documents both checks and the deliberate no-bot update policy. Final validation passes all seventeen Node policy tests, release metadata validation, zizmor with zero medium-or-higher findings, rustfmt, the two benchmark workflow tests, actionlint 1.7.12, all eight YAML parses, immutable-ref search, and diff checks.
+
+The five guided reviews produced no critical or high findings. Security, DevOps, and architecture independently identified the scanner-bootstrap provenance gap, and architecture also identified partial manual pin drift; both medium findings were remediated. Senior intent and duplication review found no actionable issues. Repository administration, push, and pull-request creation remain deliberately outside this implementation until separately authorized.
+
+The reviewed branch is clean, three commits ahead of `origin/master` at `c4430031`, and all post-rebase checks pass. The remaining handoff is administrative: select the repository Action allowlist, require full-length SHA pins, and change the repository's default workflow token from write to read after the code lands.
 
 ## Context and Orientation
 
@@ -81,7 +96,7 @@ An Action is external code named by a `uses:` line such as `actions/checkout@v5`
 
 `actions/checkout` normally saves its Git credential in repository configuration so later `git push` commands work. Most jobs never push, so they must set `persist-credentials: false`. The one metadata synchronization job that pushes to `master` will also disable persistence and provide `GH_TOKEN` only to the final commit/push step, where `gh auth setup-git` supplies an ephemeral credential helper.
 
-Zizmor is a static analyzer for GitHub Actions. The new repository script will invoke the exact PyPI release `zizmor@1.28.0` through `uvx`, require parse/schema collection to succeed, report findings of medium severity or higher, and run offline. In CI, its GitHub output format creates annotations without needing Advanced Security or a writable security-events token.
+Zizmor is a static analyzer for GitHub Actions. The repository script invokes the exact PyPI release `zizmor==1.28.0` from `scripts/github-actions-security/uv.lock`, requires parse/schema collection to succeed, reports findings of medium severity or higher, and keeps zizmor's GitHub audit offline. In CI, its GitHub output format creates annotations without needing Advanced Security or a writable security-events token.
 
 ## Plan of Work
 
@@ -143,7 +158,7 @@ Zizmor must collect the entire repository strictly and report zero findings at m
 
 All checks are read-only. Re-running the pin replacement is safe because identical upstream refs must map to identical hashes. If an upstream ref cannot be resolved or its commit cannot be tied to the named repository, stop for that Action rather than substituting a guessed hash.
 
-The security script uses a versioned temporary `uvx` environment and does not write project dependencies. Zizmor runs without `--fix`, so it cannot edit workflows. If a broad scanner finding is a false positive, prefer changing the workflow to make the trust boundary explicit. Add a narrow documented suppression only when the behavior is demonstrably safe; never lower the global severity threshold merely to obtain green CI.
+The security script uses an isolated environment from the dedicated locked tool project and does not write product dependencies. Zizmor runs without `--fix`, so it cannot edit workflows. If a broad scanner finding is a false positive, prefer changing the workflow to make the trust boundary explicit. Add a narrow documented suppression only when the behavior is demonstrably safe; never lower the global severity threshold merely to obtain green CI.
 
 Release cache removal changes performance only and can be reversed by a reviewed cache design that proves untrusted runs cannot populate keys consumed by publishers. Repository-level Actions settings remain untouched until after this branch is merged and the user separately authorizes the external mutation.
 
@@ -166,7 +181,7 @@ These settings are evidence for the branch changes, not permission to mutate rep
 
 ## Interfaces and Dependencies
 
-`scripts/check-github-actions-security.sh` is a Bash entry point with no arguments. It requires `uvx`, invokes exactly zizmor 1.28.0, runs offline with strict collection and a medium minimum severity, and selects `github` output format only inside GitHub Actions.
+`scripts/check-github-actions-security.sh` is a Bash entry point with no arguments. It requires `uv`, invokes exactly zizmor 1.28.0 from `scripts/github-actions-security/uv.lock` in an isolated environment, runs zizmor offline with strict collection and a medium minimum severity, and selects `github` output format only inside GitHub Actions.
 
 `scripts/github-actions-policy.test.mjs` uses Node built-ins only. It exports or locally tests a helper that classifies a single `uses:` line and runs one repository test over `.github/workflows/*.yml`. External refs must match a full lowercase hexadecimal commit and a nonempty readable comment; local refs beginning with `./` are exempt.
 
@@ -175,3 +190,7 @@ The only new CI dependency is `astral-sh/setup-uv`, itself pinned to a verified 
 Revision note (2026-07-22): Initial implementation-ready plan recorded after the live issue diagnosis, user approval of the no-bot policy, current zizmor baseline, and final pre-implementation synchronization with `origin/master`.
 
 Revision note (2026-07-22): Recorded both completed implementation milestones, the actionlint-only duplicate-key finding and fix, complete validation evidence, and the remaining specialist review phase.
+
+Revision note (2026-07-22): Recorded the completed five-reviewer phase and remediation of hash-locked scanner bootstrap plus cross-workflow pin consistency.
+
+Revision note (2026-07-22): Recorded final synchronization to `origin/master` at `c4430031` and successful post-rebase validation.

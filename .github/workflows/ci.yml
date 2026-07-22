@@ -24,10 +24,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
+          version: 0.11.31
+          checksum: 8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b
           enable-cache: false
+        timeout-minutes: 2
 
       - name: Audit GitHub Actions
         run: bash scripts/check-github-actions-security.sh
+        timeout-minutes: 2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -346,6 +350,7 @@ jobs:
         if: matrix.can-test
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
+          version: 0.11.31
           python-version: '3.12'
           enable-cache: false
 
@@ -394,6 +399,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
+          version: 0.11.31
           python-version: '3.12'
 
       - name: Run python tests

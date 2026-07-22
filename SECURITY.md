@@ -39,10 +39,10 @@ Run the enforced security audit locally with:
 bash scripts/check-github-actions-security.sh
 ```
 
-The script runs the pinned zizmor 1.28.0 release offline, requires strict workflow collection, and fails on findings of medium severity or higher. The companion Node test enforces immutable references and readable comments:
+The script runs the pinned zizmor 1.28.0 release from a dedicated hash-bearing lockfile, keeps zizmor's GitHub audit offline, requires strict workflow collection, and fails on findings of medium severity or higher. The companion Node test enforces immutable references, readable comments, and one consistent SHA/comment tuple for every Action repository:
 
 ```bash
 node --test scripts/github-actions-policy.test.mjs
 ```
 
-Action updates are deliberate, reviewed maintenance. Resolve the desired upstream tag in the action's authoritative repository, verify the commit, update both the SHA and its comment, and run both checks. This repository intentionally does not use an automated action-update bot.
+Action updates are deliberate, reviewed maintenance. Resolve the desired upstream tag in the action's authoritative repository, verify the commit, update every occurrence of that repository to the same SHA and comment, and run both checks. This repository intentionally does not use an automated action-update bot.

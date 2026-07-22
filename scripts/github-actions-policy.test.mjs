@@ -11,7 +11,7 @@ const WORKFLOWS_DIRECTORY = fileURLToPath(
   new URL("../.github/workflows/", import.meta.url),
 );
 
-export function validateUsesLine(line) {
+function inspectUsesLine(line) {
   const uses = line.match(/^\s*(?:-\s+)?uses:\s*(.*?)\s*$/u);
   if (!uses) {
     return null;
@@ -19,7 +19,9 @@ export function validateUsesLine(line) {
 
   const reference = uses[1].match(/^(\S+?)(?:\s+#\s*(\S+))?$/u);
   if (!reference) {
-    return "expected one action reference and an optional single-token ref comment";
+    return {
+      error: "expected one action reference and an optional single-token ref comment",
+    };
   }
 
   const [, target, comment] = reference;
@@ -30,13 +32,62 @@ export function validateUsesLine(line) {
   const separator = target.lastIndexOf("@");
   const commit = separator === -1 ? "" : target.slice(separator + 1);
   if (!FULL_COMMIT.test(commit)) {
-    return "external actions must use a lowercase 40-character commit SHA";
+    return {
+      error: "external actions must use a lowercase 40-character commit SHA",
+    };
   }
   if (!comment || !READABLE_REF.test(comment)) {
-    return 'external actions must include a readable upstream ref comment such as "# v5.1.0"';
+    return {
+      error:
+        'external actions must include a readable upstream ref comment such as "# v5.1.0"',
+    };
   }
 
-  return null;
+  const [owner, repositoryName] = target.slice(0, separator).split("/");
+  if (!owner || !repositoryName) {
+    return { error: "external actions must identify an owner and repository" };
+  }
+
+  return {
+    repository: `${owner}/${repositoryName}`.toLowerCase(),
+    pin: `${commit} # ${comment}`,
+  };
+}
+
+export function validateUsesLine(line) {
+  return inspectUsesLine(line)?.error ?? null;
+}
+
+export function findUsesPolicyFailures(workflows) {
+  const failures = [];
+  const repositoryPins = new Map();
+
+  for (const workflow of workflows) {
+    const lines = workflow.contents.split(/\r?\n/u);
+    lines.forEach((line, index) => {
+      const result = inspectUsesLine(line);
+      if (!result) {
+        return;
+      }
+
+      const location = `${workflow.path}:${index + 1}`;
+      if (result.error) {
+        failures.push(`${location}: ${result.error}`);
+        return;
+      }
+
+      const previous = repositoryPins.get(result.repository);
+      if (previous && previous.pin !== result.pin) {
+        failures.push(
+          `${location}: ${result.repository} uses ${result.pin}, but ${previous.location} uses ${previous.pin}; one repository must use one SHA/comment tuple`,
+        );
+        return;
+      }
+      repositoryPins.set(result.repository, { pin: result.pin, location });
+    });
+  }
+
+  return failures;
 }
 
 test("rejects a mutable external action ref", () => {
@@ -77,22 +128,35 @@ test("ignores local actions and reusable workflows", () => {
   );
 });
 
+test("rejects inconsistent pins from the same action repository", () => {
+  const failures = findUsesPolicyFailures([
+    {
+      path: "first.yml",
+      contents:
+        "- uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v5.1.0",
+    },
+    {
+      path: "second.yml",
+      contents:
+        "- uses: Actions/Checkout@1123456789abcdef0123456789abcdef01234567 # v5.2.0",
+    },
+  ]);
+
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /one repository must use one SHA\/comment tuple/u);
+});
+
 test("all checked-in external actions have reviewable immutable refs", () => {
-  const failures = [];
   const workflows = readdirSync(WORKFLOWS_DIRECTORY)
     .filter((file) => [".yaml", ".yml"].includes(extname(file)))
-    .sort();
-
-  for (const workflow of workflows) {
-    const path = join(WORKFLOWS_DIRECTORY, workflow);
-    const lines = readFileSync(path, "utf8").split(/\r?\n/u);
-    lines.forEach((line, index) => {
-      const error = validateUsesLine(line);
-      if (error) {
-        failures.push(`${relative(REPOSITORY_ROOT, path)}:${index + 1}: ${error}`);
-      }
+    .sort()
+    .map((workflow) => {
+      const path = join(WORKFLOWS_DIRECTORY, workflow);
+      return {
+        path: relative(REPOSITORY_ROOT, path),
+        contents: readFileSync(path, "utf8"),
+      };
     });
-  }
 
-  assert.deepEqual(failures, []);
+  assert.deepEqual(findUsesPolicyFailures(workflows), []);
 });
