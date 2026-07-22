@@ -20,7 +20,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 06:42Z) Installed this plan at .agents/plans/issue-920-query-code-snapshot-indexes.md and committed checkpoint d4441387.
 - [x] (2026-07-22 07:42Z) Completed Milestone 1, ran the five focused benchmark targets, all new benchmark unit tests, all-target/all-feature Clippy, and a five-perspective guided review; fixed every confirmed finding before checkpointing.
 - [x] (2026-07-22 07:42Z) Captured a correctness-clean local pre-index report for all 12 query cases at .cache/issue920-preindex-output/run-20260722T073755Z.json.
-- [ ] Complete Milestone 2, run differential/lifecycle/freshness tests, run guided review, fix confirmed findings, update this plan, and commit.
+- [x] (2026-07-22 09:55Z) Completed Milestone 2 implementation and its three-specialist guided review; fixed construction peak-memory, finalization/selection cancellation, duplicate retained-byte accounting, scoped-versus-admitted telemetry, narrow-scope build cost, live-overlay freshness, and cold-ratio findings.
 - [ ] Capture a comparable post-index local report and record candidate reduction, latency, and retained bytes.
 - [ ] Complete Milestone 3 using the measured promotion criteria, run focused tests, run guided review, fix confirmed findings, update this plan, and commit.
 - [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
@@ -56,6 +56,15 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: The complete pre-index corpus is intentionally single-file scoped, so scanned_files is 1 in every case. The useful Milestone 2 reduction signal is candidate fact count and physical fact materialization, especially 13,628 facts for Dapper, 8,859 for fmt, 8,433 for Click, and 2,860 for Ky.
   Evidence: .cache/issue920-preindex-output/run-20260722T073755Z.json.
+
+- Observation: Automatically freezing every `Project` attached to an analyzer made snapshot postings safe but broke the LSP's intentionally live didOpen/didChange overlay. The correct validity boundary is the overlay's monotonic generation, including set, clear, clear-all, and rejected-overlay removal; immutable analyzer generations continue to use generation zero and a fresh cache owner on update.
+  Evidence: the first attempted fix failed 6 of 188 `bifrost_lsp_server` tests; generation-keyed cache acquisition then passed all 188 plus `mutable_overlay_generation_invalidates_cached_postings`.
+
+- Observation: Building the Dapper posting index on the first production `Auto` request produced a 348.3 ms first request and 25.7 ms warm median, a 13.53x ratio that failed the plan's 10x retention gate even though warm execution improved materially. Recording one viable scan before building on reuse moved construction into the first warmup and produced 207.2/25.2 ms, or 8.24x, while retaining the build profile as `warmup_transition`.
+  Evidence: dirty-tree development reports `.cache/.cache/issue920-dapper-auto-selection-v5/run-20260722T094553Z.json` and `.cache/.cache/issue920-dapper-auto-reuse-v6/run-20260722T094849Z.json`; both must be superseded by a clean-commit report before citation outside this plan.
+
+- Observation: `scoped_fact_nodes` cannot be counted on a scan-only path without materializing files that exact source anchors excluded. The profile now reports zero when that total is unavailable and separately records `admitted_fact_nodes`, the compatibility-budget denominator available on both scan and indexed paths.
+  Evidence: the Dapper scan admitted 49,181 facts after source filtering while the complete indexed scope contained 85,325 facts.
 
 ## Decision Log
 
@@ -107,6 +116,18 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: Workload/language intent belongs to the query IR, while deriving filesystem requirements from glob syntax would duplicate the query parser and still mishandle nested set branches or escaped metacharacters.
   Date/Author: 2026-07-22 / Codex.
 
+- Decision: Key each provider-local posting value by representation version plus `Project::analysis_generation`, and verify the generation before publication and selection. Do not freeze live projects automatically.
+  Rationale: LSP overlays must remain mutable, while a monotonic generation prevents an old positive or negative posting from serving after an in-place edit. The owner still changes on ordinary analyzer update/update_all/clone-with-project boundaries.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Production `Auto` scans the first viable whole-provider use, records reuse interest for that exact source generation, and builds on a later viable use. `IndexedRequired` still builds immediately for deterministic differential tests.
+  Rationale: This avoids imposing whole-workspace construction on one-shot queries and satisfies the measured first-to-warm retention gate. The benchmark preserves the transition's build work instead of hiding it in discarded warmup observations.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Select the smallest scoped posting by exact cardinality, materialize only that term, and filter it against later postings. Keep term cardinalities representation-neutral in the public profile.
+  Rationale: The original eager implementation copied every broad posting plus intersections into request-local vectors and had unbounded cancellation gaps. Cardinality-first filtering bounds temporary selection memory and explains the physical choice.
+  Date/Author: 2026-07-22 / Codex.
+
 - Decision: Treat WarmReuse as a benchmark execution policy rather than a query-syntax property. Every case runs first, warmup, and measured requests in one session; the label exists only to prove the corpus explicitly covers reuse.
   Rationale: Reuse is observable runner state and cannot honestly be inferred from CodeQuery syntax.
   Date/Author: 2026-07-22 / Codex.
@@ -116,6 +137,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 Milestone 1 is complete. The checked-in manifest now has 12 correctness-checked query cases across all ten pinned languages and all six workload classes. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
 
 The local pre-index report passed all cases. First/warm median milliseconds were: Gson exact 58.2/8.9, Gson regex 55.8/9.0, Gson containment 65.6/18.3, Gin 35.4/3.9, fmt broad 248.2/178.3, Express 34.8/3.2, Ky typed 29.7/3.3, Click 51.3/6.0, serde_json 25.8/3.2, FastRoute 21.6/1.9, Scala XML 32.8/3.3, and Dapper 69.4/13.0. These are local development-build figures, not the final Ubuntu comparison.
+
+Milestone 2 is implementation- and guided-review-complete. The posting index retains dense `(file_id, fact_id)` rows for kind, name, selective kind/name, exact callee/module role values, kwarg keywords, and compact source-trigram filters; facts and sources remain in their existing caches. Construction preflights fixed allocations, enforces a conservative peak estimate, polls cancellation through source, fact, finalization, census, and selection loops, and publishes only under an unchanged source generation. Forced scan/index tests cover every structural language, RQL/JSON equivalence, nested captures/negation, file/source/fact/pipeline/result cutoffs, update/update_all, add/delete, clones, and mutable overlays. The complete LSP suite remains green.
+
+The latest dirty-tree Dapper development run is encouraging but not yet authoritative: its workspace query reduced examined facts from 49,181 to 27 and warm median from the paired scan's earlier 98.5 ms to 25.2 ms. It retained 1,979,748 bytes against 12,215,566 normalized-facts bytes (16.2%), and its first request/warm median ratio was 8.24x. A clean milestone commit and paired rerun are required next.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -412,6 +437,19 @@ Relevant existing commits:
 The issue comment records a cancelled scan_usages_by_location request and a non-independent search_symbols delay. Those timings are not query_code baselines. They justify explicit workspace hydration, lazy-build, cancellation, abandoned-build, and warm-request boundaries.
 
 Append milestone test transcripts and benchmark tables here. Each benchmark table must name commit SHA, repository/commit, machine/runner, cold contract, case ID, result cardinality, first ms, warm median/p95 ms, scoped/candidate/materialized files/facts, physical bytes/facts, facts hydration/extraction, index/derived build/hit/wait, retained bytes, truncation, and diagnostics.
+
+Milestone 2 focused validation before checkpoint:
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    # pass
+    cargo test --test structural_search_planner --test structural_search_cross_language --test structural_search_python
+    # 20 + 27 + 14 pass
+    cargo test --test bifrost_lsp_server
+    # 188 pass
+    cargo test analyzer::structural::index --lib
+    # 10 pass after review hardening
+    cargo test indexed_ --lib
+    # 10 pass, including all-language differential and RQL/JSON parity
 
 ## Interfaces and Dependencies
 

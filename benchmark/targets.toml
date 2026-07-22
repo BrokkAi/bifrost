@@ -350,4 +350,5 @@ definition_queries = [
 ]
 query_code_queries = [
   { id = "exact-sql-mapper-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["csharp"],"where":["Dapper/SqlMapper.cs"],"match":{"kind":"class","name":"SqlMapper"},"limit":100}', required_paths = ["Dapper/SqlMapper.cs"], expected_witness_json = '{"result_type":"structural_match","path":"Dapper/SqlMapper.cs","kind":"class","enclosing_symbol":"Dapper.SqlMapper"}', min_results = 1, max_results = 1 },
+  { id = "workspace-exact-sql-mapper-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["csharp"],"match":{"kind":"class","name":"SqlMapper"},"limit":100}', required_paths = ["Dapper/SqlMapper.cs"], expected_witness_json = '{"result_type":"structural_match","path":"Dapper/SqlMapper.cs","kind":"class","enclosing_symbol":"Dapper.SqlMapper"}', min_results = 27, max_results = 27 },
 ]

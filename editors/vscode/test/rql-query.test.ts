@@ -90,7 +90,7 @@ void test("retains profiled ordinary results for navigation", async () => {
         Promise.resolve({
           text: "1 result\n\nCodeQuery profile\n",
           mode: "profile",
-          report: { format: "bifrost_code_query_profile/v1" },
+          report: { format: "bifrost_code_query_profile/v2" },
           results: [
             {
               uri: "file:///workspace/src/app.py",

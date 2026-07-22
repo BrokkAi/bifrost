@@ -816,7 +816,7 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
     assert_eq!(profile["result"]["mode"], "profile");
     assert_eq!(
         profile["result"]["report"]["format"],
-        "bifrost_code_query_profile/v1"
+        "bifrost_code_query_profile/v2"
     );
     assert_eq!(
         profile["result"]["results"].as_array().map(Vec::len),

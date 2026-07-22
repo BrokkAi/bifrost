@@ -4,8 +4,8 @@ use crate::benchmark::mcp_iteration::{
 };
 use crate::benchmark::mcp_session::McpSession;
 use crate::benchmark::report::{
-    QueryCodeAccessPathMetrics, QueryCodeBenchmarkMetrics, QueryCodeFactsCacheMetrics,
-    QueryCodeProfileMetrics, ScenarioReport, ScenarioTransport,
+    QueryCodeAccessPathMetrics, QueryCodeAccessPathTermMetrics, QueryCodeBenchmarkMetrics,
+    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, ScenarioReport, ScenarioTransport,
 };
 use crate::benchmark::runner::BenchmarkProfile;
 use crate::benchmark::{
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-const COLD_CONTRACT: &str = "fresh MCP process and analyzer snapshot; empty in-memory query indexes and derived layers; pinned checkout and durable structural-facts store retained";
+const COLD_CONTRACT: &str = "fresh MCP process and analyzer snapshot; empty in-memory query indexes and derived layers; pinned checkout and durable structural-facts store retained; production Auto records one viable use before building on reuse";
 
 #[derive(Debug)]
 struct QueryCodeIteration {
@@ -59,6 +59,7 @@ fn run_case(
     let mut warmup_durations_ms = Vec::with_capacity(manifest.warmup_iterations);
     let mut measured_durations_ms = Vec::with_capacity(manifest.measured_iterations);
     let mut measured_metrics = Vec::with_capacity(manifest.measured_iterations);
+    let mut warmup_transition = None;
     let mut profile_artifacts = Vec::new();
 
     let (first_outcome, artifact) = run_iteration(target, case, session, profile, "first", 1);
@@ -79,7 +80,22 @@ fn run_case(
             ensure_stable_result(case, &expected_result, &observation.result)?;
             Ok(observation)
         }) {
-            Ok(observation) => warmup_durations_ms.push(observation.duration_ms),
+            Ok(observation) => {
+                if warmup_transition.is_none()
+                    && observation
+                        .metrics
+                        .access_path
+                        .as_ref()
+                        .is_some_and(|access| {
+                            access.index_builds > 0
+                                || access.index_unavailable > 0
+                                || access.index_cancelled > 0
+                        })
+                {
+                    warmup_transition = Some(observation.metrics.clone());
+                }
+                warmup_durations_ms.push(observation.duration_ms);
+            }
             Err(error) => return failure_report(case, profile_artifacts, error),
         }
     }
@@ -118,6 +134,7 @@ fn run_case(
         QueryCodeBenchmarkMetrics {
             cold_contract: COLD_CONTRACT.to_string(),
             first: first_metrics,
+            warmup_transition,
             warm: warm_metrics,
         },
     );
@@ -202,8 +219,7 @@ struct ProfileWire {
     timings_ns: TimingWire,
     work: WorkWire,
     cache_layers: Vec<CacheLayerWire>,
-    #[serde(default)]
-    access_path: Option<Value>,
+    access_path: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,11 +337,7 @@ fn parse_profile(
                 unknown_outcomes: facts.unknown_outcomes,
                 replayed_files: facts.replayed_files,
             },
-            access_path: profile
-                .access_path
-                .as_ref()
-                .map(parse_access_path)
-                .transpose()?,
+            access_path: Some(parse_access_path(&profile.access_path)?),
         },
     ))
 }
@@ -468,11 +480,39 @@ fn required_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, Strin
 }
 
 fn parse_access_path(value: &Value) -> Result<QueryCodeAccessPathMetrics, String> {
+    let selected_terms = value
+        .pointer("/selected_terms")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "query_code profile is missing array `/selected_terms`".to_string())?
+        .iter()
+        .map(|term| {
+            Ok(QueryCodeAccessPathTermMetrics {
+                label: required_string(term, "/label")?.to_string(),
+                candidate_facts: required_u64(term, "/candidate_facts")?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(QueryCodeAccessPathMetrics {
         selected: required_string(value, "/selected")?.to_string(),
+        representation_version: required_u64(value, "/representation_version")?
+            .try_into()
+            .map_err(|_| "query_code representation version exceeds u32".to_string())?,
+        estimated_provider_files: required_u64(value, "/estimated_provider_files")?,
         scoped_files: required_u64(value, "/scoped_files")?,
+        scoped_fact_nodes: required_u64(value, "/scoped_fact_nodes")?,
+        admitted_fact_nodes: required_u64(value, "/admitted_fact_nodes")?,
         candidate_files: required_u64(value, "/candidate_files")?,
         candidate_facts: required_u64(value, "/candidate_facts")?,
+        selected_terms,
+        source_verification_required: value
+            .pointer("/source_verification_required")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                "query_code profile is missing boolean `/source_verification_required`".to_string()
+            })?,
+        cache_ready_lookups: required_u64(value, "/cache_ready_lookups")?,
+        materialized_files: required_u64(value, "/materialized_files")?,
+        materialized_fact_nodes: required_u64(value, "/materialized_fact_nodes")?,
         inspected_source_bytes: required_u64(value, "/inspected_source_bytes")?,
         examined_fact_nodes: required_u64(value, "/examined_fact_nodes")?,
         index_lookups: required_u64(value, "/index_lookups")?,
@@ -481,6 +521,15 @@ fn parse_access_path(value: &Value) -> Result<QueryCodeAccessPathMetrics, String
         index_builds: required_u64(value, "/index_builds")?,
         index_waits: required_u64(value, "/index_waits")?,
         index_wait_ns: required_u64(value, "/index_wait_ns")?,
+        index_cancelled: required_u64(value, "/index_cancelled")?,
+        index_unavailable: required_u64(value, "/index_unavailable")?,
+        index_over_budget: required_u64(value, "/index_over_budget")?,
+        scan_fallbacks: required_u64(value, "/scan_fallbacks")?,
+        index_build_files: required_u64(value, "/index_build_files")?,
+        index_build_source_bytes: required_u64(value, "/index_build_source_bytes")?,
+        index_build_fact_nodes: required_u64(value, "/index_build_fact_nodes")?,
+        index_build_facts_bytes: required_u64(value, "/index_build_facts_bytes")?,
+        index_build_ns: required_u64(value, "/index_build_ns")?,
         retained_bytes: required_u64(value, "/retained_bytes")?,
     })
 }
@@ -544,20 +593,36 @@ fn aggregate_access_path_metrics(
         "query_code access-path metrics appeared only after the first measured iteration"
             .to_string()
     })?;
-    if paths
-        .iter()
-        .any(|path| path.is_none_or(|path| path.selected != first.selected))
-    {
+    if paths.iter().any(|path| {
+        path.is_none_or(|path| {
+            path.selected != first.selected
+                || path.representation_version != first.representation_version
+                || path.selected_terms != first.selected_terms
+                || path.source_verification_required != first.source_verification_required
+        })
+    }) {
         return Err(
-            "query_code selected access path changed across measured iterations".to_string(),
+            "query_code selected access path or representation changed across measured iterations"
+                .to_string(),
         );
     }
     let paths = paths.into_iter().flatten().collect::<Vec<_>>();
     Ok(Some(QueryCodeAccessPathMetrics {
         selected: first.selected.clone(),
+        representation_version: first.representation_version,
+        estimated_provider_files: median_path_counter(&paths, |value| {
+            value.estimated_provider_files
+        }),
         scoped_files: median_path_counter(&paths, |value| value.scoped_files),
+        scoped_fact_nodes: median_path_counter(&paths, |value| value.scoped_fact_nodes),
+        admitted_fact_nodes: median_path_counter(&paths, |value| value.admitted_fact_nodes),
         candidate_files: median_path_counter(&paths, |value| value.candidate_files),
         candidate_facts: median_path_counter(&paths, |value| value.candidate_facts),
+        selected_terms: first.selected_terms.clone(),
+        source_verification_required: first.source_verification_required,
+        cache_ready_lookups: median_path_counter(&paths, |value| value.cache_ready_lookups),
+        materialized_files: median_path_counter(&paths, |value| value.materialized_files),
+        materialized_fact_nodes: median_path_counter(&paths, |value| value.materialized_fact_nodes),
         inspected_source_bytes: median_path_counter(&paths, |value| value.inspected_source_bytes),
         examined_fact_nodes: median_path_counter(&paths, |value| value.examined_fact_nodes),
         index_lookups: median_path_counter(&paths, |value| value.index_lookups),
@@ -566,6 +631,17 @@ fn aggregate_access_path_metrics(
         index_builds: median_path_counter(&paths, |value| value.index_builds),
         index_waits: median_path_counter(&paths, |value| value.index_waits),
         index_wait_ns: median_path_counter(&paths, |value| value.index_wait_ns),
+        index_cancelled: median_path_counter(&paths, |value| value.index_cancelled),
+        index_unavailable: median_path_counter(&paths, |value| value.index_unavailable),
+        index_over_budget: median_path_counter(&paths, |value| value.index_over_budget),
+        scan_fallbacks: median_path_counter(&paths, |value| value.scan_fallbacks),
+        index_build_files: median_path_counter(&paths, |value| value.index_build_files),
+        index_build_source_bytes: median_path_counter(&paths, |value| {
+            value.index_build_source_bytes
+        }),
+        index_build_fact_nodes: median_path_counter(&paths, |value| value.index_build_fact_nodes),
+        index_build_facts_bytes: median_path_counter(&paths, |value| value.index_build_facts_bytes),
+        index_build_ns: median_path_counter(&paths, |value| value.index_build_ns),
         retained_bytes: median_path_counter(&paths, |value| value.retained_bytes),
     }))
 }
@@ -622,7 +698,13 @@ mod tests {
         assert_eq!(metrics.total_ns, 11);
         assert_eq!(metrics.scanned_files, 2);
         assert_eq!(metrics.facts_cache.extractions, 2);
-        assert_eq!(metrics.access_path, None);
+        assert_eq!(
+            metrics
+                .access_path
+                .as_ref()
+                .map(|path| path.selected.as_str()),
+            Some("posting:kind+name")
+        );
     }
 
     #[test]
@@ -640,7 +722,7 @@ mod tests {
     #[test]
     fn profile_parser_rejects_unimplemented_future_format() {
         let mut response = profiled_query_response();
-        response["structuredContent"]["format"] = json!("bifrost_code_query_profile/v2");
+        response["structuredContent"]["format"] = json!("bifrost_code_query_profile/v3");
 
         let error = parse_profile(&benchmark_case(), &response)
             .expect_err("future format must require an explicit parser update");
@@ -668,7 +750,7 @@ mod tests {
     fn profiled_query_response() -> Value {
         json!({
             "structuredContent": {
-                "format": "bifrost_code_query_profile/v1",
+                "format": "bifrost_code_query_profile/v2",
                 "result": {
                     "results": [{
                         "result_type": "structural_match",
@@ -708,7 +790,43 @@ mod tests {
                         "unknown_outcomes": 0,
                         "replayed_files": 2
                     }
-                }]
+                }],
+                "access_path": {
+                    "selected": "posting:kind+name",
+                    "representation_version": 1,
+                    "estimated_provider_files": 2,
+                    "scoped_files": 2,
+                    "scoped_fact_nodes": 4,
+                    "admitted_fact_nodes": 4,
+                    "candidate_files": 1,
+                    "candidate_facts": 1,
+                    "selected_terms": [
+                        {"label": "name", "candidate_facts": 1},
+                        {"label": "kind", "candidate_facts": 2}
+                    ],
+                    "source_verification_required": true,
+                    "cache_ready_lookups": 1,
+                    "materialized_files": 1,
+                    "materialized_fact_nodes": 2,
+                    "inspected_source_bytes": 40,
+                    "examined_fact_nodes": 1,
+                    "index_lookups": 1,
+                    "index_hits": 1,
+                    "index_misses": 0,
+                    "index_builds": 0,
+                    "index_waits": 0,
+                    "index_wait_ns": 0,
+                    "index_cancelled": 0,
+                    "index_unavailable": 0,
+                    "index_over_budget": 0,
+                    "scan_fallbacks": 0,
+                    "index_build_files": 0,
+                    "index_build_source_bytes": 0,
+                    "index_build_fact_nodes": 0,
+                    "index_build_facts_bytes": 0,
+                    "index_build_ns": 0,
+                    "retained_bytes": 512
+                }
             }
         })
     }

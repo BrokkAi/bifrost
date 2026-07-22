@@ -46,12 +46,13 @@ The explanation deliberately omits internal cache fingerprints, storage generati
 
 ## Profile response
 
-A profile has format `bifrost_code_query_profile/v1`. Its `result` field is the exact ordinary `CodeQueryResult`; result ordering, diagnostics, provenance, truncation, and completion semantics do not change. The remaining fields are observations from that same execution:
+A profile has format `bifrost_code_query_profile/v2`. Its `result` field is the exact ordinary `CodeQueryResult`; result ordering, diagnostics, provenance, truncation, and completion semantics do not change. The remaining fields are observations from that same execution:
 
 - `explain` contains the selected public plan described above.
 - `timings_ns` separates planning, execution, result rendering, and the execution-core total elapsed wall time.
 - `work` reports budget-accounted files, source bytes, fact nodes, pipeline rows, references, provenance steps, and resolved import files and edges.
 - `cache_layers` reports deterministic, completeness-sensitive outcomes for request-local seed results, seed-path structural facts, reference and call relations, and forward/reverse import relations.
+- `access_path` separates compatibility-budget work from physical structural access. It reports the selected positive posting terms and their pre-intersection candidate cardinalities, provider/scoped/candidate facts, compatibility-admitted fact nodes, whether exact source-anchor verification remained necessary, cache readiness, materialization and source inspection, index lifecycle/build cost, fallback, and uniquely retained bytes. `scoped_fact_nodes` is exact when indexed metadata is available and zero for scan-only execution; `admitted_fact_nodes` is comparable on both paths. A narrow scope may reuse a ready snapshot index, but production `Auto` will not construct a whole-provider index when the scoped files are fewer than eight or less than one quarter of that provider. For a viable scope, the first use scans and records reuse interest; a later use builds the snapshot index, avoiding whole-workspace construction for one-shot queries.
 - `scheduling` reports peak concurrency and, when bounded dispatch actually occurred, queue, coordinator, budget-wait, and dispatch observations.
 - `operators` reports authored invocation identity, disposition and termination reasons, cardinalities, elapsed/wait/merge/scheduling time, work/cache deltas, truncation, cancellation, and a lower-bound temporary container-capacity estimate.
 

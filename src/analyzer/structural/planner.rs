@@ -26,6 +26,7 @@ use crate::analyzer::structural::Role;
 #[derive(Debug, Clone)]
 pub(crate) struct QueryPlan {
     positive_source_anchors: Vec<String>,
+    structural_access: StructuralAccessRequirements,
     features: QueryFeatures,
 }
 
@@ -33,6 +34,7 @@ impl QueryPlan {
     pub(crate) fn for_query(query: &CodeQuerySeed) -> Self {
         Self {
             positive_source_anchors: collect_positive_source_anchors(query),
+            structural_access: StructuralAccessRequirements::for_query(query),
             features: QueryFeatures::for_query(query),
         }
     }
@@ -50,6 +52,131 @@ impl QueryPlan {
             required_anchors: &self.positive_source_anchors,
         }
     }
+
+    pub(crate) fn structural_access(&self) -> &StructuralAccessRequirements {
+        &self.structural_access
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StructuralPostingTerm {
+    Kinds(Vec<super::NormalizedKind>),
+    ExactName(String),
+    RoleName { role: Role, name: String },
+    KwargKeyword(String),
+}
+
+impl StructuralPostingTerm {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Kinds(_) => "kind",
+            Self::ExactName(_) => "name",
+            Self::RoleName { .. } => "role_name",
+            Self::KwargKeyword(_) => "kwarg",
+        }
+    }
+}
+
+/// Representation-neutral positive constraints available to a physical
+/// structural index. The matcher still verifies every selected fact.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StructuralAccessRequirements {
+    terms: Vec<StructuralPostingTerm>,
+}
+
+impl StructuralAccessRequirements {
+    fn for_query(query: &CodeQuerySeed) -> Self {
+        let mut terms = Vec::new();
+        if !query.root.kinds.is_empty() {
+            terms.push(StructuralPostingTerm::Kinds(query.root.kinds.clone()));
+        }
+        if let Some(StringPredicate::Exact(name)) = &query.root.name {
+            terms.push(StructuralPostingTerm::ExactName(name.clone()));
+        }
+        for &role in Role::single_target_roles() {
+            if let Some(pattern) = query.root.single_role_pattern(role) {
+                push_role_name_term(&mut terms, role, pattern);
+            }
+        }
+        for &role in Role::list_target_roles() {
+            for pattern in query.root.list_role_patterns(role) {
+                push_role_name_term(&mut terms, role, pattern);
+            }
+        }
+        for (keyword, pattern) in &query.root.kwargs {
+            terms.push(StructuralPostingTerm::KwargKeyword(keyword.clone()));
+            push_role_name_term(&mut terms, Role::Kwarg, pattern);
+        }
+        let mut unique = Vec::with_capacity(terms.len());
+        for term in terms {
+            if !unique.contains(&term) {
+                unique.push(term);
+            }
+        }
+        Self { terms: unique }
+    }
+
+    pub(crate) fn terms(&self) -> &[StructuralPostingTerm] {
+        &self.terms
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(terms: Vec<StructuralPostingTerm>) -> Self {
+        Self { terms }
+    }
+}
+
+/// Storage-independent description of the access path selected for one
+/// provider scope. Concrete posting layouts remain private to the index; the
+/// planner, profile, and benchmark consume only these cardinalities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuralAccessPathKind {
+    ScanOnly,
+    Posting,
+}
+
+impl StructuralAccessPathKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::ScanOnly => "scan_only",
+            Self::Posting => "posting",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructuralPostingEstimate {
+    pub(crate) label: &'static str,
+    pub(crate) candidate_facts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructuralAccessPathEstimate {
+    pub(crate) kind: StructuralAccessPathKind,
+    pub(crate) provider_files: u64,
+    pub(crate) scoped_files: u64,
+    pub(crate) scoped_fact_nodes: u64,
+    pub(crate) candidate_files: u64,
+    pub(crate) candidate_facts: u64,
+    pub(crate) selected_terms: Vec<StructuralPostingEstimate>,
+    pub(crate) source_verification_required: bool,
+    pub(crate) cache_ready_before_lookup: bool,
+}
+
+fn push_role_name_term(terms: &mut Vec<StructuralPostingTerm>, role: Role, pattern: &Pattern) {
+    if !supports_exact_role_name_posting(role) {
+        return;
+    }
+    if let Some(StringPredicate::Exact(name)) = &pattern.name {
+        terms.push(StructuralPostingTerm::RoleName {
+            role,
+            name: name.clone(),
+        });
+    }
+}
+
+pub(crate) fn supports_exact_role_name_posting(role: Role) -> bool {
+    matches!(role, Role::Callee | Role::Module)
 }
 
 /// Source-level candidate index for a single planned query.
@@ -64,6 +191,14 @@ pub(crate) struct SourceCandidateIndex<'a> {
 }
 
 impl SourceCandidateIndex<'_> {
+    pub(crate) fn requires_source(&self) -> bool {
+        !self.required_anchors.is_empty()
+    }
+
+    pub(crate) fn required_anchors(&self) -> &[String] {
+        self.required_anchors
+    }
+
     pub(crate) fn may_match(&self, source: &str) -> bool {
         self.required_anchors
             .iter()
@@ -177,6 +312,7 @@ mod tests {
         let anchors = vec!["eval".to_string(), "shell".to_string()];
         let plan = QueryPlan {
             positive_source_anchors: anchors,
+            structural_access: StructuralAccessRequirements::default(),
             features: QueryFeatures::default(),
         };
         let index = plan.build_source_index();
@@ -185,6 +321,7 @@ mod tests {
 
         let plan = QueryPlan {
             positive_source_anchors: Vec::new(),
+            structural_access: StructuralAccessRequirements::default(),
             features: QueryFeatures::default(),
         };
         assert!(plan.build_source_index().may_match("anything"));

@@ -1077,5 +1077,26 @@ fn current_bifrost_commit() -> Option<String> {
     }
     let sha = String::from_utf8(output.stdout).ok()?;
     let trimmed = sha.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    if trimmed.is_empty() {
+        return None;
+    }
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .current_dir(repo_root)
+        .output()
+        .ok();
+    let dirty = status
+        .filter(|status| status.status.success())
+        .and_then(|status| String::from_utf8(status.stdout).ok())
+        .is_some_and(|status| {
+            status.lines().any(|line| {
+                let path = line.get(3..).unwrap_or_default().trim_matches('"');
+                !path.starts_with(".cache/") && !path.starts_with("benchmark/.cache/")
+            })
+        });
+    Some(if dirty {
+        format!("{trimmed}-dirty")
+    } else {
+        trimmed.to_string()
+    })
 }

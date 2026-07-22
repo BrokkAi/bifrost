@@ -92,6 +92,7 @@ fn run() -> Result<(), String> {
                     other => return Err(format!("unknown run argument: {other}")),
                 }
             }
+            validate_query_code_access_mode()?;
             run_manifest(manifest_path, selected_repo, output_dir, max_files, profile)
         }
         "compare" => {
@@ -139,6 +140,19 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+fn validate_query_code_access_mode() -> Result<(), String> {
+    let Some(value) = env::var_os("BIFROST_BENCHMARK_QUERY_CODE_ACCESS") else {
+        return Ok(());
+    };
+    match value.to_str() {
+        Some("auto" | "scan_only") => Ok(()),
+        _ => Err(format!(
+            "BIFROST_BENCHMARK_QUERY_CODE_ACCESS must be `auto` or `scan_only`, got `{}`",
+            value.to_string_lossy()
+        )),
     }
 }
 
@@ -428,6 +442,9 @@ fn print_validate_help() {
 fn print_run_help() {
     println!(
         "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N] [--profile]"
+    );
+    println!(
+        "  BIFROST_BENCHMARK_QUERY_CODE_ACCESS=auto|scan_only selects the query_code reference access path"
     );
 }
 

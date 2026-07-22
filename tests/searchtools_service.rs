@@ -480,7 +480,7 @@ fn query_code_exposes_planning_only_explain_and_opt_in_profile_reports() {
             serde_json::json!({ "query_file": "queries/app-profile.rql" }),
         )
         .expect("profile query file");
-    assert_eq!(profile["format"], "bifrost_code_query_profile/v1");
+    assert_eq!(profile["format"], "bifrost_code_query_profile/v2");
     assert_eq!(profile["result"], ordinary);
     assert!(
         profile["operators"]

@@ -1378,8 +1378,134 @@ class CodeQueryOperatorTermination(StrEnum):
 
 
 @dataclass(frozen=True)
+class CodeQueryAccessPathTermProfile:
+    label: str
+    candidate_facts: int
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any]
+    ) -> CodeQueryAccessPathTermProfile:
+        return cls(
+            label=str(data["label"]),
+            candidate_facts=int(data["candidate_facts"]),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryAccessPathProfile:
+    selected: str
+    representation_version: int
+    estimated_provider_files: int
+    scoped_files: int
+    scoped_fact_nodes: int
+    admitted_fact_nodes: int
+    candidate_files: int
+    candidate_facts: int
+    selected_terms: list[CodeQueryAccessPathTermProfile]
+    source_verification_required: bool
+    cache_ready_lookups: int
+    materialized_files: int
+    materialized_fact_nodes: int
+    inspected_source_bytes: int
+    examined_fact_nodes: int
+    index_lookups: int
+    index_hits: int
+    index_misses: int
+    index_builds: int
+    index_waits: int
+    index_wait_ns: int
+    index_cancelled: int
+    index_unavailable: int
+    index_over_budget: int
+    scan_fallbacks: int
+    index_build_files: int
+    index_build_source_bytes: int
+    index_build_fact_nodes: int
+    index_build_facts_bytes: int
+    index_build_ns: int
+    retained_bytes: int
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryAccessPathProfile:
+        known = {
+            "selected",
+            "representation_version",
+            "estimated_provider_files",
+            "scoped_files",
+            "scoped_fact_nodes",
+            "admitted_fact_nodes",
+            "candidate_files",
+            "candidate_facts",
+            "selected_terms",
+            "source_verification_required",
+            "cache_ready_lookups",
+            "materialized_files",
+            "materialized_fact_nodes",
+            "inspected_source_bytes",
+            "examined_fact_nodes",
+            "index_lookups",
+            "index_hits",
+            "index_misses",
+            "index_builds",
+            "index_waits",
+            "index_wait_ns",
+            "index_cancelled",
+            "index_unavailable",
+            "index_over_budget",
+            "scan_fallbacks",
+            "index_build_files",
+            "index_build_source_bytes",
+            "index_build_fact_nodes",
+            "index_build_facts_bytes",
+            "index_build_ns",
+            "retained_bytes",
+        }
+        return cls(
+            selected=str(data.get("selected", "scan_only")),
+            representation_version=int(data.get("representation_version", 0)),
+            estimated_provider_files=int(data.get("estimated_provider_files", 0)),
+            scoped_files=int(data.get("scoped_files", 0)),
+            scoped_fact_nodes=int(data.get("scoped_fact_nodes", 0)),
+            admitted_fact_nodes=int(data.get("admitted_fact_nodes", 0)),
+            candidate_files=int(data.get("candidate_files", 0)),
+            candidate_facts=int(data.get("candidate_facts", 0)),
+            selected_terms=[
+                CodeQueryAccessPathTermProfile.from_dict(term)
+                for term in data.get("selected_terms", [])
+            ],
+            source_verification_required=bool(
+                data.get("source_verification_required", False)
+            ),
+            cache_ready_lookups=int(data.get("cache_ready_lookups", 0)),
+            materialized_files=int(data.get("materialized_files", 0)),
+            materialized_fact_nodes=int(data.get("materialized_fact_nodes", 0)),
+            inspected_source_bytes=int(data.get("inspected_source_bytes", 0)),
+            examined_fact_nodes=int(data.get("examined_fact_nodes", 0)),
+            index_lookups=int(data.get("index_lookups", 0)),
+            index_hits=int(data.get("index_hits", 0)),
+            index_misses=int(data.get("index_misses", 0)),
+            index_builds=int(data.get("index_builds", 0)),
+            index_waits=int(data.get("index_waits", 0)),
+            index_wait_ns=int(data.get("index_wait_ns", 0)),
+            index_cancelled=int(data.get("index_cancelled", 0)),
+            index_unavailable=int(data.get("index_unavailable", 0)),
+            index_over_budget=int(data.get("index_over_budget", 0)),
+            scan_fallbacks=int(data.get("scan_fallbacks", 0)),
+            index_build_files=int(data.get("index_build_files", 0)),
+            index_build_source_bytes=int(data.get("index_build_source_bytes", 0)),
+            index_build_fact_nodes=int(data.get("index_build_fact_nodes", 0)),
+            index_build_facts_bytes=int(data.get("index_build_facts_bytes", 0)),
+            index_build_ns=int(data.get("index_build_ns", 0)),
+            retained_bytes=int(data.get("retained_bytes", 0)),
+            extra=_extra_fields(data, known),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQueryProfile:
-    FORMAT: ClassVar[str] = "bifrost_code_query_profile/v1"
+    FORMAT: ClassVar[str] = "bifrost_code_query_profile/v2"
 
     format: str
     result: CodeQueryResult
@@ -1387,6 +1513,7 @@ class CodeQueryProfile:
     timings_ns: CodeQueryProfileTimings
     work: CodeQueryProfileWork
     cache_layers: list[CodeQueryProfileCacheLayer]
+    access_path: CodeQueryAccessPathProfile
     scheduling: CodeQueryProfileScheduling
     operators: list[CodeQueryOperatorObservation]
     rendered_text: str | None = None
@@ -1405,6 +1532,7 @@ class CodeQueryProfile:
             "timings_ns",
             "work",
             "cache_layers",
+            "access_path",
             "scheduling",
             "operators",
         }
@@ -1415,6 +1543,7 @@ class CodeQueryProfile:
             timings_ns=CodeQueryProfileTimings.from_dict(data.get("timings_ns", {})),
             work=CodeQueryProfileWork.from_dict(data.get("work", {})),
             cache_layers=_code_query_cache_layers(data),
+            access_path=CodeQueryAccessPathProfile.from_dict(data["access_path"]),
             scheduling=CodeQueryProfileScheduling.from_dict(
                 data.get("scheduling", {})
             ),

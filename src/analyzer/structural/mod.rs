@@ -25,6 +25,7 @@ pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
+pub(crate) mod index;
 pub mod kinds;
 pub mod matcher;
 pub mod planner;
@@ -35,8 +36,8 @@ pub mod search;
 pub mod spec;
 
 pub use execution::{
-    CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind, CodeQueryExplain,
-    CodeQueryExplainScheduling, CodeQueryLogicalNode, CodeQueryLogicalOperation,
+    CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
+    CodeQueryExplain, CodeQueryExplainScheduling, CodeQueryLogicalNode, CodeQueryLogicalOperation,
     CodeQueryLogicalPlan, CodeQueryOperatorDisposition, CodeQueryOperatorObservation,
     CodeQueryOperatorTermination, CodeQueryOperatorTimings, CodeQueryPhysicalNode,
     CodeQueryPhysicalOperator, CodeQueryPhysicalPlan, CodeQueryProfile,

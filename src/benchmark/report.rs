@@ -58,6 +58,8 @@ pub struct ScenarioReport {
 pub struct QueryCodeBenchmarkMetrics {
     pub cold_contract: String,
     pub first: QueryCodeProfileMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_transition: Option<QueryCodeProfileMetrics>,
     pub warm: QueryCodeProfileMetrics,
 }
 
@@ -94,9 +96,18 @@ pub struct QueryCodeFactsCacheMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryCodeAccessPathMetrics {
     pub selected: String,
+    pub representation_version: u32,
+    pub estimated_provider_files: u64,
     pub scoped_files: u64,
+    pub scoped_fact_nodes: u64,
+    pub admitted_fact_nodes: u64,
     pub candidate_files: u64,
     pub candidate_facts: u64,
+    pub selected_terms: Vec<QueryCodeAccessPathTermMetrics>,
+    pub source_verification_required: bool,
+    pub cache_ready_lookups: u64,
+    pub materialized_files: u64,
+    pub materialized_fact_nodes: u64,
     pub inspected_source_bytes: u64,
     pub examined_fact_nodes: u64,
     pub index_lookups: u64,
@@ -105,7 +116,22 @@ pub struct QueryCodeAccessPathMetrics {
     pub index_builds: u64,
     pub index_waits: u64,
     pub index_wait_ns: u64,
+    pub index_cancelled: u64,
+    pub index_unavailable: u64,
+    pub index_over_budget: u64,
+    pub scan_fallbacks: u64,
+    pub index_build_files: u64,
+    pub index_build_source_bytes: u64,
+    pub index_build_fact_nodes: u64,
+    pub index_build_facts_bytes: u64,
+    pub index_build_ns: u64,
     pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeAccessPathTermMetrics {
+    pub label: String,
+    pub candidate_facts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -460,6 +486,7 @@ fn compare_present_scenarios(
         _ => None,
     };
 
+    let cold_ratio_failure = query_code_cold_ratio_failure(key.scenario, candidate);
     let (outcome, is_regression, detail) = if baseline.success && !candidate.success {
         (
             ScenarioCompareOutcome::Regression,
@@ -472,6 +499,8 @@ fn compare_present_scenarios(
             false,
             Some("candidate recovered from a failing baseline".to_string()),
         )
+    } else if baseline.success && candidate.success && cold_ratio_failure.is_some() {
+        (ScenarioCompareOutcome::Regression, true, cold_ratio_failure)
     } else if baseline.success && candidate.success {
         match (baseline.median_ms, candidate.median_ms) {
             (Some(baseline_ms), Some(candidate_ms))
@@ -519,6 +548,29 @@ fn compare_present_scenarios(
         is_regression,
         detail,
     }
+}
+
+fn query_code_cold_ratio_failure(
+    scenario: BenchmarkScenario,
+    candidate: &ScenarioReport,
+) -> Option<String> {
+    const MAX_COLD_TO_WARM_RATIO: f64 = 10.0;
+    if scenario != BenchmarkScenario::QueryCode {
+        return None;
+    }
+    let (Some(first_ms), Some(warm_median_ms)) = (candidate.first_duration_ms, candidate.median_ms)
+    else {
+        return None;
+    };
+    if !first_ms.is_finite() || !warm_median_ms.is_finite() || warm_median_ms <= 0.0 {
+        return None;
+    }
+    let ratio = first_ms / warm_median_ms;
+    (ratio > MAX_COLD_TO_WARM_RATIO).then(|| {
+        format!(
+            "query_code first request is {ratio:.2}x warm median, above the {MAX_COLD_TO_WARM_RATIO:.1}x retention limit"
+        )
+    })
 }
 
 fn relative_delta_pct(baseline_ms: f64, candidate_ms: f64) -> Option<f64> {

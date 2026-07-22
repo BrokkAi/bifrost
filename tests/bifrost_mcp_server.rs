@@ -896,7 +896,7 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
     assert_eq!(profile["result"]["isError"], false, "{profile}");
     assert_eq!(
         profile["result"]["structuredContent"]["format"],
-        "bifrost_code_query_profile/v1"
+        "bifrost_code_query_profile/v2"
     );
     assert_eq!(
         profile["result"]["structuredContent"]["result"]["results"][0]["kind"],

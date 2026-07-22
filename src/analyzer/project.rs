@@ -192,6 +192,13 @@ pub trait Project: Send + Sync {
     fn has_overlay(&self, _file: &ProjectFile) -> bool {
         false
     }
+
+    /// Monotonic process-local generation for source that can change behind
+    /// an analyzer. Immutable/disk projects use zero because analyzer updates
+    /// already create a fresh cache owner.
+    fn analysis_generation(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +704,20 @@ impl OverlayProject {
         }
     }
 
+    fn next_revision(&self) -> OverlayRevision {
+        let previous = self
+            .next_overlay_revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("overlay revision space exhausted");
+        OverlayRevision::from_monotonic_counter(
+            previous
+                .checked_add(1)
+                .expect("successful overlay revision update cannot overflow"),
+        )
+    }
+
     /// Capture an independent read view of the current overlays.
     ///
     /// Subsequent editor changes mutate the live project's map without changing this
@@ -726,24 +747,18 @@ impl OverlayProject {
             self.log_rejection(&abs_path, content.len());
             // Drop any stale overlay so reads return disk content rather than
             // a now-misleading older version of the buffer.
-            self.overlays
+            let removed = self
+                .overlays
                 .write()
                 .expect("overlay lock poisoned")
                 .remove(&abs_path);
+            if removed.is_some() {
+                self.next_revision();
+            }
             return false;
         }
         let mut overlays = self.overlays.write().expect("overlay lock poisoned");
-        let previous = self
-            .next_overlay_revision
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("overlay revision space exhausted");
-        let revision = OverlayRevision::from_monotonic_counter(
-            previous
-                .checked_add(1)
-                .expect("successful overlay revision update cannot overflow"),
-        );
+        let revision = self.next_revision();
         overlays.insert(
             abs_path,
             Arc::new(OverlayEntry {
@@ -758,20 +773,26 @@ impl OverlayProject {
     /// actually removed — callers use this to decide whether reparse is needed.
     pub fn clear(&self, abs_path: &Path) -> bool {
         let abs_path = abs_path.to_path_buf().normalize();
-        self.overlays
+        let removed = self
+            .overlays
             .write()
             .expect("overlay lock poisoned")
             .remove(&abs_path)
-            .is_some()
+            .is_some();
+        if removed {
+            self.next_revision();
+        }
+        removed
     }
 
     /// Drop every overlay. Not invoked by the LSP today; reserved for future
     /// session-reset paths.
     pub fn clear_all(&self) {
-        self.overlays
-            .write()
-            .expect("overlay lock poisoned")
-            .clear();
+        let mut overlays = self.overlays.write().expect("overlay lock poisoned");
+        if !overlays.is_empty() {
+            overlays.clear();
+            self.next_revision();
+        }
     }
 
     /// Emit a single stderr line reporting that `abs_path` was rejected, but
@@ -891,6 +912,10 @@ impl Project for OverlayProject {
             .read()
             .expect("overlay lock poisoned")
             .contains_key(&file.abs_path())
+    }
+
+    fn analysis_generation(&self) -> u64 {
+        self.next_overlay_revision.load(Ordering::Acquire)
     }
 }
 
@@ -1124,6 +1149,27 @@ mod tests {
             snapshot.read_source_snapshot(&file).unwrap().origin(),
             ProjectSourceOrigin::Overlay(frozen_revision)
         );
+    }
+
+    #[test]
+    fn overlay_analysis_generation_advances_for_set_clear_and_clear_all() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::new(delegate);
+        let initial = overlay.analysis_generation();
+
+        assert!(overlay.set(file.abs_path(), "fn first() {}\n".to_string()));
+        let after_set = overlay.analysis_generation();
+        assert!(after_set > initial);
+        assert!(overlay.clear(&file.abs_path()));
+        let after_clear = overlay.analysis_generation();
+        assert!(after_clear > after_set);
+        assert!(overlay.set(file.abs_path(), "fn second() {}\n".to_string()));
+        let before_clear_all = overlay.analysis_generation();
+        overlay.clear_all();
+        assert!(overlay.analysis_generation() > before_clear_all);
     }
 
     #[test]

@@ -1,10 +1,509 @@
 use super::*;
 use crate::analyzer::structural::CodeQuery;
 use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
-use crate::analyzer::{CodeUnitType, JavaAnalyzer, PhpAnalyzer, TestProject, TypescriptAnalyzer};
+use crate::analyzer::{
+    AnalyzerConfig, CSharpAnalyzer, CodeUnitType, CppAnalyzer, GoAnalyzer, JavaAnalyzer,
+    JavascriptAnalyzer, OverlayProject, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer,
+    ScalaAnalyzer, TestProject, TypescriptAnalyzer, WorkspaceAnalyzer,
+};
 use serde_json::json;
 use std::cell::Cell;
 use std::path::PathBuf;
+
+fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnalyzer> {
+    match language {
+        Language::Cpp => Box::new(CppAnalyzer::from_project(project)),
+        Language::CSharp => Box::new(CSharpAnalyzer::from_project(project)),
+        Language::Go => Box::new(GoAnalyzer::from_project(project)),
+        Language::Java => Box::new(JavaAnalyzer::from_project(project)),
+        Language::JavaScript => Box::new(JavascriptAnalyzer::from_project(project)),
+        Language::Php => Box::new(PhpAnalyzer::from_project(project)),
+        Language::Python => Box::new(PythonAnalyzer::from_project(project)),
+        Language::Ruby => Box::new(RubyAnalyzer::from_project(project)),
+        Language::Rust => Box::new(RustAnalyzer::from_project(project)),
+        Language::Scala => Box::new(ScalaAnalyzer::from_project(project)),
+        Language::TypeScript => Box::new(TypescriptAnalyzer::from_project(project)),
+        other => panic!("no structural differential fixture for {other:?}"),
+    }
+}
+
+#[test]
+fn indexed_postings_match_scan_results_in_every_structural_language() {
+    let cases = [
+        (
+            Language::Cpp,
+            "app.cpp",
+            "void audit() {}\nvoid run() { audit(); }\n",
+        ),
+        (
+            Language::CSharp,
+            "App.cs",
+            "class App { void Audit() {} void Run() { Audit(); } }\n",
+        ),
+        (
+            Language::Go,
+            "app.go",
+            "package app\nfunc audit() {}\nfunc run() { audit() }\n",
+        ),
+        (
+            Language::Java,
+            "App.java",
+            "class App { void audit() {} void run() { audit(); } }\n",
+        ),
+        (
+            Language::JavaScript,
+            "app.js",
+            "function audit() {}\nfunction run() { audit(); }\n",
+        ),
+        (
+            Language::Php,
+            "app.php",
+            "<?php\nfunction audit() {}\nfunction run() { audit(); }\n",
+        ),
+        (
+            Language::Python,
+            "app.py",
+            "def audit():\n    pass\n\ndef run():\n    audit()\n",
+        ),
+        (
+            Language::Ruby,
+            "app.rb",
+            "def audit; end\ndef run; audit(); end\n",
+        ),
+        (
+            Language::Rust,
+            "lib.rs",
+            "fn audit() {}\nfn run() { audit(); }\n",
+        ),
+        (
+            Language::Scala,
+            "App.scala",
+            "object App { def audit(): Unit = (); def run(): Unit = audit() }\n",
+        ),
+        (
+            Language::TypeScript,
+            "app.ts",
+            "function audit(): void {}\nfunction run(): void { audit(); }\n",
+        ),
+    ];
+    for (language, path, source) in cases {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), path)
+            .write(source)
+            .expect("write source");
+        let analyzer = language_analyzer(language, TestProject::new(root, language));
+        let callee = if language == Language::CSharp {
+            "Audit"
+        } else {
+            "audit"
+        };
+        let query = CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": callee }
+            }
+        }))
+        .expect("query");
+        let scan = execute_code_query_with_access_mode(
+            analyzer.as_ref(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::ScanOnly,
+            true,
+        )
+        .expect("scan access");
+        let indexed = execute_code_query_with_access_mode(
+            analyzer.as_ref(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::IndexedRequired,
+            true,
+        )
+        .expect("indexed access");
+
+        assert_eq!(
+            serde_json::to_value(&indexed.result).expect("indexed result JSON"),
+            serde_json::to_value(&scan.result).expect("scan result JSON"),
+            "response mismatch for {language:?}"
+        );
+        assert_eq!(indexed.work, scan.work, "budget mismatch for {language:?}");
+        let profile = indexed.profile.expect("indexed profile");
+        assert!(
+            profile.access_path.selected.starts_with("posting:"),
+            "unexpected access path for {language:?}: {:?}",
+            profile.access_path
+        );
+        assert!(profile.access_path.candidate_facts > 0);
+        assert!(
+            profile.access_path.candidate_facts < profile.access_path.scoped_fact_nodes,
+            "fixture must prove fact reduction for {language:?}: {:?}",
+            profile.access_path
+        );
+    }
+}
+
+fn run_required_index(analyzer: &dyn IAnalyzer, name: &str) -> DetailedCodeQueryResult {
+    run_class_query(analyzer, name, StructuralAccessMode::IndexedRequired)
+}
+
+fn run_class_query(
+    analyzer: &dyn IAnalyzer,
+    name: &str,
+    access_mode: StructuralAccessMode,
+) -> DetailedCodeQueryResult {
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": name }
+    }))
+    .expect("class query");
+    execute_code_query_with_access_mode(
+        analyzer,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        access_mode,
+        true,
+    )
+    .expect("class query")
+}
+
+#[test]
+fn snapshot_index_reuses_clones_and_resets_updates_and_overlays() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), "app.ts");
+    file.write("class Before {}\n").expect("write source");
+    let project: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root, Language::TypeScript));
+    let analyzer = TypescriptAnalyzer::new(Arc::clone(&project));
+
+    let first = run_required_index(&analyzer, "Before");
+    assert_eq!(first.result.structural_matches().len(), 1);
+    assert_eq!(
+        first
+            .profile
+            .expect("first profile")
+            .access_path
+            .index_builds,
+        1
+    );
+
+    let clone = analyzer.clone();
+    let reused = run_required_index(&clone, "Before");
+    let reused_profile = reused.profile.expect("clone profile");
+    assert_eq!(reused.result.structural_matches().len(), 1);
+    assert_eq!(reused_profile.access_path.index_hits, 1);
+    assert_eq!(reused_profile.access_path.index_builds, 0);
+
+    file.write("class After {}\n").expect("update source");
+    let updated = analyzer.update(&BTreeSet::from([file.clone()]));
+    let after = run_required_index(&updated, "After");
+    assert_eq!(after.result.structural_matches().len(), 1);
+    assert_eq!(
+        after
+            .profile
+            .expect("update profile")
+            .access_path
+            .index_builds,
+        1
+    );
+    assert!(
+        run_required_index(&updated, "Before")
+            .result
+            .structural_matches()
+            .is_empty()
+    );
+
+    let overlay = Arc::new(OverlayProject::new(Arc::clone(&project)));
+    assert!(overlay.set(file.abs_path(), "class Overlay {}\n".to_string()));
+    let snapshot = updated.clone_with_project(overlay as Arc<dyn crate::analyzer::Project>);
+    let overlay_result = run_required_index(&snapshot, "Overlay");
+    assert_eq!(overlay_result.result.structural_matches().len(), 1);
+    assert_eq!(
+        overlay_result
+            .profile
+            .expect("overlay profile")
+            .access_path
+            .index_builds,
+        1
+    );
+}
+
+#[test]
+fn update_all_rebuilds_postings_for_added_and_deleted_files() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let before = ProjectFile::new(root.clone(), "before.ts");
+    before
+        .write("class Before {}\n")
+        .expect("write original source");
+    let project: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root.clone(), Language::TypeScript));
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    assert_eq!(
+        run_required_index(workspace.analyzer(), "Before")
+            .result
+            .structural_matches()
+            .len(),
+        1
+    );
+
+    let added = ProjectFile::new(root, "added.ts");
+    added.write("class Added {}\n").expect("write added source");
+    let with_added = workspace.update_all();
+    let added_result = run_required_index(with_added.analyzer(), "Added");
+    assert_eq!(added_result.result.structural_matches().len(), 1);
+    assert_eq!(
+        added_result
+            .profile
+            .expect("added profile")
+            .access_path
+            .index_builds,
+        1
+    );
+
+    std::fs::remove_file(before.abs_path()).expect("delete original source");
+    let without_before = with_added.update_all();
+    assert!(
+        run_required_index(without_before.analyzer(), "Before")
+            .result
+            .structural_matches()
+            .is_empty()
+    );
+    assert_eq!(
+        run_required_index(without_before.analyzer(), "Added")
+            .result
+            .structural_matches()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn mutable_overlay_generation_invalidates_cached_postings() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), "app.ts");
+    file.write("class Before {}\n").expect("write source");
+    let disk: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root, Language::TypeScript));
+    let overlay = Arc::new(OverlayProject::new(disk));
+    let analyzer =
+        TypescriptAnalyzer::new(Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>);
+
+    assert_eq!(
+        run_required_index(&analyzer, "Before")
+            .result
+            .structural_matches()
+            .len(),
+        1
+    );
+    assert!(overlay.set(file.abs_path(), "class After {}\n".to_string()));
+
+    assert!(
+        run_class_query(&analyzer, "Before", StructuralAccessMode::ScanOnly)
+            .result
+            .structural_matches()
+            .is_empty(),
+        "the scan path must observe the revised live overlay"
+    );
+    assert_eq!(
+        run_class_query(&analyzer, "After", StructuralAccessMode::ScanOnly)
+            .result
+            .structural_matches()
+            .len(),
+        1
+    );
+    let revised = run_required_index(&analyzer, "After");
+    assert_eq!(revised.result.structural_matches().len(), 1);
+    assert_eq!(
+        revised
+            .profile
+            .expect("revised profile")
+            .access_path
+            .index_builds,
+        1,
+        "the revised overlay generation must not hit the old posting index"
+    );
+    assert!(
+        run_required_index(&analyzer, "Before")
+            .result
+            .structural_matches()
+            .is_empty(),
+        "old negative evidence must not survive the generation change"
+    );
+}
+
+#[test]
+fn auto_reuses_but_does_not_build_a_whole_snapshot_for_a_narrow_scope() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "app.ts")
+        .write("class App {}\n")
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+
+    let first = run_class_query(&analyzer, "App", StructuralAccessMode::Auto);
+    let first_profile = first.profile.expect("auto profile");
+    assert_eq!(first_profile.access_path.selected, "scan_only");
+    assert_eq!(first_profile.access_path.index_lookups, 0);
+
+    let built = run_required_index(&analyzer, "App");
+    assert_eq!(
+        built
+            .profile
+            .expect("build profile")
+            .access_path
+            .index_builds,
+        1
+    );
+
+    let reused = run_class_query(&analyzer, "App", StructuralAccessMode::Auto);
+    let reused_profile = reused.profile.expect("reuse profile");
+    assert!(reused_profile.access_path.selected.starts_with("posting:"));
+    assert_eq!(reused_profile.access_path.index_hits, 1);
+    assert_eq!(reused_profile.access_path.cache_ready_lookups, 1);
+}
+
+#[test]
+fn auto_builds_only_after_a_viable_scope_is_reused() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    for index in 0..MIN_AUTO_STRUCTURAL_INDEX_FILES {
+        ProjectFile::new(root.clone(), format!("file_{index}.ts"))
+            .write(format!("class Type{index} {{}}\n"))
+            .expect("write source");
+    }
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+
+    let first = run_class_query(&analyzer, "Type0", StructuralAccessMode::Auto);
+    let first_profile = first.profile.expect("first profile");
+    assert_eq!(first_profile.access_path.selected, "scan_only");
+    assert_eq!(first_profile.access_path.index_lookups, 0);
+
+    let second = run_class_query(&analyzer, "Type0", StructuralAccessMode::Auto);
+    let second_profile = second.profile.expect("second profile");
+    assert_eq!(second_profile.access_path.index_builds, 1);
+    assert!(second_profile.access_path.selected.starts_with("posting:"));
+
+    let third = run_class_query(&analyzer, "Type0", StructuralAccessMode::Auto);
+    let third_profile = third.profile.expect("third profile");
+    assert_eq!(third_profile.access_path.index_hits, 1);
+    assert_eq!(third_profile.access_path.index_builds, 0);
+}
+
+#[test]
+fn indexed_rql_and_json_queries_are_response_equivalent() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "app.ts")
+        .write("class App {}\n")
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let json_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "class", "name": "App" }
+    }))
+    .expect("JSON query");
+    let rql_query = CodeQuery::from_source("(class :name \"App\")").expect("RQL query");
+
+    let json_result = execute_code_query_with_access_mode(
+        &analyzer,
+        &json_query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::IndexedRequired,
+        true,
+    )
+    .expect("indexed JSON query");
+    let rql_result = execute_code_query_with_access_mode(
+        &analyzer,
+        &rql_query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::IndexedRequired,
+        true,
+    )
+    .expect("indexed RQL query");
+
+    assert_eq!(
+        serde_json::to_value(&rql_result.result).expect("RQL result JSON"),
+        serde_json::to_value(&json_result.result).expect("JSON result JSON")
+    );
+    assert_eq!(rql_result.work, json_result.work);
+}
+
+#[test]
+fn indexed_candidates_preserve_nested_capture_negation_and_budget_cutoffs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "a.ts")
+        .write(
+            "class Controller { run(): void { audit(\"ok\"); } }\nfunction audit(value: string): void {}\n",
+        )
+        .expect("write first source");
+    ProjectFile::new(root.clone(), "b.ts")
+        .write(
+            "class Excluded { run(): void { audit(\"bad\"); } }\nfunction audit(value: string): void {}\n",
+        )
+        .expect("write second source");
+    ProjectFile::new(root.clone(), "c.ts")
+        .write(
+            "class ControllerTwo { run(): void { audit(\"also-ok\"); } }\nfunction audit(value: string): void {}\n",
+        )
+        .expect("write third source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "match": {
+            "kind": "call",
+            "callee": { "name": { "regex": "^audit$" } },
+            "args": [{ "capture": "argument" }]
+        },
+        "inside": { "kind": "method", "name": "run" },
+        "not_inside": { "kind": "class", "name": "Excluded" },
+        "result_detail": "full",
+        "limit": 1
+    }))
+    .expect("nested query");
+
+    for limits in [
+        CodeQueryExecutionLimits::default(),
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+        CodeQueryExecutionLimits {
+            max_scanned_source_bytes: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+        CodeQueryExecutionLimits {
+            max_fact_nodes: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    ] {
+        let scan = execute_code_query_with_access_mode(
+            &analyzer,
+            &query,
+            limits,
+            StructuralAccessMode::ScanOnly,
+            true,
+        )
+        .expect("scan query");
+        let indexed = execute_code_query_with_access_mode(
+            &analyzer,
+            &query,
+            limits,
+            StructuralAccessMode::IndexedRequired,
+            true,
+        )
+        .expect("indexed query");
+        assert_eq!(
+            serde_json::to_value(&indexed.result).expect("indexed result"),
+            serde_json::to_value(&scan.result).expect("scan result")
+        );
+        assert_eq!(indexed.work, scan.work);
+    }
+}
 
 fn diagnostic(
     code: CodeQueryDiagnosticCode,
@@ -1709,6 +2208,8 @@ fn cancellation_bearing_parallel_union_runs_cancellation_safe_tasks() {
         true,
         UnionExecutionStrategy::Parallel,
         2,
+        StructuralAccessMode::Auto,
+        None,
     );
 
     assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);

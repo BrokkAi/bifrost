@@ -166,6 +166,15 @@ where
         }
     }
 
+    /// Return a resident complete value without reserving build leadership.
+    /// This supports physical planners that may reuse an index for a narrow
+    /// request but must not construct the whole-workspace value for it.
+    pub(crate) fn get_ready(&self, key: &K, cancellation: &CancellationToken) -> Option<Arc<V>> {
+        (!cancellation.is_cancelled())
+            .then(|| self.entries.get(key))
+            .flatten()
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_complete_for_test(&self, key: K, value: Arc<V>) {
         self.entries.insert(key, value);

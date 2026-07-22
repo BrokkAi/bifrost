@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use super::super::query::CodeQuery;
 use super::super::search::CodeQueryResult;
@@ -28,6 +29,7 @@ pub(crate) struct QueryExecutionProfile {
     /// Total budget-accounted request work (`execution_work + rendering_work`).
     pub(crate) work: QueryOperatorWorkProfile,
     pub(crate) cache: QueryCacheProfile,
+    pub(crate) access_path: QueryAccessPathProfile,
     #[serde(skip)]
     pub(crate) scheduler_workers: usize,
 }
@@ -52,6 +54,7 @@ impl QueryExecutionProfile {
             rendering_work: QueryOperatorWorkProfile::default(),
             work: QueryOperatorWorkProfile::default(),
             cache: QueryCacheProfile::default(),
+            access_path: QueryAccessPathProfile::default(),
             scheduler_workers,
         }
     }
@@ -63,6 +66,150 @@ impl QueryExecutionProfile {
     pub(crate) fn record_scheduler_run(&mut self, run: SchedulerRunProfile) {
         self.peak_concurrency = self.peak_concurrency.max(run.peak_concurrency);
         self.scheduler = self.scheduler.saturating_add(run);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct QueryAccessPathProfile {
+    pub(crate) selected: String,
+    pub(crate) representation_version: u32,
+    pub(crate) estimated_provider_files: u64,
+    pub(crate) scoped_files: u64,
+    /// Exact total facts in the scoped provider files when an index supplies
+    /// metadata. Zero on scan-only paths where counting excluded files would
+    /// itself require extra materialization.
+    pub(crate) scoped_fact_nodes: u64,
+    /// Facts admitted by compatibility source filtering and charged to the
+    /// execution budget. This is available and comparable on both paths.
+    pub(crate) admitted_fact_nodes: u64,
+    pub(crate) candidate_files: u64,
+    pub(crate) candidate_facts: u64,
+    pub(crate) selected_terms: Vec<QueryAccessPathTermProfile>,
+    pub(crate) source_verification_required: bool,
+    pub(crate) cache_ready_lookups: u64,
+    pub(crate) materialized_files: u64,
+    pub(crate) materialized_fact_nodes: u64,
+    pub(crate) inspected_source_bytes: u64,
+    pub(crate) examined_fact_nodes: u64,
+    pub(crate) index_lookups: u64,
+    pub(crate) index_hits: u64,
+    pub(crate) index_misses: u64,
+    pub(crate) index_builds: u64,
+    pub(crate) index_waits: u64,
+    pub(crate) index_wait_ns: u64,
+    pub(crate) index_cancelled: u64,
+    pub(crate) index_unavailable: u64,
+    pub(crate) index_over_budget: u64,
+    pub(crate) scan_fallbacks: u64,
+    pub(crate) index_build_files: u64,
+    pub(crate) index_build_source_bytes: u64,
+    pub(crate) index_build_fact_nodes: u64,
+    pub(crate) index_build_facts_bytes: u64,
+    pub(crate) index_build_ns: u64,
+    pub(crate) retained_bytes: u64,
+}
+
+impl QueryAccessPathProfile {
+    pub(crate) fn record_selected(&mut self, selected: &str) {
+        self.selected = merge_access_path_labels(&self.selected, selected);
+    }
+
+    pub(crate) fn saturating_add(mut self, other: Self) -> Self {
+        self.selected = merge_access_path_labels(&self.selected, &other.selected);
+        self.representation_version = self
+            .representation_version
+            .max(other.representation_version);
+        self.estimated_provider_files = self
+            .estimated_provider_files
+            .saturating_add(other.estimated_provider_files);
+        self.scoped_files = self.scoped_files.saturating_add(other.scoped_files);
+        self.scoped_fact_nodes = self
+            .scoped_fact_nodes
+            .saturating_add(other.scoped_fact_nodes);
+        self.admitted_fact_nodes = self
+            .admitted_fact_nodes
+            .saturating_add(other.admitted_fact_nodes);
+        self.candidate_files = self.candidate_files.saturating_add(other.candidate_files);
+        self.candidate_facts = self.candidate_facts.saturating_add(other.candidate_facts);
+        self.selected_terms = merge_access_term_profiles(self.selected_terms, other.selected_terms);
+        self.source_verification_required |= other.source_verification_required;
+        self.cache_ready_lookups = self
+            .cache_ready_lookups
+            .saturating_add(other.cache_ready_lookups);
+        self.materialized_files = self
+            .materialized_files
+            .saturating_add(other.materialized_files);
+        self.materialized_fact_nodes = self
+            .materialized_fact_nodes
+            .saturating_add(other.materialized_fact_nodes);
+        self.inspected_source_bytes = self
+            .inspected_source_bytes
+            .saturating_add(other.inspected_source_bytes);
+        self.examined_fact_nodes = self
+            .examined_fact_nodes
+            .saturating_add(other.examined_fact_nodes);
+        self.index_lookups = self.index_lookups.saturating_add(other.index_lookups);
+        self.index_hits = self.index_hits.saturating_add(other.index_hits);
+        self.index_misses = self.index_misses.saturating_add(other.index_misses);
+        self.index_builds = self.index_builds.saturating_add(other.index_builds);
+        self.index_waits = self.index_waits.saturating_add(other.index_waits);
+        self.index_wait_ns = self.index_wait_ns.saturating_add(other.index_wait_ns);
+        self.index_cancelled = self.index_cancelled.saturating_add(other.index_cancelled);
+        self.index_unavailable = self
+            .index_unavailable
+            .saturating_add(other.index_unavailable);
+        self.index_over_budget = self
+            .index_over_budget
+            .saturating_add(other.index_over_budget);
+        self.scan_fallbacks = self.scan_fallbacks.saturating_add(other.scan_fallbacks);
+        self.index_build_files = self
+            .index_build_files
+            .saturating_add(other.index_build_files);
+        self.index_build_source_bytes = self
+            .index_build_source_bytes
+            .saturating_add(other.index_build_source_bytes);
+        self.index_build_fact_nodes = self
+            .index_build_fact_nodes
+            .saturating_add(other.index_build_fact_nodes);
+        self.index_build_facts_bytes = self
+            .index_build_facts_bytes
+            .saturating_add(other.index_build_facts_bytes);
+        self.index_build_ns = self.index_build_ns.saturating_add(other.index_build_ns);
+        self.retained_bytes = self.retained_bytes.saturating_add(other.retained_bytes);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct QueryAccessPathTermProfile {
+    pub(crate) label: String,
+    pub(crate) candidate_facts: u64,
+}
+
+fn merge_access_term_profiles(
+    left: Vec<QueryAccessPathTermProfile>,
+    right: Vec<QueryAccessPathTermProfile>,
+) -> Vec<QueryAccessPathTermProfile> {
+    let mut totals = BTreeMap::new();
+    for term in left.into_iter().chain(right) {
+        let total = totals.entry(term.label).or_insert(0u64);
+        *total = total.saturating_add(term.candidate_facts);
+    }
+    totals
+        .into_iter()
+        .map(|(label, candidate_facts)| QueryAccessPathTermProfile {
+            label,
+            candidate_facts,
+        })
+        .collect()
+}
+
+fn merge_access_path_labels(left: &str, right: &str) -> String {
+    match (left.is_empty(), right.is_empty(), left == right) {
+        (true, true, _) => String::new(),
+        (true, false, _) => right.to_string(),
+        (false, true, _) | (false, false, true) => left.to_string(),
+        (false, false, false) => "mixed".to_string(),
     }
 }
 
@@ -434,12 +581,13 @@ pub struct CodeQueryProfile {
     pub timings_ns: CodeQueryProfileTimings,
     pub work: CodeQueryProfileWork,
     pub cache_layers: Vec<CodeQueryProfileCacheLayer>,
+    pub access_path: CodeQueryAccessPathProfile,
     pub scheduling: CodeQueryProfileScheduling,
     pub operators: Vec<CodeQueryOperatorObservation>,
 }
 
 impl CodeQueryProfile {
-    pub const FORMAT: &'static str = "bifrost_code_query_profile/v1";
+    pub const FORMAT: &'static str = "bifrost_code_query_profile/v2";
 
     pub(crate) fn from_internal(
         query: &CodeQuery,
@@ -463,6 +611,7 @@ impl CodeQueryProfile {
             },
             work: CodeQueryProfileWork::from_internal(profile.work),
             cache_layers: CodeQueryProfileCacheLayer::from_internal(profile.cache),
+            access_path: CodeQueryAccessPathProfile::from_internal(profile.access_path),
             scheduling: CodeQueryProfileScheduling {
                 peak_concurrency: profile.peak_concurrency,
                 bounded_dispatch,
@@ -472,6 +621,96 @@ impl CodeQueryProfile {
                 .into_iter()
                 .map(CodeQueryOperatorObservation::from_internal)
                 .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryAccessPathProfile {
+    pub selected: String,
+    pub representation_version: u32,
+    pub estimated_provider_files: u64,
+    pub scoped_files: u64,
+    pub scoped_fact_nodes: u64,
+    pub admitted_fact_nodes: u64,
+    pub candidate_files: u64,
+    pub candidate_facts: u64,
+    pub selected_terms: Vec<CodeQueryAccessPathTermProfile>,
+    pub source_verification_required: bool,
+    pub cache_ready_lookups: u64,
+    pub materialized_files: u64,
+    pub materialized_fact_nodes: u64,
+    pub inspected_source_bytes: u64,
+    pub examined_fact_nodes: u64,
+    pub index_lookups: u64,
+    pub index_hits: u64,
+    pub index_misses: u64,
+    pub index_builds: u64,
+    pub index_waits: u64,
+    pub index_wait_ns: u64,
+    pub index_cancelled: u64,
+    pub index_unavailable: u64,
+    pub index_over_budget: u64,
+    pub scan_fallbacks: u64,
+    pub index_build_files: u64,
+    pub index_build_source_bytes: u64,
+    pub index_build_fact_nodes: u64,
+    pub index_build_facts_bytes: u64,
+    pub index_build_ns: u64,
+    pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryAccessPathTermProfile {
+    pub label: String,
+    pub candidate_facts: u64,
+}
+
+impl CodeQueryAccessPathProfile {
+    fn from_internal(profile: QueryAccessPathProfile) -> Self {
+        Self {
+            selected: if profile.selected.is_empty() {
+                "scan_only".to_string()
+            } else {
+                profile.selected
+            },
+            representation_version: profile.representation_version,
+            estimated_provider_files: profile.estimated_provider_files,
+            scoped_files: profile.scoped_files,
+            scoped_fact_nodes: profile.scoped_fact_nodes,
+            admitted_fact_nodes: profile.admitted_fact_nodes,
+            candidate_files: profile.candidate_files,
+            candidate_facts: profile.candidate_facts,
+            selected_terms: profile
+                .selected_terms
+                .into_iter()
+                .map(|term| CodeQueryAccessPathTermProfile {
+                    label: term.label,
+                    candidate_facts: term.candidate_facts,
+                })
+                .collect(),
+            source_verification_required: profile.source_verification_required,
+            cache_ready_lookups: profile.cache_ready_lookups,
+            materialized_files: profile.materialized_files,
+            materialized_fact_nodes: profile.materialized_fact_nodes,
+            inspected_source_bytes: profile.inspected_source_bytes,
+            examined_fact_nodes: profile.examined_fact_nodes,
+            index_lookups: profile.index_lookups,
+            index_hits: profile.index_hits,
+            index_misses: profile.index_misses,
+            index_builds: profile.index_builds,
+            index_waits: profile.index_waits,
+            index_wait_ns: profile.index_wait_ns,
+            index_cancelled: profile.index_cancelled,
+            index_unavailable: profile.index_unavailable,
+            index_over_budget: profile.index_over_budget,
+            scan_fallbacks: profile.scan_fallbacks,
+            index_build_files: profile.index_build_files,
+            index_build_source_bytes: profile.index_build_source_bytes,
+            index_build_fact_nodes: profile.index_build_fact_nodes,
+            index_build_facts_bytes: profile.index_build_facts_bytes,
+            index_build_ns: profile.index_build_ns,
+            retained_bytes: profile.retained_bytes,
         }
     }
 }
@@ -1025,6 +1264,42 @@ mod public_contract_tests {
             "structural_facts"
         );
         assert_eq!(
+            value["access_path"],
+            json!({
+                "selected": "scan_only",
+                "representation_version": 0,
+                "estimated_provider_files": 0,
+                "scoped_files": 0,
+                "scoped_fact_nodes": 0,
+                "admitted_fact_nodes": 0,
+                "candidate_files": 0,
+                "candidate_facts": 0,
+                "selected_terms": [],
+                "source_verification_required": false,
+                "cache_ready_lookups": 0,
+                "materialized_files": 0,
+                "materialized_fact_nodes": 0,
+                "inspected_source_bytes": 0,
+                "examined_fact_nodes": 0,
+                "index_lookups": 0,
+                "index_hits": 0,
+                "index_misses": 0,
+                "index_builds": 0,
+                "index_waits": 0,
+                "index_wait_ns": 0,
+                "index_cancelled": 0,
+                "index_unavailable": 0,
+                "index_over_budget": 0,
+                "scan_fallbacks": 0,
+                "index_build_files": 0,
+                "index_build_source_bytes": 0,
+                "index_build_fact_nodes": 0,
+                "index_build_facts_bytes": 0,
+                "index_build_ns": 0,
+                "retained_bytes": 0
+            })
+        );
+        assert_eq!(
             value["scheduling"],
             json!({
                 "peak_concurrency": 2,
@@ -1083,7 +1358,6 @@ mod public_contract_tests {
             "final_in_authored_suffix",
             "derived_layer_request",
             "projection_filter_fingerprint",
-            "representation_version",
         ] {
             assert!(!serialized.contains(internal_field));
         }

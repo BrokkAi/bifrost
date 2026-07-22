@@ -11,15 +11,20 @@ use super::execution::plan::{
     PhysicalQueryOperator, PhysicalQueryPlan,
 };
 use super::execution::profile::{
-    CodeQueryProfile, QueryCacheProfile, QueryExecutionProfile, QueryOperatorDisposition,
-    QueryOperatorProfile, QueryOperatorTermination, QueryOperatorWorkProfile,
+    CodeQueryProfile, QueryAccessPathProfile, QueryAccessPathTermProfile, QueryCacheProfile,
+    QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
+    QueryOperatorTermination, QueryOperatorWorkProfile,
 };
 use super::execution::scheduler::BoundedReadyScheduler;
 use super::facts::{FileFacts, Span};
+use super::index::{
+    STRUCTURAL_INDEX_REPRESENTATION_VERSION, SnapshotStructuralIndex, StructuralCandidateSet,
+    StructuralIndexAcquisition, StructuralIndexBuildMetrics, StructuralIndexLifecycle,
+};
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::provider::StructuralFactsCacheOutcome;
+use super::provider::{StructuralFactsCacheOutcome, StructuralSearchProvider};
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
@@ -134,6 +139,15 @@ const MAX_PIPELINE_ROWS: usize = 50_000;
 const MAX_PROVENANCE_TRACES: usize = 16;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 const CODE_QUERY_SCHEDULER_WORKERS: usize = 2;
+const MIN_AUTO_STRUCTURAL_INDEX_FILES: usize = 8;
+const BENCHMARK_ACCESS_MODE_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuralAccessMode {
+    Auto,
+    ScanOnly,
+    IndexedRequired,
+}
 
 /// A match found before rendering, held until the rendering pass (which
 /// truncates at `limit` and does enclosing-symbol lookups).
@@ -964,6 +978,9 @@ struct QueryExecutionState<'a> {
     import_graph: Option<DirectImportGraph>,
     cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
+    observed_structural_indexes: Option<Arc<Mutex<HashSet<usize>>>>,
+    access_mode: StructuralAccessMode,
+    access_failure: Option<String>,
     parallel_seed_budget: Option<FairSeedBudgetLease>,
     scheduler_workers: usize,
 }
@@ -983,6 +1000,8 @@ struct ParallelSeedBranchResult {
     seed_cache: HashMap<String, CachedSeedExecution>,
     cache_profile: Option<QueryCacheProfile>,
     operators: Vec<QueryOperatorProfile>,
+    access_path: QueryAccessPathProfile,
+    access_failure: Option<String>,
 }
 
 struct ParallelUnionExecution {
@@ -1160,7 +1179,36 @@ pub(crate) fn execute_code_query_with_union_strategy(
         capture_profile,
         strategy,
         CODE_QUERY_SCHEDULER_WORKERS,
+        StructuralAccessMode::Auto,
+        None,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn execute_code_query_with_access_mode(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    mode: StructuralAccessMode,
+    capture_profile: bool,
+) -> Result<DetailedCodeQueryResult, String> {
+    let mut failure = None;
+    let detailed = execute_internal_with_strategy(
+        analyzer,
+        query,
+        limits,
+        None,
+        None,
+        capture_profile,
+        UnionExecutionStrategy::Sequential,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        mode,
+        Some(&mut failure),
+    );
+    match failure {
+        Some(failure) => Err(failure),
+        None => Ok(detailed),
+    }
 }
 
 #[cfg(test)]
@@ -1200,7 +1248,16 @@ fn execute_internal(
         capture_profile,
         UnionExecutionStrategy::Auto,
         CODE_QUERY_SCHEDULER_WORKERS,
+        benchmark_structural_access_mode(),
+        None,
     )
+}
+
+fn benchmark_structural_access_mode() -> StructuralAccessMode {
+    match std::env::var(BENCHMARK_ACCESS_MODE_ENV).as_deref() {
+        Ok("scan_only") => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::Auto,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,6 +1271,8 @@ fn execute_internal_with_strategy(
     capture_profile: bool,
     union_strategy: UnionExecutionStrategy,
     scheduler_workers: usize,
+    access_mode: StructuralAccessMode,
+    access_failure_out: Option<&mut Option<String>>,
 ) -> DetailedCodeQueryResult {
     // Keep repeated analyzer reads coherent and reusable even for direct API
     // callers that do not already own a wider request scope. Nested scopes are
@@ -1252,6 +1311,10 @@ fn execute_internal_with_strategy(
         cache_profile: capture_profile.then(QueryCacheProfile::default),
         profile: capture_profile
             .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
+        observed_structural_indexes: capture_profile
+            .then(|| Arc::new(Mutex::new(HashSet::default()))),
+        access_mode,
+        access_failure: None,
         parallel_seed_budget: None,
         scheduler_workers,
     };
@@ -1339,6 +1402,9 @@ fn execute_internal_with_strategy(
         profile.cache = state.cache_profile.unwrap_or_default();
     }
     let profile = state.profile;
+    if let Some(out) = access_failure_out {
+        *out = state.access_failure.take();
+    }
     let detailed = DetailedCodeQueryResult {
         result: CodeQueryResult {
             results,
@@ -2565,6 +2631,8 @@ fn execute_parallel_seed_union(
     let analyzer = state.analyzer;
     let cancellation = state.cancellation;
     let receiver_budget_override = state.receiver_budget_override;
+    let access_mode = state.access_mode;
+    let observed_structural_indexes = state.observed_structural_indexes.clone();
     let scheduler_workers = state.scheduler_workers;
     let base_budget = state.budget;
     let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
@@ -2590,6 +2658,9 @@ fn execute_parallel_seed_union(
                     cache_profile: profiling.then(QueryCacheProfile::default),
                     profile: profiling
                         .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
+                    observed_structural_indexes: observed_structural_indexes.clone(),
+                    access_mode,
+                    access_failure: None,
                     parallel_seed_budget: Some(lease.clone()),
                     scheduler_workers,
                 };
@@ -2614,17 +2685,18 @@ fn execute_parallel_seed_union(
                 debug_assert!(branch_state.reference_cache.outbound.is_empty());
                 debug_assert!(branch_state.call_cache.incoming.is_empty());
                 debug_assert!(branch_state.call_cache.outgoing.is_empty());
-                let operators = branch_state
-                    .profile
-                    .take()
-                    .map(|profile| profile.operators)
-                    .unwrap_or_default();
+                let (operators, access_path) = branch_state.profile.take().map_or_else(
+                    || (Vec::new(), QueryAccessPathProfile::default()),
+                    |profile| (profile.operators, profile.access_path),
+                );
                 ParallelSeedBranchResult {
                     execution,
                     diagnostics: branch_diagnostics,
                     seed_cache: branch_state.seed_cache,
                     cache_profile: branch_state.cache_profile,
                     operators,
+                    access_path,
+                    access_failure: branch_state.access_failure,
                 }
             }));
             match result {
@@ -2672,6 +2744,11 @@ fn execute_parallel_seed_union(
         }
         if let Some(profile) = &mut state.profile {
             profile.operators.extend(result.operators);
+            profile.access_path =
+                std::mem::take(&mut profile.access_path).saturating_add(result.access_path);
+        }
+        if state.access_failure.is_none() {
+            state.access_failure = result.access_failure;
         }
         if contributes_to_public_prefix {
             if result.execution.cancelled {
@@ -2820,6 +2897,343 @@ fn cancelled_plan_execution() -> PlanExecution {
     }
 }
 
+#[derive(Clone)]
+enum SeedStructuralAccess {
+    Scan,
+    Indexed {
+        index: Arc<SnapshotStructuralIndex>,
+        candidates: Arc<StructuralCandidateSet>,
+    },
+}
+
+impl SeedStructuralAccess {
+    fn index_file(&self, file: &ProjectFile) -> Option<&super::index::StructuralIndexFile> {
+        match self {
+            Self::Scan => None,
+            Self::Indexed { index, .. } => index.file(file),
+        }
+    }
+
+    fn candidate_facts(&self, file: &ProjectFile) -> Option<&[u32]> {
+        match self {
+            Self::Scan => None,
+            Self::Indexed { candidates, .. } => Some(candidates.facts_for(file)),
+        }
+    }
+
+    fn source_may_contain(&self, file: &ProjectFile, required_anchors: &[String]) -> Option<bool> {
+        match self {
+            Self::Scan => None,
+            Self::Indexed { index, .. } => index.source_may_contain(file, required_anchors),
+        }
+    }
+}
+
+fn record_index_build_facts(
+    profile: Option<&mut QueryCacheProfile>,
+    build: StructuralIndexBuildMetrics,
+) {
+    let Some(profile) = profile else {
+        return;
+    };
+    let facts = &mut profile.seed_structural_facts;
+    facts.lookups = facts
+        .lookups
+        .saturating_add(build.memory_hits)
+        .saturating_add(build.persisted_hydrations)
+        .saturating_add(build.extractions)
+        .saturating_add(build.unavailable)
+        .saturating_add(build.unknown_outcomes);
+    facts.memory_hits = facts.memory_hits.saturating_add(build.memory_hits);
+    facts.persisted_hydrations = facts
+        .persisted_hydrations
+        .saturating_add(build.persisted_hydrations);
+    facts.extractions = facts.extractions.saturating_add(build.extractions);
+    facts.unavailable = facts.unavailable.saturating_add(build.unavailable);
+    facts.unknown_outcomes = facts
+        .unknown_outcomes
+        .saturating_add(build.unknown_outcomes);
+    facts.replayed_files = facts.replayed_files.saturating_add(build.memory_hits);
+}
+
+fn record_index_build_access(
+    profile: Option<&mut QueryExecutionProfile>,
+    build: StructuralIndexBuildMetrics,
+) {
+    let Some(profile) = profile else {
+        return;
+    };
+    let access = &mut profile.access_path;
+    access.index_build_files = access.index_build_files.saturating_add(build.files);
+    access.index_build_source_bytes = access
+        .index_build_source_bytes
+        .saturating_add(build.source_bytes);
+    access.index_build_fact_nodes = access
+        .index_build_fact_nodes
+        .saturating_add(build.fact_nodes);
+    access.index_build_facts_bytes = access
+        .index_build_facts_bytes
+        .saturating_add(build.facts_bytes);
+    access.index_build_ns = access.index_build_ns.saturating_add(build.elapsed_ns);
+}
+
+fn load_seed_facts(
+    provider: &dyn StructuralSearchProvider,
+    file: &ProjectFile,
+    cache_profile: Option<&mut QueryCacheProfile>,
+) -> Option<Arc<FileFacts>> {
+    let Some(profile) = cache_profile else {
+        return provider.structural_facts(file);
+    };
+    let (facts, outcome) = provider.structural_facts_with_outcome(file);
+    match outcome {
+        StructuralFactsCacheOutcome::MemoryHit => profile
+            .seed_structural_facts
+            .record_memory_hit(facts.is_some()),
+        StructuralFactsCacheOutcome::PersistedHydration => {
+            profile.seed_structural_facts.record_persisted_hydration()
+        }
+        StructuralFactsCacheOutcome::Extracted => {
+            profile.seed_structural_facts.record_extraction();
+        }
+        StructuralFactsCacheOutcome::Unavailable => {
+            profile.seed_structural_facts.record_unavailable();
+        }
+        StructuralFactsCacheOutcome::Unknown => {
+            profile.seed_structural_facts.record_unknown();
+        }
+    }
+    facts
+}
+
+fn scan_access(
+    state: &mut QueryExecutionState<'_>,
+    scoped_files: usize,
+    fallback_reason: Option<&str>,
+) -> SeedStructuralAccess {
+    if let Some(profile) = &mut state.profile {
+        profile
+            .access_path
+            .record_selected(super::planner::StructuralAccessPathKind::ScanOnly.label());
+        profile.access_path.scoped_files = profile
+            .access_path
+            .scoped_files
+            .saturating_add(u64::try_from(scoped_files).unwrap_or(u64::MAX));
+        if fallback_reason.is_some() {
+            profile.access_path.scan_fallbacks =
+                profile.access_path.scan_fallbacks.saturating_add(1);
+        }
+    }
+    if state.access_mode == StructuralAccessMode::IndexedRequired && state.access_failure.is_none()
+    {
+        state.access_failure = fallback_reason
+            .map(str::to_string)
+            .or_else(|| Some("query has no sound structural posting requirements".to_string()));
+    }
+    SeedStructuralAccess::Scan
+}
+
+fn prepare_seed_access(
+    provider: &dyn StructuralSearchProvider,
+    provider_file_count: usize,
+    files: &[ProjectFile],
+    plan: &QueryPlan,
+    state: &mut QueryExecutionState<'_>,
+) -> SeedStructuralAccess {
+    if state.access_mode == StructuralAccessMode::ScanOnly {
+        return scan_access(state, files.len(), None);
+    }
+    if plan.structural_access().terms().is_empty() {
+        return scan_access(state, files.len(), None);
+    }
+    let Some(cache) = provider.snapshot_structural_index_cache() else {
+        return scan_access(
+            state,
+            files.len(),
+            Some("structural provider has no snapshot index cache"),
+        );
+    };
+
+    let uncancelled = CancellationToken::default();
+    let cancellation = state.cancellation.unwrap_or(&uncancelled);
+    let source_generation = provider.structural_source_generation();
+    let ready_index = cache.get_ready(source_generation, cancellation);
+    let cache_ready_before_lookup = ready_index.is_some();
+    let auto_build_is_viable = files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
+        && files.len().saturating_mul(4) >= provider_file_count;
+    if state.access_mode == StructuralAccessMode::Auto
+        && ready_index.is_none()
+        && (!auto_build_is_viable || !cache.observe_auto_reuse_opportunity(source_generation))
+    {
+        return scan_access(state, files.len(), None);
+    }
+    let acquisition = ready_index.map_or_else(
+        || cache.acquire(provider, cancellation),
+        |index| StructuralIndexAcquisition::Ready {
+            index,
+            lifecycle: StructuralIndexLifecycle::Hit,
+            wait: Default::default(),
+            build: StructuralIndexBuildMetrics::default(),
+        },
+    );
+    if let Some(profile) = &mut state.profile {
+        let access = &mut profile.access_path;
+        access.representation_version = STRUCTURAL_INDEX_REPRESENTATION_VERSION;
+        access.index_lookups = access.index_lookups.saturating_add(1);
+        let wait = match &acquisition {
+            StructuralIndexAcquisition::Ready { wait, .. }
+            | StructuralIndexAcquisition::Unavailable { wait, .. }
+            | StructuralIndexAcquisition::Cancelled { wait, .. } => *wait,
+        };
+        access.index_waits = access.index_waits.saturating_add(wait.waits);
+        access.index_wait_ns = access.index_wait_ns.saturating_add(wait.wait_ns);
+    }
+
+    match acquisition {
+        StructuralIndexAcquisition::Ready {
+            index,
+            lifecycle,
+            build,
+            ..
+        } => {
+            if index.source_generation() != provider.structural_source_generation() {
+                return scan_access(
+                    state,
+                    files.len(),
+                    Some("structural source generation changed before index selection"),
+                );
+            }
+            record_index_build_facts(state.cache_profile.as_mut(), build);
+            record_index_build_access(state.profile.as_mut(), build);
+            if let Some(profile) = &mut state.profile {
+                let access = &mut profile.access_path;
+                match lifecycle {
+                    StructuralIndexLifecycle::Hit => {
+                        access.index_hits = access.index_hits.saturating_add(1)
+                    }
+                    StructuralIndexLifecycle::Built => {
+                        access.index_misses = access.index_misses.saturating_add(1);
+                        access.index_builds = access.index_builds.saturating_add(1);
+                    }
+                }
+                let first_observation =
+                    state
+                        .observed_structural_indexes
+                        .as_ref()
+                        .is_some_and(|observed| {
+                            observed
+                                .lock()
+                                .expect("observed structural index lock poisoned")
+                                .insert(Arc::as_ptr(&index) as usize)
+                        });
+                if first_observation {
+                    access.retained_bytes =
+                        access.retained_bytes.saturating_add(index.retained_bytes());
+                }
+            }
+            let selection = index.select(
+                plan.structural_access(),
+                files,
+                plan.has_source_anchors(),
+                cache_ready_before_lookup,
+                cancellation,
+            );
+            if index.source_generation() != provider.structural_source_generation() {
+                return scan_access(
+                    state,
+                    files.len(),
+                    Some("structural source generation changed during index selection"),
+                );
+            }
+            match selection {
+                Ok(Some(candidates)) => {
+                    if let Some(profile) = &mut state.profile {
+                        let access = &mut profile.access_path;
+                        access.record_selected(&format!(
+                            "{}:{}",
+                            candidates.estimate.kind.label(),
+                            candidates.selected
+                        ));
+                        access.scoped_files = access
+                            .scoped_files
+                            .saturating_add(candidates.estimate.scoped_files);
+                        access.estimated_provider_files = access
+                            .estimated_provider_files
+                            .saturating_add(candidates.estimate.provider_files);
+                        access.scoped_fact_nodes = access
+                            .scoped_fact_nodes
+                            .saturating_add(candidates.estimate.scoped_fact_nodes);
+                        access.candidate_files = access
+                            .candidate_files
+                            .saturating_add(candidates.estimate.candidate_files);
+                        access.candidate_facts = access
+                            .candidate_facts
+                            .saturating_add(candidates.estimate.candidate_facts);
+                        access.selected_terms.extend(
+                            candidates.estimate.selected_terms.iter().map(|term| {
+                                QueryAccessPathTermProfile {
+                                    label: term.label.to_string(),
+                                    candidate_facts: term.candidate_facts,
+                                }
+                            }),
+                        );
+                        access.source_verification_required |=
+                            candidates.estimate.source_verification_required;
+                        access.cache_ready_lookups = access.cache_ready_lookups.saturating_add(
+                            u64::from(candidates.estimate.cache_ready_before_lookup),
+                        );
+                    }
+                    SeedStructuralAccess::Indexed {
+                        index,
+                        candidates: Arc::new(candidates),
+                    }
+                }
+                Ok(None) => scan_access(state, files.len(), None),
+                Err(reason) => {
+                    if reason.contains("cancelled")
+                        && let Some(profile) = &mut state.profile
+                    {
+                        profile.access_path.index_cancelled =
+                            profile.access_path.index_cancelled.saturating_add(1);
+                    }
+                    scan_access(state, files.len(), Some(reason))
+                }
+            }
+        }
+        StructuralIndexAcquisition::Unavailable { reason, build, .. } => {
+            record_index_build_facts(state.cache_profile.as_mut(), build);
+            record_index_build_access(state.profile.as_mut(), build);
+            if let Some(profile) = &mut state.profile {
+                let access = &mut profile.access_path;
+                access.index_misses = access.index_misses.saturating_add(1);
+                access.index_builds = access.index_builds.saturating_add(1);
+                access.index_unavailable = access.index_unavailable.saturating_add(1);
+                if reason.contains("limit") || reason.contains("retained-byte") {
+                    access.index_over_budget = access.index_over_budget.saturating_add(1);
+                }
+            }
+            scan_access(state, files.len(), Some(reason))
+        }
+        StructuralIndexAcquisition::Cancelled { build, .. } => {
+            record_index_build_facts(state.cache_profile.as_mut(), build);
+            record_index_build_access(state.profile.as_mut(), build);
+            if let Some(profile) = &mut state.profile {
+                let access = &mut profile.access_path;
+                access.index_misses = access.index_misses.saturating_add(1);
+                access.index_cancelled = access.index_cancelled.saturating_add(1);
+                if build.elapsed_ns > 0 {
+                    access.index_builds = access.index_builds.saturating_add(1);
+                }
+            }
+            scan_access(
+                state,
+                files.len(),
+                Some("structural index acquisition cancelled"),
+            )
+        }
+    }
+}
+
 fn execute_seed(
     seed: &CodeQuerySeed,
     terminal_cap: Option<usize>,
@@ -2881,7 +3295,8 @@ fn execute_seed(
     let diagnostic_start = diagnostics.len();
     let plan = QueryPlan::for_query(seed);
     let source_index = plan.build_source_index();
-    let mut providers = state.analyzer.structural_search_providers();
+    let analyzer = state.analyzer;
+    let mut providers = analyzer.structural_search_providers();
     providers.sort_by_key(|provider| provider.structural_language());
     providers.retain(|provider| {
         seed.languages.is_empty() || seed.languages.contains(&provider.structural_language())
@@ -2913,6 +3328,7 @@ fn execute_seed(
         let language = provider.structural_language();
         supported.insert(language);
         let mut files = provider.structural_files();
+        let provider_file_count = files.len();
         files.retain(|file| file_matches_globs(file, seed));
         files.sort();
         let explicitly_requested = seed.languages.contains(&language);
@@ -2931,7 +3347,12 @@ fn execute_seed(
                     }),
             );
         }
-        provider_scopes.push((language, provider, files));
+        let access = if files.is_empty() {
+            SeedStructuralAccess::Scan
+        } else {
+            prepare_seed_access(provider, provider_file_count, &files, &plan, state)
+        };
+        provider_scopes.push((language, provider, files, access));
     }
     for language in state.analyzer.languages() {
         let explicitly_requested = seed.languages.contains(&language);
@@ -2954,12 +3375,16 @@ fn execute_seed(
     }
 
     let mut candidates = Vec::new();
-    for (language, provider, files) in provider_scopes {
-        candidates.extend(
-            files
-                .into_iter()
-                .map(|file| (rel_path_string(&file), language, provider, file)),
-        );
+    for (language, provider, files, access) in provider_scopes {
+        candidates.extend(files.into_iter().map(|file| {
+            (
+                rel_path_string(&file),
+                language,
+                provider,
+                file,
+                access.clone(),
+            )
+        }));
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
@@ -2968,7 +3393,7 @@ fn execute_seed(
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut truncated = false;
     let mut cache_complete = state.cache_profile.as_ref().map(|_| true);
-    'candidates: for (_path, language, provider, file) in candidates {
+    'candidates: for (_path, language, provider, file, access) in candidates {
         if state
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
@@ -2980,16 +3405,48 @@ fn execute_seed(
                 pipeline_halted: false,
             };
         }
-        let Some(source) = provider.structural_source(&file) else {
+        let indexed_file = access.index_file(&file);
+        let source_definitely_absent = source_index.requires_source()
+            && access.source_may_contain(&file, source_index.required_anchors()) == Some(false);
+        let source = if indexed_file.is_none()
+            || (source_index.requires_source() && !source_definitely_absent)
+        {
+            let source = provider.structural_source(&file);
+            if let (Some(source), Some(profile)) = (&source, &mut state.profile) {
+                profile.access_path.inspected_source_bytes = profile
+                    .access_path
+                    .inspected_source_bytes
+                    .saturating_add(u64::try_from(source.len()).unwrap_or(u64::MAX));
+            }
+            source
+        } else {
+            None
+        };
+        if source_index.requires_source() && !source_definitely_absent && source.is_none() {
             push_seed_provider_omission(diagnostics, language, &file, "indexed source snapshot");
             truncated = true;
             cache_complete = cache_complete.map(|_| false);
             continue;
+        }
+        let source_bytes = match (indexed_file, source.as_ref()) {
+            (Some(indexed), _) => usize::try_from(indexed.source_bytes).unwrap_or(usize::MAX),
+            (None, Some(source)) => source.len(),
+            (None, None) => {
+                push_seed_provider_omission(
+                    diagnostics,
+                    language,
+                    &file,
+                    "indexed source snapshot",
+                );
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                continue;
+            }
         };
         let mut projected = state.budget;
         projected.scanned_files = projected.scanned_files.saturating_add(1);
         projected.scanned_source_bytes =
-            projected.scanned_source_bytes.saturating_add(source.len());
+            projected.scanned_source_bytes.saturating_add(source_bytes);
         if let Some(lease) = &parallel_budget {
             match lease.admit(projected) {
                 FairSeedBudgetAdmission::Admitted => {}
@@ -3013,47 +3470,59 @@ fn execute_seed(
         }
         state.budget.scanned_files = projected.scanned_files;
         state.budget.scanned_source_bytes = projected.scanned_source_bytes;
-        if !source_index.may_match(&source) {
+        if source_definitely_absent {
             continue;
         }
-        let facts = if state.cache_profile.is_some() {
-            let (facts, outcome) = provider.structural_facts_with_outcome(&file);
-            if let Some(profile) = &mut state.cache_profile {
-                match outcome {
-                    StructuralFactsCacheOutcome::MemoryHit => profile
-                        .seed_structural_facts
-                        .record_memory_hit(facts.is_some()),
-                    StructuralFactsCacheOutcome::PersistedHydration => {
-                        profile.seed_structural_facts.record_persisted_hydration()
-                    }
-                    StructuralFactsCacheOutcome::Extracted => {
-                        profile.seed_structural_facts.record_extraction();
-                    }
-                    StructuralFactsCacheOutcome::Unavailable => {
-                        profile.seed_structural_facts.record_unavailable();
-                    }
-                    StructuralFactsCacheOutcome::Unknown => {
-                        profile.seed_structural_facts.record_unknown();
-                    }
-                }
-            }
-            facts
-        } else {
-            provider.structural_facts(&file)
-        };
-        let Some(facts) = facts else {
-            push_seed_provider_omission(
-                diagnostics,
-                language,
-                &file,
-                "normalized structural facts",
-            );
-            truncated = true;
-            cache_complete = cache_complete.map(|_| false);
+        if source
+            .as_deref()
+            .is_some_and(|source| !source_index.may_match(source))
+        {
             continue;
+        }
+        let candidate_ids = access.candidate_facts(&file);
+        let mut facts = None;
+        let fact_nodes = if let Some(indexed) = indexed_file {
+            usize::try_from(indexed.fact_nodes).unwrap_or(usize::MAX)
+        } else {
+            let loaded = load_seed_facts(provider, &file, state.cache_profile.as_mut());
+            let Some(loaded) = loaded else {
+                push_seed_provider_omission(
+                    diagnostics,
+                    language,
+                    &file,
+                    "normalized structural facts",
+                );
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                continue;
+            };
+            let count = loaded.nodes().len();
+            if let Some(profile) = &mut state.profile {
+                profile.access_path.materialized_files =
+                    profile.access_path.materialized_files.saturating_add(1);
+                profile.access_path.materialized_fact_nodes = profile
+                    .access_path
+                    .materialized_fact_nodes
+                    .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            }
+            facts = Some(loaded);
+            if let Some(profile) = &mut state.profile {
+                let access_profile = &mut profile.access_path;
+                access_profile.candidate_files = access_profile.candidate_files.saturating_add(1);
+                access_profile.candidate_facts = access_profile
+                    .candidate_facts
+                    .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            }
+            count
         };
+        if let Some(profile) = &mut state.profile {
+            profile.access_path.admitted_fact_nodes = profile
+                .access_path
+                .admitted_fact_nodes
+                .saturating_add(u64::try_from(fact_nodes).unwrap_or(u64::MAX));
+        }
         projected = state.budget;
-        projected.fact_nodes = projected.fact_nodes.saturating_add(facts.nodes().len());
+        projected.fact_nodes = projected.fact_nodes.saturating_add(fact_nodes);
         if let Some(lease) = &parallel_budget {
             match lease.admit(projected) {
                 FairSeedBudgetAdmission::Admitted => {}
@@ -3078,8 +3547,80 @@ fn execute_seed(
             break;
         }
         state.budget.fact_nodes = projected.fact_nodes;
+        let selected_facts = candidate_ids.unwrap_or(&[]);
+        if indexed_file.is_some() && selected_facts.is_empty() {
+            continue;
+        }
+        let facts = match facts {
+            Some(facts) => facts,
+            None => {
+                let loaded = load_seed_facts(provider, &file, state.cache_profile.as_mut());
+                let Some(loaded) = loaded else {
+                    push_seed_provider_omission(
+                        diagnostics,
+                        language,
+                        &file,
+                        "normalized structural facts",
+                    );
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    continue;
+                };
+                if loaded.nodes().len() != fact_nodes
+                    || selected_facts
+                        .last()
+                        .is_some_and(|id| (*id as usize) >= loaded.nodes().len())
+                {
+                    state.access_failure.get_or_insert_with(|| {
+                        format!(
+                            "snapshot structural index metadata changed for {}",
+                            rel_path_string(&file)
+                        )
+                    });
+                    push_seed_provider_omission(
+                        diagnostics,
+                        language,
+                        &file,
+                        "fresh snapshot structural index metadata",
+                    );
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    continue;
+                }
+                if let Some(profile) = &mut state.profile {
+                    profile.access_path.materialized_files =
+                        profile.access_path.materialized_files.saturating_add(1);
+                    profile.access_path.materialized_fact_nodes = profile
+                        .access_path
+                        .materialized_fact_nodes
+                        .saturating_add(u64::try_from(loaded.nodes().len()).unwrap_or(u64::MAX));
+                }
+                loaded
+            }
+        };
         let remaining = match_cap.saturating_sub(pending.len());
-        let matches = super::matcher::match_query(seed, &facts, remaining);
+        let matches = if indexed_file.is_some() {
+            if let Some(profile) = &mut state.profile {
+                profile.access_path.examined_fact_nodes = profile
+                    .access_path
+                    .examined_fact_nodes
+                    .saturating_add(u64::try_from(selected_facts.len()).unwrap_or(u64::MAX));
+            }
+            super::matcher::match_query_candidates(
+                seed,
+                &facts,
+                selected_facts.iter().copied(),
+                remaining,
+            )
+        } else {
+            if let Some(profile) = &mut state.profile {
+                profile.access_path.examined_fact_nodes = profile
+                    .access_path
+                    .examined_fact_nodes
+                    .saturating_add(u64::try_from(facts.nodes().len()).unwrap_or(u64::MAX));
+            }
+            super::matcher::match_query(seed, &facts, remaining)
+        };
         if let Some(lease) = &parallel_budget {
             for fact_match in matches {
                 let mut projected = state.budget;

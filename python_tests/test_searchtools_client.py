@@ -146,7 +146,7 @@ def _code_query_explain_payload(
 
 def _code_query_profile_payload() -> dict:
     return {
-        "format": "bifrost_code_query_profile/v1",
+        "format": "bifrost_code_query_profile/v2",
         "result": {"results": [], "truncated": False, "diagnostics": []},
         "explain": _code_query_explain_payload(execution_mode="profile"),
         "timings_ns": {
@@ -185,6 +185,43 @@ def _code_query_profile_payload() -> dict:
                 },
             },
         ],
+        "access_path": {
+            "selected": "posting:kind+name",
+            "representation_version": 1,
+            "estimated_provider_files": 1,
+            "scoped_files": 1,
+            "scoped_fact_nodes": 4,
+            "admitted_fact_nodes": 4,
+            "candidate_files": 1,
+            "candidate_facts": 1,
+            "selected_terms": [
+                {"label": "name", "candidate_facts": 1},
+                {"label": "kind", "candidate_facts": 4},
+            ],
+            "source_verification_required": True,
+            "cache_ready_lookups": 1,
+            "materialized_files": 1,
+            "materialized_fact_nodes": 4,
+            "inspected_source_bytes": 120,
+            "examined_fact_nodes": 1,
+            "index_lookups": 1,
+            "index_hits": 1,
+            "index_misses": 0,
+            "index_builds": 0,
+            "index_waits": 0,
+            "index_wait_ns": 0,
+            "index_cancelled": 0,
+            "index_unavailable": 0,
+            "index_over_budget": 0,
+            "scan_fallbacks": 0,
+            "index_build_files": 0,
+            "index_build_source_bytes": 0,
+            "index_build_fact_nodes": 0,
+            "index_build_facts_bytes": 0,
+            "index_build_ns": 0,
+            "retained_bytes": 512,
+            "future_access_fact": True,
+        },
         "scheduling": {
             "peak_concurrency": 1,
             "bounded_dispatch": {
@@ -295,6 +332,12 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertEqual(response.explain.parsed_query.execution_mode, "profile")
         self.assertEqual(response.timings_ns.total, 66)
         self.assertEqual(response.work.scanned_source_bytes, 120)
+        self.assertEqual(response.access_path.selected, "posting:kind+name")
+        self.assertEqual(response.access_path.candidate_facts, 1)
+        self.assertEqual(response.access_path.selected_terms[0].label, "name")
+        self.assertTrue(response.access_path.source_verification_required)
+        self.assertEqual(response.access_path.cache_ready_lookups, 1)
+        self.assertTrue(response.access_path.extra["future_access_fact"])
         self.assertIs(
             response.cache_layers[0].layer, CodeQueryCacheLayerKind.SEED_RESULT
         )

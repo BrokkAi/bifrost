@@ -201,6 +201,30 @@ fn query_code_cases_are_compared_independently() {
 }
 
 #[test]
+fn query_code_cold_to_warm_ratio_blocks_false_warm_improvement() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 200.0, 100.0)],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 330.0, 25.0)],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+    let scenario = &comparison.scenarios[0];
+    assert_eq!(scenario.outcome, ScenarioCompareOutcome::Regression);
+    assert!(scenario.is_regression);
+    assert!(
+        scenario
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("13.20x")),
+        "{scenario:?}"
+    );
+}
+
+#[test]
 fn broad_workspace_slowdown_is_classified_as_environment_variance() {
     let baseline = report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0));
     let candidate = report_with_scenarios(broad_slowdown_repos(260.0, 125.0, 230.0));
@@ -412,6 +436,16 @@ fn scenario(name: BenchmarkScenario, success: bool, median_ms: Option<f64>) -> S
 
 fn query_scenario(case_id: &str, median_ms: f64) -> ScenarioReport {
     scenario(BenchmarkScenario::QueryCode, true, Some(median_ms)).with_case_id(case_id.to_string())
+}
+
+fn query_scenario_with_first(
+    case_id: &str,
+    first_duration_ms: f64,
+    median_ms: f64,
+) -> ScenarioReport {
+    let mut scenario = query_scenario(case_id, median_ms);
+    scenario.first_duration_ms = Some(first_duration_ms);
+    scenario
 }
 
 fn scenario_with_transport(

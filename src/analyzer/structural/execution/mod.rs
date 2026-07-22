@@ -9,11 +9,11 @@ pub use plan::{
     CodeQuerySchedulingPolicy, CodeQuerySelectedScheduling,
 };
 pub use profile::{
-    CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind, CodeQueryOperatorDisposition,
-    CodeQueryOperatorObservation, CodeQueryOperatorTermination, CodeQueryOperatorTimings,
-    CodeQueryProfile, CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer,
-    CodeQueryProfileScheduling, CodeQueryProfileTimings, CodeQueryProfileWork,
-    CodeQueryStructuralFactsCacheCounters,
+    CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
+    CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
+    CodeQueryOperatorTimings, CodeQueryProfile, CodeQueryProfileCacheCounters,
+    CodeQueryProfileCacheLayer, CodeQueryProfileScheduling, CodeQueryProfileTimings,
+    CodeQueryProfileWork, CodeQueryStructuralFactsCacheCounters,
 };
 
 #[cfg(test)]

@@ -15,6 +15,8 @@ const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
 const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
 const PROFILE_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const BENCHMARK_QUERY_ACCESS_ENV: &str = "BIFROST_BENCHMARK_QUERY_CODE_ACCESS";
+const SERVER_QUERY_ACCESS_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
 
 #[derive(Debug, Clone, Copy)]
 pub struct StderrCursor {
@@ -355,6 +357,13 @@ impl McpSession {
         }
         if profile {
             command.env("BIFROST_TIMING", "1");
+        }
+        // The server selector is an internal transport detail. Never inherit
+        // an ambient value into a benchmark process; only the validated
+        // benchmark-facing selector below may set it.
+        command.env_remove(SERVER_QUERY_ACCESS_ENV);
+        if let Some(access_mode) = std::env::var_os(BENCHMARK_QUERY_ACCESS_ENV) {
+            command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
         }
         let mut child = command
             .stdin(Stdio::piped())
