@@ -21,6 +21,12 @@ Only the generated runtime inputs used by Bifrost are copied:
 - `src/tree_sitter/array.h`
 - `src/tree_sitter/parser.h`
 
+`build.rs` compiles these unchanged bytes with preprocessor aliases that give
+the language function and all five external-scanner functions a
+`brokk_bifrost_` prefix. The private archive and symbols prevent a downstream
+dependency on the published `tree-sitter-scala` crate from changing which
+parser Bifrost uses through native link order.
+
 The SHA-256 checksums at this snapshot are:
 
 | File | SHA-256 |

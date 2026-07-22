@@ -55,6 +55,39 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+  crate-package:
+    name: crate package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Build publishable crate
+        run: cargo package --locked
+
+      - name: Enforce compressed crate size budget
+        shell: bash
+        env:
+          MAX_CRATE_BYTES: '10000000'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(target/package/brokk-bifrost-*.crate)
+          if (( ${#archives[@]} != 1 )); then
+            echo "Expected one packaged crate, found ${#archives[@]}" >&2
+            exit 1
+          fi
+          actual_bytes=$(wc -c < "${archives[0]}")
+          echo "Packaged crate: ${actual_bytes} bytes (budget: ${MAX_CRATE_BYTES})"
+          if (( actual_bytes > MAX_CRATE_BYTES )); then
+            echo "Packaged crate exceeds the temporary vendoring size budget" >&2
+            exit 1
+          fi
+
   release-scripts:
     name: release scripts
     runs-on: ubuntu-latest
