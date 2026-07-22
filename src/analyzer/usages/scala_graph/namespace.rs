@@ -157,20 +157,26 @@ fn unique_units(units: Vec<CodeUnit>) -> Vec<CodeUnit> {
         .collect()
 }
 
-/// Whether an indexed lexical type lookup is blocked by a parser-proven local
-/// type binding which intentionally has no stable `CodeUnit` identity.
+/// The nearest parser-proven type binding which intentionally has no stable
+/// `CodeUnit` identity of its own.
 ///
-/// Type parameters are visible throughout their owner. Local type aliases are
-/// visible after their declaration in the active block. Both are authoritative
-/// type-namespace bindings: callers must not fall through to an indexed class,
-/// import, or package declaration with the same spelling.
-pub(crate) fn scala_unindexed_type_binding_shadows(
+/// Type parameters and local aliases are authoritative barriers. A type alias
+/// directly inside an anonymous instance may instead refine an indexed member
+/// of the exact constructed base; the inverse scanner retains the instance node
+/// so it can prove that relationship without inventing an anonymous identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalaUnindexedTypeBinding<'tree> {
+    Authoritative,
+    AnonymousRefinement(Node<'tree>),
+}
+
+pub(crate) fn scala_nearest_unindexed_type_binding<'tree>(
     source: &str,
-    reference: Node<'_>,
+    reference: Node<'tree>,
     root_name: &str,
-) -> bool {
+) -> Option<ScalaUnindexedTypeBinding<'tree>> {
     if root_name.is_empty() {
-        return false;
+        return None;
     }
     let name = root_name;
 
@@ -184,13 +190,45 @@ pub(crate) fn scala_unindexed_type_binding_shadows(
         if let Some(parameters) = parameters
             && scala_type_parameters_declare(parameters, source, name)
         {
-            return true;
+            return Some(ScalaUnindexedTypeBinding::Authoritative);
+        }
+
+        if node.kind() == "template_body"
+            && let Some(instance) = scala_anonymous_instance_for_template(node)
+        {
+            let mut cursor = node.walk();
+            let matches = node
+                .named_children(&mut cursor)
+                .filter(|child| matches!(child.kind(), "type_definition" | "type_declaration"))
+                .filter(|child| {
+                    child.child_by_field_name("name").is_some_and(|declared| {
+                        source
+                            .get(declared.byte_range())
+                            .is_some_and(|text| text.trim() == name)
+                    })
+                })
+                .collect::<Vec<_>>();
+            return match matches.as_slice() {
+                [definition] if definition.kind() == "type_definition" => {
+                    let declaration_name = definition.child_by_field_name("name");
+                    if declaration_name.is_some_and(|declared| declared == reference) {
+                        Some(ScalaUnindexedTypeBinding::Authoritative)
+                    } else {
+                        Some(ScalaUnindexedTypeBinding::AnonymousRefinement(instance))
+                    }
+                }
+                [_] | [_, _, ..] => Some(ScalaUnindexedTypeBinding::Authoritative),
+                [] => {
+                    current = node.parent();
+                    continue;
+                }
+            };
         }
 
         if matches!(node.kind(), "block" | "indented_block") {
             let mut cursor = node.walk();
             if node.named_children(&mut cursor).any(|child| {
-                child.kind() == "type_definition"
+                matches!(child.kind(), "type_definition" | "type_declaration")
                     && child.start_byte() < reference.start_byte()
                     && child.child_by_field_name("name").is_some_and(|alias| {
                         source
@@ -198,12 +236,38 @@ pub(crate) fn scala_unindexed_type_binding_shadows(
                             .is_some_and(|text| text.trim() == name)
                     })
             }) {
-                return true;
+                return Some(ScalaUnindexedTypeBinding::Authoritative);
             }
         }
         current = node.parent();
     }
-    false
+    None
+}
+
+pub(crate) fn scala_anonymous_instance_for_template<'tree>(
+    template: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let parent = template.parent()?;
+    if parent.kind() == "instance_expression" {
+        return Some(parent);
+    }
+    parent
+        .parent()
+        .filter(|grandparent| grandparent.kind() == "instance_expression")
+}
+
+/// Compatibility predicate for definition lookup, which already knows how to
+/// resolve anonymous refinements through its forward path. Only ordinary local
+/// bindings should prevent that path from continuing.
+pub(crate) fn scala_unindexed_type_binding_shadows(
+    source: &str,
+    reference: Node<'_>,
+    root_name: &str,
+) -> bool {
+    matches!(
+        scala_nearest_unindexed_type_binding(source, reference, root_name),
+        Some(ScalaUnindexedTypeBinding::Authoritative)
+    )
 }
 
 fn scala_type_parameters_declare(parameters: Node<'_>, source: &str, name: &str) -> bool {

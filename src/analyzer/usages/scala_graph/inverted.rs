@@ -27,8 +27,9 @@ use super::local::{
 };
 use super::namespace::{
     ScalaDirectAncestorResolution, ScalaQualifiedTypeRootBinding, ScalaQualifiedTypeRootResolution,
-    ScalaTypeNamespaceResolution, resolve_exact_lexical_type_namespace, scala_qualified_type_root,
-    scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
+    ScalaTypeNamespaceResolution, ScalaUnindexedTypeBinding, resolve_exact_lexical_type_namespace,
+    scala_anonymous_instance_for_template, scala_nearest_unindexed_type_binding,
+    scala_qualified_type_root, scala_type_reference_is_singleton,
 };
 use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
@@ -3593,24 +3594,33 @@ impl ProjectTypes {
         &self,
         scala: &ScalaAnalyzer,
         normalized_fqn: &str,
+        source_file: Option<&ProjectFile>,
     ) -> Option<&CodeUnit> {
         let candidates = self
             .index
             .by_normalized_fqn(normalized_fqn)
             .iter()
-            .filter(|unit| unit.is_function() || unit.is_field())
+            .filter(|unit| unit.is_function() || self.has_term_field_declaration(unit))
             .collect::<Vec<_>>();
         if let [candidate] = candidates.as_slice() {
             return Some(*candidate);
         }
-        let stable_members = self
-            .index
-            .by_normalized_fqn(normalized_fqn)
-            .iter()
-            .filter(|unit| unit.is_function() || unit.is_field())
+        if candidates.iter().any(|unit| unit.is_function()) {
+            return None;
+        }
+        let source_file = source_file?;
+        let stable_members = candidates
+            .into_iter()
+            .filter(|unit| self.has_term_field_declaration(unit))
+            .filter(|unit| unit.source() == source_file)
             .filter(|unit| {
                 self.exact_structural_parent(scala, unit)
-                    .is_some_and(|owner| owner.is_class() && owner.short_name().ends_with('$'))
+                    .is_some_and(|owner| {
+                        owner.source() == source_file
+                            && owner.is_class()
+                            && owner.short_name().ends_with('$')
+                            && self.type_is_stable_owner(scala, &owner)
+                    })
             })
             .collect::<Vec<_>>();
         let [candidate] = stable_members.as_slice() else {
@@ -5861,7 +5871,8 @@ impl NameResolver {
             }
             let normalized = scala_normalized_fq_name(&tier.candidate);
             if include_members
-                && let Some(member) = types.importable_member_by_normalized_fqn(scala, &normalized)
+                && let Some(member) =
+                    types.importable_member_by_normalized_fqn(scala, &normalized, source_file)
             {
                 member_names.add_declaration(local_name.clone(), member, 192);
                 for method in types.direct_extension_method(scala, &normalized) {
@@ -6496,8 +6507,16 @@ impl ScalaScan<'_, '_> {
         let Some(root_name) = segments.first() else {
             return ScalaTypeNamespaceResolution::NoMatch;
         };
-        if scala_unindexed_type_binding_shadows(self.source, lookup_node, root_name) {
-            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+        if let Some(binding) =
+            scala_nearest_unindexed_type_binding(self.source, lookup_node, root_name)
+        {
+            return match binding {
+                ScalaUnindexedTypeBinding::Authoritative => {
+                    ScalaTypeNamespaceResolution::AuthoritativeMiss
+                }
+                ScalaUnindexedTypeBinding::AnonymousRefinement(instance) => self
+                    .exact_type_member_before_anonymous_binding(lookup_node, instance, root_name),
+            };
         }
         let mut owners = Vec::new();
         let mut current = self.class_ranges.enclosing_unit(node.start_byte()).cloned();
@@ -6509,6 +6528,134 @@ impl ScalaScan<'_, '_> {
         }
         self.types
             .exact_lexical_type_namespace(self.scala, owners, root_name, false)
+    }
+
+    /// Resolve exact indexed type-member tiers encountered before an outer
+    /// anonymous refinement binding. Intervening anonymous constructed bases
+    /// and named templates both have higher precedence than the outer alias.
+    fn exact_type_member_before_anonymous_binding(
+        &self,
+        lookup_node: Node<'_>,
+        binding_instance: Node<'_>,
+        name: &str,
+    ) -> ScalaTypeNamespaceResolution {
+        let mut current = Some(lookup_node);
+        while let Some(node) = current {
+            if node.kind() == "template_body" {
+                if let Some(instance) = scala_anonymous_instance_for_template(node) {
+                    let Some(owner) = self.constructed_type_declaration_for_boundary(instance)
+                    else {
+                        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                    };
+                    if instance != binding_instance {
+                        match self.types.exact_lexical_type_namespace(
+                            self.scala,
+                            std::iter::once(owner),
+                            name,
+                            false,
+                        ) {
+                            ScalaTypeNamespaceResolution::Resolved(member) => {
+                                return ScalaTypeNamespaceResolution::Resolved(member);
+                            }
+                            ScalaTypeNamespaceResolution::NoMatch => {
+                                current = node.parent();
+                                continue;
+                            }
+                            ScalaTypeNamespaceResolution::AuthoritativeMiss
+                            | ScalaTypeNamespaceResolution::Ambiguous => {
+                                return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                            }
+                        }
+                    }
+                    match self
+                        .types
+                        .stable_type_member_for_owner_unit(self.scala, &owner, name)
+                    {
+                        FieldResolution::Resolved(member)
+                            if self.types.is_type_alias(self.scala, &member.declaration) =>
+                        {
+                            return ScalaTypeNamespaceResolution::Resolved(member.declaration);
+                        }
+                        FieldResolution::Resolved(_) | FieldResolution::NoMatch => {
+                            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                        }
+                        FieldResolution::Unresolved => {
+                            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                        }
+                    }
+                } else if let Some(named_owner) = scala_named_template_owner(node) {
+                    let Some(owner) = self
+                        .class_ranges
+                        .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
+                        .cloned()
+                    else {
+                        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                    };
+                    match self.types.exact_lexical_type_namespace(
+                        self.scala,
+                        std::iter::once(owner),
+                        name,
+                        false,
+                    ) {
+                        ScalaTypeNamespaceResolution::Resolved(member) => {
+                            return ScalaTypeNamespaceResolution::Resolved(member);
+                        }
+                        ScalaTypeNamespaceResolution::NoMatch => {}
+                        ScalaTypeNamespaceResolution::AuthoritativeMiss
+                        | ScalaTypeNamespaceResolution::Ambiguous => {
+                            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                        }
+                    }
+                }
+            }
+            current = node.parent();
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+    }
+
+    /// Resolve an anonymous base which may itself be a nested type inherited
+    /// from a surrounding anonymous base (for example `Metric.UnsafeAPI`).
+    fn constructed_type_declaration_for_boundary(&self, instance: Node<'_>) -> Option<CodeUnit> {
+        if let Some(owner) = constructed_type_declaration(instance, self) {
+            return Some(owner);
+        }
+        let type_node = constructed_type_node(instance)?;
+        let path = scala_type_lookup_segments(type_node, self.source);
+        let [name] = path.as_slice() else {
+            return None;
+        };
+
+        let mut current = instance.parent();
+        while let Some(node) = current {
+            if node.kind() == "template_body" {
+                let enclosing_owner =
+                    if let Some(outer_instance) = scala_anonymous_instance_for_template(node) {
+                        constructed_type_declaration(outer_instance, self)?
+                    } else if let Some(named_owner) = scala_named_template_owner(node) {
+                        self.class_ranges
+                            .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
+                            .cloned()?
+                    } else {
+                        current = node.parent();
+                        continue;
+                    };
+                match self.types.exact_lexical_type_namespace(
+                    self.scala,
+                    std::iter::once(enclosing_owner),
+                    name,
+                    false,
+                ) {
+                    ScalaTypeNamespaceResolution::Resolved(target) => {
+                        return exact_constructed_type_target(type_node, target, name, self);
+                    }
+                    ScalaTypeNamespaceResolution::NoMatch => {}
+                    ScalaTypeNamespaceResolution::AuthoritativeMiss
+                    | ScalaTypeNamespaceResolution::Ambiguous => return None,
+                }
+            }
+            current = node.parent();
+        }
+        None
     }
 
     fn visible_type(&self, node: Node<'_>, name: &str) -> Option<String> {
@@ -6908,6 +7055,12 @@ fn record_reference(
             };
             if let Some(resolved) = resolved {
                 if is_constructor_like_reference(node, ctx.source) {
+                    if let ScalaResolvedReference::Exact(alias) = &resolved
+                        && ctx.types.is_type_alias(ctx.scala, alias)
+                    {
+                        ctx.record_exact(alias.clone(), ScalaReferenceRole::Type, node);
+                        return;
+                    }
                     let fqn = match &resolved {
                         ScalaResolvedReference::Exact(unit) => unit.fq_name(),
                         ScalaResolvedReference::Logical(fqn) => fqn.clone(),
@@ -9345,18 +9498,27 @@ fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<C
     None
 }
 
+fn scala_named_template_owner(mut template: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = template.parent() {
+        match parent.kind() {
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                return Some(parent);
+            }
+            "instance_expression" | "template_body" => return None,
+            _ => template = parent,
+        }
+    }
+    None
+}
+
 /// The fqn of the type constructed by a `new Foo()` value expression.
-fn constructed_type(mut node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
-    while node.kind() == "call_expression" {
-        node = node.child_by_field_name("function")?;
-    }
-    if node.kind() != "instance_expression" {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let type_node = node
-        .named_children(&mut cursor)
-        .find(|child| !matches!(child.kind(), "arguments" | "template_body"))?;
+fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+    constructed_type_declaration(node, ctx).map(|target| target.fq_name())
+}
+
+/// The exact declaration constructed by a `new Foo()` value expression.
+fn constructed_type_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<CodeUnit> {
+    let type_node = constructed_type_node(node)?;
     let path = scala_type_lookup_segments(type_node, ctx.source);
     let name = path.last()?;
     let class_fqn = resolve_receiver_type_node(type_node, ctx)?;
@@ -9372,7 +9534,52 @@ fn constructed_type(mut node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<Strin
             Some(ctx.source_file),
         )
         .type_target
-        .map(|target| target.fq_name())
+}
+
+fn constructed_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "call_expression" {
+        node = node.child_by_field_name("function")?;
+    }
+    if node.kind() != "instance_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let type_nodes = node
+        .named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "arguments" | "template_body"))
+        .collect::<Vec<_>>();
+    let [type_node] = type_nodes.as_slice() else {
+        return None;
+    };
+    if matches!(
+        type_node.kind(),
+        "compound_type" | "infix_type" | "intersection_type" | "with_type"
+    ) {
+        return None;
+    }
+    Some(*type_node)
+}
+
+fn exact_constructed_type_target(
+    type_node: Node<'_>,
+    target: CodeUnit,
+    name: &str,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<CodeUnit> {
+    let resolved = ctx
+        .types
+        .resolve_type_application(
+            ctx.scala,
+            &ctx.resolver,
+            Some(&target.fq_name()),
+            None,
+            name,
+            call_site_shape_for_reference(type_node).as_ref(),
+            TypeApplicationRole::ExplicitConstructor,
+            Some(ctx.source_file),
+        )
+        .type_target?;
+    (resolved == target).then_some(target)
 }
 
 fn unwrap_single_scala_expression(mut node: Node<'_>) -> Node<'_> {
