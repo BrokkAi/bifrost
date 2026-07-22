@@ -1145,57 +1145,70 @@ impl ProjectTypes {
         while !level.is_empty() {
             let mut matches = Vec::new();
             let mut next = Vec::new();
+            let mut next_is_ambiguous = false;
+            let mut level_owners = Vec::new();
             for owner in level {
                 if !seen.insert(owner.clone()) {
                     continue;
                 }
+                level_owners.push(owner.clone());
                 matches.extend(
                     self.members_for_exact_owner_unit(scala, &owner, member)
                         .into_iter()
                         .filter(|unit| unit.is_field() || self.is_type_alias(scala, unit))
                         .cloned(),
                 );
-                // Export aliases do not have a declaration under the exporter.
-                // Consult parser-recorded export bindings only for a physically
-                // unique exporter and require one physical target for every
-                // selected binding.
-                let exported_bindings = self
-                    .exported_member_bindings(scala, &owner)
-                    .into_iter()
-                    .filter(|(visible_name, _)| visible_name == member)
-                    .collect::<Vec<_>>();
-                if !exported_bindings.is_empty() {
-                    let physical_owners = self
-                        .index
-                        .by_fqn(&owner.fq_name())
-                        .iter()
-                        .filter(|candidate| candidate.is_class())
+            }
+            // A declaration directly owned at this hierarchy tier is
+            // authoritative. Only consult exports and ancestors when the
+            // complete direct tier has no matching declaration; otherwise an
+            // unrelated ambiguous replica beyond that tier can incorrectly
+            // hide the exact physical member.
+            if matches.is_empty() {
+                for owner in level_owners {
+                    // Export aliases do not have a declaration under the exporter.
+                    // Consult parser-recorded export bindings only for a physically
+                    // unique exporter and require one physical target for every
+                    // selected binding.
+                    let exported_bindings = self
+                        .exported_member_bindings(scala, &owner)
+                        .into_iter()
+                        .filter(|(visible_name, _)| visible_name == member)
                         .collect::<Vec<_>>();
-                    if physical_owners.len() != 1 || physical_owners[0] != &owner {
-                        return FieldResolution::Unresolved;
+                    if !exported_bindings.is_empty() {
+                        let physical_owners = self
+                            .index
+                            .by_fqn(&owner.fq_name())
+                            .iter()
+                            .filter(|candidate| candidate.is_class())
+                            .collect::<Vec<_>>();
+                        if physical_owners.len() != 1 || physical_owners[0] != &owner {
+                            return FieldResolution::Unresolved;
+                        }
                     }
-                }
-                for (_, target_fqn) in exported_bindings {
-                    let exported = self
-                        .index
-                        .by_fqn(&target_fqn)
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.is_field() || self.is_type_alias(scala, candidate)
-                        })
-                        .collect::<Vec<_>>();
-                    let [exported] = exported.as_slice() else {
-                        return FieldResolution::Unresolved;
+                    for (_, target_fqn) in exported_bindings {
+                        let exported = self
+                            .index
+                            .by_fqn(&target_fqn)
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.is_field() || self.is_type_alias(scala, candidate)
+                            })
+                            .collect::<Vec<_>>();
+                        let [exported] = exported.as_slice() else {
+                            return FieldResolution::Unresolved;
+                        };
+                        matches.push((*exported).clone());
+                    }
+                    let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
+                        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                        ScalaDirectAncestorResolution::Ambiguous => {
+                            next_is_ambiguous = true;
+                            Vec::new()
+                        }
                     };
-                    matches.push((*exported).clone());
+                    next.extend(ancestors);
                 }
-                let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                    ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
-                    ScalaDirectAncestorResolution::Ambiguous => {
-                        return FieldResolution::Unresolved;
-                    }
-                };
-                next.extend(ancestors);
             }
             if !matches.is_empty() {
                 let type_members = matches
@@ -1215,6 +1228,9 @@ impl ProjectTypes {
                     declaration: matches.pop().expect("one exact Scala stable type member"),
                     declared_type: None,
                 });
+            }
+            if next_is_ambiguous {
+                return FieldResolution::Unresolved;
             }
             level = next;
         }
@@ -9559,6 +9575,9 @@ fn constructed_type_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Opti
     let type_node = constructed_type_node(node)?;
     let path = scala_type_lookup_segments(type_node, ctx.source);
     let name = path.last()?;
+    if let Some(target) = resolve_receiver_type_declaration_node(type_node, ctx) {
+        return exact_constructed_type_target(type_node, target, name, ctx);
+    }
     let class_fqn = resolve_receiver_type_node(type_node, ctx)?;
     ctx.types
         .resolve_type_application(
@@ -9884,8 +9903,11 @@ fn resolve_receiver_type_declaration_node(
         match ctx.exact_lexically_visible_type(type_node) {
             ScalaTypeNamespaceResolution::Resolved(declaration) => declaration,
             ScalaTypeNamespaceResolution::AuthoritativeMiss
-            | ScalaTypeNamespaceResolution::Ambiguous
-            | ScalaTypeNamespaceResolution::NoMatch => return None,
+            | ScalaTypeNamespaceResolution::Ambiguous => return None,
+            ScalaTypeNamespaceResolution::NoMatch if path.len() == 1 => {
+                ctx.resolver.resolve_unit(&path[0])?
+            }
+            ScalaTypeNamespaceResolution::NoMatch => return None,
         }
     };
     if !ctx.types.is_type_alias(ctx.scala, &declaration) {

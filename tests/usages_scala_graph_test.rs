@@ -9721,6 +9721,111 @@ object Uses {
 }
 
 #[test]
+fn scala_anonymous_refinement_keeps_duplicate_source_set_type_member_exact() {
+    let scala2 = r#"package zio.internal.stacktracer
+
+object Tracer {
+  trait Traced extends Any
+  val instance: Tracer = new Tracer {
+    type Type = String
+    val empty: Type with Traced = "".intern().asInstanceOf[Type with Traced] // scala2-anonymous-empty
+    def unapply(trace: Type): Option[String] = None // scala2-anonymous-unapply
+    def parseOrNull(trace: Type): String = trace // scala2-anonymous-parse
+    def apply(value: String): Type with Traced = value.asInstanceOf[Type with Traced] // scala2-anonymous-apply
+  }
+}
+
+sealed trait Tracer {
+  type Type <: AnyRef
+  val empty: Type with Tracer.Traced // scala2-trait-empty
+  def unapply(trace: Type): Option[String] // scala2-trait-unapply
+  def parseOrNull(trace: Type): String // scala2-trait-parse
+  def apply(value: String): Type with Tracer.Traced // scala2-trait-apply
+}
+"#;
+    let scala3 = r#"package zio.internal.stacktracer
+
+object Tracer {
+  type Traced = Any
+  val instance: Tracer = new Tracer {
+    type Type = String
+    val empty = "".intern()
+    def unapply(trace: Type): Option[String] = None // scala3-anonymous-unapply
+    def parseOrNull(trace: Type): String = trace // scala3-anonymous-parse
+    def apply(value: String): Type with Traced = value.asInstanceOf[Type with Traced] // scala3-anonymous-apply
+  }
+}
+
+sealed trait Tracer {
+  type Type <: AnyRef
+  val empty: Type // scala3-trait-empty
+  def unapply(trace: Type): Option[String] // scala3-trait-unapply
+  def parseOrNull(trace: Type): String // scala3-trait-parse
+  def apply(value: String): Type with Tracer.Traced // scala3-trait-apply
+}
+"#;
+    let ambiguous_consumer = r#"package zio.internal.stacktracer
+
+object AmbiguousConsumer {
+  val instance = new Tracer {
+    type Type = String
+    val empty: Type = "" // ambiguous-replica-must-fail-closed
+  }
+}
+"#;
+    let scala2_path = "stacktracer/src/main/scala-2/zio/internal/stacktracer/Tracer.scala";
+    let scala3_path = "stacktracer/src/main/scala-3/zio/internal/stacktracer/Tracer.scala";
+    let consumer_path = "stacktracer/src/main/shared/zio/internal/stacktracer/Ambiguous.scala";
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (scala2_path, scala2),
+        (scala3_path, scala3),
+        (consumer_path, ambiguous_consumer),
+    ]);
+    let scala2_type = analyzer
+        .get_definitions("zio.internal.stacktracer.Tracer.Type")
+        .into_iter()
+        .find(|target| target.source() == &project.file(scala2_path))
+        .expect("Scala 2 physical Tracer.Type");
+    let hits = authoritative_scala_hits(&analyzer, &scala2_type);
+    assert_eq!(hits.len(), 10, "Scala 2 exact type-member hits: {hits:#?}");
+    assert!(
+        hits.iter().all(|hit| hit.file == project.file(scala2_path)),
+        "Scala 3 physical replica leaked into Scala 2 hits: {hits:#?}"
+    );
+    for marker in [
+        "scala2-anonymous-empty",
+        "scala2-anonymous-unapply",
+        "scala2-anonymous-parse",
+        "scala2-anonymous-apply",
+        "scala2-trait-empty",
+        "scala2-trait-unapply",
+        "scala2-trait-parse",
+        "scala2-trait-apply",
+    ] {
+        assert_hit_contains(&hits, marker);
+    }
+    assert_no_hit_contains(&hits, "ambiguous-replica-must-fail-closed");
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": [format!(
+                "{scala2_path}#zio.internal.stacktracer.Tracer.Type"
+            )],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(mcp["results"][0]["status"], "found", "{mcp}");
+    assert_eq!(mcp["results"][0]["total_hits"], 10, "{mcp}");
+    let rendered = mcp.to_string();
+    assert!(rendered.contains("scala2-anonymous-empty"), "{mcp}");
+    assert!(!rendered.contains("scala3-"), "{mcp}");
+    assert!(!rendered.contains("ambiguous-replica"), "{mcp}");
+}
+
+#[test]
 fn scala_usage_finder_records_unqualified_type_alias_constructor() {
     let source = r#"package aliases
 trait ExternalKey[A]
