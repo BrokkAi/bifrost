@@ -198,9 +198,130 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  agent-plugin-package:
+    name: stage agent plugin package
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare agent plugin release metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ steps.tag.outputs.version }}"
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+
+      - name: Generate Amp skill bundle
+        run: node scripts/generate-amp-skill-bundle.mjs
+
+      - name: Test agent plugin launcher
+        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+
+      - name: Validate agent plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+
+      - name: Package agent plugin
+        shell: bash
+        run: |
+          package_root="${RUNNER_TEMP}/bifrost-agent-package"
+          mkdir -p "$package_root" dist
+          cp -R plugins/bifrost-agent "$package_root/bifrost-agent"
+          cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "$package_root/bifrost-agent/"
+          tar -C "$package_root" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+
+      - name: Upload staged agent plugin
+        uses: actions/upload-artifact@v6
+        with:
+          name: bifrost-agent-package
+          path: dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz
+          if-no-files-found: error
+
+  agent-plugin-prepublish-smoke:
+    name: prepublication agent plugin smoke
+    needs: [build, agent-plugin-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download built Linux binary
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/bifrost-linux-release
+
+      - name: Download staged agent plugin
+        uses: actions/download-artifact@v7
+        with:
+          name: bifrost-agent-package
+          path: ${{ runner.temp }}/bifrost-agent-prepublish
+
+      - name: Extract staged agent plugin
+        shell: bash
+        run: |
+          package_dir="${RUNNER_TEMP}/bifrost-agent-prepublish"
+          archive="$(find "$package_dir" -maxdepth 1 -type f -name 'bifrost-agent-*.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -C "$package_dir" -xzf "$archive"
+
+      - name: Extract built Linux binary
+        id: binary
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/bifrost-linux-release
+        run: |
+          archive="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -C "$ARTIFACT_DIR" -xzf "$archive"
+          binary="$(find "$ARTIFACT_DIR" -type f -name "${BIN_NAME}" -print -quit)"
+          test -n "$binary"
+          chmod +x "$binary"
+          echo "path=$binary" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke staged agent plugin with built binary
+        shell: bash
+        run: >
+          node scripts/smoke-agent-plugin-release.mjs
+          --plugin-dir "${RUNNER_TEMP}/bifrost-agent-prepublish/bifrost-agent"
+          --cache-dir "${RUNNER_TEMP}/bifrost-agent-prepublish-cache"
+          --binary-path "${{ steps.binary.outputs.path }}"
+
   release:
     name: release
-    needs: build
+    needs: [build, agent-plugin-prepublish-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -230,22 +351,13 @@ jobs:
           name: ${{ steps.tag.outputs.name }}
           generate_release_notes: true
           files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.sha256
-
-      - name: Announce release on Discord
-        continue-on-error: true
-        env:
-          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.tag.outputs.name }}
-        shell: bash
-        run: bash scripts/announce-discord-release.sh
+            dist/${{ env.BIN_NAME }}-${{ steps.tag.outputs.name }}-*.tar.gz
+            dist/${{ env.BIN_NAME }}-${{ steps.tag.outputs.name }}-*.zip
+            dist/${{ env.BIN_NAME }}-${{ steps.tag.outputs.name }}-*.sha256
 
   pi-package:
     name: Pi package
-    needs: release
+    needs: [release, publish-agent-plugin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -310,7 +422,7 @@ jobs:
 
   vscode:
     name: vscode extension
-    needs: release
+    needs: [release, publish-agent-plugin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -369,20 +481,11 @@ jobs:
         run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
         working-directory: editors/vscode
 
-      - name: Package agent plugin
-        shell: bash
-        run: |
-          cp -R plugins/bifrost-agent "${RUNNER_TEMP}/bifrost-agent"
-          cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "${RUNNER_TEMP}/bifrost-agent/"
-          tar -C "${RUNNER_TEMP}" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
-
-      - name: Upload editor and agent plugin artifacts to GitHub Release
+      - name: Upload editor artifact to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          files: |
-            dist/*.vsix
-            dist/bifrost-agent-*.tar.gz
+          files: dist/*.vsix
 
       - name: Publish extension to Visual Studio Marketplace
         run: >
@@ -394,7 +497,7 @@ jobs:
 
   agent-plugin-release-smoke:
     name: packaged agent plugin smoke
-    needs: vscode
+    needs: release
     runs-on: macos-latest
     permissions:
       contents: read
@@ -416,26 +519,64 @@ jobs:
         with:
           node-version: 22
 
-      - name: Download packaged agent plugin
+      - name: Download staged agent plugin
+        uses: actions/download-artifact@v7
+        with:
+          name: bifrost-agent-package
+          path: ${{ runner.temp }}/bifrost-agent-release
+
+      - name: Extract staged agent plugin
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          release_dir="${RUNNER_TEMP}/bifrost-agent-release"
-          mkdir -p "$release_dir"
-          gh release download "${{ steps.tag.outputs.name }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" \
-            --dir "$release_dir"
-          tar -C "$release_dir" -xzf "$release_dir/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz"
+        run: >
+          tar -C "${RUNNER_TEMP}/bifrost-agent-release"
+          -xzf "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz"
 
       - name: Smoke packaged launcher and MCP
         shell: bash
         run: >
           node scripts/smoke-agent-plugin-release.mjs
           --plugin-dir "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent"
-          --workspace "$GITHUB_WORKSPACE"
           --cache-dir "${RUNNER_TEMP}/bifrost-agent-cold-cache"
+
+  publish-agent-plugin:
+    name: publish validated agent plugin
+    needs: [release, agent-plugin-release-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Download validated agent plugin
+        uses: actions/download-artifact@v7
+        with:
+          name: bifrost-agent-package
+          path: dist
+
+      - name: Upload agent plugin to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz
+
+      - name: Announce release on Discord
+        continue-on-error: true
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+        shell: bash
+        run: bash scripts/announce-discord-release.sh
 
   sync-agent-plugin-release-metadata:
     name: sync generated release metadata
