@@ -1767,7 +1767,11 @@ fn get_definitions_by_reference_resolves_rust_self_field_chain_to_field_definiti
 // with no hint. It must now name the owner type it tried and suggest a
 // concrete follow-up query.
 #[test]
-fn get_definitions_by_reference_hints_owner_type_when_rust_field_owner_is_unindexed() {
+fn get_definitions_by_reference_resolves_rust_field_of_macro_wrapped_owner() {
+    // #1019 shape 3 composed with the #1015 macro-item indexing fix: the
+    // owning struct is declared inside a macro invocation (tokio's
+    // pin_project! shape). Now that macro-wrapped items index, the field
+    // target resolves outright instead of falling back to the owner hint.
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "src/lib.rs",
@@ -1792,6 +1796,41 @@ fn get_definitions_by_reference_hints_owner_type_when_rust_field_owner_is_uninde
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
     let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!("Sleep.inner", result["definitions"][0]["fqn"], "{value}");
+    assert_eq!("field", result["definitions"][0]["kind"], "{value}");
+}
+
+#[test]
+fn get_definitions_by_reference_hints_owner_type_when_rust_field_owner_is_unindexed() {
+    // The owner type is never declared anywhere in the workspace (generated
+    // or external), so the receiver's type cannot resolve; the failure must
+    // carry the owner-qualified actionable hint (#1019), not the generic
+    // whole-chain wording.
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+"struct Inner {\n    ctx: u32,\n}\n\nimpl Mystery {\n    fn poll(&self) {\n        let _res_span = self.inner.ctx.clone();\n    }\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "Mystery.poll",
+                    "context": "let _res_span = self.inner.ctx.clone();",
+                    "target": "inner"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
     assert_eq!("no_definition", result["status"], "{value}");
     assert_eq!(
         "no_indexed_definition", result["diagnostics"][0]["kind"],
@@ -1800,12 +1839,11 @@ fn get_definitions_by_reference_hints_owner_type_when_rust_field_owner_is_uninde
     let message = result["diagnostics"][0]["message"].as_str().unwrap();
     // The diagnostic must not collapse to the unhelpful whole-chain wording
     // and must instead name the owner type and a concrete retry.
-    assert!(message.contains("Sleep"), "{value}");
+    assert!(message.contains("Mystery"), "{value}");
     assert!(message.contains("inner"), "{value}");
     assert!(message.contains("get_symbol_sources"), "{value}");
     assert_ne!(
-        message,
-        "`self.inner.ctx.resource_span.clone` did not resolve to an indexed Rust definition",
+        message, "`self.inner.ctx.clone` did not resolve to an indexed Rust definition",
         "{value}"
     );
 }
