@@ -2145,6 +2145,102 @@ fn visit_ts_method(
         code_unit,
         SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source)),
     );
+    if member_name == "constructor" {
+        visit_ts_constructor_assigned_fields(file, source, node, parent, top_level, parsed);
+    }
+}
+
+/// Index constructor-assigned instance properties (`this.x = ...`) as Field
+/// units, mirroring the JavaScript analyzer: pre-class-field style codebases
+/// (and any constructor that assigns properties) otherwise have instance
+/// fields that scan_usages resolves but search_symbols cannot find.
+fn visit_ts_constructor_assigned_fields(
+    file: &ProjectFile,
+    source: &str,
+    constructor: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut stack = vec![constructor];
+    while let Some(node) = stack.pop() {
+        if node.id() != constructor.id()
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "function"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "class"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && let Some(property) = ts_this_member_property(left, source)
+        {
+            let Some(name) = ts_property_name_text(property, source) else {
+                continue;
+            };
+            let code_unit = CodeUnit::new(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Field,
+                "",
+                format!("{}.{}", parent.short_name(), name),
+            );
+            parsed.add_code_unit(
+                code_unit.clone(),
+                property,
+                source,
+                Some(parent.clone()),
+                Some(top_level.clone()),
+            );
+            parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+fn ts_this_member_property<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    if object.kind() != "this" {
+        return None;
+    }
+    let property = node.child_by_field_name("property")?;
+    ts_property_name_text(property, source)
+        .is_some()
+        .then_some(property)
+}
+
+fn ts_property_name_text(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier"
+        | "property_identifier"
+        | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern" => {
+            let text = node_text(node, source).trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "string" => {
+            let text = node_text(node, source)
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn visit_ts_field(
