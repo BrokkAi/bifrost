@@ -1805,19 +1805,35 @@ pub fn check_i3a(
         summary.i3a_summary_element_checks += 1;
         let mut sources = array_field(structured, "sources");
         let Some(block) = sources.next() else {
-            sink.record(violation(
-                InvariantKind::I3,
-                language,
-                "get_symbol_sources",
-                "summaries-listed-symbol-unresolvable",
-                &record.symbol_fq,
-                &record.symbol_path,
-                Some(record.arguments.clone()),
-                json!({
-                    "listed_under": element_path,
-                    "expected": "a symbol get_summaries lists resolves via get_symbol_sources",
-                }),
-            ));
+            // Bare element names collide across a large workspace by design;
+            // an ambiguity answer is consistent when it offers the listed
+            // file's own `path#symbol` selector, because the listing itself
+            // supplies the disambiguating path (an agent following the
+            // summary resolves in one guided re-call). The violation is
+            // resolvability from the listing context: a hard not_found, or
+            // matches that exclude the listed path (the bfg shape, where the
+            // emitted spelling maps to no exact declaration at all).
+            let own_selector = format!("{element_path}#");
+            let resolvable_from_listing = array_field(structured, "ambiguous")
+                .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|candidate| candidate.starts_with(&own_selector));
+            if !resolvable_from_listing {
+                sink.record(violation(
+                    InvariantKind::I3,
+                    language,
+                    "get_symbol_sources",
+                    "summaries-listed-symbol-unresolvable",
+                    &record.symbol_fq,
+                    &record.symbol_path,
+                    Some(record.arguments.clone()),
+                    json!({
+                        "listed_under": element_path,
+                        "expected": "a symbol get_summaries lists resolves via get_symbol_sources from its listing context",
+                    }),
+                ));
+            }
             continue;
         };
         let reported_path = block.get("path").and_then(Value::as_str).unwrap_or("");

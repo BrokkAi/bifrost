@@ -347,6 +347,66 @@ fn i3a_fires_when_summaries_listed_symbol_is_unresolvable() {
     assert_eq!(violations[0].shape, "summaries-listed-symbol-unresolvable");
 }
 
+// Bare element names collide across a large workspace; ambiguity that offers
+// the listed file's own `path#symbol` selector resolves the element from its
+// listing context and is not a violation (the oh-my-openagent ts shape).
+#[test]
+fn i3a_silent_when_ambiguity_offers_the_listed_paths_own_selector() {
+    let records = vec![record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "packages/a/install.mjs".to_string(),
+        },
+        json!({
+            "ambiguous": [{
+                "target": "resolveXdgDataDir",
+                "matches": [
+                    "packages/a/install.mjs#resolveXdgDataDir",
+                    "packages/utils/xdg.ts#resolveXdgDataDir"
+                ]
+            }],
+            "not_found": [],
+            "sources": []
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "ts", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
+// Ambiguity whose matches exclude the listed path leaves the element
+// unresolvable from its listing context (the bfg shape: the emitted spelling
+// maps to no exact declaration).
+#[test]
+fn i3a_fires_when_ambiguity_excludes_the_listed_path() {
+    let records = vec![record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "src/LFS.scala".to_string(),
+        },
+        json!({
+            "ambiguous": [{
+                "target": "com.madgag.git.LFS.Pointer",
+                "matches": [
+                    "com.madgag.git.LFS$.Pointer",
+                    "com.madgag.git.LFS$.Pointer$"
+                ]
+            }],
+            "not_found": [],
+            "sources": []
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "scala", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(violations[0].shape, "summaries-listed-symbol-unresolvable");
+}
+
 #[test]
 fn i3a_fires_when_reported_path_differs_from_listed_path() {
     let records = vec![record(
