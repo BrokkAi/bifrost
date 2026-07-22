@@ -12,7 +12,7 @@ use tree_sitter::Tree;
 
 mod csharp;
 mod go;
-mod java;
+pub(crate) mod java;
 mod js_ts;
 mod rust;
 mod scala;

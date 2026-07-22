@@ -222,7 +222,7 @@ mod tests {
     fn facts_for(source: &str, class_name: &str) -> Vec<(String, String)> {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let mut stack = vec![tree.root_node()];

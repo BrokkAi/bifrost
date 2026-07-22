@@ -7,6 +7,28 @@ use std::sync::{LazyLock, Mutex};
 
 static LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+const ISSUE_1016_JOBCTRL: &str = include_str!("fixtures/scala-issue-1016/JobCtrl.scala");
+
+fn scala_class_end_byte(language: tree_sitter::Language, source: &str, name: &str) -> usize {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).expect("Scala language");
+    let tree = parser.parse(source, None).expect("Scala parse tree");
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "class_definition"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|child| &source[child.byte_range()] == name)
+        {
+            return node.end_byte();
+        }
+
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    panic!("missing Scala class {name}");
+}
+
 fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
     let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
@@ -626,6 +648,106 @@ class JobSrv @Inject() (
             .iter()
             .any(|source| source["text"].as_str().unwrap().contains("def submit")),
         "{result}"
+    );
+}
+
+#[test]
+fn issue_1016_scala_annotated_constructor_supports_sources_and_body_reference_context() {
+    // This integration binary deliberately links the old published grammar
+    // beside Bifrost. Its JobCtrl remains truncated, while the service below
+    // must use Bifrost's private, fixed parser symbols and return the body.
+    let published_end = scala_class_end_byte(
+        tree_sitter_scala::LANGUAGE.into(),
+        ISSUE_1016_JOBCTRL,
+        "JobCtrl",
+    );
+    assert!(
+        published_end
+            < ISSUE_1016_JOBCTRL
+                .find("def create")
+                .expect("create method"),
+        "the coexistence control unexpectedly used Bifrost's fixed parser"
+    );
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "org/thp/thehive/connector/cortex/controllers/v0/JobCtrl.scala",
+            ISSUE_1016_JOBCTRL,
+        )
+        .file(
+            "org/thp/thehive/connector/cortex/services/JobSrv.scala",
+            r#"package org.thp.thehive.connector.cortex.services
+
+class JobSrv {
+  def submit(
+      cortexId: String,
+      analyzerId: String,
+      observable: Any,
+      richCase: Any,
+      parameters: Any
+  ): Unit = ()
+}
+"#,
+        )
+        .build();
+
+    let source_result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["org.thp.thehive.connector.cortex.controllers.v0.JobCtrl"]}"#,
+    );
+    assert_eq!(
+        source_result["sources"].as_array().map(Vec::len),
+        Some(1),
+        "{source_result}"
+    );
+    assert_eq!(
+        source_result["ambiguous"].as_array().map(Vec::len),
+        Some(0),
+        "{source_result}"
+    );
+    assert_eq!(
+        source_result["not_found"].as_array().map(Vec::len),
+        Some(0),
+        "{source_result}"
+    );
+    let source = source_result["sources"][0]["text"]
+        .as_str()
+        .expect("JobCtrl source text");
+    assert!(
+        source.contains("override val entrypoint: Entrypoint"),
+        "{source}"
+    );
+    assert!(
+        source.contains("def create: Action[AnyContent]"),
+        "{source}"
+    );
+    assert!(source.contains("jobSrv"), "{source}");
+    assert!(
+        source
+            .contains(".submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))"),
+        "{source}"
+    );
+    assert!(!source.contains("class PublicJob"), "{source}");
+
+    let reference_args = serde_json::json!({
+        "references": [{
+            "symbol": "org.thp.thehive.connector.cortex.controllers.v0.JobCtrl",
+            "context": ".submit(cortexId, analyzerId, o, c, parameters.getOrElse(JsObject.empty))",
+            "target": "submit"
+        }]
+    })
+    .to_string();
+    let reference_result = call_tool(&project, "get_definitions_by_reference", &reference_args);
+    let result = &reference_result["results"][0];
+    assert_eq!(result["status"], "resolved", "{reference_result}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions.iter().any(|definition| {
+                definition["fqn"] == "org.thp.thehive.connector.cortex.services.JobSrv.submit"
+            })),
+        "{reference_result}"
     );
 }
 

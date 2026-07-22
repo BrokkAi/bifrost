@@ -250,19 +250,84 @@ impl ProcedureInvocationKind {
 
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchExtensibility {
+    /// Additional runtime targets may exist unless a dispatch oracle proves
+    /// closure through stronger language-specific evidence.
+    #[default]
+    Open,
+    /// The declaration itself proves that invocation cannot select an
+    /// overriding implementation.
+    Closed,
+}
+
+impl DispatchExtensibility {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Orthogonal properties that should not be encoded in [`ProcedureKind`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_static: bool,
     pub is_synthetic: bool,
     pub invocation: ProcedureInvocationKind,
+    pub dispatch_extensibility: DispatchExtensibility,
+}
+
+/// The positional or keyword domain accepted or produced at a call boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ArgumentDomain {
+    Positional,
+    Keyword,
+    PositionalOrKeyword,
+    LanguageDefined(Box<str>),
+}
+
+impl ArgumentDomain {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Positional => "positional",
+            Self::Keyword => "keyword",
+            Self::PositionalOrKeyword => "positional_or_keyword",
+            Self::LanguageDefined(_) => "language_defined",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub enum FormalMultiplicity {
+    #[default]
+    One,
+    Rest(ArgumentDomain),
+}
+
+impl FormalMultiplicity {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::One => "one",
+            Self::Rest(_) => "rest",
+        }
+    }
+
+    pub const fn is_rest(&self) -> bool {
+        matches!(self, Self::Rest(_))
+    }
 }
 
 /// The semantic role of a value row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticValueKind {
     Local,
-    Parameter { ordinal: u32 },
+    Parameter {
+        ordinal: u32,
+        multiplicity: FormalMultiplicity,
+    },
     Receiver,
     Return,
     Temporary,
@@ -271,6 +336,67 @@ pub enum SemanticValueKind {
     Callable,
     AwaitResult,
     LanguageDefined(Box<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallArgumentExpansion {
+    Unclassified,
+    Direct(ArgumentDomain),
+    Spread(ArgumentDomain),
+}
+
+impl CallArgumentExpansion {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::Direct(_) => "direct",
+            Self::Spread(_) => "spread",
+        }
+    }
+
+    pub const fn domain(&self) -> Option<&ArgumentDomain> {
+        match self {
+            Self::Unclassified => None,
+            Self::Direct(domain) | Self::Spread(domain) => Some(domain),
+        }
+    }
+
+    pub const fn is_spread(&self) -> bool {
+        matches!(self, Self::Spread(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticCallArgument {
+    pub value: ValueId,
+    pub expansion: CallArgumentExpansion,
+}
+
+impl SemanticCallArgument {
+    /// Construct a direct argument when structured lowering established that
+    /// the source is not a spread and identified its argument domain.
+    pub fn direct(value: ValueId, domain: ArgumentDomain) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Direct(domain),
+        }
+    }
+
+    /// Preserve the pre-v5 contract without manufacturing direct/spread or
+    /// positional/keyword semantics. Adapters refine this row only from their
+    /// structured syntax.
+    pub fn unclassified(value: ValueId) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Unclassified,
+        }
+    }
+}
+
+impl From<ValueId> for SemanticCallArgument {
+    fn from(value: ValueId) -> Self {
+        Self::unclassified(value)
+    }
 }
 
 impl SemanticValueKind {
@@ -581,7 +707,7 @@ pub struct SemanticCallSite {
     pub point: ProgramPointId,
     pub callee: ValueId,
     pub receiver: Option<ValueId>,
-    pub arguments: Box<[ValueId]>,
+    pub arguments: Box<[SemanticCallArgument]>,
     pub result: Option<ValueId>,
     pub thrown: Option<ValueId>,
     /// Targets named or established by local syntax/declaration semantics.
@@ -722,12 +848,178 @@ impl SemanticGapSubject {
     }
 }
 
+/// One semantic consumer concern that an explicit gap may invalidate.
+///
+/// Gap impacts are deliberately independent of language and capability names.
+/// Consumers can therefore select only the uncertainty that affects their
+/// operation without importing adapter-specific knowledge.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SemanticGapImpact {
+    DispatchCoverage,
+    CallEvaluation,
+    ReturnTransfer,
+    ValueFlow,
+    HeapRead,
+    HeapWrite,
+    Aliasing,
+}
+
+impl SemanticGapImpact {
+    pub const ALL: [Self; 7] = [
+        Self::DispatchCoverage,
+        Self::CallEvaluation,
+        Self::ReturnTransfer,
+        Self::ValueFlow,
+        Self::HeapRead,
+        Self::HeapWrite,
+        Self::Aliasing,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DispatchCoverage => "dispatch_coverage",
+            Self::CallEvaluation => "call_evaluation",
+            Self::ReturnTransfer => "return_transfer",
+            Self::ValueFlow => "value_flow",
+            Self::HeapRead => "heap_read",
+            Self::HeapWrite => "heap_write",
+            Self::Aliasing => "aliasing",
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1_u8 << (self as u8)
+    }
+}
+
+/// Compact, deterministically iterable semantic gap impacts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SemanticGapImpacts(u8);
+
+impl SemanticGapImpacts {
+    pub const NONE: Self = Self(0);
+
+    const VALUE: Self =
+        Self::single(SemanticGapImpact::ValueFlow).with(SemanticGapImpact::Aliasing);
+    const MEMORY: Self = Self::VALUE
+        .with(SemanticGapImpact::HeapRead)
+        .with(SemanticGapImpact::HeapWrite);
+    const RETURN_TRANSFER: Self = Self::VALUE.with(SemanticGapImpact::ReturnTransfer);
+    /// Conservative downstream profile for a represented evaluation whose
+    /// timing or multiplicity is unresolved.
+    ///
+    /// The evaluation still exists in the IR, so this deliberately does not
+    /// weaken dispatch coverage or call existence. It does leave produced
+    /// values, aliases, heap effects, and return transfer open.
+    pub const DEFERRED_EFFECTS: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
+    const CONTROL_FLOW: Self = Self::DEFERRED_EFFECTS;
+    /// Conservative downstream profile for a represented call whose
+    /// caller-side evaluation or transfer is incomplete.
+    ///
+    /// The represented call may still affect produced values, aliases, heap
+    /// reads and writes, return transfer, and caller-side evaluation beyond
+    /// what its retained IR events prove.
+    pub const CALL_EVALUATION: Self =
+        Self::DEFERRED_EFFECTS.with(SemanticGapImpact::CallEvaluation);
+
+    pub const fn single(impact: SemanticGapImpact) -> Self {
+        Self(impact.bit())
+    }
+
+    #[must_use]
+    pub const fn with(self, impact: SemanticGapImpact) -> Self {
+        Self(self.0 | impact.bit())
+    }
+
+    pub const fn contains(self, impact: SemanticGapImpact) -> bool {
+        self.0 & impact.bit() != 0
+    }
+
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Derive the conservative cross-language impacts shared by adapter gap
+    /// builders. Adapter-specific consequences that cannot be inferred from
+    /// the capability and subject must still be attached deliberately.
+    pub const fn for_gap(capability: SemanticCapability, subject: SemanticGapSubject) -> Self {
+        let capability_impacts = match capability {
+            SemanticCapability::Procedures
+            | SemanticCapability::BasicBlocks
+            | SemanticCapability::ProgramPoints => Self::NONE,
+            SemanticCapability::EntryBoundary => Self::VALUE,
+            SemanticCapability::NormalExitBoundary
+            | SemanticCapability::ExceptionalExitBoundary
+            | SemanticCapability::ReturnFlow => Self::RETURN_TRANSFER,
+            SemanticCapability::NormalControlFlow
+            | SemanticCapability::ExceptionalControlFlow
+            | SemanticCapability::CleanupControlFlow
+            | SemanticCapability::NonLocalControl => Self::CONTROL_FLOW,
+            SemanticCapability::Assignments
+            | SemanticCapability::Values
+            | SemanticCapability::LocalFlow
+            | SemanticCapability::ParameterFlow => Self::VALUE,
+            SemanticCapability::ReceiverFlow => {
+                Self::VALUE.with(SemanticGapImpact::DispatchCoverage)
+            }
+            SemanticCapability::Allocations
+            | SemanticCapability::FieldMemory
+            | SemanticCapability::StaticMemory
+            | SemanticCapability::IndexMemory
+            | SemanticCapability::Captures => Self::MEMORY,
+            // A call-site-scoped omission leaves call-dependent values and
+            // aliases open, but it does not by itself weaken retained target
+            // coverage or caller-side evaluation. Broader Calls gaps and
+            // callable producer gaps need adapter-authored impacts for any
+            // specific downstream consequence. DeferredExecution always
+            // leaves evaluation effects open; adapters additionally attach
+            // CallEvaluation only when a represented call's caller-side
+            // evaluation or transfer is itself incomplete.
+            SemanticCapability::Calls => match subject {
+                SemanticGapSubject::CallSite(_) => Self::VALUE,
+                _ => Self::NONE,
+            },
+            SemanticCapability::CallableReferences => Self::NONE,
+            SemanticCapability::DeferredExecution => Self::DEFERRED_EFFECTS,
+            SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
+            SemanticCapability::DynamicDispatch => {
+                Self::single(SemanticGapImpact::DispatchCoverage)
+            }
+            SemanticCapability::NormalCallContinuation
+            | SemanticCapability::ExceptionalCallContinuation
+            | SemanticCapability::AsyncSuspendResume
+            | SemanticCapability::GeneratorSuspension
+            | SemanticCapability::ResourceManagement => Self::CALL_EVALUATION,
+        };
+        let subject_impacts = match subject {
+            SemanticGapSubject::Value(_) => Self::VALUE,
+            SemanticGapSubject::MemoryLocation(_) | SemanticGapSubject::Capture(_) => Self::MEMORY,
+            SemanticGapSubject::CallContinuation { .. }
+            | SemanticGapSubject::AsyncContinuation { .. } => Self::CALL_EVALUATION,
+            SemanticGapSubject::Procedure
+            | SemanticGapSubject::Point
+            | SemanticGapSubject::CallSite(_) => Self::NONE,
+        };
+        capability_impacts.union(subject_impacts)
+    }
+
+    /// Iterate in [`SemanticGapImpact::ALL`] order, which is part of the
+    /// deterministic semantic rendering contract.
+    pub fn iter(self) -> impl Iterator<Item = SemanticGapImpact> {
+        SemanticGapImpact::ALL
+            .into_iter()
+            .filter(move |impact| self.contains(*impact))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticGap {
     pub id: SemanticGapId,
     pub point: ProgramPointId,
     pub subject: SemanticGapSubject,
     pub capability: SemanticCapability,
+    pub impacts: SemanticGapImpacts,
     pub kind: SemanticGapKind,
     /// Required exactly when `kind` is `ExceededBudget`.
     pub budget: Option<SemanticBudgetExceeded>,
@@ -2000,8 +2292,21 @@ fn measure_artifact_work(
         account_locator(&procedure.locator, &mut work);
 
         for value in &procedure.values {
-            if let SemanticValueKind::LanguageDefined(name) = &value.kind {
-                account_text(name, &mut work);
+            match &value.kind {
+                SemanticValueKind::LanguageDefined(name) => account_text(name, &mut work),
+                SemanticValueKind::Parameter {
+                    multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(name)),
+                    ..
+                } => account_text(name, &mut work),
+                SemanticValueKind::Local
+                | SemanticValueKind::Parameter { .. }
+                | SemanticValueKind::Receiver
+                | SemanticValueKind::Return
+                | SemanticValueKind::Temporary
+                | SemanticValueKind::Constant
+                | SemanticValueKind::Exception
+                | SemanticValueKind::Callable
+                | SemanticValueKind::AwaitResult => {}
             }
         }
         for allocation in &procedure.allocations {
@@ -2027,6 +2332,11 @@ fn measure_artifact_work(
             work.nested_entries = work
                 .nested_entries
                 .saturating_add(call_site.arguments.len());
+            for argument in &call_site.arguments {
+                if let Some(ArgumentDomain::LanguageDefined(name)) = argument.expansion.domain() {
+                    account_text(name, &mut work);
+                }
+            }
             account_target_resolution(&call_site.declared_targets, &mut work);
         }
         for mapping in &procedure.source_mappings {
@@ -2350,6 +2660,7 @@ fn validate_procedure(
         }
         validate_gap_capability(id, capabilities, gap)?;
         validate_gap_subject(id, procedure, &async_suspends, gap)?;
+        validate_gap_impacts(id, gap)?;
         if (gap.kind == SemanticGapKind::ExceededBudget) != gap.budget.is_some() {
             return Err(SemanticIrError::procedure(
                 id,
@@ -2363,8 +2674,18 @@ fn validate_procedure(
         gap_index.insert(id, gap)?;
     }
 
+    let mut parameter_ordinals = HashSet::default();
     for value in &procedure.values {
         validate_metadata(id, value.source, value.evidence, procedure, "value")?;
+        if let SemanticValueKind::Parameter { ordinal, .. } = &value.kind
+            && !parameter_ordinals.insert(*ordinal)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::CallContract,
+                format!("parameter ordinal {ordinal} is published more than once"),
+            ));
+        }
     }
     if !procedure.values.is_empty() {
         require_capability(id, capabilities, SemanticCapability::Values, "value rows")?;
@@ -3019,7 +3340,7 @@ fn validate_call_site(
         ensure_value(id, receiver, procedure.values.len(), "call receiver")?;
     }
     for argument in &call_site.arguments {
-        ensure_value(id, *argument, procedure.values.len(), "call argument")?;
+        ensure_value(id, argument.value, procedure.values.len(), "call argument")?;
     }
     if let Some(result) = call_site.result {
         ensure_value(id, result, procedure.values.len(), "call result")?;
@@ -4427,6 +4748,26 @@ fn validate_gap_capability(
     ))
 }
 
+fn validate_gap_impacts(procedure: ProcedureId, gap: &SemanticGap) -> Result<(), SemanticIrError> {
+    let required = SemanticGapImpacts::for_gap(gap.capability, gap.subject);
+    let Some(missing) = required
+        .iter()
+        .find(|impact| !gap.impacts.contains(*impact))
+    else {
+        return Ok(());
+    };
+    Err(SemanticIrError::procedure(
+        procedure,
+        SemanticIrErrorKind::GapContract,
+        format!(
+            "gap {} for {} is missing mandatory {} impact",
+            gap.id,
+            gap.capability.label(),
+            missing.label(),
+        ),
+    ))
+}
+
 fn memory_location_capability(kind: &MemoryLocationKind) -> SemanticCapability {
     match kind {
         MemoryLocationKind::Field { .. } => SemanticCapability::FieldMemory,
@@ -4563,6 +4904,102 @@ mod tests {
 
     fn key() -> SemanticArtifactKey {
         key_with_language(SemanticLanguage::Standard(Language::Java))
+    }
+
+    #[test]
+    fn semantic_gap_impacts_are_compact_total_and_deterministic() {
+        let impacts = SemanticGapImpacts::NONE
+            .with(SemanticGapImpact::Aliasing)
+            .with(SemanticGapImpact::DispatchCoverage)
+            .with(SemanticGapImpact::HeapRead)
+            .with(SemanticGapImpact::HeapRead);
+
+        assert_eq!(
+            impacts.iter().collect::<Vec<_>>(),
+            vec![
+                SemanticGapImpact::DispatchCoverage,
+                SemanticGapImpact::HeapRead,
+                SemanticGapImpact::Aliasing,
+            ]
+        );
+        assert!(impacts.contains(SemanticGapImpact::HeapRead));
+        assert!(!impacts.contains(SemanticGapImpact::ValueFlow));
+        assert_eq!(SemanticGapImpacts::default(), SemanticGapImpacts::NONE);
+
+        assert_eq!(
+            SemanticGapImpacts::for_gap(
+                SemanticCapability::DynamicDispatch,
+                SemanticGapSubject::Point,
+            ),
+            SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
+        );
+        assert_eq!(
+            SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapSubject::Point,
+            ),
+            SemanticGapImpacts::CONTROL_FLOW,
+        );
+        let call_impacts = SemanticGapImpacts::for_gap(
+            SemanticCapability::Calls,
+            SemanticGapSubject::CallSite(CallSiteId::new(0)),
+        );
+        assert_eq!(call_impacts, SemanticGapImpacts::VALUE);
+        assert!(!call_impacts.contains(SemanticGapImpact::DispatchCoverage));
+        assert!(!call_impacts.contains(SemanticGapImpact::CallEvaluation));
+        assert_eq!(
+            SemanticGapImpacts::for_gap(SemanticCapability::Calls, SemanticGapSubject::Procedure,),
+            SemanticGapImpacts::NONE,
+        );
+        let callable_impacts = SemanticGapImpacts::for_gap(
+            SemanticCapability::CallableReferences,
+            SemanticGapSubject::CallSite(CallSiteId::new(0)),
+        );
+        assert_eq!(callable_impacts, SemanticGapImpacts::NONE);
+        let deferred_impacts = SemanticGapImpacts::for_gap(
+            SemanticCapability::DeferredExecution,
+            SemanticGapSubject::CallSite(CallSiteId::new(0)),
+        );
+        assert_eq!(deferred_impacts, SemanticGapImpacts::DEFERRED_EFFECTS);
+        assert!(!deferred_impacts.contains(SemanticGapImpact::DispatchCoverage));
+        assert!(!deferred_impacts.contains(SemanticGapImpact::CallEvaluation));
+        for impact in [
+            SemanticGapImpact::ReturnTransfer,
+            SemanticGapImpact::ValueFlow,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+            SemanticGapImpact::Aliasing,
+        ] {
+            assert!(SemanticGapImpacts::DEFERRED_EFFECTS.contains(impact));
+            assert!(SemanticGapImpacts::CALL_EVALUATION.contains(impact));
+        }
+        assert!(!SemanticGapImpacts::DEFERRED_EFFECTS.contains(SemanticGapImpact::CallEvaluation));
+        assert!(SemanticGapImpacts::CALL_EVALUATION.contains(SemanticGapImpact::CallEvaluation));
+        assert!(!SemanticGapImpacts::CALL_EVALUATION.contains(SemanticGapImpact::DispatchCoverage));
+        assert_eq!(
+            SemanticGapImpacts::for_gap(
+                SemanticCapability::ConcurrentSpawn,
+                SemanticGapSubject::CallSite(CallSiteId::new(0)),
+            ),
+            SemanticGapImpacts::CALL_EVALUATION,
+        );
+        let assignment =
+            SemanticGapImpacts::for_gap(SemanticCapability::Assignments, SemanticGapSubject::Point);
+        assert!(assignment.contains(SemanticGapImpact::ValueFlow));
+        assert!(assignment.contains(SemanticGapImpact::Aliasing));
+
+        let capture = SemanticGapImpacts::for_gap(
+            SemanticCapability::Captures,
+            SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
+        );
+        for impact in [
+            SemanticGapImpact::ValueFlow,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+            SemanticGapImpact::Aliasing,
+        ] {
+            assert!(capture.contains(impact), "missing {impact:?}");
+        }
     }
 
     fn capabilities(features: &[SemanticCapability]) -> SemanticCapabilities {
@@ -5146,6 +5583,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::Captures,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Captures,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "unrelated capture uncertainty".into(),
@@ -5357,6 +5798,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Capture(CaptureId::new(0)),
             capability: SemanticCapability::Captures,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Captures,
+                SemanticGapSubject::Capture(CaptureId::new(0)),
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "capture mode is allegedly unknown".into(),
@@ -5429,6 +5874,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::Calls,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Calls,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
             detail: "calls are unsupported here".into(),
@@ -5449,6 +5898,105 @@ mod tests {
             SemanticArtifact::try_new(key, capabilities(&[SemanticCapability::Calls]), vec![parts])
                 .expect_err("unsupported gap contradicts complete support");
         assert_eq!(error.kind(), SemanticIrErrorKind::CapabilityContract);
+    }
+
+    #[test]
+    fn mandatory_gap_impacts_are_enforced_while_specific_extras_are_allowed() {
+        let key = key();
+        let procedure_with_gap = |capability, subject, impacts| {
+            let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+            parts.gaps.push(SemanticGap {
+                id: SemanticGapId::new(0),
+                point: ProgramPointId::new(0),
+                subject,
+                capability,
+                impacts,
+                kind: SemanticGapKind::Unknown,
+                budget: None,
+                detail: "fixture semantic gap".into(),
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            });
+            let mut events = parts.points[0].events.to_vec();
+            events.push(SemanticEvent::new(
+                SemanticEffect::Gap {
+                    gap: SemanticGapId::new(0),
+                },
+                SourceMappingId::new(0),
+                EvidenceId::new(0),
+            ));
+            parts.points[0].events = events.into_boxed_slice();
+            parts
+        };
+
+        for (capability, missing) in [
+            (
+                SemanticCapability::DynamicDispatch,
+                SemanticGapImpact::DispatchCoverage,
+            ),
+            (
+                SemanticCapability::CleanupControlFlow,
+                SemanticGapImpact::ReturnTransfer,
+            ),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapImpact::ReturnTransfer,
+            ),
+            (
+                SemanticCapability::NonLocalControl,
+                SemanticGapImpact::ReturnTransfer,
+            ),
+            (
+                SemanticCapability::Assignments,
+                SemanticGapImpact::ValueFlow,
+            ),
+            (SemanticCapability::Captures, SemanticGapImpact::ValueFlow),
+            (
+                SemanticCapability::NormalCallContinuation,
+                SemanticGapImpact::CallEvaluation,
+            ),
+        ] {
+            let error = SemanticArtifact::try_new(
+                key.clone(),
+                capabilities(&[capability]),
+                vec![procedure_with_gap(
+                    capability,
+                    SemanticGapSubject::Point,
+                    SemanticGapImpacts::NONE,
+                )],
+            )
+            .expect_err("a consumer-affecting gap cannot omit its mandatory impact");
+            assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+            assert!(error.detail().contains(missing.label()));
+        }
+
+        let incomplete_capture = SemanticGapImpacts::single(SemanticGapImpact::ValueFlow);
+        let error = SemanticArtifact::try_new(
+            key.clone(),
+            capabilities(&[SemanticCapability::Captures]),
+            vec![procedure_with_gap(
+                SemanticCapability::Captures,
+                SemanticGapSubject::Point,
+                incomplete_capture,
+            )],
+        )
+        .expect_err("a capture gap cannot hide missing heap and alias impacts");
+        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+        assert!(error.detail().contains(SemanticGapImpact::HeapRead.label()));
+
+        let impacts = SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage)
+            .with(SemanticGapImpact::CallEvaluation);
+        let procedure = procedure_with_gap(
+            SemanticCapability::DynamicDispatch,
+            SemanticGapSubject::Point,
+            impacts,
+        );
+        SemanticArtifact::try_new(
+            key,
+            capabilities(&[SemanticCapability::DynamicDispatch]),
+            vec![procedure],
+        )
+        .expect("adapter-specific impacts may extend the mandatory baseline");
     }
 
     #[test]
@@ -5600,6 +6148,10 @@ mod tests {
                 point: ProgramPointId::new(0),
                 subject: SemanticGapSubject::Value(ValueId::new(0)),
                 capability: SemanticCapability::CallableReferences,
+                impacts: SemanticGapImpacts::for_gap(
+                    SemanticCapability::CallableReferences,
+                    SemanticGapSubject::Value(ValueId::new(0)),
+                ),
                 kind: gap_kind,
                 budget,
                 detail: "nested body target is unavailable".into(),
@@ -5666,6 +6218,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Value(ValueId::new(0)),
             capability: SemanticCapability::CallableReferences,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::CallableReferences,
+                SemanticGapSubject::Value(ValueId::new(0)),
+            ),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
             detail: "nested body was recognized but not materialized".into(),
@@ -5741,6 +6297,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Value(ValueId::new(0)),
             capability: SemanticCapability::CallableReferences,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::CallableReferences,
+                SemanticGapSubject::Value(ValueId::new(0)),
+            ),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
             detail: "nested body was recognized but not materialized".into(),
@@ -6091,6 +6651,13 @@ mod tests {
                 kind: CallContinuationKind::Normal,
             },
             capability: SemanticCapability::NormalCallContinuation,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::NormalCallContinuation,
+                SemanticGapSubject::CallContinuation {
+                    call_site: CallSiteId::new(0),
+                    kind: CallContinuationKind::Normal,
+                },
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "normal continuation is allegedly unknown".into(),
@@ -6120,6 +6687,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::CallSite(CallSiteId::new(0)),
             capability: SemanticCapability::Calls,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Calls,
+                SemanticGapSubject::CallSite(CallSiteId::new(0)),
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "declared targets are allegedly unknown".into(),
@@ -6261,6 +6832,13 @@ mod tests {
                 kind: CallContinuationKind::Exceptional,
             },
             capability: SemanticCapability::ExceptionalCallContinuation,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalCallContinuation,
+                SemanticGapSubject::CallContinuation {
+                    call_site: CallSiteId::new(0),
+                    kind: CallContinuationKind::Exceptional,
+                },
+            ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
             detail: "adapter does not model exceptional call continuation".into(),
@@ -6517,6 +7095,13 @@ mod tests {
                 kind: AsyncResumeKind::Normal,
             },
             capability: SemanticCapability::AsyncSuspendResume,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::AsyncSuspendResume,
+                SemanticGapSubject::AsyncContinuation {
+                    suspend: ProgramPointId::new(0),
+                    kind: AsyncResumeKind::Normal,
+                },
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "normal resume is allegedly unknown".into(),

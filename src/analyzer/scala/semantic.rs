@@ -1,7 +1,5 @@
 //! Scala lowering into the language-neutral executable-semantics IR.
 
-use std::sync::Arc;
-
 use tree_sitter::Node;
 
 use crate::analyzer::semantic::cfg::{
@@ -14,18 +12,9 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{ProjectFile, ScalaAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"scala-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"scala-cfg-v2";
 
-impl ProgramSemanticsProvider for ScalaAnalyzer {
-    fn materialize(
-        &self,
-        file: &ProjectFile,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-        self.inner
-            .materialize_semantics_with_lowerer(&ScalaSemanticLowerer, file, request)
-    }
-}
+impl_program_semantics_provider!(ScalaAnalyzer, ScalaSemanticLowerer);
 
 struct ScalaSemanticLowerer;
 
@@ -69,66 +58,16 @@ impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
             }
         };
 
-        let mut procedures = Vec::with_capacity(specs.len());
-        let mut observed = SemanticWork::default();
-        for spec in &specs {
-            if cancellation.is_cancelled() {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: observed,
-                });
-            }
-            let mut staged_budget = budget.clone();
-            if let Err(exceeded) = staged_budget.charge(observed) {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work: observed,
-                });
-            }
-            match lower_procedure(prepared, spec, &staged_budget, cancellation) {
-                Ok((parts, work)) => {
-                    let candidate = sum_work(observed, work);
-                    if let Err(exceeded) = budget.check(candidate) {
-                        return Ok(SemanticOutcome::ExceededBudget {
-                            partial: None,
-                            exceeded,
-                            work: candidate,
-                        });
-                    }
-                    observed = candidate;
-                    procedures.push(parts);
-                }
-                Err(ScalaLoweringError::Cancelled(work)) => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work: sum_work(observed, *work),
-                    });
-                }
-                Err(ScalaLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_work(observed, *work);
-                    let exceeded = budget.check(work).err().unwrap_or(exceeded);
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                Err(ScalaLoweringError::Invalid(detail)) => {
-                    return Err(SemanticProviderError::internal(detail));
-                }
-            }
-        }
-        Ok(SemanticOutcome::Complete {
-            value: procedures,
-            work: observed,
-        })
+        lower_procedure_batch(
+            &specs,
+            SemanticWork::default(),
+            budget,
+            cancellation,
+            |spec, staged_budget, cancellation| {
+                lower_procedure(prepared, spec, staged_budget, cancellation)
+            },
+        )
     }
-}
-
-fn sum_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
 }
 
 fn scala_capabilities() -> SemanticCapabilities {
@@ -196,11 +135,6 @@ struct ProcedureEnumerationFrame<'tree> {
 struct SyntheticBodyScope {
     procedure: ProcedureId,
     callable_path: usize,
-}
-
-struct DeclarationPathEntry {
-    parent: Option<usize>,
-    segment: DeclarationSegment,
 }
 
 fn enumerate_procedures<'tree>(
@@ -288,7 +222,7 @@ fn enumerate_procedures<'tree>(
                 SemanticRole::Procedure,
                 anchor,
             );
-            let candidate = sum_work(preflight, procedure_identity_preflight(&locator));
+            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
             if let Err(exceeded) = budget.check(candidate) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
@@ -359,79 +293,6 @@ fn enumerate_procedures<'tree>(
     }
 
     Ok(ProcedureEnumeration::Complete(specs))
-}
-
-fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
-    }
-}
-
-fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let ordinal = *siblings.entry(key.clone()).or_default();
-    *siblings.get_mut(&key).expect("inserted sibling ordinal") += 1;
-    ordinal
-}
-
-fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -601,6 +462,7 @@ fn callable_shape<'tree>(
             is_static: false,
             is_synthetic: synthetic,
             invocation,
+            ..ProcedureProperties::default()
         },
         attach_lexical_parent,
     ))
@@ -620,18 +482,7 @@ fn lambda_body(node: Node<'_>) -> Option<Node<'_>> {
         .or_else(|| named_children(node).into_iter().next_back())
 }
 
-#[derive(Debug)]
-enum ScalaLoweringError {
-    Cancelled(Box<SemanticWork>),
-    Budget(SemanticBudgetExceeded, Box<SemanticWork>),
-    Invalid(String),
-}
-
-impl From<SemanticBudgetExceeded> for ScalaLoweringError {
-    fn from(error: SemanticBudgetExceeded) -> Self {
-        Self::Budget(error, Box::default())
-    }
-}
+type ScalaLoweringError = ProcedureLoweringError;
 
 #[derive(Debug, Clone, Copy)]
 struct EdgeTarget {
@@ -672,12 +523,6 @@ enum Work<'tree> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PointMetadata {
-    source: SourceMappingId,
-    evidence: EvidenceId,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
     id: CleanupRegionId,
     body: Node<'tree>,
@@ -686,18 +531,10 @@ struct CleanupRegion<'tree> {
 
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
-    locator: SemanticLocator,
+    session: ProcedureLoweringSession<'targets>,
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
-    point_metadata: Vec<PointMetadata>,
-    next_source: usize,
-    next_evidence: usize,
-    next_value: usize,
-    next_call_site: usize,
-    next_gap: usize,
-    source_occurrences: HashMap<(usize, usize), u32>,
     cleanups: Vec<CleanupRegion<'tree>>,
-    cancellation: &'targets CancellationToken,
 }
 
 fn lower_procedure<'tree>(
@@ -706,84 +543,29 @@ fn lower_procedure<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), ScalaLoweringError> {
-    let base_source = SourceMappingId::new(0);
-    let base_evidence = EvidenceId::new(0);
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
         spec.locator.clone(),
         spec.kind,
-        base_source,
-        base_evidence,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
     );
     parts.lexical_parent = spec.lexical_parent;
     parts.properties = spec.properties;
-    parts.source_mappings.push(SourceMapping {
-        id: base_source,
-        locator: spec.locator.clone(),
-        kind: SourceMappingKind::Exact,
-    });
-    parts.evidence_rows.push(Evidence {
-        id: base_evidence,
-        proof: ProofStatus::Proven,
-        completeness: EvidenceCompleteness::Complete,
-        sources: Box::new([base_source]),
-    });
-
-    let mut builder = ProcedureCfgBuilder::new(parts, budget)?;
-    let entry = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::Entry,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let normal_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::NormalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let exceptional_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::ExceptionalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let function_scope = builder.push_scope(
-        None,
-        ScopeBinding::Function {
-            return_target: normal_exit,
-            throw_target: exceptional_exit,
-        },
-    );
+    let ProcedureLoweringStart {
+        mut builder,
+        session,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        function_scope,
+    } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
         source: prepared.source(),
-        locator: spec.locator.clone(),
+        session,
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
-        point_metadata: vec![
-            PointMetadata {
-                source: base_source,
-                evidence: base_evidence,
-            };
-            3
-        ],
-        next_source: 1,
-        next_evidence: 1,
-        next_value: 0,
-        next_call_site: 0,
-        next_gap: 0,
-        source_occurrences: HashMap::default(),
         cleanups: Vec::new(),
-        cancellation,
     };
 
     if callable_has_by_name_parameter(spec.callable) {
@@ -806,15 +588,39 @@ fn lower_procedure<'tree>(
             "Scala object, trait, or unconditional-given initialization is demand scheduled",
         )?;
     }
-    if spec.kind == ProcedureKind::Constructor && spec.properties.is_synthetic {
-        context.add_gap(
-            &mut builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unsupported,
-            "implicit superclass and mixin constructor invocations are not emitted as call sites",
-        )?;
+    let extends_clause = if spec.properties.is_synthetic {
+        spec.callable.child_by_field_name("extend")
+    } else {
+        None
+    };
+    let parent_arguments = extends_clause
+        .map(parent_argument_expressions)
+        .unwrap_or_default();
+    if spec.properties.is_synthetic
+        && (spec.kind == ProcedureKind::Constructor || extends_clause.is_some())
+    {
+        let detail =
+            "implicit superclass and mixin initialization calls are not emitted as call sites";
+        if extends_clause.is_some() {
+            context.session.add_gap_with_impacts(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapImpacts::CALL_EVALUATION,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        } else {
+            context.add_gap(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        }
         context.add_gap(
             &mut builder,
             entry,
@@ -846,14 +652,29 @@ fn lower_procedure<'tree>(
         )?;
         EdgeTarget::normal(implicit_return)
     };
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
-
-    let mut pending = vec![Work::Expression {
-        node: spec.body,
-        entry: body_entry,
-        next: body_next,
-        scope: function_scope,
-    }];
+    // `callable_shape` retains a bodyless template's declaration as its source
+    // anchor. Its structured parent-constructor arguments still execute before
+    // the template body, while the declaration itself is not an expression.
+    let bodyless_template = spec.properties.is_synthetic && spec.body.id() == spec.callable.id();
+    let mut pending = if bodyless_template {
+        context.edge(&mut builder, body_entry, body_next)?;
+        Vec::new()
+    } else {
+        vec![Work::Expression {
+            node: spec.body,
+            entry: body_entry,
+            next: body_next,
+            scope: function_scope,
+        }]
+    };
+    context.schedule_expressions(
+        &mut builder,
+        entry,
+        &parent_arguments,
+        EdgeTarget::normal(body_entry),
+        function_scope,
+        &mut pending,
+    )?;
     let mut drive_error = None;
     while let Some(initial) = pending.pop() {
         if let Err(error) =
@@ -904,7 +725,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         work: Work<'tree>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), ScalaLoweringError> {
-        if self.cancellation.is_cancelled() {
+        if self.session.cancellation().is_cancelled() {
             return Err(ScalaLoweringError::Cancelled(Box::default()));
         }
         match work {
@@ -1980,45 +1801,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
-        let call_site = CallSiteId::new(
-            u32::try_from(self.next_call_site)
-                .map_err(|_| ScalaLoweringError::Invalid("too many call sites".into()))?,
-        );
         let arguments = argument_nodes
             .iter()
             .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.add_call_site(SemanticCallSite {
-            id: call_site,
-            point: invoke,
-            callee,
-            receiver,
-            arguments: arguments.into_boxed_slice(),
-            result: Some(result),
-            thrown: Some(thrown),
-            declared_targets: resolution.clone(),
-            target_evidence: metadata.evidence,
-            normal_continuation: ControlContinuation::Target(normal),
-            exceptional_continuation: ControlContinuation::Target(exceptional),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_call_site += 1;
-        self.append_effect(builder, invoke, SemanticEffect::Invoke { call_site })?;
-        self.append_effect(
+        let call_site = self.session.add_call_site(
             builder,
-            normal,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Normal,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Exceptional,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: arguments.into_iter().map(Into::into).collect(),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
             },
         )?;
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
@@ -2065,18 +1863,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         if !argument_nodes.is_empty() {
-            self.add_gap(
-                builder,
-                invoke,
-                SemanticGapSubject::CallSite(call_site),
-                SemanticCapability::DeferredExecution,
-                SemanticGapKind::Unknown,
-                if has_structured_argument {
-                    "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved"
-                } else {
-                    "argument evaluation strictness depends on the resolved Scala parameter signature"
-                },
-            )?;
+            let detail = if has_structured_argument {
+                "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved"
+            } else {
+                "argument evaluation strictness depends on the resolved Scala parameter signature"
+            };
+            if has_structured_argument {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::CALL_EVALUATION,
+                    SemanticGapKind::Unknown,
+                    detail,
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapKind::Unknown,
+                    detail,
+                )?;
+            }
         }
         if is_future_like_call(self.source, callable) {
             self.add_gap(
@@ -2088,11 +1899,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "Future-style execution-context scheduling is not lowered",
             )?;
             if argument_nodes.is_empty() {
-                self.add_gap(
+                self.session.add_gap_with_impacts(
                     builder,
                     invoke,
                     SemanticGapSubject::CallSite(call_site),
                     SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::CALL_EVALUATION,
                     SemanticGapKind::Unknown,
                     "Future body execution timing is not lowered",
                 )?;
@@ -2305,45 +2117,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
-        let call_site = CallSiteId::new(
-            u32::try_from(self.next_call_site)
-                .map_err(|_| ScalaLoweringError::Invalid("too many call sites".into()))?,
-        );
         let arguments = argument_nodes
             .iter()
             .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.add_call_site(SemanticCallSite {
-            id: call_site,
-            point: invoke,
-            callee,
-            receiver,
-            arguments: arguments.into_boxed_slice(),
-            result: Some(result),
-            thrown: Some(thrown),
-            declared_targets: resolution.clone(),
-            target_evidence: metadata.evidence,
-            normal_continuation: ControlContinuation::Target(normal),
-            exceptional_continuation: ControlContinuation::Target(exceptional),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_call_site += 1;
-        self.append_effect(builder, invoke, SemanticEffect::Invoke { call_site })?;
-        self.append_effect(
+        let call_site = self.session.add_call_site(
             builder,
-            normal,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Normal,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Exceptional,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: arguments.into_iter().map(Into::into).collect(),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
             },
         )?;
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
@@ -2560,12 +2349,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let (entry, created) =
                 builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
             if created {
-                if entry.index() != self.point_metadata.len() {
-                    return Err(ScalaLoweringError::Invalid(
-                        "cleanup specialization broke dense point allocation".into(),
-                    ));
-                }
-                self.point_metadata.push(metadata);
+                self.session.register_point(
+                    entry,
+                    metadata,
+                    "cleanup specialization broke dense point allocation",
+                )?;
                 let cleanup_next = if next.kind == ControlEdgeKind::Normal {
                     next
                 } else {
@@ -2637,18 +2425,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, ScalaLoweringError> {
         let metadata = self.mapping(builder, node)?;
-        let events = effects
-            .into_iter()
-            .map(|effect| SemanticEvent::new(effect, metadata.source, metadata.evidence))
-            .collect();
-        let point = builder.add_point(events, metadata.source, metadata.evidence)?;
-        if point.index() != self.point_metadata.len() {
-            return Err(ScalaLoweringError::Invalid(
-                "program-point allocation is not dense".into(),
-            ));
-        }
-        self.point_metadata.push(metadata);
-        Ok(point)
+        self.session.add_point(builder, metadata, effects)
     }
 
     fn mapping(
@@ -2657,51 +2434,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, ScalaLoweringError> {
         let range = node.byte_range();
-        let occurrence = self
-            .source_occurrences
-            .entry((range.start, range.end))
-            .or_default();
-        let anchor = source_anchor(node, *occurrence).map_err(ScalaLoweringError::Invalid)?;
-        *occurrence += 1;
-        let source = SourceMappingId::new(
-            u32::try_from(self.next_source)
-                .map_err(|_| ScalaLoweringError::Invalid("too many source mappings".into()))?,
-        );
-        let evidence = EvidenceId::new(
-            u32::try_from(self.next_evidence)
-                .map_err(|_| ScalaLoweringError::Invalid("too many evidence rows".into()))?,
-        );
-        let locator = SemanticLocator::new(
-            self.locator.mount(),
-            self.locator.path().clone(),
-            self.locator.language(),
-            self.locator.declaration().clone(),
-            SemanticRole::ProgramPoint,
-            anchor,
-        );
-        builder.add_source_mapping(SourceMapping {
-            id: source,
-            locator,
-            kind: SourceMappingKind::Exact,
-        })?;
-        builder.add_evidence(Evidence {
-            id: evidence,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            sources: Box::new([source]),
-        })?;
-        self.next_source += 1;
-        self.next_evidence += 1;
-        Ok(PointMetadata { source, evidence })
+        let occurrence = self.session.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(ScalaLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, ScalaLoweringError> {
-        self.point_metadata
-            .get(point.index())
-            .copied()
-            .ok_or_else(|| {
-                ScalaLoweringError::Invalid(format!("missing metadata for program point {point}"))
-            })
+        self.session.metadata(point)
     }
 
     fn value(
@@ -2710,19 +2450,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         kind: SemanticValueKind,
     ) -> Result<ValueId, ScalaLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = ValueId::new(
-            u32::try_from(self.next_value)
-                .map_err(|_| ScalaLoweringError::Invalid("too many semantic values".into()))?,
-        );
-        builder.add_value(SemanticValue {
-            id,
-            kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_value += 1;
-        Ok(id)
+        self.session.add_value(builder, point, kind)
     }
 
     fn append_effect(
@@ -2731,12 +2459,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         effect: SemanticEffect,
     ) -> Result<(), ScalaLoweringError> {
-        let metadata = self.metadata(point)?;
-        builder.append_event(
-            point,
-            SemanticEvent::new(effect, metadata.source, metadata.evidence),
-        )?;
-        Ok(())
+        self.session.append_effect(builder, point, effect)
     }
 
     fn add_gap(
@@ -2748,24 +2471,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         kind: SemanticGapKind,
         detail: &str,
     ) -> Result<(), ScalaLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = SemanticGapId::new(
-            u32::try_from(self.next_gap)
-                .map_err(|_| ScalaLoweringError::Invalid("too many semantic gaps".into()))?,
-        );
-        builder.add_gap(SemanticGap {
-            id,
-            point,
-            subject,
-            capability,
-            kind,
-            budget: None,
-            detail: detail.into(),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_gap += 1;
-        self.append_effect(builder, point, SemanticEffect::Gap { gap: id })
+        self.session
+            .add_gap(builder, point, subject, capability, kind, detail)?;
+        Ok(())
     }
 
     fn edge(
@@ -2774,26 +2482,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         source_point: ProgramPointId,
         target: EdgeTarget,
     ) -> Result<(), ScalaLoweringError> {
-        let metadata = self.metadata(source_point)?;
-        builder.add_edge(ControlEdge {
-            source_point,
-            target_point: target.point,
-            kind: target.kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        Ok(())
+        self.session
+            .add_edge(builder, source_point, target.point, target.kind)
     }
 }
 
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
-}
-
-fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor).collect()
 }
 
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -2827,10 +2523,6 @@ fn missing_field(node: Node<'_>, field: &str) -> ScalaLoweringError {
         node.start_byte(),
         node.end_byte()
     ))
-}
-
-fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    source.get(node.byte_range())
 }
 
 fn infix_operator<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
@@ -2886,6 +2578,17 @@ fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
     named_children(node)
         .into_iter()
         .filter(|child| is_runtime_node(child.kind()))
+        .collect()
+}
+
+/// Return executable expressions from structured parent-constructor argument
+/// lists. Curried trailing lists are unfielded children of `extends_clause`,
+/// so collect every direct `arguments` child in source order.
+fn parent_argument_expressions(extends_clause: Node<'_>) -> Vec<Node<'_>> {
+    named_children(extends_clause)
+        .into_iter()
+        .filter(|child| child.kind() == "arguments")
+        .flat_map(runtime_expression_children)
         .collect()
 }
 
@@ -3055,21 +2758,4 @@ fn is_future_like_call(source: &str, function: Node<'_>) -> bool {
     matches!(function.kind(), "identifier" | "field_expression")
         && node_text(source, function)
             .is_some_and(|text| text == "Future" || text.ends_with(".Future"))
-}
-
-fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {
-    let start_position = node.start_position();
-    let end_position = node.end_position();
-    let start = SourcePosition::new(
-        u32::try_from(node.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start_position.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start_position.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = SourcePosition::new(
-        u32::try_from(node.end_byte()).map_err(|_| "source end exceeds u32")?,
-        u32::try_from(end_position.row).map_err(|_| "source end line exceeds u32")?,
-        u32::try_from(end_position.column).map_err(|_| "source end column exceeds u32")?,
-    );
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
 }

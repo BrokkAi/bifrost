@@ -7,6 +7,7 @@ use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
 
 use super::capabilities::SemanticCapability;
+use super::ids::SemanticArtifactKey;
 use super::ir::{SemanticArtifact, SemanticIrError};
 
 /// Declare every independently bounded semantic-materialization dimension once.
@@ -64,6 +65,17 @@ macro_rules! semantic_budget_dimensions {
                 Some(Self {
                     $($field: self.$field.checked_add(other.$field)?),+
                 })
+            }
+
+            /// Add work conservatively, using a uniformly maximal sentinel if
+            /// any dimension overflows.
+            ///
+            /// Budget accounting treats overflow as an unconditional stop. A
+            /// single shared operation keeps that policy consistent across
+            /// lowering, CFG/ICFG construction, and oracle materialization.
+            pub(crate) fn conservative_add(self, other: Self) -> Self {
+                self.checked_add(other)
+                    .unwrap_or_else(|| Self::uniform(usize::MAX))
             }
 
             pub(crate) fn component_max(self, other: Self) -> Self {
@@ -426,8 +438,70 @@ impl std::error::Error for SemanticProviderError {
     }
 }
 
+/// One current source snapshot and the complete semantic artifact identity
+/// derived from that same atomic project read.
+///
+/// This is not a materialized artifact and does not retain syntax or IR. It is
+/// the source-bearing freshness proof used when a semantic handle crosses
+/// provider calls and its exact source must be consumed by a downstream
+/// resolver without a second, racing read.
+#[derive(Debug, Clone)]
+pub struct SemanticArtifactSourceSnapshot {
+    key: SemanticArtifactKey,
+    source: Arc<str>,
+}
+
+impl SemanticArtifactSourceSnapshot {
+    pub(crate) fn new(key: SemanticArtifactKey, source: Arc<str>) -> Self {
+        Self { key, source }
+    }
+
+    /// Complete artifact identity for this exact source snapshot.
+    pub const fn key(&self) -> &SemanticArtifactKey {
+        &self.key
+    }
+
+    /// Exact disk or overlay source used to derive [`Self::key`].
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn into_parts(self) -> (SemanticArtifactKey, Arc<str>) {
+        (self.key, self.source)
+    }
+}
+
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
 pub trait ProgramSemanticsProvider: Send + Sync {
+    /// Capture the file's current atomic source snapshot and derive its complete
+    /// semantic artifact identity without parsing or lowering procedures.
+    ///
+    /// `None` means the current snapshot exceeds `max_source_bytes`; source
+    /// access and identity failures remain operational errors.
+    fn current_artifact_source(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError>;
+
+    /// Derive the complete identity of the file's current atomic source
+    /// snapshot without parsing, lowering procedures, or charging semantic
+    /// work.
+    ///
+    /// This is the generation check for handles that cross provider calls. It
+    /// uses the same adapter, IR, configuration, and dependency identity as
+    /// [`Self::materialize`].
+    /// `None` means the current snapshot exceeds `max_source_bytes`; source
+    /// access and identity failures remain operational errors.
+    fn current_artifact_key(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+        self.current_artifact_source(file, max_source_bytes)
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.key().clone()))
+    }
+
     /// Prepare one exact file snapshot, derive its identity, and lower it as
     /// one linearized operation. Implementations cache only complete artifacts.
     fn materialize(
@@ -444,6 +518,14 @@ mod tests {
     struct FailingProgramSemanticsProvider(SemanticProviderError);
 
     impl ProgramSemanticsProvider for FailingProgramSemanticsProvider {
+        fn current_artifact_source(
+            &self,
+            _file: &ProjectFile,
+            _max_source_bytes: usize,
+        ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError> {
+            Err(self.0.clone())
+        }
+
         fn materialize(
             &self,
             _file: &ProjectFile,

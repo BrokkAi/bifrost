@@ -213,7 +213,10 @@ fn assignment_artifact(source: &FixtureSource, procedure_name: &str) -> Semantic
     procedure.values.extend([
         SemanticValue {
             id: ValueId::new(0),
-            kind: SemanticValueKind::Parameter { ordinal: 0 },
+            kind: SemanticValueKind::Parameter {
+                ordinal: 0,
+                multiplicity: FormalMultiplicity::One,
+            },
             source: SOURCE,
             evidence: EVIDENCE,
         },
@@ -225,6 +228,62 @@ fn assignment_artifact(source: &FixtureSource, procedure_name: &str) -> Semantic
         },
     ]);
     build_artifact(source, vec![procedure])
+}
+
+#[test]
+fn duplicate_parameter_ordinals_are_rejected() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/duplicate.ts",
+            "export function duplicate(a: number, b: number) { return a; }",
+        )
+        .build();
+    let source = FixtureSource::from_file(
+        &project.file("src/duplicate.ts"),
+        SemanticLanguage::Standard(Language::TypeScript),
+    );
+    let locator = source.procedure_locator(
+        vec![named_segment(
+            DeclarationSegmentKind::Function,
+            "duplicate",
+            0,
+        )],
+        anchor(0, 0),
+    );
+    let mut procedure = base_procedure(
+        ProcedureId::new(0),
+        locator,
+        ProcedureKind::Function,
+        vec![event(SemanticEffect::ProcedureReturn {
+            value: Some(ValueId::new(0)),
+        })],
+        true,
+    );
+    procedure.values.extend([
+        SemanticValue {
+            id: ValueId::new(0),
+            kind: SemanticValueKind::Parameter {
+                ordinal: 0,
+                multiplicity: FormalMultiplicity::One,
+            },
+            source: SOURCE,
+            evidence: EVIDENCE,
+        },
+        SemanticValue {
+            id: ValueId::new(1),
+            kind: SemanticValueKind::Parameter {
+                ordinal: 0,
+                multiplicity: FormalMultiplicity::Rest(ArgumentDomain::Positional),
+            },
+            source: SOURCE,
+            evidence: EVIDENCE,
+        },
+    ]);
+
+    let error = SemanticArtifact::try_new(source.key.clone(), capabilities(), vec![procedure])
+        .expect_err("a procedure cannot publish two formal ports for one ordinal");
+    assert_eq!(error.kind(), SemanticIrErrorKind::CallContract);
+    assert!(error.detail().contains("parameter ordinal 0"));
 }
 
 #[test]
@@ -351,7 +410,10 @@ fn nested_lambda_is_a_separate_procedure_with_explicit_capture_binding() {
     outer.values.extend([
         SemanticValue {
             id: ValueId::new(0),
-            kind: SemanticValueKind::Parameter { ordinal: 0 },
+            kind: SemanticValueKind::Parameter {
+                ordinal: 0,
+                multiplicity: FormalMultiplicity::One,
+            },
             source: SOURCE,
             evidence: EVIDENCE,
         },
@@ -746,6 +808,10 @@ fn ambiguous_callable_reference_keeps_candidates_and_an_explicit_gap() {
         point: BODY,
         subject: SemanticGapSubject::Value(ValueId::new(0)),
         capability: SemanticCapability::CallableReferences,
+        impacts: SemanticGapImpacts::for_gap(
+            SemanticCapability::CallableReferences,
+            SemanticGapSubject::Value(ValueId::new(0)),
+        ),
         kind: SemanticGapKind::Ambiguous,
         budget: None,
         detail: "both declarations remain viable".into(),
@@ -826,6 +892,10 @@ fn explicit_gap_does_not_fabricate_a_call_or_control_edge() {
             point: BODY,
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::Calls,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Calls,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "call target cannot be established".into(),
@@ -837,6 +907,10 @@ fn explicit_gap_does_not_fabricate_a_call_or_control_edge() {
             point: BODY,
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::ExceptionalControlFlow,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
             detail: "adapter does not expose exceptional flow".into(),
@@ -848,6 +922,10 @@ fn explicit_gap_does_not_fabricate_a_call_or_control_edge() {
             point: BODY,
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::AsyncSuspendResume,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::AsyncSuspendResume,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
             detail: "adapter does not expose async suspension".into(),

@@ -108,7 +108,7 @@ fn call_reference_target_at_cursor(
             end_byte: Some(range.end_byte),
         },
         file.clone(),
-        Arc::new(content.to_string()),
+        Arc::from(content),
     )?;
     if outcome.status != DefinitionLookupStatus::Resolved {
         return None;

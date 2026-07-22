@@ -670,7 +670,7 @@ fn forward_resolve_file(
     sites: &[SampledSite],
     path: &str,
 ) -> ForwardFileResult {
-    let Some(source) = analyzer.indexed_source(file).map(Arc::new) else {
+    let Some(source) = analyzer.indexed_source(file).map(Arc::<str>::from) else {
         return ForwardFileResult {
             records: Vec::new(),
             resolved: Vec::new(),
