@@ -493,7 +493,8 @@ fn compare_scenario_pair(
             detail: Some("scenario missing from candidate report".to_string()),
         },
         (None, Some(candidate)) => {
-            let invariant_failure = query_code_cold_ratio_failure(key.scenario, candidate);
+            let invariant_failure =
+                query_code_cold_ratio_failure(key.scenario, candidate, thresholds);
             let candidate_failure =
                 (!candidate.success).then(|| "new candidate scenario failed".to_string());
             ScenarioCompareReport {
@@ -533,7 +534,7 @@ fn compare_present_scenarios(
         _ => None,
     };
 
-    let cold_ratio_failure = query_code_cold_ratio_failure(key.scenario, candidate);
+    let cold_ratio_failure = query_code_cold_ratio_failure(key.scenario, candidate, thresholds);
     let (outcome, is_regression, detail) = if baseline.success && !candidate.success {
         (
             ScenarioCompareOutcome::Regression,
@@ -600,6 +601,7 @@ fn compare_present_scenarios(
 fn query_code_cold_ratio_failure(
     scenario: BenchmarkScenario,
     candidate: &ScenarioReport,
+    thresholds: CompareThresholds,
 ) -> Option<String> {
     const MAX_COLD_TO_WARM_RATIO: f64 = 10.0;
     if scenario != BenchmarkScenario::QueryCode {
@@ -613,9 +615,11 @@ fn query_code_cold_ratio_failure(
         return None;
     }
     let ratio = first_ms / warm_median_ms;
-    (ratio > MAX_COLD_TO_WARM_RATIO).then(|| {
+    let excess_ms = first_ms - MAX_COLD_TO_WARM_RATIO * warm_median_ms;
+    (ratio > MAX_COLD_TO_WARM_RATIO && excess_ms >= thresholds.absolute_ms).then(|| {
         format!(
-            "query_code first request is {ratio:.2}x warm median, above the {MAX_COLD_TO_WARM_RATIO:.1}x retention limit"
+            "query_code first request is {ratio:.2}x warm median and exceeds the {MAX_COLD_TO_WARM_RATIO:.1}x retention limit by {excess_ms:.1} ms (absolute floor {:.1} ms)",
+            thresholds.absolute_ms
         )
     })
 }

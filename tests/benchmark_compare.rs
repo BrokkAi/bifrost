@@ -225,6 +225,24 @@ fn query_code_cold_to_warm_ratio_blocks_false_warm_improvement() {
 }
 
 #[test]
+fn query_code_cold_to_warm_ratio_ignores_sub_floor_boundary_jitter() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 200.0, 25.0)],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 270.0, 25.0)],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+    let scenario = &comparison.scenarios[0];
+    assert_eq!(scenario.outcome, ScenarioCompareOutcome::Unchanged);
+    assert!(!scenario.is_regression, "{scenario:?}");
+    assert!(!comparison.has_actionable_regressions, "{comparison:?}");
+}
+
+#[test]
 fn new_query_code_candidate_still_enforces_cold_to_warm_invariant() {
     let baseline = report_with_scenarios(vec![repo_with_scenarios(
         "fixture-java",

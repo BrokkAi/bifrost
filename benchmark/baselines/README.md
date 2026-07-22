@@ -37,18 +37,23 @@ the same 10 repositories and 76 scenarios. It was checked in by commit
 `0d12e86f982c734d8caf446e42990b02fec0b997`; the originating Actions run was not
 recorded in the repository.
 
-The issue #920 query-regression baseline is promoted from the successful full
-manual benchmark run on July 22, 2026 (`run-20260722T204647Z.json` from Actions
-run 29955662059, Bifrost commit
-`bc98c29da12ced428b0b4952709ebbeb20a4ff5a`). The report had zero scenario
+The issue #920 query-regression baseline is promoted from the complete full
+manual benchmark artifact on July 22, 2026 (`run-20260722T210340Z.json` from
+Actions run 29956839833, Bifrost commit
+`3ed81cc526df464b6b9430da0ffa81cc07e03f59`). The harness had zero scenario
 failures across the same 10 repositories and 92 scenarios, including all 16 new
 `query_code` cases with stable result cardinalities and no query diagnostics.
 The artifact also passes strict comparison against itself, including the
-first-to-warm retention invariant. Comparison with the July 15 baseline reported
-four improvements and four existing-scenario timing regressions. This promotion
-deliberately establishes the reviewed post-#920 floor so subsequent strict runs
-exercise the new query correctness, cache-path, and timing contracts instead of
-treating all 16 cases as absent from the baseline.
+dual-arm first-to-warm retention invariant. The original workflow failed strict
+enforcement because the Dapper workspace query measured 10.32x first-to-warm
+while exceeding the 10x budget by only 11.0 ms, before the comparator applied its
+ordinary 50 ms absolute noise floor. Under the corrected comparator, comparison
+with the preceding #920 candidate reports 16 improvements and one
+existing-scenario Rust definition timing regression after the final master
+integration. This promotion deliberately establishes the reviewed final-head
+post-#920 floor so subsequent strict runs exercise the new query correctness,
+cache-path, and timing contracts instead of treating all 16 cases as absent from
+the baseline.
 
 It is not written automatically. Promote it deliberately:
 
