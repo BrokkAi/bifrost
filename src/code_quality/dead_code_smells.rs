@@ -15,7 +15,7 @@ use crate::analyzer::usages::{
     ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -2056,17 +2056,11 @@ fn java_overloaded_function_fqns(analyzer: &dyn IAnalyzer) -> HashSet<String> {
 }
 
 fn overloaded_function_fqns(analyzer: &dyn IAnalyzer, language: Language) -> HashSet<String> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
     for declaration in analyzer.all_declarations().filter(|unit| {
         code_unit_language(unit) == language && !unit.is_synthetic() && unit.is_function()
     }) {
-        let fqn = declaration.fq_name();
-        let definition_count = analyzer
-            .get_definitions(&fqn)
-            .into_iter()
-            .filter(|definition| code_unit_language(definition) == language)
-            .count();
-        *counts.entry(fqn).or_default() += definition_count.max(1);
+        *counts.entry(declaration.fq_name()).or_default() += 1;
     }
     counts
         .into_iter()
