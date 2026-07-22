@@ -25,15 +25,25 @@ pub(super) fn start_initialized_session(
     no_line_numbers: bool,
     profile: bool,
 ) -> Result<McpSession, String> {
-    McpSession::start(root, no_line_numbers, profile).and_then(|mut session| {
-        match session.initialize() {
-            Ok(()) => Ok(session),
-            Err(error) => {
-                let tail = session.shutdown_and_stderr_tail();
-                Err(error_with_stderr_tail(error, tail))
-            }
+    McpSession::start(root, no_line_numbers, profile).and_then(initialize_session)
+}
+
+pub(super) fn start_initialized_scan_only_session(
+    root: &Path,
+    no_line_numbers: bool,
+    profile: bool,
+) -> Result<McpSession, String> {
+    McpSession::start_scan_only(root, no_line_numbers, profile).and_then(initialize_session)
+}
+
+fn initialize_session(mut session: McpSession) -> Result<McpSession, String> {
+    match session.initialize() {
+        Ok(()) => Ok(session),
+        Err(error) => {
+            let tail = session.shutdown_and_stderr_tail();
+            Err(error_with_stderr_tail(error, tail))
         }
-    })
+    }
 }
 
 pub(super) fn run_profiled_iteration<T>(

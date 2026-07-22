@@ -345,6 +345,23 @@ fn receive_response(
 
 impl McpSession {
     pub fn start(root: &Path, no_line_numbers: bool, profile: bool) -> Result<Self, String> {
+        Self::start_with_query_access(root, no_line_numbers, profile, None)
+    }
+
+    pub(super) fn start_scan_only(
+        root: &Path,
+        no_line_numbers: bool,
+        profile: bool,
+    ) -> Result<Self, String> {
+        Self::start_with_query_access(root, no_line_numbers, profile, Some("scan_only"))
+    }
+
+    fn start_with_query_access(
+        root: &Path,
+        no_line_numbers: bool,
+        profile: bool,
+        query_access: Option<&str>,
+    ) -> Result<Self, String> {
         let bifrost_binary = bifrost_binary_path()?;
         let mut command = Command::new(&bifrost_binary);
         command
@@ -362,7 +379,9 @@ impl McpSession {
         // an ambient value into a benchmark process; only the validated
         // benchmark-facing selector below may set it.
         command.env_remove(SERVER_QUERY_ACCESS_ENV);
-        if let Some(access_mode) = std::env::var_os(BENCHMARK_QUERY_ACCESS_ENV) {
+        if let Some(access_mode) = query_access {
+            command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
+        } else if let Some(access_mode) = std::env::var_os(BENCHMARK_QUERY_ACCESS_ENV) {
             command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
         }
         let mut child = command

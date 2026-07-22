@@ -153,6 +153,36 @@ pub(crate) enum StructuralAccessMode {
     Auto,
     ScanOnly,
     IndexedRequired,
+    #[cfg(test)]
+    DerivedAutoForTest,
+}
+
+impl StructuralAccessMode {
+    const fn uses_auto_index_admission(self) -> bool {
+        match self {
+            Self::Auto => true,
+            #[cfg(test)]
+            Self::DerivedAutoForTest => true,
+            Self::ScanOnly | Self::IndexedRequired => false,
+        }
+    }
+
+    const fn permits_snapshot_import_topology(self) -> bool {
+        match self {
+            Self::IndexedRequired => true,
+            #[cfg(test)]
+            Self::DerivedAutoForTest => true,
+            Self::Auto | Self::ScanOnly => false,
+        }
+    }
+
+    const fn uses_snapshot_import_auto_admission(self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::DerivedAutoForTest => true,
+            Self::Auto | Self::ScanOnly | Self::IndexedRequired => false,
+        }
+    }
 }
 
 /// A match found before rendering, held until the rendering pass (which
@@ -3084,7 +3114,7 @@ fn prepare_seed_access(
     let cache_ready_before_lookup = ready_index.is_some();
     let auto_build_is_viable = files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
         && files.len().saturating_mul(4) >= provider_file_count;
-    if state.access_mode == StructuralAccessMode::Auto && ready_index.is_none() {
+    if state.access_mode.uses_auto_index_admission() && ready_index.is_none() {
         if !auto_build_is_viable {
             return scan_access(state, files.len(), None);
         }
@@ -3866,7 +3896,7 @@ fn acquire_direct_import_layer(
             build: DerivedLayerBuildMetrics::default(),
         },
         None if !layer_requested
-            || (state.access_mode == StructuralAccessMode::Auto
+            || (state.access_mode.uses_snapshot_import_auto_admission()
                 && (state.deferred_derived_builds.contains(&request)
                     || !cache.observe_auto_reuse_opportunity(
                         request,
@@ -3875,7 +3905,7 @@ fn acquire_direct_import_layer(
                         remaining_import_edges,
                     ))) =>
         {
-            if layer_requested && state.access_mode == StructuralAccessMode::Auto {
+            if layer_requested && state.access_mode.uses_snapshot_import_auto_admission() {
                 state.deferred_derived_builds.insert(request);
             }
             if let Some(profile) = &mut state.cache_profile {
@@ -4025,7 +4055,7 @@ fn acquire_direct_import_layer(
                 state.import_graph_generations = Some(source_generations.clone());
             }
             if let Some(rejection_scope) = rejection_scope
-                && state.access_mode == StructuralAccessMode::Auto
+                && state.access_mode.uses_snapshot_import_auto_admission()
             {
                 cache.record_auto_rejection(
                     request,
@@ -4130,7 +4160,7 @@ fn apply_plan_step(
     let mut snapshot_relation_complete = true;
     if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
         discard_stale_request_import_graph(state);
-        if state.access_mode != StructuralAccessMode::ScanOnly {
+        if state.access_mode.permits_snapshot_import_topology() {
             let request = derived_layer_request
                 .unwrap_or_else(DerivedLayerRequest::complete_direct_import_topology);
             let build_if_missing = derived_layer_request.is_some();

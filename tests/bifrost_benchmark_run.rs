@@ -158,6 +158,22 @@ query_code_queries = [
         "report: {report}"
     );
     assert!(
+        query_code["query_code"]["cold_contract"]
+            .as_str()
+            .is_some_and(|contract| contract.contains("primed by an untimed scan-only process")),
+        "report: {report}"
+    );
+    assert!(
+        query_code["query_code"]["first"]["facts_cache"]["persisted_hydrations"]
+            .as_u64()
+            .is_some_and(|hydrations| hydrations > 0),
+        "the measured process must hydrate the primed durable facts: {report}"
+    );
+    assert_eq!(
+        query_code["query_code"]["first"]["facts_cache"]["extractions"], 0,
+        "the measured first request must not include structural-fact extraction: {report}"
+    );
+    assert!(
         query_code["query_code"]["warm"]["facts_cache"]["memory_hits"]
             .as_u64()
             .is_some_and(|hits| hits > 0),

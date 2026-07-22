@@ -319,7 +319,7 @@ fn auto_import_topology_builds_only_after_observing_reuse() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&first.result).expect("first Auto result"),
@@ -337,7 +337,7 @@ fn auto_import_topology_builds_only_after_observing_reuse() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&built.result).expect("built Auto result"),
@@ -360,7 +360,7 @@ fn auto_import_topology_builds_only_after_observing_reuse() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&hit.result).expect("hit Auto result"),
@@ -714,7 +714,7 @@ fn auto_import_topology_budget_fallback_matches_request_local_response() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&admitted.result).expect("admission result"),
@@ -731,7 +731,7 @@ fn auto_import_topology_budget_fallback_matches_request_local_response() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&automatic.result).expect("automatic result"),
@@ -751,7 +751,7 @@ fn auto_import_topology_budget_fallback_matches_request_local_response() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&suppressed.result).expect("suppressed result"),
@@ -799,7 +799,7 @@ fn late_topology_edge_limit_reuses_partial_work_for_fallback() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&admission.result).expect("admission response"),
@@ -812,7 +812,7 @@ fn late_topology_edge_limit_reuses_partial_work_for_fallback() {
         "Target",
         "importers_of",
         limits,
-        StructuralAccessMode::Auto,
+        StructuralAccessMode::DerivedAutoForTest,
     );
     assert_eq!(
         serde_json::to_value(&fallback.result).expect("fallback response"),
@@ -3131,12 +3131,12 @@ fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
     assert_eq!(profile.cache.import_reverse.hits, 1);
     assert_eq!(profile.cache.import_reverse.incomplete_hits, 1);
     assert_eq!(profile.cache.import_reverse.complete_hits, 0);
-    assert_eq!(profile.cache.direct_import_topology.lookups, 4);
-    assert_eq!(profile.cache.direct_import_topology.misses, 4);
+    assert_eq!(profile.cache.direct_import_topology.lookups, 0);
+    assert_eq!(profile.cache.direct_import_topology.misses, 0);
     assert_eq!(profile.cache.direct_import_topology.hits, 0);
     assert_eq!(profile.cache.direct_import_topology.builds, 0);
     assert_eq!(profile.cache.direct_import_topology.complete_builds, 0);
-    assert_eq!(profile.cache.direct_import_topology.fallbacks, 4);
+    assert_eq!(profile.cache.direct_import_topology.fallbacks, 0);
     assert_eq!(
         profile
             .operators
@@ -3222,7 +3222,7 @@ fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
 }
 
 #[test]
-fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
+fn profile_records_request_local_import_graph_reuse_without_snapshot_retention() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
     ProjectFile::new(root.clone(), PathBuf::from("bench/LeftHub.java"))
@@ -3259,11 +3259,11 @@ fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
     assert_eq!(deferred.result.completion(), CodeQueryCompletion::Complete);
     let deferred_profile = deferred.profile.expect("deferred profile");
     assert_serial_profile_reconciles(&deferred_profile);
-    assert_eq!(deferred_profile.cache.direct_import_topology.lookups, 2);
-    assert_eq!(deferred_profile.cache.direct_import_topology.misses, 2);
+    assert_eq!(deferred_profile.cache.direct_import_topology.lookups, 0);
+    assert_eq!(deferred_profile.cache.direct_import_topology.misses, 0);
     assert_eq!(deferred_profile.cache.direct_import_topology.hits, 0);
     assert_eq!(deferred_profile.cache.direct_import_topology.builds, 0);
-    assert_eq!(deferred_profile.cache.direct_import_topology.fallbacks, 2);
+    assert_eq!(deferred_profile.cache.direct_import_topology.fallbacks, 0);
 
     let detailed =
         execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
@@ -3292,14 +3292,14 @@ fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
     assert_eq!(profile.cache.import_reverse.hits, 1);
     assert_eq!(profile.cache.import_reverse.complete_hits, 1);
     assert!(profile.cache.import_reverse.replayed_items > 0);
-    assert_eq!(profile.cache.direct_import_topology.lookups, 2);
-    assert_eq!(profile.cache.direct_import_topology.misses, 1);
-    assert_eq!(profile.cache.direct_import_topology.hits, 1);
-    assert_eq!(profile.cache.direct_import_topology.builds, 1);
-    assert_eq!(profile.cache.direct_import_topology.complete_builds, 1);
-    assert_eq!(profile.cache.direct_import_topology.build_files, 4);
-    assert_eq!(profile.cache.direct_import_topology.build_edges, 4);
-    assert!(profile.cache.direct_import_topology.retained_bytes > 0);
+    assert_eq!(profile.cache.direct_import_topology.lookups, 0);
+    assert_eq!(profile.cache.direct_import_topology.misses, 0);
+    assert_eq!(profile.cache.direct_import_topology.hits, 0);
+    assert_eq!(profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(profile.cache.direct_import_topology.complete_builds, 0);
+    assert_eq!(profile.cache.direct_import_topology.build_files, 0);
+    assert_eq!(profile.cache.direct_import_topology.build_edges, 0);
+    assert_eq!(profile.cache.direct_import_topology.retained_bytes, 0);
     let import_steps = profile
         .operators
         .iter()

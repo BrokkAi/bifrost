@@ -1,6 +1,7 @@
 use crate::analyzer::structural::CodeQueryProfile;
 use crate::benchmark::mcp_iteration::{
-    IterationId, run_profiled_iteration, start_initialized_session,
+    IterationId, error_with_stderr_tail, run_profiled_iteration,
+    start_initialized_scan_only_session, start_initialized_session,
 };
 use crate::benchmark::mcp_session::McpSession;
 use crate::benchmark::report::{
@@ -16,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-const COLD_CONTRACT: &str = "fresh MCP process and analyzer snapshot; empty in-memory query indexes and derived layers; pinned checkout and durable structural-facts store retained; production Auto records one viable use before building on reuse";
+const COLD_CONTRACT: &str = "fresh measured MCP process and analyzer snapshot; empty in-memory query indexes and derived layers; pinned checkout and durable structural facts primed by an untimed scan-only process; production Auto records one viable use before building on reuse";
 
 #[derive(Debug)]
 struct QueryCodeIteration {
@@ -34,8 +35,18 @@ pub(super) fn run_scenarios(
     target
         .query_code_queries
         .iter()
-        .map(
-            |case| match start_initialized_session(workspace_path, false, profile.is_some()) {
+        .map(|case| {
+            if let Err(error) = prime_durable_facts(case, workspace_path) {
+                return failure_report(
+                    case,
+                    Vec::new(),
+                    format!(
+                        "failed to prime durable structural facts for query_code case `{}` in `{}`: {error}",
+                        case.id, target.name
+                    ),
+                );
+            }
+            match start_initialized_session(workspace_path, false, profile.is_some()) {
                 Ok(mut session) => run_case(target, manifest, case, &mut session, profile),
                 Err(error) => failure_report(
                     case,
@@ -45,9 +56,26 @@ pub(super) fn run_scenarios(
                         case.id, target.name
                     ),
                 ),
-            },
-        )
+            }
+        })
         .collect()
+}
+
+fn prime_durable_facts(case: &QueryCodeBenchmarkCase, workspace_path: &Path) -> Result<(), String> {
+    let mut session = start_initialized_scan_only_session(workspace_path, false, false)?;
+    let outcome = (|| {
+        let arguments = query_arguments(case)?;
+        let result = session.call_tool("query_code", arguments)?;
+        parse_profile(case, &result)?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let tail = session.shutdown_and_stderr_tail();
+            Err(error_with_stderr_tail(error, tail))
+        }
+    }
 }
 
 fn run_case(
