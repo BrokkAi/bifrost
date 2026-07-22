@@ -1852,3 +1852,132 @@ fn mixed_symbol_sources_render_recovery_before_source_bodies() {
     let source = rendered.find("## Widget").expect("source body");
     assert!(recovery < source, "{rendered}");
 }
+
+// ---------------------------------------------------------------------------
+// `path#terminal` member resolution (issue #1056)
+//
+// Resolution used to run globally first and filter to the anchor file after;
+// members (whose short names are owner-qualified) were invisible to the
+// exact/short-name stages, so any top-level namesake in the workspace
+// short-circuited the search and the member reported not_found on the very
+// file the selector named. Anchored selectors now resolve within the file
+// from the start.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn anchored_selector_resolves_member_by_terminal_name_despite_global_namesake() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/tools/rename.ts",
+            "export class LspRenameDetails {\n  apply(edit: string): string {\n    return edit;\n  }\n}\n",
+        )
+        .file(
+            "src/apply.ts",
+            "export function apply(input: string): string {\n  return input;\n}\n",
+        )
+        .build();
+
+    // The shadowing namesake is what used to short-circuit resolution: the
+    // bare name has a top-level candidate, but the anchored selector must
+    // reach the member in its own file.
+    let anchored = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/tools/rename.ts#apply"]}"#,
+    );
+    assert_eq!(
+        0,
+        anchored["ambiguous"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    assert_eq!(
+        0,
+        anchored["not_found"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    assert_eq!(
+        1,
+        anchored["sources"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    assert_eq!(
+        "src/tools/rename.ts", anchored["sources"][0]["path"],
+        "{anchored}"
+    );
+    assert!(
+        anchored["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("apply(edit: string)"),
+        "{anchored}"
+    );
+}
+
+#[test]
+fn anchored_selector_reports_ambiguity_between_same_named_members_in_one_file() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/tools/handlers.ts",
+            "export class ReadHandler {\n  apply(edit: string): string {\n    return edit;\n  }\n}\n\nexport class WriteHandler {\n  apply(edit: string): string {\n    return edit + edit;\n  }\n}\n",
+        )
+        .build();
+
+    let anchored = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/tools/handlers.ts#apply"]}"#,
+    );
+    assert_eq!(
+        0,
+        anchored["sources"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    assert_eq!(
+        0,
+        anchored["not_found"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    let matches = string_array(&anchored["ambiguous"][0]["matches"]);
+    assert_eq!(
+        vec![
+            "src/tools/handlers.ts#ReadHandler.apply".to_string(),
+            "src/tools/handlers.ts#WriteHandler.apply".to_string(),
+        ],
+        matches,
+        "{anchored}"
+    );
+}
+
+#[test]
+fn anchored_selector_resolves_scala_nested_symbol_despite_global_namesake() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/AuditRenderer.scala",
+            "object AuditRenderer {\n  case class Job(id: Int)\n}\n",
+        )
+        .file("src/domain/Job.scala", "case class Job(name: String)\n")
+        .build();
+
+    // TheHive shape: a nested declaration addressed by its file and terminal
+    // name must resolve even when a top-level namesake exists elsewhere.
+    // A case class is two declarations (class + synthetic companion), so the
+    // correct anchored outcome is actionable ambiguity naming the nested
+    // class — not the not_found the old global-first resolution produced.
+    let anchored = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/AuditRenderer.scala#Job"]}"#,
+    );
+    assert_eq!(
+        0,
+        anchored["not_found"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    let matches = string_array(&anchored["ambiguous"][0]["matches"]);
+    assert!(
+        matches
+            .iter()
+            .any(|candidate| candidate == "AuditRenderer$.Job"),
+        "{anchored}"
+    );
+}

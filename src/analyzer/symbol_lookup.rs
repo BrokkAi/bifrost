@@ -87,7 +87,7 @@ pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> V
     if exact.is_empty() { matches } else { exact }
 }
 
-fn resolve_codeunit_fuzzy_with(
+pub(crate) fn resolve_codeunit_fuzzy_with(
     analyzer: &dyn IAnalyzer,
     input: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,

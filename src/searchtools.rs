@@ -8,7 +8,8 @@ use crate::analyzer::declaration_range::{
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
-    resolve_enclosing_codeunits, strip_trailing_call_suffix, symbol_selector_leaf,
+    resolve_codeunit_fuzzy_with, resolve_enclosing_codeunits, strip_trailing_call_suffix,
+    symbol_selector_leaf,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{
@@ -1806,7 +1807,7 @@ fn resolve_definition_context_symbol(
         }
     };
     if let Some((anchor, lookup)) = anchored {
-        let candidates = match exact_then_fuzzy_codeunit_resolution(analyzer, lookup) {
+        let candidates = match anchor_scoped_codeunit_resolution(analyzer, &anchor, lookup) {
             CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
             CodeUnitResolution::NotFound => Vec::new(),
         };
@@ -2506,6 +2507,25 @@ fn exact_then_fuzzy_codeunit_resolution(
     }
 }
 
+/// Resolve `lookup` with every resolution stage scoped to the anchor file of
+/// a `path#symbol` selector. Global-first resolution short-circuits on a
+/// top-level namesake anywhere in the workspace, and members are invisible
+/// to the exact/short-name stages (their short names are owner-qualified),
+/// so an in-file member was hidden whenever a same-named top-level symbol
+/// existed elsewhere — `path#terminal` reported not_found on the very file
+/// it named (issue #1056). Scoping every stage to the anchor file resolves
+/// members by terminal name while preserving top-level-wins priority within
+/// the file; `path#qualified` behavior is unchanged.
+fn anchor_scoped_codeunit_resolution(
+    analyzer: &dyn IAnalyzer,
+    anchor: &str,
+    lookup: &str,
+) -> CodeUnitResolution {
+    resolve_codeunit_fuzzy_with(analyzer, lookup, |unit| {
+        rel_path_string(unit.source()) == anchor
+    })
+}
+
 /// Resolve a symbol input into one selectable definition group. A file anchor
 /// (`src/plugin/relativeTime/index.js#default`) narrows same-name module-scoped
 /// definitions to the exact relative path before grouping; a bare name that
@@ -2520,7 +2540,10 @@ fn resolve_selectable_definitions(
         DefinitionSelector::Name(name) => (None, name),
         DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
     };
-    let mut resolution = resolve(analyzer, lookup);
+    let mut resolution = match &anchor {
+        Some(anchor) => anchor_scoped_codeunit_resolution(analyzer, anchor, lookup),
+        None => resolve(analyzer, lookup),
+    };
     if matches!(resolution, CodeUnitResolution::NotFound)
         && anchor.is_none()
         && let Some(path_selector) = split_path_qualified_definition_selector(analyzer, input)
@@ -2530,9 +2553,9 @@ fn resolve_selectable_definitions(
                 anchor: path_anchor,
                 lookup: path_lookup,
             } => {
+                resolution = anchor_scoped_codeunit_resolution(analyzer, &path_anchor, path_lookup);
                 anchor = Some(path_anchor);
                 lookup = path_lookup;
-                resolution = resolve(analyzer, lookup);
             }
             PathQualifiedSelector::AmbiguousPath(item) => {
                 return SelectableDefinitionResolution::NotFound(not_found_input(
@@ -2549,28 +2572,41 @@ fn resolve_selectable_definitions(
         CodeUnitResolution::Resolved(code_units) => code_units,
         CodeUnitResolution::Ambiguous(matches) => matches,
         CodeUnitResolution::NotFound => {
-            return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
-        }
-    };
-
-    let code_units = match anchor {
-        Some(anchor) => {
-            let candidate_names = if looks_like_extensionless_path_anchor(&anchor) {
-                code_unit_match_names(&code_units)
+            let Some(anchor) = &anchor else {
+                return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
+            };
+            // Nothing resolved in the anchor file. Resolve globally once
+            // for diagnostics: candidates elsewhere mean the symbol exists
+            // but not here (the anchor recovery note's case); nothing
+            // anywhere is a genuine not-found.
+            let global_candidates = match resolve(analyzer, lookup) {
+                CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
+                CodeUnitResolution::NotFound => Vec::new(),
+            };
+            if global_candidates.is_empty() {
+                return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
+            }
+            let candidate_names = if looks_like_extensionless_path_anchor(anchor) {
+                code_unit_match_names(&global_candidates)
             } else {
                 Vec::new()
             };
-            let narrowed: Vec<CodeUnit> = code_units
-                .into_iter()
-                .filter(|unit| rel_path_string(unit.source()) == anchor)
-                .collect();
-            if narrowed.is_empty() {
-                return SelectableDefinitionResolution::NotFound(
-                    symbol_source_anchor_not_found_input(input, &anchor, lookup, &candidate_names),
-                );
-            }
-            narrowed
+            return SelectableDefinitionResolution::NotFound(symbol_source_anchor_not_found_input(
+                input,
+                anchor,
+                lookup,
+                &candidate_names,
+            ));
         }
+    };
+
+    // Anchored resolution is already scoped to the anchor file; the filter is
+    // a no-op safeguard and keeps the unanchored path untouched.
+    let code_units = match anchor {
+        Some(anchor) => code_units
+            .into_iter()
+            .filter(|unit| rel_path_string(unit.source()) == anchor)
+            .collect(),
         None => code_units,
     };
 
@@ -3024,11 +3060,25 @@ fn resolve_file_anchored_symbol_sources(
     anchor: String,
     lookup: &str,
 ) -> SourceLookupOutcome {
-    let code_units = match exact_then_fuzzy_codeunit_resolution(analyzer, lookup) {
+    let code_units = match anchor_scoped_codeunit_resolution(analyzer, &anchor, lookup) {
         CodeUnitResolution::Resolved(code_units) | CodeUnitResolution::Ambiguous(code_units) => {
             code_units
         }
         CodeUnitResolution::NotFound => {
+            // Nothing resolved in the anchor file. Check globally once for
+            // diagnostics: candidates elsewhere mean the symbol exists but
+            // not here (the anchor recovery note's case); nothing anywhere
+            // falls through to the generated/unsupported/generic not-found
+            // handling, as before.
+            let global_candidates = match exact_then_fuzzy_codeunit_resolution(analyzer, lookup) {
+                CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
+                CodeUnitResolution::NotFound => Vec::new(),
+            };
+            if !global_candidates.is_empty() {
+                return SourceLookupOutcome::NotFound(anchor_not_found_input(
+                    input, &anchor, lookup,
+                ));
+            }
             let generated = java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
             if !generated.is_empty() {
                 return SourceLookupOutcome::Found(generated);
@@ -3043,9 +3093,6 @@ fn resolve_file_anchored_symbol_sources(
         .into_iter()
         .filter(|unit| rel_path_string(unit.source()) == anchor)
         .collect();
-    if narrowed.is_empty() {
-        return SourceLookupOutcome::NotFound(anchor_not_found_input(input, &anchor, lookup));
-    }
 
     let groups = distinct_definitions(narrowed);
     match groups.as_slice() {
