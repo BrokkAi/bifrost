@@ -19935,6 +19935,7 @@ void run() {
     detail::vformat_to(out, 0, 0, 0);
 }
 #include "format-inl.h"
+#include "missing-config.h"
 "#;
     let format_inline = r#"
 #define FMT_FUNC
