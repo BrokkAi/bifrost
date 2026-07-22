@@ -9346,7 +9346,10 @@ fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<C
 }
 
 /// The fqn of the type constructed by a `new Foo()` value expression.
-fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+fn constructed_type(mut node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+    while node.kind() == "call_expression" {
+        node = node.child_by_field_name("function")?;
+    }
     if node.kind() != "instance_expression" {
         return None;
     }
