@@ -9,7 +9,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::mcp_common::{BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD};
+use crate::mcp_common::{
+    BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
+};
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
 const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
@@ -369,6 +371,10 @@ impl McpSession {
             .arg(root)
             .arg("--server")
             .arg("searchtools");
+        // Pinned benchmark checkouts are immutable for the lifetime of a run.
+        // Watching them lets delayed VCS/cache events invalidate analyzer caches
+        // between samples and measures rebuild jitter rather than warm queries.
+        command.env(MCP_FILE_WATCHER_ENV, "off");
         if no_line_numbers {
             command.arg("--no-line-numbers");
         }

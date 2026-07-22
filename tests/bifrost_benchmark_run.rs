@@ -377,7 +377,6 @@ definition_queries = [
     }
     for expected in [
         "SearchToolsService::snapshot_for_query",
-        "SearchToolsService::apply_watcher_delta",
         "get_definition::resolve_navigation_batch",
         "language=Java",
         "get_definition::language_dispatch",
@@ -388,6 +387,7 @@ definition_queries = [
         );
     }
     for forbidden in [
+        "SearchToolsService::apply_watcher_delta",
         "global_usage_definition_index::enumerate_live_keys",
         "global_usage_definition_index::fetch_persisted_rows",
         "global_usage_definition_index::resolve_persisted_rows",

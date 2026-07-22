@@ -40,6 +40,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 21:10Z) Captured the final-head full Ubuntu artifact from run 29956839833: 10 repositories, 92 successful scenarios, 16 clean QueryCode cases, and no subset markers. Added the ordinary 50 ms absolute noise arm to the 10x cold/warm gate after five clean full runs straddled the ratio boundary by only 1-11 ms; the original eager-build regression still exceeds the combined gate by 91 ms.
 - [x] (2026-07-22 21:50Z) Rejected run 29956839833 as an unusually fast provisional baseline after two exact-current-head replays produced the same broad slowdown signature. Promoted the complete run 29959610518 artifact instead: it has no regressions against either the immediately preceding current-head artifact or the earlier representative run 29955662059.
 - [x] (2026-07-22 22:15Z) Traced the remaining strict-run instability to `build_full_scala_usage_edges` deep-cloning the analyzer-cached full Scala graph on every warm dead-code request. Returned the cached `Arc` through the generic dead-code graph consumer instead; two fresh-process pinned `scala-xml` runs measured stable 737.4 ms and 743.3 ms medians instead of alternating between roughly 1.8 s and 2.4 s.
+- [x] (2026-07-22 22:50Z) Traced the `serde-json-rs get_definition` bimodality to delayed file-watcher events forcing `update_all` and rebuilding Rust's reference context between measured samples. Benchmark MCP children now use the existing manual-update model for their immutable pinned checkouts while production MCP sessions continue to watch by default; the real-child profile test and a full local serde target run prove no watcher work enters timed samples.
 
 ## Surprises & Discoveries
 
@@ -84,6 +85,9 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: The residual `scala-xml dead_code_smells` regression was deterministic within a process but bimodal across processes: identical-code runs measured about 1.8 s or 2.4 s. Scala's analyzer cache already held the full `UsageEdges` behind `Arc`, but the public full-graph helper dereferenced and deep-cloned the complete edge and call-site maps on every warm request.
   Evidence: Actions runs 29958615453, 29959610518, and 29960771358; `full_usage_edge_builder_returns_the_cached_graph_handle`; local reports `run-20260722T221324Z.json` and `run-20260722T221427Z.json`.
+
+- Observation: `serde-json-rs get_definition` was bimodal because the benchmark's live file watcher occasionally observed four delayed paths and requested a full refresh during a measured iteration. That discarded Rust's cached reference context and changed an otherwise 23-57 ms warm request into a 395-1,012 ms rebuild. The pinned checkout itself is immutable for the run, so this work is benchmark contamination rather than the product behavior being measured.
+  Evidence: Actions runs 29962572037 and 29960771358; local pre-fix profile `/private/tmp/bifrost-serde-definition.6Wku1i`; post-fix profile `/private/tmp/bifrost-serde-manual.yFU2v5`, whose ten measured definition requests stayed between 24.5 and 25.7 ms and contain no `SearchToolsService::apply_watcher_delta` scope.
 
 - Observation: `scoped_fact_nodes` cannot be counted on a scan-only path without materializing files that exact source anchors excluded. The profile now reports zero when that total is unavailable and separately records `admitted_fact_nodes`, the compatibility-budget denominator available on both scan and indexed paths.
   Evidence: the Dapper scan admitted 49,181 facts after source filtering while the complete indexed scope contained 85,325 facts.
@@ -258,6 +262,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: The graph is immutable and generation-bound, so cloning its full BTreeMap and call-site payload provides no isolation. Sharing removes the unstable allocator-heavy warm path while retaining ownership and cache invalidation semantics.
   Date/Author: 2026-07-22 / Codex.
 
+- Decision: Launch benchmark MCP children with `BIFROST_MCP_FILE_WATCHER=off`, backed by deferred persisted and unbound manual service constructors. Keep the environment unset and file watching enabled for every normal MCP launch.
+  Rationale: Pinned benchmark checkouts are immutable and explicit refresh remains available; disabling automatic watcher polling removes asynchronous VCS/cache invalidations from warm timing without weakening ordinary live-workspace behavior or changing benchmark persistence semantics.
+  Date/Author: 2026-07-22 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The checked-in manifest now has 16 correctness-checked query cases across all ten pinned languages and all six workload classes, including the representative Gson, Express, and Ky importer workloads added during derived-relation measurement. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
@@ -273,6 +281,8 @@ Milestone 3 measurement is complete. `DirectImportTopology` retains compact outg
 The post-milestone guided review and final acceptance audit are complete. Cache rejection handoff, atomic overlay generations, request-scoped posting admission, post-replay generation validation, bounded allocation preflight, generation-bound import fallback, Pareto-scoped rejection caching, and opaque provider ownership close the lifecycle and architecture gaps found by the reviewers. Benchmark evidence is protected by a checkout build-identity handshake, strict cache-layer decoding, non-vacuous witnesses, subset-report exclusion, and an environment-variance-independent cold/warm invariant. The initial exact-head Ubuntu artifact exposed one remaining benchmark-contract defect—durable facts were described but not primed—and the failed topology promotion. The corrected exact-head pair proves deterministic hydration, no topology retention, and a posting-index representative that clears every promotion gate. Temporary workflow controls are removed, the branch is rebased onto current master, and the draft PR contains the implementation and validation evidence.
 
 The final-head baseline artifact is `run-20260722T214543Z.json` from Actions run 29959610518 at `ba488b66a840356ed946f19d2d81e2960c84d7f2`. Its harness passed all 92 scenarios and all 16 QueryCode oracles. It has no regressions against the adjacent current-head run 29958615453 or the earlier representative run 29955662059. The dual-arm comparator accepts the report against itself and still rejects the original 13.53x eager-build sample; the blessed baseline includes the latest-master behavior without preserving the anomalously fast timings from provisional run 29956839833.
+
+The post-baseline architectural sweep removed two unrelated sources of warm-run distortion rather than widening timing thresholds: Scala dead-code analysis now borrows its cached graph, and immutable benchmark sessions no longer poll a live watcher. The focused post-watcher local serde run completed every target scenario successfully; its ten definition samples were 24.5-25.7 ms after one intentional warmup build, with no measured refresh or reference-context rebuild. A final exact-head Ubuntu report still determines whether the representative checked-in baseline remains appropriate.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -769,6 +779,19 @@ Final corrected exact-head Ubuntu pair:
     Auto maximum first/warm ratio across the complete corpus = 9.612x
     workflow policy after removing temporary trigger and selector = 2 passed
 
+Post-baseline watcher isolation validation (dirty implementation tree, Apple arm64 development build):
+
+    cargo test --lib mcp_common::tests
+    # 4 pass; unset/on/off file-watcher policy is validated without mutating process environment
+    cargo test --lib searchtools_service::watcher_startup_tests
+    # 7 pass; deferred manual services do not invoke the watcher starter and watching modes retain failure semantics
+    cargo test --test bifrost_benchmark_run
+    # 10 pass; the real-child profile test now rejects any benchmark watcher-delta scope
+    BIFROST_BENCHMARK_BIFROST_BIN=./target/debug/bifrost ./target/debug/bifrost_benchmark run --manifest benchmark/targets.toml --repo serde-json-rs --output /private/tmp/bifrost-serde-manual.yFU2v5 --profile
+    # all seven target scenarios pass; get_definition median = 25.0 ms; ten samples = 24.5-25.7 ms
+    # only warmup 1 builds RustAnalyzer::build_reference_context; no profile contains SearchToolsService::apply_watcher_delta or a full refresh
+    report = /private/tmp/bifrost-serde-manual.yFU2v5/run-20260722T224815Z.json
+
 Invalid local timing artifacts that must not be cited:
 
     .cache/issue920-ky-derived-clean-auto and .cache/.cache/issue920-ky-derived-clean-scan
@@ -833,3 +856,5 @@ Production query_code uses Auto, which may retain measured structural postings b
 Plan revision note, 2026-07-21: initial self-contained draft created after live issue/origin diagnosis. It resolves cold-cache, budget-parity, snapshot-ownership, promotion, review, cleanup, and temporary benchmark workflow decisions so implementation can proceed without reconstructing prior context.
 
 Plan revision note, 2026-07-22: recorded explicit authorization, creation of the issue worktree/branch, and the refreshed origin/master base. The repository copy is now authoritative and Milestone 1 is unblocked.
+
+Plan revision note, 2026-07-22: recorded the post-baseline Scala graph-sharing cleanup, representative baseline selection, and benchmark watcher isolation discovered by exact-head reruns. Production file watching remains the default; only immutable benchmark children select manual updates.

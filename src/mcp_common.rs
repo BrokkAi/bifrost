@@ -6,6 +6,7 @@ use crate::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -28,6 +29,7 @@ const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bif
 pub(crate) const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
 pub(crate) const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
     "\n\u{1e}bifrost-benchmark-profile-boundary\u{1e}\n";
+pub(crate) const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -162,9 +164,12 @@ pub fn run_stdio_server(
     // Explicit roots build in the background. Rootless servers answer initialize
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
-    let service = match root {
-        Some(root) => SearchToolsService::new_deferred(root)?,
-        None => SearchToolsService::new_unbound(),
+    let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
+    let service = match (root, watch_files) {
+        (Some(root), true) => SearchToolsService::new_deferred(root)?,
+        (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
+        (None, true) => SearchToolsService::new_unbound(),
+        (None, false) => SearchToolsService::new_unbound_manual(),
     };
     let mut connection = McpConnectionState::new(accepts_client_roots);
 
@@ -211,6 +216,18 @@ pub fn run_stdio_server(
     // are unaffected.
     std::mem::forget(service);
     Ok(())
+}
+
+fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(true),
+        Some(value) if value == "on" => Ok(true),
+        Some(value) if value == "off" => Ok(false),
+        Some(value) => Err(format!(
+            "{MCP_FILE_WATCHER_ENV} must be `on` or `off`, not `{}`",
+            value.to_string_lossy()
+        )),
+    }
 }
 
 fn dispatch_message(
@@ -1105,6 +1122,17 @@ fn render_compact_symbols_text(compact: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_watching_defaults_on_and_accepts_explicit_modes() {
+        assert!(file_watching_enabled(None).unwrap());
+        assert!(file_watching_enabled(Some(OsStr::new("on"))).unwrap());
+        assert!(!file_watching_enabled(Some(OsStr::new("off"))).unwrap());
+
+        let error = file_watching_enabled(Some(OsStr::new("disabled"))).unwrap_err();
+        assert!(error.contains(MCP_FILE_WATCHER_ENV), "{error}");
+        assert!(error.contains("on` or `off"), "{error}");
+    }
 
     #[test]
     fn compact_summary_reuses_parent_aware_elements() {
