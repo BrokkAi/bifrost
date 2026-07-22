@@ -631,7 +631,7 @@ pub(super) fn resolve_rust_module_path_with_crate(
     resolve_rust_module_segments_with_crate(package, crate_package, &segments)
 }
 
-pub(super) fn resolve_rust_module_segments_with_crate<S: AsRef<str>>(
+pub(crate) fn resolve_rust_module_segments_with_crate<S: AsRef<str>>(
     package: &str,
     crate_package: &str,
     segments: &[S],
@@ -726,7 +726,7 @@ pub(super) fn rust_external_module_segments(segments: &[String]) -> Option<(&str
     Some((root, (!nested.is_empty()).then_some(nested)))
 }
 
-pub(super) fn rust_crate_root_package(file: &ProjectFile) -> String {
+pub(crate) fn rust_crate_root_package(file: &ProjectFile) -> String {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel
         .components()

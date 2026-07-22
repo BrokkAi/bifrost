@@ -1545,6 +1545,10 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.declaration_candidates_by_identifier(identifier)
+    }
+
     fn search_symbol_candidates(
         &self,
         pattern: &str,

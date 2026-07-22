@@ -107,6 +107,20 @@ fn visible_import_binders_in_tree(
     source: &str,
     reference_byte: usize,
 ) -> Vec<ImportBinder> {
+    visible_import_binders_with_scopes_in_tree(root, source, reference_byte)
+        .into_iter()
+        .map(|(_, binder)| binder)
+        .collect()
+}
+
+/// The scope-start byte of each binder's enclosing visibility scope, so
+/// `self`/`super` module specifiers can be resolved against the lexical
+/// module the import actually lives in (not just the file package).
+fn visible_import_binders_with_scopes_in_tree(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> Vec<(usize, ImportBinder)> {
     let mut imports = Vec::new();
     collect_visible_use_statements(root, reference_byte, &mut imports);
     let mut by_scope: HashMap<(usize, usize), ImportBinder> = HashMap::default();
@@ -120,7 +134,54 @@ fn visible_import_binders_in_tree(
     }
     let mut binders: Vec<_> = by_scope.into_iter().collect();
     binders.sort_by_key(|((start, end), _)| (end.saturating_sub(*start), *start));
-    binders.into_iter().map(|(_, binder)| binder).collect()
+    binders
+        .into_iter()
+        .map(|((start, _), binder)| (start, binder))
+        .collect()
+}
+
+pub(crate) fn visible_import_binders_with_scopes_at(
+    source: &str,
+    reference_byte: usize,
+) -> Vec<(usize, ImportBinder)> {
+    let Some(tree) = parse_rust_tree(source) else {
+        return Vec::new();
+    };
+    visible_import_binders_with_scopes_in_tree(tree.root_node(), source, reference_byte)
+}
+
+/// The file package plus the inline `mod` path enclosing `byte` — the
+/// lexical package a nested import's `self`/`super` specifiers resolve
+/// against (`super` from `mod tests` is the file's own module, not the
+/// file's parent).
+pub(crate) fn lexical_package_at(file_package: &str, source: &str, byte: usize) -> String {
+    let Some(tree) = parse_rust_tree(source) else {
+        return file_package.to_string();
+    };
+    let mut modules = Vec::new();
+    let mut current = tree
+        .root_node()
+        .descendant_for_byte_range(byte, byte)
+        .and_then(|node| node.parent());
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item"
+            && let Some(name_node) = parent.child_by_field_name("name")
+        {
+            let name = super::declarations::rust_node_text(name_node, source).trim();
+            if !name.is_empty() {
+                modules.push(name.to_string());
+            }
+        }
+        current = parent.parent();
+    }
+    modules.reverse();
+    if file_package.is_empty() {
+        modules.join(".")
+    } else if modules.is_empty() {
+        file_package.to_string()
+    } else {
+        format!("{}.{}", file_package, modules.join("."))
+    }
 }
 
 pub(crate) fn visible_import_binder_in_tree(

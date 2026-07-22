@@ -1323,6 +1323,154 @@ fn get_definitions_by_reference_accepts_js_file_anchored_symbols() {
     }
 }
 
+// #1057 M3: the `definitions` (reference) surface must report ambiguity in the
+// same conditions as get_symbol_sources/get_summaries. A bare terminal name
+// whose only exact hit is a top-level namesake, while a same-named member
+// exists, previously short-circuited on resolve_codeunit_exact and silently
+// resolved the free function. It must now report status "not_found" with an
+// `ambiguous_symbol` diagnostic listing both file-anchored selectors — the same
+// selectors the sources surface offers (the fuzzer's cross-surface
+// spelling-status-drift shape). The fully-qualified member spelling still
+// resolves (unique qualified name → Ok).
+#[test]
+fn get_definitions_by_reference_reports_member_collision_ambiguity() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "checker/cached-version.ts",
+            "export function getCachedVersion() {\n  return 1;\n}\n",
+        )
+        .file(
+            "hook.ts",
+            "export function seed() {\n  return 0;\n}\nexport class AutoUpdateCheckerDeps {\n  getCachedVersion() {\n    return seed();\n  }\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    // Bare name is ambiguous on the reference surface (previously a silent pick).
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "getCachedVersion",
+                    "context": "return 1;",
+                    "target": "return"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+    assert_eq!("not_found", result["status"], "{value}");
+    assert_eq!(
+        "ambiguous_symbol", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+    let message = result["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(message.contains("is ambiguous; matches:"), "{value}");
+
+    // Cross-surface consistency: get_symbol_sources offers the SAME selectors,
+    // and the reference-surface diagnostic lists exactly those selectors.
+    let sources_payload = service
+        .call_tool_json("get_symbol_sources", r#"{"symbols":["getCachedVersion"]}"#)
+        .unwrap();
+    let sources: Value = serde_json::from_str(&sources_payload).unwrap();
+    let source_matches: Vec<String> = sources["ambiguous"][0]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(2, source_matches.len(), "{sources}");
+    for selector in &source_matches {
+        assert!(
+            message.contains(selector),
+            "reference surface must list {selector}: {value}"
+        );
+    }
+
+    // The fully-qualified member spelling still resolves (unique → Ok).
+    let qualified_payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "AutoUpdateCheckerDeps.getCachedVersion",
+                    "context": "return seed();",
+                    "target": "seed"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let qualified: Value = serde_json::from_str(&qualified_payload).unwrap();
+    assert_eq!("resolved", qualified["results"][0]["status"], "{qualified}");
+    assert_eq!(
+        "seed", qualified["results"][0]["definitions"][0]["fqn"],
+        "{qualified}"
+    );
+}
+
+// #1057 M3: identical-FQN twins (same fq in two files) must report ambiguity on
+// the reference surface for BOTH the bare and the fully-qualified spelling, with
+// the same file-anchored selectors — before M3 the fully-qualified spelling
+// short-circuited on resolve_codeunit_exact and silently returned both twins
+// with no ambiguity signal.
+#[test]
+fn get_definitions_by_reference_reports_twin_fqn_ambiguity() {
+    let scala2_path = "core/src/main/scala-2/demo/Widget.scala";
+    let scala3_path = "core/src/main/scala-3/demo/Widget.scala";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            scala2_path,
+            "package demo\n\nclass Widget {\n  def value: Int = 2\n}\n",
+        )
+        .file(
+            scala3_path,
+            "package demo\n\nclass Widget {\n  def value: Int = 3\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let expected = vec![
+        format!("{scala2_path}#demo.Widget"),
+        format!("{scala3_path}#demo.Widget"),
+    ];
+
+    for symbol in ["demo.Widget", "Widget"] {
+        let payload = service
+            .call_tool_json(
+                "get_definitions_by_reference",
+                &serde_json::json!({
+                    "references": [{
+                        "symbol": symbol,
+                        "context": "def value",
+                        "target": "value"
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = &value["results"][0];
+        assert_eq!("not_found", result["status"], "{symbol}: {value}");
+        assert_eq!(
+            "ambiguous_symbol", result["diagnostics"][0]["kind"],
+            "{symbol}: {value}"
+        );
+        let message = result["diagnostics"][0]["message"].as_str().unwrap();
+        for selector in &expected {
+            assert!(
+                message.contains(selector.as_str()),
+                "{symbol} must list {selector}: {value}"
+            );
+        }
+    }
+}
+
 #[test]
 fn get_definitions_guidance_matches_call_surface_for_qualified_targets() {
     let temp = TempDir::new().unwrap();

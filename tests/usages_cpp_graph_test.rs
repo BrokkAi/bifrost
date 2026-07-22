@@ -13700,7 +13700,7 @@ void* construct_without_default_exact() { return new Gadget(1, 2); }
                 "void* construct_default() { return new Widget(1); }",
                 "Widget",
             ),
-            "demo.Widget.Widget",
+            "demo.Widget",
         ),
         (
             fixture_token_range(
@@ -13721,7 +13721,7 @@ void* construct_without_default_exact() { return new Gadget(1, 2); }
                 .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some(expected_fqn)),
-            "forward lookup must select the logical callable before its definition-only inverse query: {forward:#?}"
+            "forward lookup must preserve the public navigation identity before the definition-only inverse query: {forward:#?}"
         );
     }
 
@@ -14344,12 +14344,12 @@ void wrong_namespace() {
         (
             "    Constructed(); // positive-constructor-function-only",
             "Constructed",
-            constructor.fq_name(),
+            constructed.fq_name(),
         ),
         (
             "    model::Constructed(); // positive-qualified-constructor-function-only",
             "Constructed",
-            constructor.fq_name(),
+            constructed.fq_name(),
         ),
         (
             "    Late(); // positive-before-later-function",
