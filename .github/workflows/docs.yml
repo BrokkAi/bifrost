@@ -60,8 +60,8 @@ jobs:
           PUBLIC_BIFROST_VERSION: ${{ steps.docs_version.outputs.version }}
           PUBLIC_BIFROST_TAG: ${{ steps.docs_version.outputs.tag }}
           PUBLIC_BIFROST_RELEASE_URL: ${{ steps.docs_version.outputs.release_url }}
-          PUBLIC_DOCS_SITE: https://brokkai.github.io
-          PUBLIC_DOCS_BASE: /bifrost
+          PUBLIC_DOCS_SITE: https://bifrost.brokk.ai
+          PUBLIC_DOCS_BASE: /
 
       - name: Prepare Pages artifact
         if: github.event_name != 'pull_request'
@@ -79,8 +79,8 @@ jobs:
             PUBLIC_BIFROST_VERSION="${DOCS_RELEASE_TAG#v}" \
             PUBLIC_BIFROST_TAG="${DOCS_RELEASE_TAG}" \
             PUBLIC_BIFROST_RELEASE_URL="https://github.com/BrokkAi/bifrost/releases/tag/${DOCS_RELEASE_TAG}" \
-            PUBLIC_DOCS_SITE="https://brokkai.github.io" \
-            PUBLIC_DOCS_BASE="/bifrost/versions/${DOCS_RELEASE_TAG}" \
+            PUBLIC_DOCS_SITE="https://bifrost.brokk.ai" \
+            PUBLIC_DOCS_BASE="/versions/${DOCS_RELEASE_TAG}" \
             ASTRO_TELEMETRY_DISABLED=1 \
             npm run build --prefix docs
 

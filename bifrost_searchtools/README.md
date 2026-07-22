@@ -168,7 +168,7 @@ requesting full detail; these fields only make the span policy explicit.
 `query_code` normalizes common syntax across Python, Java, JavaScript,
 TypeScript, Go, C/C++, Rust, PHP, Scala, C#, and Ruby, but it is still a
 syntactic structural query tool. Use these caveats when writing reusable rules
-or prompts; the [public Code Querying guide](https://brokkai.github.io/bifrost/code-querying/)
+or prompts; the [public Code Querying guide](https://bifrost.brokk.ai/code-querying/)
 is the canonical reference:
 
 | Area | Current behavior |
@@ -191,7 +191,7 @@ not prose.
 
 It is opt-in. Set `BIFROST_SEMANTIC_INDEX=auto` to enable background indexing;
 the models load via ONNX and download from the HuggingFace hub on first use. The
-[semantic search docs](https://brokkai.github.io/bifrost/semantic-search/) list
+[semantic search docs](https://bifrost.brokk.ai/semantic-search/) list
 every environment override.
 
 ## License

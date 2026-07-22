@@ -3,8 +3,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import rehypeBasePathLinks from './rehype-base-path-links.mjs';
 
-const site = process.env.PUBLIC_DOCS_SITE ?? 'https://brokkai.github.io';
-const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/bifrost';
+const site = process.env.PUBLIC_DOCS_SITE ?? 'https://bifrost.brokk.ai';
+const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/';
 const isDev = process.argv.includes('dev');
 const socialCardPath = [
   productionBase.replace(/^\/+|\/+$/g, ''),

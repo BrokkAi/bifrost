@@ -1,7 +1,7 @@
 blank_issues_enabled: true
 contact_links:
   - name: Bifrost documentation
-    url: https://brokkai.github.io/bifrost/
+    url: https://bifrost.brokk.ai/
     about: Read the installation, interface, query, and capability documentation.
   - name: Ask the community on Discord
     url: https://discord.gg/geYkWUeH
