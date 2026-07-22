@@ -196,7 +196,9 @@ pub use summaries::most_relevant_files;
 pub(crate) use scan_usages::ScanUsagesSurface;
 pub(crate) use scan_usages::scan_usages_target_label;
 pub(crate) use sources::symbol_source_candidate_files;
+#[cfg(any(feature = "nlp", test))]
 pub(crate) use summaries::summarize_files;
+#[cfg(feature = "nlp")]
 pub(crate) use summaries::summary_block_for_code_unit;
 
 const FILE_SEARCH_LIMIT: usize = 100;
