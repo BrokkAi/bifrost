@@ -13,9 +13,9 @@ The semantic intermediate representation and its workspace-backed oracles alread
 - [x] (2026-07-22 16:56Z) Verified issue #1081, fetched `origin`, and confirmed the clean attached issue branch matches its remote at `4037def8`.
 - [x] (2026-07-22 16:56Z) Mapped the public and private ownership seams in `oracle.rs`, `ir.rs`, and `workspace_oracle.rs`, including direct consumers and visibility hazards.
 - [x] (2026-07-22 16:56Z) Chose acyclic module boundaries and recorded the implementation and validation sequence in this plan.
-- [ ] Decompose the language-neutral oracle contracts behind the existing `oracle.rs` facade.
-- [ ] Decompose the semantic IR model, artifact, validation, and tests behind the existing `ir.rs` facade.
-- [ ] Move workspace dispatch implementation and its unit tests into `workspace_oracle/dispatch.rs` while retaining the shared root facade.
+- [x] (2026-07-22 17:10Z) Decomposed the language-neutral oracle contracts behind the existing `oracle.rs` facade and preserved the full exported type set.
+- [x] (2026-07-22 17:10Z) Decomposed the semantic IR model, artifact, validation, and tests behind the existing `ir.rs` facade and preserved the full exported type set.
+- [x] (2026-07-22 17:10Z) Moved workspace dispatch implementation and its unit tests into `workspace_oracle/dispatch.rs` while retaining the shared root facade and ICFG helper paths.
 - [ ] Run unchanged contract tests, formatting, full-feature Clippy, and a parallel specialist review; address every confirmed finding.
 
 ## Surprises & Discoveries
@@ -25,6 +25,12 @@ The semantic intermediate representation and its workspace-backed oracles alread
 
 - Observation: the six-file oracle example in the issue would create real sibling cycles if relation ownership continued to name heap queries and dispatch boundaries while those result contracts also retained relation handles.
   Evidence: `OracleRelationOwner` stores `AliasQuery` and `StoreAtPoint`, `OracleRelationSubject` stores `DispatchBoundaryKind`, and heap/dispatch result constructors validate `OracleRelationHandle` values.
+
+- Observation: the original inline IR tests inherited capability, ID, budget, `Arc`, and hash-set names through private imports in `ir.rs`; moving the same test body to a sibling file made that implicit dependency visible.
+  Evidence: the first all-target compile reported missing test-only names. `ir/tests.rs` now imports those dependencies explicitly, and `cargo check --all-targets --all-features` passes.
+
+- Observation: ICFG production code imports `exact_source_for_procedure` and `semantic_locator_work`, while its unit tests also import callable-identity, candidate-retention, and scoped-gap helpers from the workspace-oracle root.
+  Evidence: the first integrated compile resolved the imports in `src/analyzer/semantic/icfg.rs`; the facade now preserves the production paths and gates the three test-only re-exports with `#[cfg(test)]`.
 
 ## Decision Log
 
@@ -42,6 +48,10 @@ The semantic intermediate representation and its workspace-backed oracles alread
 
 - Decision: Keep `WorkspaceSemanticOracle` in `workspace_oracle.rs` and move all location-first dispatch machinery plus its unit tests to `workspace_oracle/dispatch.rs`.
   Rationale: source, value-flow, and heap submodules all share the facade type, while callable grouping, result projection, gap composition, work accounting, ordering, and cancellation are dispatch-owned. The root will re-export only the existing crate-visible helper required by ICFG tests.
+  Date/Author: 2026-07-22 / Codex
+
+- Decision: Keep ICFG helper reachability through narrow workspace-oracle facade re-exports and make relocated IR-test dependencies explicit in `ir/tests.rs`.
+  Rationale: this preserves existing consumer paths without making the new child modules public, avoids unused production imports for test-only helpers, and removes accidental reliance on facade implementation imports.
   Date/Author: 2026-07-22 / Codex
 
 ## Outcomes & Retrospective
@@ -118,6 +128,13 @@ Relevant origin commit:
 
 That commit introduced the oracle and workspace-oracle implementation being decomposed. No behavior from it is intentionally changed here.
 
+Integrated compile evidence after the three moves:
+
+    cargo check --all-targets --all-features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.43s
+
+The exported top-level `pub struct`, `pub enum`, `pub trait`, and `pub type` name sets in both `oracle` and `ir` match commit `4037def8` exactly.
+
 ## Interfaces and Dependencies
 
 At completion, these facade paths remain valid and unchanged:
@@ -130,3 +147,5 @@ At completion, these facade paths remain valid and unchanged:
 The child modules are implementation details and remain private. Public type names, trait signatures, constructors, accessors, derives, and visibility stay unchanged. The only added visibility is `pub(super)` for helpers or fields that were previously private but must now be shared among private sibling modules. No new external crate or Cargo feature is introduced.
 
 Revision note (2026-07-22 16:56Z): Initial self-contained plan created after live issue, branch, dependency, and history inspection. The oracle layout adds explicit foundational contract modules to satisfy the issue's one-direction dependency constraint.
+
+Revision note (2026-07-22 17:10Z): Recorded completion of all three module moves, the implicit IR-test imports and ICFG helper consumers found by the integrated compile, and the successful all-target/all-feature check.
