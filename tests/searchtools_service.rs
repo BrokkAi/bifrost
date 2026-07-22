@@ -366,7 +366,7 @@ class Sample {
     let profile = service
         .call_tool_value("query_code", profile_query)
         .expect("profiled Java receiver query");
-    assert_eq!(profile["format"], "bifrost_code_query_profile/v1");
+    assert_eq!(profile["format"], "bifrost_code_query_profile/v2");
     assert_eq!(profile["result"], ordinary, "{profile}");
     assert_exact_receiver(&profile["result"]);
 
