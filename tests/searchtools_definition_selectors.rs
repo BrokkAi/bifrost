@@ -2691,3 +2691,138 @@ fn arrow_const_named_input_indexes_and_resolves() {
         "Input must produce sources or ambiguity: {rendered}"
     );
 }
+
+// #1087: `resolution_from_matches` dedups candidates into a `BTreeMap<fq_name,
+// CodeUnit>` (one first-inserted representative per fq, see `insert_match`).
+// The `len == 1` branch re-expands that single fq bucket back out to every
+// declaration sharing it via `matching_definitions`, but the `len > 1`
+// ("ambiguous") branch used to skip that step and emit
+// `matches.into_values().collect()` directly -- so once a THIRD, differently
+// fq'd sibling pushed the map past one entry, every other same-fq bucket
+// silently collapsed to its single representative.
+//
+// Here `Input` is declared as a top-level arrow-function const in two files
+// (both fq `"Input"`, package empty) plus a top-level, *exported*,
+// *non-function* `const Input = {...}` object literal in a third file. JS/TS
+// indexes an exported top-level object literal with "surface shape" twice:
+// once as a module-scoped `Field` whose short_name (and therefore fq) is
+// file-scoped -- e.g. `hook/UseFormMethods.tsx.Input`, mirroring the real
+// `UseFormMethods.tsx`/`forwardRefToPassRefProp.tsx` siblings from the
+// upstream react-hook-form repro -- and once more as a plain-named "surface"
+// `Field` that itself shares fq `"Input"` with the two function
+// declarations. That gives two fq buckets: `"Input"` (3 declarations: both
+// functions plus the surface field) and the file-scoped one (1 declaration),
+// and the second bucket is what pushes `matches.len()` to 2 and selects the
+// buggy branch. Before the fix, the `"Input"` bucket collapsed from 3
+// declarations down to whichever was first-inserted, silently dropping the
+// other two; after the fix all four declarations across both buckets must be
+// listed.
+#[test]
+fn bare_name_ambiguity_expands_every_same_fq_declaration_once_a_distinct_fq_sibling_exists() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "examples/V6/customMaskedInputWithController.tsx",
+            "const Input = (props) => {\n  const { onChange, ...restProps } = props;\n  return <input {...restProps} onChange={onChange} />;\n};\n\nexport { Input };\n",
+        )
+        .file(
+            "examples/V7/anotherMaskedInput.tsx",
+            "const Input = (props) => {\n  return <input {...props} />;\n};\n\nexport { Input };\n",
+        )
+        .file(
+            "hook/UseFormMethods.tsx",
+            "export const Input = {\n  displayName: 'Input',\n};\n",
+        )
+        .build();
+
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Input"]}"#);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!("Input", result["ambiguous"][0]["target"], "{result}");
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert_eq!(
+        4,
+        matches.len(),
+        "expected all four declarations (two same-fq functions, the same-fq \
+         surface field, and the distinct-fq file-scoped field), got: {result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V6/customMaskedInputWithController.tsx")),
+        "missing first same-fq declaration: {result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V7/anotherMaskedInput.tsx")),
+        "missing second same-fq declaration: {result}"
+    );
+    assert!(
+        matches.iter().any(|m| m == "hook/UseFormMethods.tsx#Input"),
+        "missing same-fq surface field declaration: {result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m == "hook/UseFormMethods.tsx#UseFormMethods.tsx.Input"),
+        "missing distinct-fq file-scoped field declaration: {result}"
+    );
+}
+
+// No-regression companion to the above: with only the two same-fq function
+// declarations (no third, distinct-fq sibling), `resolution_from_matches`
+// takes the `len == 1` branch, which already re-expanded correctly before
+// this fix. Both file-anchored candidates must keep showing up.
+#[test]
+fn bare_name_ambiguity_still_expands_same_fq_declarations_without_a_distinct_fq_sibling() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "examples/V6/customMaskedInputWithController.tsx",
+            "const Input = (props) => {\n  const { onChange, ...restProps } = props;\n  return <input {...restProps} onChange={onChange} />;\n};\n\nexport { Input };\n",
+        )
+        .file(
+            "examples/V7/anotherMaskedInput.tsx",
+            "const Input = (props) => {\n  return <input {...props} />;\n};\n\nexport { Input };\n",
+        )
+        .build();
+
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Input"]}"#);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert_eq!(2, matches.len(), "{result}");
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V6/customMaskedInputWithController.tsx")),
+        "{result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V7/anotherMaskedInput.tsx")),
+        "{result}"
+    );
+}
+
+// No-regression: a uniquely-named symbol must keep resolving cleanly (no
+// over-triggering of ambiguity from the expansion added for #1087).
+#[test]
+fn unique_bare_name_still_resolves_cleanly_after_ambiguity_expansion_fix() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/unique.tsx",
+            "export const OnlyOneOfMe = (props) => {\n  return <input {...props} />;\n};\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["OnlyOneOfMe"]}"#,
+    );
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!("src/unique.tsx", result["sources"][0]["path"], "{result}");
+}

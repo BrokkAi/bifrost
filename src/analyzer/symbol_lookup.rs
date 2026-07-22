@@ -452,9 +452,42 @@ fn resolution_from_matches(
                 Some(CodeUnitResolution::Resolved(definitions))
             }
         }
-        _ => Some(CodeUnitResolution::Ambiguous(
-            matches.into_values().collect(),
-        )),
+        _ => {
+            // Like the `len == 1` arm above, each surviving key in `matches`
+            // holds only the single first-inserted representative for its fq
+            // name (see `insert_match`'s dedup-by-fq behavior). But a bare
+            // name's fq bucket can itself contain multiple independent
+            // declarations across files (e.g. several top-level
+            // `const Input = ...` arrow functions in different modules, all
+            // with empty package -> fq == short_name; see #1087). Re-expand
+            // every remaining key to its full set of declarations via
+            // `matching_definitions`, falling back to the stored
+            // representative when the lookup comes up empty, exactly as the
+            // `len == 1` arm does, so ambiguous results surface every
+            // candidate instead of silently collapsing cross-file
+            // duplicates down to one representative per fq.
+            //
+            // This expansion must run *after*
+            // `prefer_types_over_their_owner_named_constructors` has already
+            // pruned constructor-shaped functions above, not before: that
+            // filter reasons about one representative CodeUnit per fq key in
+            // the dedup'd map (owner/identifier checks against a single
+            // `unit`), so it needs the deduplicated shape to stay correct.
+            // Expanding first would turn `matches` into a multi-valued
+            // collection the filter isn't written to consume, and would risk
+            // re-introducing declarations the filter meant to drop before
+            // ambiguity was ever computed.
+            let mut expanded = Vec::with_capacity(matches.len());
+            for (fq_name, representative) in matches {
+                let definitions = matching_definitions(analyzer, &fq_name, include);
+                if definitions.is_empty() {
+                    expanded.push(representative);
+                } else {
+                    expanded.extend(definitions);
+                }
+            }
+            Some(CodeUnitResolution::Ambiguous(expanded))
+        }
     }
 }
 
