@@ -186,6 +186,17 @@ impl<'a> ScalaVisitor<'a> {
             match child.kind() {
                 "package_clause" => {
                     let package = scala_package_name(child, self.source);
+                    // Continuation context for content after the clause: when
+                    // no package is established yet, a braced clause
+                    // establishes the file package (`package com.example { }`
+                    // convention — its contents and everything after share
+                    // it); once a package is established, a nested braced
+                    // clause scopes only its body and the continuation
+                    // resumes the outer package (chisel's Aggregate.scala:
+                    // `package experimental { }` then top-level `Bundle`,
+                    // which stays in the outer package).
+                    let outer_package = current_package.clone();
+                    let outer_prefixes = package_prefixes.clone();
                     if !package.is_empty() {
                         current_package = if current_package.is_empty() {
                             package
@@ -199,11 +210,17 @@ impl<'a> ScalaVisitor<'a> {
                         package_prefixes.push(current_package.clone());
                     }
                     if let Some(body) = child.child_by_field_name("body") {
+                        let (continuation_package, continuation_prefixes) =
+                            if outer_package.is_empty() {
+                                (current_package.clone(), package_prefixes.clone())
+                            } else {
+                                (outer_package, outer_prefixes)
+                            };
                         stack.push(ScalaWork::CompilationUnit {
                             children,
                             index,
-                            package_name: current_package.clone(),
-                            package_prefixes: package_prefixes.clone(),
+                            package_name: continuation_package,
+                            package_prefixes: continuation_prefixes,
                             recovery_owners: recovery_owners.clone(),
                         });
                         stack.push(ScalaWork::CompilationUnit {
