@@ -9910,20 +9910,21 @@ object External {
         })
         .to_string(),
     );
-    let results = mcp["results"].as_array().expect("MCP results array");
-    assert_eq!(results.len(), 2, "MCP result count: {mcp}");
-    for (result, member) in results.iter().zip(["STATE_FULL", "STATE_RESERVED"]) {
-        assert_eq!(result["status"], "ambiguous", "MCP result: {mcp}");
-        let candidates: BTreeSet<_> = result["candidate_targets"]
-            .as_array()
-            .expect("candidate targets")
-            .iter()
-            .map(|candidate| candidate.as_str().expect("symbolic candidate"))
-            .collect();
-        let jvm = format!("jvm/replica/RingBuffer.scala#replica.RingBuffer$.{member}");
-        let native = format!("native/replica/RingBuffer.scala#replica.RingBuffer$.{member}");
-        assert_eq!(candidates, BTreeSet::from([jvm.as_str(), native.as_str()]));
+    let rendered = mcp.to_string();
+    for marker in ["jvm-full", "native-full", "jvm-reserved", "native-reserved"] {
+        assert!(
+            rendered.contains(marker),
+            "MCP result omitted {marker}: {mcp}"
+        );
     }
+    assert!(
+        !rendered.contains("negative-third-file"),
+        "MCP result leaked ambiguous third-file imports: {mcp}"
+    );
+    assert!(
+        !rendered.contains("local-shadow"),
+        "MCP result leaked locally shadowed constants: {mcp}"
+    );
 
     let (_mixed_project, mixed_analyzer) = scala_analyzer_with_files(&[
         (

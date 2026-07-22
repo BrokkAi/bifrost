@@ -360,7 +360,7 @@ module.exports = grammar({
       seq(
         field("name", $._identifier),
         field("type_parameters", optional($.type_parameters)),
-        optional($.annotation),
+        optional(alias($._constructor_annotation, $.annotation)),
         optional($.access_modifier),
         field(
           "class_parameters",
@@ -512,6 +512,24 @@ module.exports = grammar({
           "@",
           field("name", $._simple_type),
           field("arguments", repeat($.arguments)),
+        ),
+      ),
+
+    // Constructor annotations accept at most one immediately adjacent argument
+    // list. A following list belongs to the class constructor instead.
+    _constructor_annotation: $ =>
+      seq(
+        "@",
+        field("name", $._simple_type),
+        optional(
+          alias(
+            seq(
+              token.immediate("("),
+              optional($._exprs_in_parens),
+              ")",
+            ),
+            $.arguments,
+          ),
         ),
       ),
 

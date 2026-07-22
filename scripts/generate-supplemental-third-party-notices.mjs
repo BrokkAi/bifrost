@@ -221,8 +221,8 @@ async function main() {
     ),
     await vendoredLegalFile(
       "vendor/tree-sitter-scala/LICENSE",
-      "tree-sitter-scala generated parser",
-      "https://github.com/tree-sitter/tree-sitter-scala/tree/a68000002745b94eec61cef741efe7cede4ff465",
+      "Bifrost-patched tree-sitter-scala parser",
+      "https://github.com/tree-sitter/tree-sitter-scala/tree/a067c39163b62b19e76cea17476f3188da8c9e51",
       "compiled into Bifrost on every release target",
     ),
   ];

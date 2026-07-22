@@ -12,6 +12,14 @@ homepage = "https://github.com/BrokkAi/bifrost"
 readme = "README.md"
 keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
+exclude = [
+    ".agents/**",
+    "vendor/tree-sitter-scala/README.md",
+    "vendor/tree-sitter-scala/queries/**",
+    "vendor/tree-sitter-scala/src/grammar.json",
+    "vendor/tree-sitter-scala/src/node-types.json",
+    "vendor/tree-sitter-scala/tree-sitter.json",
+]
 
 [lib]
 name = "brokk_bifrost"

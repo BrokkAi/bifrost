@@ -27,7 +27,8 @@ tar -tzf "$archive" | sed 's@^[^/]*/@@' > "$package_files"
 
 required_vendor_files=(
     vendor/tree-sitter-scala/LICENSE
-    vendor/tree-sitter-scala/UPSTREAM.md
+    vendor/tree-sitter-scala/BIFROST_PATCH.md
+    vendor/tree-sitter-scala/grammar.js
     vendor/tree-sitter-scala/src/parser.c
     vendor/tree-sitter-scala/src/scanner.c
     vendor/tree-sitter-scala/src/tree_sitter/alloc.h
