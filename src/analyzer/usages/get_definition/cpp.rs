@@ -1320,7 +1320,30 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             let construction = resolve_cpp_construction_type(ctx, call);
             let construction_boundary =
                 construction.status == DefinitionLookupStatus::UnresolvableImportBoundary;
-            if construction.status != DefinitionLookupStatus::NoDefinition && !construction_boundary
+            // A qualified call `Scope::name(...)` is only genuinely constructor-shaped when
+            // the trailing path segment names the constructed type itself: either a
+            // self-named constructor call (`Type::Type(...)`) or a namespace-qualified bare
+            // type construction (`ns::Type()`), where the type's own identifier is that
+            // trailing segment. `resolve_cpp_construction_type` resolves the qualified scope
+            // text as a type reference, which -- for a *templated* scope followed by an
+            // unrelated trailing member (`Loader<int>::parse()`) -- can coincidentally match
+            // the scope's own class: template-argument text swallows the trailing
+            // `::member` before the type lookup ever sees it (issue #935). Guard against that
+            // by requiring the resolved type's identifier to actually match the call's
+            // trailing segment; otherwise fall through to the static/owner-member routing
+            // below, which resolves the scope independently of the trailing member name.
+            let construction_names_trailing_segment =
+                cpp_callable_name_node(function).is_none_or(|name| {
+                    let trailing = cpp_node_text(name, ctx.source);
+                    !construction.definitions.is_empty()
+                        && construction
+                            .definitions
+                            .iter()
+                            .all(|unit| unit.identifier() == trailing)
+                });
+            if construction.status != DefinitionLookupStatus::NoDefinition
+                && !construction_boundary
+                && construction_names_trailing_segment
             {
                 return construction;
             }
@@ -2377,9 +2400,23 @@ fn cpp_direct_base_types(
         return Vec::new();
     };
     let bases = bases.split('{').next().unwrap_or(bases);
+    // Base-class specifiers are frequently written relative to the enclosing namespace
+    // (`struct Derived : PCM::Base` inside `namespace Outer`, meaning `Outer::PCM::Base`).
+    // Resolve them the same namespace-relative way `cpp_resolve_type_unit_in_namespace`
+    // already resolves other qualified type references in this file (issue #939) --
+    // without this, a relatively-qualified base silently fails to resolve and every
+    // inherited-member lookup through it (bare calls here, and overload-assignability
+    // checks in `cpp_type_assignable_to`) fails forward.
+    let lexical_namespace = (!unit.package_name().is_empty()).then(|| unit.package_name());
     cpp_split_top_level_commas(bases)
         .filter_map(|base| {
-            cpp_resolve_type_unit(analyzer, visibility, file, &cpp_base_type_text(base))
+            cpp_resolve_type_unit_in_namespace(
+                analyzer,
+                visibility,
+                file,
+                &cpp_base_type_text(base),
+                lexical_namespace,
+            )
         })
         .collect()
 }

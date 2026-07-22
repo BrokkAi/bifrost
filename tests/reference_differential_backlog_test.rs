@@ -188,7 +188,6 @@ void panic2(const char *s) {}
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "issue #935 is live; un-ignore when the fix lands"]
 fn issue_935_cpp_templated_static_member_call_resolves_to_static_not_constructor() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -197,6 +196,8 @@ fn issue_935_cpp_templated_static_member_call_resolves_to_static_not_constructor
     Loader();
     static int parse();
 };
+
+template<class T> int Loader<T>::parse() { return 1; }
 "#,
         )
         .file(
@@ -400,8 +401,55 @@ public:
 // specifically in the call/usage resolver, not in base/ancestor computation.
 // ---------------------------------------------------------------------------------------------
 
+/// Active regression for the #939 FORWARD half: the unqualified inherited `value()` call must
+/// resolve through the namespace-relative base spelling (`PCM::Base` inside `namespace Outer`).
+/// Fixed by routing `cpp_direct_base_types` through `cpp_resolve_type_unit_in_namespace`.
 #[test]
-#[ignore = "issue #939 is live; un-ignore when the fix lands"]
+fn issue_939_cpp_relative_qualified_base_member_call_resolves_forward() {
+    let source = r#"namespace Outer {
+namespace PCM {
+struct Base {
+    int value() const { return 1; }
+};
+}
+struct Derived : PCM::Base {
+    int run() const { return value(); } // positive-relative-qualified-base-member-call
+};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("bases.cpp", source)
+        .build();
+
+    let call_line =
+        "    int run() const { return value(); } // positive-relative-qualified-base-member-call";
+    let value = lookup_by_location(
+        project.root(),
+        &json!({
+            "references": [{"path": "bases.cpp", "line": 8, "column": column_of(call_line, "value")}]
+        }),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let fqn = result["definitions"][0]["fqn"]
+        .as_str()
+        .expect("resolved fqn")
+        .to_string();
+    assert!(
+        fqn.contains("Base") && fqn.ends_with("value"),
+        "expected the call to resolve to the relatively-qualified base member `Base.value`, got {fqn:?}: {value}"
+    );
+}
+
+#[test]
+#[ignore = "issue #939 forward half is fixed (see the active forward-only regression above); \
+the inverse scan_usages_by_reference half still fails identically for the *absolute*-qualified \
+control shape (see \
+issue_939_control_cpp_absolute_qualified_base_member_call_forward_resolution), proving the \
+remaining gap is a general bare-inherited-member-call attribution limitation in \
+cpp_graph/inverted.rs's resolve_declaring_member_owner (usage-graph side), not something in \
+get_definition or specific to relative qualification. Un-ignore once that usage-graph gap is \
+fixed."]
 fn issue_939_cpp_relative_qualified_base_member_call_resolves_forward_and_inverse() {
     let source = r#"namespace Outer {
 namespace PCM {
