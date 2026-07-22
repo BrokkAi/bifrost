@@ -4,8 +4,8 @@ use brokk_bifrost::analyzer::semantic::{
     CallableReferenceKind, CallableTargetResolution, CancellationToken, ControlEdgeKind,
     DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind,
     ProcedureKind, ProcedureSemantics, SemanticBudget, SemanticBudgetDimension, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticLanguage, SemanticOutcome, SemanticRequest,
+    SemanticCapability, SemanticEffect, SemanticGap, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage, SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -175,6 +175,28 @@ fn assert_source_point_gap(
         }),
         "missing exact source-backed Point-scoped {capability:?}:{kind:?} gap for {expected_source:?}"
     );
+}
+
+fn assert_deferred_effect_impacts(gap: &SemanticGap, weakens_call_evaluation: bool, context: &str) {
+    assert_eq!(gap.capability, SemanticCapability::DeferredExecution);
+    for impact in [
+        SemanticGapImpact::ReturnTransfer,
+        SemanticGapImpact::ValueFlow,
+        SemanticGapImpact::HeapRead,
+        SemanticGapImpact::HeapWrite,
+        SemanticGapImpact::Aliasing,
+    ] {
+        assert!(
+            gap.impacts.contains(impact),
+            "DeferredExecution at {context} must surface {impact:?} uncertainty",
+        );
+    }
+    assert_eq!(
+        gap.impacts.contains(SemanticGapImpact::CallEvaluation),
+        weakens_call_evaluation,
+        "DeferredExecution impact must reflect whether {context} leaves a represented caller-side transfer incomplete",
+    );
+    assert!(!gap.impacts.contains(SemanticGapImpact::DispatchCoverage));
 }
 
 fn assert_direct_call_conformance(fixture: DirectCallFixture) {
@@ -3552,6 +3574,16 @@ int cpp_boundaries() {{
         SemanticCapability::DeferredExecution,
         SemanticGapKind::Unknown,
     );
+    let procedure = procedure_named(&graph, "cpp_boundaries", ProcedureKind::Function);
+    let static_gap = procedure
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.detail.contains("function-local static initialization")
+        })
+        .expect("missing guarded C++ local-static deferred-execution gap");
+    assert_deferred_effect_impacts(static_gap, false, "guarded C++ local-static initializer");
     graph.assert_adjacency_symmetric();
 }
 
@@ -5109,6 +5141,15 @@ func schedule() {
                 == Some("schedule")
         })
         .expect("missing Go schedule procedure");
+    let deferred_gap = schedule
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.detail.contains("deferred invocation timing")
+        })
+        .expect("missing omitted Go defer invocation gap");
+    assert_deferred_effect_impacts(deferred_gap, false, "omitted Go defer invocation");
     let snippet = |start: u32, end: u32| {
         SOURCE
             .get(start as usize..end as usize)
@@ -14369,6 +14410,16 @@ fn scala_for_enumerator_flow_retains_protocol_and_deferred_execution_gaps() {
     ] {
         graph.assert_point_gap("enumerator_decision", capability, kind);
     }
+    let enumerated = procedure_named(&graph, "enumerated", ProcedureKind::Function);
+    let deferred = enumerated
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.detail.contains("desugared closures")
+        })
+        .expect("missing Scala for-comprehension deferred-execution gap");
+    assert_deferred_effect_impacts(deferred, false, "desugared Scala closure execution");
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());
@@ -14473,6 +14524,26 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
         SemanticCapability::DeferredExecution,
         SemanticGapKind::Unsupported,
     );
+    let consume = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("consume")
+        })
+        .expect("missing Scala consume procedure");
+    let by_name_callee_gap = consume
+        .gaps()
+        .iter()
+        .find(|gap| gap.capability == SemanticCapability::DeferredExecution)
+        .expect("missing Scala by-name callee gap");
+    assert_deferred_effect_impacts(by_name_callee_gap, false, "by-name Scala callee");
     let limitations = graph
         .artifact()
         .procedures()
@@ -14540,11 +14611,7 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
                     panic!("missing CallSite-scoped {capability:?} gap for {call_source}")
                 });
             if *capability == SemanticCapability::DeferredExecution {
-                assert_eq!(
-                    gap.impacts.contains(SemanticGapImpact::CallEvaluation),
-                    deferred_weakens_call_evaluation,
-                    "DeferredExecution impact must reflect whether {call_source} withheld caller-side evaluation",
-                );
+                assert_deferred_effect_impacts(gap, deferred_weakens_call_evaluation, call_source);
             }
         }
     }
@@ -15008,6 +15075,17 @@ fn scala_constructor_initializer_given_and_partial_function_procedures_are_disti
         "the enclosing partial-function factory must not execute the case body"
     );
     assert_eq!(closure.call_sites().len(), 1);
+    for deferred in [initializer, given_initializer] {
+        let gap = deferred
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.subject == SemanticGapSubject::Procedure
+                    && gap.capability == SemanticCapability::DeferredExecution
+            })
+            .expect("missing demand-scheduled Scala procedure gap");
+        assert_deferred_effect_impacts(gap, false, "demand-scheduled Scala procedure");
+    }
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());

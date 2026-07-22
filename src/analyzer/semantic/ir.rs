@@ -906,12 +906,22 @@ impl SemanticGapImpacts {
         .with(SemanticGapImpact::HeapRead)
         .with(SemanticGapImpact::HeapWrite);
     const RETURN_TRANSFER: Self = Self::VALUE.with(SemanticGapImpact::ReturnTransfer);
-    const CONTROL_FLOW: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
-    /// Conservative downstream profile for an omitted call evaluation.
+    /// Conservative downstream profile for a represented evaluation whose
+    /// timing or multiplicity is unresolved.
     ///
-    /// A call that is absent from the IR may affect produced values, aliases,
-    /// heap reads and writes, return transfer, and caller-side evaluation.
-    pub const CALL_EVALUATION: Self = Self::CONTROL_FLOW.with(SemanticGapImpact::CallEvaluation);
+    /// The evaluation still exists in the IR, so this deliberately does not
+    /// weaken dispatch coverage or call existence. It does leave produced
+    /// values, aliases, heap effects, and return transfer open.
+    pub const DEFERRED_EFFECTS: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
+    const CONTROL_FLOW: Self = Self::DEFERRED_EFFECTS;
+    /// Conservative downstream profile for a represented call whose
+    /// caller-side evaluation or transfer is incomplete.
+    ///
+    /// The represented call may still affect produced values, aliases, heap
+    /// reads and writes, return transfer, and caller-side evaluation beyond
+    /// what its retained IR events prove.
+    pub const CALL_EVALUATION: Self =
+        Self::DEFERRED_EFFECTS.with(SemanticGapImpact::CallEvaluation);
 
     pub const fn single(impact: SemanticGapImpact) -> Self {
         Self(impact.bit())
@@ -961,15 +971,17 @@ impl SemanticGapImpacts {
             // A call-site-scoped omission leaves call-dependent values and
             // aliases open, but it does not by itself weaken retained target
             // coverage or caller-side evaluation. Broader Calls gaps and
-            // callable/deferred producer gaps need adapter-authored impacts
-            // for any specific downstream consequence.
+            // callable producer gaps need adapter-authored impacts for any
+            // specific downstream consequence. DeferredExecution always
+            // leaves evaluation effects open; adapters additionally attach
+            // CallEvaluation only when a represented call's caller-side
+            // evaluation or transfer is itself incomplete.
             SemanticCapability::Calls => match subject {
                 SemanticGapSubject::CallSite(_) => Self::VALUE,
                 _ => Self::NONE,
             },
-            SemanticCapability::CallableReferences | SemanticCapability::DeferredExecution => {
-                Self::NONE
-            }
+            SemanticCapability::CallableReferences => Self::NONE,
+            SemanticCapability::DeferredExecution => Self::DEFERRED_EFFECTS,
             SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
             SemanticCapability::DynamicDispatch => {
                 Self::single(SemanticGapImpact::DispatchCoverage)
@@ -4939,18 +4951,31 @@ mod tests {
             SemanticGapImpacts::for_gap(SemanticCapability::Calls, SemanticGapSubject::Procedure,),
             SemanticGapImpacts::NONE,
         );
-        for capability in [
+        let callable_impacts = SemanticGapImpacts::for_gap(
             SemanticCapability::CallableReferences,
+            SemanticGapSubject::CallSite(CallSiteId::new(0)),
+        );
+        assert_eq!(callable_impacts, SemanticGapImpacts::NONE);
+        let deferred_impacts = SemanticGapImpacts::for_gap(
             SemanticCapability::DeferredExecution,
+            SemanticGapSubject::CallSite(CallSiteId::new(0)),
+        );
+        assert_eq!(deferred_impacts, SemanticGapImpacts::DEFERRED_EFFECTS);
+        assert!(!deferred_impacts.contains(SemanticGapImpact::DispatchCoverage));
+        assert!(!deferred_impacts.contains(SemanticGapImpact::CallEvaluation));
+        for impact in [
+            SemanticGapImpact::ReturnTransfer,
+            SemanticGapImpact::ValueFlow,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+            SemanticGapImpact::Aliasing,
         ] {
-            let impacts = SemanticGapImpacts::for_gap(
-                capability,
-                SemanticGapSubject::CallSite(CallSiteId::new(0)),
-            );
-            assert_eq!(impacts, SemanticGapImpacts::NONE);
-            assert!(!impacts.contains(SemanticGapImpact::DispatchCoverage));
-            assert!(!impacts.contains(SemanticGapImpact::CallEvaluation));
+            assert!(SemanticGapImpacts::DEFERRED_EFFECTS.contains(impact));
+            assert!(SemanticGapImpacts::CALL_EVALUATION.contains(impact));
         }
+        assert!(!SemanticGapImpacts::DEFERRED_EFFECTS.contains(SemanticGapImpact::CallEvaluation));
+        assert!(SemanticGapImpacts::CALL_EVALUATION.contains(SemanticGapImpact::CallEvaluation));
+        assert!(!SemanticGapImpacts::CALL_EVALUATION.contains(SemanticGapImpact::DispatchCoverage));
         assert_eq!(
             SemanticGapImpacts::for_gap(
                 SemanticCapability::ConcurrentSpawn,

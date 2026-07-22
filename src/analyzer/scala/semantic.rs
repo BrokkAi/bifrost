@@ -1874,7 +1874,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     invoke,
                     SemanticGapSubject::CallSite(call_site),
                     SemanticCapability::DeferredExecution,
-                    SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+                    SemanticGapImpacts::CALL_EVALUATION,
                     SemanticGapKind::Unknown,
                     detail,
                 )?;
@@ -1899,11 +1899,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "Future-style execution-context scheduling is not lowered",
             )?;
             if argument_nodes.is_empty() {
-                self.add_gap(
+                self.session.add_gap_with_impacts(
                     builder,
                     invoke,
                     SemanticGapSubject::CallSite(call_site),
                     SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::CALL_EVALUATION,
                     SemanticGapKind::Unknown,
                     "Future body execution timing is not lowered",
                 )?;

@@ -2006,6 +2006,95 @@ mod tests {
     }
 
     #[test]
+    fn procedure_deferred_scheduling_does_not_weaken_a_nested_call_transfer() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Rust,
+            &[(
+                "lib.rs",
+                "pub fn leaf() -> i32 { 7 }\npub async fn scheduled() -> i32 { leaf() }\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Rust semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Rust semantic artifact");
+        let scheduled = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("scheduled")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("scheduled procedure");
+        let scheduling_gap = scheduled
+            .semantics()
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.subject == SemanticGapSubject::Procedure
+                    && gap.capability == SemanticCapability::DeferredExecution
+            })
+            .expect("async procedure scheduling gap");
+        assert!(
+            !scheduling_gap
+                .impacts
+                .contains(SemanticGapImpact::CallEvaluation),
+            "procedure scheduling must not claim that every represented nested call is incomplete"
+        );
+        let call = scheduled
+            .semantics()
+            .call_sites()
+            .first()
+            .expect("nested leaf call");
+        let mut transfer_budget = SemanticBudget::default();
+        let outcome = fixture
+            .analyzer
+            .icfg_provider()
+            .call_transfers(
+                &scheduled,
+                call.id,
+                &mut SemanticRequest::new(&mut transfer_budget, &cancellation),
+            )
+            .expect("nested leaf call transfer");
+        assert!(
+            !matches!(
+                &outcome,
+                SemanticOutcome::Unsupported {
+                    capability: SemanticCapability::DeferredExecution,
+                    ..
+                }
+            ),
+            "procedure scheduling uncertainty must not downgrade the nested call: {outcome:#?}"
+        );
+        let transfers = outcome
+            .available_value()
+            .expect("nested call transfer payload");
+        assert_eq!(transfers.transfers.len(), 1, "{transfers:#?}");
+        assert!(transfers.transfers.iter().all(|transfer| {
+            !matches!(
+                &transfer.completeness,
+                EvidenceCompleteness::Partial(reason)
+                    if reason.contains("caller-side call evaluation")
+            )
+        }));
+    }
+
+    #[test]
     fn deferred_call_transfer_reprojects_provenance_and_charges_payload_atomically() {
         let fixture = AnalyzerFixture::new_for_language(
             crate::analyzer::Language::Rust,

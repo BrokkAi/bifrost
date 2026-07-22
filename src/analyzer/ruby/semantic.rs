@@ -2959,11 +2959,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         has_block: bool,
     ) -> Result<(), RubyLoweringError> {
         if has_block && method != Some("define_method") {
-            self.add_gap(
+            self.session.add_gap_with_impacts(
                 builder,
                 point,
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::DeferredExecution,
+                SemanticGapImpacts::CALL_EVALUATION,
                 SemanticGapKind::Unknown,
                 "an attached Ruby block is a separate callable whose invocation timing depends on the callee",
             )?;
