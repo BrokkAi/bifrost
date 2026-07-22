@@ -167,6 +167,40 @@ fn selected_repo_comparison_ignores_unselected_baseline_scenarios() {
 }
 
 #[test]
+fn query_code_cases_are_compared_independently() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![
+            query_scenario("exact-class", 100.0),
+            query_scenario("typed-callers", 100.0),
+        ],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![
+            query_scenario("exact-class", 170.0),
+            query_scenario("typed-callers", 110.0),
+        ],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    assert_eq!(comparison.compared_scenarios_count, 2, "{comparison:?}");
+    let exact = comparison
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.case_id.as_deref() == Some("exact-class"))
+        .expect("exact-name case");
+    assert_eq!(exact.outcome, ScenarioCompareOutcome::Regression);
+    let typed = comparison
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.case_id.as_deref() == Some("typed-callers"))
+        .expect("typed traversal case");
+    assert_eq!(typed.outcome, ScenarioCompareOutcome::Unchanged);
+}
+
+#[test]
 fn broad_workspace_slowdown_is_classified_as_environment_variance() {
     let baseline = report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0));
     let candidate = report_with_scenarios(broad_slowdown_repos(260.0, 125.0, 230.0));
@@ -374,6 +408,10 @@ fn repo_with_scenarios(name: &str, scenarios: Vec<ScenarioReport>) -> BenchmarkR
 
 fn scenario(name: BenchmarkScenario, success: bool, median_ms: Option<f64>) -> ScenarioReport {
     scenario_with_transport(name, ScenarioTransport::Mcp, success, median_ms)
+}
+
+fn query_scenario(case_id: &str, median_ms: f64) -> ScenarioReport {
+    scenario(BenchmarkScenario::QueryCode, true, Some(median_ms)).with_case_id(case_id.to_string())
 }
 
 fn scenario_with_transport(

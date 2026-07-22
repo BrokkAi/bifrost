@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -13,6 +14,7 @@ use crate::mcp_common::{BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOU
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
 const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
 const PROFILE_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
+const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy)]
 pub struct StderrCursor {
@@ -260,9 +262,83 @@ fn close_boundary_stream(boundaries: &(Mutex<BoundaryState>, Condvar)) {
 pub struct McpSession {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    stdout: StdoutDrain,
     stderr: StderrDrain,
     next_id: u64,
+}
+
+struct StdoutDrain {
+    responses: Receiver<Result<Value, String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StdoutDrain {
+    fn spawn(stdout: ChildStdout) -> Result<Self, String> {
+        let (sender, responses) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("bifrost-benchmark-stdout".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => {
+                            let _ = sender.send(Err("bifrost MCP server closed early".to_string()));
+                            break;
+                        }
+                        Ok(_) => match serde_json::from_str(&line) {
+                            Ok(response) => {
+                                if sender.send(Ok(response)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(format!(
+                                    "failed to parse MCP JSON response: {error}; line={line}"
+                                )));
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            let _ =
+                                sender.send(Err(format!("failed to read MCP response: {error}")));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to spawn MCP stdout reader: {error}"))?;
+        Ok(Self {
+            responses,
+            worker: Some(worker),
+        })
+    }
+
+    fn receive(&self, timeout: Duration) -> Result<Value, String> {
+        receive_response(&self.responses, timeout)
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn receive_response(
+    responses: &Receiver<Result<Value, String>>,
+    timeout: Duration,
+) -> Result<Value, String> {
+    match responses.recv_timeout(timeout) {
+        Ok(response) => response,
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "timed out after {}s waiting for bifrost MCP response",
+            timeout.as_secs_f64()
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("bifrost MCP stdout reader stopped early".to_string())
+        }
+    }
 }
 
 impl McpSession {
@@ -314,10 +390,18 @@ impl McpSession {
                 return Err(err);
             }
         };
+        let mut stdout = match StdoutDrain::spawn(stdout) {
+            Ok(stdout) => stdout,
+            Err(err) => {
+                terminate_child(&mut child);
+                return Err(err);
+            }
+        };
         let stderr = match StderrDrain::spawn(stderr, STDERR_TAIL_CAPACITY_BYTES) {
             Ok(stderr) => stderr,
             Err(err) => {
                 terminate_child(&mut child);
+                stdout.join();
                 return Err(err);
             }
         };
@@ -325,7 +409,7 @@ impl McpSession {
         Ok(Self {
             child,
             stdin,
-            reader: BufReader::new(stdout),
+            stdout,
             stderr,
             next_id: 1,
         })
@@ -422,7 +506,13 @@ impl McpSession {
 
     fn request(&mut self, payload: Value) -> Result<Value, String> {
         self.write_line(&payload)?;
-        self.read_line()
+        match self.stdout.receive(MCP_RESPONSE_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.shutdown();
+                Err(error)
+            }
+        }
     }
 
     fn notify(&mut self, payload: Value) -> Result<(), String> {
@@ -435,21 +525,6 @@ impl McpSession {
             .map_err(|err| format!("failed to write MCP request: {err}"))
     }
 
-    fn read_line(&mut self) -> Result<Value, String> {
-        let mut line = String::new();
-        let bytes = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|err| format!("failed to read MCP response: {err}"))?;
-        if bytes == 0 {
-            self.shutdown();
-            return Err("bifrost MCP server closed early".to_string());
-        }
-
-        serde_json::from_str(&line)
-            .map_err(|err| format!("failed to parse MCP JSON response: {err}; line={line}"))
-    }
-
     fn take_id(&mut self) -> u64 {
         let next = self.next_id;
         self.next_id += 1;
@@ -459,6 +534,7 @@ impl McpSession {
     fn shutdown(&mut self) {
         let _ = self.stdin.flush();
         terminate_child(&mut self.child);
+        self.stdout.join();
         self.stderr.join();
     }
 }
@@ -625,5 +701,15 @@ mod tests {
         let captured = tail.capture_since(cursor);
         assert_eq!(captured.text, "new-one\n");
         assert!(!captured.truncated);
+    }
+
+    #[test]
+    fn stdout_response_wait_has_a_hard_timeout() {
+        let (_sender, responses) = mpsc::channel();
+
+        let error = receive_response(&responses, Duration::from_millis(1))
+            .expect_err("silent child must time out");
+
+        assert!(error.contains("timed out"), "{error}");
     }
 }

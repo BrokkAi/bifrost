@@ -1,9 +1,14 @@
 use crate::Language;
+use crate::analyzer::structural::{
+    CodeQuery, CodeQueryPlanSource, CodeQuerySeed, Pattern, StringPredicate,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const MAX_QUERY_CODE_CASE_ID_LENGTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestValidationError {
@@ -178,10 +183,12 @@ pub enum BenchmarkScenario {
     CallHierarchy,
     #[serde(rename = "type_hierarchy")]
     TypeHierarchy,
+    #[serde(rename = "query_code")]
+    QueryCode,
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
@@ -193,6 +200,7 @@ impl BenchmarkScenario {
         Self::GetDefinition,
         Self::CallHierarchy,
         Self::TypeHierarchy,
+        Self::QueryCode,
     ];
 
     pub fn label(self) -> &'static str {
@@ -208,6 +216,7 @@ impl BenchmarkScenario {
             Self::GetDefinition => "get_definition",
             Self::CallHierarchy => "call_hierarchy",
             Self::TypeHierarchy => "type_hierarchy",
+            Self::QueryCode => "query_code",
         }
     }
 
@@ -218,6 +227,39 @@ impl BenchmarkScenario {
             Self::GetDefinition => "get_definitions_by_location",
             Self::CallHierarchy | Self::TypeHierarchy => self.label(),
             _ => self.label(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryCodeWorkload {
+    ExactName,
+    Broad,
+    Regex,
+    Containment,
+    TypedTraversal,
+    WarmReuse,
+}
+
+impl QueryCodeWorkload {
+    pub const ALL: [Self; 6] = [
+        Self::ExactName,
+        Self::Broad,
+        Self::Regex,
+        Self::Containment,
+        Self::TypedTraversal,
+        Self::WarmReuse,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExactName => "exact_name",
+            Self::Broad => "broad",
+            Self::Regex => "regex",
+            Self::Containment => "containment",
+            Self::TypedTraversal => "typed_traversal",
+            Self::WarmReuse => "warm_reuse",
         }
     }
 }
@@ -278,6 +320,8 @@ impl BenchmarkManifest {
         let mut seen_repo_names = BTreeSet::new();
         let mut covered_languages = BTreeSet::new();
         let mut covered_scenarios = BTreeSet::new();
+        let mut query_code_languages = BTreeSet::new();
+        let mut query_code_workloads = BTreeSet::new();
 
         for repo in &self.repos {
             repo.validate(&mut errors);
@@ -292,9 +336,18 @@ impl BenchmarkManifest {
             for scenario in repo.scenario_set() {
                 covered_scenarios.insert(scenario);
             }
+            if !repo.query_code_queries.is_empty() {
+                for query in &repo.query_code_queries {
+                    if let Ok(decoded) = query.decode() {
+                        let traits = QueryCodeTraits::from_query(&decoded, &repo.language_set());
+                        query_code_languages.extend(traits.languages);
+                        query_code_workloads.extend(query.workloads.iter().copied());
+                    }
+                }
+            }
         }
 
-        for required_language in required_languages {
+        for &required_language in &required_languages {
             if !covered_languages.contains(&required_language) {
                 errors.push(format!(
                     "required language `{}` is not covered by any repo entry",
@@ -303,12 +356,31 @@ impl BenchmarkManifest {
             }
         }
 
-        for required_scenario in required_scenarios {
+        for &required_scenario in &required_scenarios {
             if !covered_scenarios.contains(&required_scenario) {
                 errors.push(format!(
                     "required scenario `{}` is not enabled by any repo entry",
                     required_scenario.label()
                 ));
+            }
+        }
+
+        if required_scenarios.contains(&BenchmarkScenario::QueryCode) {
+            for &required_language in &required_languages {
+                if !query_code_languages.contains(&required_language) {
+                    errors.push(format!(
+                        "required language `{}` has no query_code benchmark case",
+                        required_language.label()
+                    ));
+                }
+            }
+            for workload in QueryCodeWorkload::ALL {
+                if !query_code_workloads.contains(&workload) {
+                    errors.push(format!(
+                        "query_code benchmark corpus does not cover `{}` workload",
+                        workload.label()
+                    ));
+                }
             }
         }
 
@@ -371,6 +443,8 @@ pub struct BenchmarkRepoTarget {
     pub call_hierarchy_queries: Vec<HierarchyQueryTarget>,
     #[serde(default)]
     pub type_hierarchy_queries: Vec<HierarchyQueryTarget>,
+    #[serde(default)]
+    pub query_code_queries: Vec<QueryCodeBenchmarkCase>,
 }
 
 pub type ScanUsageQueryTarget = BenchmarkLocationSelector;
@@ -405,6 +479,25 @@ pub struct HierarchyQueryTarget {
     pub min_supertypes: usize,
     #[serde(default)]
     pub min_subtypes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeBenchmarkCase {
+    pub id: String,
+    pub workloads: Vec<QueryCodeWorkload>,
+    pub query_json: String,
+    #[serde(default)]
+    pub required_paths: Vec<String>,
+    #[serde(default)]
+    pub expected_witness_json: Option<String>,
+    #[serde(default)]
+    pub min_results: Option<usize>,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    #[serde(default)]
+    pub expected_truncated: bool,
+    #[serde(default)]
+    pub expected_diagnostic_codes: Vec<String>,
 }
 
 impl BenchmarkRepoTarget {
@@ -597,7 +690,304 @@ impl BenchmarkRepoTarget {
                 query.validate(name, "type_hierarchy_queries", index, errors);
             }
         }
+
+        if scenarios.contains(&BenchmarkScenario::QueryCode) {
+            if self.query_code_queries.is_empty() {
+                errors.push(format!(
+                    "repo `{name}` enables `query_code` but does not define query_code_queries"
+                ));
+            }
+        } else if !self.query_code_queries.is_empty() {
+            errors.push(format!(
+                "repo `{name}` defines query_code_queries but does not enable `query_code`"
+            ));
+        }
+        let mut query_ids = BTreeSet::new();
+        for (index, query) in self.query_code_queries.iter().enumerate() {
+            query.validate(name, index, &languages, errors);
+            let id = query.id.trim();
+            if !id.is_empty() && !query_ids.insert(id) {
+                errors.push(format!(
+                    "repo `{name}` defines duplicate query_code case id `{id}`"
+                ));
+            }
+        }
     }
+}
+
+impl QueryCodeBenchmarkCase {
+    fn validate(
+        &self,
+        repo_name: &str,
+        index: usize,
+        repo_languages: &BTreeSet<ManifestLanguage>,
+        errors: &mut Vec<String>,
+    ) {
+        let label = format!("repo `{repo_name}` query_code_queries[{index}]");
+        let id = self.id.trim();
+        if id.is_empty() {
+            errors.push(format!("{label} must define a non-empty id"));
+        } else if id.len() > MAX_QUERY_CODE_CASE_ID_LENGTH
+            || !id.is_ascii()
+            || !id
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            errors.push(format!(
+                "{label} id must be an ASCII slug of at most {MAX_QUERY_CODE_CASE_ID_LENGTH} bytes using letters, digits, `_`, or `-`"
+            ));
+        }
+
+        let workloads = self.workloads.iter().copied().collect::<BTreeSet<_>>();
+        if workloads.is_empty() {
+            errors.push(format!("{label} must define at least one workload"));
+        } else if workloads.len() != self.workloads.len() {
+            errors.push(format!("{label} defines duplicate workloads"));
+        }
+
+        let decoded = match serde_json::from_str::<serde_json::Value>(&self.query_json) {
+            Ok(value) => match value.as_object() {
+                Some(object) => {
+                    if object.contains_key("query_file") {
+                        errors.push(format!(
+                            "{label} must embed a query and cannot use query_file"
+                        ));
+                    }
+                    if object.contains_key("execution_mode") {
+                        errors.push(format!(
+                            "{label} cannot set execution_mode; the benchmark always profiles"
+                        ));
+                    }
+                    match CodeQuery::from_json(&value) {
+                        Ok(query) => Some(query),
+                        Err(error) => {
+                            errors.push(format!("{label} has an invalid query_json: {error}"));
+                            None
+                        }
+                    }
+                }
+                None => {
+                    errors.push(format!("{label} query_json must contain a JSON object"));
+                    None
+                }
+            },
+            Err(error) => {
+                errors.push(format!("{label} has invalid query_json: {error}"));
+                None
+            }
+        };
+
+        if let Some(query) = decoded.as_ref() {
+            let traits = QueryCodeTraits::from_query(query, repo_languages);
+            for language in &traits.languages {
+                if !repo_languages.contains(language) {
+                    errors.push(format!(
+                        "{label} queries language `{}` which is not declared by repo `{repo_name}`",
+                        language.label()
+                    ));
+                }
+            }
+            for unsupported in &traits.unsupported_languages {
+                errors.push(format!(
+                    "{label} queries unsupported benchmark language `{}`",
+                    unsupported.config_label()
+                ));
+            }
+            for workload in workloads
+                .iter()
+                .filter(|workload| **workload != QueryCodeWorkload::WarmReuse)
+            {
+                if !traits.workloads.contains(workload) {
+                    errors.push(format!(
+                        "{label} declares `{}` workload but the decoded query does not exercise it",
+                        workload.label()
+                    ));
+                }
+            }
+        }
+
+        let mut required_paths = BTreeSet::new();
+        for raw_path in &self.required_paths {
+            let path = raw_path.trim();
+            if !is_safe_workspace_relative_path(path) {
+                errors.push(format!(
+                    "{label} required path `{raw_path}` must be a normalized workspace-relative path without `.` or `..` components"
+                ));
+            } else if !required_paths.insert(path) {
+                errors.push(format!("{label} defines duplicate required path `{path}`"));
+            }
+        }
+
+        let has_witness = match &self.expected_witness_json {
+            Some(witness) => match serde_json::from_str::<serde_json::Value>(witness) {
+                Ok(value) if value.is_object() => true,
+                Ok(_) => {
+                    errors.push(format!(
+                        "{label} expected_witness_json must contain a JSON object"
+                    ));
+                    false
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "{label} has invalid expected_witness_json: {error}"
+                    ));
+                    false
+                }
+            },
+            None => false,
+        };
+        if !has_witness && self.min_results.unwrap_or(0) == 0 {
+            errors.push(format!(
+                "{label} must require a positive result count or an exact result witness"
+            ));
+        }
+        if let (Some(min), Some(max)) = (self.min_results, self.max_results)
+            && min > max
+        {
+            errors.push(format!(
+                "{label} min_results {min} exceeds max_results {max}"
+            ));
+        }
+        if has_witness && self.max_results == Some(0) {
+            errors.push(format!(
+                "{label} cannot require a witness while max_results is zero"
+            ));
+        }
+
+        let diagnostic_codes = self
+            .expected_diagnostic_codes
+            .iter()
+            .map(|code| code.trim())
+            .collect::<BTreeSet<_>>();
+        if diagnostic_codes.iter().any(|code| code.is_empty()) {
+            errors.push(format!("{label} has a blank expected diagnostic code"));
+        }
+        if diagnostic_codes.len() != self.expected_diagnostic_codes.len() {
+            errors.push(format!(
+                "{label} defines duplicate expected diagnostic codes"
+            ));
+        }
+    }
+
+    pub(crate) fn required_paths(&self) -> impl Iterator<Item = &String> {
+        self.required_paths.iter()
+    }
+
+    fn decode(&self) -> Result<CodeQuery, String> {
+        let value = serde_json::from_str::<serde_json::Value>(&self.query_json)
+            .map_err(|error| error.to_string())?;
+        CodeQuery::from_json(&value).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Default)]
+struct QueryCodeTraits {
+    languages: BTreeSet<ManifestLanguage>,
+    unsupported_languages: BTreeSet<Language>,
+    workloads: BTreeSet<QueryCodeWorkload>,
+}
+
+impl QueryCodeTraits {
+    fn from_query(query: &CodeQuery, repo_languages: &BTreeSet<ManifestLanguage>) -> Self {
+        let mut traits = Self::default();
+        let mut plans = vec![&query.plan];
+        while let Some(plan) = plans.pop() {
+            if !plan.steps.is_empty() {
+                traits.workloads.insert(QueryCodeWorkload::TypedTraversal);
+            }
+            match &plan.source {
+                CodeQueryPlanSource::Seed(seed) => {
+                    traits.observe_seed(seed, repo_languages);
+                }
+                CodeQueryPlanSource::Set { branches, .. } => plans.extend(branches),
+            }
+        }
+        traits
+    }
+
+    fn observe_seed(&mut self, seed: &CodeQuerySeed, repo_languages: &BTreeSet<ManifestLanguage>) {
+        if seed.languages.is_empty() {
+            self.languages.extend(repo_languages);
+        } else {
+            for &language in &seed.languages {
+                match manifest_language_from_analyzer(language) {
+                    Some(language) => {
+                        self.languages.insert(language);
+                    }
+                    None => {
+                        self.unsupported_languages.insert(language);
+                    }
+                }
+            }
+        }
+
+        if matches!(seed.root.name.as_ref(), Some(StringPredicate::Exact(_))) {
+            self.workloads.insert(QueryCodeWorkload::ExactName);
+        }
+        if seed.root.name.is_none() && seed.root.text.is_none() {
+            self.workloads.insert(QueryCodeWorkload::Broad);
+        }
+        if seed.inside.is_some() || positive_patterns(seed).any(|pattern| pattern.has.is_some()) {
+            self.workloads.insert(QueryCodeWorkload::Containment);
+        }
+        if positive_patterns(seed).any(pattern_has_regex) {
+            self.workloads.insert(QueryCodeWorkload::Regex);
+        }
+    }
+}
+
+fn positive_patterns(seed: &CodeQuerySeed) -> impl Iterator<Item = &Pattern> {
+    let mut stack = vec![&seed.root];
+    if let Some(inside) = seed.inside.as_ref() {
+        stack.push(inside);
+    }
+    std::iter::from_fn(move || {
+        let pattern = stack.pop()?;
+        stack.extend(pattern.has.as_deref());
+        stack.extend(pattern.callee.as_deref());
+        stack.extend(pattern.receiver.as_deref());
+        stack.extend(pattern.args.iter());
+        stack.extend(pattern.kwargs.iter().map(|(_, pattern)| pattern));
+        stack.extend(pattern.left.as_deref());
+        stack.extend(pattern.right.as_deref());
+        stack.extend(pattern.module.as_deref());
+        stack.extend(pattern.decorators.iter());
+        stack.extend(pattern.object.as_deref());
+        stack.extend(pattern.field.as_deref());
+        Some(pattern)
+    })
+}
+
+fn pattern_has_regex(pattern: &Pattern) -> bool {
+    matches!(pattern.name.as_ref(), Some(StringPredicate::Regex(_)))
+        || matches!(pattern.text.as_ref(), Some(StringPredicate::Regex(_)))
+}
+
+fn is_safe_workspace_relative_path(raw_path: &str) -> bool {
+    let windows_drive_prefix = raw_path.as_bytes().get(1) == Some(&b':')
+        && raw_path
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    if raw_path.is_empty()
+        || raw_path.len() > 4096
+        || raw_path.contains('\\')
+        || windows_drive_prefix
+        || raw_path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return false;
+    }
+    let path = Path::new(raw_path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 impl BenchmarkLocationSelector {

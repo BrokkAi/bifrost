@@ -137,6 +137,11 @@ fn pinned_probe_files(
     candidate_files: &BTreeSet<PathBuf>,
 ) -> Result<BTreeSet<PathBuf>, String> {
     let mut pinned = BTreeSet::new();
+    let query_code_paths = target
+        .query_code_queries
+        .iter()
+        .flat_map(crate::benchmark::QueryCodeBenchmarkCase::required_paths)
+        .collect::<Vec<_>>();
     for raw_path in target
         .summary_targets
         .iter()
@@ -161,6 +166,7 @@ fn pinned_probe_files(
                 .iter()
                 .map(|query| &query.selector.path),
         )
+        .chain(query_code_paths)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {

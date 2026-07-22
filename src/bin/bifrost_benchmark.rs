@@ -310,15 +310,28 @@ fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
         }
         for scenario in &repo.scenarios {
             let status = if scenario.success { "ok" } else { "failed" };
+            let case_suffix = scenario
+                .case_id
+                .as_deref()
+                .map(|case_id| format!("/{case_id}"))
+                .unwrap_or_default();
             match scenario.median_ms {
                 Some(median) => {
                     println!(
-                        "  {}: {status} median={median:.1} ms",
-                        scenario.name.label()
+                        "  {}{case_suffix}: {status} median={median:.1} ms{}{}",
+                        scenario.name.label(),
+                        scenario
+                            .p95_ms
+                            .map(|p95| format!(" p95={p95:.1} ms"))
+                            .unwrap_or_default(),
+                        scenario
+                            .first_duration_ms
+                            .map(|first| format!(" first={first:.1} ms"))
+                            .unwrap_or_default()
                     );
                 }
                 None => {
-                    println!("  {}: {status}", scenario.name.label());
+                    println!("  {}{case_suffix}: {status}", scenario.name.label());
                 }
             }
             if let Some(message) = &scenario.failure_message {
@@ -367,17 +380,22 @@ fn print_compare_summary(report: &BenchmarkCompareReport) {
             continue;
         }
         let detail = scenario.detail.as_deref().unwrap_or("state changed");
+        let case_suffix = scenario
+            .case_id
+            .as_deref()
+            .map(|case_id| format!("/{case_id}"))
+            .unwrap_or_default();
         match scenario.delta_ms {
             Some(delta_ms) => match scenario.delta_pct {
                 Some(delta_pct) => println!(
-                    "  {} {} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%)",
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%)",
                     scenario.repo_name,
                     scenario.scenario.label(),
                     scenario.transport,
                     scenario.outcome
                 ),
                 None => println!(
-                    "  {} {} {:?}: {:?} delta={delta_ms:.1} ms",
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms",
                     scenario.repo_name,
                     scenario.scenario.label(),
                     scenario.transport,
@@ -385,7 +403,7 @@ fn print_compare_summary(report: &BenchmarkCompareReport) {
                 ),
             },
             None => println!(
-                "  {} {} {:?}: {:?} ({detail})",
+                "  {} {}{case_suffix} {:?}: {:?} ({detail})",
                 scenario.repo_name,
                 scenario.scenario.label(),
                 scenario.transport,

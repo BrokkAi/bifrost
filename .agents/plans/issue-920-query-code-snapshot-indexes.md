@@ -17,9 +17,9 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-21 20:39Z) Diagnosed the current benchmark, seed scan, matcher, facts cache, analyzer snapshot lifecycle, request-local relations, and #918 cache/profile primitives.
 - [x] (2026-07-21 20:39Z) Drafted the self-contained implementation and acceptance plan while the configured issue worktree was absent.
 - [x] (2026-07-22 06:42Z) Received explicit authorization and created /Users/dave/.codex/worktrees/3527/bifrost on branch brokk/issue-920-benchmark-query-code-and-add-snapshot from current origin/master.
-- [x] (2026-07-22 06:42Z) Installed this plan at .agents/plans/issue-920-query-code-snapshot-indexes.md; initial checkpoint commit remains to be made.
-- [ ] Complete Milestone 1, run its focused tests, run guided review, fix confirmed findings, update this plan, and commit.
-- [ ] Capture a local pre-index query_code benchmark report for at least one representative pinned repository.
+- [x] (2026-07-22 06:42Z) Installed this plan at .agents/plans/issue-920-query-code-snapshot-indexes.md and committed checkpoint d4441387.
+- [x] (2026-07-22 07:42Z) Completed Milestone 1, ran the five focused benchmark targets, all new benchmark unit tests, all-target/all-feature Clippy, and a five-perspective guided review; fixed every confirmed finding before checkpointing.
+- [x] (2026-07-22 07:42Z) Captured a correctness-clean local pre-index report for all 12 query cases at .cache/issue920-preindex-output/run-20260722T073755Z.json.
 - [ ] Complete Milestone 2, run differential/lifecycle/freshness tests, run guided review, fix confirmed findings, update this plan, and commit.
 - [ ] Capture a comparable post-index local report and record candidate reduction, latency, and retained bytes.
 - [ ] Complete Milestone 3 using the measured promotion criteria, run focused tests, run guided review, fix confirmed findings, update this plan, and commit.
@@ -47,6 +47,15 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: Bifrost code-intelligence MCP tools were not callable while the configured worktree path was absent. The diagnosis used commit-scoped git and ripgrep against an origin/master archive instead.
   Evidence: no search_symbols, get_symbol_sources, get_summaries, or workspace activation tools were exposed in the active tool catalog.
+
+- Observation: After the worktree existed, the available Bifrost MCP remained activated against the installed plugin-cache checkout rather than this issue worktree, so code-intelligence results would have described the wrong snapshot. Repository reads therefore continued through ripgrep and focused source reads. This is a tool activation false negative worth following up separately.
+  Evidence: active Bifrost tool root reported the plugin cache rather than /Users/dave/.codex/worktrees/3527/bifrost.
+
+- Observation: The first Milestone 1 guided review found that path-and-kind witnesses could pass if name predicates were ignored, failed later iterations retained plausible timings, manifest workload/language claims were not derived from the decoded query, query path pinning hand-parsed only the top-level JSON shape, MCP reads had no timeout, and query-specific logic had overgrown runner.rs.
+  Evidence: all findings were reproduced in the diff and fixed by exact identity/count witnesses, failure timing invalidation, decoded-query intent validation, explicit validated required_paths, a 15-minute per-response timeout plus 180-minute workflow timeout, and focused query_code/mcp_iteration modules.
+
+- Observation: The complete pre-index corpus is intentionally single-file scoped, so scanned_files is 1 in every case. The useful Milestone 2 reduction signal is candidate fact count and physical fact materialization, especially 13,628 facts for Dapper, 8,859 for fmt, 8,433 for Click, and 2,860 for Ky.
+  Evidence: .cache/issue920-preindex-output/run-20260722T073755Z.json.
 
 ## Decision Log
 
@@ -94,9 +103,19 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: The user explicitly requested temporary benchmark enablement from the draft PR. Slack posting is already restricted to schedule or opted-in workflow_dispatch events.
   Date/Author: 2026-07-21 / Codex.
 
+- Decision: Validate benchmark workload and language coverage from the canonical decoded CodeQuery plan, but make subset-workspace pins an explicit required_paths field with strict portable relative-path validation.
+  Rationale: Workload/language intent belongs to the query IR, while deriving filesystem requirements from glob syntax would duplicate the query parser and still mishandle nested set branches or escaped metacharacters.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Treat WarmReuse as a benchmark execution policy rather than a query-syntax property. Every case runs first, warmup, and measured requests in one session; the label exists only to prove the corpus explicitly covers reuse.
+  Rationale: Reuse is observable runner state and cannot honestly be inferred from CodeQuery syntax.
+  Date/Author: 2026-07-22 / Codex.
+
 ## Outcomes & Retrospective
 
-No implementation outcome exists yet. Diagnosis, an isolated issue branch, and this self-contained plan are complete. Milestone 1 benchmark implementation is next.
+Milestone 1 is complete. The checked-in manifest now has 12 correctness-checked query cases across all ten pinned languages and all six workload classes. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
+
+The local pre-index report passed all cases. First/warm median milliseconds were: Gson exact 58.2/8.9, Gson regex 55.8/9.0, Gson containment 65.6/18.3, Gin 35.4/3.9, fmt broad 248.2/178.3, Express 34.8/3.2, Ky typed 29.7/3.3, Click 51.3/6.0, serde_json 25.8/3.2, FastRoute 21.6/1.9, Scala XML 32.8/3.3, and Dapper 69.4/13.0. These are local development-build figures, not the final Ubuntu comparison.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 

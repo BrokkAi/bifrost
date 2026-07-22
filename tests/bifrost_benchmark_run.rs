@@ -36,6 +36,7 @@ required_scenarios = [
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
+  "query_code",
 ]
 
 [[repos]]
@@ -56,6 +57,7 @@ scenarios = [
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
+  "query_code",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
@@ -75,6 +77,13 @@ call_hierarchy_queries = [
 ]
 type_hierarchy_queries = [
   {{ path = "XExtendsY.java", line = 1, column = 14, min_supertypes = 1 }},
+]
+query_code_queries = [
+  {{ id = "class-a", workloads = ["exact_name", "warm_reuse"], query_json = '{{"match":{{"kind":"class","name":"A"}},"limit":20}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "broad-classes", workloads = ["broad"], query_json = '{{"match":{{"kind":"class"}},"limit":100}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "regex-class-a", workloads = ["regex"], query_json = '{{"match":{{"kind":"class","name":{{"regex":"^A$"}}}},"limit":20}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "methods-inside-a", workloads = ["containment"], query_json = '{{"match":{{"kind":"method"}},"inside":{{"kind":"class","name":"A"}},"limit":100}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"method"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "class-a-file", workloads = ["typed_traversal"], query_json = '{{"match":{{"kind":"class","name":"A"}},"steps":[{{"op":"file_of"}}],"limit":20}}', expected_witness_json = '{{"result_type":"file","path":"A.java"}}', min_results = 1, expected_truncated = false }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -108,7 +117,7 @@ type_hierarchy_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 11, "report: {report}");
+    assert_eq!(scenarios.len(), 16, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
         assert!(
@@ -132,6 +141,28 @@ type_hierarchy_queries = [
     assert!(names.contains(&"get_definition"), "report: {report}");
     assert!(names.contains(&"call_hierarchy"), "report: {report}");
     assert!(names.contains(&"type_hierarchy"), "report: {report}");
+    assert!(names.contains(&"query_code"), "report: {report}");
+
+    let query_code = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "query_code")
+        .expect("query_code scenario");
+    assert_eq!(query_code["case_id"], "class-a", "report: {report}");
+    assert!(
+        query_code["first_duration_ms"].is_number(),
+        "report: {report}"
+    );
+    assert!(query_code["p95_ms"].is_number(), "report: {report}");
+    assert_eq!(
+        query_code["query_code"]["first"]["result_cardinality"], 1,
+        "report: {report}"
+    );
+    assert!(
+        query_code["query_code"]["warm"]["facts_cache"]["memory_hits"]
+            .as_u64()
+            .is_some_and(|hits| hits > 0),
+        "report: {report}"
+    );
 }
 
 #[test]

@@ -1,5 +1,8 @@
-use crate::benchmark::artifact_path::{sanitize_component, unique_component};
+use crate::benchmark::mcp_iteration::{
+    IterationId, run_profiled_iteration, start_initialized_session,
+};
 use crate::benchmark::mcp_session::McpSession;
+use crate::benchmark::query_code;
 use crate::benchmark::repo_cache::prepare_repo;
 use crate::benchmark::report::{
     BenchmarkRepoReport, BenchmarkRunReport, ScenarioReport, ScenarioTransport,
@@ -105,6 +108,7 @@ fn run_repo(
                 BenchmarkScenario::WorkspaceBuild
                     | BenchmarkScenario::CallHierarchy
                     | BenchmarkScenario::TypeHierarchy
+                    | BenchmarkScenario::QueryCode
             )
         })
         .collect();
@@ -120,6 +124,18 @@ fn run_repo(
         false,
         request.profile.as_ref(),
     ));
+
+    if target
+        .scenario_set()
+        .contains(&BenchmarkScenario::QueryCode)
+    {
+        scenario_reports.extend(query_code::run_scenarios(
+            target,
+            manifest,
+            &workspace_path,
+            request.profile.as_ref(),
+        ));
+    }
     scenario_reports.extend(run_mcp_scenarios(
         target,
         manifest,
@@ -154,11 +170,19 @@ fn run_repo(
     }
 
     scenario_reports.sort_by_key(|report| {
-        target
+        let scenario_index = target
             .scenarios
             .iter()
             .position(|scenario| *scenario == report.name)
-            .unwrap_or(usize::MAX)
+            .unwrap_or(usize::MAX);
+        let case_index = report.case_id.as_ref().map_or(0, |case_id| {
+            target
+                .query_code_queries
+                .iter()
+                .position(|case| case.id == *case_id)
+                .unwrap_or(usize::MAX)
+        });
+        (scenario_index, case_index)
     });
 
     Ok(BenchmarkRepoReport {
@@ -184,15 +208,7 @@ fn run_mcp_scenarios(
         return Vec::new();
     }
 
-    let session = McpSession::start(workspace_path, no_line_numbers, profile.is_some()).and_then(
-        |mut session| match session.initialize() {
-            Ok(()) => Ok(session),
-            Err(err) => {
-                let tail = session.shutdown_and_stderr_tail();
-                Err(error_with_stderr_tail(err, tail))
-            }
-        },
-    );
+    let session = start_initialized_session(workspace_path, no_line_numbers, profile.is_some());
     match session {
         Ok(mut session) => scenarios
             .into_iter()
@@ -708,122 +724,26 @@ fn run_mcp_iteration(
     phase: &str,
     iteration: usize,
 ) -> (Result<f64, String>, Option<PathBuf>) {
-    let cursor = if profile.is_some() {
-        if let Err(err) = session.profile_boundary() {
-            return (
-                Err(error_with_stderr_tail(err, session.stderr_tail())),
-                None,
-            );
-        }
-        Some(session.stderr_cursor())
-    } else {
-        None
-    };
-    let start = Instant::now();
-    let mut outcome = session
-        .call_tool(
-            scenario_tool_name(target, scenario),
-            tool_arguments(target, scenario),
-        )
-        .and_then(|result| assert_scenario_result(target, scenario, &result))
-        .map(|()| elapsed_ms(start));
-
-    if profile.is_some() {
-        outcome = preserve_outcome_on_boundary_failure(outcome, session.profile_boundary());
-    } else if outcome.is_err() {
-        // Flush stderr written before a normal JSON-RPC error response so the
-        // diagnostic tail below is complete even outside profile mode.
-        let _ = session.profile_boundary();
-    }
-
-    let artifact = profile.and_then(|profile| {
-        let captured = session.stderr_since(cursor.expect("profile cursor"));
-        match write_profile_trace(
-            profile, target, scenario, phase, iteration, &outcome, &captured,
-        ) {
-            Ok(path) => Some(path),
-            Err(err) => {
-                outcome = Err(err);
-                None
-            }
-        }
-    });
-
-    if let Err(err) = outcome {
-        outcome = Err(error_with_stderr_tail(err, session.stderr_tail()));
-    }
-    (outcome, artifact)
-}
-
-fn preserve_outcome_on_boundary_failure(
-    outcome: Result<f64, String>,
-    boundary: Result<(), String>,
-) -> Result<f64, String> {
-    match (outcome, boundary) {
-        (outcome, Ok(())) => outcome,
-        (Ok(_), Err(boundary_error)) => Err(format!(
-            "failed to synchronize benchmark profile output: {boundary_error}"
-        )),
-        (Err(request_error), Err(boundary_error)) => Err(format!(
-            "{request_error}\nadditionally failed to synchronize benchmark profile output: {boundary_error}"
-        )),
-    }
-}
-
-fn write_profile_trace(
-    profile: &BenchmarkProfile,
-    target: &BenchmarkRepoTarget,
-    scenario: BenchmarkScenario,
-    phase: &str,
-    iteration: usize,
-    outcome: &Result<f64, String>,
-    captured: &crate::benchmark::mcp_session::CapturedStderr,
-) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(&profile.output_dir).map_err(|err| {
-        format!(
-            "failed to create benchmark profile dir `{}`: {err}",
-            profile.output_dir.display()
-        )
-    })?;
-    let filename = format!(
-        "{}-{}-{phase}-{iteration}.log",
-        unique_component(&target.name),
-        sanitize_component(scenario.label())
+    let (outcome, artifact) = run_profiled_iteration(
+        session,
+        profile,
+        IterationId {
+            target,
+            scenario,
+            case_id: None,
+            phase,
+            iteration,
+        },
+        |session| {
+            session
+                .call_tool(
+                    scenario_tool_name(target, scenario),
+                    tool_arguments(target, scenario),
+                )
+                .and_then(|result| assert_scenario_result(target, scenario, &result))
+        },
     );
-    let output_path = profile.output_dir.join(&filename);
-    let report_path = profile.report_path_prefix.join(&filename);
-    let (success, duration_ms, failure) = match outcome {
-        Ok(duration_ms) => (true, format!("{duration_ms:.3}"), String::new()),
-        Err(err) => (false, String::new(), format!("failure={err}\n")),
-    };
-    let contents = format!(
-        "repository={}\nscenario={}\nphase={phase}\niteration={iteration}\nsuccess={success}\nduration_ms={duration_ms}\ntruncated={}\n{failure}{}",
-        target.name,
-        scenario.label(),
-        captured.truncated,
-        captured.text
-    );
-    std::fs::write(&output_path, contents).map_err(|err| {
-        format!(
-            "failed to write benchmark profile trace `{}`: {err}",
-            output_path.display()
-        )
-    })?;
-    Ok(report_path)
-}
-
-fn error_with_stderr_tail(
-    error: String,
-    tail: crate::benchmark::mcp_session::CapturedStderr,
-) -> String {
-    if tail.text.trim().is_empty() {
-        return error;
-    }
-    let truncation = if tail.truncated { " (truncated)" } else { "" };
-    format!(
-        "{error}\nbifrost MCP stderr tail{truncation}:\n{}",
-        tail.text
-    )
+    (outcome.map(|timed| timed.duration_ms), artifact)
 }
 
 fn scenario_tool_name(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> &'static str {
@@ -883,7 +803,9 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
                 location_selector_arguments(&query.selector)
             }).collect::<Vec<_>>(),
         }),
-        BenchmarkScenario::CallHierarchy | BenchmarkScenario::TypeHierarchy => json!({}),
+        BenchmarkScenario::CallHierarchy
+        | BenchmarkScenario::TypeHierarchy
+        | BenchmarkScenario::QueryCode => json!({}),
     }
 }
 
@@ -1132,7 +1054,9 @@ fn assert_scenario_result(
             }
             Ok(())
         }
-        BenchmarkScenario::CallHierarchy | BenchmarkScenario::TypeHierarchy => Ok(()),
+        BenchmarkScenario::CallHierarchy
+        | BenchmarkScenario::TypeHierarchy
+        | BenchmarkScenario::QueryCode => Ok(()),
     }
 }
 
@@ -1154,21 +1078,4 @@ fn current_bifrost_commit() -> Option<String> {
     let sha = String::from_utf8(output.stdout).ok()?;
     let trimmed = sha.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::preserve_outcome_on_boundary_failure;
-
-    #[test]
-    fn boundary_failure_preserves_the_primary_request_error() {
-        let error = preserve_outcome_on_boundary_failure(
-            Err("MCP child closed early".to_string()),
-            Err("stderr boundary unavailable".to_string()),
-        )
-        .expect_err("combined failure");
-
-        assert!(error.starts_with("MCP child closed early"), "{error}");
-        assert!(error.contains("stderr boundary unavailable"), "{error}");
-    }
 }

@@ -34,16 +34,78 @@ pub enum ScenarioTransport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioReport {
     pub name: BenchmarkScenario,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
     pub transport: ScenarioTransport,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_duration_ms: Option<f64>,
     pub warmup_durations_ms: Vec<f64>,
     pub measured_durations_ms: Vec<f64>,
     pub median_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
     pub mean_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_artifacts: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_code: Option<QueryCodeBenchmarkMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeBenchmarkMetrics {
+    pub cold_contract: String,
+    pub first: QueryCodeProfileMetrics,
+    pub warm: QueryCodeProfileMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeProfileMetrics {
+    pub profile_format: String,
+    pub result_cardinality: usize,
+    pub truncated: bool,
+    pub diagnostic_codes: Vec<String>,
+    pub total_ns: u64,
+    pub scanned_files: u64,
+    pub scanned_source_bytes: u64,
+    pub fact_nodes: u64,
+    pub pipeline_rows: u64,
+    pub examined_references: u64,
+    pub import_files_resolved: u64,
+    pub import_edges_resolved: u64,
+    pub facts_cache: QueryCodeFactsCacheMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_path: Option<QueryCodeAccessPathMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeFactsCacheMetrics {
+    pub lookups: u64,
+    pub memory_hits: u64,
+    pub persisted_hydrations: u64,
+    pub extractions: u64,
+    pub unavailable: u64,
+    pub unknown_outcomes: u64,
+    pub replayed_files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeAccessPathMetrics {
+    pub selected: String,
+    pub scoped_files: u64,
+    pub candidate_files: u64,
+    pub candidate_facts: u64,
+    pub inspected_source_bytes: u64,
+    pub examined_fact_nodes: u64,
+    pub index_lookups: u64,
+    pub index_hits: u64,
+    pub index_misses: u64,
+    pub index_builds: u64,
+    pub index_waits: u64,
+    pub index_wait_ns: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +156,8 @@ pub enum ScenarioCompareOutcome {
 pub struct ScenarioCompareReport {
     pub repo_name: String,
     pub scenario: BenchmarkScenario,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
     pub transport: ScenarioTransport,
     pub outcome: ScenarioCompareOutcome,
     pub baseline_success: Option<bool>,
@@ -120,15 +184,37 @@ impl ScenarioReport {
     ) -> Self {
         Self {
             name,
+            case_id: None,
             transport,
             success,
+            first_duration_ms: None,
             median_ms: median_ms(&measured_durations_ms),
+            p95_ms: None,
             mean_ms: mean_ms(&measured_durations_ms),
             warmup_durations_ms,
             measured_durations_ms,
             failure_message,
             profile_artifacts: Vec::new(),
+            query_code: None,
         }
+    }
+
+    pub fn with_query_code(
+        mut self,
+        case_id: String,
+        first_duration_ms: f64,
+        metrics: QueryCodeBenchmarkMetrics,
+    ) -> Self {
+        self.case_id = Some(case_id);
+        self.first_duration_ms = Some(first_duration_ms);
+        self.p95_ms = percentile_ms(&self.measured_durations_ms, 95);
+        self.query_code = Some(metrics);
+        self
+    }
+
+    pub fn with_case_id(mut self, case_id: String) -> Self {
+        self.case_id = Some(case_id);
+        self
     }
 }
 
@@ -270,10 +356,22 @@ fn median_ms(values: &[f64]) -> Option<f64> {
     }
 }
 
+fn percentile_ms(values: &[f64], percentile: usize) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    debug_assert!((1..=100).contains(&percentile));
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = sorted.len().saturating_mul(percentile).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ScenarioKey<'a> {
     repo_name: &'a str,
     scenario: BenchmarkScenario,
+    case_id: Option<&'a str>,
     transport: ScenarioTransport,
 }
 
@@ -285,6 +383,7 @@ fn index_scenarios(report: &BenchmarkRunReport) -> HashMap<ScenarioKey<'_>, &Sce
                 ScenarioKey {
                     repo_name: repo.name.as_str(),
                     scenario: scenario.name,
+                    case_id: scenario.case_id.as_deref(),
                     transport: scenario.transport,
                 },
                 scenario,
@@ -298,6 +397,7 @@ fn compare_keys(left: &ScenarioKey<'_>, right: &ScenarioKey<'_>) -> std::cmp::Or
     left.repo_name
         .cmp(right.repo_name)
         .then_with(|| left.scenario.cmp(&right.scenario))
+        .then_with(|| left.case_id.cmp(&right.case_id))
         .then_with(|| left.transport.cmp(&right.transport))
 }
 
@@ -314,6 +414,7 @@ fn compare_scenario_pair(
         (Some(baseline), None) => ScenarioCompareReport {
             repo_name: key.repo_name.to_string(),
             scenario: key.scenario,
+            case_id: key.case_id.map(str::to_string),
             transport: key.transport,
             outcome: ScenarioCompareOutcome::MissingCandidate,
             baseline_success: Some(baseline.success),
@@ -328,6 +429,7 @@ fn compare_scenario_pair(
         (None, Some(candidate)) => ScenarioCompareReport {
             repo_name: key.repo_name.to_string(),
             scenario: key.scenario,
+            case_id: key.case_id.map(str::to_string),
             transport: key.transport,
             outcome: ScenarioCompareOutcome::NewCandidate,
             baseline_success: None,
@@ -405,6 +507,7 @@ fn compare_present_scenarios(
     ScenarioCompareReport {
         repo_name: key.repo_name.to_string(),
         scenario: key.scenario,
+        case_id: key.case_id.map(str::to_string),
         transport: key.transport,
         outcome,
         baseline_success: Some(baseline.success),
@@ -535,4 +638,21 @@ fn non_timing_regression(scenario: &ScenarioCompareReport) -> bool {
             && scenario.candidate_success == Some(true)
             && scenario.delta_ms.is_some()
             && scenario.delta_pct.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile_ms;
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        assert_eq!(percentile_ms(&[], 95), None);
+        assert_eq!(percentile_ms(&[4.0], 95), Some(4.0));
+        assert_eq!(percentile_ms(&[4.0, 1.0], 95), Some(4.0));
+        assert_eq!(percentile_ms(&[5.0, 1.0, 3.0], 95), Some(5.0));
+        assert_eq!(
+            percentile_ms(&[10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], 95),
+            Some(10.0)
+        );
+    }
 }
