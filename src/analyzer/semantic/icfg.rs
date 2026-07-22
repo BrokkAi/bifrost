@@ -451,10 +451,7 @@ impl SnapshotBuilder {
             self.quality = SnapshotQuality::Truncated;
             return Ok(None);
         }
-        self.work = self
-            .work
-            .checked_add(work)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+        self.work = self.work.conservative_add(work);
         self.publish_node(key).map(|id| Some((id, true)))
     }
 
@@ -543,14 +540,8 @@ impl SnapshotBuilder {
             return Ok(Some(target));
         }
         *request.budget = staged_budget;
-        let work = node_work.map_or(edge_work, |node| {
-            node.checked_add(edge_work)
-                .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
-        });
-        self.work = self
-            .work
-            .checked_add(work)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+        let work = node_work.map_or(edge_work, |node| node.conservative_add(edge_work));
+        self.work = self.work.conservative_add(work);
         self.edge_set.insert(edge.clone());
         self.edges.push(edge);
         Ok(Some(target))
@@ -1001,10 +992,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     };
                     builder.absorb_quality(&outcome);
                     if newly_resolved {
-                        builder.work = builder
-                            .work
-                            .checked_add(outcome.work())
-                            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+                        builder.work = builder.work.conservative_add(outcome.work());
                     }
                     if let Some(transfers) = outcome.available_value().cloned() {
                         builder.record_dispatch_boundaries(node, &transfers.boundaries);
@@ -1479,8 +1467,7 @@ fn completeness_reason_bytes(completeness: &EvidenceCompleteness) -> usize {
 }
 
 fn sum_semantic_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
+    left.conservative_add(right)
 }
 
 fn scoped_return_affecting_gap_indices(
@@ -1538,10 +1525,7 @@ fn cache_return_path_mask(
         builder.quality = merge_quality(builder.quality, SnapshotQuality::Truncated);
         return false;
     }
-    builder.work = builder
-        .work
-        .checked_add(scan_work)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+    builder.work = builder.work.conservative_add(scan_work);
 
     let mut from_entry = vec![false; point_count];
     let mut stack = vec![semantics.entry_point()];

@@ -4,9 +4,14 @@
 //! its candidate procedures. Control-flow stitching consumes this facade; it
 //! does not reach into the usage-graph dispatch resolver directly.
 
+mod common;
 mod heap;
+mod source;
 mod value_flow;
 
+pub use source::SourcePointsToResult;
+
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,8 +21,7 @@ use crate::analyzer::usages::{
     ExactCallLocation, UsageProof, call_dispatch_equivalence_source,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, LanguageDialect, ProjectFile, ProjectSourceOrigin, Range,
-    WorkspaceAnalyzer,
+    CodeUnit, CodeUnitType, IAnalyzer, LanguageDialect, ProjectFile, Range, WorkspaceAnalyzer,
 };
 use crate::hash::HashMap;
 
@@ -26,11 +30,11 @@ use super::{
     DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
     DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
     OracleLimits, OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, OverlaySnapshotId, ProcedureHandle, ProcedureKind, ProcedureSemantics,
-    ProofStatus, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapKind,
-    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceRevision, SourceSpan,
-    WorkspaceMountId, WorkspaceRelativePath,
+    OracleRelationSubject, ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus,
+    SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
+    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 
 /// Workspace semantic oracles bound to one immutable analyzer generation.
@@ -347,9 +351,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 let outcome = self
                     .workspace
                     .materialize_program_semantics(definition.source(), &mut staged_request)?;
-                reported_work = reported_work
-                    .checked_add(outcome.work())
-                    .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+                reported_work = reported_work.conservative_add(outcome.work());
                 materialized_files.insert(definition.source().clone(), outcome.clone());
                 outcome
             };
@@ -592,9 +594,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 .locator()
                 .cmp(right.target.semantics().locator())
         });
-        boundaries.sort_by(|left, right| {
-            dispatch_boundary_sort_key(left).cmp(&dispatch_boundary_sort_key(right))
-        });
+        boundaries.sort_by(compare_dispatch_boundaries);
         boundaries.dedup();
         if boundaries
             .iter()
@@ -1035,9 +1035,7 @@ fn cancelled_lookup_outcome(
             .map(|target| cancelled_target_boundary(workspace.analyzer(), target))
             .collect::<Result<Vec<_>, _>>()?,
     );
-    boundaries.sort_by(|left, right| {
-        dispatch_boundary_sort_key(left).cmp(&dispatch_boundary_sort_key(right))
-    });
+    boundaries.sort_by(compare_dispatch_boundaries);
     boundaries.dedup();
     let mut candidates = Vec::new();
     let truncated = bound_dispatch_projection(
@@ -1279,15 +1277,14 @@ fn completeness_reason_bytes(completeness: &EvidenceCompleteness) -> usize {
 }
 
 fn sum_semantic_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
+    left.conservative_add(right)
 }
 
 pub(crate) fn exact_source_for_procedure(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     max_source_bytes: usize,
-) -> Result<Option<(ProjectFile, Arc<String>)>, SemanticProviderError> {
+) -> Result<Option<(ProjectFile, Arc<str>)>, SemanticProviderError> {
     let key = procedure.artifact().key();
     let project = workspace.analyzer().project();
     let root = project.root();
@@ -1296,40 +1293,21 @@ pub(crate) fn exact_source_for_procedure(
             "call-site artifact belongs to a different workspace mount",
         ));
     }
-    match workspace.semantic_artifact_key_is_current(key, max_source_bytes)? {
-        Some(true) => {}
-        Some(false) => {
-            return Err(SemanticProviderError::invalid_identity(
-                "call-site artifact no longer matches the current semantic analyzer generation",
-            ));
-        }
-        None => return Ok(None),
-    }
     let file = ProjectFile::new(root.to_path_buf(), key.path().as_path());
-    let Some(snapshot) = project
-        .read_source_snapshot_limited(&file, max_source_bytes)
-        .map_err(|error| {
-            SemanticProviderError::source_access(format!(
-                "could not read exact semantic source: {error}"
-            ))
-        })?
-    else {
+    let Some(provider) = workspace.program_semantics_provider_for_file(&file) else {
+        return Err(SemanticProviderError::invalid_identity(
+            "call-site artifact has no semantic provider in the current analyzer generation",
+        ));
+    };
+    let Some(snapshot) = provider.current_artifact_source(&file, max_source_bytes)? else {
         return Ok(None);
     };
-    let source = Arc::new(snapshot.source().to_owned());
-    let content = ContentIdentity::hash_bytes(source.as_bytes());
-    let revision = match snapshot.origin() {
-        ProjectSourceOrigin::Disk => SourceRevision::Disk { content },
-        ProjectSourceOrigin::Overlay(revision) => SourceRevision::Overlay {
-            content,
-            snapshot: OverlaySnapshotId::hash_bytes(revision.get().to_le_bytes()),
-        },
-    };
-    if revision != key.revision() {
-        return Err(SemanticProviderError::invalid_identity(format!(
-            "call-site artifact revision for `{file}` no longer matches the atomic project source snapshot"
-        )));
+    if snapshot.key() != key {
+        return Err(SemanticProviderError::invalid_identity(
+            "call-site artifact no longer matches the current semantic analyzer generation",
+        ));
     }
+    let (_, source) = snapshot.into_parts();
     Ok(Some((file, source)))
 }
 
@@ -1809,30 +1787,71 @@ fn source_position(source: &str, offset: usize) -> Result<SourcePosition, Semant
     ))
 }
 
-fn dispatch_boundary_sort_key(boundary: &DispatchBoundary) -> (u8, String) {
-    match &boundary.kind {
-        DispatchBoundaryKind::External(locator) => (
-            0,
-            locator.as_ref().map_or_else(String::new, locator_sort_key),
-        ),
-        DispatchBoundaryKind::Unmaterialized(locator) => (1, locator_sort_key(locator)),
-        DispatchBoundaryKind::Deferred { target, kind } => {
-            (2, format!("{}:{}", kind.label(), locator_sort_key(target)))
-        }
-        DispatchBoundaryKind::Unresolved => (3, String::new()),
-        DispatchBoundaryKind::Truncated => (4, String::new()),
+fn compare_dispatch_boundaries(left: &DispatchBoundary, right: &DispatchBoundary) -> Ordering {
+    dispatch_boundary_rank(&left.kind)
+        .cmp(&dispatch_boundary_rank(&right.kind))
+        .then_with(|| match (&left.kind, &right.kind) {
+            (DispatchBoundaryKind::External(left), DispatchBoundaryKind::External(right)) => {
+                compare_optional_locators(left.as_ref(), right.as_ref())
+            }
+            (
+                DispatchBoundaryKind::Unmaterialized(left),
+                DispatchBoundaryKind::Unmaterialized(right),
+            ) => compare_locator_fields(left, right),
+            (
+                DispatchBoundaryKind::Deferred {
+                    target: left_target,
+                    kind: left_kind,
+                },
+                DispatchBoundaryKind::Deferred {
+                    target: right_target,
+                    kind: right_kind,
+                },
+            ) => left_kind
+                .label()
+                .cmp(right_kind.label())
+                .then_with(|| compare_locator_fields(left_target, right_target)),
+            (DispatchBoundaryKind::Unresolved, DispatchBoundaryKind::Unresolved)
+            | (DispatchBoundaryKind::Truncated, DispatchBoundaryKind::Truncated) => Ordering::Equal,
+            _ => unreachable!("matching boundary ranks must identify the same variant"),
+        })
+}
+
+const fn dispatch_boundary_rank(kind: &DispatchBoundaryKind) -> u8 {
+    match kind {
+        DispatchBoundaryKind::External(_) => 0,
+        DispatchBoundaryKind::Unmaterialized(_) => 1,
+        DispatchBoundaryKind::Deferred { .. } => 2,
+        DispatchBoundaryKind::Unresolved => 3,
+        DispatchBoundaryKind::Truncated => 4,
     }
 }
 
-fn locator_sort_key(locator: &SemanticLocator) -> String {
-    let span = locator.anchor().span();
-    format!(
-        "{}:{}:{}:{}",
-        locator.path(),
-        span.start_byte(),
-        span.end_byte(),
-        locator.anchor().occurrence()
-    )
+fn compare_optional_locators(
+    left: Option<&SemanticLocator>,
+    right: Option<&SemanticLocator>,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => compare_locator_fields(left, right),
+    }
+}
+
+fn compare_locator_fields(left: &SemanticLocator, right: &SemanticLocator) -> Ordering {
+    let left_anchor = left.anchor();
+    let right_anchor = right.anchor();
+    let left_span = left_anchor.span();
+    let right_span = right_anchor.span();
+    left.path()
+        .cmp(right.path())
+        .then_with(|| left_span.start_byte().cmp(&right_span.start_byte()))
+        .then_with(|| left_span.end_byte().cmp(&right_span.end_byte()))
+        .then_with(|| left_anchor.occurrence().cmp(&right_anchor.occurrence()))
+        // Source anchors ordinarily distinguish dispatch targets. Retain the
+        // locator's complete stable identity as a deterministic tie-breaker.
+        .then_with(|| left.cmp(right))
 }
 
 #[cfg(test)]
@@ -1883,6 +1902,86 @@ mod tests {
 
     fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
         semantic_call_fixture().1
+    }
+
+    fn locator_with_anchor(locator: &SemanticLocator, offset: u32) -> SemanticLocator {
+        let start = SourcePosition::new(offset, 0, offset);
+        let end = SourcePosition::new(offset + 1, 0, offset + 1);
+        SemanticLocator::new(
+            locator.mount(),
+            locator.path().clone(),
+            locator.language(),
+            locator.declaration().clone(),
+            locator.role(),
+            SourceAnchor::new(
+                SourceSpan::new(start, end).expect("ordered fixture span"),
+                0,
+            ),
+        )
+    }
+
+    #[test]
+    fn dispatch_boundary_order_uses_typed_variants_and_numeric_locator_fields() {
+        use crate::analyzer::semantic::DeferredInvocationKind;
+
+        let locator = semantic_call_handle()
+            .procedure()
+            .semantics()
+            .locator()
+            .clone();
+        let early = locator_with_anchor(&locator, 2);
+        let late = locator_with_anchor(&locator, 10);
+
+        assert_eq!(compare_locator_fields(&early, &late), Ordering::Less);
+
+        let boundary = |kind| DispatchBoundary {
+            kind,
+            proof: ProofStatus::Proven,
+            completeness: EvidenceCompleteness::Complete,
+            provenance: Box::new([]),
+        };
+        let mut boundaries = vec![
+            boundary(DispatchBoundaryKind::Truncated),
+            boundary(DispatchBoundaryKind::Deferred {
+                target: late,
+                kind: DeferredInvocationKind::Generator,
+            }),
+            boundary(DispatchBoundaryKind::Unresolved),
+            boundary(DispatchBoundaryKind::Unmaterialized(early.clone())),
+            boundary(DispatchBoundaryKind::External(Some(early))),
+            boundary(DispatchBoundaryKind::External(None)),
+        ];
+        boundaries.sort_by(compare_dispatch_boundaries);
+
+        assert!(matches!(
+            boundaries.as_slice(),
+            [
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::External(None),
+                    ..
+                },
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::External(Some(_)),
+                    ..
+                },
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::Unmaterialized(_),
+                    ..
+                },
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::Deferred { .. },
+                    ..
+                },
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::Unresolved,
+                    ..
+                },
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::Truncated,
+                    ..
+                },
+            ]
+        ));
     }
 
     #[test]
@@ -2177,9 +2276,7 @@ mod tests {
             "the helper must stop at the aggregate provenance/evidence cap"
         );
 
-        boundaries.sort_by(|left, right| {
-            dispatch_boundary_sort_key(left).cmp(&dispatch_boundary_sort_key(right))
-        });
+        boundaries.sort_by(compare_dispatch_boundaries);
         boundaries.dedup();
         assert!(!bound_dispatch_projection(
             &mut candidates,

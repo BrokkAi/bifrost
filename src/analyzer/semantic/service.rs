@@ -7,7 +7,10 @@ use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
 use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxTree};
-use crate::analyzer::{LanguageAdapter, ProjectFile, TreeSitterAnalyzer};
+use crate::analyzer::{
+    LanguageAdapter, LanguageDialect, OverlayRevision, ProjectFile, ProjectSourceOrigin,
+    TreeSitterAnalyzer,
+};
 
 use super::{
     AdapterSemanticsVersion, AllocationSite, BasicBlock, CaptureBinding, ConfigurationFingerprint,
@@ -171,26 +174,40 @@ fn validate_semantic_file<A: LanguageAdapter>(
     Ok(())
 }
 
-/// Derive the current complete artifact identity from one atomic prepared
-/// syntax snapshot. This deliberately does not consult the artifact cache,
-/// lower procedures, or mutate a semantic budget.
-pub(crate) fn current_artifact_key_with_lowerer<A: LanguageAdapter>(
+/// Capture current source and derive its complete artifact identity from the
+/// same atomic project snapshot. This deliberately does not parse, consult the
+/// artifact cache, lower procedures, or mutate a semantic budget.
+pub(crate) fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
     lowerer: &dyn ProgramSemanticsLowerer,
     file: &ProjectFile,
     max_source_bytes: usize,
-) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+) -> Result<Option<super::SemanticArtifactSourceSnapshot>, SemanticProviderError> {
     validate_semantic_file(analyzer, file)?;
-    let prepared = match analyzer.prepared_syntax_limited(file, max_source_bytes) {
-        Ok(Some(prepared)) => prepared,
+    let snapshot = match analyzer.source_snapshot_limited(file, max_source_bytes) {
+        Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return Err(SemanticProviderError::source_access(format!(
-                "could not prepare the current source snapshot for `{file}`"
+                "could not capture the current source snapshot for `{file}`"
             )));
         }
         Err(_) => return Ok(None),
     };
-    semantic_artifact_key(file, &prepared, lowerer.identity()).map(Some)
+    let overlay_revision = match snapshot.origin() {
+        ProjectSourceOrigin::Disk => None,
+        ProjectSourceOrigin::Overlay(revision) => Some(revision),
+    };
+    let source = snapshot.into_source();
+    let key = semantic_artifact_key(
+        file,
+        LanguageDialect::for_path(analyzer.adapter().language(), file.rel_path()),
+        &source,
+        overlay_revision,
+        lowerer.identity(),
+    )?;
+    Ok(Some(super::SemanticArtifactSourceSnapshot::new(
+        key, source,
+    )))
 }
 
 /// Materialize against exactly one prepared syntax snapshot.
@@ -262,7 +279,7 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     }
 
     let identity = lowerer.identity();
-    let key = semantic_artifact_key(file, &prepared, identity)?;
+    let key = semantic_artifact_key_for_prepared(file, &prepared, identity)?;
     let (acquisition, _cache_wait) = cache.acquire(&key, request.cancellation);
     let permit = match acquisition {
         CompleteValueAcquisition::Cached { value: artifact } => {
@@ -341,32 +358,49 @@ fn publish_cached(
     })
 }
 
-fn semantic_artifact_key(
+fn semantic_artifact_key_for_prepared(
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     identity: SemanticAdapterIdentity,
 ) -> Result<SemanticArtifactKey, SemanticProviderError> {
+    let overlay_revision = match prepared.origin() {
+        PreparedSourceOrigin::Disk => None,
+        PreparedSourceOrigin::Overlay => Some(prepared.overlay_revision().ok_or_else(|| {
+            SemanticProviderError::internal(
+                "prepared overlay source is missing its atomic revision token",
+            )
+        })?),
+    };
+    semantic_artifact_key(
+        file,
+        prepared.dialect(),
+        prepared.source(),
+        overlay_revision,
+        identity,
+    )
+}
+
+fn semantic_artifact_key(
+    file: &ProjectFile,
+    dialect: LanguageDialect,
+    source: &str,
+    overlay_revision: Option<OverlayRevision>,
+    identity: SemanticAdapterIdentity,
+) -> Result<SemanticArtifactKey, SemanticProviderError> {
     let path = WorkspaceRelativePath::try_from_path(file.rel_path())
         .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let content = ContentIdentity::hash_bytes(prepared.source().as_bytes());
-    let revision = match prepared.origin() {
-        PreparedSourceOrigin::Disk => SourceRevision::Disk { content },
-        PreparedSourceOrigin::Overlay => {
-            let revision = prepared.overlay_revision().ok_or_else(|| {
-                SemanticProviderError::internal(
-                    "prepared overlay source is missing its atomic revision token",
-                )
-            })?;
-            SourceRevision::Overlay {
-                content,
-                snapshot: OverlaySnapshotId::hash_bytes(revision.get().to_le_bytes()),
-            }
-        }
+    let content = ContentIdentity::hash_bytes(source.as_bytes());
+    let revision = match overlay_revision {
+        None => SourceRevision::Disk { content },
+        Some(revision) => SourceRevision::Overlay {
+            content,
+            snapshot: OverlaySnapshotId::hash_bytes(revision.get().to_le_bytes()),
+        },
     };
     Ok(SemanticArtifactKey::new(
         WorkspaceMountId::from_root(file.root()),
         path,
-        prepared.dialect(),
+        dialect,
         revision,
         identity.adapter,
         SemanticIrVersion::current(),
@@ -611,7 +645,9 @@ mod tests {
     use super::*;
     use crate::analyzer::semantic::SemanticBudget;
     use crate::analyzer::typescript::TypescriptAdapter;
-    use crate::analyzer::{IAnalyzer, Language, OverlayProject, TestProject};
+    use crate::analyzer::{
+        AnalyzerQueryScope, IAnalyzer, Language, OverlayProject, Project, TestProject,
+    };
 
     #[derive(Clone, Copy)]
     enum FakeMode {
@@ -804,6 +840,16 @@ mod tests {
         )
     }
 
+    fn current_artifact_key_with_lowerer(
+        analyzer: &TreeSitterAnalyzer<TypescriptAdapter>,
+        lowerer: &dyn ProgramSemanticsLowerer,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+        current_artifact_source_with_lowerer(analyzer, lowerer, file, max_source_bytes)
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.key().clone()))
+    }
+
     fn materialize(
         analyzer: &TreeSitterAnalyzer<TypescriptAdapter>,
         cache: &CompleteSemanticArtifactCache,
@@ -915,6 +961,11 @@ mod tests {
                 .expect("updated source key lookup")
                 .expect("updated source key");
         assert_ne!(baseline, source_changed);
+        assert_eq!(
+            analyzer.prepared_syntax_parse_count_for_test(&file),
+            0,
+            "freshness identity must not parse source"
+        );
     }
 
     #[test]
@@ -923,13 +974,17 @@ mod tests {
         let root = temp.path().canonicalize().expect("root");
         let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
         let analyzer = analyzer(&root);
+        let _scope = AnalyzerQueryScope::new(&analyzer);
         let cache = CompleteSemanticArtifactCache::default();
         let lowerer = FakeLowerer::new(FakeMode::Complete);
 
-        let current = current_artifact_key_with_lowerer(&analyzer, &lowerer, &file, usize::MAX)
-            .expect("current artifact key lookup")
-            .expect("current artifact key");
+        let current = current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, usize::MAX)
+            .expect("current artifact source lookup")
+            .expect("current artifact source");
+        assert_eq!(current.source(), "export const value = 1;\n");
+        let current = current.key().clone();
         assert_eq!(lowerer.calls(), 0);
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
 
         let mut budget = SemanticBudget::default();
         let SemanticOutcome::Complete { value, .. } = materialize(
@@ -944,6 +999,80 @@ mod tests {
         };
         assert_eq!(value.key(), &current);
         assert_eq!(lowerer.calls(), 1);
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn current_artifact_source_reuses_atomic_overlay_source_and_revision() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const disk = 0;\n");
+        let base: Arc<dyn crate::analyzer::Project> =
+            Arc::new(TestProject::new(root.clone(), Language::TypeScript));
+        let overlay = Arc::new(OverlayProject::new(base));
+        let source = "export const value = 1;\n";
+        assert!(overlay.set(file.abs_path(), source.to_owned()));
+        let project_source = overlay
+            .read_source_snapshot(&file)
+            .expect("first atomic overlay snapshot")
+            .into_source();
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>,
+            TypescriptAdapter,
+        );
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+
+        let first = {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len())
+                .expect("first artifact source lookup")
+                .expect("first artifact source")
+        };
+        let first_key = first.key().clone();
+        let (_, first_source) = first.into_parts();
+        assert!(Arc::ptr_eq(&project_source, &first_source));
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
+
+        let artifact = {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            let mut budget = SemanticBudget::default();
+            materialize(
+                &analyzer,
+                &cache,
+                &lowerer,
+                &file,
+                &mut budget,
+                &super::super::CancellationToken::default(),
+            )
+            .available_value()
+            .cloned()
+            .expect("first overlay artifact")
+        };
+        assert_eq!(artifact.key(), &first_key);
+
+        // A new overlay revision invalidates the old artifact even when its
+        // source bytes (and therefore content identity) are unchanged.
+        assert!(overlay.set(file.abs_path(), source.to_owned()));
+        let second = {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len())
+                .expect("second artifact source lookup")
+                .expect("second artifact source")
+        };
+        assert_eq!(second.source(), source);
+        assert_eq!(
+            first_key.revision().content(),
+            second.key().revision().content()
+        );
+        assert_ne!(artifact.key(), second.key());
+
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(
+            current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len() - 1,)
+                .expect("bounded overlay lookup")
+                .is_none()
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ fn symbol_target_at_position(
                 resolved_target(
                     analyzer,
                     &file,
-                    Arc::new(content.clone()),
+                    Arc::from(content.as_str()),
                     start_byte,
                     end_byte,
                     resolution,
@@ -100,7 +100,7 @@ fn symbol_target_at_position(
             match resolved_target(
                 analyzer,
                 &file,
-                Arc::new(content.clone()),
+                Arc::from(content.as_str()),
                 start_byte,
                 end_byte,
                 resolution,
@@ -198,7 +198,7 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
 fn resolved_target(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    content: Arc<String>,
+    content: Arc<str>,
     start_byte: usize,
     end_byte: usize,
     resolution: TargetResolution,

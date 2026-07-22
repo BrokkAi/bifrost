@@ -632,12 +632,14 @@ pub enum ObjectCardinality {
 pub struct OracleLimitValues {
     pub dispatch_targets: usize,
     pub objects_per_value: usize,
-    pub interned_roots: usize,
-    pub interned_selectors: usize,
-    pub interned_paths: usize,
     pub access_path_length: usize,
     pub alias_breadth: usize,
+    /// Maximum number of point-sensitive observations retained when a source
+    /// range is projected into semantic values and program points.
+    pub source_observations: usize,
     pub call_context_depth: usize,
+    /// Maximum number of transitive value-summary edges followed by one heap
+    /// trace before the retained candidate set becomes truncated.
     pub summary_depth: usize,
     pub call_binding_entries: usize,
     pub provenance_records: usize,
@@ -649,11 +651,9 @@ impl OracleLimitValues {
         Self {
             dispatch_targets: value,
             objects_per_value: value,
-            interned_roots: value,
-            interned_selectors: value,
-            interned_paths: value,
             access_path_length: value,
             alias_breadth: value,
+            source_observations: value,
             call_context_depth: value,
             summary_depth: value,
             call_binding_entries: value,
@@ -688,6 +688,13 @@ impl fmt::Display for InvalidOracleLimits {
 impl std::error::Error for InvalidOracleLimits {}
 
 /// Positive finite bounds shared by dispatch, value-flow, and heap queries.
+///
+/// These limits bound retained answer shapes and semantic expansion depth.
+/// [`crate::analyzer::semantic::SemanticBudget`] independently bounds total
+/// traversal and materialization work. Roots, selectors, and paths are
+/// currently owned inline by bounded candidates rather than by a long-lived
+/// interner, so their retention is covered by the candidate, provenance, and
+/// path-length limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OracleLimits {
     values: OracleLimitValues,
@@ -698,11 +705,9 @@ impl OracleLimits {
         let dimensions = [
             ("dispatch_targets", values.dispatch_targets),
             ("objects_per_value", values.objects_per_value),
-            ("interned_roots", values.interned_roots),
-            ("interned_selectors", values.interned_selectors),
-            ("interned_paths", values.interned_paths),
             ("access_path_length", values.access_path_length),
             ("alias_breadth", values.alias_breadth),
+            ("source_observations", values.source_observations),
             ("call_context_depth", values.call_context_depth),
             ("summary_depth", values.summary_depth),
             ("call_binding_entries", values.call_binding_entries),
@@ -733,24 +738,16 @@ impl OracleLimits {
         self.values.objects_per_value
     }
 
-    pub const fn interned_roots(self) -> usize {
-        self.values.interned_roots
-    }
-
-    pub const fn interned_selectors(self) -> usize {
-        self.values.interned_selectors
-    }
-
-    pub const fn interned_paths(self) -> usize {
-        self.values.interned_paths
-    }
-
     pub const fn access_path_length(self) -> usize {
         self.values.access_path_length
     }
 
     pub const fn alias_breadth(self) -> usize {
         self.values.alias_breadth
+    }
+
+    pub const fn source_observations(self) -> usize {
+        self.values.source_observations
     }
 
     pub const fn call_context_depth(self) -> usize {
@@ -779,13 +776,13 @@ impl Default for OracleLimits {
         Self::new(OracleLimitValues {
             dispatch_targets: 1_024,
             objects_per_value: 256,
-            interned_roots: 100_000,
-            interned_selectors: 250_000,
-            interned_paths: 250_000,
             access_path_length: 8,
             alias_breadth: 1_024,
+            source_observations: 1_024,
             call_context_depth: 2,
-            summary_depth: 8,
+            // Match the established receiver-analysis expansion budget now
+            // that this limit governs real reaching-definition traversal.
+            summary_depth: 64,
             call_binding_entries: 4_096,
             provenance_records: 4_096,
             evidence_handles: 4_096,
@@ -1143,6 +1140,23 @@ impl AccessPathRoot {
         }
         Ok(())
     }
+
+    fn validate_at(&self, procedure: &ProcedureHandle) -> Result<(), OracleContractError> {
+        match self {
+            Self::Value(value) => require_same_procedure(value.procedure(), procedure),
+            Self::Allocation(allocation) => {
+                require_same_procedure(allocation.procedure(), procedure)
+            }
+            Self::ProcedurePort(port) | Self::CaptureSlot(port) => {
+                require_same_procedure(port.procedure(), procedure)
+            }
+            Self::LexicalCell(location) => require_same_procedure(location.procedure(), procedure),
+            Self::Static(locator)
+            | Self::TypeSummary(locator)
+            | Self::ModuleObject(locator)
+            | Self::External(locator) => locator.validate_at(procedure),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1320,115 +1334,10 @@ impl AccessPathAtPoint {
     }
 }
 
-/// The identity component of one abstract object.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AbstractObjectIdentity {
-    Value(ValueHandle),
-    Allocation(AllocationHandle),
-    ProcedurePort(ProcedurePortHandle),
-    Static(ScopedSemanticLocator),
-    LexicalCell(MemoryLocationHandle),
-    CaptureSlot(ProcedurePortHandle),
-    TypeSummary(ScopedSemanticLocator),
-    ModuleObject(ScopedSemanticLocator),
-    External(ScopedSemanticLocator),
-}
-
-impl AbstractObjectIdentity {
-    fn validate_shape(&self) -> Result<(), OracleContractError> {
-        match self {
-            Self::ProcedurePort(port)
-                if matches!(port.kind(), ProcedurePortKind::Capture { .. }) =>
-            {
-                Err(OracleContractError::InvalidAccessRoot(
-                    "capture ports must use the canonical capture-slot object identity",
-                ))
-            }
-            Self::LexicalCell(location) => {
-                let row = location
-                    .procedure()
-                    .semantics()
-                    .memory_location(location.id())
-                    .expect("memory-location handles are validated at construction");
-                if matches!(row.kind, MemoryLocationKind::LexicalCell { .. }) {
-                    Ok(())
-                } else {
-                    Err(OracleContractError::InvalidAccessRoot(
-                        "lexical-cell object identity does not name a lexical-cell location",
-                    ))
-                }
-            }
-            Self::CaptureSlot(port)
-                if !matches!(port.kind(), ProcedurePortKind::Capture { .. }) =>
-            {
-                Err(OracleContractError::InvalidAccessRoot(
-                    "capture-slot object identity does not name a capture port",
-                ))
-            }
-            Self::Static(locator) if locator.locator().role() != SemanticRole::MemoryLocation => {
-                Err(OracleContractError::InvalidAccessRoot(
-                    "static object identities must name a memory-location locator",
-                ))
-            }
-            Self::Value(_)
-            | Self::Allocation(_)
-            | Self::ProcedurePort(_)
-            | Self::Static(_)
-            | Self::CaptureSlot(_)
-            | Self::TypeSummary(_)
-            | Self::ModuleObject(_)
-            | Self::External(_) => Ok(()),
-        }
-    }
-
-    fn validate_at(&self, procedure: &ProcedureHandle) -> Result<(), OracleContractError> {
-        match self {
-            Self::Value(value) => require_same_procedure(value.procedure(), procedure),
-            Self::Allocation(allocation) => {
-                require_same_procedure(allocation.procedure(), procedure)
-            }
-            Self::ProcedurePort(port) | Self::CaptureSlot(port) => {
-                require_same_procedure(port.procedure(), procedure)
-            }
-            Self::LexicalCell(location) => require_same_procedure(location.procedure(), procedure),
-            Self::Static(locator)
-            | Self::TypeSummary(locator)
-            | Self::ModuleObject(locator)
-            | Self::External(locator) => locator.validate_at(procedure),
-        }
-    }
-
-    fn matches_root(&self, root: &AccessPathRoot) -> bool {
-        matches!(
-            (self, root),
-            (Self::Value(left), AccessPathRoot::Value(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::Allocation(left), AccessPathRoot::Allocation(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::ProcedurePort(left), AccessPathRoot::ProcedurePort(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::Static(left), AccessPathRoot::Static(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::LexicalCell(left), AccessPathRoot::LexicalCell(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::CaptureSlot(left), AccessPathRoot::CaptureSlot(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::TypeSummary(left), AccessPathRoot::TypeSummary(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::ModuleObject(left), AccessPathRoot::ModuleObject(right)) if left == right
-        ) || matches!(
-            (self, root),
-            (Self::External(left), AccessPathRoot::External(right)) if left == right
-        )
-    }
-}
+/// The identity component of one abstract object. Object identities and
+/// access-path roots deliberately share one canonical symbolic domain so
+/// conversion cannot drift as new root kinds are added.
+pub type AbstractObjectIdentity = AccessPathRoot;
 
 /// An abstract object candidate.  Cardinality is explicit and never inferred
 /// merely from an allocation-site identity.
@@ -1486,7 +1395,7 @@ pub struct AbstractLocation {
 
 impl AbstractLocation {
     pub fn new(object: AbstractObject, path: AccessPath) -> Result<Self, OracleContractError> {
-        if !object.identity.matches_root(path.root()) {
+        if &object.identity != path.root() {
             return Err(OracleContractError::ObjectPathMismatch);
         }
         Ok(Self { object, path })
@@ -3377,7 +3286,7 @@ pub struct DispatchCandidate {
     pub(crate) proof: ProofStatus,
     pub(crate) completeness: EvidenceCompleteness,
     pub(crate) provenance: Box<[OracleRelationHandle]>,
-    sealed_call: Option<CallSiteHandle>,
+    sealed: bool,
 }
 
 impl DispatchCandidate {
@@ -3398,7 +3307,7 @@ impl DispatchCandidate {
             proof,
             completeness,
             provenance: collect_candidate_provenance(provenance, limits)?,
-            sealed_call: None,
+            sealed: false,
         })
     }
 
@@ -3418,16 +3327,16 @@ impl DispatchCandidate {
         &self.provenance
     }
 
-    fn seal_for_call(&mut self, call: &CallSiteHandle) {
-        self.sealed_call = Some(call.clone());
+    fn seal(&mut self) {
+        self.sealed = true;
     }
 
-    fn is_sealed_for(&self, call: &CallSiteHandle) -> bool {
-        self.sealed_call.as_ref() == Some(call)
+    const fn is_sealed(&self) -> bool {
+        self.sealed
     }
 
     fn validate_for_call(&self, call: &CallSiteHandle) -> Result<(), OracleContractError> {
-        if !self.is_sealed_for(call) || self.provenance.is_empty() {
+        if !self.is_sealed() || self.provenance.is_empty() {
             return Err(OracleContractError::InvalidRelationIdentity);
         }
         let owner = OracleRelationOwner::Dispatch(call.clone());
@@ -3573,7 +3482,7 @@ impl DispatchResult {
             limits,
         )?;
         for candidate in &mut result.candidates {
-            candidate.seal_for_call(call);
+            candidate.seal();
         }
         Ok(result)
     }
@@ -3627,7 +3536,7 @@ impl DispatchResult {
             && self
                 .candidates
                 .iter()
-                .any(|candidate| !candidate.is_sealed_for(call))
+                .any(|candidate| !candidate.is_sealed())
         {
             return Err(OracleContractError::InvalidRelationIdentity);
         }

@@ -4,8 +4,6 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
-use std::sync::Arc;
-
 use tree_sitter::Node;
 
 use crate::analyzer::semantic::cfg::{
@@ -19,28 +17,7 @@ use crate::hash::{HashMap, HashSet};
 
 const ADAPTER_VERSION: &[u8] = b"cpp-cfg-v1";
 
-impl ProgramSemanticsProvider for CppAnalyzer {
-    fn current_artifact_key(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
-        self.inner.current_semantic_artifact_key_with_lowerer(
-            &CppSemanticLowerer,
-            file,
-            max_source_bytes,
-        )
-    }
-
-    fn materialize(
-        &self,
-        file: &ProjectFile,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-        self.inner
-            .materialize_semantics_with_lowerer(&CppSemanticLowerer, file, request)
-    }
-}
+impl_program_semantics_provider!(CppAnalyzer, CppSemanticLowerer);
 
 struct CppSemanticLowerer;
 
@@ -199,11 +176,6 @@ enum CallablePreflightStop {
     Cancelled {
         work: Box<SemanticWork>,
     },
-}
-
-struct DeclarationPathEntry {
-    parent: Option<usize>,
-    segment: DeclarationSegment,
 }
 
 fn enumerate_procedures<'tree>(
@@ -519,79 +491,6 @@ fn callable_preflight(
         stack.extend(named_children(node));
     }
     Ok(result)
-}
-
-fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
-    }
-}
-
-fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let ordinal = *siblings.entry(key.clone()).or_default();
-    *siblings.get_mut(&key).expect("inserted sibling ordinal") += 1;
-    ordinal
-}
-
-fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -4475,10 +4374,6 @@ fn missing_field(node: Node<'_>, field: &str) -> CppLoweringError {
     ))
 }
 
-fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    source.get(node.byte_range())
-}
-
 fn binary_operator(node: Node<'_>) -> Option<&'static str> {
     match node.child_by_field_name("operator")?.kind() {
         "&&" | "and" => Some("&&"),
@@ -4490,23 +4385,6 @@ fn binary_operator(node: Node<'_>) -> Option<&'static str> {
 fn assignment_operator(node: Node<'_>) -> Option<&str> {
     node.child_by_field_name("operator")
         .map(|operator| operator.kind())
-}
-
-fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {
-    let start = node.start_position();
-    let end = node.end_position();
-    let start = SourcePosition::new(
-        u32::try_from(node.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = SourcePosition::new(
-        u32::try_from(node.end_byte()).map_err(|_| "source end exceeds u32")?,
-        u32::try_from(end.row).map_err(|_| "source end line exceeds u32")?,
-        u32::try_from(end.column).map_err(|_| "source end column exceeds u32")?,
-    );
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
 }
 
 const fn completion_label(kind: CompletionKind) -> &'static str {

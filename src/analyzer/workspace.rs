@@ -322,6 +322,7 @@ impl WorkspaceAnalyzer {
 
     /// Check a retained semantic handle against the complete identity of the
     /// file's current analyzer generation without rematerializing its IR.
+    #[cfg(test)]
     pub(crate) fn semantic_artifact_key_is_current(
         &self,
         key: &crate::analyzer::semantic::SemanticArtifactKey,

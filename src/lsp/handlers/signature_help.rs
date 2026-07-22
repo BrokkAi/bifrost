@@ -43,7 +43,7 @@ pub fn handle(
             end_byte: Some(context.callee_range.end_byte),
         }],
         file,
-        Arc::new(content),
+        Arc::from(content),
     );
     let outcome = outcomes.into_iter().next()?;
     if outcome.status != DefinitionLookupStatus::Resolved {

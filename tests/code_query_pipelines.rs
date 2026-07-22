@@ -207,6 +207,40 @@ class Sample {
 }
 
 #[test]
+fn java_member_targets_reuse_exact_inherited_method_resolution() {
+    let members = serialized(&run(
+        &[(
+            "Inherited.java",
+            r#"class Base { void run() {} }
+class Service extends Base { int run; }
+class Sample {
+    void caller() {
+        Service service = new Service();
+        service.run();
+    }
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+
+    assert_eq!(members["results"][0]["outcome"], "precise", "{members}");
+    let targets = members["results"][0]["member_targets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected member targets: {members}"));
+    assert_eq!(targets.len(), 1, "{members}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Base.run")),
+        "the inherited method must win over the same-named field: {members}"
+    );
+}
+
+#[test]
 fn java_receiver_projection_preserves_type_static_current_and_factory_labels() {
     let files = [(
         "Labels.java",

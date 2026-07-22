@@ -6,26 +6,24 @@
 use std::sync::Arc;
 
 use super::WorkspaceSemanticOracle;
+use super::common::{
+    Interruption, WorkStager, dedup_evidence, evidence_handle, evidence_quality, internal_contract,
+    value_handle,
+};
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
     AccessSelector, AllocationHandle, CallArgumentEndpoint, CallArgumentExpansion,
     CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings,
     CallPassingMode, CandidateCoverage, CaptureSource, DispatchCandidate, EvidenceCompleteness,
     EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationHandle, MemoryLocationKind,
-    ObjectCardinality, OracleCallContext, OracleCandidate, OracleContractError,
-    OracleRelationArena, OracleRelationHandle, OracleRelationId, OracleRelationKind,
-    OracleRelationOwner, OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProofStatus,
-    ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
-    SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation,
-    ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle,
+    ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
+    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
+    OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProofStatus, ScopedSemanticLocator,
+    SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
+    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind,
+    ValueFlowSnapshot, ValueHandle,
 };
-
-#[derive(Debug)]
-enum Interruption {
-    Budget(crate::analyzer::semantic::SemanticBudgetExceeded),
-    Cancelled,
-}
 
 #[derive(Debug, Clone, Copy)]
 enum GapOutcomeQuality {
@@ -53,33 +51,6 @@ fn merge_gap_quality(
         (Some(Unproven), _) | (_, Unproven) => Unproven,
         (Some(Ambiguous), Ambiguous) | (None, Ambiguous) => Ambiguous,
     })
-}
-
-struct WorkStager {
-    budget: crate::analyzer::semantic::SemanticBudget,
-    work: SemanticWork,
-}
-
-impl WorkStager {
-    fn new(request: &SemanticRequest<'_>) -> Self {
-        Self {
-            budget: request.budget.clone(),
-            work: SemanticWork::default(),
-        }
-    }
-
-    fn charge(&mut self, work: SemanticWork) -> Result<(), Interruption> {
-        let reported = self
-            .work
-            .checked_add(work)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
-        if let Err(exceeded) = self.budget.charge(work) {
-            self.work = reported;
-            return Err(Interruption::Budget(exceeded));
-        }
-        self.work = reported;
-        Ok(())
-    }
 }
 
 #[derive(Clone)]
@@ -111,60 +82,11 @@ fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
     .any(|capability| !capabilities.is_available(capability))
 }
 
-fn internal_contract(context: &str, error: OracleContractError) -> SemanticProviderError {
-    SemanticProviderError::internal(format!("{context}: {error}"))
-}
-
-fn evidence_handle(
-    procedure: &ProcedureHandle,
-    id: crate::analyzer::semantic::EvidenceId,
-) -> Result<EvidenceHandle, SemanticProviderError> {
-    procedure
-        .evidence_handle(id)
-        .ok_or_else(|| SemanticProviderError::internal("semantic row has no evidence handle"))
-}
-
-fn evidence_quality(evidence: &[EvidenceHandle]) -> (ProofStatus, EvidenceCompleteness) {
-    let proof = evidence
-        .iter()
-        .find_map(|handle| {
-            let row = handle
-                .procedure()
-                .semantics()
-                .evidence_row(handle.id())
-                .expect("evidence handles are validated at construction");
-            (!matches!(row.proof, ProofStatus::Proven)).then(|| row.proof.clone())
-        })
-        .unwrap_or(ProofStatus::Proven);
-    let completeness = evidence
-        .iter()
-        .find_map(|handle| {
-            let row = handle
-                .procedure()
-                .semantics()
-                .evidence_row(handle.id())
-                .expect("evidence handles are validated at construction");
-            (!matches!(row.completeness, EvidenceCompleteness::Complete))
-                .then(|| row.completeness.clone())
-        })
-        .unwrap_or(EvidenceCompleteness::Complete);
-    (proof, completeness)
-}
-
 fn proven_complete(evidence: &[EvidenceHandle]) -> bool {
     matches!(
         evidence_quality(evidence),
         (ProofStatus::Proven, EvidenceCompleteness::Complete)
     )
-}
-
-fn value_handle(
-    procedure: &ProcedureHandle,
-    id: crate::analyzer::semantic::ValueId,
-) -> Result<ValueHandle, SemanticProviderError> {
-    procedure
-        .value_handle(id)
-        .ok_or_else(|| SemanticProviderError::internal("semantic effect has a stale value ID"))
 }
 
 fn location_value_reads(location: &MemoryLocationKind) -> usize {
@@ -474,16 +396,6 @@ impl BindingBuild {
         self.relations.push(BindingRelationDraft { evidence });
         index
     }
-}
-
-fn dedup_evidence(evidence: impl IntoIterator<Item = EvidenceHandle>) -> Vec<EvidenceHandle> {
-    let mut result = Vec::new();
-    for handle in evidence {
-        if !result.contains(&handle) {
-            result.push(handle);
-        }
-    }
-    result
 }
 
 fn materialize_call_bindings(

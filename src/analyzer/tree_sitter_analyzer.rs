@@ -12,6 +12,7 @@ use crate::analyzer::{
     ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata,
     SummaryFileProjection, UsageFactsIndex,
 };
+use crate::cancellation::CancellationToken;
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
@@ -53,6 +54,14 @@ pub(crate) enum BulkFileStateSource {
 pub(crate) enum WalkControl {
     Continue,
     SkipChildren,
+    Break,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedNamedTreeWalk {
+    Complete { visited: usize },
+    Exceeded { visited: usize },
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -128,7 +137,11 @@ pub(crate) fn walk_tree_preorder<'tree>(
     loop {
         let node = cursor.node();
         let should_descend = if include_root || !is_root {
-            visit(node) != WalkControl::SkipChildren
+            match visit(node) {
+                WalkControl::Continue => true,
+                WalkControl::SkipChildren => false,
+                WalkControl::Break => return,
+            }
         } else {
             true
         };
@@ -155,11 +168,29 @@ pub(crate) fn walk_named_tree_preorder<'tree>(
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> WalkControl,
 ) {
+    let result: Result<(), std::convert::Infallible> =
+        try_walk_named_tree_preorder(root, include_root, |node| Ok(visit(node)));
+    match result {
+        Ok(()) => {}
+        Err(error) => match error {},
+    }
+}
+
+/// Fallible counterpart to [`walk_named_tree_preorder`]. Both helpers retain
+/// source-order preorder traversal while allowing visitors to prune or stop.
+pub(crate) fn try_walk_named_tree_preorder<'tree, Error>(
+    root: Node<'tree>,
+    include_root: bool,
+    mut visit: impl FnMut(Node<'tree>) -> Result<WalkControl, Error>,
+) -> Result<(), Error> {
     let mut stack = vec![(root, true)];
     while let Some((node, is_root)) = stack.pop() {
-        if node.is_named() && (include_root || !is_root) && visit(node) == WalkControl::SkipChildren
-        {
-            continue;
+        if node.is_named() && (include_root || !is_root) {
+            match visit(node)? {
+                WalkControl::Continue => {}
+                WalkControl::SkipChildren => continue,
+                WalkControl::Break => return Ok(()),
+            }
         }
 
         for index in (0..node.named_child_count()).rev() {
@@ -167,6 +198,40 @@ pub(crate) fn walk_named_tree_preorder<'tree>(
                 stack.push((child, false));
             }
         }
+    }
+    Ok(())
+}
+
+/// Visit named nodes in source-order preorder while applying the shared
+/// receiver/setup traversal budget and cancellation policy.
+pub(crate) fn walk_named_tree_preorder_bounded<'tree>(
+    root: Node<'tree>,
+    include_root: bool,
+    max_named_nodes: usize,
+    cancellation: Option<&CancellationToken>,
+    mut visit: impl FnMut(Node<'tree>),
+) -> BoundedNamedTreeWalk {
+    enum Stop {
+        Exceeded,
+        Cancelled,
+    }
+
+    let mut visited = 0usize;
+    let result = try_walk_named_tree_preorder(root, include_root, |node| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(Stop::Cancelled);
+        }
+        visited = visited.saturating_add(1);
+        if visited > max_named_nodes {
+            return Err(Stop::Exceeded);
+        }
+        visit(node);
+        Ok(WalkControl::Continue)
+    });
+    match result {
+        Ok(()) => BoundedNamedTreeWalk::Complete { visited },
+        Err(Stop::Exceeded) => BoundedNamedTreeWalk::Exceeded { visited },
+        Err(Stop::Cancelled) => BoundedNamedTreeWalk::Cancelled,
     }
 }
 
@@ -1481,16 +1546,16 @@ where
         )
     }
 
-    pub(crate) fn current_semantic_artifact_key_with_lowerer(
+    pub(crate) fn current_semantic_artifact_source_with_lowerer(
         &self,
         lowerer: &dyn crate::analyzer::semantic::service::ProgramSemanticsLowerer,
         file: &ProjectFile,
         max_source_bytes: usize,
     ) -> Result<
-        Option<crate::analyzer::semantic::SemanticArtifactKey>,
+        Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
         crate::analyzer::semantic::SemanticProviderError,
     > {
-        crate::analyzer::semantic::service::current_artifact_key_with_lowerer(
+        crate::analyzer::semantic::service::current_artifact_source_with_lowerer(
             self,
             lowerer,
             file,
@@ -2878,6 +2943,18 @@ where
 
     pub(crate) fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
         self.prepared_syntax_with_limit(file, None).ok().flatten()
+    }
+
+    /// Capture the same request-scoped atomic source used by syntax
+    /// preparation without parsing it. Semantic freshness checks need the
+    /// source identity, but not a tree.
+    pub(crate) fn source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<ProjectSourceSnapshot>, PreparedSyntaxLimitExceeded> {
+        self.resolve_prepared_source(file, Some(max_source_bytes))
+            .map(|resolved| resolved.map(|resolved| resolved.snapshot))
     }
 
     /// Prepare syntax from one atomically captured project source snapshot,

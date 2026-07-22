@@ -1354,10 +1354,9 @@ mod tests {
         ControlEdgeKind, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
         DependencyFingerprint, EvidenceId, ProcedureKind, ProcedureSemanticsParts, ProgramPointId,
         SemanticBudget, SemanticCapabilities, SemanticCapability, SemanticEvent, SemanticGapId,
-        SemanticGapImpact, SemanticGapImpacts, SemanticIrVersion, SemanticLanguage,
-        SemanticLocator, SemanticRole, SemanticWork, SourceAnchor, SourceMappingId,
-        SourceMappingKind, SourcePosition, SourceRevision, SourceSpan, StableDigest,
-        WorkspaceMountId, WorkspaceRelativePath,
+        SemanticGapImpacts, SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole,
+        SemanticWork, SourceAnchor, SourceMappingId, SourceMappingKind, SourcePosition,
+        SourceRevision, SourceSpan, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
     };
 
     #[test]
@@ -1661,6 +1660,7 @@ mod tests {
             receiver: None,
             arguments: Box::new([super::super::ir::SemanticCallArgument::direct(
                 super::super::ids::ValueId::new(1),
+                super::super::ir::ArgumentDomain::Positional,
             )]),
             result: None,
             thrown: None,
@@ -1696,8 +1696,13 @@ mod tests {
                 kind: super::super::ir::CallContinuationKind::Exceptional,
             },
             capability: SemanticCapability::ExceptionalCallContinuation,
-            impacts: SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation)
-                .with(SemanticGapImpact::ReturnTransfer),
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalCallContinuation,
+                SemanticGapSubject::CallContinuation {
+                    call_site: super::super::ids::CallSiteId::new(0),
+                    kind: super::super::ir::CallContinuationKind::Exceptional,
+                },
+            ),
             kind: super::super::ir::SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
             detail: "bounded target proof".into(),
@@ -1708,7 +1713,9 @@ mod tests {
         write_gap(&mut gap_rendered, &gap).unwrap();
         assert!(gap_rendered.contains(":subject (subject :kind \"call_continuation\""));
         assert!(gap_rendered.contains(":continuation-kind \"exceptional\""));
-        assert!(gap_rendered.contains(":impacts (\"call_evaluation\" \"return_transfer\")"));
+        assert!(gap_rendered.contains(
+            ":impacts (\"call_evaluation\" \"return_transfer\" \"value_flow\" \"heap_read\" \"heap_write\" \"aliasing\")"
+        ));
         assert!(gap_rendered.contains(":dimension \"program_points\" :limit 1 :attempted 2"));
 
         let capture = CaptureBinding {
@@ -1985,7 +1992,10 @@ mod tests {
             point: ProgramPointId::new(2),
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::ExceptionalControlFlow,
-            impacts: SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapSubject::Point,
+            ),
             kind: super::super::ir::SemanticGapKind::Unsupported,
             budget: None,
             detail,

@@ -182,7 +182,7 @@ fn assert_direct_call_conformance(fixture: DirectCallFixture) {
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, false, false);
+    assert_direct_call_project_conformance(&project, fixture, DirectCallExpectations::default());
 }
 
 fn assert_closed_dispatch_direct_call_conformance(fixture: DirectCallFixture) {
@@ -190,7 +190,14 @@ fn assert_closed_dispatch_direct_call_conformance(fixture: DirectCallFixture) {
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, false, true);
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            closed_dispatch_refinement: true,
+            ..DirectCallExpectations::default()
+        },
+    );
 }
 
 fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
@@ -198,15 +205,27 @@ fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, true, false);
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            unproven_return: true,
+            ..DirectCallExpectations::default()
+        },
+    );
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DirectCallExpectations {
+    unproven_link_unit: bool,
+    unproven_return: bool,
+    closed_dispatch_refinement: bool,
 }
 
 fn assert_direct_call_project_conformance(
     project: &BuiltInlineTestProject,
     fixture: DirectCallFixture,
-    expect_unproven_link_unit: bool,
-    expect_unproven_return: bool,
-    expect_closed_dispatch_refinement: bool,
+    expectations: DirectCallExpectations,
 ) {
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let mut cfg = SemanticGraph::materialize(project, &analyzer, fixture.caller_path);
@@ -297,7 +316,7 @@ fn assert_direct_call_project_conformance(
                 || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
     });
     let has_unresolved_dynamic_dispatch =
-        has_dynamic_dispatch_gap && !expect_closed_dispatch_refinement;
+        has_dynamic_dispatch_gap && !expectations.closed_dispatch_refinement;
 
     let mut icfg = IcfgGraph::materialize(
         project,
@@ -356,12 +375,15 @@ fn assert_direct_call_project_conformance(
         root(),
     );
 
-    if has_unresolved_dynamic_dispatch || expect_unproven_link_unit || expect_unproven_return {
+    if has_unresolved_dynamic_dispatch
+        || expectations.unproven_link_unit
+        || expectations.unproven_return
+    {
         icfg.assert_outcome(IcfgOutcomeKind::Unproven);
     } else {
         icfg.assert_outcome(IcfgOutcomeKind::Complete);
     }
-    if has_unresolved_dynamic_dispatch || expect_unproven_link_unit {
+    if has_unresolved_dynamic_dispatch || expectations.unproven_link_unit {
         icfg.assert_boundary(
             "icfg_invoke",
             ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
@@ -379,7 +401,7 @@ fn assert_direct_call_project_conformance(
     let return_edge = icfg_edge("icfg_normal_continuation", IcfgEdgeKind::NormalReturn)
         .originating_call("direct_call");
     icfg.assert_successors("callee_normal_exit", &[return_edge]);
-    if expect_unproven_link_unit || expect_unproven_return {
+    if expectations.unproven_link_unit || expectations.unproven_return {
         icfg.assert_edge_unproven_partial("callee_normal_exit", return_edge);
     } else {
         // An open target set weakens the operation and adds an unresolved arm,
@@ -545,7 +567,14 @@ fn assert_declared_cpp_direct_call_conformance(
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, true, false, false);
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            unproven_link_unit: true,
+            ..DirectCallExpectations::default()
+        },
+    );
 }
 
 #[test]

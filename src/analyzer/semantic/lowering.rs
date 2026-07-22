@@ -5,20 +5,23 @@
 //! topology, and uncertainty; the session owns dense IDs, exact provenance,
 //! common call rows, and batch-level budget/cancellation semantics.
 
+use crate::analyzer::lexical_definitions::FormalVariadicKind;
 use crate::hash::HashMap;
+use tree_sitter::Node;
 
 use super::cfg::{ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
 use super::{
-    AllocationId, AllocationKind, AllocationSite, CallContinuationKind, CallSiteId,
+    AllocationId, AllocationKind, AllocationSite, ArgumentDomain, CallContinuationKind, CallSiteId,
     CallableTargetResolution, CancellationToken, CaptureBinding, CaptureId, CaptureMode,
-    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, Evidence,
-    EvidenceCompleteness, EvidenceId, MemoryLocation, MemoryLocationId, MemoryLocationKind,
-    ProcedureId, ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget,
-    SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite, SemanticCapability,
-    SemanticEffect, SemanticEvent, SemanticGap, SemanticGapId, SemanticGapImpacts, SemanticGapKind,
-    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole,
-    SemanticValue, SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
-    SourceMappingKind, ValueId,
+    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, DeclarationSegment,
+    DeclarationSegmentKind, Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity,
+    MemoryAccessKind, MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId,
+    ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
+    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
+    SemanticGap, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
+    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
+    SourceMappingKind, SourcePosition, SourceSpan, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -36,8 +39,144 @@ impl From<SemanticBudgetExceeded> for ProcedureLoweringError {
 }
 
 pub(crate) fn sum_lowering_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
+    left.conservative_add(right)
+}
+
+/// Return the source slice represented by a tree-sitter node.
+pub(crate) fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
+    source.get(node.byte_range())
+}
+
+/// Collect children associated with one structured tree-sitter field.
+pub(crate) fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name(field, &mut cursor).collect()
+}
+
+/// Convert one tree-sitter node into the stable source anchor used throughout
+/// the neutral semantic IR.
+pub(crate) fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {
+    let start = node.start_position();
+    let end = node.end_position();
+    let start = SourcePosition::new(
+        u32::try_from(node.start_byte()).map_err(|_| "source start exceeds u32")?,
+        u32::try_from(start.row).map_err(|_| "source start line exceeds u32")?,
+        u32::try_from(start.column).map_err(|_| "source start column exceeds u32")?,
+    );
+    let end = SourcePosition::new(
+        u32::try_from(node.end_byte()).map_err(|_| "source end exceeds u32")?,
+        u32::try_from(end.row).map_err(|_| "source end line exceeds u32")?,
+        u32::try_from(end.column).map_err(|_| "source end column exceeds u32")?,
+    );
+    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
+    Ok(SourceAnchor::new(span, occurrence))
+}
+
+/// Translate syntax-level variadic classification into the neutral call-port
+/// multiplicity used by semantic adapters.
+pub(crate) const fn formal_multiplicity(
+    variadic: Option<FormalVariadicKind>,
+) -> FormalMultiplicity {
+    match variadic {
+        None => FormalMultiplicity::One,
+        Some(FormalVariadicKind::Positional) => {
+            FormalMultiplicity::Rest(ArgumentDomain::Positional)
+        }
+        Some(FormalVariadicKind::Keyword) => FormalMultiplicity::Rest(ArgumentDomain::Keyword),
+        Some(FormalVariadicKind::Both) => {
+            FormalMultiplicity::Rest(ArgumentDomain::PositionalOrKeyword)
+        }
+    }
+}
+
+/// One node in the persistent declaration path assembled while adapters walk
+/// nested syntax iteratively.
+///
+/// Adapters decide which syntax introduces a declaration segment; this shared
+/// representation owns the language-neutral path mechanics used after that
+/// decision.
+pub(crate) struct DeclarationPathEntry {
+    pub(crate) parent: Option<usize>,
+    pub(crate) segment: DeclarationSegment,
+}
+
+pub(crate) fn push_declaration_path(
+    paths: &mut Vec<DeclarationPathEntry>,
+    parent: usize,
+    segment: DeclarationSegment,
+) -> usize {
+    let id = paths.len();
+    paths.push(DeclarationPathEntry {
+        parent: Some(parent),
+        segment,
+    });
+    id
+}
+
+pub(crate) fn collect_declaration_path(
+    paths: &[DeclarationPathEntry],
+    mut path: usize,
+) -> Vec<DeclarationSegment> {
+    let mut segments = Vec::new();
+    loop {
+        let entry = &paths[path];
+        segments.push(entry.segment.clone());
+        let Some(parent) = entry.parent else {
+            break;
+        };
+        path = parent;
+    }
+    segments.reverse();
+    segments
+}
+
+pub(crate) fn next_sibling_ordinal(
+    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
+    scope: usize,
+    kind: DeclarationSegmentKind,
+    name: Option<&str>,
+) -> u32 {
+    let key = (scope, kind, name.map(Box::<str>::from));
+    let next = siblings.entry(key).or_default();
+    let ordinal = *next;
+    *next += 1;
+    ordinal
+}
+
+pub(crate) fn declaration_segment(
+    kind: DeclarationSegmentKind,
+    name: Option<&str>,
+    anchor: SourceAnchor,
+    sibling_ordinal: u32,
+) -> Result<DeclarationSegment, String> {
+    match name {
+        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
+            .map_err(|error| error.to_string()),
+        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
+    }
+}
+
+/// Work retained for the shared procedure identity rows created by
+/// [`ProcedureLoweringSession::start`]. Adapters use the same calculation to
+/// reject an enumeration before retaining an unbounded locator path.
+pub(crate) fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
+    let segments = locator.declaration().segments();
+    let locator_text = locator.path().as_str().len().saturating_add(
+        segments
+            .iter()
+            .filter_map(|segment| segment.name())
+            .fold(0usize, |total, name| total.saturating_add(name.len())),
+    );
+    SemanticWork {
+        procedures: 1,
+        source_mappings: 1,
+        evidence: 1,
+        // Two empty adjacency offset arrays, one evidence source, and three
+        // retained locator copies (procedure, locator index, source mapping).
+        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
+        owned_text_bytes: locator_text.saturating_mul(3),
+        ..SemanticWork::default()
+    }
 }
 
 /// Lower an adapter-owned sequence of procedure specs with one consistent
@@ -121,6 +260,13 @@ pub(crate) struct PointMetadata {
     pub(crate) source: SourceMappingId,
     pub(crate) evidence: EvidenceId,
 }
+
+/// Target-local slot reserved for the lexical receiver capture, when present.
+///
+/// Parent capture rows are emitted before their child procedure is lowered, so
+/// both sides use this planned destination. The child-side helper below checks
+/// the dense allocation rather than relying on an adapter-local magic ID.
+pub(crate) const RECEIVER_CAPTURE_DESTINATION: MemoryLocationId = MemoryLocationId::new(0);
 
 /// Adapter-supplied values needed to publish one ordinary call row and its
 /// matched continuation events. Syntax evaluation and control edges remain
@@ -444,6 +590,39 @@ impl<'a> ProcedureLoweringSession<'a> {
         Ok(id)
     }
 
+    /// Reserve and load the target-local slot used to receive a lexical
+    /// receiver captured from the immediate parent procedure.
+    pub(crate) fn add_receiver_capture_input(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        metadata: PointMetadata,
+        lexical_parent: ProcedureId,
+    ) -> Result<(ValueId, MemoryLocationId), ProcedureLoweringError> {
+        let value = self.add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        let location = self.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Capture { lexical_parent },
+        )?;
+        if location != RECEIVER_CAPTURE_DESTINATION {
+            return Err(ProcedureLoweringError::Invalid(format!(
+                "receiver capture destination must be {}, allocated {location}",
+                RECEIVER_CAPTURE_DESTINATION
+            )));
+        }
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Capture,
+                location,
+                result: value,
+            },
+        )?;
+        Ok((value, location))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_capture(
         &mut self,
@@ -504,7 +683,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             point,
             subject,
             capability,
-            SemanticGapImpacts::for_gap(capability, subject),
+            SemanticGapImpacts::NONE,
             kind,
             detail,
         )
@@ -517,11 +696,12 @@ impl<'a> ProcedureLoweringSession<'a> {
         point: ProgramPointId,
         subject: SemanticGapSubject,
         capability: SemanticCapability,
-        impacts: SemanticGapImpacts,
+        additional_impacts: SemanticGapImpacts,
         kind: SemanticGapKind,
         detail: impl Into<Box<str>>,
     ) -> Result<SemanticGapId, ProcedureLoweringError> {
         let metadata = self.metadata(point)?;
+        let impacts = SemanticGapImpacts::for_gap(capability, subject).union(additional_impacts);
         let id = SemanticGapId::try_from_index(self.next_gap)
             .map_err(|_| ProcedureLoweringError::Invalid("too many semantic gaps".into()))?;
         builder.add_gap(SemanticGap {

@@ -7,6 +7,13 @@ readonly result_prefix='BIFROST_SEMANTIC_ORACLE_BENCHMARK='
 readonly vscode_commit='19e0f9e681ecb8e5c09d8784acaa601316ca4571'
 readonly petclinic_commit='f182358d02e4a68e52bdbabf55ca7800288511e7'
 
+for tool in cargo git jq; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'required benchmark tool is unavailable: %s\n' "$tool" >&2
+        exit 2
+    fi
+done
+
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
@@ -112,7 +119,12 @@ jq -cs '
                 cold_materialization_ms: median(.cold_materialization_ms),
                 warm_materialization_ms: median(.warm_materialization_ms),
                 warm_arc_reuse_count: median(.warm_arc_reuse_count),
-                warm_arc_reuse_ratio: (median(.warm_arc_reuse_count) / .[0].files_materialized),
+                warm_arc_reuse_ratio: (
+                    if .[0].files_materialized > 0
+                    then median(.warm_arc_reuse_count) / .[0].files_materialized
+                    else error("benchmark dataset materialized no files: \(.[0].name)")
+                    end
+                ),
                 oracle_projection_ms: median(.oracle_projection_ms),
                 receiver_structural_baseline_ms: median(.receiver.structural_baseline_ms),
                 receiver_projection_ms: median(.receiver.receiver_projection_ms),

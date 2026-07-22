@@ -5,8 +5,6 @@
 //! block invocation).  This adapter lowers only tree-sitter-structured control
 //! and calls, and records the remaining decisions as exact semantic gaps.
 
-use std::sync::Arc;
-
 use tree_sitter::Node;
 
 use crate::analyzer::semantic::cfg::{
@@ -21,28 +19,7 @@ use crate::hash::{HashMap, HashSet};
 
 const ADAPTER_VERSION: &[u8] = b"ruby-cfg-v1";
 
-impl ProgramSemanticsProvider for RubyAnalyzer {
-    fn current_artifact_key(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
-        self.inner.current_semantic_artifact_key_with_lowerer(
-            &RubySemanticLowerer,
-            file,
-            max_source_bytes,
-        )
-    }
-
-    fn materialize(
-        &self,
-        file: &ProjectFile,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-        self.inner
-            .materialize_semantics_with_lowerer(&RubySemanticLowerer, file, request)
-    }
-}
+impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
 #[derive(Default)]
 struct BodyComponents<'tree> {
@@ -208,11 +185,6 @@ fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     node.named_children(&mut cursor).collect()
 }
 
-fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor).collect()
-}
-
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RubyLoweringError> {
     node.child_by_field_name(field)
         .ok_or_else(|| missing_field(node, field))
@@ -225,10 +197,6 @@ fn missing_field(node: Node<'_>, field: &str) -> RubyLoweringError {
         node.start_byte(),
         node.end_byte()
     ))
-}
-
-fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    source.get(node.byte_range())
 }
 
 fn is_short_circuit_binary(source: &str, node: Node<'_>) -> bool {
@@ -349,10 +317,7 @@ impl<'source, 'request> LocalBindingCollector<'source, 'request> {
     }
 
     fn charge(&mut self, delta: SemanticWork) -> Result<(), RubyLoweringError> {
-        let candidate = self
-            .work
-            .checked_add(delta)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+        let candidate = self.work.conservative_add(delta);
         if let Err(exceeded) = self.budget.check(candidate) {
             return Err(RubyLoweringError::Budget(exceeded, Box::new(candidate)));
         }
@@ -619,23 +584,6 @@ fn callable_parameters<'tree>(callable: Node<'tree>, body: Node<'tree>) -> Optio
     })
 }
 
-fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {
-    let start_position = node.start_position();
-    let end_position = node.end_position();
-    let start = SourcePosition::new(
-        u32::try_from(node.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start_position.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start_position.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = SourcePosition::new(
-        u32::try_from(node.end_byte()).map_err(|_| "source end exceeds u32")?,
-        u32::try_from(end_position.row).map_err(|_| "source end line exceeds u32")?,
-        u32::try_from(end_position.column).map_err(|_| "source end column exceeds u32")?,
-    );
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
-}
-
 fn source_anchor_between(
     start_node: Node<'_>,
     end_node: Node<'_>,
@@ -871,11 +819,6 @@ struct ProcedureEnumerationFrame<'tree> {
 struct SyntheticBodyScope {
     procedure: ProcedureId,
     callable_path: usize,
-}
-
-struct DeclarationPathEntry {
-    parent: Option<usize>,
-    segment: DeclarationSegment,
 }
 
 fn enumerate_procedures<'tree>(
@@ -1232,79 +1175,6 @@ fn is_initializer_member_declaration(node: Node<'_>) -> bool {
         node.kind(),
         "method" | "singleton_method" | "class" | "module" | "singleton_class"
     )
-}
-
-fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
-    }
-}
-
-fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let ordinal = *siblings.entry(key.clone()).or_default();
-    *siblings.get_mut(&key).expect("inserted sibling ordinal") += 1;
-    ordinal
-}
-
-fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
 }
 
 type RubyLoweringError = ProcedureLoweringError;

@@ -351,7 +351,7 @@ pub(crate) fn resolve_definition_batch_with_source(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
-    source: Arc<String>,
+    source: Arc<str>,
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
@@ -362,7 +362,7 @@ pub(crate) fn resolve_navigation_batch_with_source(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
-    source: Arc<String>,
+    source: Arc<str>,
     operation: NavigationOperation,
 ) -> Vec<NavigationLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
@@ -399,7 +399,7 @@ pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
-    source: Arc<String>,
+    source: Arc<str>,
     cancellation: &CancellationToken,
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
@@ -411,7 +411,7 @@ pub(crate) fn resolve_call_reference_definition_with_source(
     analyzer: &dyn IAnalyzer,
     request: DefinitionLookupRequest,
     file: ProjectFile,
-    source: Arc<String>,
+    source: Arc<str>,
 ) -> Option<DefinitionLookupOutcome> {
     let language = language_for_file(&request.file);
     if matches!(language, Language::None | Language::Ruby) {
@@ -462,7 +462,7 @@ struct DefinitionBatchContext<'a> {
     js_ts_contexts: HashMap<(ProjectFile, Language), JsTsDefinitionContext>,
     go_contexts: HashMap<ProjectFile, GoDefinitionContext>,
     scala_contexts: HashMap<ProjectFile, ScalaDefinitionContext>,
-    sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
+    sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
@@ -516,12 +516,12 @@ impl<'a> DefinitionBatchContext<'a> {
         &self.bounded_support
     }
 
-    fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
+    fn source(&mut self, file: &ProjectFile) -> Result<Arc<str>, String> {
         self.sources
             .entry(file.clone())
             .or_insert_with(|| {
                 file.read_to_string()
-                    .map(Arc::new)
+                    .map(Arc::<str>::from)
                     .map_err(|err| format!("failed to read `{}`: {err}", rel_path_string(file)))
             })
             .clone()
@@ -1756,14 +1756,14 @@ mod tests {
             &analyzer,
             requests.clone(),
             consumer.clone(),
-            Arc::new(source.to_string()),
+            Arc::from(source),
         );
         let first_batch_validations = analyzer.live_oid_validation_count_for_test(&types);
         let second = resolve_definition_batch_with_source(
             &analyzer,
             vec![requests[0].clone()],
             consumer,
-            Arc::new(source.to_string()),
+            Arc::from(source),
         );
         let after_second_batch = analyzer.live_oid_validation_count_for_test(&types);
 
@@ -1818,14 +1818,14 @@ mod tests {
             &analyzer,
             requests.clone(),
             consumer.clone(),
-            Arc::new(source.to_string()),
+            Arc::from(source),
         );
         let first_batch_classifications = analyzer.type_alias_classification_count_for_test();
         let second = resolve_definition_batch_with_source(
             &analyzer,
             vec![requests[1].clone()],
             consumer,
-            Arc::new(source.to_string()),
+            Arc::from(source),
         );
         let second_batch_classifications = analyzer
             .type_alias_classification_count_for_test()

@@ -7,6 +7,9 @@
 
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::slice;
+use crate::analyzer::tree_sitter_analyzer::{
+    BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
+};
 use crate::analyzer::usages::get_definition::js_ts::{
     parse_js_ts_tree, resolve_js_ts_module_binding_candidates,
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -61,6 +64,17 @@ pub(in crate::analyzer::usages) struct JsTsMemberTargetReport {
     pub(crate) receiver_range: Range,
     pub(crate) member_name: String,
     pub(crate) analysis: ReceiverAnalysisReport<CodeUnit>,
+}
+
+pub(in crate::analyzer::usages) enum JsTsReceiverSyntaxIndexBuild {
+    Complete {
+        index: Arc<JsTsReceiverSyntaxIndex>,
+        visited: usize,
+    },
+    ExceededScope {
+        visited: usize,
+    },
+    Cancelled,
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
@@ -1655,49 +1669,57 @@ pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index<'tree>(
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(Arc<JsTsReceiverSyntaxIndex>, usize)> {
-    let mut functions: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
-    let mut classes: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
-    let mut seen = HashSet::default();
-    let mut stack = vec![root];
-    let mut visited = 0usize;
-    while let Some(node) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return None;
-        }
-        if !seen.insert(node.id()) {
-            continue;
-        }
-        visited += 1;
-        let range = IndexedNodeRange {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-        };
-        if node.kind() == "function_declaration"
-            && let Some(name_node) = node.child_by_field_name("name")
-            && let Some(name) = simple_identifier_text(name_node, source)
-        {
-            functions.entry(name.to_string()).or_default().push(range);
-        } else if matches!(
-            node.kind(),
-            "class_declaration" | "abstract_class_declaration"
-        ) && let Some(name_node) = node.child_by_field_name("name")
-            && let Some(name) = simple_identifier_text(name_node, source)
-        {
-            classes.entry(name.to_string()).or_default().push(range);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
+    match build_js_ts_receiver_syntax_index_bounded(root, source, cancellation, usize::MAX) {
+        JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => Some((index, visited)),
+        JsTsReceiverSyntaxIndexBuild::Cancelled => None,
+        JsTsReceiverSyntaxIndexBuild::ExceededScope { .. } => {
+            unreachable!("an in-memory syntax tree cannot exceed usize::MAX nodes")
         }
     }
-    Some((
-        Arc::new(JsTsReceiverSyntaxIndex {
+}
+
+pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index_bounded<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+    max_scope_nodes: usize,
+) -> JsTsReceiverSyntaxIndexBuild {
+    let mut functions: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
+    let mut classes: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
+    let traversal =
+        walk_named_tree_preorder_bounded(root, true, max_scope_nodes, cancellation, |node| {
+            let range = IndexedNodeRange {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            };
+            if node.kind() == "function_declaration"
+                && let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = simple_identifier_text(name_node, source)
+            {
+                functions.entry(name.to_string()).or_default().push(range);
+            } else if matches!(
+                node.kind(),
+                "class_declaration" | "abstract_class_declaration"
+            ) && let Some(name_node) = node.child_by_field_name("name")
+                && let Some(name) = simple_identifier_text(name_node, source)
+            {
+                classes.entry(name.to_string()).or_default().push(range);
+            }
+        });
+    let visited = match traversal {
+        BoundedNamedTreeWalk::Complete { visited } => visited,
+        BoundedNamedTreeWalk::Exceeded { visited } => {
+            return JsTsReceiverSyntaxIndexBuild::ExceededScope { visited };
+        }
+        BoundedNamedTreeWalk::Cancelled => return JsTsReceiverSyntaxIndexBuild::Cancelled,
+    };
+    JsTsReceiverSyntaxIndexBuild::Complete {
+        index: Arc::new(JsTsReceiverSyntaxIndex {
             function_declarations_by_name: functions,
             class_declarations_by_name: classes,
         }),
         visited,
-    ))
+    }
 }
 
 fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {

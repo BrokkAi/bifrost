@@ -10,7 +10,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
 
 pub(crate) struct DeclarationNameRangeContext {
-    content: Arc<String>,
+    content: Arc<str>,
     line_starts: OnceLock<Vec<usize>>,
     tree: Option<Tree>,
 }
@@ -18,8 +18,8 @@ pub(crate) struct DeclarationNameRangeContext {
 impl DeclarationNameRangeContext {
     pub(crate) fn new(file: &ProjectFile, content: String) -> Self {
         let language = language_for_file(file);
-        let content = Arc::new(content);
-        let tree = parse_tree_for_language(file, language, content.as_str());
+        let content = Arc::<str>::from(content);
+        let tree = parse_tree_for_language(file, language, content.as_ref());
         Self {
             content,
             line_starts: OnceLock::new(),
@@ -33,10 +33,10 @@ impl DeclarationNameRangeContext {
 
     pub(crate) fn line_starts(&self) -> &[usize] {
         self.line_starts
-            .get_or_init(|| compute_line_starts(&self.content))
+            .get_or_init(|| compute_line_starts(self.content.as_ref()))
     }
 
-    pub(crate) fn shared_content(&self) -> Arc<String> {
+    pub(crate) fn shared_content(&self) -> Arc<str> {
         Arc::clone(&self.content)
     }
 

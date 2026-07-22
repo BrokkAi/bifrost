@@ -650,8 +650,7 @@ impl ProcedureCfgBuilder {
 pub(crate) struct ReachabilitySealCancelled;
 
 fn combine_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
+    left.conservative_add(right)
 }
 
 fn locator_work(locator: &SemanticLocator, copies: usize) -> SemanticWork {

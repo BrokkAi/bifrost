@@ -348,7 +348,7 @@ fn resolve_rename_target(
             end_byte: Some(cursor.end),
         }],
         cursor.file.clone(),
-        Arc::new(cursor.content.to_string()),
+        Arc::from(cursor.content),
     );
     let Some(outcome) = outcomes.pop() else {
         return Err(RenameFailure {

@@ -335,7 +335,10 @@ fn build_artifact() -> Arc<SemanticArtifact> {
         point: ENTRY,
         callee: ValueId::new(0),
         receiver: None,
-        arguments: Box::new([SemanticCallArgument::direct(ValueId::new(1))]),
+        arguments: Box::new([SemanticCallArgument::direct(
+            ValueId::new(1),
+            ArgumentDomain::Positional,
+        )]),
         result: Some(ValueId::new(2)),
         thrown: None,
         declared_targets: target.clone(),
@@ -1052,14 +1055,14 @@ fn assert_weak(eligibility: UpdateEligibility, expected: WeakUpdateReason) {
 #[test]
 fn every_oracle_limit_dimension_rejects_zero() {
     type LimitSetter = fn(&mut OracleLimitValues);
-    let dimensions: [(&str, LimitSetter); 12] = [
+    let dimensions: [(&str, LimitSetter); 10] = [
         ("dispatch_targets", |limits| limits.dispatch_targets = 0),
         ("objects_per_value", |limits| limits.objects_per_value = 0),
-        ("interned_roots", |limits| limits.interned_roots = 0),
-        ("interned_selectors", |limits| limits.interned_selectors = 0),
-        ("interned_paths", |limits| limits.interned_paths = 0),
         ("access_path_length", |limits| limits.access_path_length = 0),
         ("alias_breadth", |limits| limits.alias_breadth = 0),
+        ("source_observations", |limits| {
+            limits.source_observations = 0
+        }),
         ("call_context_depth", |limits| limits.call_context_depth = 0),
         ("summary_depth", |limits| limits.summary_depth = 0),
         ("call_binding_entries", |limits| {
@@ -1073,6 +1076,15 @@ fn every_oracle_limit_dimension_rejects_zero() {
         set_zero(&mut values);
         assert_eq!(OracleLimits::new(values).unwrap_err().dimension(), expected);
     }
+
+    let limits = OracleLimits::new(OracleLimitValues {
+        alias_breadth: 2,
+        source_observations: 3,
+        ..OracleLimitValues::uniform(1)
+    })
+    .unwrap();
+    assert_eq!(limits.alias_breadth(), 2);
+    assert_eq!(limits.source_observations(), 3);
 }
 
 #[test]

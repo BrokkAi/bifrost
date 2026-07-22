@@ -2,30 +2,35 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
-    AbstractObjectIdentity, DeclarationSegmentKind, HeapOracle, ObservationPhase,
-    OracleCallContext, PointsToResult, SemanticBudget, SemanticOutcome, SemanticRequest,
-    ValueAtPoint,
+    AbstractObjectIdentity, OracleLimitValues, OracleLimits, SemanticBudget,
+    SemanticBudgetDimension, SemanticBudgetExceeded, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticWork, SourcePointsToResult, WorkspaceSemanticOracle,
+};
+use crate::analyzer::tree_sitter_analyzer::{
+    BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::usages::get_definition::{
-    java::resolve_java, js_ts::parse_js_ts_tree, parse_tree_for_language,
+    DefinitionLookupOutcome, DefinitionLookupStatus, java::resolve_java, js_ts::parse_js_ts_tree,
+    parse_tree_for_language,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type,
 };
+use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
-    JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index, member_expression_at_site,
-    node_range, smallest_named_node_covering,
+    JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
+    build_js_ts_receiver_syntax_index_bounded, member_expression_at_site, node_range,
+    smallest_named_node_covering,
 };
 use crate::analyzer::usages::js_ts_graph::{JsTsReceiverFactProvider, compute_jsts_import_binder};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
-    ReceiverValue,
+    ReceiverBudgetLimit, ReceiverValue,
 };
 use crate::analyzer::usages::reference_site::{SourceLocationRequest, resolve_reference_site};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
-    Range, WorkspaceAnalyzer,
+    AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -81,9 +86,10 @@ pub(crate) struct ReceiverQueryReport {
     pub(crate) candidates_truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReceiverQueryError {
     Cancelled,
+    SemanticProvider(SemanticProviderError),
 }
 
 pub(crate) struct ReceiverQueryService<'a> {
@@ -92,6 +98,7 @@ pub(crate) struct ReceiverQueryService<'a> {
     definitions: AnalyzerDefinitionLookup<'a>,
     prepared_files: RefCell<HashMap<ProjectFile, PreparedReceiverFile>>,
     prepared_java_files: RefCell<HashMap<ProjectFile, PreparedJavaReceiverFile>>,
+    java_class_ranges: RefCell<HashMap<ProjectFile, ClassRangeIndex>>,
 }
 
 struct PreparedReceiverFile {
@@ -109,7 +116,7 @@ struct PreparedJavaReceiverFile {
 enum SemanticReceiverGate {
     Available {
         work: ReceiverAnalysisWork,
-        points_to: Option<PointsToResult>,
+        points_to: Option<SourcePointsToResult>,
         truncated: bool,
     },
     Unavailable {
@@ -117,6 +124,7 @@ enum SemanticReceiverGate {
     },
     Exceeded {
         work: ReceiverAnalysisWork,
+        limit: ReceiverBudgetLimit,
     },
 }
 
@@ -128,6 +136,7 @@ impl<'a> ReceiverQueryService<'a> {
             definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
+            java_class_ranges: RefCell::new(HashMap::default()),
         }
     }
 
@@ -139,6 +148,7 @@ impl<'a> ReceiverQueryService<'a> {
             definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
+            java_class_ranges: RefCell::new(HashMap::default()),
         }
     }
 
@@ -198,10 +208,21 @@ impl<'a> ReceiverQueryService<'a> {
                 ));
             };
             check_cancelled(cancellation)?;
-            let Some((syntax_index, visited)) =
-                build_js_ts_receiver_syntax_index(tree.root_node(), &source, cancellation)
-            else {
-                return Err(ReceiverQueryError::Cancelled);
+            let (syntax_index, visited) = match build_js_ts_receiver_syntax_index_bounded(
+                tree.root_node(),
+                &source,
+                cancellation,
+                budget.max_scope_nodes,
+            ) {
+                JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => (index, visited),
+                JsTsReceiverSyntaxIndexBuild::ExceededScope { visited } => {
+                    return Ok(setup_budget_report(
+                        operation, file, language, range, &source, visited,
+                    ));
+                }
+                JsTsReceiverSyntaxIndexBuild::Cancelled => {
+                    return Err(ReceiverQueryError::Cancelled);
+                }
             };
             setup_nodes = visited;
             self.prepared_files.borrow_mut().insert(
@@ -214,6 +235,10 @@ impl<'a> ReceiverQueryService<'a> {
                 },
             );
         }
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: budget.max_scope_nodes.saturating_sub(setup_nodes),
+            ..budget
+        };
         let prepared_files = self.prepared_files.borrow();
         let prepared = prepared_files
             .get(file)
@@ -356,32 +381,32 @@ impl<'a> ReceiverQueryService<'a> {
             });
         };
         let cancellation = cancellation.cloned().unwrap_or_default();
-        let mut semantic_budget = receiver_semantic_budget(budget.max_scope_nodes);
-        let outcome = semantic_pointees_at_source(
-            workspace,
-            file,
-            range,
-            &mut semantic_budget,
-            &cancellation,
-        );
-        let work = semantic_receiver_work(semantic_budget.used());
+        let mut semantic = ReceiverSemanticBridge::new(budget);
+        let outcome = semantic
+            .oracle(workspace)
+            .pointees_at_source(
+                file,
+                range,
+                &mut SemanticRequest::new(&mut semantic.budget, &cancellation),
+            )
+            .map_err(ReceiverQueryError::SemanticProvider)?;
+        let work = semantic.work();
         match outcome {
-            Ok(SemanticOutcome::Cancelled { .. }) => Err(ReceiverQueryError::Cancelled),
-            Ok(SemanticOutcome::ExceededBudget { .. }) => {
-                Ok(SemanticReceiverGate::Exceeded { work })
+            SemanticOutcome::Cancelled { .. } => Err(ReceiverQueryError::Cancelled),
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                Ok(SemanticReceiverGate::Exceeded {
+                    work,
+                    limit: ReceiverSemanticBridge::receiver_limit(exceeded),
+                })
             }
-            Ok(outcome) => match outcome.available_value() {
-                Some(points_to) if !points_to.objects().candidates().is_empty() => {
-                    Ok(SemanticReceiverGate::Available {
-                        work,
-                        points_to: Some(points_to.clone()),
-                        truncated: points_to.objects().coverage()
-                            == crate::analyzer::semantic::CandidateCoverage::Truncated,
-                    })
-                }
+            outcome => match outcome.available_value() {
+                Some(points_to) if !points_to.is_empty() => Ok(SemanticReceiverGate::Available {
+                    work,
+                    points_to: Some(points_to.clone()),
+                    truncated: points_to.coverage().is_truncated(),
+                }),
                 Some(_) | None => Ok(SemanticReceiverGate::Unavailable { work }),
             },
-            Err(_) => Ok(SemanticReceiverGate::Unavailable { work }),
         }
     }
 
@@ -429,11 +454,37 @@ impl<'a> ReceiverQueryService<'a> {
                     Some(&source),
                 ));
             };
-            setup_nodes = count_named_nodes(tree.root_node(), cancellation)?;
+            setup_nodes = match walk_named_tree_preorder_bounded(
+                tree.root_node(),
+                true,
+                budget.max_scope_nodes,
+                cancellation,
+                |_| {},
+            ) {
+                BoundedNamedTreeWalk::Complete { visited } => visited,
+                BoundedNamedTreeWalk::Exceeded { visited } => {
+                    return Ok(setup_budget_report(
+                        operation,
+                        file,
+                        Language::Java,
+                        range,
+                        &source,
+                        visited,
+                    ));
+                }
+                BoundedNamedTreeWalk::Cancelled => return Err(ReceiverQueryError::Cancelled),
+            };
+            self.java_class_ranges
+                .borrow_mut()
+                .insert(file.clone(), ClassRangeIndex::build(self.analyzer, file));
             self.prepared_java_files
                 .borrow_mut()
                 .insert(file.clone(), PreparedJavaReceiverFile { source, tree });
         }
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: budget.max_scope_nodes.saturating_sub(setup_nodes),
+            ..budget
+        };
 
         let prepared_files = self.prepared_java_files.borrow();
         let prepared = prepared_files
@@ -479,48 +530,90 @@ impl<'a> ReceiverQueryService<'a> {
             }
         };
         let query_range = node_range(query_node);
-        let member_name = java_member_at_site(input_node, &prepared.source);
-        let mut semantic_budget = receiver_semantic_budget(budget.max_scope_nodes);
-        let cancellation = cancellation.cloned().unwrap_or_default();
-        let semantic = semantic_pointees_at_source(
-            workspace,
-            file,
-            query_range,
-            &mut semantic_budget,
-            &cancellation,
-        );
-        let semantic = match semantic {
-            Ok(SemanticOutcome::Cancelled { .. }) => return Err(ReceiverQueryError::Cancelled),
-            Ok(SemanticOutcome::ExceededBudget { .. }) => {
-                return Ok(java_budget_report(
+        let member_node = java_member_node_at_site(input_node);
+        let member_name = member_node.and_then(|member| {
+            prepared
+                .source
+                .get(member.start_byte()..member.end_byte())
+                .map(str::to_string)
+        });
+        let semantic = self.semantic_receiver_gate(file, query_range, budget, cancellation)?;
+        let (points_to, mut work, mut candidates_truncated) = match semantic {
+            SemanticReceiverGate::Available {
+                work,
+                points_to: Some(points_to),
+                truncated,
+            } => (points_to, work, truncated),
+            SemanticReceiverGate::Available {
+                work,
+                points_to: None,
+                ..
+            }
+            | SemanticReceiverGate::Unavailable { work } => {
+                let mut report =
+                    java_unknown_report(operation, file, query_node, &prepared.source, member_name);
+                report.work = work;
+                report.work.setup_nodes = setup_nodes;
+                return Ok(report);
+            }
+            SemanticReceiverGate::Exceeded { mut work, limit } => {
+                work.setup_nodes = setup_nodes;
+                return Ok(budget_report(
                     operation,
-                    file,
-                    query_node,
-                    &prepared.source,
-                    member_name,
-                    setup_nodes,
-                    semantic_receiver_work(semantic_budget.used()),
+                    site(
+                        file,
+                        Language::Java,
+                        node_range(query_node),
+                        &prepared.source,
+                        query_node.kind(),
+                        member_name,
+                    ),
+                    work,
+                    limit,
                 ));
             }
-            Err(_) => None,
-            Ok(outcome) => outcome.available_value().cloned(),
         };
-        let Some(points_to) = semantic else {
-            let mut report =
-                java_unknown_report(operation, file, query_node, &prepared.source, member_name);
-            report.work = semantic_receiver_work(semantic_budget.used());
-            report.work.setup_nodes = setup_nodes;
-            return Ok(report);
-        };
-        if points_to.objects().candidates().is_empty() {
-            let mut report =
-                java_unknown_report(operation, file, query_node, &prepared.source, member_name);
-            report.work = semantic_receiver_work(semantic_budget.used());
-            report.work.setup_nodes = setup_nodes;
-            return Ok(report);
-        }
 
         self.definitions.set_language(Language::Java);
+        work.setup_nodes = setup_nodes;
+        if operation == ReceiverQueryOperation::MemberTargets {
+            let Some(member_node) = member_node else {
+                let mut report =
+                    java_unknown_report(operation, file, query_node, &prepared.source, member_name);
+                report.work = work;
+                return Ok(report);
+            };
+            let Some(outcome) = java_definition_at(
+                self.analyzer,
+                &self.definitions,
+                file,
+                &prepared.source,
+                &prepared.tree,
+                member_node,
+            ) else {
+                let mut report =
+                    java_unknown_report(operation, file, query_node, &prepared.source, member_name);
+                report.work = work;
+                return Ok(report);
+            };
+            let (outcome, truncated) = java_definition_outcome(outcome, budget.max_targets);
+            candidates_truncated |= truncated;
+            return Ok(ReceiverQueryReport {
+                operation,
+                site: site(
+                    file,
+                    Language::Java,
+                    query_range,
+                    &prepared.source,
+                    query_node.kind(),
+                    member_name,
+                ),
+                analysis: ReceiverQueryAnalysis::MemberTargets(outcome),
+                work,
+                candidates_truncated,
+            });
+        }
+
         let mut type_outcome = java_type_outcome_at(
             self.analyzer,
             &self.definitions,
@@ -531,7 +624,7 @@ impl<'a> ReceiverQueryService<'a> {
         );
         if type_outcome.types.is_empty() {
             let receiver_owners =
-                java_current_receiver_owners(workspace, &self.definitions, &points_to);
+                java_current_receiver_owners(workspace, &self.java_class_ranges, &points_to);
             if !receiver_owners.is_empty() {
                 let fqn = receiver_owners[0].fq_name();
                 type_outcome.status = TypeLookupStatus::Resolved;
@@ -553,42 +646,14 @@ impl<'a> ReceiverQueryService<'a> {
                 context_node,
             );
         }
-        let mut work = semantic_receiver_work(semantic_budget.used());
-        work.setup_nodes = setup_nodes;
-        let mut candidates_truncated = points_to.objects().coverage()
-            == crate::analyzer::semantic::CandidateCoverage::Truncated
-            || type_outcome
-                .types
-                .iter()
-                .map(|ty| ty.definitions.len())
-                .sum::<usize>()
-                > budget.max_targets;
+        candidates_truncated |= type_outcome
+            .types
+            .iter()
+            .map(|ty| ty.definitions.len())
+            .sum::<usize>()
+            > budget.max_targets;
 
         let analysis = match operation {
-            ReceiverQueryOperation::MemberTargets => {
-                let Some(member_name) = member_name.as_deref() else {
-                    let mut report = java_unknown_report(
-                        operation,
-                        file,
-                        query_node,
-                        &prepared.source,
-                        member_name,
-                    );
-                    report.work = work;
-                    return Ok(report);
-                };
-                let (targets, truncated) = java_member_targets(
-                    &self.definitions,
-                    &type_outcome,
-                    member_name,
-                    budget.max_targets,
-                );
-                candidates_truncated |= truncated;
-                ReceiverQueryAnalysis::MemberTargets(java_type_outcome(
-                    type_outcome.status,
-                    targets,
-                ))
-            }
             ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
                 let (values, truncated) = java_receiver_values(
                     workspace,
@@ -614,6 +679,9 @@ impl<'a> ReceiverQueryService<'a> {
                 );
                 candidates_truncated |= truncated;
                 ReceiverQueryAnalysis::Values(java_type_outcome(type_outcome.status, values))
+            }
+            ReceiverQueryOperation::MemberTargets => {
+                unreachable!("member targets return through the exact Java resolver above")
             }
         };
 
@@ -660,8 +728,8 @@ fn apply_semantic_gate(
             neutral_unknown(&mut report.analysis);
             work
         }
-        SemanticReceiverGate::Exceeded { work } => {
-            neutral_exceeded(&mut report.analysis);
+        SemanticReceiverGate::Exceeded { work, limit } => {
+            neutral_exceeded(&mut report.analysis, limit);
             work
         }
     };
@@ -678,7 +746,7 @@ fn apply_semantic_gate(
 
 fn retain_neutral_backed_values(
     analysis: &mut ReceiverQueryAnalysis,
-    points_to: &PointsToResult,
+    points_to: &SourcePointsToResult,
 ) -> bool {
     let ReceiverQueryAnalysis::Values(outcome) = analysis else {
         return false;
@@ -695,9 +763,7 @@ fn retain_neutral_backed_values(
     let original_len = values.len();
     values.retain(|value| {
         points_to
-            .objects()
-            .candidates()
-            .iter()
+            .object_candidates()
             .any(|candidate| neutral_object_supports_receiver(candidate.value().identity(), value))
     });
     let removed = values.len() != original_len;
@@ -783,206 +849,161 @@ fn replace_with_neutral_unknown<T>(outcome: &mut ReceiverAnalysisOutcome<T>) {
     }
 }
 
-fn neutral_exceeded(analysis: &mut ReceiverQueryAnalysis) {
+fn neutral_exceeded(analysis: &mut ReceiverQueryAnalysis, limit: ReceiverBudgetLimit) {
     match analysis {
-        ReceiverQueryAnalysis::Values(outcome) => replace_with_neutral_exceeded(outcome),
-        ReceiverQueryAnalysis::MemberTargets(outcome) => replace_with_neutral_exceeded(outcome),
-    }
-}
-
-fn replace_with_neutral_exceeded<T>(outcome: &mut ReceiverAnalysisOutcome<T>) {
-    if !matches!(outcome, ReceiverAnalysisOutcome::Unsupported { .. }) {
-        *outcome = ReceiverAnalysisOutcome::ExceededBudget {
-            limit: "scope_nodes",
-        };
-    }
-}
-
-fn semantic_pointees_at_source(
-    workspace: &WorkspaceAnalyzer,
-    file: &ProjectFile,
-    range: Range,
-    budget: &mut SemanticBudget,
-    cancellation: &CancellationToken,
-) -> Result<SemanticOutcome<PointsToResult>, crate::analyzer::semantic::SemanticProviderError> {
-    let artifact = workspace
-        .materialize_program_semantics(file, &mut SemanticRequest::new(budget, cancellation))?;
-    let Some(artifact) = artifact.available_value() else {
-        return Ok(match artifact {
-            SemanticOutcome::ExceededBudget { exceeded, work, .. } => {
-                SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                }
-            }
-            SemanticOutcome::Cancelled { work, .. } => SemanticOutcome::Cancelled {
-                partial: None,
-                work,
-            },
-            SemanticOutcome::Unsupported {
-                capability, work, ..
-            } => SemanticOutcome::Unsupported {
-                capability,
-                partial: None,
-                work,
-            },
-            SemanticOutcome::Complete { .. }
-            | SemanticOutcome::Ambiguous { .. }
-            | SemanticOutcome::Unknown { .. }
-            | SemanticOutcome::Unproven { .. } => SemanticOutcome::Unknown {
-                partial: None,
-                work: artifact.work(),
-            },
-        });
-    };
-    let Some(value) = source_value_observation(artifact, range) else {
-        return Ok(SemanticOutcome::Unknown {
-            partial: None,
-            work: artifact.work(),
-        });
-    };
-    workspace
-        .semantic_oracle_provider()
-        .pointees(&value, &mut SemanticRequest::new(budget, cancellation))
-}
-
-fn source_value_observation(
-    artifact: &Arc<crate::analyzer::semantic::SemanticArtifact>,
-    range: Range,
-) -> Option<ValueAtPoint> {
-    let mut best: Option<(usize, ValueAtPoint)> = None;
-    for procedure in artifact.procedures() {
-        let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
-            continue;
-        };
-        for value in procedure.values() {
-            let Some(mapping) = procedure.source_mapping(value.source) else {
-                continue;
-            };
-            let span = mapping.locator.anchor().span();
-            if (span.start_byte() as usize) > range.start_byte
-                || (span.end_byte() as usize) < range.end_byte
-            {
-                continue;
-            }
-            let Some(point) = procedure
-                .points()
-                .iter()
-                .filter(|point| point.source == value.source)
-                .max_by_key(|point| point.id.index())
-                .or_else(|| {
-                    procedure
-                        .points()
-                        .iter()
-                        .filter(|point| {
-                            procedure
-                                .source_mapping(point.source)
-                                .is_some_and(|mapping| {
-                                    let point_span = mapping.locator.anchor().span();
-                                    point_span.start_byte() as usize <= range.start_byte
-                                        && point_span.end_byte() as usize >= range.end_byte
-                                })
-                        })
-                        .min_by_key(|point| {
-                            procedure
-                                .source_mapping(point.source)
-                                .map_or(usize::MAX, |mapping| {
-                                    let point_span = mapping.locator.anchor().span();
-                                    (point_span.end_byte() - point_span.start_byte()) as usize
-                                })
-                        })
-                })
-            else {
-                continue;
-            };
-            let (Some(value_handle), Some(point_handle)) = (
-                procedure_handle.value_handle(value.id),
-                procedure_handle.point_handle(point.id),
-            ) else {
-                continue;
-            };
-            let Some(observation) = ValueAtPoint::new(
-                value_handle,
-                point_handle,
-                ObservationPhase::AfterEffects,
-                OracleCallContext::empty(),
-            )
-            .ok() else {
-                continue;
-            };
-            let width = (span.end_byte() - span.start_byte()) as usize;
-            if best
-                .as_ref()
-                .is_none_or(|(best_width, _)| width < *best_width)
-            {
-                best = Some((width, observation));
-            }
+        ReceiverQueryAnalysis::Values(outcome) => replace_with_neutral_exceeded(outcome, limit),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => {
+            replace_with_neutral_exceeded(outcome, limit)
         }
     }
-    best.map(|(_, observation)| observation)
 }
 
-fn semantic_receiver_work(work: crate::analyzer::semantic::SemanticWork) -> ReceiverAnalysisWork {
-    ReceiverAnalysisWork {
-        setup_nodes: 0,
-        summary_expansions: work
-            .call_sites
-            .saturating_add(work.memory_locations)
-            .saturating_add(work.captures)
-            .saturating_add(work.nested_entries),
-        scope_nodes: work
-            .procedures
-            .saturating_add(work.program_points)
-            .saturating_add(work.values)
-            .saturating_add(work.events)
-            .saturating_add(work.control_edges),
+fn replace_with_neutral_exceeded<T>(
+    outcome: &mut ReceiverAnalysisOutcome<T>,
+    limit: ReceiverBudgetLimit,
+) {
+    if !matches!(outcome, ReceiverAnalysisOutcome::Unsupported { .. }) {
+        *outcome = ReceiverAnalysisOutcome::ExceededBudget {
+            limit: limit.as_str(),
+        };
     }
 }
 
-fn receiver_semantic_budget(scope_nodes: usize) -> SemanticBudget {
-    let rows = scope_nodes.max(1);
-    let nested = rows.saturating_mul(16).max(1);
-    let text = rows.saturating_mul(1_024).max(1);
-    SemanticBudget::new(crate::analyzer::semantic::SemanticWork {
-        source_bytes: text,
-        procedures: rows,
-        blocks: rows,
-        program_points: rows,
-        values: rows,
-        allocations: rows,
-        call_sites: rows,
-        memory_locations: rows,
-        captures: rows,
-        source_mappings: rows,
-        evidence: rows,
-        gaps: rows,
-        events: nested,
-        control_edges: nested,
-        nested_entries: nested,
-        owned_text_bytes: text,
-    })
-    .expect("receiver semantic budget is positive")
+struct ReceiverSemanticBridge {
+    budget: SemanticBudget,
+    oracle_limits: OracleLimits,
+}
+
+impl ReceiverSemanticBridge {
+    fn new(receiver: ReceiverAnalysisBudget) -> Self {
+        let scope = receiver.max_scope_nodes.max(1);
+        let summaries = receiver.max_summary_expansions.max(1);
+        let targets = receiver.max_targets.max(1);
+        // Oracle limits are positive by contract. Source projections always
+        // start with an empty OracleCallContext, so this representational
+        // minimum does not retain a call frame when receiver context depth is
+        // explicitly zero.
+        let context = receiver.context_depth.max(1);
+        let traversal = scope
+            .saturating_mul(context.saturating_add(1))
+            .saturating_add(summaries.saturating_mul(targets))
+            .max(1);
+        let text = scope.saturating_mul(1_024).max(1);
+        let budget = SemanticBudget::new(SemanticWork {
+            source_bytes: text,
+            procedures: scope,
+            blocks: scope,
+            program_points: scope,
+            values: scope,
+            allocations: scope,
+            call_sites: summaries,
+            memory_locations: summaries,
+            captures: summaries,
+            source_mappings: scope,
+            evidence: scope,
+            gaps: scope,
+            events: traversal,
+            control_edges: traversal,
+            nested_entries: traversal,
+            owned_text_bytes: text,
+        })
+        .expect("receiver semantic budget is positive");
+
+        let defaults = OracleLimits::default().values();
+        let oracle_limits = OracleLimits::new(OracleLimitValues {
+            dispatch_targets: targets,
+            objects_per_value: targets,
+            alias_breadth: targets,
+            source_observations: targets,
+            call_context_depth: context,
+            summary_depth: summaries,
+            call_binding_entries: summaries,
+            ..defaults
+        })
+        .expect("receiver oracle limits are positive");
+        Self {
+            budget,
+            oracle_limits,
+        }
+    }
+
+    fn oracle<'workspace>(
+        &self,
+        workspace: &'workspace WorkspaceAnalyzer,
+    ) -> WorkspaceSemanticOracle<'workspace> {
+        WorkspaceSemanticOracle::with_limits(workspace, self.oracle_limits)
+    }
+
+    fn work(&self) -> ReceiverAnalysisWork {
+        Self::receiver_work(self.budget.used())
+    }
+
+    fn receiver_work(work: SemanticWork) -> ReceiverAnalysisWork {
+        ReceiverAnalysisWork {
+            setup_nodes: 0,
+            summary_expansions: work
+                .call_sites
+                .saturating_add(work.memory_locations)
+                .saturating_add(work.captures)
+                .saturating_add(work.nested_entries),
+            scope_nodes: work
+                .procedures
+                .saturating_add(work.blocks)
+                .saturating_add(work.program_points)
+                .saturating_add(work.values)
+                .saturating_add(work.allocations)
+                .saturating_add(work.source_mappings)
+                .saturating_add(work.evidence)
+                .saturating_add(work.gaps)
+                .saturating_add(work.events)
+                .saturating_add(work.control_edges),
+        }
+    }
+
+    fn receiver_limit(exceeded: SemanticBudgetExceeded) -> ReceiverBudgetLimit {
+        match exceeded.dimension() {
+            SemanticBudgetDimension::CallSites
+            | SemanticBudgetDimension::MemoryLocations
+            | SemanticBudgetDimension::Captures
+            | SemanticBudgetDimension::NestedEntries => ReceiverBudgetLimit::SummaryExpansions,
+            SemanticBudgetDimension::SourceBytes
+            | SemanticBudgetDimension::Procedures
+            | SemanticBudgetDimension::Blocks
+            | SemanticBudgetDimension::ProgramPoints
+            | SemanticBudgetDimension::Values
+            | SemanticBudgetDimension::Allocations
+            | SemanticBudgetDimension::SourceMappings
+            | SemanticBudgetDimension::Evidence
+            | SemanticBudgetDimension::Gaps
+            | SemanticBudgetDimension::Events
+            | SemanticBudgetDimension::ControlEdges
+            | SemanticBudgetDimension::OwnedTextBytes => ReceiverBudgetLimit::ScopeNodes,
+        }
+    }
 }
 
 fn java_receiver_values(
     workspace: &WorkspaceAnalyzer,
-    points_to: &PointsToResult,
+    points_to: &SourcePointsToResult,
     type_outcome: &crate::analyzer::usages::get_type::TypeLookupOutcome,
     factory: Option<CodeUnit>,
     type_reference: bool,
     limit: usize,
 ) -> (Vec<ReceiverValue>, bool) {
-    let allocations = points_to
-        .objects()
-        .candidates()
-        .iter()
-        .filter_map(|candidate| match candidate.value().identity() {
-            AbstractObjectIdentity::Allocation(allocation) => Some(allocation),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let current_receiver = points_to.objects().candidates().iter().any(|candidate| {
+    let mut allocations = Vec::new();
+    for allocation in
+        points_to
+            .object_candidates()
+            .filter_map(|candidate| match candidate.value().identity() {
+                AbstractObjectIdentity::Allocation(allocation) => Some(allocation),
+                _ => None,
+            })
+    {
+        if !allocations.contains(&allocation) {
+            allocations.push(allocation);
+        }
+    }
+    let current_receiver = points_to.object_candidates().any(|candidate| {
         matches!(
             candidate.value().identity(),
             AbstractObjectIdentity::ProcedurePort(port)
@@ -1176,70 +1197,78 @@ fn java_contextual_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn java_member_targets(
-    definitions: &AnalyzerDefinitionLookup<'_>,
-    type_outcome: &crate::analyzer::usages::get_type::TypeLookupOutcome,
-    member_name: &str,
+fn java_definition_outcome(
+    outcome: DefinitionLookupOutcome,
     limit: usize,
-) -> (Vec<CodeUnit>, bool) {
-    let mut targets = Vec::new();
-    for owner in type_outcome
-        .types
-        .iter()
-        .flat_map(|ty| ty.definitions.iter())
-    {
-        for candidate in definitions.fqn_direct_children(&owner.fq_name()) {
-            if candidate.identifier() == member_name && !targets.contains(&candidate) {
-                if targets.len() == limit {
-                    return (targets, true);
-                }
-                targets.push(candidate);
-            }
+) -> (ReceiverAnalysisOutcome<CodeUnit>, bool) {
+    let mut definitions = Vec::new();
+    for definition in outcome.definitions {
+        if !definitions.contains(&definition) {
+            definitions.push(definition);
         }
     }
-    (targets, false)
+    let truncated = definitions.len() > limit;
+    definitions.truncate(limit);
+    let outcome = if definitions.is_empty() {
+        ReceiverAnalysisOutcome::Unknown
+    } else {
+        match outcome.status {
+            DefinitionLookupStatus::Resolved => ReceiverAnalysisOutcome::Precise(definitions),
+            DefinitionLookupStatus::Ambiguous => ReceiverAnalysisOutcome::Ambiguous(definitions),
+            DefinitionLookupStatus::UnsupportedLanguage => ReceiverAnalysisOutcome::Unsupported {
+                reason: "receiver_analysis_language_unsupported",
+            },
+            DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::UnresolvableImportBoundary
+            | DefinitionLookupStatus::InvalidLocation
+            | DefinitionLookupStatus::NotFound => ReceiverAnalysisOutcome::Unknown,
+        }
+    };
+    (outcome, truncated)
 }
 
 fn java_current_receiver_owners(
     workspace: &WorkspaceAnalyzer,
-    definitions: &AnalyzerDefinitionLookup<'_>,
-    points_to: &PointsToResult,
+    class_ranges: &RefCell<HashMap<ProjectFile, ClassRangeIndex>>,
+    points_to: &SourcePointsToResult,
 ) -> Vec<CodeUnit> {
+    let analyzer = workspace.analyzer();
     let mut owners = Vec::new();
-    for port in points_to
-        .objects()
-        .candidates()
-        .iter()
-        .filter_map(|candidate| match candidate.value().identity() {
-            AbstractObjectIdentity::ProcedurePort(port)
-                if port.kind() == crate::analyzer::semantic::ProcedurePortKind::Receiver =>
-            {
-                Some(port)
-            }
-            _ => None,
-        })
+    for port in
+        points_to
+            .object_candidates()
+            .filter_map(|candidate| match candidate.value().identity() {
+                AbstractObjectIdentity::ProcedurePort(port)
+                    if port.kind() == crate::analyzer::semantic::ProcedurePortKind::Receiver =>
+                {
+                    Some(port)
+                }
+                _ => None,
+            })
     {
-        let Some(name) = port
+        let file = ProjectFile::new(
+            analyzer.project().root().to_path_buf(),
+            port.procedure().artifact().key().path().as_path(),
+        );
+        if !class_ranges.borrow().contains_key(&file) {
+            class_ranges
+                .borrow_mut()
+                .insert(file.clone(), ClassRangeIndex::build(analyzer, &file));
+        }
+        let byte = port
             .procedure()
             .semantics()
             .locator()
-            .declaration()
-            .segments()
-            .iter()
-            .rev()
-            .find(|segment| segment.kind() == DeclarationSegmentKind::Type)
-            .and_then(|segment| segment.name())
-        else {
-            continue;
-        };
-        let file = ProjectFile::new(
-            workspace.analyzer().project().root().to_path_buf(),
-            port.procedure().artifact().key().path().as_path(),
-        );
-        for candidate in definitions.file_identifier(&file, name) {
-            if candidate.is_class() && !owners.contains(&candidate) {
-                owners.push(candidate);
-            }
+            .anchor()
+            .span()
+            .start_byte() as usize;
+        if let Some(owner) = class_ranges
+            .borrow()
+            .get(&file)
+            .and_then(|ranges| ranges.enclosing_unit(byte))
+            && !owners.contains(owner)
+        {
+            owners.push(owner.clone());
         }
     }
     owners
@@ -1292,38 +1321,27 @@ fn java_unknown_report(
     }
 }
 
-fn java_budget_report(
+fn budget_report(
     operation: ReceiverQueryOperation,
-    file: &ProjectFile,
-    node: Node<'_>,
-    source: &str,
-    member_name: Option<String>,
-    setup_nodes: usize,
-    mut work: ReceiverAnalysisWork,
+    site: ReceiverQuerySite,
+    work: ReceiverAnalysisWork,
+    limit: ReceiverBudgetLimit,
 ) -> ReceiverQueryReport {
     let analysis = match operation {
         ReceiverQueryOperation::MemberTargets => {
             ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes",
+                limit: limit.as_str(),
             })
         }
         ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
             ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes",
+                limit: limit.as_str(),
             })
         }
     };
-    work.setup_nodes = setup_nodes;
     ReceiverQueryReport {
         operation,
-        site: site(
-            file,
-            Language::Java,
-            node_range(node),
-            source,
-            node.kind(),
-            member_name,
-        ),
+        site,
         analysis,
         work,
         candidates_truncated: false,
@@ -1340,7 +1358,7 @@ fn java_receiver_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn java_member_at_site(mut node: Node<'_>, source: &str) -> Option<String> {
+fn java_member_node_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         let member = match node.kind() {
             "method_invocation" => node.child_by_field_name("name"),
@@ -1348,31 +1366,10 @@ fn java_member_at_site(mut node: Node<'_>, source: &str) -> Option<String> {
             _ => None,
         };
         if let Some(member) = member {
-            return source
-                .get(member.start_byte()..member.end_byte())
-                .map(str::to_string);
+            return Some(member);
         }
         node = node.parent()?;
     }
-}
-
-fn count_named_nodes(
-    root: Node<'_>,
-    cancellation: Option<&CancellationToken>,
-) -> Result<usize, ReceiverQueryError> {
-    let mut stack = vec![root];
-    let mut visited = 0usize;
-    while let Some(node) = stack.pop() {
-        check_cancelled(cancellation)?;
-        if node.is_named() {
-            visited = visited.saturating_add(1);
-        }
-        let mut cursor = node.walk();
-        let mut children = node.children(&mut cursor).collect::<Vec<_>>();
-        children.reverse();
-        stack.extend(children);
-    }
-    Ok(visited)
 }
 
 fn values_report(
@@ -1425,6 +1422,25 @@ fn unsupported_report(
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
     }
+}
+
+fn setup_budget_report(
+    operation: ReceiverQueryOperation,
+    file: &ProjectFile,
+    language: Language,
+    range: Range,
+    source: &str,
+    setup_nodes: usize,
+) -> ReceiverQueryReport {
+    budget_report(
+        operation,
+        site(file, language, range, source, "setup", None),
+        ReceiverAnalysisWork {
+            setup_nodes,
+            ..ReceiverAnalysisWork::default()
+        },
+        ReceiverBudgetLimit::ScopeNodes,
+    )
 }
 
 fn site(
@@ -1688,8 +1704,16 @@ class Sample {
             .expect("second Java receiver query");
 
         assert_eq!(service.prepared_file_count(), 1);
+        assert_eq!(service.java_class_ranges.borrow().len(), 1);
         assert!(first.work.setup_nodes > 0);
         assert_eq!(second.work.setup_nodes, 0);
+        for report in [&first, &second] {
+            assert!(matches!(
+                report.analysis,
+                ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(ref targets))
+                    if targets.len() == 1
+            ));
+        }
 
         let capped = service
             .analyze(
@@ -1704,7 +1728,7 @@ class Sample {
                 None,
             )
             .expect("candidate-capped Java receiver query");
-        assert!(capped.candidates_truncated);
+        assert!(!capped.candidates_truncated);
         assert!(matches!(
             capped.analysis,
             ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(ref targets))
@@ -1728,6 +1752,7 @@ class Sample {
                 limit: "scope_nodes"
             })
         ));
+        assert_eq!(bounded.work.setup_nodes, 2);
 
         let cancellation = CancellationToken::default();
         cancellation.cancel();
@@ -1742,6 +1767,50 @@ class Sample {
             ),
             Err(ReceiverQueryError::Cancelled)
         );
+    }
+
+    #[test]
+    fn java_current_receiver_keeps_exact_nested_owner_identity() {
+        let source = r#"
+class Left {
+    static class Worker {
+        void helper() {}
+        void caller() { this.helper(); }
+    }
+}
+class Right {
+    static class Worker {
+        void helper() {}
+        void caller() { this.helper(); }
+    }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Nested.java"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::Java)),
+            AnalyzerConfig::default(),
+        );
+        let report = ReceiverQueryService::from_workspace(&workspace)
+            .analyze(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                marker_range(source, "this.helper"),
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("nested current-receiver query");
+
+        assert!(matches!(
+            report.analysis,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(ref values))
+                if matches!(values.as_slice(), [ReceiverValue::CurrentReceiver(owner)]
+                    if owner.fq_name().contains("Left.Worker")
+                        && !owner.fq_name().contains("Right.Worker"))
+        ));
     }
 
     #[test]
@@ -1774,7 +1843,14 @@ export function caller() {
                 limit: "scope_nodes"
             })
         ));
-        assert!(report.work.scope_nodes > ReceiverAnalysisBudget::tiny().max_scope_nodes);
+        assert_eq!(report.work.setup_nodes, 2);
+        assert!(
+            report
+                .work
+                .setup_nodes
+                .saturating_add(report.work.scope_nodes)
+                > ReceiverAnalysisBudget::tiny().max_scope_nodes
+        );
 
         let cancellation = CancellationToken::default();
         cancellation.cancel();
@@ -1789,5 +1865,119 @@ export function caller() {
             ),
             Err(ReceiverQueryError::Cancelled)
         );
+    }
+
+    #[test]
+    fn receiver_semantic_bridge_uses_every_receiver_limit() {
+        let bridge = ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
+            context_depth: 2,
+            max_targets: 3,
+            max_summary_expansions: 5,
+            max_scope_nodes: 7,
+        });
+        let semantic = bridge.budget.limits();
+        assert_eq!(semantic.procedures, 7);
+        assert_eq!(semantic.call_sites, 5);
+        assert_eq!(semantic.source_bytes, 7 * 1_024);
+        assert_eq!(semantic.nested_entries, 7 * 3 + 5 * 3);
+
+        let oracle = bridge.oracle_limits.values();
+        assert_eq!(oracle.dispatch_targets, 3);
+        assert_eq!(oracle.objects_per_value, 3);
+        assert_eq!(oracle.alias_breadth, 3);
+        assert_eq!(oracle.source_observations, 3);
+        assert_eq!(oracle.call_context_depth, 2);
+        assert_eq!(oracle.summary_depth, 5);
+        assert_eq!(oracle.call_binding_entries, 5);
+
+        let zero_context = ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
+            context_depth: 0,
+            ..ReceiverAnalysisBudget::default()
+        });
+        assert_eq!(zero_context.oracle_limits.call_context_depth(), 1);
+    }
+
+    #[test]
+    fn receiver_semantic_bridge_translates_all_row_work_and_limit_kinds() {
+        let translated = ReceiverSemanticBridge::receiver_work(SemanticWork {
+            source_bytes: usize::MAX,
+            procedures: 1,
+            blocks: 1,
+            program_points: 1,
+            values: 1,
+            allocations: 1,
+            call_sites: 1,
+            memory_locations: 1,
+            captures: 1,
+            source_mappings: 1,
+            evidence: 1,
+            gaps: 1,
+            events: 1,
+            control_edges: 1,
+            nested_entries: 1,
+            owned_text_bytes: usize::MAX,
+        });
+        assert_eq!(translated.setup_nodes, 0);
+        assert_eq!(translated.summary_expansions, 4);
+        assert_eq!(translated.scope_nodes, 10);
+
+        let budget = SemanticBudget::uniform(1).unwrap();
+        let summary = budget
+            .check(SemanticWork {
+                call_sites: 2,
+                ..SemanticWork::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            ReceiverSemanticBridge::receiver_limit(summary),
+            ReceiverBudgetLimit::SummaryExpansions
+        );
+        let scope = budget
+            .check(SemanticWork {
+                events: 2,
+                ..SemanticWork::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            ReceiverSemanticBridge::receiver_limit(scope),
+            ReceiverBudgetLimit::ScopeNodes
+        );
+    }
+
+    #[test]
+    fn semantic_receiver_gate_preserves_provider_identity_failures() {
+        let source = "export const value = {};\n";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::TypeScript)),
+            AnalyzerConfig::default(),
+        );
+        let foreign = tempfile::tempdir().expect("foreign temp dir");
+        let foreign_file = ProjectFile::new(
+            foreign.path().canonicalize().expect("foreign root"),
+            PathBuf::from("app.ts"),
+        );
+
+        let result = ReceiverQueryService::from_workspace(&workspace).semantic_receiver_gate(
+            &foreign_file,
+            Range {
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 0,
+                end_line: 0,
+            },
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ReceiverQueryError::SemanticProvider(
+                SemanticProviderError::InvalidIdentity(_)
+            ))
+        ));
     }
 }

@@ -41,8 +41,8 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
 use crate::analyzer::usages::receiver_query::{
-    ReceiverQueryAnalysis, ReceiverQueryInput, ReceiverQueryOperation, ReceiverQueryReport,
-    ReceiverQueryService,
+    ReceiverQueryAnalysis, ReceiverQueryError, ReceiverQueryInput, ReceiverQueryOperation,
+    ReceiverQueryReport, ReceiverQueryService,
 };
 use crate::analyzer::usages::{
     CallBindingCache, CallBindingStatus, CallRelationDiagnostic, CallRelationDiagnosticCode,
@@ -652,6 +652,7 @@ pub enum CodeQueryDiagnosticCode {
     UnsupportedImportAnalysis,
     SemanticResultsOmitted,
     ReceiverAnalysisPartial,
+    ReceiverAnalysisFailed,
     CallRelationBudgetExhausted,
     CallRelationParseFailed,
     CallRelationCandidatesOmitted,
@@ -685,6 +686,7 @@ impl CodeQueryDiagnosticCode {
             Self::UnsupportedImportAnalysis => "unsupported_import_analysis",
             Self::SemanticResultsOmitted => "semantic_results_omitted",
             Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
+            Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
             Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
             Self::CallRelationParseFailed => "call_relation_parse_failed",
             Self::CallRelationCandidatesOmitted => "call_relation_candidates_omitted",
@@ -3696,6 +3698,7 @@ fn append_diagnostic_terminations(
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+            | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
             | CodeQueryDiagnosticCode::CallRelationParseFailed
             | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
             | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
@@ -4645,8 +4648,7 @@ fn apply_pipeline_step(
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
     let mut semantic_omissions: BTreeMap<(Language, &'static str), usize> = BTreeMap::new();
-    let mut receiver_diagnostics: BTreeMap<(Language, &'static str, String), usize> =
-        BTreeMap::new();
+    let mut receiver_diagnostics = ReceiverDiagnostics::new();
     let mut enclosing_declarations: HashMap<ProjectFile, EnclosingDeclarationIndex> =
         HashMap::default();
     let mut exhausted = false;
@@ -5122,16 +5124,24 @@ fn apply_pipeline_step(
         });
     }
     append_semantic_omission_diagnostics(diagnostics, step, semantic_omissions);
-    for ((language, operation, reason), count) in receiver_diagnostics {
+    for ((code, language, operation, reason), count) in receiver_diagnostics {
+        let message = if code == CodeQueryDiagnosticCode::ReceiverAnalysisFailed {
+            format!(
+                "{operation} failed for {count} analysis input{}: {reason}",
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "{operation} returned {count} analysis row{} with {reason}",
+                if count == 1 { "" } else { "s" }
+            )
+        };
         diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+            code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: language.config_label(),
-            message: format!(
-                "{operation} returned {count} analysis row{} with {reason}",
-                if count == 1 { "" } else { "s" }
-            ),
+            message,
         });
     }
     if let Some(instrumentation) = instrumentation {
@@ -5170,6 +5180,9 @@ fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
         _ => unreachable!("receiver operation requested for a non-receiver step"),
     }
 }
+
+type ReceiverDiagnostics =
+    BTreeMap<(CodeQueryDiagnosticCode, Language, &'static str, String), usize>;
 
 fn structural_receiver_ranges(
     seed: &SeedMatch,
@@ -5247,7 +5260,7 @@ fn receiver_analysis_expansions(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
-    receiver_diagnostics: &mut BTreeMap<(Language, &'static str, String), usize>,
+    receiver_diagnostics: &mut ReceiverDiagnostics,
     shared_budget_exhausted: &mut bool,
     receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
@@ -5269,12 +5282,25 @@ fn receiver_analysis_expansions(
             max_summary_expansions: base.max_summary_expansions.min(remaining_facts),
             max_scope_nodes: base.max_scope_nodes.min(remaining_facts),
         };
-        let Ok(report) =
-            service.analyze(operation, file, range, input, receiver_budget, cancellation)
-        else {
-            *shared_budget_exhausted = true;
-            break;
-        };
+        let report =
+            match service.analyze(operation, file, range, input, receiver_budget, cancellation) {
+                Ok(report) => report,
+                Err(ReceiverQueryError::Cancelled) => {
+                    *shared_budget_exhausted = true;
+                    break;
+                }
+                Err(ReceiverQueryError::SemanticProvider(error)) => {
+                    *receiver_diagnostics
+                        .entry((
+                            CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
+                            crate::analyzer::common::language_for_file(file),
+                            operation.as_str(),
+                            error.to_string(),
+                        ))
+                        .or_default() += 1;
+                    break;
+                }
+            };
 
         let candidate_count = receiver_candidate_count(&report);
         budget.fact_nodes = budget
@@ -5300,6 +5326,7 @@ fn receiver_analysis_expansions(
             }) => {
                 *receiver_diagnostics
                     .entry((
+                        CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                         language,
                         operation.as_str(),
                         format!("unsupported provider or shape: {reason}"),
@@ -5313,6 +5340,7 @@ fn receiver_analysis_expansions(
                 *receiver_truncated = true;
                 *receiver_diagnostics
                     .entry((
+                        CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                         language,
                         operation.as_str(),
                         format!("exceeded receiver limit {limit}"),
@@ -5334,6 +5362,7 @@ fn receiver_analysis_expansions(
             *receiver_truncated = true;
             *receiver_diagnostics
                 .entry((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                     language,
                     operation.as_str(),
                     "truncated candidates at max_targets".to_string(),
@@ -6650,7 +6679,7 @@ fn scan_outbound_reference_hits(
     }
     budget.scanned_files += 1;
     budget.scanned_source_bytes += source.len();
-    let source = Arc::new(source);
+    let source = Arc::<str>::from(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::UsesParserUnsupported,
@@ -8592,6 +8621,7 @@ mod tests {
             (Code::UnsupportedImportAnalysis, Impact::Incomplete),
             (Code::SemanticResultsOmitted, Impact::Incomplete),
             (Code::ReceiverAnalysisPartial, Impact::Incomplete),
+            (Code::ReceiverAnalysisFailed, Impact::Incomplete),
             (Code::CallRelationBudgetExhausted, Impact::Incomplete),
             (Code::CallRelationParseFailed, Impact::Incomplete),
             (Code::CallRelationCandidatesOmitted, Impact::Incomplete),

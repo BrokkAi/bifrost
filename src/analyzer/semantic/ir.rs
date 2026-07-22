@@ -374,11 +374,11 @@ pub struct SemanticCallArgument {
 
 impl SemanticCallArgument {
     /// Construct a direct argument when structured lowering established that
-    /// the source is not a spread.
-    pub fn direct(value: ValueId) -> Self {
+    /// the source is not a spread and identified its argument domain.
+    pub fn direct(value: ValueId, domain: ArgumentDomain) -> Self {
         Self {
             value,
-            expansion: CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword),
+            expansion: CallArgumentExpansion::Direct(domain),
         }
     }
 
@@ -900,6 +900,16 @@ pub struct SemanticGapImpacts(u8);
 impl SemanticGapImpacts {
     pub const NONE: Self = Self(0);
 
+    const VALUE: Self =
+        Self::single(SemanticGapImpact::ValueFlow).with(SemanticGapImpact::Aliasing);
+    const MEMORY: Self = Self::VALUE
+        .with(SemanticGapImpact::HeapRead)
+        .with(SemanticGapImpact::HeapWrite);
+    const RETURN_TRANSFER: Self = Self::VALUE.with(SemanticGapImpact::ReturnTransfer);
+    const CONTROL_FLOW: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
+    const CALL_EVALUATION: Self = Self::CONTROL_FLOW.with(SemanticGapImpact::CallEvaluation);
+    const CALL: Self = Self::CALL_EVALUATION.with(SemanticGapImpact::DispatchCoverage);
+
     pub const fn single(impact: SemanticGapImpact) -> Self {
         Self(impact.bit())
     }
@@ -913,22 +923,61 @@ impl SemanticGapImpacts {
         self.0 & impact.bit() != 0
     }
 
-    /// Derive the conservative cross-language impact shared by adapter gap
-    /// builders. More specific impacts, such as uncertain caller-side call
-    /// evaluation, must be attached deliberately by the adapter that proves
-    /// that relationship.
-    pub const fn for_gap(capability: SemanticCapability, _subject: SemanticGapSubject) -> Self {
-        match capability {
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Derive the conservative cross-language impacts shared by adapter gap
+    /// builders. Adapter-specific consequences that cannot be inferred from
+    /// the capability and subject must still be attached deliberately.
+    pub const fn for_gap(capability: SemanticCapability, subject: SemanticGapSubject) -> Self {
+        let capability_impacts = match capability {
+            SemanticCapability::Procedures
+            | SemanticCapability::BasicBlocks
+            | SemanticCapability::ProgramPoints => Self::NONE,
+            SemanticCapability::EntryBoundary => Self::VALUE,
+            SemanticCapability::NormalExitBoundary
+            | SemanticCapability::ExceptionalExitBoundary
+            | SemanticCapability::ReturnFlow => Self::RETURN_TRANSFER,
+            SemanticCapability::NormalControlFlow
+            | SemanticCapability::ExceptionalControlFlow
+            | SemanticCapability::CleanupControlFlow
+            | SemanticCapability::NonLocalControl => Self::CONTROL_FLOW,
+            SemanticCapability::Assignments
+            | SemanticCapability::Values
+            | SemanticCapability::LocalFlow
+            | SemanticCapability::ParameterFlow => Self::VALUE,
+            SemanticCapability::ReceiverFlow => {
+                Self::VALUE.with(SemanticGapImpact::DispatchCoverage)
+            }
+            SemanticCapability::Allocations
+            | SemanticCapability::FieldMemory
+            | SemanticCapability::StaticMemory
+            | SemanticCapability::IndexMemory
+            | SemanticCapability::Captures => Self::MEMORY,
+            SemanticCapability::Calls
+            | SemanticCapability::CallableReferences
+            | SemanticCapability::ConcurrentSpawn => Self::CALL,
             SemanticCapability::DynamicDispatch => {
                 Self::single(SemanticGapImpact::DispatchCoverage)
             }
-            SemanticCapability::CleanupControlFlow
-            | SemanticCapability::ExceptionalControlFlow
-            | SemanticCapability::NonLocalControl => {
-                Self::single(SemanticGapImpact::ReturnTransfer)
-            }
-            _ => Self::NONE,
-        }
+            SemanticCapability::NormalCallContinuation
+            | SemanticCapability::ExceptionalCallContinuation
+            | SemanticCapability::AsyncSuspendResume
+            | SemanticCapability::GeneratorSuspension
+            | SemanticCapability::DeferredExecution
+            | SemanticCapability::ResourceManagement => Self::CALL_EVALUATION,
+        };
+        let subject_impacts = match subject {
+            SemanticGapSubject::Value(_) => Self::VALUE,
+            SemanticGapSubject::MemoryLocation(_) | SemanticGapSubject::Capture(_) => Self::MEMORY,
+            SemanticGapSubject::CallContinuation { .. }
+            | SemanticGapSubject::AsyncContinuation { .. } => Self::CALL_EVALUATION,
+            SemanticGapSubject::Procedure
+            | SemanticGapSubject::Point
+            | SemanticGapSubject::CallSite(_) => Self::NONE,
+        };
+        capability_impacts.union(subject_impacts)
     }
 
     /// Iterate in [`SemanticGapImpact::ALL`] order, which is part of the
@@ -4856,7 +4905,7 @@ mod tests {
         assert_eq!(
             SemanticGapImpacts::for_gap(
                 SemanticCapability::DynamicDispatch,
-                SemanticGapSubject::CallSite(CallSiteId::new(0)),
+                SemanticGapSubject::Point,
             ),
             SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
         );
@@ -4865,15 +4914,32 @@ mod tests {
                 SemanticCapability::ExceptionalControlFlow,
                 SemanticGapSubject::Point,
             ),
-            SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+            SemanticGapImpacts::CONTROL_FLOW,
         );
         assert_eq!(
             SemanticGapImpacts::for_gap(
                 SemanticCapability::Calls,
                 SemanticGapSubject::CallSite(CallSiteId::new(0)),
             ),
-            SemanticGapImpacts::NONE,
+            SemanticGapImpacts::CALL,
         );
+        let assignment =
+            SemanticGapImpacts::for_gap(SemanticCapability::Assignments, SemanticGapSubject::Point);
+        assert!(assignment.contains(SemanticGapImpact::ValueFlow));
+        assert!(assignment.contains(SemanticGapImpact::Aliasing));
+
+        let capture = SemanticGapImpacts::for_gap(
+            SemanticCapability::Captures,
+            SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0)),
+        );
+        for impact in [
+            SemanticGapImpact::ValueFlow,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+            SemanticGapImpact::Aliasing,
+        ] {
+            assert!(capture.contains(impact), "missing {impact:?}");
+        }
     }
 
     fn capabilities(features: &[SemanticCapability]) -> SemanticCapabilities {
@@ -5457,7 +5523,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::Captures,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Captures,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "unrelated capture uncertainty".into(),
@@ -5669,7 +5738,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Capture(CaptureId::new(0)),
             capability: SemanticCapability::Captures,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Captures,
+                SemanticGapSubject::Capture(CaptureId::new(0)),
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "capture mode is allegedly unknown".into(),
@@ -5742,7 +5814,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::Calls,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Calls,
+                SemanticGapSubject::Point,
+            ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
             detail: "calls are unsupported here".into(),
@@ -5768,12 +5843,12 @@ mod tests {
     #[test]
     fn mandatory_gap_impacts_are_enforced_while_specific_extras_are_allowed() {
         let key = key();
-        let procedure_with_gap = |capability, impacts| {
+        let procedure_with_gap = |capability, subject, impacts| {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.gaps.push(SemanticGap {
                 id: SemanticGapId::new(0),
                 point: ProgramPointId::new(0),
-                subject: SemanticGapSubject::Point,
+                subject,
                 capability,
                 impacts,
                 kind: SemanticGapKind::Unknown,
@@ -5811,20 +5886,55 @@ mod tests {
                 SemanticCapability::NonLocalControl,
                 SemanticGapImpact::ReturnTransfer,
             ),
+            (
+                SemanticCapability::Assignments,
+                SemanticGapImpact::ValueFlow,
+            ),
+            (SemanticCapability::Captures, SemanticGapImpact::ValueFlow),
+            (
+                SemanticCapability::Calls,
+                SemanticGapImpact::DispatchCoverage,
+            ),
+            (
+                SemanticCapability::NormalCallContinuation,
+                SemanticGapImpact::CallEvaluation,
+            ),
         ] {
             let error = SemanticArtifact::try_new(
                 key.clone(),
                 capabilities(&[capability]),
-                vec![procedure_with_gap(capability, SemanticGapImpacts::NONE)],
+                vec![procedure_with_gap(
+                    capability,
+                    SemanticGapSubject::Point,
+                    SemanticGapImpacts::NONE,
+                )],
             )
             .expect_err("a consumer-affecting gap cannot omit its mandatory impact");
             assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
             assert!(error.detail().contains(missing.label()));
         }
 
+        let incomplete_capture = SemanticGapImpacts::single(SemanticGapImpact::ValueFlow);
+        let error = SemanticArtifact::try_new(
+            key.clone(),
+            capabilities(&[SemanticCapability::Captures]),
+            vec![procedure_with_gap(
+                SemanticCapability::Captures,
+                SemanticGapSubject::Point,
+                incomplete_capture,
+            )],
+        )
+        .expect_err("a capture gap cannot hide missing heap and alias impacts");
+        assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+        assert!(error.detail().contains(SemanticGapImpact::HeapRead.label()));
+
         let impacts = SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage)
             .with(SemanticGapImpact::CallEvaluation);
-        let procedure = procedure_with_gap(SemanticCapability::DynamicDispatch, impacts);
+        let procedure = procedure_with_gap(
+            SemanticCapability::DynamicDispatch,
+            SemanticGapSubject::Point,
+            impacts,
+        );
         SemanticArtifact::try_new(
             key,
             capabilities(&[SemanticCapability::DynamicDispatch]),
@@ -5982,7 +6092,10 @@ mod tests {
                 point: ProgramPointId::new(0),
                 subject: SemanticGapSubject::Value(ValueId::new(0)),
                 capability: SemanticCapability::CallableReferences,
-                impacts: SemanticGapImpacts::NONE,
+                impacts: SemanticGapImpacts::for_gap(
+                    SemanticCapability::CallableReferences,
+                    SemanticGapSubject::Value(ValueId::new(0)),
+                ),
                 kind: gap_kind,
                 budget,
                 detail: "nested body target is unavailable".into(),
@@ -6049,7 +6162,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Value(ValueId::new(0)),
             capability: SemanticCapability::CallableReferences,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::CallableReferences,
+                SemanticGapSubject::Value(ValueId::new(0)),
+            ),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
             detail: "nested body was recognized but not materialized".into(),
@@ -6125,7 +6241,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::Value(ValueId::new(0)),
             capability: SemanticCapability::CallableReferences,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::CallableReferences,
+                SemanticGapSubject::Value(ValueId::new(0)),
+            ),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
             detail: "nested body was recognized but not materialized".into(),
@@ -6476,7 +6595,13 @@ mod tests {
                 kind: CallContinuationKind::Normal,
             },
             capability: SemanticCapability::NormalCallContinuation,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::NormalCallContinuation,
+                SemanticGapSubject::CallContinuation {
+                    call_site: CallSiteId::new(0),
+                    kind: CallContinuationKind::Normal,
+                },
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "normal continuation is allegedly unknown".into(),
@@ -6506,7 +6631,10 @@ mod tests {
             point: ProgramPointId::new(0),
             subject: SemanticGapSubject::CallSite(CallSiteId::new(0)),
             capability: SemanticCapability::Calls,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Calls,
+                SemanticGapSubject::CallSite(CallSiteId::new(0)),
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "declared targets are allegedly unknown".into(),
@@ -6648,8 +6776,13 @@ mod tests {
                 kind: CallContinuationKind::Exceptional,
             },
             capability: SemanticCapability::ExceptionalCallContinuation,
-            impacts: SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation)
-                .with(SemanticGapImpact::ReturnTransfer),
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalCallContinuation,
+                SemanticGapSubject::CallContinuation {
+                    call_site: CallSiteId::new(0),
+                    kind: CallContinuationKind::Exceptional,
+                },
+            ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
             detail: "adapter does not model exceptional call continuation".into(),
@@ -6906,7 +7039,13 @@ mod tests {
                 kind: AsyncResumeKind::Normal,
             },
             capability: SemanticCapability::AsyncSuspendResume,
-            impacts: SemanticGapImpacts::NONE,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::AsyncSuspendResume,
+                SemanticGapSubject::AsyncContinuation {
+                    suspend: ProgramPointId::new(0),
+                    kind: AsyncResumeKind::Normal,
+                },
+            ),
             kind: SemanticGapKind::Unknown,
             budget: None,
             detail: "normal resume is allegedly unknown".into(),

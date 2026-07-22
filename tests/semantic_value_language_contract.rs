@@ -8,8 +8,9 @@ use brokk_bifrost::analyzer::semantic::{
     CaptureMode, CaptureSource, DispatchCandidate, DispatchExtensibility, DispatchOracle,
     FormalMultiplicity, HeapOracle, IndexSelector, MemoryAccessKind, MemoryLocationKind,
     MemoryStoreHandle, ObjectCardinality, ObservationPhase, OracleCallContext, OracleContractError,
-    OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
-    ProcedureSemantics, ScopedSemanticLocator, SemanticBudget, SemanticCapability, SemanticEffect,
+    OracleLimitValues, OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle,
+    ProcedurePortKind, ProcedureSemantics, ScopedSemanticLocator, SemanticBudget,
+    SemanticBudgetDimension, SemanticCapability, SemanticEffect, SemanticGapImpact,
     SemanticGapSubject, SemanticOutcome, SemanticRequest, SemanticValueKind, StoreAtPoint,
     UpdateEligibility, ValueAtPoint, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
     ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason, WorkspaceSemanticOracle,
@@ -107,11 +108,11 @@ fn assert_value_contract(
     assert_eq!(call.arguments.len(), 2);
     assert_eq!(
         call.arguments[0].expansion,
-        CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword)
+        CallArgumentExpansion::Direct(ArgumentDomain::Positional)
     );
     assert_eq!(
         call.arguments[1].expansion,
-        CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword)
+        CallArgumentExpansion::Direct(ArgumentDomain::Positional)
     );
     let argument_sources = call
         .arguments
@@ -389,6 +390,65 @@ fn assert_receiver_capture(graph: &SemanticGraph) {
             )),
         "child procedure must load its capture slot"
     );
+}
+
+fn assert_nested_receiver_capture_relay(graph: &SemanticGraph) {
+    let parent = procedure_named(graph, "nestedCapture", ProcedureKind::Method);
+    let outer_capture = parent
+        .captures()
+        .first()
+        .expect("method must bind the outer lexical callable");
+    let outer = graph
+        .artifact()
+        .procedure(outer_capture.target)
+        .expect("outer lexical callable procedure");
+    assert_eq!(outer.kind(), ProcedureKind::Lambda);
+    assert!(matches!(
+        outer
+            .memory_location(outer_capture.destination)
+            .expect("outer receiver capture slot")
+            .kind,
+        MemoryLocationKind::Capture { lexical_parent } if lexical_parent == parent.id()
+    ));
+
+    let inner_capture = outer
+        .captures()
+        .first()
+        .expect("outer callable must relay its receiver to the inner callable");
+    let CaptureSource::Value(relayed_receiver) = inner_capture.captured else {
+        panic!("nested receiver relay must use the outer capture value");
+    };
+    assert_eq!(
+        outer
+            .value(relayed_receiver)
+            .expect("relayed receiver value")
+            .kind,
+        SemanticValueKind::Local
+    );
+    let inner = graph
+        .artifact()
+        .procedure(inner_capture.target)
+        .expect("inner lexical callable procedure");
+    assert_eq!(inner.kind(), ProcedureKind::Lambda);
+    assert!(matches!(
+        inner
+            .memory_location(inner_capture.destination)
+            .expect("inner receiver capture slot")
+            .kind,
+        MemoryLocationKind::Capture { lexical_parent } if lexical_parent == outer.id()
+    ));
+    for (procedure, destination) in [
+        (outer, outer_capture.destination),
+        (inner, inner_capture.destination),
+    ] {
+        assert!(
+            !procedure.gaps().iter().any(|gap| {
+                gap.subject == SemanticGapSubject::MemoryLocation(destination)
+                    && gap.capability == SemanticCapability::Captures
+            }),
+            "a fully relayed receiver capture must remain exact"
+        );
+    }
 }
 
 fn assert_branch_ambiguous_local(graph: &SemanticGraph, source: &str) {
@@ -823,6 +883,7 @@ fn assert_call_bindings(
     analyzer: &brokk_bifrost::WorkspaceAnalyzer,
     graph: &SemanticGraph,
     source: &str,
+    expected_coverage: CandidateCoverage,
 ) {
     let oracle = analyzer.semantic_oracle_provider();
     let call = call_named(graph, source, "instance", "this.sink(input, made)");
@@ -876,7 +937,7 @@ fn assert_call_bindings(
     let bindings = available(&bindings);
     assert_eq!(
         bindings.coverage(),
-        CandidateCoverage::Exhaustive,
+        expected_coverage,
         "caller gaps: {:?}; callee gaps: {:?}",
         call.procedure().semantics().gaps(),
         candidate.target().semantics().gaps()
@@ -985,6 +1046,16 @@ fn assert_open_spread_bindings(
 ) {
     let oracle = analyzer.semantic_oracle_provider();
     let call = call_named(graph, source, "spread", "this.sink(...values)");
+    let call_site = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("scoped call handle must resolve its semantic row");
+    assert_eq!(
+        call_site.arguments[0].expansion,
+        CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+        "JavaScript and TypeScript spread syntax expands a positional argument sequence"
+    );
     let cancellation = CancellationToken::default();
     let mut budget = SemanticBudget::default();
     let candidate = dispatch_candidate_named(&oracle, &call, "sink", &mut budget, &cancellation);
@@ -1076,6 +1147,79 @@ fn assert_heap_oracle(
         "an acyclic allocation-site identity is not by itself a runtime singleton"
     );
     assert_eq!(budget.used(), points_to.work());
+
+    let instance = procedure_handle_named(graph, "instance", ProcedureKind::Method);
+    let (return_point, return_source) = instance
+        .semantics()
+        .points()
+        .iter()
+        .find_map(|point| {
+            point.events.iter().find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    ..
+                } => Some((point.id, source)),
+                _ => None,
+            })
+        })
+        .expect("instance fixture must publish its return transfer");
+    let returned_value = ValueAtPoint::new(
+        instance.value_handle(return_source).unwrap(),
+        instance.point_handle(return_point).unwrap(),
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let returned_points_to = oracle
+        .pointees(
+            &returned_value,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("transitive return points-to query should materialize");
+    assert!(
+        available(&returned_points_to)
+            .objects()
+            .candidates()
+            .iter()
+            .any(|candidate| matches!(
+                candidate.value().identity(),
+                AbstractObjectIdentity::Allocation(_)
+            )),
+        "the default summary depth must reach through the return read and local binding"
+    );
+
+    let shallow_limits = OracleLimits::new(OracleLimitValues {
+        summary_depth: 1,
+        ..OracleLimits::default().values()
+    })
+    .unwrap();
+    let shallow_oracle = WorkspaceSemanticOracle::with_limits(analyzer, shallow_limits);
+    let mut shallow_budget = SemanticBudget::default();
+    let shallow_points_to = shallow_oracle
+        .pointees(
+            &returned_value,
+            &mut SemanticRequest::new(&mut shallow_budget, &cancellation),
+        )
+        .expect("depth-bounded return points-to query should retain a typed partial");
+    assert_eq!(
+        available(&shallow_points_to).objects().coverage(),
+        CandidateCoverage::Truncated,
+        "omitting the allocation behind a deeper producer chain must be explicit"
+    );
+    assert!(
+        available(&shallow_points_to)
+            .objects()
+            .candidates()
+            .is_empty(),
+        "a depth cap must not replace an omitted producer with a fabricated symbolic object"
+    );
+    assert_eq!(
+        shallow_budget.used(),
+        shallow_points_to.work(),
+        "a depth-truncated query must commit exactly the states it actually visited"
+    );
 
     let path = AccessPath::exact(
         AccessPathRoot::Value(allocation_value),
@@ -1250,7 +1394,12 @@ fn assert_heap_oracle(
         candidate.value().identity(),
         AbstractObjectIdentity::ProcedurePort(_)
     )));
-    let bounded = WorkspaceSemanticOracle::with_limits(analyzer, OracleLimits::uniform(1).unwrap());
+    let candidate_limits = OracleLimits::new(OracleLimitValues {
+        objects_per_value: 1,
+        ..OracleLimits::default().values()
+    })
+    .unwrap();
+    let bounded = WorkspaceSemanticOracle::with_limits(analyzer, candidate_limits);
     let mut budget = SemanticBudget::default();
     let bounded_branch = bounded
         .pointees(
@@ -1298,7 +1447,10 @@ fn assert_heap_oracle(
         .expect("distinct allocation-site alias query should materialize");
     assert_eq!(
         *available(&disjoint).answer().value(),
-        AliasRelation::Disjoint
+        AliasRelation::Disjoint,
+        "distinct allocation sites should remain disjoint; allocations: {allocations:?}; calls: {:?}; procedure gaps: {:?}",
+        two.semantics().call_sites(),
+        two.semantics().gaps(),
     );
     let bounded_alias_oracle =
         WorkspaceSemanticOracle::with_limits(analyzer, OracleLimits::uniform(1).unwrap());
@@ -1757,8 +1909,8 @@ class Sample {
     assert_java_sibling_scopes(&java, JAVA);
     assert_value_flow_oracle(&analyzer, &typescript);
     assert_value_flow_oracle(&analyzer, &java);
-    assert_call_bindings(&analyzer, &typescript, TYPESCRIPT);
-    assert_call_bindings(&analyzer, &java, JAVA);
+    assert_call_bindings(&analyzer, &typescript, TYPESCRIPT, CandidateCoverage::Open);
+    assert_call_bindings(&analyzer, &java, JAVA, CandidateCoverage::Open);
     assert_variadic_and_static_receiver_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_variadic_and_static_receiver_bindings(&analyzer, &java, JAVA);
     assert_java_dispatch_closure(&analyzer, &java, JAVA);
@@ -1804,6 +1956,178 @@ class Sample {
 }
 
 #[test]
+fn source_points_to_preserves_path_specialized_finally_observations() {
+    const SOURCE: &str = r#"class Service { void run() {} }
+class Sample {
+    void caller(Service service, boolean fail) {
+        try {
+            if (fail) throw new RuntimeException();
+            return;
+        } finally {
+            service.run();
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("Specialized.java", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("Specialized.java");
+    let start_byte = SOURCE.rfind("service.run").expect("finally receiver");
+    let start_line = SOURCE[..start_byte]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let range = brokk_bifrost::analyzer::Range {
+        start_byte,
+        end_byte: start_byte + "service".len(),
+        start_line,
+        end_line: start_line,
+    };
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .semantic_oracle_provider()
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("source points-to query");
+    let points_to = available(&outcome);
+    assert!(
+        points_to.observations().len() >= 2,
+        "the duplicated finally body must retain every point-specialized observation: {outcome:#?}"
+    );
+    let point_ids = points_to
+        .observations()
+        .iter()
+        .map(|result| result.query().point().id())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(point_ids.len(), points_to.observations().len());
+    assert!(
+        points_to
+            .observations()
+            .windows(2)
+            .all(|pair| pair[0].query().value().id() == pair[1].query().value().id()),
+        "path specialization should retain one static value at distinct program points"
+    );
+    assert!(
+        points_to
+            .observations()
+            .iter()
+            .all(|result| result.query().context().calls().is_empty()),
+        "source observations start context-free; a zero receiver context depth retains no calls"
+    );
+
+    let limits = OracleLimits::new(OracleLimitValues {
+        alias_breadth: 8,
+        source_observations: 1,
+        ..OracleLimits::default().values()
+    })
+    .unwrap();
+    let bounded = WorkspaceSemanticOracle::with_limits(&analyzer, limits);
+    let mut budget = SemanticBudget::default();
+    let bounded_outcome = bounded
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("bounded source points-to query");
+    let bounded_points_to = available(&bounded_outcome);
+    assert_eq!(bounded_points_to.observations().len(), 1);
+    assert_eq!(bounded_points_to.coverage(), CandidateCoverage::Truncated);
+    assert!(matches!(bounded_outcome, SemanticOutcome::Unproven { .. }));
+}
+
+#[test]
+fn source_points_to_projection_is_pre_cancellable_and_budget_staged() {
+    let mut source = String::from(
+        "class Service { void run() {} }\nclass Sample { void caller(Service service) {\n",
+    );
+    for index in 0..128 {
+        source.push_str(&format!("Object local{index} = new Object();\n"));
+    }
+    source.push_str("service.run();\n}\n}\n");
+    let start_byte = source.rfind("service.run").expect("receiver call");
+    let start_line = source[..start_byte]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let range = brokk_bifrost::analyzer::Range {
+        start_byte,
+        end_byte: start_byte + "service".len(),
+        start_line,
+        end_line: start_line,
+    };
+    let project = InlineTestProject::new()
+        .file("LargeProjection.java", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("LargeProjection.java");
+    let oracle = analyzer.semantic_oracle_provider();
+
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut cancelled_budget = SemanticBudget::default();
+    let cancelled_outcome = oracle
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+        )
+        .expect("pre-cancellation is a semantic outcome");
+    assert!(matches!(
+        cancelled_outcome,
+        SemanticOutcome::Cancelled {
+            partial: None,
+            work,
+        } if work == Default::default()
+    ));
+    assert_eq!(cancelled_budget.used(), Default::default());
+
+    let cancellation = CancellationToken::default();
+    let mut materialization_budget = SemanticBudget::default();
+    let materialized = analyzer
+        .materialize_program_semantics(
+            &file,
+            &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+        )
+        .expect("large fixture materialization");
+    assert!(materialized.available_value().is_some());
+    let materialization_work = materialization_budget.used();
+
+    let mut limits = SemanticBudget::default().limits();
+    limits.values = materialization_work.values + 4;
+    let mut projection_budget = SemanticBudget::new(limits).unwrap();
+    let outcome = oracle
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+        )
+        .expect("projection exhaustion is a semantic outcome");
+    assert!(matches!(
+        outcome,
+        SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work,
+        } if exceeded.dimension() == SemanticBudgetDimension::Values
+            && exceeded.limit() == materialization_work.values + 4
+            && exceeded.attempted() == materialization_work.values + 5
+            && work.values == materialization_work.values + 5
+    ));
+    assert_eq!(
+        projection_budget.used(),
+        materialization_work,
+        "failed projection work must not be committed to the caller budget"
+    );
+}
+
+#[test]
 fn logical_assignment_arrow_without_parent_binding_retains_an_explicit_capture_gap() {
     let project = InlineTestProject::new()
         .file(
@@ -1828,6 +2152,143 @@ fn logical_assignment_arrow_without_parent_binding_retains_an_explicit_capture_g
         gap.subject == SemanticGapSubject::MemoryLocation(capture.id)
             && gap.capability == SemanticCapability::Captures
     }));
+
+    let lambda = graph
+        .artifact()
+        .procedure_handle(lambda.id())
+        .expect("logical-assignment arrow procedure handle");
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .semantic_oracle_provider()
+        .procedure_relations(
+            &lambda,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("capture-gapped value-flow snapshot");
+    assert_eq!(
+        available(&outcome).coverage(),
+        CandidateCoverage::Open,
+        "an explicit capture gap must keep downstream value flow open"
+    );
+}
+
+#[test]
+fn traced_call_gap_keeps_a_dependent_heap_value_open() {
+    const SOURCE: &str = r#"
+class Sample {
+    consume(_value: Sample) {}
+    forward(input: Sample): Sample { this.consume(input); return input; }
+}
+"#;
+    let project = InlineTestProject::new().file("forward.ts", SOURCE).build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "forward.ts");
+    let call = call_named(&graph, SOURCE, "forward", "this.consume(input)");
+    let call_row = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("forwarding call row");
+    assert!(call.procedure().semantics().gaps().iter().any(|gap| {
+        gap.subject == SemanticGapSubject::CallSite(call.id())
+            && gap.capability == SemanticCapability::Calls
+            && gap.impacts.contains(SemanticGapImpact::Aliasing)
+    }));
+
+    let argument = call_row.arguments[0].value;
+    let parameter = flow_source(
+        call.procedure().semantics(),
+        argument,
+        ValueFlowKind::Parameter,
+    );
+    assert!(matches!(
+        call.procedure().semantics().value(parameter).unwrap().kind,
+        SemanticValueKind::Parameter { ordinal: 0, .. }
+    ));
+    let continuation = call_row
+        .normal_continuation
+        .target()
+        .expect("forwarding call normal continuation");
+    let query = ValueAtPoint::new(
+        call.procedure().value_handle(argument).unwrap(),
+        call.procedure().point_handle(continuation).unwrap(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .semantic_oracle_provider()
+        .pointees(
+            &query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("call-dependent parameter points-to query");
+    assert_eq!(
+        available(&outcome).objects().coverage(),
+        CandidateCoverage::Open,
+        "a call gap reached by the parameter trace must keep the heap result open"
+    );
+}
+
+#[test]
+fn nested_lexical_callables_relay_receiver_captures() {
+    const TYPESCRIPT: &str = r#"
+class Capture {
+    nestedCapture() { return () => () => this; }
+}
+"#;
+    const JAVA: &str = r#"
+class Capture {
+    java.util.function.Supplier<java.util.function.Supplier<Object>> nestedCapture() {
+        return () -> () -> this;
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("nested/Capture.ts", TYPESCRIPT)
+        .file("nested/Capture.java", JAVA)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let typescript = SemanticGraph::materialize(&project, &analyzer, "nested/Capture.ts");
+    let java = SemanticGraph::materialize(&project, &analyzer, "nested/Capture.java");
+
+    assert_nested_receiver_capture_relay(&typescript);
+    assert_nested_receiver_capture_relay(&java);
+}
+
+#[test]
+fn local_binding_preindex_uses_source_preorder() {
+    const TYPESCRIPT: &str =
+        "function ordered() { let first = 1; let second = 2; return second; }\n";
+    const JAVA: &str = r#"
+class Ordered {
+    void ordered() { Object first = new Object(); Object second = new Object(); }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("ordered/ordered.ts", TYPESCRIPT)
+        .file("ordered/Ordered.java", JAVA)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for (path, source, kind) in [
+        ("ordered/ordered.ts", TYPESCRIPT, ProcedureKind::Function),
+        ("ordered/Ordered.java", JAVA, ProcedureKind::Method),
+    ] {
+        let graph = SemanticGraph::materialize(&project, &analyzer, path);
+        let procedure = procedure_named(&graph, "ordered", kind);
+        let locals = procedure
+            .values()
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Local)
+            .map(|value| mapped_source(procedure, source, value.source))
+            .collect::<Vec<_>>();
+        assert_eq!(locals, ["first", "second"]);
+    }
 }
 
 #[test]

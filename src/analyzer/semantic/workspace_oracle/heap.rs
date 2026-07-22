@@ -7,52 +7,23 @@
 use std::collections::VecDeque;
 
 use super::WorkspaceSemanticOracle;
+use super::common::{
+    Interruption, WorkStager, dedup_evidence, evidence_handle, evidence_quality, internal_contract,
+    value_handle,
+};
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathAtPoint,
     AccessPathRoot, AliasExclusivity, AliasExclusivityWitness, AliasQuery, AliasRelation,
-    AliasResult, CandidateCoverage, EscapeStatus, EscapeWitness, EvidenceCompleteness,
-    EvidenceHandle, HeapOracle, LocationResult, ObjectCardinality, ObservationPhase,
-    OracleCandidate, OracleContractError, OracleRelationArena, OracleRelationId,
+    AliasResult, CandidateCoverage, CaptureSource, EscapeStatus, EscapeWitness,
+    EvidenceCompleteness, EvidenceHandle, HeapOracle, LocationResult, MemoryLocationKind,
+    ObjectCardinality, ObservationPhase, OracleCandidate, OracleRelationArena, OracleRelationId,
     OracleRelationKind, OracleRelationOwner, OracleRelationRecord, OracleSet, PointsToResult,
     ProcedureHandle, ProcedurePortHandle, ProofStatus, SemanticCapability, SemanticEffect,
-    SemanticGapImpact, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
-    SemanticWork, StoreAtPoint, StrongUpdateEvidence, UpdateEligibility, ValueAtPoint, ValueHandle,
-    WeakUpdateReason,
+    SemanticGap, SemanticGapImpact, SemanticGapSubject, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticValueKind, SemanticWork, StoreAtPoint, StrongUpdateEvidence,
+    UpdateEligibility, ValueAtPoint, ValueHandle, WeakUpdateReason,
 };
 use crate::hash::HashSet;
-
-#[derive(Debug)]
-enum Interruption {
-    Budget(crate::analyzer::semantic::SemanticBudgetExceeded),
-    Cancelled,
-}
-
-struct WorkStager {
-    budget: crate::analyzer::semantic::SemanticBudget,
-    work: SemanticWork,
-}
-
-impl WorkStager {
-    fn new(request: &SemanticRequest<'_>) -> Self {
-        Self {
-            budget: request.budget.clone(),
-            work: SemanticWork::default(),
-        }
-    }
-
-    fn charge(&mut self, work: SemanticWork) -> Result<(), Interruption> {
-        let reported = self
-            .work
-            .checked_add(work)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
-        if let Err(exceeded) = self.budget.charge(work) {
-            self.work = reported;
-            return Err(Interruption::Budget(exceeded));
-        }
-        self.work = reported;
-        Ok(())
-    }
-}
 
 #[derive(Clone)]
 struct ObjectDraft {
@@ -80,56 +51,11 @@ struct TraceState {
     value: crate::analyzer::semantic::ValueId,
     point: crate::analyzer::semantic::ProgramPointId,
     event_limit: usize,
-}
-
-fn internal_contract(context: &str, error: OracleContractError) -> SemanticProviderError {
-    SemanticProviderError::internal(format!("{context}: {error}"))
-}
-
-fn evidence_handle(
-    procedure: &ProcedureHandle,
-    id: crate::analyzer::semantic::EvidenceId,
-) -> Result<EvidenceHandle, SemanticProviderError> {
-    procedure
-        .evidence_handle(id)
-        .ok_or_else(|| SemanticProviderError::internal("semantic row has no evidence handle"))
-}
-
-fn dedup_evidence(evidence: impl IntoIterator<Item = EvidenceHandle>) -> Vec<EvidenceHandle> {
-    let mut result = Vec::new();
-    for handle in evidence {
-        if !result.contains(&handle) {
-            result.push(handle);
-        }
-    }
-    result
-}
-
-fn evidence_quality(evidence: &[EvidenceHandle]) -> (ProofStatus, EvidenceCompleteness) {
-    let proof = evidence
-        .iter()
-        .find_map(|handle| {
-            let row = handle
-                .procedure()
-                .semantics()
-                .evidence_row(handle.id())
-                .expect("evidence handles are validated at construction");
-            (!matches!(row.proof, ProofStatus::Proven)).then(|| row.proof.clone())
-        })
-        .unwrap_or(ProofStatus::Proven);
-    let completeness = evidence
-        .iter()
-        .find_map(|handle| {
-            let row = handle
-                .procedure()
-                .semantics()
-                .evidence_row(handle.id())
-                .expect("evidence handles are validated at construction");
-            (!matches!(row.completeness, EvidenceCompleteness::Complete))
-                .then(|| row.completeness.clone())
-        })
-        .unwrap_or(EvidenceCompleteness::Complete);
-    (proof, completeness)
+    /// Number of transitive value-flow producers followed from the queried
+    /// value. Keeping this in the visited identity bounds value cycles while
+    /// allowing a shallower route to the same semantic state to retain facts
+    /// that a deeper, truncated route could not reach.
+    summary_depth: usize,
 }
 
 fn merge_quality(
@@ -149,15 +75,6 @@ fn merge_quality(
     (proof, completeness)
 }
 
-fn value_handle(
-    procedure: &ProcedureHandle,
-    id: crate::analyzer::semantic::ValueId,
-) -> Result<ValueHandle, SemanticProviderError> {
-    procedure
-        .value_handle(id)
-        .ok_or_else(|| SemanticProviderError::internal("semantic effect has a stale value ID"))
-}
-
 fn candidate_cardinality_for_root(root: &AccessPathRoot) -> ObjectCardinality {
     match root {
         AccessPathRoot::Static(_) | AccessPathRoot::LexicalCell(_) => ObjectCardinality::Singleton,
@@ -169,50 +86,6 @@ fn candidate_cardinality_for_root(root: &AccessPathRoot) -> ObjectCardinality {
         | AccessPathRoot::Allocation(_)
         | AccessPathRoot::ModuleObject(_)
         | AccessPathRoot::External(_) => ObjectCardinality::Unknown,
-    }
-}
-
-fn identity_for_root(root: &AccessPathRoot) -> AbstractObjectIdentity {
-    match root {
-        AccessPathRoot::Value(value) => AbstractObjectIdentity::Value(value.clone()),
-        AccessPathRoot::ProcedurePort(port) => AbstractObjectIdentity::ProcedurePort(port.clone()),
-        AccessPathRoot::Allocation(allocation) => {
-            AbstractObjectIdentity::Allocation(allocation.clone())
-        }
-        AccessPathRoot::Static(locator) => AbstractObjectIdentity::Static(locator.clone()),
-        AccessPathRoot::LexicalCell(location) => {
-            AbstractObjectIdentity::LexicalCell(location.clone())
-        }
-        AccessPathRoot::CaptureSlot(port) => AbstractObjectIdentity::CaptureSlot(port.clone()),
-        AccessPathRoot::TypeSummary(locator) => {
-            AbstractObjectIdentity::TypeSummary(locator.clone())
-        }
-        AccessPathRoot::ModuleObject(locator) => {
-            AbstractObjectIdentity::ModuleObject(locator.clone())
-        }
-        AccessPathRoot::External(locator) => AbstractObjectIdentity::External(locator.clone()),
-    }
-}
-
-fn root_for_identity(identity: &AbstractObjectIdentity) -> AccessPathRoot {
-    match identity {
-        AbstractObjectIdentity::Value(value) => AccessPathRoot::Value(value.clone()),
-        AbstractObjectIdentity::Allocation(allocation) => {
-            AccessPathRoot::Allocation(allocation.clone())
-        }
-        AbstractObjectIdentity::ProcedurePort(port) => AccessPathRoot::ProcedurePort(port.clone()),
-        AbstractObjectIdentity::Static(locator) => AccessPathRoot::Static(locator.clone()),
-        AbstractObjectIdentity::LexicalCell(location) => {
-            AccessPathRoot::LexicalCell(location.clone())
-        }
-        AbstractObjectIdentity::CaptureSlot(port) => AccessPathRoot::CaptureSlot(port.clone()),
-        AbstractObjectIdentity::TypeSummary(locator) => {
-            AccessPathRoot::TypeSummary(locator.clone())
-        }
-        AbstractObjectIdentity::ModuleObject(locator) => {
-            AccessPathRoot::ModuleObject(locator.clone())
-        }
-        AbstractObjectIdentity::External(locator) => AccessPathRoot::External(locator.clone()),
     }
 }
 
@@ -274,10 +147,17 @@ fn root_evidence(
     )?])
 }
 
-fn gap_opens_heap(
+fn gap_impacts_heap(gap: &SemanticGap) -> bool {
+    gap.impacts.contains(SemanticGapImpact::HeapRead)
+        || gap.impacts.contains(SemanticGapImpact::HeapWrite)
+        || gap.impacts.contains(SemanticGapImpact::Aliasing)
+}
+
+fn heap_gaps_are_open(
     procedure: &ProcedureHandle,
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
+    mut relevant: impl FnMut(&SemanticGap) -> bool,
 ) -> Result<bool, Interruption> {
     let mut open = false;
     for gap in procedure.semantics().gaps() {
@@ -288,11 +168,143 @@ fn gap_opens_heap(
             gaps: 1,
             ..SemanticWork::default()
         })?;
-        open |= gap.impacts.contains(SemanticGapImpact::HeapRead)
-            || gap.impacts.contains(SemanticGapImpact::HeapWrite)
-            || gap.impacts.contains(SemanticGapImpact::Aliasing);
+        open |= relevant(gap) && gap_impacts_heap(gap);
     }
     Ok(open)
+}
+
+fn memory_location_uses_value(
+    location: &MemoryLocationKind,
+    value: crate::analyzer::semantic::ValueId,
+) -> bool {
+    match location {
+        MemoryLocationKind::Field { base, .. } => *base == value,
+        MemoryLocationKind::Index { base, index } => *base == value || *index == Some(value),
+        MemoryLocationKind::LexicalCell { binding } => *binding == value,
+        MemoryLocationKind::Static { .. } | MemoryLocationKind::Capture { .. } => false,
+    }
+}
+
+fn traced_gap_affects_value(
+    procedure: &ProcedureHandle,
+    gap: &SemanticGap,
+    value: crate::analyzer::semantic::ValueId,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<bool, InterruptionOrProvider> {
+    if cancellation.is_cancelled() {
+        return Err(InterruptionOrProvider::Interruption(
+            Interruption::Cancelled,
+        ));
+    }
+    Ok(match gap.subject {
+        // Procedure gaps are handled before tracing because they apply even
+        // when an exact producer cuts the trace short.
+        SemanticGapSubject::Procedure => false,
+        SemanticGapSubject::Point
+        | SemanticGapSubject::CallContinuation { .. }
+        | SemanticGapSubject::AsyncContinuation { .. } => true,
+        SemanticGapSubject::Value(subject) => subject == value,
+        SemanticGapSubject::MemoryLocation(location) => {
+            staged
+                .charge(SemanticWork {
+                    memory_locations: 1,
+                    ..SemanticWork::default()
+                })
+                .map_err(InterruptionOrProvider::Interruption)?;
+            let location = procedure
+                .semantics()
+                .memory_location(location)
+                .ok_or_else(|| {
+                    InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                        "semantic gap has a stale memory location",
+                    ))
+                })?;
+            // Static/capture load results are already opened when the trace
+            // reaches their MemoryLoad effect. Value roots can otherwise
+            // depend on a location only through its structured operands.
+            memory_location_uses_value(&location.kind, value)
+        }
+        SemanticGapSubject::Capture(capture) => {
+            staged
+                .charge(SemanticWork {
+                    captures: 1,
+                    ..SemanticWork::default()
+                })
+                .map_err(InterruptionOrProvider::Interruption)?;
+            let capture = procedure.semantics().capture(capture).ok_or_else(|| {
+                InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                    "semantic gap has a stale capture binding",
+                ))
+            })?;
+            let captured_value = match capture.captured {
+                CaptureSource::Value(captured) => captured == value,
+                CaptureSource::Location(location) => {
+                    staged
+                        .charge(SemanticWork {
+                            memory_locations: 1,
+                            ..SemanticWork::default()
+                        })
+                        .map_err(InterruptionOrProvider::Interruption)?;
+                    procedure
+                        .semantics()
+                        .memory_location(location)
+                        .is_some_and(|location| memory_location_uses_value(&location.kind, value))
+                }
+            };
+            staged
+                .charge(SemanticWork {
+                    allocations: 1,
+                    ..SemanticWork::default()
+                })
+                .map_err(InterruptionOrProvider::Interruption)?;
+            let environment_value = procedure
+                .semantics()
+                .allocation(capture.environment)
+                .is_some_and(|allocation| allocation.result == value);
+            capture.callable == value || captured_value || environment_value
+        }
+        SemanticGapSubject::CallSite(call_site) => {
+            staged
+                .charge(SemanticWork {
+                    call_sites: 1,
+                    ..SemanticWork::default()
+                })
+                .map_err(InterruptionOrProvider::Interruption)?;
+            let call = procedure.semantics().call_site(call_site).ok_or_else(|| {
+                InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                    "semantic gap has a stale call site",
+                ))
+            })?;
+            let fixed_field_matches = call.callee == value
+                || call.receiver == Some(value)
+                || call.result == Some(value)
+                || call.thrown == Some(value);
+            if fixed_field_matches {
+                true
+            } else {
+                let mut argument_matches = false;
+                for argument in &call.arguments {
+                    if cancellation.is_cancelled() {
+                        return Err(InterruptionOrProvider::Interruption(
+                            Interruption::Cancelled,
+                        ));
+                    }
+                    staged
+                        .charge(SemanticWork {
+                            nested_entries: 1,
+                            ..SemanticWork::default()
+                        })
+                        .map_err(InterruptionOrProvider::Interruption)?;
+                    if argument.value == value {
+                        argument_matches = true;
+                        break;
+                    }
+                }
+                argument_matches
+            }
+        }
+    })
 }
 
 fn points_to_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
@@ -480,8 +492,10 @@ fn resolve_objects(
             ..SemanticWork::default()
         })
         .map_err(InterruptionOrProvider::Interruption)?;
-    let gaps_open = gap_opens_heap(procedure, staged, cancellation)
-        .map_err(InterruptionOrProvider::Interruption)?;
+    let gaps_open = heap_gaps_are_open(procedure, staged, cancellation, |gap| {
+        gap.subject == SemanticGapSubject::Procedure
+    })
+    .map_err(InterruptionOrProvider::Interruption)?;
     let mut open = points_to_capabilities_are_open(procedure) || gaps_open;
     open |= query.context().was_truncated();
     let point_row = procedure
@@ -501,6 +515,7 @@ fn resolve_objects(
             value: query.value().id(),
             point: query.point().id(),
             event_limit: initial_limit,
+            summary_depth: 0,
         },
         Vec::<EvidenceHandle>::new(),
     )];
@@ -538,6 +553,25 @@ fn resolve_objects(
                     ..SemanticWork::default()
                 })
                 .map_err(InterruptionOrProvider::Interruption)?;
+            if let SemanticEffect::Gap { gap } = event.effect {
+                staged
+                    .charge(SemanticWork {
+                        gaps: 1,
+                        ..SemanticWork::default()
+                    })
+                    .map_err(InterruptionOrProvider::Interruption)?;
+                let gap = procedure.semantics().gap(gap).ok_or_else(|| {
+                    InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                        "semantic gap event has a stale gap ID",
+                    ))
+                })?;
+                if gap_impacts_heap(gap)
+                    && traced_gap_affects_value(procedure, gap, state.value, staged, cancellation)?
+                {
+                    open = true;
+                }
+                continue;
+            }
             let source = match event.effect {
                 SemanticEffect::Assignment { target, value } if target == state.value => {
                     Some(value)
@@ -665,14 +699,21 @@ fn resolve_objects(
         }
         if let Some((source, event_limit, evidence)) = producer {
             if source != state.value {
-                stack.push((
-                    TraceState {
-                        value: source,
-                        point: state.point,
-                        event_limit,
-                    },
-                    evidence,
-                ));
+                if state.summary_depth >= limits.summary_depth() {
+                    // Preserve candidates found along other paths but expose
+                    // that this producer chain was not fully explored.
+                    truncated = true;
+                } else {
+                    stack.push((
+                        TraceState {
+                            value: source,
+                            point: state.point,
+                            event_limit,
+                            summary_depth: state.summary_depth + 1,
+                        },
+                        evidence,
+                    ));
+                }
             }
         } else {
             let predecessors = procedure
@@ -720,6 +761,7 @@ fn resolve_objects(
                             value: state.value,
                             point: predecessor,
                             event_limit,
+                            summary_depth: state.summary_depth,
                         },
                         dedup_evidence(
                             inherited_evidence.iter().cloned().chain(std::iter::once(
@@ -864,7 +906,7 @@ fn resolve_locations(
                 ..SemanticWork::default()
             })
             .map_err(InterruptionOrProvider::Interruption)?;
-        let gaps_open = gap_opens_heap(procedure, staged, cancellation)
+        let gaps_open = heap_gaps_are_open(procedure, staged, cancellation, |_| true)
             .map_err(InterruptionOrProvider::Interruption)?;
         let open =
             location_capabilities_are_open(query) || gaps_open || query.context().was_truncated();
@@ -894,8 +936,8 @@ fn resolve_locations(
         } else {
             candidate_cardinality_for_root(query.path().root())
         };
-        let object = AbstractObject::new(identity_for_root(query.path().root()), cardinality)
-            .map_err(|error| {
+        let object =
+            AbstractObject::new(query.path().root().clone(), cardinality).map_err(|error| {
                 InterruptionOrProvider::Provider(internal_contract("invalid access root", error))
             })?;
         DraftSet {
@@ -927,7 +969,7 @@ fn resolve_locations(
             })
             .map_err(InterruptionOrProvider::Interruption)?;
         let path = AccessPath::bounded(
-            root_for_identity(draft.object.identity()),
+            draft.object.identity().clone(),
             query.path().selectors().to_vec(),
             query.path().tail(),
             limits,
@@ -1213,7 +1255,7 @@ fn materialize_update(
         first.location.clone()
     } else {
         let object = AbstractObject::new(
-            identity_for_root(store.target().path().root()),
+            store.target().path().root().clone(),
             candidate_cardinality_for_root(store.target().path().root()),
         )
         .map_err(|error| internal_contract("invalid store object", error))?;
