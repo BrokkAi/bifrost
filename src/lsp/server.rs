@@ -1051,6 +1051,11 @@ where
                     worker_method, worker_id, error.code, error.message
                 );
             }
+            // Make capacity available before publishing completion. Once the
+            // client receives this response it may immediately issue another
+            // cancellable request, which must not race the completed worker's
+            // slot teardown.
+            drop(slot);
             if let Err(err) = sender.send(Message::Response(response)) {
                 eprintln!(
                     "[bifrost-lsp] failed to send request response method={} id={:?}: {err}",
@@ -1058,7 +1063,6 @@ where
                 );
             }
             drop(active_request);
-            drop(slot);
         }) {
         Ok(handle) => handle,
         Err(err) => {

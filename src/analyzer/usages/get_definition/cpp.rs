@@ -1318,7 +1318,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
         "qualified_identifier" => {
             let text = cpp_callable_reference_text(function, ctx.source);
             let constructor = resolve_cpp_constructor(ctx, call);
-            if constructor.status != DefinitionLookupStatus::NoDefinition {
+            let constructor_boundary =
+                constructor.status == DefinitionLookupStatus::UnresolvableImportBoundary;
+            if constructor.status != DefinitionLookupStatus::NoDefinition && !constructor_boundary {
                 return constructor;
             }
             let mut candidates = cpp_visible_name_candidates(
@@ -1385,6 +1387,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         return cpp_callable_candidates_outcome(candidates);
                     }
                 }
+            }
+            if constructor_boundary {
+                return constructor;
             }
             if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, &text) {
                 return boundary(format!(
