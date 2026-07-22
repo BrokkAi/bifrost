@@ -691,7 +691,15 @@ pub fn check_i1_ex(
             continue;
         }
         summary.name_token_checks += 1;
-        if !fragment.contains(&symbol.identifier) {
+        // The display identifier of a nested symbol is the enclosing path
+        // (`test_deprecated_class$BadlyDeprecatedClass`); the token the
+        // declaration's own text carries is the terminal segment.
+        let name_token = symbol
+            .identifier
+            .rsplit(['#', '.', '$'])
+            .next()
+            .unwrap_or(&symbol.identifier);
+        if !fragment.contains(name_token) {
             sink.record(i1_violation(
                 language,
                 SHAPE_RANGE_NAME_TOKEN_ABSENT,

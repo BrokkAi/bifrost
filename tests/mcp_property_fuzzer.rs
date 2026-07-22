@@ -849,3 +849,28 @@ fn rerun_configs_target_summaries_listed_signatures_by_file_not_symbol() {
         );
     }
 }
+
+// Python function-local classes carry the enclosing path in their display
+// identifier (`test_deprecated_class$BadlyDeprecatedClass`); the name-token
+// check must look for the terminal segment, which is what the declaration's
+// own text carries (the Cirq ×130 shape).
+#[test]
+fn i1_silent_on_python_nested_class_fixture() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/test_compat.py",
+            "class NewClass:\n    pass\n\n\ndef deprecated_class(*args, **kwargs):\n    def wrap(cls):\n        return cls\n    return wrap\n\n\ndef test_deprecated_class():\n    @deprecated_class(deadline='invalid')\n    class BadlyDeprecatedClass(NewClass):\n        pass\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let report =
+        run_invariants(workspace.analyzer(), &fuzzer_config("py")).expect("run invariants");
+    assert!(
+        report
+            .violations
+            .iter()
+            .all(|violation| violation.shape != "range-name-token-absent"),
+        "{:?}",
+        report.violations
+    );
+}

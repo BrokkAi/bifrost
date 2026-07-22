@@ -254,6 +254,9 @@ const REFERENCE_TOKEN_STOPLIST: [&str; 172] = [
 pub struct ProbeSummary {
     pub symbols_sampled: usize,
     pub symbols_excluded_range_invalid: usize,
+    /// Go blank identifiers (`_`) skipped at generation: unaddressable, and
+    /// every blank in a package shares one fq.
+    pub symbols_excluded_blank_identifier: usize,
     pub selector_probes: usize,
     pub definition_probes: usize,
     pub definition_batch_probes: usize,
@@ -277,6 +280,10 @@ pub struct ProbeSummary {
     /// I3(b) follow-ups skipped because the scan target is a module unit,
     /// whose name is its file path, not a searchable symbol.
     pub skipped_scan_search_module: usize,
+    /// I3(a) follow-ups skipped because the summary element is a
+    /// package/module declaration, whose "path" is a convention rather than
+    /// a per-file contract.
+    pub skipped_module_summary_element: usize,
     pub i2_spelling_groups: usize,
     pub i3a_summary_element_checks: usize,
     pub i3b_scan_resolution_checks: usize,
@@ -652,6 +659,13 @@ fn generate_probes(
             continue;
         }
         if symbol.ranges.is_empty() || !is_ident_like(&symbol.identifier) {
+            continue;
+        }
+        // Go blank identifiers (`var _ Iface = ...`): unaddressable by any
+        // spelling, and every blank in a package shares one fq, so
+        // selector-based invariants cannot apply.
+        if symbol.identifier == "_" {
+            summary.symbols_excluded_blank_identifier += 1;
             continue;
         }
         if let Some(filter) = &config.symbol_filter
@@ -1086,6 +1100,24 @@ fn derive_follow_ups(
                             ) else {
                                 continue;
                             };
+                            // Package/module elements (`package cn.hutool.ai;`)
+                            // are listed under every file that declares them;
+                            // the module's "path" is a convention, not a
+                            // per-file contract, so I3a's path check cannot
+                            // apply (java packages, like go blanks and the
+                            // I1(b) module naming convention).
+                            if element.get("kind").and_then(Value::as_str) == Some("module") {
+                                summary.skipped_module_summary_element += 1;
+                                continue;
+                            }
+                            // Go blank identifiers (`pkg._module_._`):
+                            // unaddressable, and every blank in a package
+                            // shares one fq, so the path check fabricates
+                            // mismatches between files.
+                            if terminal_of(symbol) == "_" {
+                                summary.symbols_excluded_blank_identifier += 1;
+                                continue;
+                            }
                             follow.push(ProbeRecord {
                                 id: format!(
                                     "i3a:get_symbol_sources:{}:{symbol}",
@@ -1459,7 +1491,14 @@ fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
         return false;
     }
     if expected.len() == 1 {
-        return expected[0].contains(text_lines[0]);
+        let line = text_lines[0];
+        // Go embedded-field blocks deliberately re-insert the `type`
+        // keyword, rendering the field as a type declaration over the
+        // file's own field text.
+        return expected[0].contains(line)
+            || line
+                .strip_prefix("type ")
+                .is_some_and(|stripped| expected[0].contains(stripped));
     }
     let last = expected.len() - 1;
     expected[0].ends_with(text_lines[0])
@@ -2145,6 +2184,21 @@ pub fn check_i5(
                         failures.push(json!({
                             "kind": "ambiguous",
                             "target": entry.get("target"),
+                            "problem": "no candidate list",
+                        }));
+                    }
+                }
+                // Path-ambiguity is its own payload kind: matches to re-call
+                // with are actionable guidance (go/cli: `main` matched
+                // fixture ref paths — formally guided, even when the
+                // candidates are not what the caller wanted).
+                for entry in array_field(structured, "ambiguous_paths") {
+                    any_failure_payload = true;
+                    examined += 1;
+                    if array_field(entry, "matches").next().is_none() {
+                        failures.push(json!({
+                            "kind": "ambiguous_paths",
+                            "input": entry.get("input"),
                             "problem": "no candidate list",
                         }));
                     }

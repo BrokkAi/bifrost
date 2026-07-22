@@ -10,6 +10,7 @@
 
 mod common;
 
+use brokk_bifrost::Language;
 use brokk_bifrost::mcp_property_fuzzer::service_probes::{
     ProbeKind, ProbeOutcome, ProbeRecord, ProbeSummary, check_i1c, check_i2, check_i3a, check_i3b,
     check_i3c, check_i4, check_i5, check_render_mode_drift, disputed_name, minimize_batch,
@@ -829,11 +830,41 @@ fn i5_silent_when_failures_carry_hints() {
             },
             json!({"results": [{"status": "not_found", "diagnostics": [{"kind": "symbol_not_found", "message": "`Foo` does not resolve to a workspace symbol"}]}]}),
         ),
+        // Path ambiguity with re-callable matches is actionable guidance,
+        // not an empty refusal (go/cli `main` shape).
+        record(
+            "i5:path-ambiguity",
+            "get_symbol_sources",
+            ProbeKind::Spelling {
+                order: 0,
+                spelling: "main".to_string(),
+            },
+            json!({"ambiguous": [], "ambiguous_paths": [{"input": "main", "matches": ["git/fixtures/simple.git/refs/heads/main"]}], "not_found": [], "sources": []}),
+        ),
     ];
     let mut sink = Default::default();
     let mut summary = ProbeSummary::default();
     check_i5(&refs(&records), "scala", &mut sink, &mut summary);
     assert!(sink.into_sorted_vec().is_empty());
+}
+
+#[test]
+fn i5_fires_when_ambiguous_paths_carry_no_matches() {
+    let records = vec![record(
+        "i5:path-ambiguity",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "main".to_string(),
+        },
+        json!({"ambiguous": [], "ambiguous_paths": [{"input": "main", "matches": []}], "not_found": [], "sources": []}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i5(&refs(&records), "scala", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(violations[0].shape, "empty-failure-hint");
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,6 +1045,35 @@ fn i1c_silent_when_single_line_block_sits_mid_line() {
     assert_eq!(summary.i1c_source_text_checks, 1);
 }
 
+// Go embedded-field blocks deliberately re-insert the `type` keyword: the
+// returned text may add that prefix over the file's own field text (the
+// go-ethereum `type Request     any` shape).
+#[test]
+fn i1c_silent_when_go_embedded_field_reinserts_the_type_keyword() {
+    let input = I1Input {
+        files: vec![I1File {
+            path: "beacon/light/request/types.go".to_string(),
+            text: Some("package request\n\ntype Container struct {\n\tRequest     any\n\tOther       int\n}\n".to_string()),
+            parse_errors: Some(vec![]),
+        }],
+        symbols: vec![],
+    };
+    let records = vec![record(
+        "i1c",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "request.Request".to_string(),
+        },
+        json!({"sources": [{"label": "beacon/light/request.Request", "path": "beacon/light/request/types.go", "start_line": 4, "end_line": 4, "text": "type Request     any"}]}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i1c(&refs(&records), &input, "go", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(summary.i1c_source_text_checks, 1);
+}
+
 // The bfg InvocableBFG.processFor shape: the reported range's last line is
 // blank and the returned text faithfully carries it. The comparison must not
 // lose that trailing blank line to a join/re-split round trip.
@@ -1147,5 +1207,63 @@ fn service_invariants_silent_on_healthy_scala_fixture() {
         report.violations.is_empty(),
         "{}",
         serde_json::to_string_pretty(&report.violations).expect("violations json")
+    );
+}
+
+// Java package declarations appear as module-kind summary elements under
+// every file that declares them; they must not generate I3(a) follow-ups.
+#[test]
+fn java_module_summary_elements_are_skipped() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/com/example/Greeter.java",
+            "package com.example;\n\npublic class Greeter {\n    public String greet(String name) {\n        return \"hello \" + name;\n    }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("java"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    let summary = report.probe_summary.as_ref().expect("probe summary");
+    assert!(
+        summary.skipped_module_summary_element > 0,
+        "package element should be skipped: {summary:?}"
+    );
+}
+
+// Go package-level blank identifiers (`var _ = ...`) are unaddressable and
+// share one fq per package; probing them fabricates path mismatches.
+#[test]
+fn go_blank_identifiers_are_excluded_from_probing() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "pkg/obs/telemetry.go",
+            "package obs\n\nvar _ = compute()\n\nfunc compute() int { return 1 }\n\ntype Meter struct{ v int }\n\nfunc (m *Meter) Inc() { m.v++ }\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("go"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    let summary = report.probe_summary.as_ref().expect("probe summary");
+    assert!(
+        summary.symbols_excluded_blank_identifier > 0,
+        "blank identifier should be excluded: {summary:?}"
     );
 }
