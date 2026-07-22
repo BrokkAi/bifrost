@@ -42,9 +42,10 @@ use lsp_types::{
 
 use crate::NavigationOperation;
 use crate::analyzer::policy::{
-    PolicySourceDiagnosticSeverity, rqlp_source_completion_at, rqlp_source_help_at,
-    validate_rqlp_source,
+    PolicyReportDocument, PolicySourceDiagnosticSeverity, PolicySourceIdentity,
+    evaluate_policy_source, rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
 };
+use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
 };
@@ -699,6 +700,9 @@ fn handle_request(
     if req.method == RunRqlQuery::METHOD {
         return handle_run_rql_query_request(connection, state, req);
     }
+    if req.method == RunRqlPolicy::METHOD {
+        return handle_run_rql_policy_request(connection, state, req);
+    }
     if req.method == SemanticTokensFullRequest::METHOD {
         return handle_semantic_tokens_request(connection, state, req);
     }
@@ -940,7 +944,18 @@ struct CancellableWorkerConfig {
     success_message: &'static str,
 }
 
-fn start_cancellable_worker<T, F>(
+enum CancellableWorkerError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<RequestCancelled> for CancellableWorkerError {
+    fn from(_: RequestCancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+fn start_cancellable_worker<T, F, E>(
     connection: &Connection,
     state: &ServerState,
     id: RequestId,
@@ -951,12 +966,13 @@ fn start_cancellable_worker<T, F>(
 ) -> Result<(), String>
 where
     T: serde::Serialize,
+    E: Into<CancellableWorkerError>,
     F: FnOnce(
             &WorkspaceAnalyzer,
             &dyn Project,
             &RequestContext,
             &CancellationToken,
-        ) -> Result<T, RequestCancelled>
+        ) -> Result<T, E>
         + Send
         + 'static,
 {
@@ -1141,6 +1157,127 @@ fn handle_run_rql_query_request(
     )
 }
 
+fn handle_run_rql_policy_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params = match req.extract::<RunRqlPolicyParams>(RunRqlPolicy::METHOD) {
+        Ok((_, params)) => params,
+        Err(ExtractError::JsonError { error, .. }) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to decode params for {method}: {error}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+        Err(ExtractError::MethodMismatch(_)) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Method not implemented: {method}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+    };
+
+    let (workspace_root, source_identity) =
+        match resolve_run_policy_identity(state.project(), &params.document_uri) {
+            Ok(validated) => validated,
+            Err(message) => {
+                let response = Response::new_err(id, ErrorCode::InvalidParams as i32, message);
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+        };
+    let source = params.source;
+    // Policy dependencies are confined to `workspace_root`, while analyzer
+    // result paths are relative to the active project's report coordinate root.
+    let policy_root_uri = path_to_uri_string(&workspace_root);
+    let report_root_uri = path_to_uri_string(state.project().root());
+
+    start_cancellable_worker(
+        connection,
+        state,
+        id,
+        method,
+        None,
+        CancellableWorkerConfig {
+            worker_name: "bifrost-lsp-run-policy",
+            progress_title: "Running RQL policy",
+            progress_initial_message: "Loading policy dependencies",
+            cancellation_message: "policy request cancelled by client",
+            success_message: "Policy report ready",
+        },
+        move |workspace, _project, context, cancellation| {
+            context.report("Evaluating policy");
+            let outcome = evaluate_policy_source(
+                &workspace_root,
+                source_identity,
+                &source,
+                workspace.analyzer(),
+                Some(cancellation),
+            )
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    CancellableWorkerError::Cancelled
+                } else {
+                    CancellableWorkerError::Failed(format!(
+                        "Failed to evaluate RQL policy: {error}"
+                    ))
+                }
+            })?;
+            if cancellation.is_cancelled() {
+                return Err(CancellableWorkerError::Cancelled);
+            }
+            Ok(RunRqlPolicyResult {
+                policy_root_uri,
+                report_root_uri,
+                report: outcome.into_report(),
+            })
+        },
+    )
+}
+
+fn resolve_run_policy_identity(
+    project: &dyn Project,
+    document_uri: &Uri,
+) -> Result<(PathBuf, PolicySourceIdentity), String> {
+    let project_file = resolve_project_file_allow_missing(project, document_uri)
+        .ok_or_else(|| "Run Policy document is outside the active Bifrost workspace".to_string())?;
+    let workspace_root = project.workspace_root_for_file(&project_file);
+    let project_file_path = project_file.abs_path();
+    let expected_relative = project_file_path
+        .strip_prefix(&workspace_root)
+        .map_err(|_| "Run Policy could not determine the document workspace root".to_string())?;
+    let source_path = WorkspaceRelativePath::try_from_path(expected_relative)
+        .map_err(|error| format!("Run Policy document path is not portable: {error}"))?;
+    if source_path
+        .as_path()
+        .extension()
+        .and_then(|value| value.to_str())
+        != Some("rqlp")
+    {
+        return Err("Run Policy requires an `.rqlp` document URI".to_string());
+    }
+
+    Ok((
+        workspace_root,
+        PolicySourceIdentity::new(source_path.as_str()),
+    ))
+}
+
 fn run_rql_query_result(
     workspace: &WorkspaceAnalyzer,
     response: CodeQueryResponse,
@@ -1280,14 +1417,14 @@ fn handle_references_request(
     )
 }
 
-fn finish_cancellable_request<T: serde::Serialize>(
+fn finish_cancellable_request<T: serde::Serialize, E: Into<CancellableWorkerError>>(
     id: &RequestId,
     method: &str,
     context: &RequestContext,
     cancellation: &CancellationToken,
     cancellation_message: &str,
     success_message: &str,
-    run: impl FnOnce() -> Result<T, RequestCancelled>,
+    run: impl FnOnce() -> Result<T, E>,
 ) -> Response {
     match panic::catch_unwind(panic::AssertUnwindSafe(run)) {
         Err(_) => {
@@ -1299,14 +1436,20 @@ fn finish_cancellable_request<T: serde::Serialize>(
             )
         }
         Ok(result) => match result {
-            Err(RequestCancelled) => {
-                context.end("Cancelled");
-                Response::new_err(
-                    id.clone(),
-                    ErrorCode::RequestCanceled as i32,
-                    cancellation_message.to_string(),
-                )
-            }
+            Err(error) => match error.into() {
+                CancellableWorkerError::Cancelled => {
+                    context.end("Cancelled");
+                    Response::new_err(
+                        id.clone(),
+                        ErrorCode::RequestCanceled as i32,
+                        cancellation_message.to_string(),
+                    )
+                }
+                CancellableWorkerError::Failed(message) => {
+                    context.end("Failed");
+                    Response::new_err(id.clone(), ErrorCode::InternalError as i32, message)
+                }
+            },
             Ok(_) if cancellation.is_cancelled() => {
                 context.end("Cancelled");
                 Response::new_err(
@@ -1978,6 +2121,33 @@ struct RunRqlQueryResultItem {
     uri: String,
     #[serde(flatten)]
     result: CodeQueryResultItem,
+}
+
+enum RunRqlPolicy {}
+
+impl lsp_types::request::Request for RunRqlPolicy {
+    type Params = RunRqlPolicyParams;
+    // The canonical report is intentionally output-only because it contains
+    // analyzer-owned evidence types. Serialize that exact shape without
+    // maintaining a second deserializable Rust protocol model.
+    type Result = serde_json::Value;
+
+    const METHOD: &'static str = "bifrost/runPolicy";
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRqlPolicyParams {
+    document_uri: Uri,
+    source: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRqlPolicyResult {
+    policy_root_uri: String,
+    report_root_uri: String,
+    report: PolicyReportDocument,
 }
 
 /// Source-only query validation for the RQL editor. This deliberately has no
@@ -3735,7 +3905,7 @@ mod tests {
         );
         context.begin();
 
-        let response = finish_cancellable_request::<serde_json::Value>(
+        let response = finish_cancellable_request::<serde_json::Value, CancellableWorkerError>(
             &RequestId::from(9),
             References::METHOD,
             &context,
@@ -3779,7 +3949,7 @@ mod tests {
             &cancellation,
             "query request cancelled by client",
             "Query ready",
-            || Ok(json!({ "results": ["partial"] })),
+            || Ok::<_, CancellableWorkerError>(json!({ "results": ["partial"] })),
         );
 
         assert!(response.result.is_none());

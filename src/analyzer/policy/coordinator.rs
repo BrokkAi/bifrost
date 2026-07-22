@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use crate::CancellationToken;
+use crate::analyzer::{AnalyzerConfig, FilesystemProject, IAnalyzer, Project, WorkspaceAnalyzer};
 use crate::schema_version::SchemaVersionOrigin;
 use crate::workspace_document::WorkspaceRoot;
 
@@ -34,7 +35,7 @@ use super::resolved::{
 };
 use super::source::{
     PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
-    PolicySourceRelatedDiagnostic, validate_policy_source_identity,
+    PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
 };
 use super::{PolicyBatchBudget, PolicyBudget};
 
@@ -154,6 +155,33 @@ pub fn evaluate_policy_files(
     )
 }
 
+/// Evaluate one live policy source against an analyzer snapshot that the caller owns.
+///
+/// The root source comes from `source` rather than the filesystem, while referenced
+/// selectors, endpoints, endpoint directories, and catalogs remain confined beneath
+/// `root` by the normal workspace-backed policy registry.
+pub fn evaluate_policy_source(
+    root: impl AsRef<Path>,
+    source_identity: PolicySourceIdentity,
+    source: &str,
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let (root, _) = open_policy_workspace_root(root.as_ref())?;
+
+    let input = prepare_source_input(source_identity, source)?;
+    evaluate_policy_inputs(
+        &root,
+        vec![input],
+        false,
+        PolicyFailOn::Never,
+        PolicyBatchBudget::default(),
+        PolicyRegistryLimits::default(),
+        Some(analyzer),
+        cancellation,
+    )
+}
+
 fn evaluate_policy_files_with_limits(
     root: &Path,
     policy_files: &[PathBuf],
@@ -174,18 +202,7 @@ fn evaluate_policy_files_with_limits(
         )));
     }
 
-    let root = root.canonicalize().map_err(|error| {
-        PolicyCoordinatorError::new(format!(
-            "failed to resolve policy workspace root {}: {error}",
-            root.display()
-        ))
-    })?;
-    let read_root = WorkspaceRoot::open(&root).map_err(|error| {
-        PolicyCoordinatorError::new(format!(
-            "failed to open policy workspace root {}: {error}",
-            root.display()
-        ))
-    })?;
+    let (root, read_root) = open_policy_workspace_root(root)?;
 
     let mut inputs = Vec::with_capacity(policy_files.len());
     for path in policy_files {
@@ -193,16 +210,48 @@ fn evaluate_policy_files_with_limits(
     }
     exclude_duplicate_policy_ids(&mut inputs)?;
 
+    evaluate_policy_inputs(
+        &root,
+        inputs,
+        require_explicit_schema_versions,
+        fail_on,
+        batch_budget,
+        registry_limits,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_policy_inputs(
+    root: &Path,
+    mut inputs: Vec<InputOutcome>,
+    require_explicit_schema_versions: bool,
+    fail_on: PolicyFailOn,
+    batch_budget: PolicyBatchBudget,
+    registry_limits: PolicyRegistryLimits,
+    supplied_analyzer: Option<&dyn IAnalyzer>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    check_policy_cancellation(cancellation)?;
     let catalogs = Arc::new(
-        TaintCatalogRegistry::new_for_workspace(root.clone(), CatalogRegistryLimits::default())
-            .map_err(|error| {
-                PolicyCoordinatorError::new(format!(
-                    "failed to initialize policy catalog registry: {error}"
-                ))
-            })?,
-    );
-    let mut registry = PolicyRegistry::new_for_workspace(root.clone(), catalogs, registry_limits)
+        TaintCatalogRegistry::new_for_workspace(
+            root.to_path_buf(),
+            CatalogRegistryLimits::default(),
+        )
         .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to initialize policy catalog registry: {error}"
+            ))
+        })?,
+    );
+    check_policy_cancellation(cancellation)?;
+    let mut registry = PolicyRegistry::new_for_workspace(
+        root.to_path_buf(),
+        catalogs,
+        registry_limits,
+    )
+    .map_err(|error| {
         PolicyCoordinatorError::new(format!("failed to initialize policy registry: {error}"))
     })?;
 
@@ -221,6 +270,7 @@ fn evaluate_policy_files_with_limits(
 
     let mut input_by_policy_id = HashMap::new();
     for (input_index, _, source) in pending_indexes {
+        check_policy_cancellation(cancellation)?;
         let InputOutcome::Pending(prepared) = &inputs[input_index] else {
             return Err(PolicyCoordinatorError::new(
                 "pending policy input changed during stable registration",
@@ -269,10 +319,10 @@ fn evaluate_policy_files_with_limits(
         })
         .collect::<HashSet<_>>();
 
-    let analyzer = if runnable_ids.is_empty() {
+    let owned_analyzer = if runnable_ids.is_empty() || supplied_analyzer.is_some() {
         None
     } else {
-        let project = FilesystemProject::new(root.clone()).map_err(|error| {
+        let project = FilesystemProject::new(root).map_err(|error| {
             PolicyCoordinatorError::new(format!(
                 "failed to construct analyzer project {}: {error}",
                 root.display()
@@ -281,14 +331,17 @@ fn evaluate_policy_files_with_limits(
         let project: Arc<dyn Project> = Arc::new(project);
         Some(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
     };
+    check_policy_cancellation(cancellation)?;
 
     let evaluator = DefaultPolicyEvaluator::new();
     let mut runs = HashMap::with_capacity(runnable_ids.len());
-    let analyzer = analyzer.as_ref().map(WorkspaceAnalyzer::analyzer);
+    let analyzer =
+        supplied_analyzer.or_else(|| owned_analyzer.as_ref().map(WorkspaceAnalyzer::analyzer));
     for policy in registry
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
     {
+        check_policy_cancellation(cancellation)?;
         let mut evaluation_budget = *batch_budget.per_policy();
         let context = PolicyEvaluationContext {
             analyzer: analyzer.ok_or_else(|| {
@@ -297,7 +350,7 @@ fn evaluate_policy_files_with_limits(
                     policy.definition().metadata.id
                 ))
             })?,
-            cancellation: None,
+            cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],
         };
@@ -313,6 +366,7 @@ fn evaluate_policy_files_with_limits(
     })?;
     let mut retained_findings = Vec::new();
     for input in inputs {
+        check_policy_cancellation(cancellation)?;
         match input {
             InputOutcome::Diagnostic(diagnostic) => builder
                 .register_primary_diagnostic(diagnostic)
@@ -379,6 +433,33 @@ fn evaluate_policy_files_with_limits(
     })
 }
 
+fn open_policy_workspace_root(
+    root: &Path,
+) -> Result<(PathBuf, WorkspaceRoot), PolicyCoordinatorError> {
+    let root = root.canonicalize().map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to resolve policy workspace root {}: {error}",
+            root.display()
+        ))
+    })?;
+    let workspace = WorkspaceRoot::open(&root).map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to open policy workspace root {}: {error}",
+            root.display()
+        ))
+    })?;
+    Ok((root, workspace))
+}
+
+fn check_policy_cancellation(
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), PolicyCoordinatorError> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(PolicyCoordinatorError::new("policy evaluation cancelled"));
+    }
+    Ok(())
+}
+
 fn prepare_input(
     root: &WorkspaceRoot,
     path: &Path,
@@ -398,28 +479,53 @@ fn prepare_input(
                 ));
             }
             let (_, document, parsed) = loaded.into_parts();
-            match parsed.document() {
-                RqlpDocument::Policy { definition } => Ok(InputOutcome::Pending(PreparedPolicy {
-                    source,
-                    bytes: document.source().to_string(),
-                    policy_id: definition.metadata.id.clone(),
-                })),
-                RqlpDocument::Endpoint { definition } => {
-                    Ok(InputOutcome::Diagnostic(report_diagnostic(
-                        PolicyReportDiagnosticCode::NotExecutableEndpoint,
-                        format!(
-                            "endpoint `{}` is a reusable dependency and is not an executable policy root",
-                            definition.id
-                        ),
-                        Some(source),
-                        None,
-                        Vec::new(),
-                    )?))
-                }
-            }
+            prepare_parsed_input(source, document.source().to_string(), parsed.document())
         }
         Err(error) => Ok(InputOutcome::Diagnostic(document_load_diagnostic(
             path, &error,
+        )?)),
+    }
+}
+
+fn prepare_source_input(
+    source_identity: PolicySourceIdentity,
+    source: &str,
+) -> Result<InputOutcome, PolicyCoordinatorError> {
+    if let Err(error) = validate_policy_source_identity(&source_identity) {
+        return Ok(InputOutcome::Diagnostic(
+            invalid_source_identity_diagnostic(&source_identity, error)?,
+        ));
+    }
+
+    match parse_rqlp_source(source, source_identity.clone()) {
+        Ok(parsed) => prepare_parsed_input(source_identity, source.to_owned(), parsed.document()),
+        Err(error) => Ok(InputOutcome::Diagnostic(source_diagnostic(
+            source_identity,
+            &error.diagnostic,
+        )?)),
+    }
+}
+
+fn prepare_parsed_input(
+    source: PolicySourceIdentity,
+    bytes: String,
+    document: &RqlpDocument,
+) -> Result<InputOutcome, PolicyCoordinatorError> {
+    match document {
+        RqlpDocument::Policy { definition } => Ok(InputOutcome::Pending(PreparedPolicy {
+            source,
+            bytes,
+            policy_id: definition.metadata.id.clone(),
+        })),
+        RqlpDocument::Endpoint { definition } => Ok(InputOutcome::Diagnostic(report_diagnostic(
+            PolicyReportDiagnosticCode::NotExecutableEndpoint,
+            format!(
+                "endpoint `{}` is a reusable dependency and is not an executable policy root",
+                definition.id
+            ),
+            Some(source),
+            None,
+            Vec::new(),
         )?)),
     }
 }
@@ -932,6 +1038,121 @@ mod tests {
         )
         .expect("bounded canonical policy report");
         output
+    }
+
+    #[test]
+    fn live_policy_source_uses_supplied_analyzer_and_unsaved_bytes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/live.rqlp",
+            &match_policy("test.saved", "Saved source"),
+        );
+
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let live_source = match_policy("test.unsaved", "Unsaved source");
+
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/live.rqlp"),
+            &live_source,
+            analyzer.analyzer(),
+            None,
+        )
+        .expect("live policy report");
+
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_CLEAN);
+        assert!(outcome.report().diagnostics().is_empty());
+        assert_eq!(outcome.report().rules().len(), 1);
+        assert_eq!(
+            outcome.report().rules()[0].policy_id().as_str(),
+            "test.unsaved"
+        );
+        assert_eq!(outcome.report().rules()[0].name(), "Unsaved source");
+        assert_eq!(outcome.report().runs().len(), 1);
+        assert!(outcome.report().runs()[0].completion().is_complete());
+        assert_eq!(outcome.report().runs()[0].findings().len(), 1);
+        assert_eq!(
+            outcome.report().runs()[0].findings()[0].primary().path(),
+            "app.ts"
+        );
+    }
+
+    #[test]
+    fn live_endpoint_root_is_a_canonical_non_executable_diagnostic() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let endpoint = r#"(endpoint
+  :id "endpoint.input"
+  :name "Input"
+  :display-name "input"
+  :role source
+  :categories [input.user]
+  :selector
+    (rql
+      (language typescript (function :name "target")))
+  :binding return-value
+  :supersedes [])"#;
+
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/input.rqlp"),
+            endpoint,
+            analyzer.analyzer(),
+            None,
+        )
+        .expect("endpoint diagnostic report");
+
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert!(outcome.report().rules().is_empty());
+        assert!(outcome.report().runs().is_empty());
+        assert_eq!(outcome.report().diagnostics().len(), 1);
+        assert_eq!(
+            outcome.report().diagnostics()[0].code(),
+            PolicyReportDiagnosticCode::NotExecutableEndpoint
+        );
+        assert_eq!(
+            outcome.report().diagnostics()[0]
+                .source()
+                .map(PolicySourceIdentity::as_str),
+            Some("policies/input.rqlp")
+        );
+    }
+
+    #[test]
+    fn live_policy_source_stops_before_registry_loading_when_cancelled() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/live.rqlp"),
+            &match_policy("test.cancelled", "Cancelled"),
+            analyzer.analyzer(),
+            Some(&cancellation),
+        );
+        let Err(error) = result else {
+            panic!("cancelled evaluation must stop");
+        };
+
+        assert_eq!(error.to_string(), "policy evaluation cancelled");
     }
 
     #[test]
