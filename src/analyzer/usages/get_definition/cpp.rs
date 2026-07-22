@@ -6,7 +6,7 @@ use crate::analyzer::declaration_range::{
 };
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_parameter_type_text,
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 
@@ -2462,6 +2462,7 @@ struct CppType {
     name: String,
     unit: Option<CodeUnit>,
     indirection: i32,
+    pointee_const: bool,
     alias_unit: Option<CodeUnit>,
 }
 
@@ -2478,6 +2479,7 @@ impl CppType {
             name: name.clone(),
             unit: cpp_resolve_type_unit(analyzer, visibility, file, &name),
             indirection,
+            pointee_const: false,
             alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
         }
     }
@@ -2487,6 +2489,7 @@ impl CppType {
             name: cpp_name_for(&unit),
             unit: Some(unit),
             indirection,
+            pointee_const: false,
             alias_unit: None,
         }
     }
@@ -2496,6 +2499,7 @@ impl CppType {
             name: self.name.clone(),
             unit: self.unit.clone(),
             indirection: self.indirection,
+            pointee_const: self.pointee_const,
         }
     }
 }
@@ -2557,8 +2561,13 @@ fn cpp_expression_type(
 ) -> Option<CppType> {
     match node.kind() {
         "number_literal" | "true" | "false" | "char_literal" | "string_literal"
-        | "unary_expression" => cpp_literal_type_name(node, source)
-            .map(|name| CppType::from_text(analyzer, visibility, file, name, 0)),
+        | "unary_expression" => cpp_literal_arg_type(node, source).map(|literal| CppType {
+            unit: cpp_resolve_type_unit(analyzer, visibility, file, &literal.name),
+            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &literal.name),
+            name: literal.name,
+            indirection: literal.indirection,
+            pointee_const: literal.pointee_const,
+        }),
         "identifier" => {
             let name = cpp_node_text(node, source);
             let ctx = CppLookupCtx {
@@ -2655,6 +2664,7 @@ fn cpp_field_declared_type(
         name,
         unit,
         indirection,
+        pointee_const: false,
     })
 }
 
@@ -3641,6 +3651,7 @@ fn cpp_seed_binding(
                 name: name.clone(),
                 unit,
                 indirection: 0,
+                pointee_const: false,
                 alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
             }
         })

@@ -3020,10 +3020,22 @@ fn cpp_declarator_label_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn cpp_parameter_type(parameter: Node<'_>, source: &str) -> String {
-    let type_text = parameter
+    let base_type = parameter
         .child_by_field_name("type")
         .map(|node| normalize_cpp_whitespace(node_text(node, source)))
         .unwrap_or_default();
+    let mut cursor = parameter.walk();
+    let qualifiers = parameter
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_qualifier")
+        .map(|child| normalize_cpp_whitespace(node_text(child, source)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let type_text = match (qualifiers.is_empty(), base_type.is_empty()) {
+        (true, _) => base_type,
+        (_, true) => qualifiers,
+        (false, false) => format!("{qualifiers} {base_type}"),
+    };
     let declarator_suffix = cpp_parameter_declarator(parameter)
         .map(|node| cpp_declarator_suffix_without_name(node, source))
         .unwrap_or_default();
