@@ -1204,18 +1204,39 @@ fn rust_visible_import_resolution(
         let mut expected_fqns = HashSet::default();
         if explicitly_bound {
             for (local_name, binding) in &binder.bindings {
-                if local_name != reference || binding.kind != ImportKind::Named {
+                if local_name != reference {
                     continue;
                 }
-                let imported = binding.imported_name.as_deref().unwrap_or(reference);
-                if let Some(package) = resolve_import_package_scoped(
-                    rust,
-                    file,
-                    source,
-                    scope_start,
-                    &binding.module_specifier,
-                ) {
-                    expected_fqns.insert(format!("{package}.{imported}"));
+                // Scope-aware fqn for `self`/`super` specifiers: Named
+                // bindings (`use super::{X}`) resolve the package and append
+                // the item; Namespace bindings (`use super::X`) resolve the
+                // full path directly. File-level resolution pops from the
+                // file's parent package and misses both (#1074).
+                match binding.kind {
+                    ImportKind::Named => {
+                        let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                        if let Some(package) = resolve_import_package_scoped(
+                            rust,
+                            file,
+                            source,
+                            scope_start,
+                            &binding.module_specifier,
+                        ) {
+                            expected_fqns.insert(format!("{package}.{imported}"));
+                        }
+                    }
+                    ImportKind::Namespace => {
+                        if let Some(fqn) = resolve_import_package_scoped(
+                            rust,
+                            file,
+                            source,
+                            scope_start,
+                            &binding.module_specifier,
+                        ) {
+                            expected_fqns.insert(fqn);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1224,12 +1245,32 @@ fn rust_visible_import_resolution(
         // standard target resolution looks in the file's parent package and
         // misses them, so steer them to the current file directly.
         for (local_name, binding) in &binder.bindings {
-            if local_name != reference || binding.kind != ImportKind::Named {
+            if local_name != reference {
                 continue;
             }
-            let imported = binding.imported_name.as_deref().unwrap_or(reference);
-            if import_resolves_within_file(file, source, scope_start, &binding.module_specifier) {
-                targets.push((file.clone(), imported.to_string()));
+            match binding.kind {
+                ImportKind::Named => {
+                    let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                    if import_package_resolves_to_file(
+                        file,
+                        source,
+                        scope_start,
+                        &binding.module_specifier,
+                    ) {
+                        targets.push((file.clone(), imported.to_string()));
+                    }
+                }
+                ImportKind::Namespace => {
+                    if let Some(name) = import_path_resolves_within_file(
+                        file,
+                        source,
+                        scope_start,
+                        &binding.module_specifier,
+                    ) {
+                        targets.push((file.clone(), name));
+                    }
+                }
+                _ => {}
             }
         }
         let mut candidates = Vec::new();
@@ -1303,8 +1344,8 @@ fn resolve_import_package_scoped(
 /// True when a `self`/`super` import's module specifier resolves to the
 /// current file's own package — i.e. the import targets a declaration in
 /// this file, which the file-level target resolution (looking in the file's
-/// parent package) cannot see.
-fn import_resolves_within_file(
+/// parent package) cannot see. Used for Named bindings (`use super::{X}`).
+fn import_package_resolves_to_file(
     file: &ProjectFile,
     source: &str,
     scope_start: usize,
@@ -1329,6 +1370,35 @@ fn import_resolves_within_file(
         &segments,
     )
     .is_some_and(|resolved| resolved == file_package)
+}
+
+/// For Namespace bindings (`use super::X` — the full path is the specifier):
+/// when the scope-aware resolution lands inside the current file, return the
+/// imported declaration's terminal name so the file can be targeted directly.
+fn import_path_resolves_within_file(
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    module_specifier: &str,
+) -> Option<String> {
+    let first = module_specifier.split("::").next()?;
+    if !matches!(first, "self" | "super") {
+        return None;
+    }
+    let file_package = crate::analyzer::rust::rust_package_name(file);
+    let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
+    let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
+    let segments: Vec<&str> = module_specifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let resolved = crate::analyzer::rust::resolve_rust_module_segments_with_crate(
+        &lexical_package,
+        &crate_package,
+        &segments,
+    )?;
+    let (parent, name) = resolved.rsplit_once('.')?;
+    (parent == file_package).then(|| name.to_string())
 }
 
 fn rust_import_target_candidates(
@@ -2504,7 +2574,7 @@ fn resolve_rust_field(
             return None;
         }
         let member = rust_node_text(field, source).trim();
-        let owner = rust_expression_type_fqn(
+        let Some(owner) = rust_expression_type_fqn(
             analyzer,
             support,
             file,
@@ -2513,7 +2583,19 @@ fn resolve_rust_field(
             receiver,
             field_expression.start_byte(),
             cache,
-        )?;
+        ) else {
+            // The receiver's type could not be resolved to an indexed
+            // definition at all (e.g. the owning struct is declared inside a
+            // macro invocation Bifrost does not expand into declarations,
+            // #1015). Returning `None` here used to fall all the way back to
+            // `resolve_rust_unscoped`'s generic fallback, which reported the
+            // *entire* dotted chain as unresolved with no hint (#1019). Name
+            // the owner type when it can still be read syntactically from the
+            // enclosing `impl` block so the caller has a concrete next query.
+            return Some(rust_field_owner_unresolved_outcome(
+                source, node, receiver, member,
+            ));
+        };
         let candidates = rust_member_candidates(
             support.fqn(&format!("{owner}.{member}")),
             rust_field_expression_member_kind(field_expression),
@@ -2548,13 +2630,59 @@ fn resolve_rust_field(
         return if candidates.is_empty() {
             Some(no_definition(
                 "no_indexed_definition",
-                format!("`{owner}.{member}` is not indexed as a Rust definition"),
+                format!(
+                    "`{owner}.{member}` is not indexed as a Rust definition; try get_symbol_sources with \"{owner}.{member}\" or search_symbols for \"{member}\""
+                ),
             ))
         } else {
             Some(candidates_outcome(candidates))
         };
     }
     None
+}
+
+/// Build an actionable `no_indexed_definition` outcome for a `receiver.member`
+/// field access whose receiver type could not be resolved at all. When the
+/// receiver is `self`, the enclosing `impl`'s type name can still be read
+/// straight off the syntax tree even though it never resolved to an indexed
+/// definition, so the hint can name it and suggest a concrete retry (#1019).
+fn rust_field_owner_unresolved_outcome(
+    source: &str,
+    node: Node<'_>,
+    receiver: Node<'_>,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    if rust_node_text(receiver, source).trim() == "self"
+        && let Some(owner_name) = rust_enclosing_impl_type_name_text(node, source)
+    {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{member}` looks like a field of `{owner_name}`, but `{owner_name}` did not resolve to an indexed Rust definition (it may be declared inside a macro invocation Bifrost does not expand); try get_symbol_sources with \"{owner_name}.{member}\" or search_symbols for \"{member}\""
+            ),
+        );
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!(
+            "`{member}` did not resolve to an indexed Rust definition because its receiver's type could not be determined; try search_symbols for \"{member}\""
+        ),
+    )
+}
+
+/// Like [`rust_enclosing_impl_type_fqn`] but reads the impl's `Self` type name
+/// straight from the syntax tree instead of resolving it to an indexed FQN, so
+/// it still produces a name when the type itself is not indexed.
+fn rust_enclosing_impl_type_name_text(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node.parent()?;
+    loop {
+        if current.kind() == "impl_item"
+            && let Some(type_node) = current.child_by_field_name("type")
+        {
+            return rust_type_ref(type_node, source).map(|type_ref| type_ref.name);
+        }
+        current = current.parent()?;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

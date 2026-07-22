@@ -24745,3 +24745,115 @@ fn rust_super_import_from_test_module_resolves_same_file_declaration() {
         "{value}"
     );
 }
+
+// The http4s Message.scala shape: a file that imports its own companion
+// member (`import org.http4s.Message.EntityStreamException`) must not get
+// the "not indexed" boundary claim — the import target is declared in the
+// same file (fuzzer I4 on http4s).
+#[test]
+fn scala_import_of_own_companion_member_does_not_claim_boundary() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Message.scala",
+            "package org.http4s\n\nimport cats.syntax.all._\nimport org.http4s.Message.EntityStreamException\n\ntrait Message {\n  def go: EntityStreamException = EntityStreamException.createWithDefaultMsg(1)\n}\n\nobject Message {\n  final case class EntityStreamException(msg: String) extends Exception(msg)\n\n  object EntityStreamException {\n    def createWithDefaultMsg(maxBytes: Long): EntityStreamException = ???\n  }\n}\n",
+        )
+        .build();
+
+    let line = "  def go: EntityStreamException = EntityStreamException.createWithDefaultMsg(1)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Message.scala","line":7,"column":{}}}]}}"#,
+            column_of(line, "EntityStreamException")
+        ),
+    );
+
+    let rendered = value.to_string();
+    assert!(
+        !rendered.contains("not indexed in this workspace"),
+        "boundary claim must not fire: {rendered}"
+    );
+    assert_eq!(
+        value["results"][0]["status"].as_str().expect("status"),
+        "resolved",
+        "the import must resolve to the same-file case class: {rendered}"
+    );
+}
+
+#[test]
+fn rust_super_import_multi_name_list_resolves_same_file_declaration() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/syntax_tree.rs",
+            "fn check_posix_regex_errors(pattern: &str) -> bool { pattern.len() > 0 }\nfn check_regex_valid(p: &str) -> bool { check_posix_regex_errors(p) }\n\n#[cfg(test)]\nmod tests {\n    use super::{check_posix_regex_errors, check_regex_valid};\n\n    fn check(p: &str) -> bool { check_posix_regex_errors(p) }\n}\n",
+        )
+        .build();
+
+    let line = "    fn check(p: &str) -> bool { check_posix_regex_errors(p) }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/syntax_tree.rs","line":8,"column":{}}}]}}"#,
+            column_of(line, "check_posix_regex_errors")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/syntax_tree.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_super_import_braced_single_resolves_call() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/syntax_tree.rs",
+            "fn check_posix_regex_errors(pattern: &str) -> bool { pattern.len() > 0 }\n\n#[cfg(test)]\nmod tests {\n    use super::{check_posix_regex_errors};\n\n    fn check(p: &str) -> bool { check_posix_regex_errors(p) }\n}\n",
+        )
+        .build();
+
+    let line = "    fn check(p: &str) -> bool { check_posix_regex_errors(p) }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/syntax_tree.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "check_posix_regex_errors")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/syntax_tree.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_super_import_unbraced_resolves_call() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/syntax_tree.rs",
+            "fn check_posix_regex_errors(pattern: &str) -> bool { pattern.len() > 0 }\n\n#[cfg(test)]\nmod tests {\n    use super::check_posix_regex_errors;\n\n    fn check(p: &str) -> bool { check_posix_regex_errors(p) }\n}\n",
+        )
+        .build();
+
+    let line = "    fn check(p: &str) -> bool { check_posix_regex_errors(p) }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/syntax_tree.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "check_posix_regex_errors")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/syntax_tree.rs",
+        "{value}"
+    );
+}
