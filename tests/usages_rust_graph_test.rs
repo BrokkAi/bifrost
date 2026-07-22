@@ -398,6 +398,63 @@ fn local_item_decoy() -> usize {
 }
 
 #[test]
+fn rust_bare_function_values_in_comma_separated_macro_arguments_remain_references() {
+    let baseline = r#"
+use criterion::{criterion_group, Criterion};
+
+fn bench(_: &mut Criterion) {}
+fn other(_: &mut Criterion) {}
+
+criterion_group!(benches, bench); // EXACT_BENCH_VALUE
+criterion_group!(others, other); // OTHER_VALUE_DECOY
+
+fn lexical_decoy() {
+    let bench = other;
+    criterion_group!(local, bench); // LEXICAL_VALUE_DECOY
+}
+"#;
+    let same_fqn_decoy = r#"
+use criterion::{criterion_group, Criterion};
+
+fn bench(_: &mut Criterion) {}
+criterion_group!(benches, bench); // SAME_FQN_OTHER_TARGET
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"macro-args\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub fn library() {}\n"),
+        ("benches/baseline.rs", baseline),
+        ("benches/enter_span.rs", same_fqn_decoy),
+    ]);
+    let file = project.file("benches/baseline.rs");
+    let target = analyzer
+        .get_definitions("benches.bench")
+        .into_iter()
+        .find(|candidate| candidate.source() == &file)
+        .expect("baseline bench definition");
+    let hits = rust_graph_hits_for_target(&analyzer, target);
+    let expected = baseline
+        .find("bench); // EXACT_BENCH_VALUE")
+        .expect("exact comma-separated macro value");
+
+    assert_eq!(
+        vec![expected],
+        hits.iter()
+            .filter(|hit| hit.file == file && hit.kind == UsageHitKind::Reference)
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "the exact bare function value must survive comma-separated macro arguments while lexical and same-name item decoys remain excluded: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("benches/enter_span.rs")),
+        "the independent same-FQN bench target must remain physically unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_bare_token_tree_roles_distinguish_casts_bindings_aliases_and_operators() {
     let consumer = r#"
 use crate::defs::{x, CastType, Choice, Other, LEFT, MODULE_CONST, RIGHT};

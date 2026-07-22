@@ -462,6 +462,16 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                             )
                             .is_some_and(|fqn| {
                                 ctx.matches_unique_resolved_fqn_in_namespace(&fqn, namespace)
+                                    // Independent Cargo targets can intentionally emit the
+                                    // same analyzer FQN. Once forward resolution has proven
+                                    // the written name, let the seed-aware usage resolver
+                                    // select its exact physical declaration.
+                                    || (fqn == ctx.target.fq_name()
+                                        && ctx.matches_identifier(
+                                            text,
+                                            node.start_byte(),
+                                            namespace,
+                                        ))
                             })
                         };
                     // `matches_identifier` has already applied lexical/item shadowing and

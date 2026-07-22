@@ -125,6 +125,10 @@ impl RustAnalyzer {
         self.cargo_routes().target_roots_for_file(file)
     }
 
+    pub(crate) fn file_uses_rust_2015_edition(&self, file: &ProjectFile) -> bool {
+        self.cargo_routes().file_uses_rust_2015_edition(file)
+    }
+
     pub(crate) fn files_share_cargo_target(
         &self,
         left: &ProjectFile,

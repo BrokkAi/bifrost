@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use super::RustAnalyzer;
+use super::cargo_routes::RustCargoTargetRelation;
 use super::declarations::rust_package_name;
 use super::imports::{
     RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
@@ -744,6 +745,24 @@ impl RustAnalyzer {
         ));
         files.sort();
         files.dedup();
+        // Path-derived Rust package names are shared by independent Cargo
+        // examples, benches, and binaries. Rooted paths are crate-relative, so
+        // only disambiguate when the package lookup actually collided: retain
+        // physically shared targets when known, otherwise preserve unknown
+        // relationships conservatively, and never cross a proven-disjoint root.
+        if rooted && files.len() > 1 {
+            let routes = self.cargo_routes();
+            let mut shared = Vec::new();
+            let mut unknown = Vec::new();
+            for candidate in files {
+                match routes.target_relation(importing_file, &candidate) {
+                    RustCargoTargetRelation::Shared => shared.push(candidate),
+                    RustCargoTargetRelation::Unknown => unknown.push(candidate),
+                    RustCargoTargetRelation::Disjoint => {}
+                }
+            }
+            return if shared.is_empty() { unknown } else { shared };
+        }
         files
     }
 

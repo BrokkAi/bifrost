@@ -5112,6 +5112,275 @@ where
 }
 
 #[test]
+fn rust_bare_values_inside_impl_prefer_module_constants_over_associated_constants() {
+    let source = r#"
+const START_FIELD: &str = "start";
+const END_FIELD: &str = "end";
+const VALUE_FIELD: &str = "value";
+
+struct Spanned;
+
+trait Deserialize {
+    fn bare() -> [&'static str; 3];
+}
+
+impl Spanned {
+    const START_FIELD: &str = "associated start";
+    const END_FIELD: &str = "associated end";
+    const VALUE_FIELD: &str = "associated value";
+    fn qualified() -> [&'static str; 3] {
+        [Self::START_FIELD, Self::END_FIELD, Self::VALUE_FIELD]
+    }
+}
+
+impl Deserialize for Spanned {
+    fn bare() -> [&'static str; 3] {
+        [START_FIELD, END_FIELD, VALUE_FIELD]
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let bare_body = source
+        .find("[START_FIELD, END_FIELD, VALUE_FIELD]")
+        .expect("bare constant array");
+    for name in ["START_FIELD", "END_FIELD", "VALUE_FIELD"] {
+        let bare = bare_body
+            + source[bare_body..]
+                .find(name)
+                .expect("bare module constant reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, bare),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{name}: {value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{name}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"],
+            format!("_module_.{name}"),
+            "{name}: {value}"
+        );
+        assert_eq!(result["definitions"][0]["kind"], "field", "{name}: {value}");
+
+        let qualified = source
+            .find(&format!("Self::{name}"))
+            .expect("qualified associated constant reference")
+            + "Self::".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, qualified),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "Self::{name}: {value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "Self::{name}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"],
+            format!("Spanned.{name}"),
+            "Self::{name}: {value}"
+        );
+    }
+}
+
+#[test]
+fn rust_child_module_scoped_root_rejects_parent_sibling_for_extern_prelude_name() {
+    let source = r#"
+mod toml_edit {
+    pub fn local() {}
+}
+
+mod child {
+    fn external() {
+        toml_edit::de::from_str();
+    }
+
+    fn explicitly_local() {
+        use crate::toml_edit;
+        toml_edit::local();
+    }
+}
+
+fn parent_local() {
+    toml_edit::local();
+}
+"#;
+    let legacy = r#"
+mod toml_edit {
+    pub fn local() {}
+}
+
+mod child {
+    fn unresolved_without_extern_crate() {
+        toml_edit::de::from_str();
+    }
+}
+"#;
+    let legacy_explicit = r#"
+extern crate toml_edit;
+
+mod child {
+    fn external() {
+        toml_edit::de::from_str();
+    }
+}
+"#;
+    let legacy_alias = r#"
+extern crate toml_edit as edit;
+
+mod child {
+    fn external() {
+        edit::de::from_str();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\", \"legacy\", \"legacy-explicit\", \"legacy-alias\", \"toml-edit\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntoml_edit = { path = \"../toml-edit\" }\n",
+        )
+        .file("app/src/lib.rs", source)
+        .file(
+            "legacy/Cargo.toml",
+            "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"2015\"\n\n[dependencies]\ntoml_edit = { path = \"../toml-edit\" }\n",
+        )
+        .file("legacy/src/lib.rs", legacy)
+        .file(
+            "legacy-explicit/Cargo.toml",
+            "[package]\nname = \"legacy_explicit\"\nversion = \"0.1.0\"\nedition = \"2015\"\n\n[dependencies]\ntoml_edit = { path = \"../toml-edit\" }\n",
+        )
+        .file("legacy-explicit/src/lib.rs", legacy_explicit)
+        .file(
+            "legacy-alias/Cargo.toml",
+            "[package]\nname = \"legacy_alias\"\nversion = \"0.1.0\"\nedition = \"2015\"\n\n[dependencies]\ntoml_edit = { path = \"../toml-edit\" }\n",
+        )
+        .file("legacy-alias/src/lib.rs", legacy_alias)
+        .file(
+            "toml-edit/Cargo.toml",
+            "[package]\nname = \"toml_edit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("toml-edit/src/lib.rs", "pub mod de;\n")
+        .file("toml-edit/src/de.rs", "pub fn from_str() {}\n")
+        .build();
+
+    let external = source
+        .find("toml_edit::de::from_str")
+        .expect("extern-prelude qualifier");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/src/lib.rs", source, external),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+
+    for marker in ["toml_edit::local();\n    }\n}", "toml_edit::local();\n}"] {
+        let local = source.find(marker).expect("local module qualifier");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/src/lib.rs", source, local),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "app/src/lib.rs",
+            "{value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], "app.src.toml_edit",
+            "{value}"
+        );
+    }
+
+    let legacy_root = legacy
+        .find("toml_edit::de::from_str")
+        .expect("Rust 2015 bare dependency root");
+    let value = lookup(
+        project.root(),
+        &location_reference("legacy/src/lib.rs", legacy, legacy_root),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let legacy_explicit_root = legacy_explicit
+        .find("toml_edit::de::from_str")
+        .expect("explicit Rust 2015 extern crate root");
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "legacy-explicit/src/lib.rs",
+            legacy_explicit,
+            legacy_explicit_root,
+        ),
+    );
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+
+    let legacy_alias_root = legacy_alias
+        .find("edit::de::from_str")
+        .expect("aliased Rust 2015 extern crate root");
+    let value = lookup(
+        project.root(),
+        &location_reference("legacy-alias/src/lib.rs", legacy_alias, legacy_alias_root),
+    );
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_same_fqn_expansion_preserves_type_namespace_for_local_module_paths() {
+    let source = r#"
+mod types {
+    pub struct Item {
+        pub value: usize,
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Item() {}
+}
+
+fn consume(_: types::Item) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"namespace-expansion\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", source)
+        .build();
+
+    let item = source.rfind("types::Item").expect("scoped type reference") + "types::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, item),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "types.Item", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
 fn rust_member_calls_do_not_fall_back_to_same_named_fields() {
     let source = r#"
 struct Builder {
@@ -7789,7 +8058,7 @@ fn consume(_: crate::Shared) {}
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .file(
             "src/lib.rs",
@@ -7844,6 +8113,110 @@ fn consume(_: crate::Shared) {}
             "{value}"
         );
         assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+    }
+}
+
+#[test]
+fn rust_cargo_bench_targets_scope_bare_macro_arguments_to_the_physical_root() {
+    let left = r#"
+const NUM_ENTRIES: usize = 10;
+
+mod parser {
+    use crate::NUM_ENTRIES;
+
+    #[divan::bench(args = NUM_ENTRIES)]
+    fn bench() {}
+}
+
+mod edit {
+    use crate::NUM_ENTRIES;
+
+    #[divan::bench(args = NUM_ENTRIES)]
+    fn bench() {}
+}
+"#;
+    let right = r#"
+const NUM_ENTRIES: usize = 20;
+
+mod parser {
+    use crate::NUM_ENTRIES;
+
+    #[divan::bench(args = NUM_ENTRIES)]
+    fn bench() {}
+}
+
+mod edit {
+    use crate::NUM_ENTRIES;
+
+    #[divan::bench(args = NUM_ENTRIES)]
+    fn bench() {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("benches/left.rs", left)
+        .file("benches/right.rs", right)
+        .build();
+
+    for (path, source) in [("benches/left.rs", left), ("benches/right.rs", right)] {
+        for (start, _) in source.match_indices("NUM_ENTRIES").skip(1) {
+            let value = lookup(project.root(), &location_reference(path, source, start));
+            let result = &value["results"][0];
+            assert_eq!(result["status"], "resolved", "{value}");
+            assert_eq!(
+                result["definitions"].as_array().map(Vec::len),
+                Some(1),
+                "{value}"
+            );
+            assert_eq!(result["definitions"][0]["path"], path, "{value}");
+            assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+            assert_eq!(
+                result["definitions"][0]["fqn"], "benches._module_.NUM_ENTRIES",
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rust_cargo_example_targets_scope_local_module_paths_to_the_physical_root() {
+    let source = r#"
+mod yak_shave {
+    pub fn shave_all() {}
+}
+
+fn run() {
+    yak_shave::shave_all();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("examples/compact.rs", source)
+        .file("examples/source_locations.rs", source)
+        .build();
+
+    for path in ["examples/compact.rs", "examples/source_locations.rs"] {
+        let start = source.rfind("yak_shave").expect("module reference");
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], path, "{value}");
+        assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "examples.yak_shave",
+            "{value}"
+        );
     }
 }
 

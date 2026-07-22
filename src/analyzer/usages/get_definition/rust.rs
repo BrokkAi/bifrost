@@ -275,21 +275,36 @@ fn rust_scope_forward_candidates_to_cargo_target(
     if outcome.definitions.is_empty() {
         return outcome;
     }
+    let mut expanded = outcome.definitions.clone();
+    for definition in &outcome.definitions {
+        expanded.extend(
+            support
+                .fqn(&definition.fq_name())
+                .into_iter()
+                .filter(|candidate| rust_same_declaration_namespace(rust, definition, candidate)),
+        );
+        expanded.extend(
+            support
+                .file_identifier(file, definition.identifier())
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.fq_name() == definition.fq_name()
+                        && rust_same_declaration_namespace(rust, definition, candidate)
+                }),
+        );
+    }
+    sort_units(&mut expanded);
+    expanded.dedup();
     if matches!(
         scope,
         RustCargoReferenceScope::LexicalSelf
             | RustCargoReferenceScope::ImportTargets(_)
             | RustCargoReferenceScope::StructuredLocalPath
     ) && outcome.definitions.len() == 1
+        && expanded == outcome.definitions
     {
         return outcome;
     }
-    let mut expanded = outcome.definitions.clone();
-    for definition in &outcome.definitions {
-        expanded.extend(support.fqn(&definition.fq_name()));
-    }
-    sort_units(&mut expanded);
-    expanded.dedup();
     let (scoped, fail_closed) = match scope {
         RustCargoReferenceScope::LocalTarget { fail_closed } => (
             rust.candidates_in_same_cargo_target_root(file, expanded),
@@ -355,6 +370,19 @@ fn rust_scope_forward_candidates_to_cargo_target(
             .filter(|diagnostic| diagnostic.kind != "ambiguous_definition"),
     );
     scoped_outcome
+}
+
+fn rust_same_declaration_namespace(
+    rust: &RustAnalyzer,
+    expected: &CodeUnit,
+    candidate: &CodeUnit,
+) -> bool {
+    expected.is_module() == candidate.is_module()
+        && expected.is_class() == candidate.is_class()
+        && expected.is_macro() == candidate.is_macro()
+        && expected.is_function() == candidate.is_function()
+        && expected.is_field() == candidate.is_field()
+        && (!expected.is_field() || rust.is_type_alias(expected) == rust.is_type_alias(candidate))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1307,7 +1335,7 @@ fn rust_current_module_candidates(
                     .ranges(candidate)
                     .first()
                     .map(|range| {
-                        lexical_scope::enclosing_mod_item_range_at(root, range.start_byte)
+                        rust_declaration_syntax_module_range(root, range, candidate.is_module())
                             == reference_syntax_module
                     })
                     .unwrap_or(reference_syntax_module.is_none())
@@ -1322,6 +1350,28 @@ fn rust_current_module_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn rust_declaration_syntax_module_range(
+    root: Node<'_>,
+    range: &Range,
+    declaration_is_module: bool,
+) -> Option<(usize, usize)> {
+    if !declaration_is_module {
+        return lexical_scope::enclosing_mod_item_range_at(root, range.start_byte);
+    }
+    let mut declaration = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
+    while declaration.kind() != "mod_item" {
+        declaration = declaration.parent()?;
+    }
+    let mut parent = declaration.parent();
+    while let Some(node) = parent {
+        if node.kind() == "mod_item" {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        parent = node.parent();
+    }
+    None
 }
 
 fn rust_role_accepts_imported(
@@ -1353,8 +1403,15 @@ fn rust_role_accepts_current_module(
         RustBareReferenceRole::Type => {
             candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
         }
-        RustBareReferenceRole::Value => rust_value_namespace_candidate(rust, candidate),
-        RustBareReferenceRole::Callable => rust_callable_namespace_candidate(rust, candidate),
+        RustBareReferenceRole::Value => {
+            (candidate.is_class() && rust.has_rust_value_constructor(candidate))
+                || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
+                || (candidate.is_field() && rust_declaration_is_module_value_item(rust, candidate))
+        }
+        RustBareReferenceRole::Callable => {
+            candidate.is_class()
+                || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
+        }
         RustBareReferenceRole::Owner => {
             candidate.is_module()
                 || candidate.is_class()
@@ -1465,6 +1522,28 @@ fn rust_declaration_is_module_type_alias(rust: &RustAnalyzer, candidate: &CodeUn
 fn rust_declaration_is_value_item(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
     rust_declaration_matches(rust, candidate, |node| {
         matches!(node.kind(), "enum_variant" | "const_item" | "static_item")
+    })
+}
+
+fn rust_declaration_is_module_value_item(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    rust_declaration_matches(rust, candidate, |node| {
+        if !matches!(node.kind(), "const_item" | "static_item") {
+            return false;
+        }
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            match parent.kind() {
+                // The nearest item boundary determines whether this is an
+                // associated item. A const inside a method's block is a local
+                // value even though an impl or trait appears farther up the
+                // ancestor chain.
+                "block" | "function_item" | "mod_item" | "source_file" => return true,
+                "impl_item" | "trait_item" => return false,
+                _ => {}
+            }
+            current = parent.parent();
+        }
+        true
     })
 }
 
@@ -1973,6 +2052,44 @@ fn rust_focused_prefix_resolution_outcome(
         if !local.is_empty() {
             return candidates_outcome(local);
         }
+
+        // Rust 2018+ places Cargo dependencies in the extern prelude. A module
+        // declared in an ancestor is not thereby visible by its bare name in a
+        // child module, so once explicit imports and declarations in the actual
+        // lexical module are exhausted, an available Cargo route wins over a
+        // same-named parent/sibling declaration cached in the file-wide forward
+        // reference context.
+        let rust_2015 = rust.file_uses_rust_2015_edition(file);
+        let explicit_extern_route = rust_2015
+            .then(|| rust_visible_extern_crate_binding(root, source, focused_text))
+            .flatten();
+        let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
+        let cargo_route = explicit_extern_route.as_deref().unwrap_or(focused_text);
+        let external = cargo_root_in_scope
+            .then(|| rust.resolve_module_package(file, cargo_route))
+            .flatten()
+            .into_iter()
+            .flat_map(|package| support.fqn(&package))
+            .filter(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
+            .collect();
+        if let Some(routed) = rust.candidates_in_cargo_library_route(file, cargo_route, external) {
+            if !cargo_root_in_scope {
+                return no_definition(
+                    "no_indexed_definition",
+                    format!(
+                        "Cargo dependency `{focused_text}` is not in the Rust 2015 implicit extern prelude"
+                    ),
+                );
+            }
+            if !routed.is_empty() {
+                return candidates_outcome(routed);
+            }
+            return boundary(format!(
+                "focused Rust owner `{focused_text}` resolves through Cargo but its crate root is not indexed"
+            ));
+        }
     }
 
     if let Some(fqn) = resolved_fqn
@@ -2040,6 +2157,53 @@ fn rust_focused_prefix_resolution_outcome(
             "focused Rust path segment `{focused_text}` did not resolve to an indexed definition"
         ),
     )
+}
+
+fn rust_visible_extern_crate_binding(
+    root: Node<'_>,
+    source: &str,
+    binding: &str,
+) -> Option<String> {
+    let mut ancestor = Some(root);
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "source_file" | "mod_item" | "block")
+            && let Some(crate_name) = rust_extern_crate_binding_in_scope(node, source, binding)
+        {
+            return Some(crate_name);
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+fn rust_extern_crate_binding_in_scope(
+    scope: Node<'_>,
+    source: &str,
+    binding: &str,
+) -> Option<String> {
+    let items = if scope.kind() == "mod_item" {
+        scope.child_by_field_name("body")?
+    } else {
+        scope
+    };
+    for index in 0..items.named_child_count() {
+        let Some(node) = items.named_child(index) else {
+            continue;
+        };
+        if node.kind() == "extern_crate_declaration" {
+            let bound = node
+                .child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
+                .map(|name| rust_node_text(name, source).trim() == binding)
+                .unwrap_or(false);
+            if bound {
+                return node
+                    .child_by_field_name("name")
+                    .map(|name| rust_node_text(name, source).trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 fn rust_path_root_matches_enclosing_module(root: Node<'_>, source: &str, root_name: &str) -> bool {
