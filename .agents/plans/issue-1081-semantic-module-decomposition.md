@@ -11,12 +11,13 @@ The semantic intermediate representation and its workspace-backed oracles alread
 ## Progress
 
 - [x] (2026-07-22 16:56Z) Verified issue #1081, fetched `origin`, and confirmed the clean attached issue branch matches its remote at `4037def8`.
-- [x] (2026-07-22 16:56Z) Mapped the public and private ownership seams in `oracle.rs`, `ir.rs`, and `workspace_oracle.rs`, including direct consumers and visibility hazards.
+- [x] (2026-07-22 16:56Z) Mapped the public and private ownership seams in `oracle.rs`, the original flat `ir.rs`, and `workspace_oracle.rs`, including direct consumers and visibility hazards.
 - [x] (2026-07-22 16:56Z) Chose acyclic module boundaries and recorded the implementation and validation sequence in this plan.
 - [x] (2026-07-22 17:10Z) Decomposed the language-neutral oracle contracts behind the existing `oracle.rs` facade and preserved the full exported type set.
-- [x] (2026-07-22 17:10Z) Decomposed the semantic IR model, artifact, validation, and tests behind the existing `ir.rs` facade and preserved the full exported type set.
+- [x] (2026-07-22 17:10Z) Decomposed the semantic IR model, artifact, validation, and tests behind the existing IR facade and preserved the full exported type set.
 - [x] (2026-07-22 17:10Z) Moved workspace dispatch implementation and its unit tests into `workspace_oracle/dispatch.rs` while retaining the shared root facade and ICFG helper paths.
 - [x] (2026-07-22 17:27Z) Ran the unchanged contract tests, formatting, all-target/all-feature checking and Clippy, exact scope checks, and five parallel specialist review lenses; no code findings remained.
+- [x] (2026-07-22 18:06Z) Rebased onto `origin/master` at `1584751d`, reconciled upstream's independent `ir/mod.rs` split without losing either side's content, and reran formatting, all-feature checking and Clippy, and all 90 focused contract tests.
 
 ## Surprises & Discoveries
 
@@ -38,10 +39,13 @@ The semantic intermediate representation and its workspace-backed oracles alread
 - Observation: the shell initially resolved `cargo` and `rustc` from `/Users/dave/.local/bin` but `cargo-clippy` from Homebrew, whose LLVM patch versions are incompatible for isolated compilation.
   Evidence: the first isolated Clippy run reported E0514 with LLVM 22.1.2 versus 22.1.6 metadata. Rerunning with `/opt/homebrew/bin/cargo`, `/opt/homebrew/bin/rustc`, and the matching Homebrew Clippy completed cleanly with warnings denied.
 
+- Observation: while the reviewed branch was being published, `origin/master` gained commit `65ac7f19`, which independently moved the flat IR into `ir/mod.rs`, `ir/validate.rs`, and `ir/tests.rs`.
+  Evidence: GitHub reported PR #1090 as conflicting. The rebase retained upstream's module-directory home, replaced its large contract `mod.rs` with the #1081 facade plus `model.rs` and `artifact.rs`, renamed `validate.rs` to `validation.rs`, and kept the merged test body with only sibling-required imports. The rebased incremental IR diff is therefore focused on the deeper ownership split rather than repeating upstream's first-stage code motion.
+
 ## Decision Log
 
-- Decision: Keep `src/analyzer/semantic/oracle.rs` and `src/analyzer/semantic/ir.rs` as thin private-child facades instead of replacing either file with a directory `mod.rs`.
-  Rationale: Rust supports sibling directories beneath a file module, and retaining the existing root files minimizes path churn while preserving `semantic::oracle::*`, `semantic::ir::*`, and `semantic::*` as single re-export layers.
+- Decision: Keep `src/analyzer/semantic/oracle.rs` as a thin private-child facade and, after rebasing, use upstream's `src/analyzer/semantic/ir/mod.rs` as the equivalent thin IR facade.
+  Rationale: The original implementation used Rust's supported sibling directory beneath `ir.rs`. Once upstream established the directory module, retaining `ir/mod.rs` avoids undoing current-master topology while preserving `semantic::oracle::*`, `semantic::ir::*`, and `semantic::*` as single re-export layers.
   Date/Author: 2026-07-22 / Codex
 
 - Decision: Add foundational `oracle/error.rs`, `oracle/model.rs`, and `oracle/traits.rs` modules in addition to the issue's example relation, limits, value-flow, call, heap, and dispatch modules.
@@ -62,7 +66,7 @@ The semantic intermediate representation and its workspace-backed oracles alread
 
 ## Outcomes & Retrospective
 
-Issue #1081 is complete as a topology-only refactor. `oracle.rs`, `ir.rs`, and `workspace_oracle.rs` are now 27-, 17-, and 55-line facades. Oracle contracts live in focused `call`, `dispatch`, `error`, `heap`, `limits`, `model`, `relation`, `traits`, and `value_flow` children. IR model, validation, immutable artifact, and tests have separate homes. Workspace dispatch implementation and tests now live together under the unchanged shared workspace-oracle facade.
+Issue #1081 is complete as a topology-only refactor. `oracle.rs`, `ir/mod.rs`, and `workspace_oracle.rs` are now 27-, 17-, and 55-line facades. Oracle contracts live in focused `call`, `dispatch`, `error`, `heap`, `limits`, `model`, `relation`, `traits`, and `value_flow` children. IR model, validation, immutable artifact, and tests have separate homes. Workspace dispatch implementation and tests now live together under the unchanged shared workspace-oracle facade.
 
 The public oracle and IR type sets match `4037def8` exactly, all existing consumers compile with all features, and the four acceptance test files are byte-for-byte unchanged. Their 90 tests pass with `--features nlp` (25 ICFG, 11 IR, 41 oracle, and 13 value-language tests). Formatting, exact diff checks, and all-target/all-feature Clippy with warnings denied pass. The only incomplete literal form of the requested test command is the known macOS PyO3 executable-link limitation described above; Python-feature compilation remains covered by both `cargo check` and Clippy.
 
@@ -74,7 +78,7 @@ The repository root for every command is `/Users/dave/.codex/worktrees/74bc/bifr
 
 `src/analyzer/semantic/oracle.rs` currently contains the entire oracle contract. Its facade will declare private child modules and publicly re-export their existing public items exactly once. `oracle/model.rs` will own relation-independent query and identity vocabulary such as call contexts, procedure ports, scoped locators, access paths, abstract objects and locations, alias/store queries, object cardinality, and dispatch-boundary kinds. `oracle/relation.rs` will own relation IDs, owners, records, arenas, handles, candidates, sets, coverage, and provenance validation. `oracle/limits.rs`, `value_flow.rs`, `dispatch.rs`, `call.rs`, and `heap.rs` will own their named contracts; `error.rs` will own `OracleContractError`; `traits.rs` will own `DispatchOracle`, `ValueFlowOracle`, and `HeapOracle`.
 
-`src/analyzer/semantic/ir.rs` currently mixes public row types, mutable construction parts, immutable artifacts and handles, validation/accounting, and about 2,350 lines of unit tests. Its facade will privately declare `model`, `validation`, `artifact`, and the test module, publicly re-exporting only model and artifact public items. `ir/model.rs` will own validation errors, semantic rows, and `ProcedureSemanticsParts`; `ir/validation.rs` will own private indexes, resource accounting, and exhaustive validators; `ir/artifact.rs` will own artifact build errors, frozen control-flow graphs, immutable procedures and artifacts, and scoped handles; `ir/tests.rs` will contain the existing test-module body unchanged.
+At the start, `src/analyzer/semantic/ir.rs` mixed public row types, mutable construction parts, immutable artifacts and handles, validation/accounting, and about 2,350 lines of unit tests. Current master independently established `ir/mod.rs`, `ir/validate.rs`, and `ir/tests.rs` before the final rebase. The completed facade at `ir/mod.rs` privately declares `model`, `validation`, `artifact`, and the test module, publicly re-exporting only model and artifact public items. `ir/model.rs` owns validation errors, semantic rows, and `ProcedureSemanticsParts`; `ir/validation.rs` owns private indexes, resource accounting, and exhaustive validators; `ir/artifact.rs` owns artifact build errors, frozen control-flow graphs, immutable procedures and artifacts, and scoped handles; `ir/tests.rs` contains the existing test body with explicit sibling imports.
 
 `src/analyzer/semantic/workspace_oracle.rs` already has `common`, `source`, `value_flow`, and `heap` children but still contains dispatch. It will remain the home of `WorkspaceSemanticOracle` and its constructors. `workspace_oracle/dispatch.rs` will own callable identity grouping, the `DispatchOracle` implementation, dispatch projection and gap helpers, work accounting, deterministic ordering, and the existing dispatch unit tests. `scoped_procedure_dispatch_gap` remains reachable at its current crate path through a crate-visible root re-export because `src/analyzer/semantic/icfg.rs` uses that path in tests.
 
@@ -151,7 +155,7 @@ Final validation evidence:
     # passed
 
     cargo check --all-targets --all-features
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.43s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.61s
 
     scripts/with-isolated-cargo-target.sh cargo test --features nlp \
       --test semantic_ir_contract \
@@ -164,14 +168,14 @@ Final validation evidence:
       /opt/homebrew/bin/cargo clippy --all-targets --all-features -- -D warnings
     # passed; managed target removed
 
-    git diff --quiet 4037def8..HEAD -- \
+    git diff --quiet origin/master..HEAD -- \
       tests/semantic_ir_contract.rs \
       tests/semantic_oracle_contract.rs \
       tests/semantic_value_language_contract.rs \
       tests/icfg_contract.rs
     # exit 0
 
-    git diff --check 4037def8..HEAD
+    git diff --check origin/master..HEAD
     # passed
 
 ## Interfaces and Dependencies
@@ -190,3 +194,5 @@ Revision note (2026-07-22 16:56Z): Initial self-contained plan created after liv
 Revision note (2026-07-22 17:10Z): Recorded completion of all three module moves, the implicit IR-test imports and ICFG helper consumers found by the integrated compile, and the successful all-target/all-feature check.
 
 Revision note (2026-07-22 17:27Z): Closed validation and review with exact test, formatting, Clippy, API-parity, and unchanged-source evidence; documented the known macOS PyO3 link boundary and the corrected local toolchain selection.
+
+Revision note (2026-07-22 18:06Z): Recorded the source-aware rebase over upstream's independent first-stage IR split, the resulting `ir/mod.rs` facade decision, and the complete post-rebase validation rerun.
