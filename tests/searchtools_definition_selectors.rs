@@ -2157,3 +2157,181 @@ fn bare_name_with_toplevel_and_member_is_ambiguous_across_languages() {
     assert_eq!(0, unique["ambiguous"].as_array().unwrap().len(), "{unique}");
     assert_eq!(1, unique["sources"].as_array().unwrap().len(), "{unique}");
 }
+
+// --- M2: location-aware distinctness for identical-FQN collisions ---------
+
+/// Model the Scala scala-2/scala-3 twin shape: the SAME package + type declared
+/// in two files under parallel source trees. Both the bare name and the
+/// fully-qualified spelling must report ambiguity listing both `path#fqn`
+/// selectors, and `get_summaries` + `get_symbol_sources` must agree on the
+/// candidate set (the cross-tool consistency the fuzzer flagged). Before the M2
+/// `distinct_definitions` change both twins collapsed to a single group and one
+/// file was silently picked.
+#[test]
+fn symbol_sources_disambiguates_scala_cross_build_twins_by_file_selector() {
+    let scala2_path = "core/src/main/scala-2/demo/Widget.scala";
+    let scala3_path = "core/src/main/scala-3/demo/Widget.scala";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            scala2_path,
+            r#"package demo
+
+class Widget {
+  def value: Int = 2
+}
+"#,
+        )
+        .file(
+            scala3_path,
+            r#"package demo
+
+class Widget {
+  def value: Int = 3
+}
+"#,
+        )
+        .build();
+
+    let scala2_selector = format!("{scala2_path}#demo.Widget");
+    let scala3_selector = format!("{scala3_path}#demo.Widget");
+    let expected = vec![scala2_selector.clone(), scala3_selector.clone()];
+
+    // Fully-qualified spelling (2b): resolve_codeunit_exact returns both twins,
+    // and distinct_definitions must now split them into two file-anchored
+    // candidates.
+    let fq = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["demo.Widget"]}"#,
+    );
+    assert_eq!(0, fq["sources"].as_array().unwrap().len(), "{fq}");
+    assert_eq!(1, fq["ambiguous"].as_array().unwrap().len(), "{fq}");
+    let mut fq_matches = string_array(&fq["ambiguous"][0]["matches"]);
+    fq_matches.sort();
+    assert_eq!(expected, fq_matches, "{fq}");
+
+    // Bare spelling: M1 gathers both twins by identifier; M2 anchors them.
+    let bare = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Widget"]}"#);
+    assert_eq!(0, bare["sources"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(1, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    let mut bare_matches = string_array(&bare["ambiguous"][0]["matches"]);
+    bare_matches.sort();
+    assert_eq!(expected, bare_matches, "{bare}");
+
+    // Cross-tool consistency: get_summaries for the same FQN surfaces the same
+    // candidate set, so file A (scala-2) appears in both surfaces rather than a
+    // silently different file per tool.
+    let summaries = call_tool(&project, "get_summaries", r#"{"targets":["demo.Widget"]}"#);
+    assert_eq!(
+        0,
+        summaries["summaries"].as_array().unwrap().len(),
+        "{summaries}"
+    );
+    assert_eq!(
+        1,
+        summaries["ambiguous"].as_array().unwrap().len(),
+        "{summaries}"
+    );
+    let mut summary_matches = string_array(&summaries["ambiguous"][0]["matches"]);
+    summary_matches.sort();
+    assert_eq!(expected, summary_matches, "{summaries}");
+    assert!(
+        summary_matches.contains(&scala2_selector),
+        "get_summaries must surface file A: {summaries}"
+    );
+    assert!(
+        fq_matches.contains(&scala2_selector),
+        "get_symbol_sources must surface file A: {fq}"
+    );
+
+    // Each anchored selector resolves to exactly its file.
+    let anchored = call_tool(
+        &project,
+        "get_symbol_sources",
+        &serde_json::json!({ "symbols": [scala2_selector] }).to_string(),
+    );
+    assert_eq!(
+        0,
+        anchored["ambiguous"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    assert_eq!(
+        1,
+        anchored["sources"].as_array().unwrap().len(),
+        "{anchored}"
+    );
+    assert_eq!(scala2_path, anchored["sources"][0]["path"], "{anchored}");
+    assert!(
+        anchored["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Int = 2"),
+        "{anchored}"
+    );
+}
+
+/// No regression: two same-FQN methods declared in ONE file are genuine
+/// overloads and must stay a single group (Resolved with both sources, not
+/// Ambiguous). This is the same-file counterpart the M2 discriminator must not
+/// split.
+#[test]
+fn symbol_sources_keeps_same_file_scala_overloads_as_one_group() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "demo/Box.scala",
+            r#"package demo
+
+class Box {
+  def run(value: Int): Int = value
+  def run(value: String): String = value
+}
+"#,
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["demo.Box.run"]}"#,
+    );
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(2, result["sources"].as_array().unwrap().len(), "{result}");
+    assert!(
+        result["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["text"].as_str().unwrap().contains("value: Int")),
+        "{result}"
+    );
+    assert!(
+        result["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["text"].as_str().unwrap().contains("value: String")),
+        "{result}"
+    );
+}
+
+/// No regression: a unique FQN in a non-module-scoped language (one file) still
+/// renders its plain FQN selector and resolves without ambiguity — the M2
+/// discriminator anchors only FQNs present in more than one file.
+#[test]
+fn symbol_sources_keeps_unique_scala_fqn_plain_selector() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "demo/Solo.scala",
+            r#"package demo
+
+class Solo {
+  def onlyOne: Int = 7
+}
+"#,
+        )
+        .build();
+
+    assert_symbol_source_contains(&project, "demo.Solo", "class Solo");
+    assert_symbol_source_contains(&project, "demo.Solo.onlyOne", "def onlyOne");
+}

@@ -1815,7 +1815,7 @@ fn resolve_definition_context_symbol(
             .into_iter()
             .filter(|unit| rel_path_string(unit.source()) == anchor)
             .collect();
-        let groups = distinct_definitions(narrowed);
+        let groups = distinct_definitions(analyzer, narrowed);
         return match groups.as_slice() {
             [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
             [] => Err(vec![DefinitionDiagnostic {
@@ -1842,7 +1842,7 @@ fn resolve_definition_context_symbol(
             kind: "ambiguous_symbol".to_string(),
             message: format!(
                 "`{symbol}` is ambiguous; matches: {}",
-                code_unit_match_names(&matches).join(", ")
+                code_unit_match_names(analyzer, &matches).join(", ")
             ),
         }]),
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
@@ -2596,7 +2596,7 @@ fn resolve_selectable_definitions(
                 return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
             }
             let candidate_names = if looks_like_extensionless_path_anchor(anchor) {
-                code_unit_match_names(&global_candidates)
+                code_unit_match_names(analyzer, &global_candidates)
             } else {
                 Vec::new()
             };
@@ -2619,7 +2619,7 @@ fn resolve_selectable_definitions(
         None => code_units,
     };
 
-    let groups = distinct_definitions(code_units);
+    let groups = distinct_definitions(analyzer, code_units);
     match groups.as_slice() {
         [] => SelectableDefinitionResolution::NotFound(symbol_not_found_input(input)),
         [(_, _)] => SelectableDefinitionResolution::Resolved(
@@ -3103,7 +3103,7 @@ fn resolve_file_anchored_symbol_sources(
         .filter(|unit| rel_path_string(unit.source()) == anchor)
         .collect();
 
-    let groups = distinct_definitions(narrowed);
+    let groups = distinct_definitions(analyzer, narrowed);
     match groups.as_slice() {
         [] => SourceLookupOutcome::NotFound(symbol_not_found_input(input)),
         [(_, _)] => {
@@ -3865,8 +3865,39 @@ fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
 /// first-seen order. Overloads of one symbol share a selector and scan together.
 /// An FQN present in multiple language/file domains is file-anchored in every
 /// domain so each ambiguity candidate can be re-queried without looping.
-fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)> {
+fn distinct_definitions(
+    analyzer: &dyn IAnalyzer,
+    overloads: Vec<CodeUnit>,
+) -> Vec<(String, Vec<CodeUnit>)> {
+    // An FQN's units are file-anchored into distinct `path#fqn` candidates for
+    // either of two reasons:
+    //
+    //  1. Cross-domain: the FQN spans more than one (language, module-scoped
+    //     file) domain — the pre-existing module-scoped/cross-language rule.
+    //
+    //  2. Genuine cross-file duplicate (#1057): within one FQN, some *callable
+    //     signature* is declared in more than one distinct file. That is the
+    //     duplicate shape — scala-2/scala-3 twins, Go build-tag twins, C#
+    //     partial-class parts (which share an empty signature key). Pure
+    //     overload sets — each *differing* signature living in a single file —
+    //     are deliberately NOT split: the codebase models overloads under one
+    //     FQN, and every surface (get_symbol_sources / get_summaries /
+    //     scan_usages) keeps merging their call sites under one selector.
+    //
+    // The signature key is `IAnalyzer::signatures(unit)` (the parameter-bearing
+    // overload label list), NOT `CodeUnit::signature()`: the latter is `None`
+    // for the top-level functions and classes that reach this grouping, so it
+    // cannot tell an arity overload apart from a twin. `signatures(unit)`
+    // returns distinct labels for overloads (`compute(value: Int)` vs
+    // `compute(left: Int, right: Int)`) and an identical label (or empty list)
+    // for twins/partial parts, which is exactly the discriminator we need.
+    //
+    // A unique FQN in one file, and same-file overloads, satisfy neither reason
+    // and keep their existing `definition_selector` rendering (module-scoped
+    // languages still render file-anchored there).
     let mut domains_by_fqn: HashMap<String, HashSet<(Language, Option<String>)>> =
+        HashMap::default();
+    let mut files_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for unit in &overloads {
         let language = language_for_target(unit);
@@ -3877,14 +3908,27 @@ fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)
             .entry(unit.fq_name())
             .or_default()
             .insert((language, module_path));
+        files_by_fqn_signature
+            .entry((unit.fq_name(), analyzer.signatures(unit)))
+            .or_default()
+            .insert(rel_path_string(unit.source()));
+    }
+
+    // FQNs where some (identical) signature is declared in more than one file.
+    let mut collision_split_fqns: HashSet<String> = HashSet::default();
+    for ((fqn, _signature), files) in &files_by_fqn_signature {
+        if files.len() > 1 {
+            collision_split_fqns.insert(fqn.clone());
+        }
     }
 
     let mut groups: Vec<(String, Vec<CodeUnit>)> = Vec::new();
     for unit in overloads {
-        let selector = if domains_by_fqn
-            .get(&unit.fq_name())
-            .is_some_and(|domains| domains.len() > 1)
-        {
+        let fqn = unit.fq_name();
+        let cross_domain = domains_by_fqn
+            .get(&fqn)
+            .is_some_and(|domains| domains.len() > 1);
+        let selector = if cross_domain || collision_split_fqns.contains(&fqn) {
             file_anchored_definition_selector(&unit)
         } else {
             definition_selector(&unit)
@@ -3911,8 +3955,8 @@ fn prefer_exact_lookup_matches(overloads: Vec<CodeUnit>, lookup: &str) -> Vec<Co
     }
 }
 
-fn code_unit_match_names(matches: &[CodeUnit]) -> Vec<String> {
-    distinct_definitions(matches.to_vec())
+fn code_unit_match_names(analyzer: &dyn IAnalyzer, matches: &[CodeUnit]) -> Vec<String> {
+    distinct_definitions(analyzer, matches.to_vec())
         .into_iter()
         .map(|(selector, _)| selector)
         .collect()
@@ -4507,7 +4551,7 @@ fn resolve_scan_usages_target(
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
     });
 
-    let groups = distinct_definitions(matches);
+    let groups = distinct_definitions(analyzer, matches);
     if groups.len() > 1 {
         let label = scan_usages_target_label(&target);
         return ScanUsageTargetResolution::Ambiguous(ambiguous_usage_symbol_from_groups(
@@ -4847,7 +4891,7 @@ fn scan_usages_backend(
         let overloads = match resolve_codeunit_fuzzy(analyzer, lookup) {
             CodeUnitResolution::Resolved(overloads) => overloads,
             CodeUnitResolution::Ambiguous(candidate_targets) => {
-                let groups = distinct_definitions(candidate_targets);
+                let groups = distinct_definitions(analyzer, candidate_targets);
                 let item = ambiguous_usage_symbol_from_groups(
                     analyzer,
                     ScanUsagesSurface::Reference,
@@ -4897,7 +4941,7 @@ fn scan_usages_backend(
             // symbols, not one with overloads; surface them as selectable
             // candidates rather than scanning a conflation of all of them.
             None => {
-                let groups = distinct_definitions(overloads);
+                let groups = distinct_definitions(analyzer, overloads);
                 if groups.len() > 1 {
                     let item = ambiguous_usage_symbol_from_groups(
                         analyzer,
@@ -5034,7 +5078,8 @@ fn scan_usages_backend(
                     });
                     continue;
                 }
-                let groups = distinct_definitions(candidate_targets.iter().cloned().collect());
+                let groups =
+                    distinct_definitions(analyzer, candidate_targets.iter().cloned().collect());
                 let surface = request.surface;
                 let detail_source = ambiguous_usage_symbol_from_groups(
                     analyzer,
