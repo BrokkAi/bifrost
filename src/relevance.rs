@@ -1265,7 +1265,12 @@ impl GitProjectContext {
             .arg("--topo-order")
             .arg("--first-parent")
             .arg("--no-color")
-            .arg("--diff-merges=first-parent")
+            // Merge diffs against the first parent only. `-m` with
+            // `--first-parent` is the documented pre-2.31 spelling of
+            // `--diff-merges=first-parent`; using it keeps the command
+            // working on older git (the flag alone aborts with
+            // "unrecognized argument" there, silently emptying results).
+            .arg("-m")
             .arg(format!("-M{NATIVE_RENAME_THRESHOLD}"))
             .arg("--name-status")
             .arg("-z")
