@@ -350,8 +350,7 @@ end
         lines.iter().any(|line| line == "Shop::Discount.default"),
         "{lines:?}"
     );
-    assert!(texts.iter().any(|text| text == ":Discount"), "{texts:?}");
-    assert!(texts.iter().any(|text| text == "Discount"), "{texts:?}");
+    assert!(texts.iter().all(|text| text == "Discount"), "{texts:?}");
 }
 
 #[test]
@@ -1135,6 +1134,7 @@ class Report
   def run
     invoice = Billing::Invoice.new
     invoice.public_send(:audit)
+    invoice.public_send(:"audit")
 
     other = Billing::Other.new
     other.public_send(:audit)
@@ -1152,14 +1152,14 @@ end
     let lines = hit_source_lines(&hits);
     let texts = hit_texts(&hits);
 
-    assert_eq!(1, hits.len(), "expected one precise hit, got {lines:?}");
+    assert_eq!(2, hits.len(), "expected two precise hits, got {lines:?}");
     assert!(
         lines
             .iter()
             .any(|line| line == "invoice.public_send(:audit)"),
         "{lines:?}"
     );
-    assert_eq!(vec![":audit".to_string()], texts);
+    assert_eq!(vec!["audit".to_string(), "audit".to_string()], texts);
 }
 
 #[test]
@@ -1826,6 +1826,7 @@ product.label
         .into_either()
         .expect("namespaced attr_reader usage lookup should succeed");
     let name_lines = hit_source_lines(&name_hits);
+    let name_texts = hit_texts(&name_hits);
     assert!(
         name_lines
             .iter()
@@ -1835,6 +1836,10 @@ product.label
     assert!(
         name_lines.iter().any(|line| line == "product.name"),
         "expected namespaced Product#name external usage, got {name_lines:?}"
+    );
+    assert!(
+        name_texts.iter().all(|text| text == "name"),
+        "expected exact name tokens, got {name_texts:?}"
     );
 }
 

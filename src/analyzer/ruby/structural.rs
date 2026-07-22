@@ -1,6 +1,7 @@
 //! Ruby structural spec for `query_code`.
 
 use crate::analyzer::Language;
+use crate::analyzer::ruby::single_static_string_content_node;
 use crate::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
@@ -162,16 +163,11 @@ fn is_import_call(node: Node<'_>, source: &str) -> bool {
     ) && module_argument_node(node).is_some()
 }
 
-fn static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "string" || node.named_child_count() != 1 {
+fn static_string_content_span(node: Node<'_>) -> Option<Span> {
+    if node.kind() != "string" {
         return None;
     }
-    let content = node.named_child(0)?;
-    (content.kind() == "string_content").then_some(content)
-}
-
-fn static_string_content_span(node: Node<'_>) -> Option<Span> {
-    let content = static_string_content_node(node)?;
+    let content = single_static_string_content_node(node)?;
     Some(Span {
         start_byte: content.start_byte(),
         end_byte: content.end_byte(),

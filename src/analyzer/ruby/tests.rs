@@ -42,6 +42,49 @@ fn is_test_require(line: &str) -> bool {
 impl TestDetectionProvider for RubyAnalyzer {}
 
 #[cfg(test)]
+mod semantic_identifier_range_tests {
+    use super::*;
+
+    fn node_with_text<'tree>(root: Node<'tree>, source: &str, expected: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if source.get(node.start_byte()..node.end_byte()) == Some(expected) {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("missing node for {expected:?}");
+    }
+
+    fn selected_text(source: &str, expected_node_text: &str) -> String {
+        let tree = parse_ruby_tree(source).expect("parse Ruby range fixture");
+        let node = node_with_text(tree.root_node(), source, expected_node_text);
+        let range = ruby_semantic_identifier_range(node, source);
+        source[range.start_byte..range.end_byte].to_string()
+    }
+
+    #[test]
+    fn selects_only_static_ruby_symbol_identifier_content() {
+        let source = r#"audit
+public_send(:audit)
+public_send(:"audit")
+public_send(:"au#{suffix}dit")
+notify("audit")
+"#;
+
+        assert_eq!(selected_text(source, "audit"), "audit");
+        assert_eq!(selected_text(source, ":audit"), "audit");
+        assert_eq!(selected_text(source, ":\"audit\""), "audit");
+        assert_eq!(
+            selected_text(source, ":\"au#{suffix}dit\""),
+            ":\"au#{suffix}dit\""
+        );
+        assert_eq!(selected_text(source, "\"audit\""), "\"audit\"");
+    }
+}
+
+#[cfg(test)]
 mod dispatch_mode_tests {
     use super::*;
     use crate::analyzer::RubyMethodDispatchMode;
