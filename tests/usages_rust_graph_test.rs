@@ -2552,6 +2552,264 @@ impl Foo {
     assert_eq!(2, result.all_hits_including_imports().len());
 }
 
+// Issue #1014 (detection facet): a trait-impl method calling an inherent-impl sibling
+// through a Pin adapter — `ready!(self.as_mut().poll_elapsed(cx))` in tokio's
+// `impl Future for Sleep` — produced no hit on any surface. The adapter-chained self
+// receiver must be detected as a SelfReceiver hit. Assert on the authoritative
+// detection surface (not the scan_usages/`all_hits` policy surface, which is issue
+// #1014's escalated policy facet).
+fn self_receiver_detected(hits: &BTreeSet<UsageHit>, file: &ProjectFile, member: &str) -> bool {
+    hits.iter().any(|hit| {
+        hit.file == *file && hit.kind == UsageHitKind::SelfReceiver && hit.snippet.contains(member)
+    })
+}
+
+#[test]
+fn rust_adapter_chained_self_receiver_in_macro_is_detected() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/sleep.rs",
+        r#"
+pub struct Sleep;
+
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            x => x,
+        }
+    };
+}
+
+impl Sleep {
+    fn poll_elapsed(self: Pin<&mut Self>) {}
+}
+
+impl Future for Sleep {
+    fn poll(mut self: Pin<&mut Self>) {
+        ready!(self.as_mut().poll_elapsed());
+    }
+}
+"#,
+    )]);
+
+    let file = project.file("src/sleep.rs");
+    let target = member(&analyzer, &file, "Sleep", "poll_elapsed");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+    assert!(
+        self_receiver_detected(&hits, &file, "poll_elapsed"),
+        "adapter-chained self receiver inside ready!(...) must be detected as a self-receiver hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_adapter_chained_self_receiver_without_macro_is_detected() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/sleep.rs",
+        r#"
+pub struct Sleep;
+
+impl Sleep {
+    fn poll_elapsed(self: Pin<&mut Self>) {}
+}
+
+impl Future for Sleep {
+    fn poll(mut self: Pin<&mut Self>) {
+        self.as_mut().poll_elapsed();
+    }
+}
+"#,
+    )]);
+
+    let file = project.file("src/sleep.rs");
+    let target = member(&analyzer, &file, "Sleep", "poll_elapsed");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+    assert!(
+        self_receiver_detected(&hits, &file, "poll_elapsed"),
+        "plain `self.as_mut().poll_elapsed()` must be detected as a self-receiver hit: {hits:#?}"
+    );
+}
+
+// Negative control: `self.other().target()` where `other()` returns a *different*
+// workspace type that has its own `target`. Existing type inference must resolve the
+// call to that other type's method, so it is a (regular) reference to `Inner.target`
+// and never a self hit on `Outer`.
+#[test]
+fn rust_non_adapter_receiver_resolves_to_returned_type_not_self() {
+    let source = r#"
+pub struct Inner;
+impl Inner {
+    fn target(&self) {}
+}
+
+pub struct Outer {
+    inner: Inner,
+}
+impl Outer {
+    fn other(&self) -> &Inner {
+        &self.inner
+    }
+    fn target(&self) {}
+    fn caller(&self) {
+        self.other().target();
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/svc.rs", source)]);
+    let file = project.file("src/svc.rs");
+    let call = source.find("self.other().target").expect("call site") + "self.other().".len();
+    let span = (call, call + "target".len());
+
+    // The call resolves to Inner.target via inference (a regular reference), not self.
+    let inner_target = member(&analyzer, &file, "Inner", "target");
+    let inner_hits = authoritative_hits(
+        &analyzer,
+        &inner_target,
+        [file.clone()].into_iter().collect(),
+    );
+    assert!(
+        inner_hits.iter().any(|hit| {
+            hit.file == file
+                && hit.kind == UsageHitKind::Reference
+                && (hit.start_offset, hit.end_offset) == span
+        }),
+        "adapter-returning receiver must resolve to Inner.target: {inner_hits:#?}"
+    );
+
+    // Scanning Outer.target must NOT claim that same call site as a self hit.
+    let outer_target = member(&analyzer, &file, "Outer", "target");
+    let outer_hits = authoritative_hits(
+        &analyzer,
+        &outer_target,
+        [file.clone()].into_iter().collect(),
+    );
+    assert!(
+        outer_hits
+            .iter()
+            .all(|hit| (hit.start_offset, hit.end_offset) != span),
+        "receiver resolved to Inner must not become an Outer hit: {outer_hits:#?}"
+    );
+}
+
+// Negative control: a non-allowlisted adapter (`mystery`) whose return type is
+// unresolvable must NOT be proven as a self hit. It is neither an allowlisted adapter
+// nor inference-resolvable, so no hit is produced at that call site.
+#[test]
+fn rust_unknown_adapter_receiver_produces_no_self_hit() {
+    let source = r#"
+pub struct Sleep;
+
+impl Sleep {
+    fn poll_elapsed(self: Pin<&mut Self>) {}
+    fn mystery(&self) -> Mystery {
+        Mystery
+    }
+}
+
+impl Future for Sleep {
+    fn poll(mut self: Pin<&mut Self>) {
+        self.mystery().poll_elapsed();
+        self.poll_elapsed();
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/sleep.rs", source)]);
+    let file = project.file("src/sleep.rs");
+    let target = member(&analyzer, &file, "Sleep", "poll_elapsed");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+
+    // The bare `self.poll_elapsed()` anchors a Success result with one self hit,
+    // proving the scan ran; the unknown-adapter call must contribute no extra hit.
+    let mystery_call =
+        source.find("self.mystery().poll_elapsed").expect("call") + "self.mystery().".len();
+    let mystery_span = (mystery_call, mystery_call + "poll_elapsed".len());
+    assert!(
+        hits.iter()
+            .all(|hit| (hit.start_offset, hit.end_offset) != mystery_span),
+        "unresolvable non-allowlisted adapter must not be proven as a self hit: {hits:#?}"
+    );
+    assert!(
+        self_receiver_detected(&hits, &file, "self.poll_elapsed"),
+        "the bare self control call must still be detected: {hits:#?}"
+    );
+}
+
+// Cross-impl bare-self regression guard: a trait impl calling an inherent sibling by
+// bare `self.poll_elapsed()` must be detected. This is proved by the enclosing impl's
+// Self type, not by physical range containment of the target inside the trait impl
+// (the inherent `impl Sleep` is a different impl block than `impl Future for Sleep`).
+#[test]
+fn rust_cross_impl_bare_self_receiver_is_detected() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/sleep.rs",
+        r#"
+pub struct Sleep;
+
+impl Sleep {
+    fn poll_elapsed(&self) {}
+}
+
+impl Future for Sleep {
+    fn poll(&self) {
+        self.poll_elapsed();
+    }
+}
+"#,
+    )]);
+
+    let file = project.file("src/sleep.rs");
+    let target = member(&analyzer, &file, "Sleep", "poll_elapsed");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+    assert!(
+        self_receiver_detected(&hits, &file, "poll_elapsed"),
+        "cross-impl bare self call must be detected as a self-receiver hit: {hits:#?}"
+    );
+}
+
+// Whole-workspace export scope also proves adapter-chained self receivers as
+// SelfReceiver hits (not merely unproven candidates): a public inherent method called
+// through `self.as_mut()` from a trait impl, both directly and inside a macro.
+#[test]
+fn rust_adapter_chained_self_receiver_proven_on_export_surface() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod sleep;\n"),
+        (
+            "src/sleep.rs",
+            r#"
+use std::pin::Pin;
+
+pub struct Sleep;
+
+macro_rules! ready {
+    ($e:expr) => { match $e { x => x } };
+}
+
+impl Sleep {
+    pub fn poll_elapsed(self: Pin<&mut Self>) {}
+}
+
+impl Future for Sleep {
+    fn poll(mut self: Pin<&mut Self>) {
+        self.as_mut().poll_elapsed();
+        ready!(self.as_mut().poll_elapsed());
+    }
+}
+"#,
+        ),
+    ]);
+    let file = project.file("src/sleep.rs");
+    let target = member(&analyzer, &file, "Sleep", "poll_elapsed");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let editor_hits = result.all_hits_including_imports();
+    let self_hits: Vec<_> = editor_hits
+        .iter()
+        .filter(|hit| hit.file == file && hit.kind == UsageHitKind::SelfReceiver)
+        .collect();
+    assert_eq!(
+        2,
+        self_hits.len(),
+        "both the plain and macro adapter calls must be proven self hits on the export surface: {editor_hits:#?}"
+    );
+}
+
 #[test]
 fn rust_seedless_local_external_hits_still_enforce_usage_cap() {
     let (project, analyzer) = rust_analyzer_with_files(&[(
