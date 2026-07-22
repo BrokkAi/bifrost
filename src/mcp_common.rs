@@ -1,6 +1,7 @@
 use crate::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
-    searchtools_render::RenderOptions, tool_arguments::normalize_tool_arguments,
+    analyzer::policy::escape_terminal_text, searchtools_render::RenderOptions,
+    tool_arguments::normalize_tool_arguments,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -20,6 +21,8 @@ const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
+const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
+const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
 
 pub(crate) const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
@@ -53,10 +56,22 @@ pub struct McpServerSpec {
 struct McpConnectionState {
     accepts_client_roots: bool,
     client_supports_roots: bool,
+    workspace_binding_source: WorkspaceBindingSource,
+    codex_sandbox_cwd_uri: Option<String>,
+    codex_sandbox_root: Option<PathBuf>,
+    initialize_received: bool,
     initialized: bool,
     pending_roots_request: Option<String>,
     roots_refresh_requested: bool,
     next_request_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceBindingSource {
+    None,
+    ExplicitRoot,
+    ClientRoots,
+    CodexSandboxState,
 }
 
 impl McpConnectionState {
@@ -64,6 +79,14 @@ impl McpConnectionState {
         Self {
             accepts_client_roots,
             client_supports_roots: false,
+            workspace_binding_source: if accepts_client_roots {
+                WorkspaceBindingSource::None
+            } else {
+                WorkspaceBindingSource::ExplicitRoot
+            },
+            codex_sandbox_cwd_uri: None,
+            codex_sandbox_root: None,
+            initialize_received: false,
             initialized: false,
             pending_roots_request: None,
             roots_refresh_requested: false,
@@ -96,6 +119,10 @@ impl McpConnectionState {
         } else {
             None
         }
+    }
+
+    fn accepts_codex_sandbox_state(&self) -> bool {
+        self.accepts_client_roots && self.initialize_received && !self.client_supports_roots
     }
 }
 
@@ -133,7 +160,7 @@ pub fn run_stdio_server(
     spec: &McpServerSpec,
 ) -> Result<(), String> {
     // Explicit roots build in the background. Rootless servers answer initialize
-    // without touching process cwd and bind only after roots negotiation.
+    // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
     let service = match root {
         Some(root) => SearchToolsService::new_deferred(root)?,
@@ -234,12 +261,39 @@ fn dispatch_message(
     match id {
         Some(id) => {
             if method == "initialize" {
+                if connection.initialize_received {
+                    return Some(error_response(
+                        id,
+                        INVALID_REQUEST,
+                        "MCP initialize may only be sent once per connection".to_string(),
+                    ));
+                }
+                connection.initialize_received = true;
                 connection.client_supports_roots = params
                     .pointer("/capabilities/roots")
                     .is_some_and(Value::is_object);
+                let client_is_codex = params.pointer("/clientInfo/name").and_then(Value::as_str)
+                    == Some(CODEX_MCP_CLIENT_NAME);
+                let protocol = if !connection.accepts_client_roots {
+                    "explicit-root"
+                } else if connection.client_supports_roots {
+                    "mcp-roots"
+                } else {
+                    "codex-sandbox-state"
+                };
+                eprintln!(
+                    "bifrost: MCP initialize client={} roots_supported={} workspace_protocol={protocol}",
+                    if client_is_codex {
+                        CODEX_MCP_CLIENT_NAME
+                    } else {
+                        "other"
+                    },
+                    connection.client_supports_roots,
+                );
             }
             Some(dispatch_request(
                 service,
+                connection,
                 id,
                 method,
                 params,
@@ -298,9 +352,12 @@ fn handle_response(
         };
         match service.bind_client_workspace(path) {
             Ok(root) => {
+                connection.workspace_binding_source = WorkspaceBindingSource::ClientRoots;
+                connection.codex_sandbox_cwd_uri = None;
+                connection.codex_sandbox_root = None;
                 eprintln!(
-                    "bifrost: bound MCP workspace root: {}",
-                    root.to_string_lossy()
+                    "bifrost: bound MCP workspace source=roots/list root={}",
+                    escape_terminal_text(root.to_string_lossy().as_ref())
                 );
                 return connection.finish_roots_response();
             }
@@ -312,11 +369,17 @@ fn handle_response(
         if let Err(error) = service.unbind_client_workspace() {
             eprintln!("bifrost: failed to clear revoked MCP workspace root: {error}");
         }
+        connection.workspace_binding_source = WorkspaceBindingSource::None;
+        connection.codex_sandbox_cwd_uri = None;
+        connection.codex_sandbox_root = None;
         eprintln!("bifrost: MCP client returned no workspace roots; server remains unbound");
     } else if let Some(error) = last_error {
         if let Err(unbind_error) = service.unbind_client_workspace() {
             eprintln!("bifrost: failed to clear unusable MCP workspace roots: {unbind_error}");
         }
+        connection.workspace_binding_source = WorkspaceBindingSource::None;
+        connection.codex_sandbox_cwd_uri = None;
+        connection.codex_sandbox_root = None;
         eprintln!("bifrost: no usable MCP workspace root: {error}");
     }
     connection.finish_roots_response()
@@ -345,6 +408,7 @@ fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
 
 fn dispatch_request(
     service: &SearchToolsService,
+    connection: &mut McpConnectionState,
     id: Value,
     method: &str,
     params: Value,
@@ -352,13 +416,16 @@ fn dispatch_request(
     spec: &McpServerSpec,
 ) -> Value {
     let response = match method {
-        "initialize" => Ok(initialize_result(spec.instructions)),
+        "initialize" => Ok(initialize_result(
+            spec.instructions,
+            connection.accepts_codex_sandbox_state(),
+        )),
         "ping" => Ok(json!({})),
         BENCHMARK_PROFILE_BOUNDARY_METHOD => write_benchmark_profile_boundary(),
         "resources/list" => Ok(list_resources_result()),
         "resources/read" => handle_resource_read(params),
         "tools/list" => Ok(list_tools_result(spec)),
-        "tools/call" => handle_tool_call(service, params, render_options, spec),
+        "tools/call" => handle_tool_call(service, connection, params, render_options, spec),
         _ => Err((METHOD_NOT_FOUND, format!("Unknown method: {method}"))),
     };
 
@@ -394,9 +461,15 @@ fn handle_notification(
             connection.roots_request()
         }
         "notifications/roots/list_changed" => {
+            if !connection.accepts_client_roots || !connection.client_supports_roots {
+                return None;
+            }
             if let Err(error) = service.unbind_client_workspace() {
                 eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
             }
+            connection.workspace_binding_source = WorkspaceBindingSource::None;
+            connection.codex_sandbox_cwd_uri = None;
+            connection.codex_sandbox_root = None;
             if connection.pending_roots_request.is_some() {
                 connection.roots_refresh_requested = true;
                 None
@@ -408,8 +481,8 @@ fn handle_notification(
     }
 }
 
-fn initialize_result(instructions: &str) -> Value {
-    json!({
+fn initialize_result(instructions: &str, advertise_codex_sandbox_state: bool) -> Value {
+    let mut result = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
             "resources": {},
@@ -420,7 +493,13 @@ fn initialize_result(instructions: &str) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": instructions,
-    })
+    });
+    if advertise_codex_sandbox_state {
+        result["capabilities"]["experimental"] = json!({
+            CODEX_SANDBOX_STATE_META_CAPABILITY: {},
+        });
+    }
+    result
 }
 
 fn list_tools_result(spec: &McpServerSpec) -> Value {
@@ -478,6 +557,7 @@ fn handle_resource_read(params: Value) -> Result<Value, (i64, String)> {
 
 fn handle_tool_call(
     service: &SearchToolsService,
+    connection: &mut McpConnectionState,
     params: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
@@ -497,17 +577,30 @@ fn handle_tool_call(
         return Ok(tool_error_result(format!("Unknown tool: {name}")));
     }
 
+    reconcile_codex_sandbox_workspace(service, connection, object)?;
+
     let arguments = object
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if connection.workspace_binding_source == WorkspaceBindingSource::None {
+        return Err(unbound_workspace_error());
+    }
     let Some(workspace_root) = service.active_workspace_root() else {
-        return Err((
-            INTERNAL_ERROR,
-            "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT."
-                .to_string(),
-        ));
+        return Err(unbound_workspace_error());
     };
+    if name == "activate_workspace" {
+        let authority = match connection.workspace_binding_source {
+            WorkspaceBindingSource::ClientRoots => Some("MCP client roots"),
+            WorkspaceBindingSource::CodexSandboxState => Some("Codex sandbox metadata"),
+            WorkspaceBindingSource::None | WorkspaceBindingSource::ExplicitRoot => None,
+        };
+        if let Some(authority) = authority {
+            return Ok(tool_error_result(format!(
+                "activate_workspace is unavailable while the workspace is controlled by {authority}; update the client-provided workspace instead"
+            )));
+        }
+    }
     let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
         Err(message) => return Ok(tool_error_result(message)),
@@ -533,6 +626,143 @@ fn handle_tool_call(
             Err(map_service_error(err.code, err.message))
         }
     }
+}
+
+fn reconcile_codex_sandbox_workspace(
+    service: &SearchToolsService,
+    connection: &mut McpConnectionState,
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), (i64, String)> {
+    if !connection.accepts_codex_sandbox_state() {
+        return Ok(());
+    }
+
+    let thread_id = params
+        .get("_meta")
+        .and_then(|metadata| metadata.get("threadId"))
+        .and_then(Value::as_str);
+    let sandbox_cwd = params
+        .get("_meta")
+        .and_then(|metadata| metadata.get(CODEX_SANDBOX_STATE_META_CAPABILITY))
+        .and_then(|sandbox_state| sandbox_state.get("sandboxCwd"))
+        .and_then(Value::as_str);
+
+    let Some(sandbox_cwd) = sandbox_cwd else {
+        revoke_codex_sandbox_workspace(service, connection, thread_id, "metadata missing")?;
+        log_codex_workspace_event("workspace metadata missing", thread_id);
+        return Err(unbound_workspace_error());
+    };
+
+    let active_root = service.active_workspace_root();
+    if connection.workspace_binding_source == WorkspaceBindingSource::CodexSandboxState
+        && connection.codex_sandbox_cwd_uri.as_deref() == Some(sandbox_cwd)
+        && connection.codex_sandbox_root.is_some()
+        && active_root.as_ref() == connection.codex_sandbox_root.as_ref()
+    {
+        return Ok(());
+    }
+
+    let candidate = match file_uri_to_path(sandbox_cwd) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            revoke_codex_sandbox_workspace(service, connection, thread_id, "metadata invalid")?;
+            log_codex_workspace_event(
+                &format!(
+                    "rejected workspace metadata error={}",
+                    escape_terminal_text(&error)
+                ),
+                thread_id,
+            );
+            return Err((
+                INVALID_PARAMS,
+                format!("Invalid Codex sandbox workspace metadata: {error}"),
+            ));
+        }
+    };
+
+    if connection.workspace_binding_source == WorkspaceBindingSource::CodexSandboxState {
+        revoke_codex_sandbox_workspace(service, connection, thread_id, "metadata changed")?;
+    }
+
+    if service.active_workspace_root().is_some() {
+        service
+            .unbind_client_workspace()
+            .map_err(|error| map_service_error(error.code, error.message))?;
+        connection.workspace_binding_source = WorkspaceBindingSource::None;
+        connection.codex_sandbox_cwd_uri = None;
+        connection.codex_sandbox_root = None;
+        log_codex_workspace_event(
+            "revoked previous workspace reason=metadata changed",
+            thread_id,
+        );
+    }
+
+    match service.bind_client_workspace(candidate) {
+        Ok(root) => {
+            connection.workspace_binding_source = WorkspaceBindingSource::CodexSandboxState;
+            connection.codex_sandbox_cwd_uri = Some(sandbox_cwd.to_string());
+            connection.codex_sandbox_root = Some(root.clone());
+            log_codex_workspace_event(
+                &format!(
+                    "bound MCP workspace source={CODEX_SANDBOX_STATE_META_CAPABILITY} root={}",
+                    escape_terminal_text(root.to_string_lossy().as_ref())
+                ),
+                thread_id,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            connection.workspace_binding_source = WorkspaceBindingSource::None;
+            connection.codex_sandbox_cwd_uri = None;
+            connection.codex_sandbox_root = None;
+            log_codex_workspace_event(
+                &format!(
+                    "failed workspace bind source={CODEX_SANDBOX_STATE_META_CAPABILITY} error={}",
+                    escape_terminal_text(&error.message)
+                ),
+                thread_id,
+            );
+            Err(map_service_error(error.code, error.message))
+        }
+    }
+}
+
+fn revoke_codex_sandbox_workspace(
+    service: &SearchToolsService,
+    connection: &mut McpConnectionState,
+    thread_id: Option<&str>,
+    reason: &str,
+) -> Result<(), (i64, String)> {
+    if connection.workspace_binding_source != WorkspaceBindingSource::CodexSandboxState {
+        return Ok(());
+    }
+    service
+        .unbind_client_workspace()
+        .map_err(|error| map_service_error(error.code, error.message))?;
+    connection.workspace_binding_source = WorkspaceBindingSource::None;
+    connection.codex_sandbox_cwd_uri = None;
+    connection.codex_sandbox_root = None;
+    log_codex_workspace_event(&format!("revoked MCP workspace reason={reason}"), thread_id);
+    Ok(())
+}
+
+fn log_codex_workspace_event(event: &str, thread_id: Option<&str>) {
+    if let Some(thread_id) = thread_id {
+        eprintln!(
+            "bifrost: {event} thread_id={}",
+            escape_terminal_text(thread_id)
+        );
+    } else {
+        eprintln!("bifrost: {event}");
+    }
+}
+
+fn unbound_workspace_error() -> (i64, String) {
+    (
+        INTERNAL_ERROR,
+        "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT."
+            .to_string(),
+    )
 }
 
 fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64, String) {

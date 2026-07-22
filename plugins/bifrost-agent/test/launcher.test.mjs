@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -731,3 +731,86 @@ test("serve-mode setup failures keep stdout clean and explain recovery on stderr
     }
   );
 });
+
+test(
+  "serve forwards termination and reaps a child that does not exit",
+  { skip: process.platform === "win32" },
+  async () => {
+    const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-signal-test-"));
+    const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
+    const binary = path.join(temp, "bifrost");
+    await writeExecutableFixture(
+      binary,
+      `#!/usr/bin/env node
+if (process.argv.includes("--version")) {
+  console.log("bifrost ${metadata.binaryVersion}");
+  process.exit(0);
+}
+process.on("SIGTERM", () => console.error("bifrost-child-saw-term"));
+console.error("bifrost-child-ready");
+setInterval(() => {}, 1_000);
+`
+    );
+
+    const launcher = spawn(
+      process.execPath,
+      [path.join(packageDir, "bin", "bifrost-launcher.mjs"), "--root", temp, "--mcp", "symbol"],
+      {
+        env: {
+          ...process.env,
+          BIFROST_BINARY_PATH: binary,
+          BIFROST_LAUNCHER_ALLOW_PATH: "0",
+          BIFROST_LAUNCHER_AUTO_INSTALL: "0",
+          BIFROST_LAUNCHER_CACHE_DIR: path.join(temp, "cache")
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+    const stderr = [];
+    launcher.stderr.setEncoding("utf8");
+    launcher.stderr.on("data", (chunk) => stderr.push(chunk));
+    const closed = new Promise((resolve, reject) => {
+      launcher.once("error", reject);
+      launcher.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    const ready = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("timed out waiting for fake Bifrost")), 10_000);
+      launcher.stderr.on("data", () => {
+        if (stderr.join("").includes("bifrost-child-ready")) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+
+    try {
+      await ready;
+      assert.equal(launcher.kill("SIGTERM"), true);
+      let closeTimeout;
+      const result = await Promise.race([
+        closed,
+        new Promise((_, reject) => {
+          closeTimeout = setTimeout(
+            () => reject(new Error("launcher did not reap fake Bifrost")),
+            10_000
+          );
+        })
+      ]);
+      clearTimeout(closeTimeout);
+      assert.equal(result.code, null);
+      assert.equal(result.signal, "SIGKILL");
+      assert.match(stderr.join(""), /bifrost-child-saw-term/);
+    } finally {
+      if (launcher.exitCode === null && launcher.signalCode === null) {
+        launcher.kill("SIGTERM");
+        await Promise.race([
+          closed,
+          new Promise((resolve) => setTimeout(resolve, 6_000))
+        ]);
+      }
+      if (launcher.exitCode === null && launcher.signalCode === null) {
+        launcher.kill("SIGKILL");
+      }
+    }
+  }
+);

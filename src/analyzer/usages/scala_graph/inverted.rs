@@ -1079,30 +1079,6 @@ impl ProjectTypes {
         FieldResolution::NoMatch
     }
 
-    fn field_for_exact_owner(
-        &self,
-        scala: &ScalaAnalyzer,
-        owner: &CodeUnit,
-        member: &str,
-    ) -> FieldResolution {
-        let mut fields = self
-            .members_for_exact_owner_unit(scala, owner, member)
-            .into_iter()
-            .filter(|unit| self.has_term_field_declaration(unit))
-            .cloned()
-            .collect::<Vec<_>>();
-        fields.sort();
-        fields.dedup();
-        match fields.as_slice() {
-            [] => FieldResolution::NoMatch,
-            [field] => FieldResolution::Resolved(ResolvedField {
-                declaration: field.clone(),
-                declared_type: self.field_declared_type(scala, field),
-            }),
-            [_, _, ..] => FieldResolution::Unresolved,
-        }
-    }
-
     pub(super) fn field_for_owner_unit(
         &self,
         scala: &ScalaAnalyzer,
@@ -7320,13 +7296,22 @@ fn record_reference(
                             | ScalaMethodValueContext::Incompatible => None,
                         };
                     let call_shape = call_shape.with_method_value_shape(method_value_shape);
-                    if record_unqualified_applied_field(function, name, ctx, bindings) {
-                        return;
-                    }
-                    if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
+                    let lexical_callable_bound =
+                        match record_unqualified_applied_field(function, name, ctx, bindings) {
+                            LexicalFieldReferenceResolution::Consumed => return,
+                            LexicalFieldReferenceResolution::CallableBound => true,
+                            LexicalFieldReferenceResolution::NoMatch => false,
+                        };
+                    if !lexical_callable_bound
+                        && (!bindings.resolve_symbol(name).is_unknown()
+                            || bindings.is_shadowed(name))
+                    {
                         return;
                     }
                     if record_lexically_visible_call(function, name, &call_shape, ctx) {
+                        return;
+                    }
+                    if lexical_callable_bound {
                         return;
                     }
                     let resolved_member_units = ctx.resolver.resolve_member_units(name);
@@ -7516,37 +7501,15 @@ fn record_reference(
                 return;
             }
             if !is_terminal_stable_field_reference(node) && !is_field_expression_value(node) {
-                let enclosing_owner = ctx.enclosing_class_unit(node.start_byte());
-                let binding_blocks_member_lookup = bindings.is_shadowed(name)
-                    && precise_scala_binding(bindings, name).is_none_or(|binding| {
-                        binding
-                            .declaration_owner
-                            .as_ref()
-                            .is_none_or(|declaration_owner| {
-                                enclosing_owner == Some(declaration_owner)
-                            })
-                    });
-                let field_allows_method_lookup = if !binding_blocks_member_lookup
-                    && let Some(owner) = enclosing_owner
+                if record_lexically_visible_field_reference(node, name, ctx, bindings)
+                    == LexicalFieldReferenceResolution::Consumed
                 {
-                    match ctx.types.field_for_owner_unit(ctx.scala, owner, name) {
-                        FieldResolution::Resolved(field) => {
-                            ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
-                            return;
-                        }
-                        FieldResolution::NoMatch => true,
-                        FieldResolution::Unresolved => false,
-                    }
-                } else {
-                    !binding_blocks_member_lookup
-                };
-                if !binding_blocks_member_lookup
-                    && field_allows_method_lookup
-                    && !matches!(
-                        companion_method_value_context(node, ctx, bindings),
-                        ScalaMethodValueContext::Function(_)
-                    )
-                    && record_lexically_visible_parameterless_method(node, name, ctx)
+                    return;
+                }
+                if !matches!(
+                    companion_method_value_context(node, ctx, bindings),
+                    ScalaMethodValueContext::Function(_)
+                ) && record_lexically_visible_parameterless_method(node, name, ctx)
                 {
                     return;
                 }
@@ -7597,24 +7560,6 @@ fn record_reference(
                 && let Some(target) = ctx.visible_type_reference(node, name)
             {
                 ctx.record_resolved(target, ScalaReferenceRole::Type, node);
-                return;
-            }
-            if !is_terminal_stable_field_reference(node)
-                && let Some(owner) = exact_owner_field_binding(bindings, name)
-            {
-                match ctx.types.field_for_exact_owner(ctx.scala, &owner, name) {
-                    FieldResolution::Resolved(field) => {
-                        ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
-                        return;
-                    }
-                    FieldResolution::Unresolved => return,
-                    FieldResolution::NoMatch => {
-                        ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, node);
-                        return;
-                    }
-                }
-            }
-            if bindings.is_shadowed(name) && !is_terminal_stable_field_reference(node) {
                 return;
             }
             if let ScalaMethodValueContext::Function(shape) =
@@ -7840,16 +7785,6 @@ fn record_reference(
                     }
                 }
                 return;
-            }
-            if let Some(owner) = ctx.enclosing_class_unit(node.start_byte()) {
-                match ctx.types.field_for_owner_unit(ctx.scala, owner, name) {
-                    FieldResolution::Resolved(field) => {
-                        ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
-                        return;
-                    }
-                    FieldResolution::Unresolved => return,
-                    FieldResolution::NoMatch => {}
-                }
             }
             if record_lexically_visible_parameterless_method(node, name, ctx) {
                 return;
@@ -8153,40 +8088,24 @@ fn record_unqualified_applied_field(
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
-) -> bool {
-    if let Some(owner) = exact_owner_field_binding(bindings, name) {
-        match ctx.types.field_for_exact_owner(ctx.scala, &owner, name) {
-            FieldResolution::Resolved(field) => {
-                ctx.record_exact(field.declaration, ScalaReferenceRole::Field, function);
-            }
-            FieldResolution::NoMatch => {
-                ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, function);
-            }
-            FieldResolution::Unresolved => {}
+) -> LexicalFieldReferenceResolution {
+    match record_lexically_visible_field_reference(function, name, ctx, bindings) {
+        LexicalFieldReferenceResolution::Consumed => {
+            return LexicalFieldReferenceResolution::Consumed;
         }
-        return true;
-    }
-    if bindings.is_shadowed(name) {
-        return false;
-    }
-    if let Some(owner) = ctx.enclosing_class_unit(function.start_byte()).cloned() {
-        match ctx.types.field_for_owner_unit(ctx.scala, &owner, name) {
-            FieldResolution::Resolved(field) => {
-                ctx.record_exact(field.declaration, ScalaReferenceRole::Field, function);
-                return true;
-            }
-            FieldResolution::Unresolved => return true,
-            FieldResolution::NoMatch => {}
+        LexicalFieldReferenceResolution::CallableBound => {
+            return LexicalFieldReferenceResolution::CallableBound;
         }
+        LexicalFieldReferenceResolution::NoMatch => {}
     }
     if let Some(target) = ctx.resolver.resolve_member_unit(name)
         && ctx.types.has_term_field_declaration(&target)
         && !ctx.types.is_type_alias(ctx.scala, &target)
     {
         ctx.record_exact(target, ScalaReferenceRole::Field, function);
-        return true;
+        return LexicalFieldReferenceResolution::Consumed;
     }
-    false
+    LexicalFieldReferenceResolution::NoMatch
 }
 
 /// Calls and infix expressions resolve callable shape at their owning AST
@@ -8672,28 +8591,66 @@ fn record_enclosing_field_qualifier(
     }) {
         return false;
     }
-    if let Some(owner) = exact_owner_field_binding(bindings, name) {
-        match ctx.types.field_for_exact_owner(ctx.scala, &owner, name) {
+    record_lexically_visible_field_reference(node, name, ctx, bindings)
+        == LexicalFieldReferenceResolution::Consumed
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LexicalFieldReferenceResolution {
+    Consumed,
+    CallableBound,
+    NoMatch,
+}
+
+/// Resolve an unqualified field through Scala's exact lexical owner chain.
+///
+/// Local and parameter bindings are authoritative. Otherwise each physical
+/// enclosing template is examined nearest-first, including that template's
+/// inherited field tier. A field declaration, field ambiguity, or callable at
+/// the nearest matching tier stops the walk, so neither a same-named outer
+/// field nor a package-level member can leak through it. Callable recording is
+/// left to the existing shape-aware path after this helper reports
+/// [`LexicalFieldReferenceResolution::CallableBound`].
+fn record_lexically_visible_field_reference(
+    node: Node<'_>,
+    name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> LexicalFieldReferenceResolution {
+    let bound_field_owner = exact_owner_field_binding(bindings, name);
+    if bindings.is_shadowed(name) && bound_field_owner.is_none() {
+        return LexicalFieldReferenceResolution::Consumed;
+    }
+    let mut owner = ctx.enclosing_class_unit(node.start_byte()).cloned();
+    let mut seen = HashSet::default();
+    while let Some(current) = owner {
+        if !seen.insert(current.clone()) {
+            return LexicalFieldReferenceResolution::Consumed;
+        }
+        owner = ctx.types.exact_structural_parent(ctx.scala, &current);
+        if !current.is_class() {
+            continue;
+        }
+        match ctx.types.field_for_owner_unit(ctx.scala, &current, name) {
             FieldResolution::Resolved(field) => {
                 ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
+                return LexicalFieldReferenceResolution::Consumed;
             }
-            FieldResolution::NoMatch | FieldResolution::Unresolved => {}
+            FieldResolution::Unresolved => return LexicalFieldReferenceResolution::Consumed,
+            FieldResolution::NoMatch if bound_field_owner.as_ref() == Some(&current) => {
+                ctx.record_exact_owner_member(current, name, ScalaReferenceRole::Field, node);
+                return LexicalFieldReferenceResolution::Consumed;
+            }
+            FieldResolution::NoMatch => {}
         }
-        return true;
-    }
-    if bindings.is_shadowed(name) {
-        return true;
-    }
-    let Some(owner) = ctx.enclosing_class_unit(node.start_byte()) else {
-        return false;
-    };
-    match ctx.types.field_for_owner_unit(ctx.scala, owner, name) {
-        FieldResolution::Resolved(field) => {
-            ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
-            true
+        if callable_name_is_bound_for_exact_owner(&current, name, ctx) {
+            return LexicalFieldReferenceResolution::CallableBound;
         }
-        FieldResolution::Unresolved => true,
-        FieldResolution::NoMatch => false,
+    }
+    if bound_field_owner.is_some() {
+        LexicalFieldReferenceResolution::Consumed
+    } else {
+        LexicalFieldReferenceResolution::NoMatch
     }
 }
 
@@ -8947,7 +8904,11 @@ fn callable_name_is_bound_for_exact_owner(
             ctx.types
                 .members_for_exact_owner_unit(ctx.scala, owner, member)
                 .iter()
-                .any(|unit| unit.is_function())
+                .any(|unit| {
+                    unit.is_function()
+                        && ctx.types.fallback_callable_role(ctx.scala, unit)
+                            == ScalaCallableRole::Ordinary
+                })
         })
 }
 

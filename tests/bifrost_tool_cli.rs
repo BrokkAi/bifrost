@@ -894,7 +894,7 @@ fn query_code_help_includes_boundary_example_and_guide() {
     assert!(stdout.contains(r#"{"match":{"kind":"call""#), "{stdout}");
     assert!(!stdout.contains("search_ast"), "{stdout}");
     assert!(
-        stdout.contains("https://brokkai.github.io/bifrost/code-querying/"),
+        stdout.contains("https://bifrost.brokk.ai/code-querying/"),
         "{stdout}"
     );
 }

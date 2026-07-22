@@ -25,9 +25,10 @@ _Source: `plugins/bifrost-agent/skills/bifrost-code-navigation/SKILL.md`._
 Use these Bifrost MCP tools when you need to find where code is defined,
 where it is used, or which source files are related to a starting point.
 
-The Bifrost agent plugin receives its workspace boundary from the host through
-MCP roots, or from an explicit launcher override. Do not call workspace
-lifecycle tools such as `activate_workspace` for the default plugin install.
+The Bifrost agent plugin receives its workspace boundary from standard MCP
+roots, Codex sandbox-state metadata, or an explicit launcher override. Do not
+call workspace lifecycle tools such as `activate_workspace` for the default
+plugin install.
 
 #### Tools
 
@@ -121,7 +122,7 @@ that matches the thing you are looking for.
   `references_of`, `used_by`, or `uses` when a structural seed should continue
   through exact indexed symbol identities; use `scan_usages_by_location` for a
   location-first lookup or `usage_graph` for the narrower whole-workspace graph. The schema reference
-  is https://brokkai.github.io/bifrost/code-query-json/.
+  is https://bifrost.brokk.ai/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file
   discovery.
 - Use `list_files` when you need a bounded directory listing that respects the

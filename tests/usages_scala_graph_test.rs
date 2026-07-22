@@ -1627,6 +1627,186 @@ class Container(val service: Service) {
 }
 
 #[test]
+fn scala_inverse_resolves_bare_outer_fields_nearest_first_across_expression_roles() {
+    let imported = r#"package defs
+
+object ImportedFields {
+  val appliedCollision: Int => Int = identity
+}
+"#;
+    let source = r#"package app
+
+import defs.ImportedFields.appliedCollision
+
+trait Left { val ambiguous: Int = 1 }
+trait Right { val ambiguous: Int = 2 }
+class Service { def run(): Int = 1 }
+
+class Container {
+  private val plain: Int = 1
+  private var counter: Int = 0
+  private val service: Service = new Service
+  private val nearest: Int = 1
+  private val ambiguous: Int = 3
+  private val appliedCollision: Int => Int = identity
+
+  private def consume(value: Int): Int = value
+
+  class Nested {
+    def plainRead: Int = consume(plain) // positive-outer-plain
+    def infixRead: Unit = counter += 1 // positive-outer-infix
+    def receiverRead: Int = service.run() // positive-outer-receiver
+  }
+
+  class Nearest {
+    val nearest: Int = 2
+    def read: Int = nearest // negative-nearest-field-shadow
+  }
+
+  class ParameterShadow {
+    def read(plain: Int): Int = plain // negative-parameter-shadow
+  }
+
+  class LocalShadow {
+    def read: Int = {
+      val counter = 2
+      counter + 1 // negative-local-shadow
+    }
+  }
+
+  class Ambiguous extends Left with Right {
+    def read: Int = ambiguous // negative-ambiguous-nearest-tier
+  }
+
+  class CallableWins {
+    def appliedCollision(value: Int): Int = value
+    def read: Int = appliedCollision(1) // positive-nearest-applied-callable
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("defs/ImportedFields.scala", imported),
+        ("app/Container.scala", source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, positive, negative) in [
+        (
+            "app.Container.plain",
+            Some("positive-outer-plain"),
+            Some("negative-parameter-shadow"),
+        ),
+        (
+            "app.Container.counter",
+            Some("positive-outer-infix"),
+            Some("negative-local-shadow"),
+        ),
+        (
+            "app.Container.service",
+            Some("positive-outer-receiver"),
+            None,
+        ),
+        (
+            "app.Container.nearest",
+            None,
+            Some("negative-nearest-field-shadow"),
+        ),
+        (
+            "app.Container.ambiguous",
+            None,
+            Some("negative-ambiguous-nearest-tier"),
+        ),
+        (
+            "defs.ImportedFields$.appliedCollision",
+            None,
+            Some("positive-nearest-applied-callable"),
+        ),
+        (
+            "app.Container.appliedCollision",
+            None,
+            Some("positive-nearest-applied-callable"),
+        ),
+        (
+            "app.Container.CallableWins.appliedCollision",
+            Some("positive-nearest-applied-callable"),
+            None,
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let targeted = authoritative_scala_hits(&analyzer, &target);
+        let file_major =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000));
+        for target_hits in [&targeted, &file_major] {
+            if let Some(marker) = positive {
+                assert_hit_contains(target_hits, marker);
+            }
+            if let Some(marker) = negative {
+                assert_no_hit_contains(target_hits, marker);
+            }
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_classifies_parameter_default_identifiers_as_terms() {
+    let source = r#"package app
+
+object DefaultToken
+object OtherToken
+
+class Config(val token: AnyRef = DefaultToken) // positive-class-default
+case class CaseConfig(token: AnyRef = DefaultToken) // positive-case-class-default
+
+object Defaults {
+  def choose(token: AnyRef = DefaultToken): AnyRef = token // positive-function-default
+  def parameterShadow(DefaultToken: AnyRef): AnyRef = DefaultToken // negative-parameter-shadow
+  def localShadow: AnyRef = {
+    val DefaultToken: AnyRef = OtherToken
+    DefaultToken // negative-local-shadow
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[("app/Defaults.scala", source)]);
+    let target = definition(&analyzer, "app.DefaultToken$");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let file_major = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+    let targeted = authoritative_scala_hits(&analyzer, &target);
+    let file = project.file("app/Defaults.scala");
+    let expected = [
+        "class Config(val token: AnyRef = DefaultToken)",
+        "case class CaseConfig(token: AnyRef = DefaultToken)",
+        "def choose(token: AnyRef = DefaultToken)",
+    ]
+    .map(|line| {
+        let line_start = source.find(line).expect("default fixture line");
+        let token = line.rfind("DefaultToken").expect("default token");
+        (
+            line_start + token,
+            line_start + token + "DefaultToken".len(),
+        )
+    })
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    for target_hits in [&targeted, &file_major] {
+        let actual = target_hits
+            .iter()
+            .filter(|hit| hit.file == file)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "default term ranges must be exact");
+        assert_no_hit_contains(target_hits, "negative-parameter-shadow");
+        assert_no_hit_contains(target_hits, "negative-local-shadow");
+    }
+}
+
+#[test]
 fn scala_usage_finder_resolves_exact_structured_field_chains() {
     let consumer = r#"package app
 
@@ -7420,6 +7600,92 @@ object App:
 }
 
 #[test]
+fn scala_renamed_imports_record_original_and_alias_tokens_with_exact_identity() {
+    let scala2 = r#"package app
+import pkg.{Widget => Widget2}
+import pkg.{Utility => Utility2}
+import pkg.Members.{answer => answer2}
+import other.{Widget => OtherWidget2}
+import other.{Utility => OtherUtility2}
+import other.Members.{answer => otherAnswer2}
+object Scala2Use {
+  val widget: Widget2 = null
+  val utility = Utility2
+  val answer = answer2
+}
+"#;
+    let scala3 = r#"package app
+import pkg.Widget as Widget3
+import pkg.Utility as Utility3
+import pkg.Members.answer as answer3
+import other.Widget as OtherWidget3
+import other.Utility as OtherUtility3
+import other.Members.answer as otherAnswer3
+object Scala3Use:
+  val widget: Widget3 = null
+  val utility = Utility3
+  val answer = answer3
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Definitions.scala",
+            "package pkg\nclass Widget\nobject Utility\nobject Members { val answer: Int = 1 }\n",
+        ),
+        (
+            "other/Definitions.scala",
+            "package other\nclass Widget\nobject Utility\nobject Members { val answer: Int = 2 }\n",
+        ),
+        ("app/Scala2Use.scala", scala2),
+        ("app/Scala3Use.scala", scala3),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, original, scala2_alias, scala3_alias) in [
+        ("pkg.Widget", "Widget", "Widget2", "Widget3"),
+        ("pkg.Utility$", "Utility", "Utility2", "Utility3"),
+        ("pkg.Members$.answer", "answer", "answer2", "answer3"),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let result =
+            strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000);
+        let import_hits = result
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import)
+            .collect::<Vec<_>>();
+
+        for (path, source, alias) in [
+            ("app/Scala2Use.scala", scala2, scala2_alias),
+            ("app/Scala3Use.scala", scala3, scala3_alias),
+        ] {
+            let import_line = source
+                .lines()
+                .find(|line| line.contains("pkg.") && line.contains(alias))
+                .expect("renamed import line");
+            let line_start = source.find(import_line).expect("import line offset");
+            for token in [original, alias] {
+                let token_start = import_line.find(token).expect("import token");
+                assert!(
+                    import_hits.iter().any(|hit| {
+                        hit.file == project.file(path)
+                            && hit.start_offset == line_start + token_start
+                            && hit.end_offset == line_start + token_start + token.len()
+                    }),
+                    "missing exact import token {token:?} for {fqn}: {import_hits:#?}"
+                );
+            }
+        }
+        assert!(
+            import_hits
+                .iter()
+                .all(|hit| !hit.snippet.contains("import other.")),
+            "unrelated renamed import leaked into {fqn}: {import_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn scala_graph_resolves_visible_extension_method_usage() {
     let app_source = r#"
 package app
@@ -9635,8 +9901,10 @@ object External {
         "scan_usages_by_reference",
         &json!({
             "symbols": [
-                "replica.RingBuffer$.STATE_FULL",
-                "replica.RingBuffer$.STATE_RESERVED"
+                "jvm/replica/RingBuffer.scala#replica.RingBuffer$.STATE_FULL",
+                "native/replica/RingBuffer.scala#replica.RingBuffer$.STATE_FULL",
+                "jvm/replica/RingBuffer.scala#replica.RingBuffer$.STATE_RESERVED",
+                "native/replica/RingBuffer.scala#replica.RingBuffer$.STATE_RESERVED"
             ],
             "include_tests": true,
         })

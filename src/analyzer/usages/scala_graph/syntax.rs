@@ -1446,14 +1446,15 @@ fn is_bare_term_reference(node: Node<'_>) -> bool {
         | "trait_definition"
         | "enum_definition"
         | "function_declaration"
-        | "parameter"
-        | "class_parameter"
         | "type_parameters"
         | "import_declaration"
         | "stable_type_identifier"
         | "singleton_type"
         | "case_class_pattern"
         | "infix_pattern" => false,
+        "parameter" | "class_parameter" => {
+            parent.child_by_field_name("default_value") == Some(node)
+        }
         "function_definition" => parent.child_by_field_name("body") == Some(node),
         "val_definition" | "var_definition" => parent.child_by_field_name("pattern") != Some(node),
         "field_expression" => parent.child_by_field_name("field") != Some(node),

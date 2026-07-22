@@ -764,7 +764,8 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                 .identifier
                 .as_deref()
                 .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
-            if name != local_name {
+            let original_name = path.rsplit('.').next().unwrap_or(&path);
+            if name != local_name && name != original_name {
                 continue;
             }
             for candidate in candidates {

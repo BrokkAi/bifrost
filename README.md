@@ -1,7 +1,7 @@
 <h1 align="center">Bifrost</h1>
 
 <p align="center">
-  <a href="https://brokkai.github.io/bifrost/">
+  <a href="https://bifrost.brokk.ai/">
     <img src="docs/src/assets/bifrost-social-card.svg" alt="Bifrost — code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use" width="720">
   </a>
 </p>
@@ -16,8 +16,8 @@
 
 <p align="center">
   <a href="#run-your-first-query">Quickstart</a> ·
-  <a href="https://brokkai.github.io/bifrost/">Documentation</a> ·
-  <a href="https://brokkai.github.io/bifrost/evaluate-bifrost/">Ten-minute evaluation</a> ·
+  <a href="https://bifrost.brokk.ai/">Documentation</a> ·
+  <a href="https://bifrost.brokk.ai/evaluate-bifrost/">Ten-minute evaluation</a> ·
   <a href="https://discord.gg/geYkWUeH">Discord</a>
 </p>
 
@@ -42,9 +42,9 @@ repository instead of stopping at language boundaries.
   content-based caching, and git/worktree awareness keep analysis responsive as
   a repository changes.
 
-See [Choose Bifrost](https://brokkai.github.io/bifrost/choose-bifrost/) for the
+See [Choose Bifrost](https://bifrost.brokk.ai/choose-bifrost/) for the
 right interface for your workflow, and the [Language and Analysis
-Capabilities](https://brokkai.github.io/bifrost/capabilities/) matrix for
+Capabilities](https://bifrost.brokk.ai/capabilities/) matrix for
 language-by-language support, precision tiers, and current analysis boundaries.
 
 ## Run Your First Query
@@ -83,7 +83,7 @@ The result identifies the normalized Python call and its exact source location:
 ```
 
 Continue with the [ten-minute
-evaluation](https://brokkai.github.io/bifrost/evaluate-bifrost/) to run the same
+evaluation](https://bifrost.brokk.ai/evaluate-bifrost/) to run the same
 query through the CLI, an MCP-connected coding agent, and VS Code.
 
 ## See Bifrost in Action
@@ -91,7 +91,7 @@ query through the CLI, an MCP-connected coding agent, and VS Code.
 ### Turn Source into a Query in VS Code
 
 <p align="center">
-  <a href="https://brokkai.github.io/bifrost/rune-ir/">
+  <a href="https://bifrost.brokk.ai/rune-ir/">
     <img src="docs/src/assets/bifrost-vscode-query-playground.gif" alt="Selecting Python source in VS Code, inspecting its normalized Rune IR, using the generated starter RQL, and browsing the exact query result" width="900">
   </a>
 </p>
@@ -105,7 +105,7 @@ rename, symbols, hierarchy, diagnostics, completion, and other LSP features.
 ### Use the Same Analyzer from the CLI
 
 <p align="center">
-  <a href="https://brokkai.github.io/bifrost/cli/">
+  <a href="https://bifrost.brokk.ai/cli/">
     <img src="docs/src/assets/bifrost-cli-query.gif" alt="Running a saved RQL query with the Bifrost CLI and receiving an exact structured match" width="900">
   </a>
 </p>
@@ -117,13 +117,13 @@ MCP for shell scripts and reproducible analysis workflows.
 
 Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python,
 Ruby, Rust, Scala, and TypeScript. See the [capability
-matrix](https://brokkai.github.io/bifrost/capabilities/) for the supported
+matrix](https://bifrost.brokk.ai/capabilities/) for the supported
 analysis and precision boundaries in each language.
 
 ## Documentation
 
 The public documentation site lives in [`docs/`](docs/) and is published at
-[brokkai.github.io/bifrost](https://brokkai.github.io/bifrost/).
+[bifrost.brokk.ai](https://bifrost.brokk.ai/).
 
 Useful starting points:
 
@@ -153,7 +153,7 @@ builds publish both the latest docs site and a versioned snapshot under
 Bifrost is licensed under `LGPL-3.0-or-later` and may be used in research,
 internal systems, hosted services, and commercial products. The integration and
 distribution boundary determines your obligations. Read [License and Use
-Cases](https://brokkai.github.io/bifrost/license-use-cases/) for practical
+Cases](https://bifrost.brokk.ai/license-use-cases/) for practical
 subprocess, linked-library, hosted-service, and redistribution examples. That
 guide is an orientation, not legal advice; the [license text](LICENSE.md)
 controls.

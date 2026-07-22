@@ -40,6 +40,7 @@ pub(super) struct PreparedCSharpFile {
     tree: Tree,
     line_starts: Vec<usize>,
     class_ranges: ClassRangeIndex,
+    using_aliases: HashMap<String, String>,
 }
 
 pub(super) fn prepare_file(
@@ -66,11 +67,13 @@ pub(super) fn prepare_file(
     let tree = parser.parse(source.as_str(), None)?;
     let line_starts = compute_line_starts(&source);
     let class_ranges = ClassRangeIndex::build(csharp, file);
+    let using_aliases = csharp.using_aliases_of(file);
     Some(PreparedCSharpFile {
         source,
         tree,
         line_starts,
         class_ranges,
+        using_aliases,
     })
 }
 
@@ -101,6 +104,7 @@ pub(super) fn scan_prepared_file(
         nearest_member_target_cache: HashMap::default(),
         extension_target_cache: HashMap::default(),
         class_ranges: prepared.class_ranges.clone(),
+        using_aliases: &prepared.using_aliases,
     };
     scan_node(prepared.tree.root_node(), &mut ctx);
 }
@@ -121,6 +125,7 @@ pub(super) struct ScanCtx<'a> {
         HashMap<(String, Option<usize>, Option<usize>), TargetMemberResolution>,
     extension_target_cache: HashMap<ExtensionTargetCacheKey, TargetMemberResolution>,
     pub(super) class_ranges: ClassRangeIndex,
+    using_aliases: &'a HashMap<String, String>,
 }
 
 type ExtensionTargetCacheKey = (Vec<String>, usize, Option<usize>, usize, usize);
@@ -201,10 +206,7 @@ fn scan_structured_type_candidate(
     let raw_name = normalize_type_text(node_text(terminal, ctx.source));
     if filter_by_target_name
         && raw_name != ctx.spec.member_name
-        && !ctx
-            .csharp
-            .using_aliases_of(ctx.file)
-            .contains_key(&raw_name)
+        && !ctx.using_aliases.contains_key(&raw_name)
     {
         return false;
     }
@@ -314,8 +316,8 @@ fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         || target_name
             .strip_suffix("Attribute")
             .is_some_and(|stem| stem == terminal);
-    let aliases = ctx.csharp.using_aliases_of(ctx.file);
-    let alias = aliases.contains_key(raw_terminal) || aliases.contains_key(terminal);
+    let alias =
+        ctx.using_aliases.contains_key(raw_terminal) || ctx.using_aliases.contains_key(terminal);
     if !exact_or_shorthand && !alias {
         return;
     }
