@@ -496,6 +496,20 @@ impl ScalaQueryTargetCatalog {
                 .unwrap_or_default(),
         }
     }
+
+    fn relevant_names(&self) -> HashSet<String> {
+        self.specs
+            .iter()
+            .flat_map(|spec| {
+                [
+                    Some(spec.member_name.clone()),
+                    spec.owner_name.clone(),
+                    Some(spec.target.identifier().to_string()),
+                ]
+            })
+            .flatten()
+            .collect()
+    }
 }
 
 fn exact_descendants_including_self(
@@ -541,6 +555,8 @@ struct ScalaQueryHitSink<'a> {
     hits: &'a mut [BTreeSet<UsageHit>],
     observed_hits: &'a mut BTreeSet<UsageHit>,
     enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
+    relevant_names: HashSet<String>,
+    allow_all_names: bool,
     max_usages: usize,
     limit_exceeded: bool,
 }
@@ -610,6 +626,19 @@ impl ScalaQueryHitSink<'_> {
 }
 
 impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
+    fn may_match_name(&self, name: &str) -> bool {
+        self.allow_all_names || self.relevant_names.contains(name)
+    }
+
+    fn register_imports(&mut self, imports: &[crate::analyzer::ImportInfo]) {
+        for import in imports {
+            self.allow_all_names |= import.is_wildcard;
+            if let Some(identifier) = import.identifier.as_deref() {
+                self.relevant_names.insert(identifier.to_string());
+            }
+        }
+    }
+
     fn record(
         &mut self,
         target: ScalaResolvedReference,
@@ -744,6 +773,7 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                     .explicit_imports
                     .get(&scala_normalized_fq_name(&candidate))
                 {
+                    self.relevant_names.insert(name.to_string());
                     matches.extend(target_ids.iter().copied());
                 }
             }
@@ -865,6 +895,8 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
                 hits: &mut hits,
                 observed_hits: &mut observed_hits,
                 enclosing_cache: HashMap::default(),
+                relevant_names: catalog.relevant_names(),
+                allow_all_names: false,
                 max_usages,
                 limit_exceeded: false,
             };
