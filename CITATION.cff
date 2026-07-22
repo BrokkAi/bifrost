@@ -13,7 +13,7 @@ version: "0.8.5"
 date-released: "2026-07-20"
 repository-code: "https://github.com/BrokkAi/bifrost"
 repository-artifact: "https://github.com/BrokkAi/bifrost/releases"
-url: "https://brokkai.github.io/bifrost/"
+url: "https://bifrost.brokk.ai/"
 license: LGPL-3.0-or-later
 keywords:
   - static analysis

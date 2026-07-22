@@ -37,7 +37,7 @@ that matches the thing you are looking for.
   `references_of`, `used_by`, or `uses` when a structural seed should continue
   through exact indexed symbol identities; use `scan_usages_by_location` for a
   location-first lookup or `usage_graph` for the narrower whole-workspace graph. The schema reference
-  is https://brokkai.github.io/bifrost/code-query-json/.
+  is https://bifrost.brokk.ai/code-query-json/.
 - Use `find_filenames` for path globs, basename searches, and repository file
   discovery.
 - Use `list_files` when you need a bounded directory listing that respects the

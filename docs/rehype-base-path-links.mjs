@@ -23,8 +23,8 @@ function prefixBasePath(value, base) {
  * Make root-relative links in Markdown and MDX respect Astro's deployment base.
  *
  * Authors can use stable site-root URLs such as `/install/`. Local development
- * keeps `/` as its base, while production and versioned builds transparently
- * emit `/bifrost/...` or `/bifrost/versions/<tag>/...` URLs.
+ * keeps `/` as its base, while versioned builds transparently emit
+ * `/versions/<tag>/...` URLs.
  */
 export default function rehypeBasePathLinks(options = {}) {
   const base = normalizeBase(options.base);
