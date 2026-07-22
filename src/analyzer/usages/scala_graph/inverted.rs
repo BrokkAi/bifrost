@@ -1207,6 +1207,7 @@ impl ProjectTypes {
                 .get(&(range.start_byte, range.end_byte))
                 && let Some(field_type) =
                     self.resolve_type_in_declaration_context(scala, &resolver, path)
+                && let Some(field_type) = self.canonical_receiver_type(scala, &field_type)
             {
                 resolved.insert(field_type);
             }
@@ -1218,7 +1219,66 @@ impl ProjectTypes {
         }
         self.facts
             .fact_for_declaration(declaration)
-            .and_then(|facts| facts.return_type_fqn.clone())
+            .and_then(|facts| facts.return_type_fqn.as_deref())
+            .and_then(|field_type| self.canonical_receiver_type(scala, field_type))
+    }
+
+    fn canonical_receiver_type(
+        &self,
+        scala: &ScalaAnalyzer,
+        receiver_type: &str,
+    ) -> Option<String> {
+        let mut current = receiver_type.to_string();
+        let mut seen = HashSet::default();
+        while seen.insert(current.clone()) {
+            let declarations = self.index.by_fqn(&current);
+            let aliases = declarations
+                .iter()
+                .filter(|unit| self.is_type_alias(scala, unit))
+                .collect::<Vec<_>>();
+            if aliases.is_empty() {
+                return Some(current);
+            }
+            if declarations
+                .iter()
+                .any(|unit| unit.is_class() && !self.is_type_alias(scala, unit))
+            {
+                return None;
+            }
+            let underlying = aliases
+                .into_iter()
+                .filter_map(|alias| self.type_alias_underlying_type(scala, alias))
+                .collect::<HashSet<_>>();
+            if underlying.len() != 1 {
+                return None;
+            }
+            current = underlying.into_iter().next().expect("one alias target");
+        }
+        None
+    }
+
+    fn type_alias_underlying_type(
+        &self,
+        scala: &ScalaAnalyzer,
+        alias: &CodeUnit,
+    ) -> Option<String> {
+        let source_facts = self.source_facts_for_file(scala, alias.source());
+        let resolver = NameResolver::for_file_types(scala, alias, self);
+        let resolved = self
+            .declaration_ranges_for(scala, alias)
+            .into_iter()
+            .filter_map(|range| {
+                source_facts
+                    .type_alias_paths_by_range
+                    .get(&(range.start_byte, range.end_byte))
+                    .and_then(|path| {
+                        self.resolve_type_in_declaration_context(scala, &resolver, path)
+                    })
+            })
+            .collect::<HashSet<_>>();
+        (resolved.len() == 1)
+            .then(|| resolved.into_iter().next())
+            .flatten()
     }
 
     pub(super) fn is_scala_trait_declaration(
@@ -9273,7 +9333,19 @@ fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
         .map(|target| target.fq_name())
 }
 
+fn unwrap_single_scala_expression(mut node: Node<'_>) -> Node<'_> {
+    while matches!(node.kind(), "block" | "block_expression" | "indented_block")
+        && node.named_child_count() == 1
+    {
+        node = node
+            .named_child(0)
+            .expect("a block with one named child has that child");
+    }
+    node
+}
+
 fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<ScalaValueOwner> {
+    let node = unwrap_single_scala_expression(node);
     constructed_type(node, ctx)
         .map(ScalaValueOwner::Logical)
         .or_else(|| {
@@ -9316,6 +9388,7 @@ fn call_result_type(
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
+    let node = unwrap_single_scala_expression(node);
     if node.kind() != "call_expression" {
         return None;
     }
@@ -9472,7 +9545,7 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
     if path.is_empty() {
         return None;
     }
-    if path.len() > 1
+    let resolved = if path.len() > 1
         && let Some(root) = path
             .first()
             .and_then(|root| ctx.lexically_visible_object_unit(type_node.start_byte(), root))
@@ -9482,25 +9555,24 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
             &path,
             false,
             Some(root),
-        )
-    {
-        return Some(declaration.fq_name());
-    }
-    match ctx.exact_lexically_visible_type(type_node) {
-        ScalaTypeNamespaceResolution::Resolved(declaration) => {
-            return Some(declaration.fq_name());
+        ) {
+        Some(declaration.fq_name())
+    } else {
+        match ctx.exact_lexically_visible_type(type_node) {
+            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous => return None,
+            ScalaTypeNamespaceResolution::NoMatch => ctx
+                .types
+                .resolve_type_in_declaration_context(ctx.scala, &ctx.resolver, &path)
+                .or_else(|| {
+                    (path.len() == 1)
+                        .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
+                        .flatten()
+                }),
         }
-        ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous => return None,
-        ScalaTypeNamespaceResolution::NoMatch => {}
-    }
-    ctx.types
-        .resolve_type_in_declaration_context(ctx.scala, &ctx.resolver, &path)
-        .or_else(|| {
-            (path.len() == 1)
-                .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
-                .flatten()
-        })
+    }?;
+    ctx.types.canonical_receiver_type(ctx.scala, &resolved)
 }
 
 fn resolve_receiver_type_declaration_node(
@@ -9509,7 +9581,7 @@ fn resolve_receiver_type_declaration_node(
 ) -> Option<CodeUnit> {
     let type_node = scala_capture_underlying_type(type_node, ctx.source);
     let path = scala_type_lookup_segments(type_node, ctx.source);
-    if path.len() > 1
+    let declaration = if path.len() > 1
         && let Some(root) = path
             .first()
             .and_then(|root| ctx.lexically_visible_object_unit(type_node.start_byte(), root))
@@ -9519,11 +9591,30 @@ fn resolve_receiver_type_declaration_node(
             &path,
             false,
             Some(root),
-        )
-    {
+        ) {
+        declaration
+    } else {
+        match ctx.exact_lexically_visible_type(type_node) {
+            ScalaTypeNamespaceResolution::Resolved(declaration) => declaration,
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous
+            | ScalaTypeNamespaceResolution::NoMatch => return None,
+        }
+    };
+    if !ctx.types.is_type_alias(ctx.scala, &declaration) {
         return Some(declaration);
     }
-    match ctx.exact_lexically_visible_type(type_node) {
+    let receiver_type = ctx
+        .types
+        .canonical_receiver_type(ctx.scala, &declaration.fq_name())?;
+    let owner_context = ctx
+        .scala
+        .structural_parent_of(&declaration)
+        .unwrap_or_else(|| declaration.clone());
+    match ctx
+        .types
+        .exact_type_declaration_for_owner_context(&receiver_type, &owner_context)
+    {
         ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
         ScalaTypeNamespaceResolution::AuthoritativeMiss
         | ScalaTypeNamespaceResolution::Ambiguous

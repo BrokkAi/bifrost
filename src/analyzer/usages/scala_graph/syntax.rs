@@ -10,6 +10,7 @@ pub(crate) struct ScalaSourceFacts {
     pub(crate) callable_alternatives_by_range:
         HashMap<(usize, usize), ScalaCallableSourceAlternative>,
     pub(crate) field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
+    pub(crate) type_alias_paths_by_range: HashMap<(usize, usize), Vec<String>>,
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
     pub(crate) enum_ranges: HashSet<(usize, usize)>,
     pub(crate) case_class_ranges: HashSet<(usize, usize)>,
@@ -227,6 +228,17 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                 {
                     facts
                         .field_type_paths_by_range
+                        .insert((node.start_byte(), node.end_byte()), path);
+                }
+            }
+            "type_definition" => {
+                if let Some(path) = node
+                    .child_by_field_name("type")
+                    .map(|type_node| scala_type_lookup_segments(type_node, source))
+                    .filter(|segments| !segments.is_empty())
+                {
+                    facts
+                        .type_alias_paths_by_range
                         .insert((node.start_byte(), node.end_byte()), path);
                 }
             }

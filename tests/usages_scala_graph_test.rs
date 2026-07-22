@@ -6932,6 +6932,224 @@ class Other {
 }
 
 #[test]
+fn scala_constructor_inferred_receivers_keep_fields_and_inherited_members_in_nested_scopes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Receivers.scala",
+            r#"package model
+
+case class QuickItem(id: String, label: String)
+
+class ReportBuilder(path: String, line: Int, enabled: Boolean) {
+  def setResult(value: Int): Int = value
+}
+
+class Batch(seed: Int, enabled: Boolean) {
+  val rebuildIndex: List[Int] => Int = _.sum
+}
+
+abstract class Access[Reporter, Compiler](seed: Int) {
+  def interrupt[B](default: B, token: Int)(run: Compiler => B)(implicit reporter: Reporter): B =
+    default
+}
+final class ConcreteAccess(seed: Int) extends Access[String, String](seed)
+
+abstract class Scanner[A] {
+  def scan(value: A, state: Null): Unit = ()
+}
+
+class OtherReportBuilder {
+  def setResult(value: Int): Int = value + 1
+}
+class OtherBatch {
+  val rebuildIndex: List[Int] => Int = _ => -1
+}
+abstract class OtherAccess[A] {
+  def interrupt[B](default: B, token: Int)(run: A => B)(implicit reporter: String): B =
+    run(null.asInstanceOf[A])
+}
+final class OtherConcreteAccess extends OtherAccess[String]
+abstract class OtherScanner[A] {
+  def scan(value: A, state: Null): Unit = ()
+}
+final class OtherConcreteScanner extends OtherScanner[String]
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+
+import model.*
+
+class NewProjectProvider {
+  def run(seed: Int): Int = {
+    val parentDir =
+      QuickItem(id = "..", label = "parent")
+    val reportBuilder =
+      new ReportBuilder("path", seed, enabled = true)
+    Option(seed).map {
+      case value if value >= 0 =>
+        reportBuilder.setResult(value) + parentDir.id.length // positive-local-members
+      case _ => 0
+    }.getOrElse(0)
+  }
+}
+
+abstract class Service {
+  val buildTargetClasses = new Batch(1, enabled = true)
+
+  def focus(seed: Int): Unit = {
+    Option(seed).foreach { platform =>
+      buildTargetClasses.rebuildIndex(List(platform)) // positive-applied-field
+    }
+  }
+}
+
+case class Presentation(seed: Int) {
+  implicit val reporter: String = "reporter"
+  val compilerAccess = new ConcreteAccess(seed)
+
+  def hints(token: Int): Int =
+    compilerAccess.interrupt(0, token)(_.length) // positive-inherited-access
+}
+
+class Provider {
+  private class ConcreteScanner(seed: Int) extends Scanner[String]
+
+  def find(seed: Int): Unit = {
+    val scanner = new ConcreteScanner(seed)
+    scanner.scan("value", null) // positive-inherited-scanner
+  }
+}
+
+class Unrelated {
+  implicit val reporter: String = "reporter"
+
+  def run(seed: Int): Unit = {
+    val reportBuilder = new OtherReportBuilder
+    val buildTargetClasses = new OtherBatch
+    val compilerAccess = new OtherConcreteAccess
+    val scanner = new OtherConcreteScanner
+    reportBuilder.setResult(seed) // negative-other-report
+    buildTargetClasses.rebuildIndex(List(seed)) // negative-other-field
+    compilerAccess.interrupt(seed, 0)(_.length) // negative-other-access
+    scanner.scan("value", null) // negative-other-scanner
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("model.QuickItem.id", "positive-local-members"),
+        ("model.ReportBuilder.setResult", "positive-local-members"),
+        ("model.Batch.rebuildIndex", "positive-applied-field"),
+        ("model.Access.interrupt", "positive-inherited-access"),
+        ("model.Scanner.scan", "positive-inherited-scanner"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-other-");
+    }
+}
+
+#[test]
+fn scala_declared_alias_receivers_and_unqualified_parameterless_values_resolve_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Schedule.scala",
+            r#"package model
+
+trait Schedule[A] {
+  type State
+  def whileOutput(predicate: A => Boolean): Schedule[A] = this
+  def addDelay(delay: A => Int): Schedule[A] = this
+}
+
+object Schedule {
+  type WithState[S, A] = Schedule[A] { type State = S }
+
+  val elapsed: Schedule.WithState[Int, Int] = new Schedule[Int] { type State = Int }
+  val forever: Schedule.WithState[Long, Int] = new Schedule[Int] { type State = Long }
+
+  def during(limit: Int): Schedule[Int] =
+    elapsed.whileOutput(_ < limit) // positive-declared-alias-while
+
+  def spaced(delay: Int): Schedule[Int] =
+    forever.addDelay(_ => delay) // positive-declared-alias-delay
+}
+
+trait OtherSchedule[A] {
+  def whileOutput(predicate: A => Boolean): OtherSchedule[A] = this
+  def addDelay(delay: A => Int): OtherSchedule[A] = this
+}
+object OtherSchedule {
+  val elapsed: OtherSchedule[Int] = new OtherSchedule[Int] {}
+  val forever: OtherSchedule[Int] = new OtherSchedule[Int] {}
+  val a = elapsed.whileOutput(_ > 0) // negative-other-while
+  val b = forever.addDelay(_ => 1) // negative-other-delay
+}
+"#,
+        ),
+        (
+            "model/RandomApi.scala",
+            r#"package model
+
+trait RandomApi {
+  def nextDouble: Double
+  def nextFloat: Float
+}
+
+object RandomApi {
+  private final case class Live(seed: Int) extends RandomApi {
+    override def nextDouble: Double = 0.5
+    override def nextFloat: Float = 0.25f
+
+    def betweenDouble(min: Double, max: Double): Double =
+      betweenDoubleWith(min, max)(nextDouble) // positive-next-double-value
+
+    def betweenFloat(min: Float, max: Float): Float =
+      betweenFloatWith(min, max)(nextFloat) // positive-next-float-value
+  }
+
+  private def betweenDoubleWith(min: Double, max: Double)(next: Double): Double = next
+  private def betweenFloatWith(min: Float, max: Float)(next: Float): Float = next
+
+  final class Other extends RandomApi {
+    override def nextDouble: Double = 1.0
+    override def nextFloat: Float = 1.0f
+    def useDouble(value: Double => Double): Double = value(nextDouble) // negative-other-double
+    def useFloat(value: Float => Float): Float = value(nextFloat) // negative-other-float
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        (
+            "model.RandomApi$.Live.nextDouble",
+            "positive-next-double-value",
+        ),
+        (
+            "model.RandomApi$.Live.nextFloat",
+            "positive-next-float-value",
+        ),
+        (
+            "model.Schedule.whileOutput",
+            "positive-declared-alias-while",
+        ),
+        ("model.Schedule.addDelay", "positive-declared-alias-delay"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-other-");
+    }
+}
+
+#[test]
 fn scala_graph_respects_local_shadowing() {
     let consumer_source = r#"
 package app
