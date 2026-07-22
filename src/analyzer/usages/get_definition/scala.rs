@@ -5809,6 +5809,17 @@ fn scala_exact_lexical_type_namespace(
             owners.push(unit);
         }
     }
+    if segments.len() == 1
+        && let Some(owner) = owners.iter().find(|owner| {
+            !owner.short_name().ends_with('$') && owner.identifier() == root_name.as_str()
+        })
+    {
+        // An enclosing class introduces its own exact type name before any
+        // inherited type members. Resolve that parser-proven identity without
+        // traversing incomplete ancestors (for example an unindexed
+        // `Serializable` mixin), which cannot make the self type ambiguous.
+        return ScalaTypeNamespaceResolution::Resolved(owner.clone());
+    }
     if segments.len() > 1 {
         for owner in owners {
             let mut candidates =
