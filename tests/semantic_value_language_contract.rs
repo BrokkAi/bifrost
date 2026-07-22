@@ -2265,13 +2265,13 @@ class Sample {
 fn nested_lexical_callables_relay_receiver_captures() {
     const TYPESCRIPT: &str = r#"
 class Capture {
-    nestedCapture() { return () => () => this; }
+    nestedCapture() { return () => { return () => this; }; }
 }
 "#;
     const JAVA: &str = r#"
 class Capture {
     java.util.function.Supplier<java.util.function.Supplier<Object>> nestedCapture() {
-        return () -> () -> this;
+        return () -> { return () -> this; };
     }
 }
 "#;
@@ -2285,6 +2285,142 @@ class Capture {
 
     assert_nested_receiver_capture_relay(&typescript);
     assert_nested_receiver_capture_relay(&java);
+}
+
+#[test]
+fn nested_type_execution_does_not_leak_receiver_or_local_facts() {
+    const TYPESCRIPT: &str = r#"
+class Boundary {
+    key = "computed";
+    Base = class {};
+    nestedType() {
+        return () => class Nested {
+            field = this;
+            static { var hidden = this; }
+        };
+    }
+    heritage() {
+        return () => class Nested extends this.Base {
+            field = this;
+        };
+    }
+    computedMethodName() {
+        return () => class Nested {
+            [this.key]() {}
+        };
+    }
+}
+"#;
+    const JAVASCRIPT: &str = r#"
+class Boundary {
+    key = "computed";
+    Base = class {};
+    nestedType() {
+        return () => class Nested {
+            field = this;
+            static { var hidden = this; }
+        };
+    }
+    heritage() {
+        return () => class Nested extends this.Base {
+            field = this;
+        };
+    }
+    computedMethodName() {
+        return () => class Nested {
+            [this.key]() {}
+        };
+    }
+}
+"#;
+    const JAVA: &str = r#"
+class Boundary {
+    java.util.function.Supplier<Object> nestedType() {
+        return () -> new Object() {
+            Object hidden = this;
+        };
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("nested/Boundary.ts", TYPESCRIPT)
+        .file("nested/Boundary.js", JAVASCRIPT)
+        .file("nested/Boundary.java", JAVA)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let typescript = SemanticGraph::materialize(&project, &analyzer, "nested/Boundary.ts");
+    let javascript = SemanticGraph::materialize(&project, &analyzer, "nested/Boundary.js");
+    let java = SemanticGraph::materialize(&project, &analyzer, "nested/Boundary.java");
+
+    for (graph, source) in [
+        (&typescript, TYPESCRIPT),
+        (&javascript, JAVASCRIPT),
+        (&java, JAVA),
+    ] {
+        let method = procedure_named(graph, "nestedType", ProcedureKind::Method);
+        assert!(
+            method.captures().is_empty(),
+            "a nested type's receiver must not create an outer capture binding"
+        );
+        let lambda = graph
+            .artifact()
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == ProcedureKind::Lambda
+                    && procedure.lexical_parent() == Some(method.id())
+            })
+            .expect("nestedType lambda");
+        assert!(
+            lambda
+                .memory_locations()
+                .iter()
+                .all(|location| !matches!(location.kind, MemoryLocationKind::Capture { .. })),
+            "a lambda that only constructs a nested type must not capture the outer receiver"
+        );
+        assert!(
+            lambda.values().iter().all(|value| {
+                value.kind != SemanticValueKind::Local
+                    || mapped_source(lambda, source, value.source) != "hidden"
+            }),
+            "nested type locals must not be indexed in the enclosing lambda"
+        );
+    }
+
+    assert!(
+        java.artifact().procedures().iter().any(|procedure| {
+            procedure.kind() == ProcedureKind::Initializer
+                && procedure
+                    .values()
+                    .iter()
+                    .any(|value| value.kind == SemanticValueKind::Receiver)
+        }),
+        "the anonymous Java field initializer must own its receiver"
+    );
+    for (graph, source) in [(&typescript, TYPESCRIPT), (&javascript, JAVASCRIPT)] {
+        assert!(
+            graph.artifact().procedures().iter().any(|procedure| {
+                procedure.kind() == ProcedureKind::Initializer
+                    && procedure.values().iter().any(|value| {
+                        value.kind == SemanticValueKind::Local
+                            && mapped_source(procedure, source, value.source) == "hidden"
+                    })
+            }),
+            "the JS/TS class static initializer must own its var-scoped local"
+        );
+        assert!(
+            !procedure_named(graph, "heritage", ProcedureKind::Method)
+                .captures()
+                .is_empty(),
+            "class heritage expressions must retain the enclosing lexical receiver"
+        );
+        assert!(
+            !procedure_named(graph, "computedMethodName", ProcedureKind::Method)
+                .captures()
+                .is_empty(),
+            "computed method names must retain the enclosing lexical receiver"
+        );
+    }
 }
 
 #[test]

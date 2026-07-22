@@ -32,6 +32,52 @@ pub(crate) enum ProcedureLoweringError {
     Invalid(String),
 }
 
+/// Marker returned when shared adapter preparation observes cooperative
+/// cancellation before procedure lowering starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoweringCancelled;
+
+/// Minimal adapter-owned view needed to relay lexical receiver demand through
+/// nested lambdas without coupling shared lowering to language syntax.
+pub(crate) trait ReceiverCaptureSpec {
+    fn lexical_parent(&self) -> Option<ProcedureId>;
+    fn relays_receiver_capture(&self) -> bool;
+    fn captures_receiver(&self) -> bool;
+    fn require_receiver_capture(&mut self);
+}
+
+/// Propagate receiver demand from lexical children to their immediate lambda
+/// parents in one reverse pass.
+///
+/// Procedure enumeration publishes dense IDs in parent-before-child order.
+/// Walking that order backwards means a demand copied to one parent is seen
+/// when that parent is visited, so even deeply nested chains remain linear.
+pub(crate) fn relay_receiver_capture_demand<T: ReceiverCaptureSpec>(
+    specs: &mut [T],
+    cancellation: &CancellationToken,
+) -> Result<(), LoweringCancelled> {
+    for index in (0..specs.len()).rev() {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        if !specs[index].captures_receiver() {
+            continue;
+        }
+        let Some(parent) = specs[index].lexical_parent() else {
+            continue;
+        };
+        let parent_index = parent.index();
+        assert!(
+            parent_index < index,
+            "lexical parent {parent} must precede child procedure index {index}"
+        );
+        if specs[parent_index].relays_receiver_capture() {
+            specs[parent_index].require_receiver_capture();
+        }
+    }
+    Ok(())
+}
+
 impl From<SemanticBudgetExceeded> for ProcedureLoweringError {
     fn from(error: SemanticBudgetExceeded) -> Self {
         Self::Budget(error, Box::default())
@@ -836,6 +882,82 @@ mod tests {
             SourceMappingId::new(0),
             EvidenceId::new(0),
         )
+    }
+
+    #[derive(Clone, Copy)]
+    struct CaptureSpec {
+        parent: Option<ProcedureId>,
+        relays_receiver_capture: bool,
+        captures_receiver: bool,
+    }
+
+    impl ReceiverCaptureSpec for CaptureSpec {
+        fn lexical_parent(&self) -> Option<ProcedureId> {
+            self.parent
+        }
+
+        fn relays_receiver_capture(&self) -> bool {
+            self.relays_receiver_capture
+        }
+
+        fn captures_receiver(&self) -> bool {
+            self.captures_receiver
+        }
+
+        fn require_receiver_capture(&mut self) {
+            self.captures_receiver = true;
+        }
+    }
+
+    fn nested_capture_specs(depth: usize) -> Vec<CaptureSpec> {
+        (0..depth)
+            .map(|index| CaptureSpec {
+                parent: (index > 0).then(|| {
+                    ProcedureId::try_from_index(index - 1).expect("small test procedure ID")
+                }),
+                relays_receiver_capture: true,
+                captures_receiver: index + 1 == depth,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn receiver_capture_demand_relays_in_one_cancellable_reverse_pass() {
+        const DEPTH: usize = 128;
+        let mut specs = nested_capture_specs(DEPTH);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(DEPTH + 2);
+
+        relay_receiver_capture_demand(&mut specs, &cancellation)
+            .expect("one cancellation check per procedure must complete");
+
+        assert!(specs.iter().all(|spec| spec.captures_receiver));
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn receiver_capture_demand_stops_when_cancelled() {
+        let mut specs = nested_capture_specs(128);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(4);
+
+        assert_eq!(
+            relay_receiver_capture_demand(&mut specs, &cancellation),
+            Err(LoweringCancelled)
+        );
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn receiver_capture_demand_stops_at_non_relaying_parent() {
+        let mut specs = nested_capture_specs(4);
+        specs[2].relays_receiver_capture = false;
+
+        relay_receiver_capture_demand(&mut specs, &CancellationToken::default())
+            .expect("uncancelled relay must complete");
+
+        assert!(!specs[0].captures_receiver);
+        assert!(!specs[1].captures_receiver);
+        assert!(!specs[2].captures_receiver);
+        assert!(specs[3].captures_receiver);
     }
 
     #[test]

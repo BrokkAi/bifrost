@@ -14,12 +14,12 @@ use crate::analyzer::semantic::cfg::{
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
-    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder, walk_named_tree_preorder,
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v4";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v5";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -64,8 +64,19 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                 });
             }
         };
-        relay_receiver_capture_demand(&mut specs);
+        if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
         for index in 0..specs.len() {
+            if cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: SemanticWork::default(),
+                });
+            }
             let can_capture_receiver = specs[index]
                 .lexical_parent
                 .and_then(|parent| specs.get(parent.index()))
@@ -166,27 +177,28 @@ struct ProcedureSpec<'tree> {
     captures_receiver: bool,
 }
 
+impl ReceiverCaptureSpec for ProcedureSpec<'_> {
+    fn lexical_parent(&self) -> Option<ProcedureId> {
+        self.lexical_parent
+    }
+
+    fn relays_receiver_capture(&self) -> bool {
+        self.kind == ProcedureKind::Lambda
+    }
+
+    fn captures_receiver(&self) -> bool {
+        self.captures_receiver
+    }
+
+    fn require_receiver_capture(&mut self) {
+        self.captures_receiver = true;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NestedProcedureTarget {
     id: ProcedureId,
     receiver_capture_destination: Option<MemoryLocationId>,
-}
-
-fn relay_receiver_capture_demand(specs: &mut [ProcedureSpec<'_>]) {
-    for index in 0..specs.len() {
-        if !specs[index].captures_receiver {
-            continue;
-        }
-        let mut lexical_parent = specs[index].lexical_parent;
-        while let Some(parent_id) = lexical_parent {
-            let parent = &mut specs[parent_id.index()];
-            if parent.kind != ProcedureKind::Lambda {
-                break;
-            }
-            parent.captures_receiver = true;
-            lexical_parent = parent.lexical_parent;
-        }
-    }
 }
 
 enum ProcedureEnumeration<'tree> {
@@ -291,6 +303,14 @@ fn enumerate_procedures<'tree>(
                 });
             }
             preflight = candidate;
+            let captures_receiver = if kind == ProcedureKind::Lambda {
+                match body_contains_free_this(body, cancellation) {
+                    Ok(captures_receiver) => captures_receiver,
+                    Err(LoweringCancelled) => return Ok(ProcedureEnumeration::Cancelled),
+                }
+            } else {
+                false
+            };
             specs.push(ProcedureSpec {
                 id,
                 callable: frame.node,
@@ -299,7 +319,7 @@ fn enumerate_procedures<'tree>(
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
-                captures_receiver: kind == ProcedureKind::Lambda && body_contains_free_this(body),
+                captures_receiver,
             });
             child_parent = Some(id);
             child_path = push_declaration_path(&mut declaration_paths, child_path, segment);
@@ -774,7 +794,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         body: Node<'tree>,
     ) -> Result<(), JavaLoweringError> {
         try_walk_named_tree_preorder(body, true, |node| {
-            if node.id() != body.id() && is_java_nested_declaration(node.kind()) {
+            if self.session.cancellation().is_cancelled() {
+                return Err(JavaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if is_java_nested_execution_boundary(node) {
                 return Ok(WalkControl::SkipChildren);
             }
             if node.kind() == "variable_declarator"
@@ -3457,9 +3482,9 @@ fn node_range(node: Node<'_>) -> Range {
     }
 }
 
-fn is_java_nested_declaration(kind: &str) -> bool {
+fn is_java_nested_execution_boundary(node: Node<'_>) -> bool {
     matches!(
-        kind,
+        node.kind(),
         "lambda_expression"
             | "method_declaration"
             | "constructor_declaration"
@@ -3469,22 +3494,29 @@ fn is_java_nested_declaration(kind: &str) -> bool {
             | "enum_declaration"
             | "record_declaration"
             | "annotation_type_declaration"
+            | "class_body"
     )
 }
 
-fn body_contains_free_this(body: Node<'_>) -> bool {
+fn body_contains_free_this(
+    body: Node<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, LoweringCancelled> {
     let mut found = false;
-    walk_named_tree_preorder(body, true, |node| {
+    try_walk_named_tree_preorder(body, true, |node| {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        if is_java_nested_execution_boundary(node) {
+            return Ok(WalkControl::SkipChildren);
+        }
         if node.kind() == "this" {
             found = true;
-            return WalkControl::Break;
+            return Ok(WalkControl::Break);
         }
-        if node.id() != body.id() && is_java_nested_declaration(node.kind()) {
-            return WalkControl::SkipChildren;
-        }
-        WalkControl::Continue
-    });
-    found
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
@@ -3502,7 +3534,7 @@ fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
         ) {
             return Some((parent.start_byte(), parent.end_byte()));
         }
-        if is_java_nested_declaration(parent.kind()) {
+        if is_java_nested_execution_boundary(parent) {
             return Some((parent.start_byte(), parent.end_byte()));
         }
         current = parent.parent();
@@ -3583,5 +3615,43 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Break => "break",
         CompletionKind::Continue => "continue",
         CompletionKind::Yield => "yield",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_this_scan_honors_cancellation() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar must load");
+        let tree = parser
+            .parse(
+                "class Example { Object value() { int first = 1; int second = 2; return this; } }",
+                None,
+            )
+            .expect("Java source must parse");
+        let mut body = None;
+        crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "block" {
+                    body = Some(node);
+                    WalkControl::Break
+                } else {
+                    WalkControl::Continue
+                }
+            },
+        );
+
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+        assert_eq!(
+            body_contains_free_this(body.expect("method body"), &cancellation),
+            Err(LoweringCancelled)
+        );
     }
 }
