@@ -2018,3 +2018,142 @@ fn anchored_selector_resolves_scala_nested_symbol_despite_global_namesake() {
         "{anchored}"
     );
 }
+
+// Assert a bare-name lookup on `tool` reports ambiguity for `target` with two
+// `path#` selectors and the recovery note. Returns the sorted match selectors.
+fn assert_bare_name_ambiguous(
+    project: &common::BuiltInlineTestProject,
+    tool: &str,
+    target: &str,
+) -> Vec<String> {
+    let field = if tool == "get_summaries" {
+        "targets"
+    } else {
+        "symbols"
+    };
+    let args = serde_json::json!({ field: [target] }).to_string();
+    let result = call_tool(project, tool, &args);
+    assert_eq!(
+        0,
+        result["not_found"].as_array().unwrap().len(),
+        "{tool}: {result}"
+    );
+    assert_eq!(
+        1,
+        result["ambiguous"].as_array().unwrap().len(),
+        "{tool}: {result}"
+    );
+    assert_eq!(target, result["ambiguous"][0]["target"], "{tool}: {result}");
+    let mut matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert_eq!(2, matches.len(), "{tool}: {result}");
+    assert!(
+        matches.iter().all(|selector| selector.contains('#')),
+        "every candidate must be a path# selector: {tool}: {result}"
+    );
+    let note = string_value(&result["ambiguous"][0]["note"]);
+    assert!(
+        note.contains("Ambiguous; re-call with one selector from `matches`"),
+        "{tool}: {result}"
+    );
+    matches.sort();
+    matches
+}
+
+// #1057: a bare terminal name whose only exact hit is a top-level namesake must
+// not silently win while a same-named member exists. Both symbol-source and
+// summary surfaces must report ambiguity with both file-anchored selectors.
+#[test]
+fn bare_name_with_toplevel_and_member_is_ambiguous_typescript() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "checker/cached-version.ts",
+            "export function getCachedVersion() {\n  return 1;\n}\n",
+        )
+        .file(
+            "hook.ts",
+            "export class AutoUpdateCheckerDeps {\n  getCachedVersion() {\n    return 2;\n  }\n}\n",
+        )
+        .file(
+            "unique.ts",
+            "export function computeUniqueThing() {\n  return 3;\n}\n",
+        )
+        .build();
+
+    for tool in ["get_symbol_sources", "get_summaries"] {
+        let matches = assert_bare_name_ambiguous(&project, tool, "getCachedVersion");
+        assert!(
+            matches
+                .iter()
+                .any(|selector| selector.contains("checker/cached-version.ts")),
+            "{tool}: {matches:?}"
+        );
+        assert!(
+            matches.iter().any(|selector| selector.contains("hook.ts")),
+            "{tool}: {matches:?}"
+        );
+    }
+
+    // A uniquely-named symbol still resolves cleanly (no over-triggering).
+    let unique = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["computeUniqueThing"]}"#,
+    );
+    assert_eq!(0, unique["ambiguous"].as_array().unwrap().len(), "{unique}");
+    assert_eq!(0, unique["not_found"].as_array().unwrap().len(), "{unique}");
+    assert_eq!(1, unique["sources"].as_array().unwrap().len(), "{unique}");
+}
+
+// The same collision spanning two languages must be reported through the
+// `MultiAnalyzer` merge of `lookup_candidates_by_identifier`. JavaScript and
+// TypeScript are distinct delegates, so a `.js` + `.ts` project genuinely
+// exercises the cross-delegate merge; both are module-scoped, so both render
+// file-anchored `path#` selectors.
+#[test]
+fn bare_name_with_toplevel_and_member_is_ambiguous_across_languages() {
+    let project = InlineTestProject::new()
+        .file(
+            "legacy.js",
+            "export function getCachedVersion() {\n  return 1;\n}\n",
+        )
+        .file(
+            "hook.ts",
+            "export class AutoUpdateCheckerDeps {\n  getCachedVersion() {\n    return 2;\n  }\n}\n",
+        )
+        .file(
+            "unique.ts",
+            "export function computeUniqueThing() {\n  return 3;\n}\n",
+        )
+        .build();
+
+    // Sanity: this project spans two distinct analyzer delegates, so the
+    // MultiAnalyzer merge of the new identifier lookup is what produces the set.
+    assert!(
+        project.languages().contains(&Language::JavaScript)
+            && project.languages().contains(&Language::TypeScript),
+        "{:?}",
+        project.languages()
+    );
+
+    for tool in ["get_symbol_sources", "get_summaries"] {
+        let matches = assert_bare_name_ambiguous(&project, tool, "getCachedVersion");
+        assert!(
+            matches
+                .iter()
+                .any(|selector| selector.contains("legacy.js")),
+            "{tool}: {matches:?}"
+        );
+        assert!(
+            matches.iter().any(|selector| selector.contains("hook.ts")),
+            "{tool}: {matches:?}"
+        );
+    }
+
+    let unique = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["computeUniqueThing"]}"#,
+    );
+    assert_eq!(0, unique["ambiguous"].as_array().unwrap().len(), "{unique}");
+    assert_eq!(1, unique["sources"].as_array().unwrap().len(), "{unique}");
+}

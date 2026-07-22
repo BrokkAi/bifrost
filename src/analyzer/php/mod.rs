@@ -520,6 +520,10 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_declarations_by_identifier(identifier)
+    }
+
     fn search_symbol_candidates(
         &self,
         pattern: &str,

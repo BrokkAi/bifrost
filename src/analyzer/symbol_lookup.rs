@@ -97,6 +97,21 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
         return CodeUnitResolution::NotFound;
     }
 
+    // Bare (single-segment) queries must see same-named members. Otherwise
+    // stage 1 (exact) silently returns a lone top-level namesake the instant it
+    // finds one, hiding same-terminal-name members and never reaching the
+    // one-vs-many ambiguity decision (#1057). Gather the union of the exact
+    // top-level hits and the identifier-indexed members, then let
+    // `resolution_from_matches` decide Resolved (one distinct declaration) vs
+    // Ambiguous (several) with the same fq-keying and type/constructor
+    // preference used by the later stages. Non-bare (qualified/anchored)
+    // queries are untouched: they already reach members via the suffix stages.
+    if let Some(leaf) = bare_query_leaf(analyzer, trimmed)
+        && let Some(resolved) = bare_name_resolution(analyzer, trimmed, &leaf, include)
+    {
+        return resolved;
+    }
+
     if let Some(resolved) = exact_resolution(analyzer, trimmed, include) {
         return resolved;
     }
@@ -151,6 +166,69 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     resolution_from_matches(analyzer, full_matches, include)
         .or_else(|| resolution_from_matches(analyzer, suffix_matches, include))
         .unwrap_or(CodeUnitResolution::NotFound)
+}
+
+/// Whether `input` is a bare (single-segment) terminal name in every language
+/// in play — the queries that must see same-named members instead of silently
+/// resolving a lone top-level namesake (#1057). Exposed so the `get_symbol_sources`
+/// surface, which otherwise short-circuits on an exact fully-qualified hit, can
+/// route bare names through the member-aware fuzzy resolver while keeping
+/// qualified names on their exact-first path.
+pub(crate) fn is_bare_symbol_query(analyzer: &dyn IAnalyzer, input: &str) -> bool {
+    let trimmed = input.trim();
+    !trimmed.is_empty() && bare_query_leaf(analyzer, trimmed).is_some()
+}
+
+/// A query is "bare" when, for every language in play, all of its structured
+/// interpretations are a single terminal segment (no `.`/`::`/`/`/`+`
+/// structure). Returns that shared terminal leaf so the caller can gather
+/// same-named members from the identifier index; returns `None` (fall through
+/// to the normal staged resolution) for qualified queries or when the
+/// languages disagree on the leaf. Derived entirely from the existing
+/// structured interpretation helpers — no string hand-parsing.
+fn bare_query_leaf(analyzer: &dyn IAnalyzer, trimmed: &str) -> Option<String> {
+    let languages = analyzer.languages();
+    let all_single_segment = languages.iter().all(|&language| {
+        let paths = query_symbol_interpretations(language, trimmed);
+        !paths.is_empty() && paths.iter().all(|path| path.len() == 1)
+    });
+    if !all_single_segment {
+        return None;
+    }
+
+    let leaves: BTreeSet<String> = languages
+        .iter()
+        .filter_map(|&language| symbol_selector_leaf(language, trimmed))
+        .collect();
+    (leaves.len() == 1)
+        .then(|| leaves.into_iter().next())
+        .flatten()
+}
+
+/// Union of (a) exact top-level definitions of the bare query and (b) every
+/// declaration whose terminal identifier equals `leaf` (members included, via
+/// the indexed identifier lookup), keyed by fq-name exactly as stages 2-3.
+/// Yields `Resolved` for one distinct declaration and `Ambiguous` for several;
+/// returns `None` when the union is empty so the caller falls through to the
+/// existing stages and NotFound handling is untouched.
+fn bare_name_resolution(
+    analyzer: &dyn IAnalyzer,
+    trimmed: &str,
+    leaf: &str,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnitResolution> {
+    let mut matches = BTreeMap::new();
+    for definition in analyzer.definitions(trimmed) {
+        if include(&definition) {
+            insert_match(&mut matches, &definition);
+        }
+    }
+    for candidate in analyzer.lookup_candidates_by_identifier(leaf) {
+        if include(&candidate) && candidate.identifier() == leaf {
+            insert_match(&mut matches, &candidate);
+        }
+    }
+    resolution_from_matches(analyzer, matches, include)
 }
 
 pub(crate) fn strip_trailing_call_suffix(symbol: &str) -> String {

@@ -7,7 +7,7 @@ use crate::analyzer::declaration_range::{
 };
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
+    CodeUnitResolution, is_bare_symbol_query, resolve_codeunit_exact, resolve_codeunit_fuzzy,
     resolve_codeunit_fuzzy_with, resolve_enclosing_codeunits, strip_trailing_call_suffix,
     symbol_selector_leaf,
 };
@@ -2487,6 +2487,15 @@ enum PathQualifiedSelector<'a> {
 }
 
 fn exact_codeunit_resolution(analyzer: &dyn IAnalyzer, input: &str) -> CodeUnitResolution {
+    // A bare terminal name must see same-named members so a lone top-level
+    // namesake cannot silently win over a hidden member (#1057). The member-aware
+    // fuzzy resolver unions the exact top-level hit with identifier-indexed
+    // members and decides Resolved vs Ambiguous; qualified/multi-segment names
+    // keep the exact-first path so canonical `/`- or `::`-bearing symbols (Go
+    // import paths, `fmt::formatter`) are never misrouted as file patterns.
+    if is_bare_symbol_query(analyzer, input) {
+        return resolve_codeunit_fuzzy(analyzer, input);
+    }
     let units = resolve_codeunit_exact(analyzer, input);
     if units.is_empty() {
         CodeUnitResolution::NotFound

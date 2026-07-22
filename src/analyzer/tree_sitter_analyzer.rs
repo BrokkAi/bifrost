@@ -5652,6 +5652,10 @@ where
             .unwrap_or_default()
     }
 
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.lookup_declarations_by_identifier(identifier)
+    }
+
     fn search_symbol_candidates(
         &self,
         pattern: &str,
