@@ -3132,10 +3132,10 @@ fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
     assert_eq!(profile.cache.import_reverse.incomplete_hits, 1);
     assert_eq!(profile.cache.import_reverse.complete_hits, 0);
     assert_eq!(profile.cache.direct_import_topology.lookups, 4);
-    assert_eq!(profile.cache.direct_import_topology.misses, 3);
-    assert_eq!(profile.cache.direct_import_topology.hits, 1);
-    assert_eq!(profile.cache.direct_import_topology.builds, 1);
-    assert_eq!(profile.cache.direct_import_topology.complete_builds, 1);
+    assert_eq!(profile.cache.direct_import_topology.misses, 4);
+    assert_eq!(profile.cache.direct_import_topology.hits, 0);
+    assert_eq!(profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(profile.cache.direct_import_topology.complete_builds, 0);
     assert_eq!(profile.cache.direct_import_topology.fallbacks, 4);
     assert_eq!(
         profile
@@ -3251,6 +3251,19 @@ fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
         "union": [branch("LeftHub"), branch("RightHub")]
     }))
     .expect("query");
+
+    let deferred =
+        execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+    assert_eq!(deferred.result.results.len(), 2);
+    assert_eq!(deferred.result.completion(), CodeQueryCompletion::Complete);
+    let deferred_profile = deferred.profile.expect("deferred profile");
+    assert_serial_profile_reconciles(&deferred_profile);
+    assert_eq!(deferred_profile.cache.direct_import_topology.lookups, 2);
+    assert_eq!(deferred_profile.cache.direct_import_topology.misses, 2);
+    assert_eq!(deferred_profile.cache.direct_import_topology.hits, 0);
+    assert_eq!(deferred_profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(deferred_profile.cache.direct_import_topology.fallbacks, 2);
 
     let detailed =
         execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());

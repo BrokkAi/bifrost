@@ -245,8 +245,16 @@ struct CacheLayerWire {
     metrics: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheMetricsKindWire {
+    CompleteValue,
+    StructuralFacts,
+}
+
 #[derive(Debug, Deserialize)]
 struct FactsCacheWire {
+    kind: CacheMetricsKindWire,
     lookups: u64,
     memory_hits: u64,
     persisted_hydrations: u64,
@@ -296,16 +304,7 @@ fn parse_profile(
         )
     })?;
     let diagnostic_codes = diagnostic_codes(&profile.result)?;
-    let facts_layer = profile
-        .cache_layers
-        .iter()
-        .find(|layer| layer.layer == "seed_structural_facts")
-        .ok_or_else(|| {
-            format!(
-                "query_code case `{}` profile is missing seed_structural_facts cache metrics",
-                case.id
-            )
-        })?;
+    let facts_layer = required_cache_layer(case, &profile.cache_layers, "seed_structural_facts")?;
     let facts: FactsCacheWire =
         serde_json::from_value(facts_layer.metrics.clone()).map_err(|error| {
             format!(
@@ -313,16 +312,33 @@ fn parse_profile(
                 case.id
             )
         })?;
-    let topology = profile
-        .cache_layers
-        .iter()
-        .find(|layer| layer.layer == "direct_import_topology")
-        .ok_or_else(|| {
+    if facts.kind != CacheMetricsKindWire::StructuralFacts {
+        return Err(format!(
+            "query_code case `{}` returned seed_structural_facts metrics with kind {:?}; expected structural_facts",
+            case.id, facts.kind
+        ));
+    }
+    let topology = required_cache_layer(case, &profile.cache_layers, "direct_import_topology")?;
+    let topology_kind = serde_json::from_value::<CacheMetricsKindWire>(
+        topology.metrics.get("kind").cloned().ok_or_else(|| {
             format!(
-                "query_code case `{}` profile is missing direct_import_topology cache metrics",
+                "query_code case `{}` returned direct_import_topology metrics without kind",
                 case.id
             )
-        })?;
+        })?,
+    )
+    .map_err(|error| {
+        format!(
+            "query_code case `{}` returned invalid direct_import_topology metrics kind: {error}",
+            case.id
+        )
+    })?;
+    if topology_kind != CacheMetricsKindWire::CompleteValue {
+        return Err(format!(
+            "query_code case `{}` returned direct_import_topology metrics with kind {topology_kind:?}; expected complete_value",
+            case.id
+        ));
+    }
     let topology: QueryCodeDerivedLayerMetrics = serde_json::from_value(topology.metrics.clone())
         .map_err(|error| {
         format!(
@@ -359,6 +375,27 @@ fn parse_profile(
             access_path: Some(parse_access_path(&profile.access_path)?),
         },
     ))
+}
+
+fn required_cache_layer<'a>(
+    case: &QueryCodeBenchmarkCase,
+    layers: &'a [CacheLayerWire],
+    required: &str,
+) -> Result<&'a CacheLayerWire, String> {
+    let mut matching = layers.iter().filter(|layer| layer.layer == required);
+    let layer = matching.next().ok_or_else(|| {
+        format!(
+            "query_code case `{}` profile is missing {required} cache metrics",
+            case.id
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "query_code case `{}` profile contains duplicate {required} cache metrics",
+            case.id
+        ));
+    }
+    Ok(layer)
 }
 
 fn validate_result(case: &QueryCodeBenchmarkCase, result: &Value) -> Result<(), String> {
@@ -809,6 +846,33 @@ mod tests {
             .expect_err("profile must include every required lifecycle counter");
         assert!(error.contains("invalid direct_import_topology"), "{error}");
         assert!(error.contains("fallbacks"), "{error}");
+    }
+
+    #[test]
+    fn profile_parser_rejects_duplicate_or_mislabeled_required_cache_layers() {
+        let mut duplicate = profiled_query_response();
+        let facts = duplicate["structuredContent"]["cache_layers"][0].clone();
+        duplicate["structuredContent"]["cache_layers"]
+            .as_array_mut()
+            .expect("cache layers")
+            .push(facts);
+        let error = parse_profile(&benchmark_case(), &duplicate)
+            .expect_err("required layers must be unique");
+        assert!(error.contains("duplicate seed_structural_facts"), "{error}");
+
+        let mut wrong_facts_kind = profiled_query_response();
+        wrong_facts_kind["structuredContent"]["cache_layers"][0]["metrics"]["kind"] =
+            json!("complete_value");
+        let error = parse_profile(&benchmark_case(), &wrong_facts_kind)
+            .expect_err("facts metrics must declare their wire kind");
+        assert!(error.contains("expected structural_facts"), "{error}");
+
+        let mut wrong_topology_kind = profiled_query_response();
+        wrong_topology_kind["structuredContent"]["cache_layers"][1]["metrics"]["kind"] =
+            json!("structural_facts");
+        let error = parse_profile(&benchmark_case(), &wrong_topology_kind)
+            .expect_err("topology metrics must declare their wire kind");
+        assert!(error.contains("expected complete_value"), "{error}");
     }
 
     #[test]

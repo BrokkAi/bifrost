@@ -249,6 +249,12 @@ fn compare_reports(
 ) -> Result<(), String> {
     let baseline = load_report(&baseline_path)?;
     let candidate = load_report(&candidate_path)?;
+    if baseline.max_files.is_some() || candidate.max_files.is_some() {
+        return Err(
+            "subset benchmark reports (--max-files) cannot be compared with baseline reports"
+                .to_string(),
+        );
+    }
     let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
 
     if let Some(path) = output_path {
@@ -402,14 +408,14 @@ fn print_compare_summary(report: &BenchmarkCompareReport) {
         match scenario.delta_ms {
             Some(delta_ms) => match scenario.delta_pct {
                 Some(delta_pct) => println!(
-                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%)",
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%) ({detail})",
                     scenario.repo_name,
                     scenario.scenario.label(),
                     scenario.transport,
                     scenario.outcome
                 ),
                 None => println!(
-                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms",
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({detail})",
                     scenario.repo_name,
                     scenario.scenario.label(),
                     scenario.transport,

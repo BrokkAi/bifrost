@@ -1082,6 +1082,14 @@ impl IAnalyzer for MultiAnalyzer {
             .collect()
     }
 
+    fn snapshot_generations_match(&self, expected: &[u64]) -> bool {
+        expected.len() == self.delegates.len()
+            && expected.iter().copied().eq(self
+                .delegates
+                .values()
+                .map(|delegate| delegate.analyzer().project().analysis_generation()))
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().contains_tests(file))

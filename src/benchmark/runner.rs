@@ -24,6 +24,7 @@ use lsp_types::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -61,7 +62,15 @@ pub fn run_benchmark(
         });
     }
 
-    let bifrost_commit = current_bifrost_commit();
+    let current_identity = current_bifrost_commit();
+    if current_identity.as_deref() != Some(crate::BIFROST_BUILD_IDENTITY) {
+        return Err(format!(
+            "benchmark harness build identity `{}` does not match current checkout `{}`; rebuild both bifrost and bifrost_benchmark",
+            crate::BIFROST_BUILD_IDENTITY,
+            current_identity.as_deref().unwrap_or("unknown")
+        ));
+    }
+    let bifrost_commit = Some(crate::BIFROST_BUILD_IDENTITY.to_string());
     let mut repos = Vec::with_capacity(selected_targets.len());
     for target in selected_targets {
         repos.push(run_repo(target, manifest, request)?);
@@ -129,12 +138,30 @@ fn run_repo(
         .scenario_set()
         .contains(&BenchmarkScenario::QueryCode)
     {
-        scenario_reports.extend(query_code::run_scenarios(
-            target,
-            manifest,
-            &workspace_path,
-            request.profile.as_ref(),
-        ));
+        if request.max_files.is_some() {
+            scenario_reports.extend(target.query_code_queries.iter().map(|case| {
+                ScenarioReport::from_timings(
+                    BenchmarkScenario::QueryCode,
+                    ScenarioTransport::Mcp,
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )
+                .with_case_id(case.id.clone())
+                .as_skipped(
+                    "query_code full-workspace oracle skipped for --max-files subset run"
+                        .to_string(),
+                )
+            }));
+        } else {
+            scenario_reports.extend(query_code::run_scenarios(
+                target,
+                manifest,
+                &workspace_path,
+                request.profile.as_ref(),
+            ));
+        }
     }
     scenario_reports.extend(run_mcp_scenarios(
         target,
@@ -1080,23 +1107,36 @@ fn current_bifrost_commit() -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let status = std::process::Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+    let diff = std::process::Command::new("git")
+        .args([
+            "diff",
+            "--binary",
+            "HEAD",
+            "--",
+            "src",
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "resources",
+        ])
         .current_dir(repo_root)
         .output()
-        .ok();
-    let dirty = status
-        .filter(|status| status.status.success())
-        .and_then(|status| String::from_utf8(status.stdout).ok())
-        .is_some_and(|status| {
-            status.lines().any(|line| {
-                let path = line.get(3..).unwrap_or_default().trim_matches('"');
-                !path.starts_with(".cache/") && !path.starts_with("benchmark/.cache/")
-            })
-        });
-    Some(if dirty {
-        format!("{trimmed}-dirty")
-    } else {
-        trimmed.to_string()
-    })
+        .ok()?;
+    if !diff.status.success() || diff.stdout.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    let mut hasher = std::process::Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    hasher.stdin.take()?.write_all(&diff.stdout).ok()?;
+    let hash = hasher.wait_with_output().ok()?;
+    if !hash.status.success() {
+        return None;
+    }
+    let fingerprint = String::from_utf8(hash.stdout).ok()?;
+    Some(format!("{trimmed}-dirty.{}", fingerprint.trim()))
 }

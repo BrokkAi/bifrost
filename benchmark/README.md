@@ -75,8 +75,13 @@ cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
 Run one repo against the full pinned checkout:
 
 ```bash
-cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo gin-go
+cargo build --bin bifrost --bin bifrost_benchmark
+./target/debug/bifrost_benchmark run --manifest benchmark/targets.toml --repo gin-go
 ```
+
+The harness verifies the MCP server's embedded build identity during
+initialization and fails if either sibling binary is stale. Rebuild both
+binaries after changing or updating the checkout.
 
 For faster local iteration, `bifrost_benchmark run` also supports `--max-files N`:
 

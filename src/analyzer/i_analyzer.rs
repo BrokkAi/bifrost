@@ -409,6 +409,14 @@ pub trait IAnalyzer: Send + Sync + Any {
         Box::new([self.project().analysis_generation()])
     }
 
+    /// Allocation-free freshness check for a previously captured generation
+    /// vector. Composite analyzers override this to compare every delegate in
+    /// the same deterministic order as [`Self::snapshot_source_generations`].
+    #[doc(hidden)]
+    fn snapshot_generations_match(&self, expected: &[u64]) -> bool {
+        expected == [self.project().analysis_generation()]
+    }
+
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
         if query.is_empty() {
             return Vec::new();

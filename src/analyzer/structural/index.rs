@@ -17,8 +17,8 @@ use crate::analyzer::complete_value_cache::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, map_with_capacity};
 use std::mem::size_of;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub(crate) const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 1;
@@ -57,11 +57,8 @@ struct RolePostingKey {
     keyword: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct KindNamePostingKey {
-    kind: NormalizedKind,
-    name: Box<str>,
-}
+type KindNamePostings = HashMap<Box<str>, Vec<(NormalizedKind, Box<[FactAddress]>)>>;
+type MutableKindNamePostings = HashMap<Box<str>, Vec<(NormalizedKind, Vec<FactAddress>)>>;
 
 #[derive(Debug)]
 pub(crate) struct SnapshotStructuralIndex {
@@ -73,7 +70,7 @@ pub(crate) struct SnapshotStructuralIndex {
     /// Only combinations that are strictly narrower than their name posting.
     /// A name used by exactly one actual kind is already represented optimally
     /// by `name_postings` and is not duplicated here.
-    kind_name_postings: HashMap<KindNamePostingKey, Box<[FactAddress]>>,
+    kind_name_postings: KindNamePostings,
     role_postings: HashMap<RolePostingKey, Box<[FactAddress]>>,
     source_trigram_filters: Box<[u64]>,
     retained_bytes: u64,
@@ -138,8 +135,15 @@ impl SnapshotStructuralIndex {
         }
         scoped_ids.sort_unstable();
         scoped_ids.dedup();
+        let full_provider_scope = scoped_ids.len() == self.files.len()
+            && scoped_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(index, file)| usize::try_from(file).ok() == Some(index));
 
-        let mut terms = self.selection_terms(requirements, &scoped_ids);
+        let mut terms =
+            self.selection_terms(requirements, &scoped_ids, full_provider_scope, cancellation)?;
         terms.sort_by(|left, right| {
             left.estimated_rows
                 .cmp(&right.estimated_rows)
@@ -208,7 +212,9 @@ impl SnapshotStructuralIndex {
         &'a self,
         requirements: &'a StructuralAccessRequirements,
         scoped_files: &[u32],
-    ) -> Vec<SelectionTerm<'a>> {
+        full_provider_scope: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<SelectionTerm<'a>>, &'static str> {
         let kinds = requirements.terms().iter().find_map(|term| match term {
             StructuralPostingTerm::Kinds(kinds) => Some(kinds.as_slice()),
             _ => None,
@@ -217,9 +223,11 @@ impl SnapshotStructuralIndex {
             StructuralPostingTerm::ExactName(name) => Some(name.as_str()),
             _ => None,
         });
-        let combined = kinds
-            .zip(exact_name)
-            .and_then(|(kinds, name)| self.kind_name_term(kinds, name, scoped_files));
+        let combined = if let Some((kinds, name)) = kinds.zip(exact_name) {
+            self.kind_name_term(kinds, name, scoped_files, full_provider_scope, cancellation)?
+        } else {
+            None
+        };
         let uses_combined = combined.is_some();
 
         let mut terms = Vec::with_capacity(requirements.terms().len());
@@ -235,9 +243,9 @@ impl SnapshotStructuralIndex {
             {
                 continue;
             }
-            terms.push(self.term(term, scoped_files));
+            terms.push(self.term(term, scoped_files, full_provider_scope, cancellation)?);
         }
-        terms
+        Ok(terms)
     }
 
     fn kind_name_term<'a>(
@@ -245,28 +253,38 @@ impl SnapshotStructuralIndex {
         requested_kinds: &[NormalizedKind],
         name: &str,
         scoped_files: &[u32],
-    ) -> Option<SelectionTerm<'a>> {
-        let mut postings = Vec::new();
-        let mut name_has_combination_postings = false;
-        for (key, posting) in &self.kind_name_postings {
-            if key.name.as_ref() != name {
-                continue;
-            }
-            name_has_combination_postings = true;
-            if requested_kinds
-                .iter()
-                .any(|requested| key.kind.satisfies(*requested))
-            {
-                postings.push(posting.as_ref());
-            }
-        }
-        if !name_has_combination_postings {
-            return None;
-        }
-        Some(SelectionTerm::new("kind_name", postings, scoped_files))
+        full_provider_scope: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SelectionTerm<'a>>, &'static str> {
+        let Some(combinations) = self.kind_name_postings.get(name) else {
+            return Ok(None);
+        };
+        let postings = combinations
+            .iter()
+            .filter(|(kind, _)| {
+                requested_kinds
+                    .iter()
+                    .any(|requested| kind.satisfies(*requested))
+            })
+            .map(|(_, posting)| posting.as_ref())
+            .collect();
+        SelectionTerm::new(
+            "kind_name",
+            postings,
+            scoped_files,
+            full_provider_scope,
+            cancellation,
+        )
+        .map(Some)
     }
 
-    fn term<'a>(&'a self, term: &StructuralPostingTerm, scoped_files: &[u32]) -> SelectionTerm<'a> {
+    fn term<'a>(
+        &'a self,
+        term: &StructuralPostingTerm,
+        scoped_files: &[u32],
+        full_provider_scope: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectionTerm<'a>, &'static str> {
         let postings = match term {
             StructuralPostingTerm::Kinds(kinds) => self
                 .kind_postings
@@ -298,72 +316,101 @@ impl SnapshotStructuralIndex {
                 .map(|posting| vec![posting.as_ref()])
                 .unwrap_or_default(),
         };
-        SelectionTerm::new(term.label(), postings, scoped_files)
+        SelectionTerm::new(
+            term.label(),
+            postings,
+            scoped_files,
+            full_provider_scope,
+            cancellation,
+        )
     }
 }
 
 struct SelectionTerm<'a> {
     label: &'static str,
-    postings: Vec<&'a [FactAddress]>,
+    postings: Vec<ScopedPosting<'a>>,
     estimated_rows: u64,
 }
 
+enum ScopedPosting<'a> {
+    Full(&'a [FactAddress]),
+    Filtered(Vec<FactAddress>),
+}
+
+impl ScopedPosting<'_> {
+    fn as_slice(&self) -> &[FactAddress] {
+        match self {
+            Self::Full(posting) => posting,
+            Self::Filtered(posting) => posting,
+        }
+    }
+}
+
 impl<'a> SelectionTerm<'a> {
-    fn new(label: &'static str, postings: Vec<&'a [FactAddress]>, scoped_files: &[u32]) -> Self {
+    fn new(
+        label: &'static str,
+        postings: Vec<&'a [FactAddress]>,
+        scoped_files: &[u32],
+        full_provider_scope: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, &'static str> {
+        let mut scoped_postings = Vec::with_capacity(postings.len());
+        for posting in postings {
+            let posting = if full_provider_scope {
+                ScopedPosting::Full(posting)
+            } else {
+                let Some(rows) = scoped_posting_rows(posting, scoped_files, cancellation) else {
+                    return Err("structural index selection cancelled");
+                };
+                ScopedPosting::Filtered(rows)
+            };
+            scoped_postings.push(posting);
+        }
+        let postings = scoped_postings;
         let estimated_rows = postings.iter().fold(0u64, |total, posting| {
-            total.saturating_add(scoped_posting_len(posting, scoped_files))
+            total.saturating_add(posting.as_slice().len() as u64)
         });
-        Self {
+        Ok(Self {
             label,
             postings,
             estimated_rows,
-        }
+        })
     }
 
     fn contains(&self, address: FactAddress) -> bool {
         self.postings
             .iter()
-            .any(|posting| posting.binary_search(&address).is_ok())
+            .any(|posting| posting.as_slice().binary_search(&address).is_ok())
     }
 
     fn materialize(
         &self,
-        scoped_files: &[u32],
+        _scoped_files: &[u32],
         cancellation: &CancellationToken,
     ) -> Result<Vec<FactAddress>, &'static str> {
         let capacity = usize::try_from(self.estimated_rows)
             .map_err(|_| "structural candidate cardinality exceeds platform limit")?;
         let mut rows = Vec::with_capacity(capacity);
-        for (file_index, &file) in scoped_files.iter().enumerate() {
-            if file_index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
-                return Err("structural index selection cancelled");
-            }
-            let ranges = self
+        let mut positions = vec![0usize; self.postings.len()];
+        loop {
+            let next = self
                 .postings
                 .iter()
-                .map(|posting| posting_range_for_file(posting, file))
-                .filter(|posting| !posting.is_empty())
-                .collect::<Vec<_>>();
-            let mut positions = vec![0usize; ranges.len()];
-            loop {
-                let next = ranges
-                    .iter()
-                    .zip(&positions)
-                    .filter_map(|(range, &position)| range.get(position).copied())
-                    .min();
-                let Some(next) = next else {
-                    break;
-                };
-                if rows.last().copied() != Some(next) {
-                    rows.push(next);
-                    if rows.len() % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
-                        return Err("structural index selection cancelled");
-                    }
+                .zip(&positions)
+                .filter_map(|(posting, &position)| posting.as_slice().get(position).copied())
+                .min();
+            let Some(next) = next else {
+                break;
+            };
+            if rows.last().copied() != Some(next) {
+                rows.push(next);
+                if rows.len() % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
+                    return Err("structural index selection cancelled");
                 }
-                for (range, position) in ranges.iter().zip(&mut positions) {
-                    while range.get(*position).copied() == Some(next) {
-                        *position += 1;
-                    }
+            }
+            for (posting, position) in self.postings.iter().zip(&mut positions) {
+                while posting.as_slice().get(*position).copied() == Some(next) {
+                    *position += 1;
                 }
             }
         }
@@ -415,16 +462,31 @@ fn trigram_filter_may_contain(filter: &[u64], anchor: &[u8]) -> bool {
     })
 }
 
-fn posting_range_for_file(posting: &[FactAddress], file: u32) -> &[FactAddress] {
-    let start = posting.partition_point(|address| address.file < file);
-    let end = posting[start..].partition_point(|address| address.file == file) + start;
-    &posting[start..end]
-}
-
-fn scoped_posting_len(posting: &[FactAddress], scoped_files: &[u32]) -> u64 {
-    scoped_files.iter().fold(0u64, |total, &file| {
-        total.saturating_add(posting_range_for_file(posting, file).len() as u64)
-    })
+fn scoped_posting_rows(
+    posting: &[FactAddress],
+    scoped_files: &[u32],
+    cancellation: &CancellationToken,
+) -> Option<Vec<FactAddress>> {
+    let mut rows = Vec::new();
+    let mut scope_index = 0usize;
+    for (index, &address) in posting.iter().enumerate() {
+        if index.is_multiple_of(FACT_CANCELLATION_BATCH) && cancellation.is_cancelled() {
+            return None;
+        }
+        while scoped_files
+            .get(scope_index)
+            .is_some_and(|file| *file < address.file)
+        {
+            scope_index += 1;
+        }
+        let Some(&scoped_file) = scoped_files.get(scope_index) else {
+            break;
+        };
+        if scoped_file == address.file {
+            rows.push(address);
+        }
+    }
+    (!cancellation.is_cancelled()).then_some(rows)
 }
 
 #[derive(Debug)]
@@ -479,11 +541,79 @@ pub(crate) enum StructuralIndexAcquisition {
 }
 
 #[derive(Clone)]
-#[doc(hidden)]
-pub struct SnapshotStructuralIndexCache {
+pub(crate) struct SnapshotStructuralIndexCache {
     complete: CompleteValueCache<StructuralIndexKey, SnapshotStructuralIndex>,
     max_retained_bytes: u64,
     auto_reuse_generation: Arc<AtomicU64>,
+    rejected: Arc<Mutex<Option<StructuralIndexRejection>>>,
+}
+
+/// Request-scoped structural-index lifecycle shared by serial and parallel
+/// seed branches. Deferred Auto observations are published only after the
+/// whole request finishes, and selected source generations remain guarded
+/// through replay and rendering.
+#[derive(Clone, Default)]
+pub(crate) struct QueryStructuralIndexSession {
+    deferred_auto: Arc<Mutex<HashMap<(usize, u64), SnapshotStructuralIndexCache>>>,
+    selected_generations: Arc<Mutex<Option<Box<[u64]>>>>,
+    inconsistent_selection: Arc<AtomicBool>,
+}
+
+impl QueryStructuralIndexSession {
+    pub(crate) fn defer_auto_build(
+        &self,
+        cache: &SnapshotStructuralIndexCache,
+        source_generation: u64,
+    ) {
+        self.deferred_auto
+            .lock()
+            .expect("structural index Auto deferral lock poisoned")
+            .entry((cache.owner_identity(), source_generation))
+            .or_insert_with(|| cache.clone());
+    }
+
+    pub(crate) fn publish_auto_observations(&self) {
+        let deferred = std::mem::take(
+            &mut *self
+                .deferred_auto
+                .lock()
+                .expect("structural index Auto deferral lock poisoned"),
+        );
+        for ((_, source_generation), cache) in deferred {
+            cache.record_auto_reuse_opportunity(source_generation);
+        }
+    }
+
+    pub(crate) fn record_selection(&self, source_generations: &[u64]) {
+        let mut selected = self
+            .selected_generations
+            .lock()
+            .expect("structural index generation guard lock poisoned");
+        if let Some(existing) = selected.as_deref() {
+            if existing != source_generations {
+                self.inconsistent_selection.store(true, Ordering::Release);
+            }
+        } else {
+            *selected = Some(source_generations.into());
+        }
+    }
+
+    pub(crate) fn selections_are_current(&self, is_current: impl FnOnce(&[u64]) -> bool) -> bool {
+        if self.inconsistent_selection.load(Ordering::Acquire) {
+            return false;
+        }
+        self.selected_generations
+            .lock()
+            .expect("structural index generation guard lock poisoned")
+            .as_deref()
+            .is_none_or(is_current)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StructuralIndexRejection {
+    key: StructuralIndexKey,
+    reason: &'static str,
 }
 
 impl SnapshotStructuralIndexCache {
@@ -495,6 +625,29 @@ impl SnapshotStructuralIndexCache {
             ),
             max_retained_bytes,
             auto_reuse_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            rejected: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn rejection_for(&self, key: StructuralIndexKey) -> Option<&'static str> {
+        self.rejected
+            .lock()
+            .expect("structural index rejection lock poisoned")
+            .as_ref()
+            .filter(|rejection| rejection.key == key)
+            .map(|rejection| rejection.reason)
+    }
+
+    fn record_rejection(&self, key: StructuralIndexKey, reason: &'static str) {
+        let mut rejected = self
+            .rejected
+            .lock()
+            .expect("structural index rejection lock poisoned");
+        if rejected
+            .as_ref()
+            .is_none_or(|current| current.key.source_generation <= key.source_generation)
+        {
+            *rejected = Some(StructuralIndexRejection { key, reason });
         }
     }
 
@@ -507,6 +660,13 @@ impl SnapshotStructuralIndexCache {
             representation_version: STRUCTURAL_INDEX_REPRESENTATION_VERSION,
             source_generation: provider.structural_source_generation(),
         };
+        if let Some(reason) = self.rejection_for(key) {
+            return StructuralIndexAcquisition::Unavailable {
+                reason,
+                wait: CompleteValueWait::default(),
+                build: StructuralIndexBuildMetrics::default(),
+            };
+        }
         let (acquisition, wait) = self.complete.acquire(&key, cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => StructuralIndexAcquisition::Ready {
@@ -519,7 +679,22 @@ impl SnapshotStructuralIndexCache {
                 wait,
                 build: StructuralIndexBuildMetrics::default(),
             },
+            CompleteValueAcquisition::Rejected => StructuralIndexAcquisition::Unavailable {
+                reason: self
+                    .rejection_for(key)
+                    .unwrap_or("structural index construction rejected by same-key leader"),
+                wait,
+                build: StructuralIndexBuildMetrics::default(),
+            },
             CompleteValueAcquisition::Leader { permit } => {
+                if let Some(reason) = self.rejection_for(key) {
+                    permit.publish_rejected();
+                    return StructuralIndexAcquisition::Unavailable {
+                        reason,
+                        wait,
+                        build: StructuralIndexBuildMetrics::default(),
+                    };
+                }
                 match build_index(
                     provider,
                     cancellation,
@@ -532,8 +707,12 @@ impl SnapshotStructuralIndexCache {
                     Ok((_index, build))
                         if provider.structural_source_generation() != key.source_generation =>
                     {
+                        let reason =
+                            "structural source generation changed during index construction";
+                        self.record_rejection(key, reason);
+                        permit.publish_rejected();
                         StructuralIndexAcquisition::Unavailable {
-                            reason: "structural source generation changed during index construction",
+                            reason,
                             wait,
                             build,
                         }
@@ -555,6 +734,8 @@ impl SnapshotStructuralIndexCache {
                         }
                     }
                     Err(BuildFailure::Unavailable { reason, metrics }) => {
+                        self.record_rejection(key, reason);
+                        permit.publish_rejected();
                         StructuralIndexAcquisition::Unavailable {
                             reason,
                             wait,
@@ -584,10 +765,17 @@ impl SnapshotStructuralIndexCache {
     /// may run only once. The first viable request records reuse interest and
     /// scans; a subsequent request may build. Forced indexed tests bypass this
     /// policy and exercise construction directly.
-    pub(crate) fn observe_auto_reuse_opportunity(&self, source_generation: u64) -> bool {
+    pub(crate) fn auto_reuse_observed(&self, source_generation: u64) -> bool {
+        self.auto_reuse_generation.load(Ordering::Acquire) == source_generation
+    }
+
+    fn record_auto_reuse_opportunity(&self, source_generation: u64) {
         self.auto_reuse_generation
-            .swap(source_generation, Ordering::AcqRel)
-            == source_generation
+            .store(source_generation, Ordering::Release);
+    }
+
+    fn owner_identity(&self) -> usize {
+        Arc::as_ptr(&self.auto_reuse_generation) as usize
     }
 
     #[cfg(test)]
@@ -644,6 +832,50 @@ fn push_posting<K: Eq + std::hash::Hash>(
             entry.insert(vec![address]);
         }
     }
+}
+
+fn push_string_posting(
+    rows: &mut HashMap<Box<str>, Vec<FactAddress>>,
+    value: &str,
+    address: FactAddress,
+    estimated_working_bytes: &mut u64,
+    max_retained_bytes: u64,
+) -> bool {
+    if let Some(posting) = rows.get_mut(value) {
+        if posting.last().copied() != Some(address) {
+            let projected = estimated_working_bytes
+                .saturating_add((size_of::<FactAddress>() as u64).saturating_mul(2));
+            if working_budget_exceeded(projected, max_retained_bytes) {
+                return false;
+            }
+            posting.push(address);
+            *estimated_working_bytes = projected;
+        }
+        return true;
+    }
+
+    let projected = estimated_working_bytes
+        .saturating_add((size_of::<FactAddress>() as u64).saturating_mul(2))
+        .saturating_add((size_of::<(Box<str>, Vec<FactAddress>)>() as u64).saturating_mul(2))
+        .saturating_add(value.len() as u64);
+    if working_budget_exceeded(projected, max_retained_bytes) {
+        return false;
+    }
+    rows.insert(value.into(), vec![address]);
+    *estimated_working_bytes = projected;
+    true
+}
+
+fn role_key_allocation_fits(
+    estimated_working_bytes: u64,
+    value_len: usize,
+    max_retained_bytes: u64,
+) -> bool {
+    let projected = estimated_working_bytes
+        .saturating_add(value_len as u64)
+        .saturating_add((size_of::<FactAddress>() as u64).saturating_mul(2))
+        .saturating_add((size_of::<(RolePostingKey, Vec<FactAddress>)>() as u64).saturating_mul(2));
+    !working_budget_exceeded(projected, max_retained_bytes)
 }
 
 fn working_budget_exceeded(estimated_working_bytes: u64, max_retained_bytes: u64) -> bool {
@@ -826,16 +1058,28 @@ fn build_index(
                 address,
                 &mut estimated_working_bytes,
             );
+            if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
+                return Err(unavailable_failure(
+                    started,
+                    "structural index construction-byte limit exceeded",
+                    metrics,
+                ));
+            }
             if let Some(name) = node.name {
-                let name: Box<str> = name.text(facts.source()).into();
-                let name_len = name.len();
-                push_posting(
+                let name = name.text(facts.source());
+                if !push_string_posting(
                     &mut name_rows,
                     name,
-                    name_len,
                     address,
                     &mut estimated_working_bytes,
-                );
+                    max_retained_bytes,
+                ) {
+                    return Err(unavailable_failure(
+                        started,
+                        "structural index construction-byte limit exceeded",
+                        metrics,
+                    ));
+                }
             }
             for target in facts.roles(fact_id as u32) {
                 if supports_exact_role_name_posting(target.role) {
@@ -843,37 +1087,73 @@ fn build_index(
                         .name
                         .or_else(|| target.node.and_then(|node| facts.node(node).name));
                     if let Some(name) = effective_name {
-                        let value: Box<str> = name.text(facts.source()).into();
+                        let value = name.text(facts.source());
                         let value_len = value.len();
+                        if !role_key_allocation_fits(
+                            estimated_working_bytes,
+                            value_len,
+                            max_retained_bytes,
+                        ) {
+                            return Err(unavailable_failure(
+                                started,
+                                "structural index construction-byte limit exceeded",
+                                metrics,
+                            ));
+                        }
                         push_posting(
                             &mut role_rows,
                             RolePostingKey {
                                 role: target.role,
-                                value,
+                                value: value.into(),
                                 keyword: false,
                             },
                             value_len,
                             address,
                             &mut estimated_working_bytes,
                         );
+                        if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
+                            return Err(unavailable_failure(
+                                started,
+                                "structural index construction-byte limit exceeded",
+                                metrics,
+                            ));
+                        }
                     }
                 }
                 if target.role == Role::Kwarg
                     && let Some(keyword) = target.keyword
                 {
-                    let value: Box<str> = keyword.text(facts.source()).into();
+                    let value = keyword.text(facts.source());
                     let value_len = value.len();
+                    if !role_key_allocation_fits(
+                        estimated_working_bytes,
+                        value_len,
+                        max_retained_bytes,
+                    ) {
+                        return Err(unavailable_failure(
+                            started,
+                            "structural index construction-byte limit exceeded",
+                            metrics,
+                        ));
+                    }
                     push_posting(
                         &mut role_rows,
                         RolePostingKey {
                             role: target.role,
-                            value,
+                            value: value.into(),
                             keyword: true,
                         },
                         value_len,
                         address,
                         &mut estimated_working_bytes,
                     );
+                    if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
+                        return Err(unavailable_failure(
+                            started,
+                            "structural index construction-byte limit exceeded",
+                            metrics,
+                        ));
+                    }
                 }
             }
             if fact_id % FACT_CANCELLATION_BATCH == 0
@@ -895,7 +1175,7 @@ fn build_index(
     let Some(name_postings) = boxed_rows(name_rows, cancellation) else {
         return Err(cancelled_failure(started, metrics));
     };
-    let mut kind_name_rows: HashMap<KindNamePostingKey, Vec<FactAddress>> = HashMap::default();
+    let mut kind_name_rows = MutableKindNamePostings::default();
     for (name_index, (name, all_name_rows)) in name_postings.iter().enumerate() {
         if name_index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
             return Err(cancelled_failure(started, metrics));
@@ -938,19 +1218,26 @@ fn build_index(
                 ));
             }
         }
-        for (kind, rows) in rows_by_kind {
-            estimated_working_bytes = estimated_working_bytes
-                .saturating_add(
-                    (size_of::<(KindNamePostingKey, Vec<FactAddress>)>() as u64).saturating_mul(2),
-                )
-                .saturating_add(name.len() as u64);
-            kind_name_rows.insert(
-                KindNamePostingKey {
-                    kind,
-                    name: name.clone(),
-                },
-                rows,
-            );
+        let mut combinations = rows_by_kind.into_iter().collect::<Vec<_>>();
+        combinations.sort_by_key(|(kind, _)| *kind);
+        estimated_working_bytes = estimated_working_bytes
+            .saturating_add(
+                (size_of::<(Box<str>, Vec<(NormalizedKind, Vec<FactAddress>)>)>() as u64)
+                    .saturating_mul(2),
+            )
+            .saturating_add(name.len() as u64)
+            .saturating_add((combinations.capacity() as u64).saturating_mul(size_of::<(
+                NormalizedKind,
+                Vec<FactAddress>,
+            )>()
+                as u64));
+        kind_name_rows.insert(name.clone(), combinations);
+        if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
+            return Err(unavailable_failure(
+                started,
+                "structural index construction-byte limit exceeded",
+                metrics,
+            ));
         }
     }
     drop(fact_kinds);
@@ -961,7 +1248,7 @@ fn build_index(
             metrics,
         ));
     }
-    let Some(kind_name_postings) = boxed_rows(kind_name_rows, cancellation) else {
+    let Some(kind_name_postings) = boxed_kind_name_rows(kind_name_rows, cancellation) else {
         return Err(cancelled_failure(started, metrics));
     };
     let Some(role_postings) = boxed_rows(role_rows, cancellation) else {
@@ -1011,6 +1298,27 @@ fn boxed_rows<K: Eq + std::hash::Hash>(
     (!cancellation.is_cancelled()).then_some(boxed)
 }
 
+fn boxed_kind_name_rows(
+    rows: MutableKindNamePostings,
+    cancellation: &CancellationToken,
+) -> Option<KindNamePostings> {
+    let mut boxed = map_with_capacity(rows.len());
+    let mut observed = 0usize;
+    for (name, combinations) in rows {
+        let mut boxed_combinations = Vec::with_capacity(combinations.len());
+        for (kind, values) in combinations {
+            if observed.is_multiple_of(FACT_CANCELLATION_BATCH) && cancellation.is_cancelled() {
+                return None;
+            }
+            observed = observed.saturating_add(values.len().max(1));
+            debug_assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+            boxed_combinations.push((kind, values.into_boxed_slice()));
+        }
+        boxed.insert(name, boxed_combinations);
+    }
+    (!cancellation.is_cancelled()).then_some(boxed)
+}
+
 fn retained_bytes(
     index: &SnapshotStructuralIndex,
     cancellation: &CancellationToken,
@@ -1031,8 +1339,8 @@ fn retained_bytes(
                     index.name_postings.capacity(),
                 ))
                 .saturating_add(hash_table_allocation_bytes::<
-                    KindNamePostingKey,
-                    Box<[FactAddress]>,
+                    Box<str>,
+                    Vec<(NormalizedKind, Box<[FactAddress]>)>,
                 >(index.kind_name_postings.capacity()))
                 .saturating_add(hash_table_allocation_bytes::<
                     RolePostingKey,
@@ -1059,13 +1367,17 @@ fn retained_bytes(
             .saturating_add(key.value.len() as u64)
             .saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
     }
-    for (entry_index, (key, posting)) in index.kind_name_postings.iter().enumerate() {
+    for (entry_index, (name, combinations)) in index.kind_name_postings.iter().enumerate() {
         if entry_index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
             return None;
         }
-        bytes = bytes
-            .saturating_add(key.name.len() as u64)
-            .saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
+        bytes = bytes.saturating_add(name.len() as u64).saturating_add(
+            (combinations.capacity() as u64)
+                .saturating_mul(size_of::<(NormalizedKind, Box<[FactAddress]>)>() as u64),
+        );
+        for (_, posting) in combinations {
+            bytes = bytes.saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
+        }
     }
     for posting in index.kind_postings.values() {
         bytes = bytes.saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
@@ -1307,6 +1619,31 @@ mod tests {
     }
 
     #[test]
+    fn request_session_defers_auto_admission_and_guards_every_selection_generation() {
+        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
+        let session = QueryStructuralIndexSession::default();
+
+        assert!(!cache.auto_reuse_observed(7));
+        session.defer_auto_build(&cache, 7);
+        session.defer_auto_build(&cache, 7);
+        assert!(
+            !cache.auto_reuse_observed(7),
+            "sibling branches must not publish a later-request observation"
+        );
+        session.publish_auto_observations();
+        assert!(cache.auto_reuse_observed(7));
+
+        session.record_selection(&[7, 11]);
+        assert!(session.selections_are_current(|expected| expected == [7, 11]));
+        assert!(!session.selections_are_current(|expected| expected == [8, 11]));
+        session.record_selection(&[7, 12]);
+        assert!(
+            !session.selections_are_current(|_| true),
+            "one request cannot combine posting selections from different generations"
+        );
+    }
+
+    #[test]
     fn cancelled_build_never_publishes() {
         let provider = provider();
         let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
@@ -1346,6 +1683,76 @@ mod tests {
             }
         ));
         assert_eq!(cache.len_for_test(), 0);
+    }
+
+    #[test]
+    fn deterministic_rejection_is_reused_without_rebuilding_the_generation() {
+        let provider = provider();
+        let cache = SnapshotStructuralIndexCache::new(1);
+
+        let StructuralIndexAcquisition::Unavailable {
+            reason: first_reason,
+            build: first_build,
+            ..
+        } = cache.acquire(&provider, &CancellationToken::default())
+        else {
+            panic!("first acquisition must reject the fixed footprint")
+        };
+        let StructuralIndexAcquisition::Unavailable {
+            reason: second_reason,
+            build: second_build,
+            ..
+        } = cache.acquire(&provider, &CancellationToken::default())
+        else {
+            panic!("second acquisition must reuse the rejection")
+        };
+
+        assert_eq!(first_reason, second_reason);
+        assert!(first_build.elapsed_ns > 0);
+        assert_eq!(second_build, StructuralIndexBuildMetrics::default());
+        assert_eq!(cache.len_for_test(), 0);
+    }
+
+    #[test]
+    fn long_identifier_is_rejected_before_index_key_allocation_exceeds_budget() {
+        let temp = tempfile::tempdir().expect("temp dir").keep();
+        let root = temp.canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root, "large.py");
+        let identifier = "a".repeat(256 * 1024);
+        let facts = FileFacts::new(
+            identifier.clone(),
+            vec![0],
+            vec![NormalizedNode {
+                kind: NormalizedKind::Class,
+                range: Range {
+                    start_byte: 0,
+                    end_byte: identifier.len(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+                parent: None,
+                name: Some(super::super::facts::Span {
+                    start_byte: 0,
+                    end_byte: identifier.len(),
+                }),
+                subtree_end: 1,
+            }],
+            CompactRows::from_parts(vec![0, 0], Vec::new()),
+        );
+        let provider = FakeProvider {
+            files: vec![file.clone()],
+            facts: HashMap::from_iter([(file, Arc::new(facts))]),
+        };
+
+        let failure = build_index(&provider, &CancellationToken::default(), 32 * 1024, 0)
+            .expect_err("identifier key must be rejected by construction budget");
+        assert!(matches!(
+            failure,
+            BuildFailure::Unavailable {
+                reason: "structural index construction-byte limit exceeded",
+                ..
+            }
+        ));
     }
 
     #[test]

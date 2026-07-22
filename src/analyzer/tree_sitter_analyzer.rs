@@ -1353,7 +1353,8 @@ pub struct TreeSitterAnalyzer<A> {
     structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
     /// Complete immutable postings for this exact analyzer generation.
     /// Ordinary clones share the owner; updates and overlays replace it.
-    structural_index_cache: Arc<crate::analyzer::structural::index::SnapshotStructuralIndexCache>,
+    structural_index_cache:
+        Arc<crate::analyzer::structural::provider::StructuralSearchSnapshotCache>,
     /// Complete immutable typed relations for this exact analyzer snapshot.
     /// Ordinary clones share the owner; updates and overlays replace it.
     snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
@@ -1434,7 +1435,7 @@ impl<A> TreeSitterAnalyzer<A> {
         let mut snapshot = self.clone();
         snapshot.project = project;
         snapshot.structural_index_cache = Arc::new(
-            crate::analyzer::structural::index::SnapshotStructuralIndexCache::new(
+            crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
                 self.config.memo_cache_budget_bytes() / 8,
             ),
         );
@@ -1627,15 +1628,15 @@ where
 
     fn build_structural_index_cache(
         config: &AnalyzerConfig,
-    ) -> crate::analyzer::structural::index::SnapshotStructuralIndexCache {
-        crate::analyzer::structural::index::SnapshotStructuralIndexCache::new(
+    ) -> crate::analyzer::structural::provider::StructuralSearchSnapshotCache {
+        crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
             config.memo_cache_budget_bytes() / 8,
         )
     }
 
     pub(crate) fn structural_index_cache(
         &self,
-    ) -> &crate::analyzer::structural::index::SnapshotStructuralIndexCache {
+    ) -> &crate::analyzer::structural::provider::StructuralSearchSnapshotCache {
         &self.structural_index_cache
     }
 

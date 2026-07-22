@@ -48,7 +48,7 @@ pub use execution::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
-pub use provider::{StructuralFactsCache, StructuralSearchProvider};
+pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
     CodeQuerySeed, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,

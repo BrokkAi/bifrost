@@ -339,6 +339,10 @@ fn run_inner(
                 println!("bifrost {}", env!("CARGO_PKG_VERSION"));
                 return Ok(CliRunResult::Complete);
             }
+            "--build-identity" => {
+                println!("{}", brokk_bifrost::BIFROST_BUILD_IDENTITY);
+                return Ok(CliRunResult::Complete);
+            }
             other => {
                 return Err(format!("Unknown argument: {other}"));
             }
@@ -850,6 +854,7 @@ OPTIONS:
     --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters
     -V, --version          Show version and exit
+        --build-identity   Show the exact embedded source identity and exit
 
 MCP TOOLSETS (--mcp):
     searchtools   every toolset below

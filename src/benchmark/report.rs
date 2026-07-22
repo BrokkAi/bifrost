@@ -38,6 +38,8 @@ pub struct ScenarioReport {
     pub case_id: Option<String>,
     pub transport: ScenarioTransport,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_duration_ms: Option<f64>,
     pub warmup_durations_ms: Vec<f64>,
@@ -239,6 +241,7 @@ impl ScenarioReport {
             case_id: None,
             transport,
             success,
+            skipped: false,
             first_duration_ms: None,
             median_ms: median_ms(&measured_durations_ms),
             p95_ms: None,
@@ -266,6 +269,13 @@ impl ScenarioReport {
 
     pub fn with_case_id(mut self, case_id: String) -> Self {
         self.case_id = Some(case_id);
+        self
+    }
+
+    pub fn as_skipped(mut self, reason: String) -> Self {
+        self.success = true;
+        self.skipped = true;
+        self.failure_message = Some(reason);
         self
     }
 }
@@ -393,6 +403,10 @@ fn mean_ms(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn median_ms(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -478,21 +492,28 @@ fn compare_scenario_pair(
             is_regression: true,
             detail: Some("scenario missing from candidate report".to_string()),
         },
-        (None, Some(candidate)) => ScenarioCompareReport {
-            repo_name: key.repo_name.to_string(),
-            scenario: key.scenario,
-            case_id: key.case_id.map(str::to_string),
-            transport: key.transport,
-            outcome: ScenarioCompareOutcome::NewCandidate,
-            baseline_success: None,
-            candidate_success: Some(candidate.success),
-            baseline_median_ms: None,
-            candidate_median_ms: candidate.median_ms,
-            delta_ms: None,
-            delta_pct: None,
-            is_regression: false,
-            detail: Some("scenario only present in candidate report".to_string()),
-        },
+        (None, Some(candidate)) => {
+            let invariant_failure = query_code_cold_ratio_failure(key.scenario, candidate);
+            let candidate_failure =
+                (!candidate.success).then(|| "new candidate scenario failed".to_string());
+            ScenarioCompareReport {
+                repo_name: key.repo_name.to_string(),
+                scenario: key.scenario,
+                case_id: key.case_id.map(str::to_string),
+                transport: key.transport,
+                outcome: ScenarioCompareOutcome::NewCandidate,
+                baseline_success: None,
+                candidate_success: Some(candidate.success),
+                baseline_median_ms: None,
+                candidate_median_ms: candidate.median_ms,
+                delta_ms: None,
+                delta_pct: None,
+                is_regression: invariant_failure.is_some() || candidate_failure.is_some(),
+                detail: invariant_failure
+                    .or(candidate_failure)
+                    .or_else(|| Some("scenario only present in candidate report".to_string())),
+            }
+        }
         (None, None) => unreachable!("scenario key without baseline or candidate"),
     }
 }
@@ -607,7 +628,9 @@ fn detect_environment_variance(
     scenarios: &[ScenarioCompareReport],
     thresholds: CompareThresholds,
 ) -> Option<EnvironmentVarianceReport> {
-    if scenarios.iter().any(non_timing_regression) {
+    if scenarios.iter().any(|scenario| {
+        non_timing_regression(scenario) && !is_query_code_candidate_invariant_failure(scenario)
+    }) {
         return None;
     }
 
@@ -627,7 +650,9 @@ fn detect_environment_variance(
     let timing_regressions = timed
         .iter()
         .copied()
-        .filter(|scenario| scenario.is_regression)
+        .filter(|scenario| {
+            scenario.is_regression && !is_query_code_candidate_invariant_failure(scenario)
+        })
         .collect::<Vec<_>>();
     if timing_regressions.is_empty() {
         return None;
@@ -712,10 +737,19 @@ fn detect_environment_variance(
 
 fn non_timing_regression(scenario: &ScenarioCompareReport) -> bool {
     scenario.is_regression
-        && !(scenario.baseline_success == Some(true)
-            && scenario.candidate_success == Some(true)
-            && scenario.delta_ms.is_some()
-            && scenario.delta_pct.is_some())
+        && (is_query_code_candidate_invariant_failure(scenario)
+            || !(scenario.baseline_success == Some(true)
+                && scenario.candidate_success == Some(true)
+                && scenario.delta_ms.is_some()
+                && scenario.delta_pct.is_some()))
+}
+
+fn is_query_code_candidate_invariant_failure(scenario: &ScenarioCompareReport) -> bool {
+    scenario.scenario == BenchmarkScenario::QueryCode
+        && scenario
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("retention limit"))
 }
 
 #[cfg(test)]

@@ -24,8 +24,9 @@ use super::execution::profile::{
 use super::execution::scheduler::BoundedReadyScheduler;
 use super::facts::{FileFacts, Span};
 use super::index::{
-    STRUCTURAL_INDEX_REPRESENTATION_VERSION, SnapshotStructuralIndex, StructuralCandidateSet,
-    StructuralIndexAcquisition, StructuralIndexBuildMetrics, StructuralIndexLifecycle,
+    QueryStructuralIndexSession, STRUCTURAL_INDEX_REPRESENTATION_VERSION, SnapshotStructuralIndex,
+    StructuralCandidateSet, StructuralIndexAcquisition, StructuralIndexBuildMetrics,
+    StructuralIndexLifecycle,
 };
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
@@ -886,12 +887,14 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     import_graph: Option<RequestLocalDirectImportGraph>,
+    import_graph_generations: Option<Box<[u64]>>,
     direct_import_layer: Option<Arc<DerivedLayer>>,
     direct_import_layer_generations: Option<Box<[u64]>>,
     deferred_derived_builds: HashSet<DerivedLayerRequest>,
     cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
     retained_value_census: Option<QueryRetainedValueCensus>,
+    structural_index_session: QueryStructuralIndexSession,
     access_mode: StructuralAccessMode,
     access_failure: Option<String>,
     parallel_seed_budget: Option<FairSeedBudgetLease>,
@@ -1252,6 +1255,7 @@ fn execute_internal_with_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         import_graph: None,
+        import_graph_generations: None,
         direct_import_layer: None,
         direct_import_layer_generations: None,
         deferred_derived_builds: HashSet::default(),
@@ -1259,6 +1263,7 @@ fn execute_internal_with_strategy(
         profile: capture_profile
             .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
         retained_value_census: capture_profile.then(QueryRetainedValueCensus::default),
+        structural_index_session: QueryStructuralIndexSession::default(),
         access_mode,
         access_failure: None,
         parallel_seed_budget: None,
@@ -1275,6 +1280,25 @@ fn execute_internal_with_strategy(
         &mut diagnostics,
         &mut profile_branch,
     );
+    if !state
+        .structural_index_session
+        .selections_are_current(|generations| {
+            state.analyzer.snapshot_generations_match(generations)
+        })
+    {
+        execution.rows.clear();
+        execution.truncated = true;
+        state.access_failure.get_or_insert_with(|| {
+            "structural source generation changed before result rendering".to_string()
+        });
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "source generation changed after structural posting selection; retry the query for a coherent snapshot".to_string(),
+        });
+    }
     if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
         profile.execution_ns = elapsed_ns(started);
     }
@@ -1335,6 +1359,35 @@ fn execute_internal_with_strategy(
             query.result_detail,
             &mut render_cache,
         ));
+    }
+    let structural_index_stale =
+        !state
+            .structural_index_session
+            .selections_are_current(|generations| {
+                state.analyzer.snapshot_generations_match(generations)
+            });
+    if structural_index_stale {
+        results.clear();
+        evidence.clear();
+        truncated = true;
+        state.access_failure.get_or_insert_with(|| {
+            "structural source generation changed during result rendering".to_string()
+        });
+        if !diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                && diagnostic.message.contains("structural posting")
+        }) {
+            diagnostics.push(CodeQueryDiagnostic {
+                code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
+            });
+        }
+    }
+    if !cancelled && !structural_index_stale {
+        state.structural_index_session.publish_auto_observations();
     }
     let total_work = execution_work_snapshot(state.budget);
     let work = public_execution_work(total_work);
@@ -2580,6 +2633,7 @@ fn execute_parallel_seed_union(
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
     let retained_value_census = state.retained_value_census.clone();
+    let structural_index_session = state.structural_index_session.clone();
     let scheduler_workers = state.scheduler_workers;
     let base_budget = state.budget;
     let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
@@ -2602,6 +2656,7 @@ fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     import_graph: None,
+                    import_graph_generations: None,
                     direct_import_layer: None,
                     direct_import_layer_generations: None,
                     deferred_derived_builds: HashSet::default(),
@@ -2609,6 +2664,7 @@ fn execute_parallel_seed_union(
                     profile: profiling
                         .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
                     retained_value_census: retained_value_census.clone(),
+                    structural_index_session: structural_index_session.clone(),
                     access_mode,
                     access_failure: None,
                     parallel_seed_budget: Some(lease.clone()),
@@ -2631,6 +2687,7 @@ fn execute_parallel_seed_union(
                 );
                 lease.finish(branch_state.budget);
                 debug_assert!(branch_state.import_graph.is_none());
+                debug_assert!(branch_state.import_graph_generations.is_none());
                 debug_assert!(branch_state.direct_import_layer.is_none());
                 debug_assert!(branch_state.direct_import_layer_generations.is_none());
                 debug_assert!(branch_state.deferred_derived_builds.is_empty());
@@ -2856,6 +2913,7 @@ enum SeedStructuralAccess {
     Indexed {
         index: Arc<SnapshotStructuralIndex>,
         candidates: Arc<StructuralCandidateSet>,
+        source_generations: Arc<[u64]>,
     },
 }
 
@@ -2878,6 +2936,15 @@ impl SeedStructuralAccess {
         match self {
             Self::Scan => None,
             Self::Indexed { index, .. } => index.source_may_contain(file, required_anchors),
+        }
+    }
+
+    fn source_generation_guard(&self) -> Option<Arc<[u64]>> {
+        match self {
+            Self::Scan => None,
+            Self::Indexed {
+                source_generations, ..
+            } => Some(Arc::clone(source_generations)),
         }
     }
 }
@@ -2999,7 +3066,10 @@ fn prepare_seed_access(
     if plan.structural_access().terms().is_empty() {
         return scan_access(state, files.len(), None);
     }
-    let Some(cache) = provider.snapshot_structural_index_cache() else {
+    let Some(cache) = provider
+        .snapshot_structural_index_cache()
+        .map(super::provider::StructuralSearchSnapshotCache::inner)
+    else {
         return scan_access(
             state,
             files.len(),
@@ -3014,11 +3084,16 @@ fn prepare_seed_access(
     let cache_ready_before_lookup = ready_index.is_some();
     let auto_build_is_viable = files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
         && files.len().saturating_mul(4) >= provider_file_count;
-    if state.access_mode == StructuralAccessMode::Auto
-        && ready_index.is_none()
-        && (!auto_build_is_viable || !cache.observe_auto_reuse_opportunity(source_generation))
-    {
-        return scan_access(state, files.len(), None);
+    if state.access_mode == StructuralAccessMode::Auto && ready_index.is_none() {
+        if !auto_build_is_viable {
+            return scan_access(state, files.len(), None);
+        }
+        if !cache.auto_reuse_observed(source_generation) {
+            state
+                .structural_index_session
+                .defer_auto_build(cache, source_generation);
+            return scan_access(state, files.len(), None);
+        }
     }
     let acquisition = ready_index.map_or_else(
         || cache.acquire(provider, cancellation),
@@ -3094,6 +3169,21 @@ fn prepare_seed_access(
             }
             match selection {
                 Ok(Some(candidates)) => {
+                    let source_generations = state.analyzer.snapshot_source_generations();
+                    if index.source_generation() != provider.structural_source_generation()
+                        || !state
+                            .analyzer
+                            .snapshot_generations_match(&source_generations)
+                    {
+                        return scan_access(
+                            state,
+                            files.len(),
+                            Some("structural source generation changed after index selection"),
+                        );
+                    }
+                    state
+                        .structural_index_session
+                        .record_selection(&source_generations);
                     if let Some(profile) = &mut state.profile {
                         let access = &mut profile.access_path;
                         access.record_selected(&format!(
@@ -3133,6 +3223,7 @@ fn prepare_seed_access(
                     SeedStructuralAccess::Indexed {
                         index,
                         candidates: Arc::new(candidates),
+                        source_generations: Arc::from(source_generations),
                     }
                 }
                 Ok(None) => scan_access(state, files.len(), None),
@@ -3153,7 +3244,9 @@ fn prepare_seed_access(
             if let Some(profile) = &mut state.profile {
                 let access = &mut profile.access_path;
                 access.index_misses = access.index_misses.saturating_add(1);
-                access.index_builds = access.index_builds.saturating_add(1);
+                access.index_builds = access
+                    .index_builds
+                    .saturating_add(u64::from(build.elapsed_ns > 0));
                 access.index_unavailable = access.index_unavailable.saturating_add(1);
                 if reason.contains("limit") || reason.contains("retained-byte") {
                     access.index_over_budget = access.index_over_budget.saturating_add(1);
@@ -3321,6 +3414,10 @@ fn execute_seed(
         }
     }
 
+    let selected_index_generations = provider_scopes
+        .iter()
+        .filter_map(|(_, _, _, access)| access.source_generation_guard())
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for (language, provider, files, access) in provider_scopes {
         candidates.extend(files.into_iter().map(|file| {
@@ -3603,6 +3700,24 @@ fn execute_seed(
             break;
         }
     }
+    if selected_index_generations
+        .iter()
+        .any(|generations| !state.analyzer.snapshot_generations_match(generations))
+    {
+        pending.clear();
+        truncated = true;
+        cache_complete = cache_complete.map(|_| false);
+        state.access_failure.get_or_insert_with(|| {
+            "structural source generation changed during posting replay".to_string()
+        });
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
+        });
+    }
     if pending.len() > desired_rows {
         pending.truncate(desired_rows);
         cache_complete = cache_complete.map(|_| false);
@@ -3732,8 +3847,9 @@ fn acquire_direct_import_layer(
         .saturating_sub(state.budget.import_edges_resolved);
     let acquisition = match ready {
         Some(layer)
-            if state.analyzer.snapshot_source_generations().as_ref()
-                == source_generations.as_ref() =>
+            if state
+                .analyzer
+                .snapshot_generations_match(&source_generations) =>
         {
             DerivedLayerAcquisition::Ready {
                 layer,
@@ -3745,6 +3861,7 @@ fn acquire_direct_import_layer(
         Some(_) => DerivedLayerAcquisition::Unavailable {
             reason: "derived-layer source generation changed before reuse".to_string(),
             over_budget: false,
+            rejection_scope: None,
             wait: Default::default(),
             build: DerivedLayerBuildMetrics::default(),
         },
@@ -3786,7 +3903,11 @@ fn acquire_direct_import_layer(
                 fallback_graph = build.fallback;
                 build.outcome
             },
-            || state.analyzer.snapshot_source_generations().as_ref() == source_generations.as_ref(),
+            || {
+                state
+                    .analyzer
+                    .snapshot_generations_match(&source_generations)
+            },
         ),
     };
 
@@ -3815,8 +3936,9 @@ fn acquire_direct_import_layer(
 
     match acquisition {
         DerivedLayerAcquisition::Ready { lifecycle, .. }
-            if state.analyzer.snapshot_source_generations().as_ref()
-                != source_generations.as_ref() =>
+            if !state
+                .analyzer
+                .snapshot_generations_match(&source_generations) =>
         {
             if let Some(profile) = &mut state.cache_profile {
                 let topology = &mut profile.direct_import_topology;
@@ -3891,17 +4013,26 @@ fn acquire_direct_import_layer(
         DerivedLayerAcquisition::Unavailable {
             reason,
             over_budget,
+            rejection_scope,
             ..
         } => {
-            if let Some(graph) = fallback_graph {
+            if let Some(graph) = fallback_graph
+                && state
+                    .analyzer
+                    .snapshot_generations_match(&source_generations)
+            {
                 state.import_graph = Some(graph);
+                state.import_graph_generations = Some(source_generations.clone());
             }
-            if over_budget && state.access_mode == StructuralAccessMode::Auto {
+            if let Some(rejection_scope) = rejection_scope
+                && state.access_mode == StructuralAccessMode::Auto
+            {
                 cache.record_auto_rejection(
                     request,
                     &source_generations,
                     remaining_import_files,
                     remaining_import_edges,
+                    rejection_scope,
                 );
             }
             if let Some(profile) = &mut state.cache_profile {
@@ -3926,7 +4057,7 @@ fn discard_stale_direct_import_layer(state: &mut QueryExecutionState<'_>, requir
     let Some(layer_generations) = state.direct_import_layer_generations.as_deref() else {
         return;
     };
-    if state.analyzer.snapshot_source_generations().as_ref() == layer_generations {
+    if state.analyzer.snapshot_generations_match(layer_generations) {
         return;
     }
     state.direct_import_layer = None;
@@ -3941,6 +4072,17 @@ fn discard_stale_direct_import_layer(state: &mut QueryExecutionState<'_>, requir
             .access_failure
             .get_or_insert_with(|| "direct import topology became stale before use".to_string());
     }
+}
+
+fn discard_stale_request_import_graph(state: &mut QueryExecutionState<'_>) {
+    let Some(generations) = state.import_graph_generations.as_deref() else {
+        return;
+    };
+    if state.analyzer.snapshot_generations_match(generations) {
+        return;
+    }
+    state.import_graph = None;
+    state.import_graph_generations = None;
 }
 
 fn record_direct_import_fallback(
@@ -3987,6 +4129,7 @@ fn apply_plan_step(
     let mut snapshot_lifecycle = None;
     let mut snapshot_relation_complete = true;
     if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
+        discard_stale_request_import_graph(state);
         if state.access_mode != StructuralAccessMode::ScanOnly {
             let request = derived_layer_request
                 .unwrap_or_else(DerivedLayerRequest::complete_direct_import_topology);
@@ -4050,9 +4193,14 @@ fn apply_plan_step(
                 }
             }
         } else {
+            if state.import_graph.is_none() {
+                state.import_graph = Some(RequestLocalDirectImportGraph::new(state.analyzer));
+                state.import_graph_generations = Some(state.analyzer.snapshot_source_generations());
+            }
             let graph = state
                 .import_graph
-                .get_or_insert_with(|| RequestLocalDirectImportGraph::new(state.analyzer));
+                .as_mut()
+                .expect("request import graph was initialized");
             let graph_exhausted = if step == &QueryStep::ImportersOf {
                 let cache_observation = state
                     .cache_profile
@@ -4211,9 +4359,11 @@ fn apply_plan_step(
             .as_ref()
             .map(DirectImportAccess::RequestLocal)
     };
-    let selected_layer_generations = use_snapshot_imports
-        .then(|| state.direct_import_layer_generations.clone())
-        .flatten();
+    let selected_layer_generations = if use_snapshot_imports {
+        state.direct_import_layer_generations.clone()
+    } else {
+        state.import_graph_generations.clone()
+    };
     let (mut rows, mut exhausted, mut step_truncated) = apply_pipeline_step(
         state.analyzer,
         state.workspace,
@@ -4233,19 +4383,23 @@ fn apply_plan_step(
         instrumentation,
     );
     if let Some(selected_generations) = selected_layer_generations
-        && state.analyzer.snapshot_source_generations().as_ref() != selected_generations.as_ref()
+        && !state
+            .analyzer
+            .snapshot_generations_match(&selected_generations)
     {
         rows.clear();
         exhausted = true;
         step_truncated = true;
         state.direct_import_layer = None;
         state.direct_import_layer_generations = None;
+        state.import_graph = None;
+        state.import_graph_generations = None;
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: "workspace",
-            message: "source generation changed during direct import topology replay; retry the query for a coherent snapshot".to_string(),
+            message: "source generation changed during direct import relation replay; retry the query for a coherent snapshot".to_string(),
         });
         if state.access_mode == StructuralAccessMode::IndexedRequired {
             state.access_failure.get_or_insert_with(|| {

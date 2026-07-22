@@ -822,9 +822,18 @@ impl QueryCodeBenchmarkCase {
             }
         }
 
-        let has_witness = match &self.expected_witness_json {
+        let has_identity_witness = match &self.expected_witness_json {
             Some(witness) => match serde_json::from_str::<serde_json::Value>(witness) {
-                Ok(value) if value.is_object() => true,
+                Ok(value) if value.is_object() => {
+                    if witness_has_stable_identity(&value) {
+                        true
+                    } else {
+                        errors.push(format!(
+                            "{label} expected_witness_json must contain a stable result identity such as a non-empty path"
+                        ));
+                        false
+                    }
+                }
                 Ok(_) => {
                     errors.push(format!(
                         "{label} expected_witness_json must contain a JSON object"
@@ -840,9 +849,13 @@ impl QueryCodeBenchmarkCase {
             },
             None => false,
         };
-        if !has_witness && self.min_results.unwrap_or(0) == 0 {
+        let has_bounded_result_count = matches!(
+            (self.min_results, self.max_results),
+            (Some(minimum), Some(maximum)) if minimum > 0 && minimum <= maximum
+        );
+        if !has_identity_witness && !has_bounded_result_count {
             errors.push(format!(
-                "{label} must require a positive result count or an exact result witness"
+                "{label} must require a positive bounded result count or an exact result witness"
             ));
         }
         if let (Some(min), Some(max)) = (self.min_results, self.max_results)
@@ -852,7 +865,7 @@ impl QueryCodeBenchmarkCase {
                 "{label} min_results {min} exceeds max_results {max}"
             ));
         }
-        if has_witness && self.max_results == Some(0) {
+        if has_identity_witness && self.max_results == Some(0) {
             errors.push(format!(
                 "{label} cannot require a witness while max_results is zero"
             ));
@@ -882,6 +895,14 @@ impl QueryCodeBenchmarkCase {
             .map_err(|error| error.to_string())?;
         CodeQuery::from_json(&value).map_err(|error| error.to_string())
     }
+}
+
+fn witness_has_stable_identity(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|path| !path.trim().is_empty())
 }
 
 #[derive(Default)]

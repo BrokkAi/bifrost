@@ -441,6 +441,7 @@ impl McpSession {
         if response.get("error").is_some() {
             return Err(format!("bifrost initialize failed: {response}"));
         }
+        validate_server_build_identity(&response)?;
 
         self.notify(json!({
             "jsonrpc": "2.0",
@@ -546,6 +547,23 @@ impl McpSession {
         self.stdout.join();
         self.stderr.join();
     }
+}
+
+fn validate_server_build_identity(response: &Value) -> Result<(), String> {
+    let server_identity = response
+        .pointer("/result/serverInfo/buildIdentity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "bifrost MCP initialize response omitted serverInfo.buildIdentity; rebuild the server binary"
+                .to_string()
+        })?;
+    if server_identity != crate::BIFROST_BUILD_IDENTITY {
+        return Err(format!(
+            "bifrost MCP server build identity `{server_identity}` does not match benchmark harness `{}`; rebuild both bifrost and bifrost_benchmark",
+            crate::BIFROST_BUILD_IDENTITY
+        ));
+    }
+    Ok(())
 }
 
 fn terminate_child(child: &mut Child) {
@@ -720,5 +738,29 @@ mod tests {
             .expect_err("silent child must time out");
 
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn initialize_build_identity_rejects_missing_and_stale_servers() {
+        let missing = json!({"result": {"serverInfo": {}}});
+        let error = validate_server_build_identity(&missing)
+            .expect_err("missing identity must be rejected");
+        assert!(
+            error.contains("omitted serverInfo.buildIdentity"),
+            "{error}"
+        );
+
+        let stale = json!({
+            "result": {"serverInfo": {"buildIdentity": "stale-binary"}}
+        });
+        let error =
+            validate_server_build_identity(&stale).expect_err("stale server must be rejected");
+        assert!(error.contains("stale-binary"), "{error}");
+        assert!(error.contains(crate::BIFROST_BUILD_IDENTITY), "{error}");
+
+        let current = json!({
+            "result": {"serverInfo": {"buildIdentity": crate::BIFROST_BUILD_IDENTITY}}
+        });
+        validate_server_build_identity(&current).expect("matching server identity");
     }
 }

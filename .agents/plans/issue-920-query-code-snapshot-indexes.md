@@ -27,8 +27,8 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 12:19Z) Resolved every confirmed Milestone 3 review finding: request-scoped Auto admission, partial-work fallback reuse, all-delegate generation identity, configured budget ownership, conservative construction preflight, post-replay generation rejection, strict benchmark parsing, and derived-layer-specific public telemetry all pass focused validation and all-target/all-feature Clippy.
 - [x] (2026-07-22 12:36Z) Completed Milestone 3 with clean-commit Gson evidence: 262 files/1,005 import edges, 112 exact results, warm median 335.5 to 263.2 ms, first/warm 2.16x, zero warm import resolution, and 20,262 retained bytes (0.44% of the persisted structural-facts payload).
 - [x] (2026-07-22 12:50Z) Centralized request-wide retained-value accounting behind a typed census and removed the per-file clone of bulk import facts; all-target/all-feature checking plus focused census and topology tests pass before the final architecture-review fixes.
-- [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
-- [ ] Run cargo fmt --check, all-target/all-feature Clippy, and the complete nlp,python feature-enabled test gate.
+- [x] (2026-07-22 14:04Z) Completed the post-milestone architecture and benchmark guided review, fixed every confirmed lifecycle, budget, generation, identity, subset, and oracle finding, and centralized snapshot-cache/access-path state behind opaque provider and request-session APIs.
+- [x] (2026-07-22 14:04Z) Passed cargo fmt --check, all-target/all-feature Clippy, the complete macOS-configured `cargo test --all-targets --features nlp,python` gate, and all 56 maturin/Python API tests.
 - [ ] Open a draft PR, temporarily enable the benchmark workflow on the PR branch, collect the Ubuntu artifact, record baseline figures, and remove the temporary workflow trigger.
 - [ ] Audit every issue acceptance criterion against current code, tests, benchmark artifacts, and PR state.
 
@@ -96,6 +96,15 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: Express remains a useful small-path corroboration but is too fast for the stricter absolute latency arm to be stable: repeated final-code runs moved its scan warm median between 12.9 and 15.7 ms while Auto stayed near 4.7-4.8 ms. The larger pinned Gson importer case gives decisive promotion evidence without relying on local timing noise.
   Evidence: valid Express v3 reports and the clean Gson pair at `da8862e8`; Gson improves by 72.297 ms while preserving 112 results.
+
+- Observation: The final guided review found stale-generation windows outside the cache primitives themselves: overlay removal incremented its generation after releasing the write lock, posting selection was not revalidated after replay, and partial import fallbacks retained request work without binding it to every delegate generation. The access path now holds mutation and generation publication atomically, carries the full generation vector through selection, and discards request-local rows when that vector changes.
+  Evidence: synchronized overlay-reader, post-selection generation-drift, and multi-delegate import-fallback regressions pass in the complete test gate.
+
+- Observation: A benchmark report can be internally correct yet attributed to the wrong source checkout when `bifrost_benchmark` executes a stale sibling `bifrost` binary. Build identity therefore has to be an explicit protocol handshake, not a convention in the runbook.
+  Evidence: `BIFROST_BUILD_IDENTITY` is embedded from the binary-affecting checkout state, exposed by CLI and MCP initialization, and rejected by runner tests when missing or stale.
+
+- Observation: Subset benchmark mode cannot produce comparable query_code numbers because its query oracles describe the pinned complete workspace, and an empty JSON witness can vacuously match any result. Subset runs now mark query_code skipped and comparison rejects subset reports; manifest witnesses require a stable nonempty path identity or a positive bounded result count.
+  Evidence: subset integration, vacuous-witness rejection, and fake fast-empty MCP-server tests pass.
 
 ## Decision Log
 
@@ -179,6 +188,18 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: Parallel seed branches share retained values, so summing per-branch bytes double-counts memory; including the semantic kind prevents unrelated cached value types from colliding if they have the same allocator address.
   Date/Author: 2026-07-22 / Codex.
 
+- Decision: Make Auto posting admission request-scoped through one `QueryStructuralIndexSession`, and publish reuse observation only after a successful generation-stable request.
+  Rationale: Branch-local observations can make a single composed request eagerly build, while failed or stale requests must not train later requests to retain an index.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Cache deterministic structural and derived-layer rejections at their honest scope, hand a leader's rejection to current followers, and retain incomparable budget rejections as a Pareto frontier.
+  Rationale: Rebuilding an impossible value wastes the same bounded work, but a tighter file budget and a tighter edge budget are not interchangeable and must not suppress a later viable request.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Bind benchmark execution to the exact source identity of both local binaries and refuse full-report comparison after `--max-files` subset execution.
+  Rationale: Performance evidence is only auditable when the measured server matches the claimed checkout and the candidate and baseline represent the same complete workload.
+  Date/Author: 2026-07-22 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The checked-in manifest now has 13 correctness-checked query cases across all ten pinned languages and all six workload classes, including the later-added representative Gson importer workload. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
@@ -190,6 +211,8 @@ Milestone 2 is implementation- and guided-review-complete. The posting index ret
 The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satisfies the Milestone 2 promotion gates. For `workspace-exact-sql-mapper-class`, scan-only first/warm median/p95 was 217.6/107.4/245.1 ms and Auto was 208.9/26.0/26.8 ms, a 4.13x warm-median improvement with an 8.04x first-to-warm ratio. Indexed warm execution reduced candidate/examined facts from 49,181 to 27, materialized facts from 49,181 to 24,269, and inspected source bytes from 1,159,390 to 917,649. The transition warmup built over 157 files and 85,325 facts in 210.9 ms; the retained index was 1,979,756 bytes versus 12,215,566 normalized-facts bytes, or 16.2%. Both paths returned the same 27 results without truncation or diagnostics.
 
 Milestone 3 is complete. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Auto defers one-shot requests, rejected builds suppress same-or-tighter retries, partial failed-build work becomes the exact request-local fallback, and every delegate generation participates in MultiAnalyzer invalidation. The clean Gson pair passes every promotion threshold; owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
+
+The post-milestone guided review is locally complete. Cache rejection handoff, atomic overlay generations, request-scoped posting admission, post-replay generation validation, bounded allocation preflight, generation-bound import fallback, Pareto-scoped rejection caching, and opaque provider ownership now close the lifecycle and architecture gaps found by the reviewers. Benchmark evidence is protected by a checkout build-identity handshake, strict cache-layer decoding, non-vacuous witnesses, subset-report exclusion, and an environment-variance-independent cold/warm invariant. The final local gate passed all Rust targets with `nlp,python`, all 56 Python API tests, formatting, and all-target/all-feature Clippy; the remaining evidence boundary is the Ubuntu workflow artifact from the draft PR.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -600,6 +623,22 @@ Milestone 3 final clean representative pair:
     auto warm = 1 complete hit / 0 import files / 0 import edges; replayed topology payload = 1,005 edges
     retained topology bytes = 20,262
     persisted structural-facts payload census = 4,648,408 bytes across 262 snapshots; topology/payload = 0.44%
+
+Post-milestone architecture and benchmark validation before rebase:
+
+    cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    # pass
+    RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' cargo test --all-targets --features nlp,python
+    # pass; macOS linker flags match .github/workflows/ci.yml
+    bash scripts/test_python.sh
+    # 56 pass
+    cargo test --lib complete_value_cache
+    cargo test --lib derived
+    cargo test --lib index
+    cargo test --lib structural::search
+    cargo test --test benchmark_manifest --test benchmark_compare --test bifrost_benchmark_run
+    # all pass, including rejection handoff, generation drift, subset, build identity, strict parser, and fake-empty oracle regressions
 
 Invalid local timing artifacts that must not be cited:
 

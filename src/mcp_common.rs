@@ -491,6 +491,7 @@ fn initialize_result(instructions: &str, advertise_codex_sandbox_state: bool) ->
         "serverInfo": {
             "name": "bifrost",
             "version": env!("CARGO_PKG_VERSION"),
+            "buildIdentity": crate::BIFROST_BUILD_IDENTITY,
         },
         "instructions": instructions,
     });

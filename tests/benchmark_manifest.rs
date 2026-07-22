@@ -145,13 +145,45 @@ query_code_queries = [
         "cannot use query_file",
         "cannot set execution_mode",
         "invalid query_json",
-        "positive result count or an exact result witness",
+        "positive bounded result count or an exact result witness",
     ] {
         assert!(
             messages.contains(expected),
             "missing `{expected}` in {messages}"
         );
     }
+}
+
+#[test]
+fn manifest_validation_rejects_vacuous_query_code_witnesses() {
+    let manifest = r#"
+warmup_iterations = 1
+measured_iterations = 1
+required_languages = ["java"]
+required_scenarios = ["query_code"]
+
+[[repos]]
+name = "fixture"
+url = "https://example.com/fixture"
+commit = "deadbeef"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["query_code"]
+query_code_queries = [
+  { id = "empty", workloads = ["exact_name", "broad", "regex", "containment", "typed_traversal", "warm_reuse"], query_json = '{"match":{"kind":"class","name":"A"}}', expected_witness_json = '{}' },
+  { id = "kind-only", workloads = ["exact_name"], query_json = '{"match":{"kind":"class","name":"A"}}', expected_witness_json = '{"kind":"class"}', min_results = 1 },
+]
+"#;
+
+    let err = BenchmarkManifest::from_toml_str(manifest).expect_err("manifest should fail");
+    let ManifestLoadError::Validation(validation) = err else {
+        panic!("expected validation error");
+    };
+    let messages = validation.messages().join("\n");
+    assert!(
+        messages.contains("stable result identity"),
+        "missing vacuous-witness error in {messages}"
+    );
 }
 
 #[test]
@@ -244,7 +276,7 @@ languages = ["java"]
 extensions = ["java"]
 scenarios = ["workspace_build", "query_code"]
 query_code_queries = [
-  { id = "nested-union", workloads = ["exact_name", "typed_traversal"], query_json = '{"union":[{"languages":["java"],"where":["src/A.java"],"match":{"kind":"class","name":"A"}},{"languages":["java"],"where":["src/B.java"],"match":{"kind":"class","name":"B"}}],"steps":[{"op":"file_of"}]}', required_paths = ["src/A.java", "src/B.java"], min_results = 1 },
+  { id = "nested-union", workloads = ["exact_name", "typed_traversal"], query_json = '{"union":[{"languages":["java"],"where":["src/A.java"],"match":{"kind":"class","name":"A"}},{"languages":["java"],"where":["src/B.java"],"match":{"kind":"class","name":"B"}}],"steps":[{"op":"file_of"}]}', required_paths = ["src/A.java", "src/B.java"], min_results = 1, max_results = 2 },
 ]
 "#;
 

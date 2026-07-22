@@ -43,8 +43,16 @@ pub(crate) enum CompleteValueAcquisition<K, V>
 where
     K: Eq + Hash,
 {
-    Cached { value: Arc<V> },
-    Leader { permit: CompleteValuePermit<K, V> },
+    Cached {
+        value: Arc<V>,
+    },
+    Leader {
+        permit: CompleteValuePermit<K, V>,
+    },
+    /// The same-key leader proved that this flight cannot produce a complete
+    /// value. Callers that retain deterministic rejection state can return it
+    /// to every follower without serially rebuilding the same value.
+    Rejected,
     Cancelled,
 }
 
@@ -159,6 +167,9 @@ where
                     return (CompleteValueAcquisition::Cached { value }, wait);
                 }
                 FlightWait::Retry => {}
+                FlightWait::Rejected => {
+                    return (CompleteValueAcquisition::Rejected, wait);
+                }
                 FlightWait::Cancelled => {
                     return (CompleteValueAcquisition::Cancelled, wait);
                 }
@@ -212,6 +223,7 @@ struct InFlightState<V> {
     running: bool,
     waiters: usize,
     completed: Option<Arc<V>>,
+    rejected: bool,
 }
 
 impl<V> InFlightMaterialization<V> {
@@ -221,6 +233,7 @@ impl<V> InFlightMaterialization<V> {
                 running: true,
                 waiters: 0,
                 completed: None,
+                rejected: false,
             }),
             wake: Condvar::new(),
         }
@@ -244,6 +257,8 @@ impl<V> InFlightMaterialization<V> {
             FlightWait::Cancelled
         } else if let Some(value) = &state.completed {
             FlightWait::Completed(Arc::clone(value))
+        } else if state.rejected {
+            FlightWait::Rejected
         } else {
             FlightWait::Retry
         }
@@ -252,6 +267,7 @@ impl<V> InFlightMaterialization<V> {
 
 enum FlightWait<V> {
     Completed(Arc<V>),
+    Rejected,
     Retry,
     Cancelled,
 }
@@ -281,6 +297,17 @@ where
             .lock()
             .expect("complete-value single-flight state mutex poisoned")
             .completed = Some(value);
+    }
+
+    /// Hand the current flight's deterministic rejection to its followers
+    /// without retaining a value in the ready cache. The owner is responsible
+    /// for keeping the exact-key reason available after this permit is dropped.
+    pub(crate) fn publish_rejected(self) {
+        self.flight
+            .state
+            .lock()
+            .expect("complete-value single-flight state mutex poisoned")
+            .rejected = true;
     }
 }
 
@@ -484,6 +511,37 @@ mod tests {
             panic!("retried complete value must be cached")
         };
         assert!(Arc::ptr_eq(&retried, &value));
+    }
+
+    #[test]
+    fn rejected_leader_hands_failure_to_current_waiters_without_serial_retry() {
+        let cache = cache(1024, 1);
+        let key = "graph".to_string();
+        let (CompleteValueAcquisition::Leader { permit }, _) =
+            cache.acquire(&key, &CancellationToken::default())
+        else {
+            panic!("first caller must lead")
+        };
+
+        let follower_cache = cache.clone();
+        let follower_key = key.clone();
+        let follower = thread::spawn(move || {
+            follower_cache.acquire(&follower_key, &CancellationToken::default())
+        });
+        wait_for_waiter(&cache);
+
+        permit.publish_rejected();
+        let (CompleteValueAcquisition::Rejected, wait) = follower.join().expect("follower thread")
+        else {
+            panic!("follower must receive the same-flight rejection")
+        };
+        assert_eq!(wait.waits, 1);
+        assert_eq!(cache.len_for_test(), 0);
+
+        assert!(matches!(
+            cache.acquire(&key, &CancellationToken::default()).0,
+            CompleteValueAcquisition::Leader { .. }
+        ));
     }
 
     #[test]

@@ -108,8 +108,15 @@ pub(crate) enum DerivedLayerBuildOutcome {
     Unavailable {
         reason: String,
         over_budget: bool,
+        rejection_scope: Option<DerivedLayerRejectionScope>,
         metrics: DerivedLayerBuildMetrics,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DerivedLayerRejectionScope {
+    RequestBudget,
+    SnapshotBudget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +139,7 @@ pub(crate) enum DerivedLayerAcquisition {
     Unavailable {
         reason: String,
         over_budget: bool,
+        rejection_scope: Option<DerivedLayerRejectionScope>,
         wait: CompleteValueWait,
         build: DerivedLayerBuildMetrics,
     },
@@ -141,7 +149,8 @@ struct DerivedLayerGeneration {
     source_generations: Box<[u64]>,
     values: Arc<CompleteValueCache<DerivedLayerRequest, DerivedLayer>>,
     auto_reuse_requests: HashSet<DerivedLayerRequest>,
-    auto_rejections: HashMap<DerivedLayerRequest, (usize, usize)>,
+    auto_rejections: HashMap<DerivedLayerRequest, Vec<(usize, usize)>>,
+    snapshot_rejections: HashSet<DerivedLayerRequest>,
 }
 
 /// Snapshot-owned complete derived values with generation-safe single-flight.
@@ -191,6 +200,7 @@ impl SnapshotDerivedLayerCache {
                     values: self.new_values(),
                     auto_reuse_requests: HashSet::default(),
                     auto_rejections: HashMap::default(),
+                    snapshot_rejections: HashSet::default(),
                 });
             }
         }
@@ -235,11 +245,16 @@ impl SnapshotDerivedLayerCache {
         max_edges: usize,
     ) -> bool {
         self.with_generation(source_generations, |generation| {
-            if generation.auto_rejections.get(&request).is_some_and(
-                |(rejected_files, rejected_edges)| {
-                    max_files <= *rejected_files && max_edges <= *rejected_edges
-                },
-            ) {
+            if generation.snapshot_rejections.contains(&request)
+                || generation
+                    .auto_rejections
+                    .get(&request)
+                    .is_some_and(|rejections| {
+                        rejections.iter().any(|(rejected_files, rejected_edges)| {
+                            max_files <= *rejected_files && max_edges <= *rejected_edges
+                        })
+                    })
+            {
                 return false;
             }
             !generation.auto_reuse_requests.insert(request)
@@ -253,11 +268,23 @@ impl SnapshotDerivedLayerCache {
         source_generations: &[u64],
         max_files: usize,
         max_edges: usize,
+        scope: DerivedLayerRejectionScope,
     ) {
         let _ = self.with_generation(source_generations, |generation| {
-            generation
-                .auto_rejections
-                .insert(request, (max_files, max_edges));
+            if scope == DerivedLayerRejectionScope::SnapshotBudget {
+                generation.snapshot_rejections.insert(request);
+                generation.auto_rejections.remove(&request);
+                return;
+            }
+            let rejections = generation.auto_rejections.entry(request).or_default();
+            if rejections
+                .iter()
+                .any(|(files, edges)| max_files <= *files && max_edges <= *edges)
+            {
+                return;
+            }
+            rejections.retain(|(files, edges)| *files > max_files || *edges > max_edges);
+            rejections.push((max_files, max_edges));
         });
     }
 
@@ -273,6 +300,7 @@ impl SnapshotDerivedLayerCache {
             return DerivedLayerAcquisition::Unavailable {
                 reason: "derived-layer source generation is older than the cache owner".to_string(),
                 over_budget: false,
+                rejection_scope: None,
                 wait: CompleteValueWait::default(),
                 build: DerivedLayerBuildMetrics::default(),
             };
@@ -284,6 +312,7 @@ impl SnapshotDerivedLayerCache {
                     return DerivedLayerAcquisition::Unavailable {
                         reason: "derived-layer source generation changed before reuse".to_string(),
                         over_budget: false,
+                        rejection_scope: None,
                         wait,
                         build: DerivedLayerBuildMetrics::default(),
                     };
@@ -305,21 +334,25 @@ impl SnapshotDerivedLayerCache {
                         };
                     }
                     if !generation_is_current() {
+                        permit.publish_rejected();
                         return DerivedLayerAcquisition::Unavailable {
                             reason: "derived-layer source generation changed during build"
                                 .to_string(),
                             over_budget: false,
+                            rejection_scope: None,
                             wait,
                             build: metrics,
                         };
                     }
                     if metrics.retained_bytes > self.max_retained_bytes {
+                        permit.publish_rejected();
                         return DerivedLayerAcquisition::Unavailable {
                             reason: format!(
                                 "derived layer retained-byte limit exceeded: {} > {}",
                                 metrics.retained_bytes, self.max_retained_bytes
                             ),
                             over_budget: true,
+                            rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
                             wait,
                             build: metrics,
                         };
@@ -331,6 +364,7 @@ impl SnapshotDerivedLayerCache {
                             reason: "derived-layer source generation changed during publication"
                                 .to_string(),
                             over_budget: false,
+                            rejection_scope: None,
                             wait,
                             build: metrics,
                         };
@@ -351,13 +385,39 @@ impl SnapshotDerivedLayerCache {
                 DerivedLayerBuildOutcome::Unavailable {
                     reason,
                     over_budget,
+                    rejection_scope,
                     metrics,
-                } => DerivedLayerAcquisition::Unavailable {
-                    reason,
-                    over_budget,
-                    wait,
-                    build: metrics,
-                },
+                } => {
+                    let generation_is_current = generation_is_current();
+                    if rejection_scope.is_some() {
+                        permit.publish_rejected();
+                    }
+                    if !generation_is_current {
+                        DerivedLayerAcquisition::Unavailable {
+                            reason: "derived-layer source generation changed during failed build"
+                                .to_string(),
+                            over_budget: false,
+                            rejection_scope: None,
+                            wait,
+                            build: metrics,
+                        }
+                    } else {
+                        DerivedLayerAcquisition::Unavailable {
+                            reason,
+                            over_budget,
+                            rejection_scope,
+                            wait,
+                            build: metrics,
+                        }
+                    }
+                }
+            },
+            CompleteValueAcquisition::Rejected => DerivedLayerAcquisition::Unavailable {
+                reason: "derived-layer construction rejected by same-key leader".to_string(),
+                over_budget: false,
+                rejection_scope: None,
+                wait,
+                build: DerivedLayerBuildMetrics::default(),
             },
             CompleteValueAcquisition::Cancelled => DerivedLayerAcquisition::Cancelled {
                 wait,
@@ -492,8 +552,7 @@ pub(crate) fn build_direct_import_topology(
     let started = Instant::now();
     let mut metrics = DerivedLayerBuildMetrics::default();
     let mut files = analyzer.analyzed_files();
-    files.sort_by_key(rel_path_string);
-    files.dedup();
+    canonicalize_project_files(&mut files);
     if files.len() > limits.max_files || u32::try_from(files.len()).is_err() {
         metrics.elapsed_ns = elapsed_ns(started);
         return DirectImportTopologyBuild {
@@ -504,6 +563,7 @@ pub(crate) fn build_direct_import_topology(
                     limits.max_files
                 ),
                 over_budget: true,
+                rejection_scope: Some(DerivedLayerRejectionScope::RequestBudget),
                 metrics,
             },
             fallback: None,
@@ -524,6 +584,7 @@ pub(crate) fn build_direct_import_topology(
             outcome: DerivedLayerBuildOutcome::Unavailable {
                 reason: "direct import topology construction-byte limit exceeded".to_string(),
                 over_budget: true,
+                rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
                 metrics,
             },
             fallback: None,
@@ -560,6 +621,11 @@ pub(crate) fn build_direct_import_topology(
                     )
                 },
                 over_budget: true,
+                rejection_scope: Some(if construction_over_budget {
+                    DerivedLayerRejectionScope::SnapshotBudget
+                } else {
+                    DerivedLayerRejectionScope::RequestBudget
+                }),
                 metrics,
             },
             fallback: Some(request_graph),
@@ -581,6 +647,7 @@ pub(crate) fn build_direct_import_topology(
                     limits.max_retained_bytes
                 ),
                 over_budget: true,
+                rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
                 metrics,
             },
             fallback: Some(request_graph),
@@ -608,6 +675,7 @@ pub(crate) fn build_direct_import_topology(
                     limits.max_retained_bytes
                 ),
                 over_budget: true,
+                rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
                 metrics,
             },
             fallback: Some(request_graph),
@@ -630,19 +698,29 @@ pub(crate) struct RequestLocalDirectImportGraph {
     forward: HashMap<ProjectFile, Vec<ProjectFile>>,
     compact: Option<CompactDirectedGraph<ProjectFile>>,
     unsupported: HashSet<ProjectFile>,
+    budget_omitted: HashSet<ProjectFile>,
     all_files: Vec<ProjectFile>,
     analyzed: HashSet<ProjectFile>,
-    resolved_files: usize,
-    resolved_edges: usize,
+    attempted_files: usize,
+    attempted_edges: usize,
+    retained_edges: usize,
     forward_target_capacity: usize,
     complete: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RequestImportResolutionLimits<'a> {
+    max_files: usize,
+    max_edges: usize,
+    cancellation: Option<&'a CancellationToken>,
+    maximum_working_bytes: Option<u64>,
+    files_are_canonical: bool,
 }
 
 impl RequestLocalDirectImportGraph {
     pub(crate) fn new(analyzer: &dyn IAnalyzer) -> Self {
         let mut all_files = analyzer.analyzed_files();
-        all_files.sort_by_key(rel_path_string);
-        all_files.dedup();
+        canonicalize_project_files(&mut all_files);
         Self::from_files(all_files)
     }
 
@@ -657,7 +735,7 @@ impl RequestLocalDirectImportGraph {
 
     fn fixed_working_bytes(files: &[ProjectFile]) -> u64 {
         (size_of::<Self>() as u64).saturating_add((files.len() as u64).saturating_mul(
-            (size_of::<ProjectFile>() * 4 + size_of::<(ProjectFile, Vec<ProjectFile>)>() * 2 + 4)
+            (size_of::<ProjectFile>() * 5 + size_of::<(ProjectFile, Vec<ProjectFile>)>() * 2 + 5)
                 as u64,
         ))
     }
@@ -680,6 +758,10 @@ impl RequestLocalDirectImportGraph {
                     .saturating_mul((size_of::<ProjectFile>() + 1) as u64),
             )
             .saturating_add(
+                (self.budget_omitted.capacity() as u64)
+                    .saturating_mul((size_of::<ProjectFile>() + 1) as u64),
+            )
+            .saturating_add(
                 (self.forward_target_capacity as u64)
                     .saturating_mul(size_of::<ProjectFile>() as u64),
             )
@@ -697,7 +779,7 @@ impl RequestLocalDirectImportGraph {
                 CompactDirectedGraph::<ProjectFile>::estimated_bytes_for_parts(
                     self.all_files.len(),
                     self.analyzed.capacity(),
-                    self.resolved_edges,
+                    self.retained_edges,
                 ),
             )
             .saturating_add(self.all_files.len() as u64)
@@ -717,7 +799,7 @@ impl RequestLocalDirectImportGraph {
         DirectImportTopology {
             graph,
             supported_sources,
-            resolved_files: self.resolved_files,
+            resolved_files: self.attempted_files,
             retained_bytes,
         }
     }
@@ -732,7 +814,7 @@ impl RequestLocalDirectImportGraph {
             .enumerate()
             .map(|(index, file)| (file.clone(), index as u32))
             .collect();
-        let mut edges = Vec::with_capacity(self.resolved_edges);
+        let mut edges = Vec::with_capacity(self.retained_edges);
         for (source, targets) in &self.forward {
             let Some(source) = index_by_file.get(source).copied() else {
                 continue;
@@ -793,7 +875,9 @@ impl RequestLocalDirectImportGraph {
     }
 
     pub(crate) fn has_cached_forward(&self, file: &ProjectFile) -> bool {
-        self.forward.contains_key(file) || self.unsupported.contains(file)
+        self.forward.contains_key(file)
+            || self.unsupported.contains(file)
+            || self.budget_omitted.contains(file)
     }
 
     pub(crate) fn cached_forward_edge_count(&self, file: &ProjectFile) -> usize {
@@ -820,11 +904,11 @@ impl RequestLocalDirectImportGraph {
     }
 
     pub(crate) fn resolved_files(&self) -> usize {
-        self.resolved_files
+        self.attempted_files
     }
 
     pub(crate) fn resolved_edges(&self) -> usize {
-        self.resolved_edges
+        self.attempted_edges
     }
 
     pub(crate) fn ensure_complete(
@@ -839,8 +923,17 @@ impl RequestLocalDirectImportGraph {
             return false;
         }
         let files = self.all_files.clone();
-        let (exhausted, _) =
-            self.ensure_forward_inner(analyzer, &files, max_files, max_edges, cancellation, None);
+        let (exhausted, _) = self.ensure_forward_inner(
+            analyzer,
+            &files,
+            RequestImportResolutionLimits {
+                max_files,
+                max_edges,
+                cancellation,
+                maximum_working_bytes: None,
+                files_are_canonical: true,
+            },
+        );
         if !exhausted {
             self.complete = true;
         }
@@ -863,10 +956,13 @@ impl RequestLocalDirectImportGraph {
         let outcome = self.ensure_forward_inner(
             analyzer,
             &files,
-            max_files,
-            max_edges,
-            Some(cancellation),
-            Some(maximum_working_bytes),
+            RequestImportResolutionLimits {
+                max_files,
+                max_edges,
+                cancellation: Some(cancellation),
+                maximum_working_bytes: Some(maximum_working_bytes),
+                files_are_canonical: true,
+            },
         );
         if !outcome.0 {
             self.complete = true;
@@ -882,32 +978,52 @@ impl RequestLocalDirectImportGraph {
         max_edges: usize,
         cancellation: Option<&CancellationToken>,
     ) -> bool {
-        self.ensure_forward_inner(analyzer, files, max_files, max_edges, cancellation, None)
-            .0
+        self.ensure_forward_inner(
+            analyzer,
+            files,
+            RequestImportResolutionLimits {
+                max_files,
+                max_edges,
+                cancellation,
+                maximum_working_bytes: None,
+                files_are_canonical: false,
+            },
+        )
+        .0
     }
 
     fn ensure_forward_inner(
         &mut self,
         analyzer: &dyn IAnalyzer,
         files: &[ProjectFile],
-        max_files: usize,
-        max_edges: usize,
-        cancellation: Option<&CancellationToken>,
-        maximum_working_bytes: Option<u64>,
+        limits: RequestImportResolutionLimits<'_>,
     ) -> (bool, bool) {
+        let RequestImportResolutionLimits {
+            max_files,
+            max_edges,
+            cancellation,
+            maximum_working_bytes,
+            files_are_canonical,
+        } = limits;
+        let previously_omitted = files.iter().any(|file| self.budget_omitted.contains(file));
         let mut pending = files
             .iter()
-            .filter(|file| !self.forward.contains_key(*file) && !self.unsupported.contains(*file))
+            .filter(|file| {
+                !self.forward.contains_key(*file)
+                    && !self.unsupported.contains(*file)
+                    && !self.budget_omitted.contains(*file)
+            })
             .cloned()
             .collect::<Vec<_>>();
-        pending.sort_by_key(rel_path_string);
-        pending.dedup();
+        if !files_are_canonical {
+            canonicalize_project_files(&mut pending);
+        }
         if pending.is_empty() {
-            return (false, false);
+            return (previously_omitted, false);
         }
 
-        let available_files = max_files.saturating_sub(self.resolved_files);
-        let mut exhausted = pending.len() > available_files;
+        let available_files = max_files.saturating_sub(self.attempted_files);
+        let mut exhausted = previously_omitted || pending.len() > available_files;
         if pending.len() > available_files {
             pending.truncate(available_files);
         }
@@ -923,7 +1039,7 @@ impl RequestLocalDirectImportGraph {
                     .or_default()
                     .push(file);
             } else {
-                self.resolved_files += 1;
+                self.attempted_files = self.attempted_files.saturating_add(1);
                 self.unsupported.insert(file);
                 self.compact = None;
                 if maximum_working_bytes
@@ -935,7 +1051,6 @@ impl RequestLocalDirectImportGraph {
         }
 
         for grouped_files in groups.values_mut() {
-            grouped_files.sort_by_key(rel_path_string);
             let Some(provider) = grouped_files
                 .first()
                 .and_then(|file| analyzer.import_analysis_provider_for_file(file))
@@ -945,10 +1060,26 @@ impl RequestLocalDirectImportGraph {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return (true, false);
             }
+            if self.attempted_edges >= max_edges {
+                exhausted = true;
+                self.budget_omitted.extend(grouped_files.iter().cloned());
+                self.compact = None;
+                continue;
+            }
             let bulk_infos = provider.import_infos_for_files(grouped_files);
+            // The provider has now materialized import information for the
+            // whole canonical batch. Charge that real work even if a later
+            // edge-budget check prevents retaining some resolved relations.
+            self.attempted_files = self.attempted_files.saturating_add(grouped_files.len());
             for file in grouped_files.iter() {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return (true, false);
+                }
+                if self.attempted_edges >= max_edges {
+                    exhausted = true;
+                    self.budget_omitted.insert(file.clone());
+                    self.compact = None;
+                    continue;
                 }
                 let owned_imports;
                 let imports =
@@ -963,16 +1094,31 @@ impl RequestLocalDirectImportGraph {
                         .into_iter()
                         .filter(|target| self.analyzed.contains(target))
                         .collect::<Vec<_>>();
-                targets.sort_by_key(rel_path_string);
-                targets.dedup();
+                canonicalize_project_files(&mut targets);
 
-                let available_edges = max_edges.saturating_sub(self.resolved_edges);
+                let transient_target_bytes = (targets.capacity() as u64)
+                    .saturating_mul(size_of::<ProjectFile>() as u64)
+                    .saturating_mul(2);
+                self.attempted_edges = self.attempted_edges.saturating_add(targets.len());
+                if maximum_working_bytes.is_some_and(|maximum| {
+                    self.estimated_working_bytes()
+                        .saturating_add(transient_target_bytes)
+                        > maximum
+                }) {
+                    self.budget_omitted.insert(file.clone());
+                    self.compact = None;
+                    return (true, true);
+                }
+
+                let available_edges =
+                    max_edges.saturating_sub(self.attempted_edges.saturating_sub(targets.len()));
                 if targets.len() > available_edges {
                     exhausted = true;
+                    self.budget_omitted.insert(file.clone());
+                    self.compact = None;
                     continue;
                 }
-                self.resolved_files += 1;
-                self.resolved_edges += targets.len();
+                self.retained_edges = self.retained_edges.saturating_add(targets.len());
                 self.forward_target_capacity = self
                     .forward_target_capacity
                     .saturating_add(targets.capacity());
@@ -987,6 +1133,16 @@ impl RequestLocalDirectImportGraph {
         }
         (exhausted, false)
     }
+}
+
+fn canonicalize_project_files(files: &mut Vec<ProjectFile>) {
+    let mut keyed = files
+        .drain(..)
+        .map(|file| (rel_path_string(&file), file))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    keyed.dedup_by(|left, right| left.1 == right.1);
+    files.extend(keyed.into_iter().map(|(_, file)| file));
 }
 
 fn elapsed_ns(started: Instant) -> u64 {
@@ -1183,6 +1339,7 @@ mod tests {
             || DerivedLayerBuildOutcome::Unavailable {
                 reason: "incomplete".to_string(),
                 over_budget: false,
+                rejection_scope: None,
                 metrics: DerivedLayerBuildMetrics::default(),
             },
             || true,
@@ -1201,6 +1358,48 @@ mod tests {
                 lifecycle: DerivedLayerLifecycle::Built,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn auto_rejections_keep_incomparable_request_budgets_and_snapshot_failures() {
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let request = DerivedLayerRequest::complete_direct_import_topology();
+        let generations = [1];
+
+        cache.record_auto_rejection(
+            request,
+            &generations,
+            10,
+            100,
+            DerivedLayerRejectionScope::RequestBudget,
+        );
+        cache.record_auto_rejection(
+            request,
+            &generations,
+            100,
+            10,
+            DerivedLayerRejectionScope::RequestBudget,
+        );
+
+        // Each Pareto point suppresses only budgets it dominates.
+        assert!(!cache.observe_auto_reuse_opportunity(request, &generations, 5, 50));
+        assert!(!cache.observe_auto_reuse_opportunity(request, &generations, 50, 5));
+        assert!(!cache.observe_auto_reuse_opportunity(request, &generations, 50, 50));
+        assert!(cache.observe_auto_reuse_opportunity(request, &generations, 50, 50));
+
+        cache.record_auto_rejection(
+            request,
+            &generations,
+            usize::MAX,
+            usize::MAX,
+            DerivedLayerRejectionScope::SnapshotBudget,
+        );
+        assert!(!cache.observe_auto_reuse_opportunity(
+            request,
+            &generations,
+            usize::MAX,
+            usize::MAX
         ));
     }
 
