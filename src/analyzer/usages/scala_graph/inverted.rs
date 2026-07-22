@@ -566,6 +566,38 @@ impl ProjectTypes {
         }
     }
 
+    fn physical_callable_targets(
+        &self,
+        scala: &ScalaAnalyzer,
+        targets: Vec<CodeUnit>,
+    ) -> PhysicalCallableTargets {
+        if targets.is_empty() {
+            return PhysicalCallableTargets::NoCandidates;
+        }
+        let owners = targets
+            .iter()
+            .filter_map(|target| self.exact_structural_parent(scala, target))
+            .collect::<HashSet<_>>();
+        if owners.len() > 1 {
+            PhysicalCallableTargets::Ambiguous
+        } else {
+            PhysicalCallableTargets::Unique(targets)
+        }
+    }
+
+    fn fallback_callable_role(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
+        if unit.is_synthetic() {
+            ScalaCallableRole::PrimaryConstructor
+        } else if self
+            .exact_structural_parent(scala, unit)
+            .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
+        {
+            ScalaCallableRole::SecondaryConstructor
+        } else {
+            ScalaCallableRole::Ordinary
+        }
+    }
+
     fn direct_member_bindings(&self, owner_fqn: &str) -> ExportedMemberBindings {
         let mut bindings = ExportedMemberBindings::default();
         for child in self.index.fqn_direct_children(owner_fqn) {
@@ -1395,7 +1427,7 @@ impl ProjectTypes {
                 .iter()
                 .map(|(method, _, alternatives)| {
                     if alternatives.is_empty() {
-                        usize::from(site_role.accepts(fallback_callable_role(scala, method)))
+                        usize::from(site_role.accepts(self.fallback_callable_role(scala, method)))
                     } else {
                         alternatives
                             .iter()
@@ -1418,7 +1450,7 @@ impl ProjectTypes {
                             .into_iter()
                             .collect::<Vec<_>>();
                         usize::from(scala_callable_alternative_is_candidate(
-                            fallback_callable_role(scala, method),
+                            self.fallback_callable_role(scala, method),
                             &fallback,
                             shape,
                             site_role,
@@ -1442,7 +1474,7 @@ impl ProjectTypes {
                     facts,
                     alternatives,
                     call_arities,
-                    fallback_callable_role(scala, method),
+                    self.fallback_callable_role(scala, method),
                     site_role,
                     unique_callable,
                 ),
@@ -1458,7 +1490,7 @@ impl ProjectTypes {
                             .into_iter()
                             .collect::<Vec<_>>();
                         scala_callable_alternative_matches(
-                            fallback_callable_role(scala, method),
+                            self.fallback_callable_role(scala, method),
                             &fallback,
                             Some(shape),
                             site_role,
@@ -2393,7 +2425,7 @@ impl ProjectTypes {
             .map(|(method, _, alternatives)| {
                 if alternatives.is_empty() {
                     usize::from(
-                        fallback_callable_role(scala, method) == ScalaCallableRole::Ordinary,
+                        self.fallback_callable_role(scala, method) == ScalaCallableRole::Ordinary,
                     )
                 } else {
                     alternatives
@@ -2425,7 +2457,7 @@ impl ProjectTypes {
                     .into_iter()
                     .collect::<Vec<_>>();
                 if !scala_callable_alternative_matches(
-                    fallback_callable_role(scala, method),
+                    self.fallback_callable_role(scala, method),
                     &fallback_shape,
                     call_shape,
                     ScalaCallableSiteRole::Ordinary,
@@ -4084,11 +4116,11 @@ impl ProjectTypes {
         if !target.is_function() || target.short_name().rsplit('.').next() != Some("apply") {
             return None;
         }
-        let companion = scala.structural_parent_of(target)?;
+        let companion = self.exact_structural_parent(scala, target)?;
         if !companion.is_class() || !companion.short_name().ends_with('$') {
             return None;
         }
-        let structural_parent = scala.structural_parent_of(&companion);
+        let structural_parent = self.exact_structural_parent(scala, &companion);
         let mut candidates = self
             .index
             .by_normalized_fqn(&scala_normalized_fq_name(&companion.fq_name()))
@@ -4097,7 +4129,7 @@ impl ProjectTypes {
                 candidate.is_class()
                     && !candidate.short_name().ends_with('$')
                     && candidate.source() == companion.source()
-                    && scala.structural_parent_of(candidate) == structural_parent
+                    && self.exact_structural_parent(scala, candidate) == structural_parent
                     && self.is_case_class(scala, candidate)
             });
         let candidate = candidates.next()?.clone();
@@ -4337,7 +4369,8 @@ impl ProjectTypes {
                         })
                 })
                 .collect::<Vec<_>>();
-            let mut callable_targets = match physical_callable_targets(scala, unapply_targets) {
+            let mut callable_targets = match self.physical_callable_targets(scala, unapply_targets)
+            {
                 PhysicalCallableTargets::Unique(targets) => targets,
                 PhysicalCallableTargets::Ambiguous => Vec::new(),
                 PhysicalCallableTargets::NoCandidates => {
@@ -4357,7 +4390,7 @@ impl ProjectTypes {
                             )
                         })
                         .collect::<Vec<_>>();
-                    match physical_callable_targets(scala, primary_targets) {
+                    match self.physical_callable_targets(scala, primary_targets) {
                         PhysicalCallableTargets::Unique(targets) => targets,
                         PhysicalCallableTargets::NoCandidates
                         | PhysicalCallableTargets::Ambiguous => Vec::new(),
@@ -4391,7 +4424,9 @@ impl ProjectTypes {
                     )
                 })
                 .collect::<Vec<_>>();
-            let callable_targets = physical_callable_targets(scala, callable_targets).into_unique();
+            let callable_targets = self
+                .physical_callable_targets(scala, callable_targets)
+                .into_unique();
             let type_target = type_target.filter(|target| {
                 self.is_scala_trait_declaration(scala, target) || {
                     let members = self
@@ -4493,7 +4528,7 @@ impl ProjectTypes {
             .as_ref()
             .map(|resolution| resolution.callable_targets.clone())
             .unwrap_or_default();
-        match physical_callable_targets(scala, apply_targets) {
+        match self.physical_callable_targets(scala, apply_targets) {
             PhysicalCallableTargets::Unique(mut apply_targets) => {
                 if !type_candidates.is_empty() {
                     let mut seen = HashSet::default();
@@ -4540,7 +4575,9 @@ impl ProjectTypes {
                 )
             })
             .collect::<Vec<_>>();
-        let callable_targets = physical_callable_targets(scala, callable_targets).into_unique();
+        let callable_targets = self
+            .physical_callable_targets(scala, callable_targets)
+            .into_unique();
         TypeApplicationResolution {
             value_result: type_target
                 .as_ref()
@@ -6100,37 +6137,6 @@ impl PhysicalCallableTargets {
     }
 }
 
-fn physical_callable_targets(
-    scala: &ScalaAnalyzer,
-    targets: Vec<CodeUnit>,
-) -> PhysicalCallableTargets {
-    if targets.is_empty() {
-        return PhysicalCallableTargets::NoCandidates;
-    }
-    let owners = targets
-        .iter()
-        .filter_map(|target| scala.structural_parent_of(target))
-        .collect::<HashSet<_>>();
-    if owners.len() > 1 {
-        PhysicalCallableTargets::Ambiguous
-    } else {
-        PhysicalCallableTargets::Unique(targets)
-    }
-}
-
-fn fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
-    if unit.is_synthetic() {
-        ScalaCallableRole::PrimaryConstructor
-    } else if scala
-        .structural_parent_of(unit)
-        .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
-    {
-        ScalaCallableRole::SecondaryConstructor
-    } else {
-        ScalaCallableRole::Ordinary
-    }
-}
-
 pub(super) fn is_package_level_type(unit: &CodeUnit) -> bool {
     !unit.short_name().contains('.')
 }
@@ -6229,7 +6235,7 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
                 | ScalaReferenceRole::CompanionExtractor
                 | ScalaReferenceRole::CompanionValue
         ) && let ScalaResolvedReference::Exact(callable) = &target
-            && let Some(owner) = self.scala.structural_parent_of(callable)
+            && let Some(owner) = self.types.exact_structural_parent(self.scala, callable)
         {
             let companions = if owner.short_name().ends_with('$') {
                 vec![owner]
@@ -7885,7 +7891,7 @@ fn record_union_receiver_parameterless_methods(
         let field_owners = resolved
             .iter()
             .filter(|declaration| declaration.is_field())
-            .filter_map(|field| ctx.scala.structural_parent_of(field))
+            .filter_map(|field| ctx.types.exact_structural_parent(ctx.scala, field))
             .collect::<Vec<_>>();
         for field_owner in field_owners {
             for ancestor in ctx.scala.get_ancestors(&field_owner) {
@@ -7894,7 +7900,10 @@ fn record_union_receiver_parameterless_methods(
                         .definitions(&format!("{}.{}", ancestor.fq_name(), member))
                         .filter(|declaration| {
                             declaration.is_function()
-                                && ctx.scala.structural_parent_of(declaration).as_ref()
+                                && ctx
+                                    .types
+                                    .exact_structural_parent(ctx.scala, declaration)
+                                    .as_ref()
                                     == Some(&ancestor)
                         }),
                 );
@@ -7915,7 +7924,10 @@ fn record_union_receiver_parameterless_methods(
                         .definitions(&format!("{}.{}", ancestor.fq_name(), member))
                         .filter(|declaration| {
                             declaration.is_function()
-                                && ctx.scala.structural_parent_of(declaration).as_ref()
+                                && ctx
+                                    .types
+                                    .exact_structural_parent(ctx.scala, declaration)
+                                    .as_ref()
                                     == Some(&ancestor)
                         }),
                 );
@@ -8421,12 +8433,14 @@ fn record_local_stable_field_reference(
             || ctx.types.field_for_owner_member(ctx.scala, &owner, segment),
             |owner| ctx.types.field_for_owner_unit(ctx.scala, owner, segment),
         );
-        owner =
-            match resolution {
-                FieldResolution::Resolved(field) => match field.declared_type {
-                    Some(declared_type) => {
-                        exact_owner = ctx.scala.structural_parent_of(&field.declaration).and_then(
-                            |context| match ctx
+        owner = match resolution {
+            FieldResolution::Resolved(field) => match field.declared_type {
+                Some(declared_type) => {
+                    exact_owner = ctx
+                        .types
+                        .exact_structural_parent(ctx.scala, &field.declaration)
+                        .and_then(|context| {
+                            match ctx
                                 .types
                                 .exact_type_declaration_for_owner_context(&declared_type, &context)
                             {
@@ -8436,14 +8450,14 @@ fn record_local_stable_field_reference(
                                 ScalaTypeNamespaceResolution::NoMatch
                                 | ScalaTypeNamespaceResolution::AuthoritativeMiss
                                 | ScalaTypeNamespaceResolution::Ambiguous => None,
-                            },
-                        );
-                        declared_type
-                    }
-                    None => return true,
-                },
-                FieldResolution::NoMatch | FieldResolution::Unresolved => return true,
-            };
+                            }
+                        });
+                    declared_type
+                }
+                None => return true,
+            },
+            FieldResolution::NoMatch | FieldResolution::Unresolved => return true,
+        };
     }
     let resolution = exact_owner.as_ref().map_or_else(
         || ctx.types.field_for_owner_member(ctx.scala, &owner, member),
