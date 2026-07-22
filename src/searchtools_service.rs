@@ -803,9 +803,8 @@ impl SearchToolsService {
         arguments: Value,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(crate::analyzer::structural::execute_request(
-            snapshot.analyzer(),
-            &query,
+        Ok(crate::analyzer::structural::execute_workspace_request(
+            snapshot, &query,
         ))
     }
 
@@ -1061,7 +1060,7 @@ impl SearchToolsService {
 
     /// Construct an MCP service that has not yet been bound to a client-approved
     /// workspace root. Analyzer-backed tools return an actionable error until a
-    /// later protocol roots negotiation installs a workspace.
+    /// later roots response or negotiated host metadata installs a workspace.
     pub fn new_unbound() -> Self {
         Self {
             root: RwLock::new(None),
@@ -1074,10 +1073,10 @@ impl SearchToolsService {
         }
     }
 
-    /// Bind a rootless MCP service to an exact filesystem root approved by the
-    /// client's roots capability. Unlike the user-facing activation tool, this
-    /// deliberately does not promote a nested directory to an enclosing Git
-    /// repository: the client's declared boundary is authoritative.
+    /// Bind a rootless MCP service to an exact filesystem root supplied by the
+    /// client through roots or negotiated host metadata. Unlike the user-facing
+    /// activation tool, this deliberately does not promote a nested directory to
+    /// an enclosing Git repository: the client-provided boundary is authoritative.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
         let canonical = root.canonicalize().map_err(|err| {
             SearchToolsServiceError::invalid_params(format!(
@@ -1137,9 +1136,8 @@ impl SearchToolsService {
         Ok(canonical)
     }
 
-    /// Remove a workspace previously supplied through MCP roots. This is used
-    /// when the client explicitly returns an empty or unusable replacement
-    /// root list, so revoked scope never remains queryable.
+    /// Remove a workspace previously supplied through MCP roots or negotiated
+    /// host metadata, so revoked scope never remains queryable.
     pub fn unbind_client_workspace(&self) -> Result<(), SearchToolsServiceError> {
         let mut session = self
             .session

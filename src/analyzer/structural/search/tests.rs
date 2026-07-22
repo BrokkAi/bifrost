@@ -351,6 +351,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::UnsupportedImportAnalysis, Impact::Incomplete),
         (Code::SemanticResultsOmitted, Impact::Incomplete),
         (Code::ReceiverAnalysisPartial, Impact::Incomplete),
+        (Code::ReceiverAnalysisFailed, Impact::Incomplete),
         (Code::CallRelationBudgetExhausted, Impact::Incomplete),
         (Code::CallRelationParseFailed, Impact::Incomplete),
         (Code::CallRelationCandidatesOmitted, Impact::Incomplete),
@@ -1359,6 +1360,7 @@ fn sequential_profile_replays_a_shared_seed_for_each_union_branch() {
 
     let detailed = execute_internal(
         &analyzer,
+        None,
         &query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -1653,6 +1655,7 @@ fn absolute_exact_globs_cannot_panic_parallel_selection() {
         .expect("absolute globs remain valid query syntax");
         let profile = execute_internal(
             &analyzer,
+            None,
             &query,
             CodeQueryExecutionLimits::default(),
             None,
@@ -1698,6 +1701,7 @@ fn cancellation_bearing_parallel_union_runs_cancellation_safe_tasks() {
 
     let detailed = execute_internal_with_strategy(
         &analyzer,
+        None,
         &query,
         CodeQueryExecutionLimits::default(),
         Some(&cancellation),
@@ -1789,6 +1793,7 @@ fn profile_marks_truncated_seed_materialization_and_replay_incomplete() {
 
     let detailed = execute_internal(
         &analyzer,
+        None,
         &query,
         CodeQueryExecutionLimits {
             max_scanned_files: 1,
@@ -2149,6 +2154,7 @@ fn profile_preserves_incomplete_reference_cache_state_for_a_sibling() {
 
     let detailed = execute_internal(
         &analyzer,
+        None,
         &query,
         CodeQueryExecutionLimits {
             max_scanned_source_bytes: source.len().saturating_mul(2).saturating_add(4),
@@ -2229,6 +2235,7 @@ fn profile_attributes_root_limit_probe_to_the_limit_operator() {
 
     let detailed = execute_internal(
         &analyzer,
+        None,
         &query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -2300,6 +2307,7 @@ fn skipped_set_profile_forwards_cancellation_safe_partial_cardinality() {
             let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
             let detailed = execute_internal(
                 &analyzer,
+                None,
                 &query,
                 CodeQueryExecutionLimits::default(),
                 Some(&cancellation),
@@ -2664,6 +2672,31 @@ fn cross_file_call_nested_rendering_cannot_retry_an_exhausted_source() {
     assert!(partial.result.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
     }));
+}
+
+#[test]
+fn receiver_budget_projects_one_remaining_fact_cap_across_all_work() {
+    let base = ReceiverAnalysisBudget::default();
+    let bounded = receiver_budget_for_remaining_work(base, 100, usize::MAX);
+    assert_eq!(bounded.max_scope_nodes, 75);
+    assert_eq!(bounded.max_summary_expansions, 25);
+    assert_eq!(
+        bounded
+            .max_scope_nodes
+            .saturating_add(bounded.max_summary_expansions),
+        100
+    );
+
+    let tiny = receiver_budget_for_remaining_work(base, 1, 1);
+    assert!(
+        tiny.max_scope_nodes
+            .saturating_add(tiny.max_summary_expansions)
+            <= 1
+    );
+    assert_eq!(tiny.max_targets, 1);
+
+    let ample = receiver_budget_for_remaining_work(base, usize::MAX, usize::MAX);
+    assert_eq!(ample, base);
 }
 
 #[test]

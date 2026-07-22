@@ -4,8 +4,8 @@ use brokk_bifrost::analyzer::semantic::{
     CallableReferenceKind, CallableTargetResolution, CancellationToken, ControlEdgeKind,
     DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind,
     ProcedureKind, ProcedureSemantics, SemanticBudget, SemanticBudgetDimension, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
-    SemanticOutcome, SemanticRequest,
+    SemanticCapability, SemanticEffect, SemanticGap, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage, SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -177,12 +177,49 @@ fn assert_source_point_gap(
     );
 }
 
+fn assert_deferred_effect_impacts(gap: &SemanticGap, weakens_call_evaluation: bool, context: &str) {
+    assert_eq!(gap.capability, SemanticCapability::DeferredExecution);
+    for impact in [
+        SemanticGapImpact::ReturnTransfer,
+        SemanticGapImpact::ValueFlow,
+        SemanticGapImpact::HeapRead,
+        SemanticGapImpact::HeapWrite,
+        SemanticGapImpact::Aliasing,
+    ] {
+        assert!(
+            gap.impacts.contains(impact),
+            "DeferredExecution at {context} must surface {impact:?} uncertainty",
+        );
+    }
+    assert_eq!(
+        gap.impacts.contains(SemanticGapImpact::CallEvaluation),
+        weakens_call_evaluation,
+        "DeferredExecution impact must reflect whether {context} leaves a represented caller-side transfer incomplete",
+    );
+    assert!(!gap.impacts.contains(SemanticGapImpact::DispatchCoverage));
+}
+
 fn assert_direct_call_conformance(fixture: DirectCallFixture) {
     let project = InlineTestProject::with_language(fixture.language)
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, false);
+    assert_direct_call_project_conformance(&project, fixture, DirectCallExpectations::default());
+}
+
+fn assert_closed_dispatch_direct_call_conformance(fixture: DirectCallFixture) {
+    let project = InlineTestProject::with_language(fixture.language)
+        .file(fixture.callee_path, fixture.callee_source)
+        .file(fixture.caller_path, fixture.caller_source)
+        .build();
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            closed_dispatch_refinement: true,
+            ..DirectCallExpectations::default()
+        },
+    );
 }
 
 fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
@@ -190,14 +227,27 @@ fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, true);
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            unproven_return: true,
+            ..DirectCallExpectations::default()
+        },
+    );
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DirectCallExpectations {
+    unproven_link_unit: bool,
+    unproven_return: bool,
+    closed_dispatch_refinement: bool,
 }
 
 fn assert_direct_call_project_conformance(
     project: &BuiltInlineTestProject,
     fixture: DirectCallFixture,
-    expect_unproven_link_unit: bool,
-    expect_unproven_return: bool,
+    expectations: DirectCallExpectations,
 ) {
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let mut cfg = SemanticGraph::materialize(project, &analyzer, fixture.caller_path);
@@ -287,6 +337,8 @@ fn assert_direct_call_project_conformance(
             && (gap.subject == SemanticGapSubject::Point
                 || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
     });
+    let has_unresolved_dynamic_dispatch =
+        has_dynamic_dispatch_gap && !expectations.closed_dispatch_refinement;
 
     let mut icfg = IcfgGraph::materialize(
         project,
@@ -345,12 +397,15 @@ fn assert_direct_call_project_conformance(
         root(),
     );
 
-    if has_dynamic_dispatch_gap || expect_unproven_link_unit || expect_unproven_return {
+    if has_unresolved_dynamic_dispatch
+        || expectations.unproven_link_unit
+        || expectations.unproven_return
+    {
         icfg.assert_outcome(IcfgOutcomeKind::Unproven);
     } else {
         icfg.assert_outcome(IcfgOutcomeKind::Complete);
     }
-    if has_dynamic_dispatch_gap || expect_unproven_link_unit {
+    if has_unresolved_dynamic_dispatch || expectations.unproven_link_unit {
         icfg.assert_boundary(
             "icfg_invoke",
             ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
@@ -368,9 +423,11 @@ fn assert_direct_call_project_conformance(
     let return_edge = icfg_edge("icfg_normal_continuation", IcfgEdgeKind::NormalReturn)
         .originating_call("direct_call");
     icfg.assert_successors("callee_normal_exit", &[return_edge]);
-    if has_dynamic_dispatch_gap || expect_unproven_link_unit || expect_unproven_return {
+    if expectations.unproven_link_unit || expectations.unproven_return {
         icfg.assert_edge_unproven_partial("callee_normal_exit", return_edge);
     } else {
+        // An open target set weakens the operation and adds an unresolved arm,
+        // but it does not invalidate proof for a retained exact candidate.
         icfg.assert_edge_proven_complete("callee_normal_exit", return_edge);
     }
     icfg.assert_predecessors(
@@ -532,12 +589,19 @@ fn assert_declared_cpp_direct_call_conformance(
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, true, false);
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            unproven_link_unit: true,
+            ..DirectCallExpectations::default()
+        },
+    );
 }
 
 #[test]
 fn java_direct_call_conformance() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::Java,
         dialect: SemanticLanguage::Standard(Language::Java),
         callee_path: "java/conformance/JavaLibrary.java",
@@ -744,7 +808,7 @@ fn rust_turbofish_direct_call_uses_the_shared_dispatch_oracle() {
 
 #[test]
 fn rust_generic_method_call_uses_the_shared_dispatch_oracle() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Rust,
         dialect: SemanticLanguage::Standard(Language::Rust),
         callee_path: "worker.rs",
@@ -1572,10 +1636,7 @@ fn rust_match_evaluates_the_subject_before_guarded_arm_selection() {
 
 #[test]
 fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "rust/implicit_calls.rs",
-            r#"
+    let source = r#"
                 fn implicit_operations(
                     left: Number,
                     right: Number,
@@ -1589,8 +1650,9 @@ fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
                     let _field = holder.field;
                     holder.method();
                 }
-            "#,
-        )
+            "#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("rust/implicit_calls.rs", source)
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/implicit_calls.rs");
@@ -1655,6 +1717,23 @@ fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
             SemanticGapKind::Unknown,
         );
     }
+    let procedure = procedure_named(&graph, "implicit_operations", ProcedureKind::Function);
+    let method_call = exact_call_site(procedure, source, "holder.method()");
+    let receiver_adjustment_gap = procedure
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.point == method_call.point
+                && gap.subject == SemanticGapSubject::Point
+                && gap.capability == SemanticCapability::Calls
+        })
+        .expect("method call must retain its receiver-adjustment gap");
+    assert!(
+        receiver_adjustment_gap
+            .impacts
+            .contains(SemanticGapImpact::CallEvaluation),
+        "omitted Deref/DerefMut calls must weaken caller-side evaluation",
+    );
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());
@@ -3495,6 +3574,16 @@ int cpp_boundaries() {{
         SemanticCapability::DeferredExecution,
         SemanticGapKind::Unknown,
     );
+    let procedure = procedure_named(&graph, "cpp_boundaries", ProcedureKind::Function);
+    let static_gap = procedure
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.detail.contains("function-local static initialization")
+        })
+        .expect("missing guarded C++ local-static deferred-execution gap");
+    assert_deferred_effect_impacts(static_gap, false, "guarded C++ local-static initializer");
     graph.assert_adjacency_symmetric();
 }
 
@@ -5052,6 +5141,15 @@ func schedule() {
                 == Some("schedule")
         })
         .expect("missing Go schedule procedure");
+    let deferred_gap = schedule
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.detail.contains("deferred invocation timing")
+        })
+        .expect("missing omitted Go defer invocation gap");
+    assert_deferred_effect_impacts(deferred_gap, false, "omitted Go defer invocation");
     let snippet = |start: u32, end: u32| {
         SOURCE
             .get(start as usize..end as usize)
@@ -14312,6 +14410,16 @@ fn scala_for_enumerator_flow_retains_protocol_and_deferred_execution_gaps() {
     ] {
         graph.assert_point_gap("enumerator_decision", capability, kind);
     }
+    let enumerated = procedure_named(&graph, "enumerated", ProcedureKind::Function);
+    let deferred = enumerated
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.detail.contains("desugared closures")
+        })
+        .expect("missing Scala for-comprehension deferred-execution gap");
+    assert_deferred_effect_impacts(deferred, false, "desugared Scala closure execution");
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());
@@ -14416,6 +14524,26 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
         SemanticCapability::DeferredExecution,
         SemanticGapKind::Unsupported,
     );
+    let consume = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("consume")
+        })
+        .expect("missing Scala consume procedure");
+    let by_name_callee_gap = consume
+        .gaps()
+        .iter()
+        .find(|gap| gap.capability == SemanticCapability::DeferredExecution)
+        .expect("missing Scala by-name callee gap");
+    assert_deferred_effect_impacts(by_name_callee_gap, false, "by-name Scala callee");
     let limitations = graph
         .artifact()
         .procedures()
@@ -14430,14 +14558,16 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
                 == Some("limitations")
         })
         .expect("missing Scala limitations procedure");
-    for (call_source, expected_capabilities) in [
+    for (call_source, expected_capabilities, deferred_weakens_call_evaluation) in [
         (
             "consume(delayed())",
             &[SemanticCapability::DeferredExecution][..],
+            false,
         ),
         (
             "consume { firstDeferred(); secondDeferred() }",
             &[SemanticCapability::DeferredExecution][..],
+            true,
         ),
         (
             "Future { spawned() }",
@@ -14445,6 +14575,7 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
                 SemanticCapability::DeferredExecution,
                 SemanticCapability::ConcurrentSpawn,
             ][..],
+            true,
         ),
     ] {
         let call = limitations
@@ -14467,15 +14598,21 @@ fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
             "each Scala source argument must remain one semantic actual for {call_source}"
         );
         for capability in expected_capabilities {
-            assert!(
-                limitations.gaps().iter().any(|gap| {
+            let gap = limitations
+                .gaps()
+                .iter()
+                .find(|gap| {
                     gap.point == call.point
                         && gap.subject == SemanticGapSubject::CallSite(call.id)
                         && gap.capability == *capability
                         && gap.kind == SemanticGapKind::Unknown
-                }),
-                "missing CallSite-scoped {capability:?} gap for {call_source}"
-            );
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing CallSite-scoped {capability:?} gap for {call_source}")
+                });
+            if *capability == SemanticCapability::DeferredExecution {
+                assert_deferred_effect_impacts(gap, deferred_weakens_call_evaluation, call_source);
+            }
         }
     }
     assert!(limitations.call_sites().iter().any(|call| {
@@ -14542,7 +14679,7 @@ fn scala_generic_method_direct_call_conformance() {
           def root(worker: GenericWorker): Int = worker.identity[Int](7)
         }
     "#;
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Scala,
         dialect: SemanticLanguage::Standard(Language::Scala),
         callee_path: "scala/GenericWorker.scala",
@@ -14938,6 +15075,17 @@ fn scala_constructor_initializer_given_and_partial_function_procedures_are_disti
         "the enclosing partial-function factory must not execute the case body"
     );
     assert_eq!(closure.call_sites().len(), 1);
+    for deferred in [initializer, given_initializer] {
+        let gap = deferred
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.subject == SemanticGapSubject::Procedure
+                    && gap.capability == SemanticCapability::DeferredExecution
+            })
+            .expect("missing demand-scheduled Scala procedure gap");
+        assert_deferred_effect_impacts(gap, false, "demand-scheduled Scala procedure");
+    }
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());
@@ -14970,6 +15118,98 @@ fn scala_constructor_direct_call_conformance() {
         caller_name: "root",
         call: "new ConstructedBox(7)",
     });
+}
+
+#[test]
+fn scala_bodyless_templates_evaluate_parent_arguments_and_surface_parent_call_gaps() {
+    const SOURCE: &str = r#"
+        package conformance
+
+        def classParentArgument(): Int = 1
+        def objectParentArgument(): Int = 2
+        class Base(value: Int)
+        class Derived extends Base(classParentArgument())
+        object Singleton extends Base(objectParentArgument())
+    "#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/BodylessParents.scala", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/BodylessParents.scala");
+
+    for (name, kind, declaration, argument_call) in [
+        (
+            "Derived",
+            ProcedureKind::Constructor,
+            "class Derived extends Base",
+            "classParentArgument()",
+        ),
+        (
+            "Singleton",
+            ProcedureKind::Initializer,
+            "object Singleton extends Base",
+            "objectParentArgument()",
+        ),
+    ] {
+        let entry_alias = format!("{name}_entry");
+        let call_alias = format!("{name}_parent_call");
+        let exit_alias = format!("{name}_exit");
+        graph
+            .bind(
+                entry_alias.clone(),
+                PointSelector::new(declaration)
+                    .procedure(name)
+                    .effect("entry"),
+            )
+            .bind(
+                call_alias.clone(),
+                PointSelector::new(argument_call)
+                    .procedure(name)
+                    .effect("invoke"),
+            )
+            .bind(
+                exit_alias.clone(),
+                PointSelector::new(declaration)
+                    .procedure(name)
+                    .effect("normal_exit"),
+            );
+        graph.assert_reachable(&entry_alias, &call_alias);
+        graph.assert_reachable(&call_alias, &exit_alias);
+
+        let procedure = procedure_named(&graph, name, kind);
+        exact_call_site(procedure, SOURCE, argument_call);
+        assert!(
+            procedure.gaps().iter().all(|gap| {
+                gap.capability != SemanticCapability::NormalControlFlow
+                    || gap.kind != SemanticGapKind::Unsupported
+            }),
+            "bodyless template {name} must not be lowered as an unsupported expression",
+        );
+
+        let parent_call_gap = procedure
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.point == procedure.entry_point()
+                    && gap.subject == SemanticGapSubject::Point
+                    && gap.capability == SemanticCapability::Calls
+                    && gap.kind == SemanticGapKind::Unsupported
+            })
+            .unwrap_or_else(|| panic!("missing parent-initialization call gap for {name}"));
+        for impact in [
+            SemanticGapImpact::ValueFlow,
+            SemanticGapImpact::ReturnTransfer,
+            SemanticGapImpact::CallEvaluation,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+            SemanticGapImpact::Aliasing,
+        ] {
+            assert!(
+                parent_call_gap.impacts.contains(impact),
+                "parent-initialization call gap for {name} must affect {impact:?}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -15222,7 +15462,7 @@ fn scala_curried_call_is_one_dispatch_matched_invoke() {
     "#;
     const CALL: &str = "worker.combine(7)(\"seven\")";
 
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Scala,
         dialect: SemanticLanguage::Standard(Language::Scala),
         callee_path: "scala/CurriedWorker.scala",

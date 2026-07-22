@@ -3,10 +3,11 @@
 use crate::hash::{HashMap, HashSet};
 
 use super::{
-    BasicBlock, BlockId, ControlEdge, ControlEdgeKind, Evidence, EvidenceId,
-    ProcedureSemanticsParts, ProgramPoint, ProgramPointId, SemanticBudget, SemanticBudgetExceeded,
-    SemanticCallSite, SemanticEvent, SemanticGap, SemanticLocator, SemanticValue, SemanticWork,
-    SourceMapping, SourceMappingId,
+    AllocationId, AllocationKind, AllocationSite, BasicBlock, BlockId, CaptureBinding, CaptureId,
+    CaptureMode, ControlEdge, ControlEdgeKind, Evidence, EvidenceId, MemoryLocation,
+    MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint, ProgramPointId,
+    SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent, SemanticGap,
+    SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
 };
 
 #[derive(Debug, Clone)]
@@ -140,11 +141,99 @@ impl ProcedureCfgBuilder {
         let id = super::ValueId::try_from_index(self.parts.values.len())
             .expect("value count is bounded by the u32 semantic budget");
         assert_eq!(value.id, id, "values must use dense builder IDs");
+        let owned_text_bytes = match &value.kind {
+            super::SemanticValueKind::LanguageDefined(name)
+            | super::SemanticValueKind::Parameter {
+                multiplicity:
+                    super::FormalMultiplicity::Rest(super::ArgumentDomain::LanguageDefined(name)),
+                ..
+            } => name.len(),
+            _ => 0,
+        };
         self.reserve(SemanticWork {
             values: 1,
+            owned_text_bytes,
             ..SemanticWork::default()
         })?;
         self.parts.values.push(value);
+        Ok(id)
+    }
+
+    pub(crate) fn add_allocation(
+        &mut self,
+        allocation: AllocationSite,
+    ) -> Result<AllocationId, SemanticBudgetExceeded> {
+        let id = AllocationId::try_from_index(self.parts.allocations.len())
+            .expect("allocation count is bounded by the u32 semantic budget");
+        assert_eq!(allocation.id, id, "allocations must use dense builder IDs");
+        let owned_text_bytes = match &allocation.kind {
+            AllocationKind::LanguageDefined(name) => name.len(),
+            AllocationKind::Object
+            | AllocationKind::Array
+            | AllocationKind::Callable
+            | AllocationKind::ClosureEnvironment
+            | AllocationKind::SharedCell => 0,
+        };
+        self.reserve(SemanticWork {
+            allocations: 1,
+            owned_text_bytes,
+            ..SemanticWork::default()
+        })?;
+        self.parts.allocations.push(allocation);
+        Ok(id)
+    }
+
+    pub(crate) fn add_memory_location(
+        &mut self,
+        location: MemoryLocation,
+    ) -> Result<MemoryLocationId, SemanticBudgetExceeded> {
+        let id = MemoryLocationId::try_from_index(self.parts.memory_locations.len())
+            .expect("memory-location count is bounded by the u32 semantic budget");
+        assert_eq!(
+            location.id, id,
+            "memory locations must use dense builder IDs"
+        );
+        let work = match &location.kind {
+            MemoryLocationKind::Field { member, .. } | MemoryLocationKind::Static { member } => {
+                locator_work(member, 1)
+            }
+            MemoryLocationKind::Index { .. }
+            | MemoryLocationKind::LexicalCell { .. }
+            | MemoryLocationKind::Capture { .. } => SemanticWork::default(),
+        };
+        self.reserve(combine_work(
+            SemanticWork {
+                memory_locations: 1,
+                ..SemanticWork::default()
+            },
+            work,
+        ))?;
+        self.parts.memory_locations.push(location);
+        Ok(id)
+    }
+
+    pub(crate) fn add_capture(
+        &mut self,
+        capture: CaptureBinding,
+    ) -> Result<CaptureId, SemanticBudgetExceeded> {
+        let id = CaptureId::try_from_index(self.parts.captures.len())
+            .expect("capture count is bounded by the u32 semantic budget");
+        assert_eq!(capture.id, id, "captures must use dense builder IDs");
+        let owned_text_bytes = match &capture.mode {
+            CaptureMode::LanguageDefined(name) => name.len(),
+            CaptureMode::Value
+            | CaptureMode::Move
+            | CaptureMode::SharedCell
+            | CaptureMode::MutableCell
+            | CaptureMode::Receiver
+            | CaptureMode::Unknown => 0,
+        };
+        self.reserve(SemanticWork {
+            captures: 1,
+            owned_text_bytes,
+            ..SemanticWork::default()
+        })?;
+        self.parts.captures.push(capture);
         Ok(id)
     }
 
@@ -155,9 +244,23 @@ impl ProcedureCfgBuilder {
         let id = super::CallSiteId::try_from_index(self.parts.call_sites.len())
             .expect("call-site count is bounded by the u32 semantic budget");
         assert_eq!(call_site.id, id, "call sites must use dense builder IDs");
+        let owned_text_bytes = call_site
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument.expansion.domain() {
+                Some(super::ArgumentDomain::LanguageDefined(name)) => Some(name.len()),
+                Some(
+                    super::ArgumentDomain::Positional
+                    | super::ArgumentDomain::Keyword
+                    | super::ArgumentDomain::PositionalOrKeyword,
+                )
+                | None => None,
+            })
+            .fold(0usize, usize::saturating_add);
         self.reserve(SemanticWork {
             call_sites: 1,
             nested_entries: call_site.arguments.len(),
+            owned_text_bytes,
             ..SemanticWork::default()
         })?;
         self.parts.call_sites.push(call_site);
@@ -547,8 +650,7 @@ impl ProcedureCfgBuilder {
 pub(crate) struct ReachabilitySealCancelled;
 
 fn combine_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
+    left.conservative_add(right)
 }
 
 fn locator_work(locator: &SemanticLocator, copies: usize) -> SemanticWork {
@@ -848,9 +950,12 @@ fn is_block_barrier(effect: &super::SemanticEffect) -> bool {
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId, ProcedureKind,
-        SemanticBudgetDimension, SemanticEffect, SemanticLanguage, SemanticLocator, SemanticRole,
-        SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        ArgumentDomain, CallArgumentExpansion, CallSiteId, CallableTargetResolution,
+        ControlContinuation, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
+        FormalMultiplicity, ProcedureId, ProcedureKind, SemanticBudgetDimension,
+        SemanticCallArgument, SemanticEffect, SemanticLanguage, SemanticLocator, SemanticRole,
+        SemanticValueKind, SourceAnchor, SourcePosition, SourceSpan, ValueId, WorkspaceMountId,
+        WorkspaceRelativePath,
     };
 
     fn builder_with_budget(budget: &SemanticBudget) -> ProcedureCfgBuilder {
@@ -882,6 +987,13 @@ mod tests {
 
     fn builder() -> ProcedureCfgBuilder {
         builder_with_budget(&SemanticBudget::default())
+    }
+
+    fn builder_with_owned_text_limit(limit: usize) -> ProcedureCfgBuilder {
+        let mut limits = SemanticBudget::default().limits();
+        limits.owned_text_bytes = limit;
+        let budget = SemanticBudget::new(limits).expect("positive builder limits");
+        builder_with_budget(&budget)
     }
 
     fn point(builder: &mut ProcedureCfgBuilder, effect: SemanticEffect) -> ProgramPointId {
@@ -923,6 +1035,91 @@ mod tests {
         assert_eq!(work.procedures, 1);
         assert!(work.nested_entries >= 2);
         assert!(work.owned_text_bytes > 0);
+    }
+
+    #[test]
+    fn builder_budget_charges_owned_value_kind_and_rest_domain_text() {
+        let baseline = builder().prospective_work().owned_text_bytes;
+        for (kind, text_bytes) in [
+            (
+                SemanticValueKind::LanguageDefined("language-value".into()),
+                "language-value".len(),
+            ),
+            (
+                SemanticValueKind::Parameter {
+                    ordinal: 0,
+                    multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(
+                        "language-rest".into(),
+                    )),
+                },
+                "language-rest".len(),
+            ),
+        ] {
+            let limit = baseline + text_bytes - 1;
+            let mut builder = builder_with_owned_text_limit(limit);
+            let before = builder.prospective_work();
+            let error = builder
+                .add_value(SemanticValue {
+                    id: ValueId::new(0),
+                    kind,
+                    source: SourceMappingId::new(0),
+                    evidence: EvidenceId::new(0),
+                })
+                .expect_err("owned value text must be checked before retention");
+
+            assert_eq!(error.dimension(), SemanticBudgetDimension::OwnedTextBytes);
+            assert_eq!(error.limit(), limit);
+            assert_eq!(error.attempted(), baseline + text_bytes);
+            assert_eq!(builder.prospective_work(), before);
+        }
+    }
+
+    #[test]
+    fn builder_budget_charges_owned_direct_and_spread_argument_domain_text() {
+        let baseline = builder().prospective_work().owned_text_bytes;
+        for (expansion, text_bytes) in [
+            (
+                CallArgumentExpansion::Direct(ArgumentDomain::LanguageDefined(
+                    "direct-domain".into(),
+                )),
+                "direct-domain".len(),
+            ),
+            (
+                CallArgumentExpansion::Spread(ArgumentDomain::LanguageDefined(
+                    "spread-domain".into(),
+                )),
+                "spread-domain".len(),
+            ),
+        ] {
+            let limit = baseline + text_bytes - 1;
+            let mut builder = builder_with_owned_text_limit(limit);
+            let before = builder.prospective_work();
+            let error = builder
+                .add_call_site(SemanticCallSite {
+                    id: CallSiteId::new(0),
+                    point: ProgramPointId::new(0),
+                    callee: ValueId::new(0),
+                    receiver: None,
+                    arguments: Box::new([SemanticCallArgument {
+                        value: ValueId::new(1),
+                        expansion,
+                    }]),
+                    result: None,
+                    thrown: None,
+                    declared_targets: CallableTargetResolution::Unknown,
+                    target_evidence: EvidenceId::new(0),
+                    normal_continuation: ControlContinuation::Unknown,
+                    exceptional_continuation: ControlContinuation::Unknown,
+                    source: SourceMappingId::new(0),
+                    evidence: EvidenceId::new(0),
+                })
+                .expect_err("owned argument-domain text must be checked before retention");
+
+            assert_eq!(error.dimension(), SemanticBudgetDimension::OwnedTextBytes);
+            assert_eq!(error.limit(), limit);
+            assert_eq!(error.attempted(), baseline + text_bytes);
+            assert_eq!(builder.prospective_work(), before);
+        }
     }
 
     #[test]

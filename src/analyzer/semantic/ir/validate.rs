@@ -160,8 +160,21 @@ pub(super) fn measure_artifact_work(
         account_locator(&procedure.locator, &mut work);
 
         for value in &procedure.values {
-            if let SemanticValueKind::LanguageDefined(name) = &value.kind {
-                account_text(name, &mut work);
+            match &value.kind {
+                SemanticValueKind::LanguageDefined(name) => account_text(name, &mut work),
+                SemanticValueKind::Parameter {
+                    multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(name)),
+                    ..
+                } => account_text(name, &mut work),
+                SemanticValueKind::Local
+                | SemanticValueKind::Parameter { .. }
+                | SemanticValueKind::Receiver
+                | SemanticValueKind::Return
+                | SemanticValueKind::Temporary
+                | SemanticValueKind::Constant
+                | SemanticValueKind::Exception
+                | SemanticValueKind::Callable
+                | SemanticValueKind::AwaitResult => {}
             }
         }
         for allocation in &procedure.allocations {
@@ -187,6 +200,11 @@ pub(super) fn measure_artifact_work(
             work.nested_entries = work
                 .nested_entries
                 .saturating_add(call_site.arguments.len());
+            for argument in &call_site.arguments {
+                if let Some(ArgumentDomain::LanguageDefined(name)) = argument.expansion.domain() {
+                    account_text(name, &mut work);
+                }
+            }
             account_target_resolution(&call_site.declared_targets, &mut work);
         }
         for mapping in &procedure.source_mappings {
@@ -510,6 +528,7 @@ fn validate_procedure(
         }
         validate_gap_capability(id, capabilities, gap)?;
         validate_gap_subject(id, procedure, &async_suspends, gap)?;
+        validate_gap_impacts(id, gap)?;
         if (gap.kind == SemanticGapKind::ExceededBudget) != gap.budget.is_some() {
             return Err(SemanticIrError::procedure(
                 id,
@@ -523,8 +542,18 @@ fn validate_procedure(
         gap_index.insert(id, gap)?;
     }
 
+    let mut parameter_ordinals = HashSet::default();
     for value in &procedure.values {
         validate_metadata(id, value.source, value.evidence, procedure, "value")?;
+        if let SemanticValueKind::Parameter { ordinal, .. } = &value.kind
+            && !parameter_ordinals.insert(*ordinal)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::CallContract,
+                format!("parameter ordinal {ordinal} is published more than once"),
+            ));
+        }
     }
     if !procedure.values.is_empty() {
         require_capability(id, capabilities, SemanticCapability::Values, "value rows")?;
@@ -1179,7 +1208,7 @@ fn validate_call_site(
         ensure_value(id, receiver, procedure.values.len(), "call receiver")?;
     }
     for argument in &call_site.arguments {
-        ensure_value(id, *argument, procedure.values.len(), "call argument")?;
+        ensure_value(id, argument.value, procedure.values.len(), "call argument")?;
     }
     if let Some(result) = call_site.result {
         ensure_value(id, result, procedure.values.len(), "call result")?;
@@ -2585,6 +2614,26 @@ fn validate_gap_capability(
             gap.kind.label(),
             gap.capability.label(),
             support
+        ),
+    ))
+}
+
+fn validate_gap_impacts(procedure: ProcedureId, gap: &SemanticGap) -> Result<(), SemanticIrError> {
+    let required = SemanticGapImpacts::for_gap(gap.capability, gap.subject);
+    let Some(missing) = required
+        .iter()
+        .find(|impact| !gap.impacts.contains(*impact))
+    else {
+        return Ok(());
+    };
+    Err(SemanticIrError::procedure(
+        procedure,
+        SemanticIrErrorKind::GapContract,
+        format!(
+            "gap {} for {} is missing mandatory {} impact",
+            gap.id,
+            gap.capability.label(),
+            missing.label(),
         ),
     ))
 }

@@ -807,7 +807,7 @@ pub(super) fn scan_outbound_reference_hits(
     }
     budget.scanned_files += 1;
     budget.scanned_source_bytes += source.len();
-    let source = Arc::new(source);
+    let source = Arc::<str>::from(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::UsesParserUnsupported,

@@ -66,6 +66,40 @@ export class Greeter {
 }
 
 #[test]
+fn javascript_double_sigil_names_are_searchable() {
+    // angular.js shape: `$$`-prefixed private names — the first `$` is
+    // followed by another `$`, which is still an unsatisfiable anchor
+    // position and must be escaped too.
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/ng/animateRunner.js",
+            "export function $$AnimateRunnerFactoryProvider(host) {\n  this.host = host;\n}\n",
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["$$AnimateRunnerFactoryProvider".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    let file = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/ng/animateRunner.js")
+        .unwrap_or_else(|| panic!("missing animateRunner.js: {search:#?}"));
+    assert!(
+        file.functions
+            .iter()
+            .any(|hit| hit.symbol == "$$AnimateRunnerFactoryProvider"),
+        "expected $$AnimateRunnerFactoryProvider: {search:#?}"
+    );
+}
+
+#[test]
 fn typescript_constructor_assigned_field_is_indexed_and_searchable() {
     // Mirrors the JavaScript constructor-field pass: without it, TS
     // constructor-assigned properties resolve in scan_usages but are

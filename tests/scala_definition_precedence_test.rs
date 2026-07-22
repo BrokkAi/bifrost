@@ -3131,3 +3131,251 @@ object Use {
         "{value}"
     );
 }
+
+#[test]
+fn scala_named_argument_uses_the_exact_visible_nested_callee_owner() {
+    let source = r#"package app
+
+case class Query(value: String)
+
+object Builder {
+  private case class Query(value: Int)
+  val query = Query(value = 1)
+}
+
+class ExactBuilder {
+  private case class Query(value: Int)
+  val query = Query(value = 1)
+}
+
+trait Left { case class Ambiguous(value: Int) }
+trait Right { case class Ambiguous(value: Int) }
+class Collision extends Left with Right {
+  val query = Ambiguous(value = 1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Query.scala", source)
+        .file(
+            "app/ExactBuilder/Query.scala",
+            "package app.ExactBuilder\ncase class Query(value: String)\n",
+        )
+        .build();
+    let call = source
+        .find("val query = Query(value")
+        .expect("nested Query call")
+        + "val query = ".len();
+    let ambiguous = source
+        .find("val query = Ambiguous(value")
+        .expect("ambiguous call")
+        + "val query = ".len();
+    let exact = source
+        .find("class ExactBuilder")
+        .and_then(|start| {
+            source[start..]
+                .find("val query = Query(value")
+                .map(|offset| start + offset + "val query = ".len())
+        })
+        .expect("exact-owner Query call");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location_in("app/Query.scala", source, call),
+            location_in("app/Query.scala", source, call + "Query(".len()),
+            location_in(
+                "app/Query.scala",
+                source,
+                ambiguous + "Ambiguous(".len(),
+            ),
+            location_in("app/Query.scala", source, exact),
+            location_in("app/Query.scala", source, exact + "Query(".len()),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.Builder$.Query.Query",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "app.Builder$.Query.value",
+        "{value}"
+    );
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "ambiguous_scala_named_argument_owner",
+        "{value}"
+    );
+    for result in &results[3..] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "app/Query.scala",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_import_package_segment_does_not_bind_a_local_package_object() {
+    let compression = "package fs2.compression\ntrait Compression[F]\n";
+    let local_object = "package fs2.io\nobject compression\n";
+    let platform = r#"package fs2
+package io
+
+import fs2.compression.Compression
+
+trait Platform[F] {
+  val compression: Compression[F]
+}
+"#;
+    let owner = "package fs2.io.pkg\nobject Owner { class Member }\n";
+    let global_package = "package pkg.Owner\ntrait GlobalOnly\n";
+    let collision_import = "package fs2.io\nimport pkg.Owner.Member\n";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("compression/Compression.scala", compression)
+        .file("io/compression.scala", local_object)
+        .file("io/Platform.scala", platform)
+        .file("io/pkg/Owner.scala", owner)
+        .file("compression/GlobalOnly.scala", global_package)
+        .file("io/Collision.scala", collision_import)
+        .build();
+    let import = platform
+        .find("fs2.compression.Compression")
+        .expect("import path");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location_in("io/Platform.scala", platform, import + "fs2.".len()),
+            location_in(
+                "io/Platform.scala",
+                platform,
+                import + "fs2.compression.".len(),
+            ),
+            location_in(
+                "io/Collision.scala",
+                collision_import,
+                collision_import.find("Owner").expect("collision segment"),
+            ),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(
+        results[0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+    assert!(
+        results[0]["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "fs2.compression.Compression",
+        "{value}"
+    );
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[2]["definitions"][0]["fqn"], "fs2.io.pkg.Owner$",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_anonymous_refinement_type_member_precedes_outer_alias() {
+    let source = r#"package zio.internal
+
+object FastList {
+  class Member
+  trait Left { type Near[A] }
+  trait Right { type Near[A] }
+  trait ListModule {
+    type List[+A]
+    def cons[A](a: A, as: List[A]): List[A]
+  }
+
+  val listModule: ListModule = new ListModule {
+    type List[+A] = Any
+    type Near[A] = Any
+    class Inner {
+      type List[A] = String
+      def keep[A](as: List[A]): List[A] = as
+    }
+    class Ambiguous extends Left with Right {
+      def keep[A](as: Near[A]): Near[A] = as
+    }
+    def missing[A](as: List.Member): Unit = ()
+    def cons[A](a: A, as: List[A]): List[A] = as
+  }
+
+  type List[+A] = listModule.List[A]
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("zio/internal/FastList.scala", source)
+        .build();
+    let cons = source
+        .rfind("def cons")
+        .expect("anonymous refinement method");
+    let parameter_type = source[cons..]
+        .find("List[A]")
+        .map(|offset| cons + offset)
+        .expect("parameter List type");
+    let return_type = source[parameter_type + "List[A]".len()..]
+        .find("List[A]")
+        .map(|offset| parameter_type + "List[A]".len() + offset)
+        .expect("return List type");
+    let inner = source.find("def keep[A](as: List").expect("inner method");
+    let inner_type = source[inner..]
+        .find("List[A]")
+        .map(|offset| inner + offset)
+        .expect("inner List type");
+    let ambiguous = source
+        .find("def keep[A](as: Near")
+        .expect("ambiguous method");
+    let ambiguous_type = source[ambiguous..]
+        .find("Near[A]")
+        .map(|offset| ambiguous + offset)
+        .expect("ambiguous Near type");
+    let missing = source
+        .find("List.Member")
+        .expect("qualified refinement type");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location_in("zio/internal/FastList.scala", source, parameter_type),
+            location_in("zio/internal/FastList.scala", source, return_type),
+            location_in("zio/internal/FastList.scala", source, inner_type),
+            location_in("zio/internal/FastList.scala", source, ambiguous_type),
+            location_in(
+                "zio/internal/FastList.scala",
+                source,
+                missing + "List.".len(),
+            ),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "zio.internal.FastList$.ListModule.List",
+            "{value}"
+        );
+    }
+    // Inner is a local template inside the anonymous refinement, so it has no
+    // stable indexed identity. Its alias is still authoritative and must block
+    // the outer ListModule.List member rather than leaking through to it.
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "local_type_binding",
+        "{value}"
+    );
+    assert_eq!(results[3]["status"], "no_definition", "{value}");
+    assert_eq!(results[4]["status"], "no_definition", "{value}");
+}

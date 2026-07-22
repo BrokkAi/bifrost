@@ -53,9 +53,16 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-20 09:23+02:00) Completed the focused #817 semantic/CFG lifecycle slice with nine-process release matrices over generated graphs, inline TypeScript/Java fixtures, pinned VS Code, and pinned Spring PetClinic. Bidirectional edge-ID rows remain the hot layout; production SQLite is a measured no-go because the optimistic packed control/call projection failed the VS Code absolute write-overhead gate. Later value-flow, solver, and summary lifecycle decisions remain open under #817.
 - [x] (2026-07-20 09:23+02:00) Completed a post-rollout semantic architecture audit. It confirmed one shared language-neutral ICFG, identified repeated point/effect/call emission and procedure-driver mechanics across adapters, and recommended a dedicated no-semantic-change extraction before #816 value/heap and data-dependence work; no source refactor is implicitly authorized by this planning observation.
 - [x] (2026-07-20 09:59+02:00) Validated the exact final #815/#817 tree with focused representation and persistence tests, formatting and diff checks, strict isolated all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,094 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
+- [x] (2026-07-21 11:03+02:00) Started #816 with the focused living plan `.agents/plans/issue-816-value-dispatch-heap-oracles.md` after verifying every prerequisite and auditing current receiver, dispatch, value/heap lowering, and future IFDS/IDE, FSA, WPDS, and synchronized call/field pushdown seams. The first checkpoint freezes the neutral oracle vocabulary, typed gap impacts, and separate workspace dispatch provider before the TypeScript/Java implementation slices.
+- [x] (2026-07-21 15:30+02:00) Completed the #816 Ultra contract/dispatch checkpoint: finite query-owned relation arenas, exact context-bearing heap and binding subjects, bounded oracle sets and paths, certificate-based strong updates, explicit dispatch coverage, schema-v5 typed gap impacts, complete artifact-key validation, and the extracted `WorkspaceSemanticOracle` now form the reviewed neutral boundary. #816 remains open for shared lowering, real TypeScript/Java value and heap facts, oracle implementations, receiver projection, evidence-backed dispatch refinement, and measurement; those milestones are suitable for High reasoning.
+- [x] (2026-07-21 19:01+02:00) Completed #816's shared lowering milestone in checkpoint `0621935c` across all ten adapter modules. One source-anchor-aware `ProcedureLoweringSession`, common call scaffold, and budget/cancellation batch driver now own finite emission invariants while each language retains AST interpretation, evaluation order, topology, prepasses, and gaps. Ruby binding-prepass accounting and C++ unconditional-`noexcept` termination remain exact. All semantic/CFG/ICFG/language/oracle focused gates and isolated strict all-feature Clippy pass.
+- [x] (2026-07-21 19:47+02:00) Completed #816's reference-language value-fact milestone in checkpoint `d74fc66f`. TypeScript/JavaScript and Java now publish exact formal/receiver ports, expression-backed actual/result/return facts, scope-distinct locals and assignments, object/closure allocations, indexed loads/stores, and lexical receiver captures. Shared fixtures prove branch ambiguity, TypeScript shadowing, Java sibling same-name negatives, static receiver absence, memory identity, and child capture slots; all focused semantic/CFG/ICFG/language/oracle/provider gates and isolated strict all-feature Clippy pass.
+- [x] (2026-07-21 20:40+02:00) Completed #816's bounded value-flow and call-binding milestone in checkpoint `4a777292`. Exact query-owned relation arenas now project assignments, ports, allocations, memory, captures, candidate-specific actual/formal and receiver bindings, normal and exceptional results, direct and rest arguments, and explicit open/truncated spread and default behavior.
+- [x] (2026-07-21 21:22+02:00) Completed #816's bounded heap-oracle milestone in checkpoint `fe474cf4`. Point-sensitive reaching definitions now project allocation, procedure-port, and location objects; exact or summary-tailed access paths; alias answers; and certificate-backed update eligibility while loop/recursive allocations, wildcard indexes, field uncertainty, budgets, and cancellation remain explicit.
+- [x] (2026-07-21 22:19+02:00) Completed #816's receiver and dispatch-refinement milestone in checkpoint `04f5996d`. Schema-v6 neutral dispatch extensibility closes only declaration-proven targets without language tests in the generic oracle. Product CodeQuery receiver traversal now uses generation-bound heap facts, preserves TypeScript/JavaScript compatibility labels as decoration, adds cached Java allocation/type/static/current/factory/member projection, and passes focused product, semantic, ICFG, language, budget/cancellation, formatting, and isolated strict-Clippy gates.
 - [x] (2026-07-17 10:18+02:00) Diagnosed #709 and added `.agents/plans/issue-709-static-analysis-policy-format.md`, selecting a distinct S-expression `.rqlp` authoring language with native versioned RQL selectors and canonical JSON only as generated interchange.
 - [x] (2026-07-17 15:14+02:00) Synchronized compatible omitted policy/RQL versions, diagnostic-neutral categorized endpoint leaves, explicit match-directory manifests, generated/default versus superseding combination presentation, and resolved endpoint-driven typestate terminal expectations from the clarified #709 workflow.
-- [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
+- [x] (2026-07-21 23:20+02:00) Completed #816's retained release measurement over inline TypeScript/Java and clean pinned VS Code/PetClinic revisions. Complete artifacts remain byte-bounded and generation-local; request-owned oracle projections remain ephemeral; raw oracle/artifact SQLite persistence is a measured no-go for #816. `.agents/docs/semantic-oracle-lifecycle-benchmark-2026-07-21.md` records exact medians, caps, provenance, cache-working-set behavior, invalidation, bounded growth, receiver overhead, and the Rust portability pressure test. Final repository gates and issue-record closure remain in the focused plan.
 - [x] Complete #818's internal TypeScript/Java control-topology slice: stitch CFG fragments through existing call relations into a demand-materialized ICFG. Public query exposure and value/heap transfers remain in their owning issues.
 - [ ] Complete #819 as needed: add iterative reachability, reverse postorder, SCC, and loop utilities; add dominators only after a named client justifies them.
 - [ ] Complete #820: implement an iterative, summary-driven IFDS/IDE-shaped solver with budgets, cancellation, uncertainty, and witnesses.
@@ -164,6 +171,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Observation: the eleven language adapters share graph and ICFG mechanics but still duplicate a lower-level semantic emission substrate.
   Evidence: `src/analyzer/semantic/icfg.rs` owns the one generic ICFG, while the language `semantic.rs` modules repeat point allocation, source/evidence mapping, values, effects, gaps, call scaffolding, budget staging, and finalization. The highest-value cleanup is a source-anchor-aware `ProcedureLoweringSession` plus a shared call scaffold and procedure batch driver, not a universal syntax visitor. The generic ICFG also contains two C++-specific gap checks that should become typed gap-impact metadata before value/heap work expands the dependency surface.
+
+- Observation: the shared lowering boundary survives both a language-specific analysis prepass and a language-specific terminal topology.
+  Evidence: Ruby supplies precomputed binding work to the common batch driver, and C++ requests a separate function-throw terminal for unconditional `noexcept`; neither case requires moving parser policy or language semantics into the shared session.
 
 ## Decision Log
 
@@ -335,6 +345,22 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: current Java, Go, C#, and related receiver adapters cannot always distinguish final, static, nonvirtual, or otherwise closed calls at the semantic-adapter boundary. A false partial is preferable to false completeness; precision tests should assert closure directly once resolver metadata supports it.
   Date: 2026-07-19.
 
+- Decision: make candidate proof, candidate-set coverage, and abstract-object cardinality independent #816 facts, and make strong updates require a validated certificate rather than a singleton-looking candidate list.
+  Rationale: a proven target can still belong to an open set, an exhaustive set can be ambiguous, and one allocation site can summarize many runtime objects. Keeping these axes separate preserves sound IFDS/IDE transfer, FSA binding, reusable summaries, and optional later pushdown interpretations.
+  Date: 2026-07-21.
+
+- Decision: replace language checks in generic semantic consumers with subject-scoped typed gap impacts, beginning with dispatch coverage, call evaluation, and return transfer.
+  Rationale: capability identifies the incomplete producer surface, while impact identifies the downstream inference that must weaken. This lets a C++ configuration gap affect retained dispatch without incorrectly treating every procedure-level `Calls` gap in another language the same way, and it provides the extension point later value/heap consumers need.
+  Date: 2026-07-21.
+
+- Decision: make the shared lowering layer responsible for dense finite IR emission, not for a universal syntax visitor.
+  Rationale: source/evidence/value/call/gap IDs, point metadata, matched call events, cleanup registration, and procedure-batch accounting are common invariants. AST fields, evaluation order, language prepasses, control topology, and uncertainty remain adapter-owned so later IFDS/IDE, FSA, and optional pushdown consumers observe honest language semantics through one IR.
+  Date: 2026-07-21.
+
+- Decision: retain complete semantic artifacts in the existing byte-bounded generation cache, keep oracle relation arenas request-local, and reject raw artifact/oracle SQLite persistence under #816.
+  Rationale: inline and PetClinic working sets reuse completely, while a whole 5,625-file VS Code pass exceeds the cache and scan-order eviction makes the immediate repeat nearly cold. Candidate, path, alias, and provenance growth stayed finite under explicit caps, but #816 did not measure a packed storage form, write amplification, hydration, invalidation, or cross-generation reuse. Reusable client-independent and solver summaries remain the separately gated #817/#823 persistence candidate.
+  Date: 2026-07-21.
+
 ## Outcomes & Retrospective
 
 The planning milestone produced root epic #813, thirteen native subissues, and this repository-local ExecPlan. The issue tree now separates the critical path from parallel and evidence-gated work:
@@ -357,6 +383,8 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
 Issue #814 is the first completed implementation milestone. Checkpoint `296c1de1` plus guided-review fixes `1faf8b9b` provide the immutable language-neutral IR/event contract, durable and dense identities, total capabilities, typed outcomes and errors, finite budgets, provider boundary, invariant validation, scoped handles, and bounded renderer. TypeScript and Java remained the right contract fixtures, but they intentionally build neutral artifacts rather than claiming real adapters. The file-level artifact and procedure-local row model survived review without prematurely selecting CSR/CSC or persistence.
 
 The handoff remains narrow: #815 builds real TypeScript/Java callable CFG adapters, #816 refines dynamic dispatch plus value/heap targets, #818 adds matched ICFG call/return edges, and #817 measures lifecycle/storage before persisting anything. Review made this boundary stricter by introducing typed unavailable continuations, exact invoke/suspend outgoing topology, exact gap/evidence correlations, constrained partial local targets, bounded atomic construction, streaming rendering, and materialization-scoped handles.
+
+#816 has now completed the shared-lowering extraction, TypeScript/Java reference value facts, reusable value-flow and candidate-specific call bindings, bounded heap/alias/update oracles, declaration-backed dispatch refinement, receiver compatibility projection, portability pressure test, lifecycle measurement, post-review schema check, and branch-local gates. All ten adapter modules use one finite emission session and call scaffold without sharing a syntax visitor; Ruby's binding prepass and C++'s separate unconditional-`noexcept` terminal prove the abstraction can preserve materially different language mechanics. TypeScript/JavaScript and Java populate the same neutral ports, values, flows, allocations, memory, capture, dispatch, and heap relations. Product receiver queries consume generation-bound neutral facts while preserving their old DTO labels, and the generic oracle contains no language branch for Java closure. The retained release matrix keeps complete artifacts byte-bounded and generation-local, keeps query-owned relation arenas ephemeral, and records a no-go for raw #816 SQLite persistence. The complete feature gate is green apart from four stale-base C++ assertions already corrected by upstream #1020; publication and issue closure wait for an explicitly authorized integration session rather than another semantic contract or adapter-shaped resolver.
 
 All nine post-reference rollout checkpoints validate that boundary from reuse and independent-adapter directions. JavaScript/JSX share the TypeScript lowering family; C#, Python, Go, Rust, PHP, Scala, Ruby, and C/C++ map their own structured syntax into the same builder, exact-location dispatch oracle, and context-bearing ICFG. Python and Rust use orthogonal invocation timing so deferred coroutine/generator construction never becomes false immediate body entry. Go keeps scheduled and selected work distinct from immediate calls, Rust uses shared cleanup markers to expose unknown Drop behavior without fabricating destructor topology, PHP owns whole-chain nullsafe continuations, Scala preserves partial-function and curried-application distinctions, Ruby uses parser-ordered binding activation, and C/C++ adds structured link-unit identity plus caller-side implicit-evaluation gaps without changing graph mechanics. Conformance now covers direct calls, common control, nested callables, handlers and cleanup, advanced-feature gaps, grammar-specific evaluation order, deferred call boundaries, scheduling boundaries, destructor uncertainty, nullish flow, chain-scoped short circuiting, expression-valued control, parameter-list dispatch, and matched-return evidence across every analyzable language without adding language-specific graph services.
 
@@ -528,7 +556,7 @@ In #815, add `src/analyzer/semantic/cfg.rs`, `src/analyzer/js_ts/semantic.rs`, a
 
 The TypeScript and Java reference fixtures cover straight-line flow, branches, merges, loops, early returns, nested calls, throw/catch/finally, closures, and explicit unsupported constructs. Keep extraction iterative and use `InlineTestProject` for small projects.
 
-In parallel, #816 adds `src/analyzer/semantic/oracle.rs` and language implementations adjacent to the two semantic adapters. It extracts `DispatchOracle`, `ValueFlowOracle`, and `HeapOracle` contracts from the receiver and language usage implementations. The contracts cover locals, parameters, receivers, returns, allocations, fields, statics, indexes, captures, bounded access paths, aliases, and strong/weak-update eligibility. They preserve `Precise`, `Ambiguous`, `Unknown`, `Unsupported`, and `ExceededBudget` outcomes.
+In parallel, #816 adds `src/analyzer/semantic/oracle.rs` and language implementations adjacent to the two semantic adapters. It extracts `DispatchOracle`, `ValueFlowOracle`, and `HeapOracle` contracts from the receiver and language usage implementations. The contracts cover locals, parameters, receivers, returns, allocations, fields, statics, indexes, captures, bounded access paths, aliases, and strong/weak-update eligibility. Oracle operations use `SemanticOutcome`; returned candidates separately retain proof, candidate-set coverage, abstract-object cardinality, exact query identity, and strong-update rejection reasons. Receiver labels such as `Precise` remain only in the later compatibility projection.
 
 ### Milestone 3: assemble the ICFG and graph utilities (#818, #819)
 
@@ -885,7 +913,7 @@ For #815 and #816:
 
     cargo test --test semantic_cfg_contract --test semantic_oracle_contract
 
-Expected: `test result: ok`; CFG invariants and equivalent branch/loop/exception fixtures pass, and precise/ambiguous/unknown/unsupported/budget oracle outcomes are distinct.
+Expected: `test result: ok`; CFG invariants and equivalent branch/loop/exception fixtures pass, and operation outcomes, candidate proof, set coverage, cardinality, query identity, and strong-update rejection remain distinct.
 
 For #818 and #819:
 
@@ -1166,6 +1194,12 @@ The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it
 The semantic adapter boundary materializes a mounted source artifact once from one prepared syntax snapshot and resolves procedures inside it:
 
     trait ProgramSemanticsProvider {
+        fn current_artifact_key(
+            &self,
+            file: &ProjectFile,
+            max_source_bytes: usize,
+        ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError>;
+
         fn materialize(
             &self,
             file: &ProjectFile,
@@ -1184,55 +1218,78 @@ The provider derives the source revision, dialect-sensitive artifact key, parsed
 
 The interprocedural boundary contains control and call metadata, not value bindings:
 
-    trait IcfgProvider {
-        fn procedure(
-            &self,
-            locator: &SemanticLocator,
-            budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<ProcedureHandle>;
-
-        fn call_control(
+    trait IcfgProvider: DispatchOracle {
+        fn call_transfers(
             &self,
             caller: &ProcedureHandle,
             call: CallSiteId,
-            budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<CallControlTargets>;
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError>;
+
+        fn snapshot(
+            &self,
+            root: &ProcedureHandle,
+            limits: IcfgSnapshotLimits,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError>;
     }
 
-`CallControlTargets` identifies candidate callee entries, the originating normal and exceptional return sites, proof, and unresolved/external status. It consumes existing call relations and dispatch evidence and never resolves syntax independently.
+`CallTransferSet` identifies candidate callee entries, the originating normal and exceptional return sites, proof, coverage, and unresolved/external status. It consumes the separate dispatch oracle and never resolves syntax independently.
 
 Value capabilities remain separate even if one implementation serves several traits:
 
     trait DispatchOracle {
-        fn callees(
+        fn resolve_call(
             &self,
-            caller: &ProcedureHandle,
-            call: CallSiteId,
-            budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<CalleeTargets>;
+            call: &CallSiteHandle,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError>;
     }
 
     trait ValueFlowOracle {
+        fn procedure_relations(
+            &self,
+            procedure: &ProcedureHandle,
+            context: &OracleCallContext,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError>;
+
         fn call_bindings(
             &self,
-            caller: &ProcedureHandle,
-            call: CallSiteId,
-            callee: &ProcedureHandle,
-            budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<CallBindings>;
+            call: &CallSiteHandle,
+            candidate: &DispatchCandidate,
+            context: &OracleCallContext,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError>;
     }
 
     trait HeapOracle {
+        fn pointees(
+            &self,
+            value: &ValueAtPoint,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<PointsToResult>, SemanticProviderError>;
+
         fn locations(
             &self,
-            procedure: &ProcedureHandle,
-            value: ValueId,
-            max_access_path: usize,
-            budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<AbstractLocations>;
+            access: &AccessPathAtPoint,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<LocationResult>, SemanticProviderError>;
+
+        fn alias(
+            &self,
+            query: &AliasQuery,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<AliasResult>, SemanticProviderError>;
+
+        fn update_eligibility(
+            &self,
+            store: &StoreAtPoint,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<UpdateEligibility>, SemanticProviderError>;
     }
 
-All candidate sets, contexts, facts, and access paths have positive finite limits recorded in `SemanticBudget` or `SolverBudget`.
+All candidate sets, contexts, facts, and access paths have positive finite limits recorded in `OracleLimits`, `SemanticBudget`, or later `SolverBudget` values.
 
 The first solver client contract is:
 
@@ -1391,3 +1448,9 @@ Plan revision note (2026-07-19): Recorded completion of #815 Milestone 4i after 
 Plan revision note (2026-07-20): Recorded completion of the focused #817 semantic/CFG lifecycle measurement. Fresh-process release matrices over generated shapes and pinned TypeScript/Java repositories confirm bidirectional rows and produce a measured SQLite no-go because the optimistic control/call projection misses the large-corpus absolute write-overhead gate. Aggregate schema v5 separates sample-time Bifrost identity, aggregation-time recommendation identity, and per-dataset repository identity. The same pass recorded the post-rollout architecture audit: preserve adapter-owned syntax semantics, extract their repeated emission and call scaffold into a shared lowering session, replace language checks in the generic ICFG with typed gap impacts, and separate workspace dispatch from language-neutral stitching before value/heap and data-dependence implementation. This is a recommendation for a dedicated follow-up ExecPlan, not an unreviewed source refactor.
 
 Plan revision note (2026-07-17): Refined #709 around the intended reusable-model workflow. Omitted policy and RQL schema versions now select only a compiled-in source-and-semantics-compatible lineage head, while explicit pins remain exact. Diagnostic-neutral categorized endpoint leaves compose through authored bounded directory/ID references; actual taint meetings receive either the fixed generated presentation or one explicitly dominant combination. Resolved endpoint bindings are also the public inputs to typestate subject/event selection, accepting states, and distinct explicit/normal-exit/exceptional-exit terminal expectations. Presentation metadata remains outside propagation, protocol, and summary keys.
+
+Plan revision note (2026-07-21): Recorded the reviewed #816 Ultra contract/dispatch checkpoint without marking the issue complete. The neutral boundary now separates operation outcome, candidate proof, set coverage, object cardinality, and exact query identity; validates finite relation provenance and conservative strong updates; exposes schema-v5 typed gap impacts and grouped call vocabulary; and routes generation-validated dispatch through `WorkspaceSemanticOracle`. The remaining shared lowering, real TypeScript/Java value and heap emission, `ValueFlowOracle`/`HeapOracle` implementations, receiver projection, dispatch refinement, and measurements are the next High-reasoning milestones.
+
+Plan revision note (2026-07-21): Recorded #816 checkpoints `4a777292`, `fe474cf4`, and `04f5996d`. The reference adapters now feed bounded value-flow, candidate-specific binding, points-to, access-path, alias, and update-eligibility relations; schema v6 carries adapter-owned dispatch closure; and product receiver queries project generation-bound heap facts into stable TypeScript/JavaScript and Java compatibility labels. Only measurement, pressure-testing, final review, and the resulting persistence/rollout decision remain under #816.
+
+Plan revision note (2026-07-21): Recorded #816's retained five-sample lifecycle matrix and portability pressure test. Inline/PetClinic working sets reuse complete artifacts, the 5,625-file VS Code sweep exceeds the byte-bounded cache without violating exact generation keys, source changes invalidate correctly, cancelled work never populates complete reuse, and candidate/path growth remains finite under explicit caps. Corpus pressure found and fixed emitted-parent capture completeness and directional parameter-port projection. Raw semantic artifact and request-arena persistence is a no-go under #816; reusable summaries remain separately measured #817/#823 work.

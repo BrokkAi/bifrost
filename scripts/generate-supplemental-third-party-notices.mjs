@@ -111,6 +111,14 @@ async function legalFile(metadata, name, relativePath, component, scope) {
   return { component, packageInfo, relativePath, scope, text };
 }
 
+async function vendoredLegalFile(relativePath, component, source, scope) {
+  const text = (await readFile(path.join(repositoryRoot, relativePath), "utf8")).trimEnd();
+  if (!text) {
+    throw new Error(`${relativePath} is empty`);
+  }
+  return { component, relativePath, scope, source, text };
+}
+
 async function sqliteNotice(metadata) {
   const packageInfo = resolvedPackage(metadata, "libsqlite3-sys");
   const relativePath = "sqlite3/sqlite3.c";
@@ -148,22 +156,26 @@ function render(sections) {
     "native source trees compiled by Rust wrapper crates.",
     "",
     "The sections below are reproduced from the exact packages resolved by",
-    "Cargo.lock for Bifrost's default and python release feature sets. Some",
-    "components are compiled only on targets where a compatible system library",
-    "is unavailable. Keeping all of their notices in every artifact gives each",
-    "platform the same complete notice set.",
+    "Cargo.lock and the immutable native-source snapshots vendored by Bifrost.",
+    "Some components are compiled only on targets where a compatible system",
+    "library is unavailable. Keeping all of their notices in every artifact",
+    "gives each platform the same complete notice set.",
   ];
 
   for (const section of sections) {
-    const { packageInfo } = section;
+    const sourceLines = section.packageInfo
+      ? [
+          `Rust package: ${section.packageInfo.name}@${section.packageInfo.version}`,
+          `Package source: ${packageUrl(section.packageInfo)}`,
+        ]
+      : [`Vendored source: ${section.source}`];
     lines.push(
       "",
       "=".repeat(80),
       section.component,
       "=".repeat(80),
       "",
-      `Rust package: ${packageInfo.name}@${packageInfo.version}`,
-      `Package source: ${packageUrl(packageInfo)}`,
+      ...sourceLines,
       `Source notice: ${section.relativePath}`,
       `Inclusion: ${section.scope}`,
       "",
@@ -206,6 +218,12 @@ async function main() {
       "src/unicode/LICENSE",
       "Unicode data used by tree-sitter",
       "compiled into the tree-sitter runtime used on every release target",
+    ),
+    await vendoredLegalFile(
+      "vendor/tree-sitter-scala/LICENSE",
+      "Bifrost-patched tree-sitter-scala parser",
+      "https://github.com/tree-sitter/tree-sitter-scala/tree/a067c39163b62b19e76cea17476f3188da8c9e51",
+      "compiled into Bifrost on every release target",
     ),
   ];
   await writeFile(outputPath, render(sections), "utf8");

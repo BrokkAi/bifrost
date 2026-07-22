@@ -257,19 +257,84 @@ impl ProcedureInvocationKind {
 
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchExtensibility {
+    /// Additional runtime targets may exist unless a dispatch oracle proves
+    /// closure through stronger language-specific evidence.
+    #[default]
+    Open,
+    /// The declaration itself proves that invocation cannot select an
+    /// overriding implementation.
+    Closed,
+}
+
+impl DispatchExtensibility {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Orthogonal properties that should not be encoded in [`ProcedureKind`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_static: bool,
     pub is_synthetic: bool,
     pub invocation: ProcedureInvocationKind,
+    pub dispatch_extensibility: DispatchExtensibility,
+}
+
+/// The positional or keyword domain accepted or produced at a call boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ArgumentDomain {
+    Positional,
+    Keyword,
+    PositionalOrKeyword,
+    LanguageDefined(Box<str>),
+}
+
+impl ArgumentDomain {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Positional => "positional",
+            Self::Keyword => "keyword",
+            Self::PositionalOrKeyword => "positional_or_keyword",
+            Self::LanguageDefined(_) => "language_defined",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub enum FormalMultiplicity {
+    #[default]
+    One,
+    Rest(ArgumentDomain),
+}
+
+impl FormalMultiplicity {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::One => "one",
+            Self::Rest(_) => "rest",
+        }
+    }
+
+    pub const fn is_rest(&self) -> bool {
+        matches!(self, Self::Rest(_))
+    }
 }
 
 /// The semantic role of a value row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticValueKind {
     Local,
-    Parameter { ordinal: u32 },
+    Parameter {
+        ordinal: u32,
+        multiplicity: FormalMultiplicity,
+    },
     Receiver,
     Return,
     Temporary,
@@ -278,6 +343,67 @@ pub enum SemanticValueKind {
     Callable,
     AwaitResult,
     LanguageDefined(Box<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallArgumentExpansion {
+    Unclassified,
+    Direct(ArgumentDomain),
+    Spread(ArgumentDomain),
+}
+
+impl CallArgumentExpansion {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::Direct(_) => "direct",
+            Self::Spread(_) => "spread",
+        }
+    }
+
+    pub const fn domain(&self) -> Option<&ArgumentDomain> {
+        match self {
+            Self::Unclassified => None,
+            Self::Direct(domain) | Self::Spread(domain) => Some(domain),
+        }
+    }
+
+    pub const fn is_spread(&self) -> bool {
+        matches!(self, Self::Spread(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticCallArgument {
+    pub value: ValueId,
+    pub expansion: CallArgumentExpansion,
+}
+
+impl SemanticCallArgument {
+    /// Construct a direct argument when structured lowering established that
+    /// the source is not a spread and identified its argument domain.
+    pub fn direct(value: ValueId, domain: ArgumentDomain) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Direct(domain),
+        }
+    }
+
+    /// Preserve the pre-v5 contract without manufacturing direct/spread or
+    /// positional/keyword semantics. Adapters refine this row only from their
+    /// structured syntax.
+    pub fn unclassified(value: ValueId) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Unclassified,
+        }
+    }
+}
+
+impl From<ValueId> for SemanticCallArgument {
+    fn from(value: ValueId) -> Self {
+        Self::unclassified(value)
+    }
 }
 
 impl SemanticValueKind {
@@ -588,7 +714,7 @@ pub struct SemanticCallSite {
     pub point: ProgramPointId,
     pub callee: ValueId,
     pub receiver: Option<ValueId>,
-    pub arguments: Box<[ValueId]>,
+    pub arguments: Box<[SemanticCallArgument]>,
     pub result: Option<ValueId>,
     pub thrown: Option<ValueId>,
     /// Targets named or established by local syntax/declaration semantics.
@@ -729,12 +855,178 @@ impl SemanticGapSubject {
     }
 }
 
+/// One semantic consumer concern that an explicit gap may invalidate.
+///
+/// Gap impacts are deliberately independent of language and capability names.
+/// Consumers can therefore select only the uncertainty that affects their
+/// operation without importing adapter-specific knowledge.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SemanticGapImpact {
+    DispatchCoverage,
+    CallEvaluation,
+    ReturnTransfer,
+    ValueFlow,
+    HeapRead,
+    HeapWrite,
+    Aliasing,
+}
+
+impl SemanticGapImpact {
+    pub const ALL: [Self; 7] = [
+        Self::DispatchCoverage,
+        Self::CallEvaluation,
+        Self::ReturnTransfer,
+        Self::ValueFlow,
+        Self::HeapRead,
+        Self::HeapWrite,
+        Self::Aliasing,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DispatchCoverage => "dispatch_coverage",
+            Self::CallEvaluation => "call_evaluation",
+            Self::ReturnTransfer => "return_transfer",
+            Self::ValueFlow => "value_flow",
+            Self::HeapRead => "heap_read",
+            Self::HeapWrite => "heap_write",
+            Self::Aliasing => "aliasing",
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1_u8 << (self as u8)
+    }
+}
+
+/// Compact, deterministically iterable semantic gap impacts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SemanticGapImpacts(u8);
+
+impl SemanticGapImpacts {
+    pub const NONE: Self = Self(0);
+
+    const VALUE: Self =
+        Self::single(SemanticGapImpact::ValueFlow).with(SemanticGapImpact::Aliasing);
+    const MEMORY: Self = Self::VALUE
+        .with(SemanticGapImpact::HeapRead)
+        .with(SemanticGapImpact::HeapWrite);
+    const RETURN_TRANSFER: Self = Self::VALUE.with(SemanticGapImpact::ReturnTransfer);
+    /// Conservative downstream profile for a represented evaluation whose
+    /// timing or multiplicity is unresolved.
+    ///
+    /// The evaluation still exists in the IR, so this deliberately does not
+    /// weaken dispatch coverage or call existence. It does leave produced
+    /// values, aliases, heap effects, and return transfer open.
+    pub const DEFERRED_EFFECTS: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
+    const CONTROL_FLOW: Self = Self::DEFERRED_EFFECTS;
+    /// Conservative downstream profile for a represented call whose
+    /// caller-side evaluation or transfer is incomplete.
+    ///
+    /// The represented call may still affect produced values, aliases, heap
+    /// reads and writes, return transfer, and caller-side evaluation beyond
+    /// what its retained IR events prove.
+    pub const CALL_EVALUATION: Self =
+        Self::DEFERRED_EFFECTS.with(SemanticGapImpact::CallEvaluation);
+
+    pub const fn single(impact: SemanticGapImpact) -> Self {
+        Self(impact.bit())
+    }
+
+    #[must_use]
+    pub const fn with(self, impact: SemanticGapImpact) -> Self {
+        Self(self.0 | impact.bit())
+    }
+
+    pub const fn contains(self, impact: SemanticGapImpact) -> bool {
+        self.0 & impact.bit() != 0
+    }
+
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Derive the conservative cross-language impacts shared by adapter gap
+    /// builders. Adapter-specific consequences that cannot be inferred from
+    /// the capability and subject must still be attached deliberately.
+    pub const fn for_gap(capability: SemanticCapability, subject: SemanticGapSubject) -> Self {
+        let capability_impacts = match capability {
+            SemanticCapability::Procedures
+            | SemanticCapability::BasicBlocks
+            | SemanticCapability::ProgramPoints => Self::NONE,
+            SemanticCapability::EntryBoundary => Self::VALUE,
+            SemanticCapability::NormalExitBoundary
+            | SemanticCapability::ExceptionalExitBoundary
+            | SemanticCapability::ReturnFlow => Self::RETURN_TRANSFER,
+            SemanticCapability::NormalControlFlow
+            | SemanticCapability::ExceptionalControlFlow
+            | SemanticCapability::CleanupControlFlow
+            | SemanticCapability::NonLocalControl => Self::CONTROL_FLOW,
+            SemanticCapability::Assignments
+            | SemanticCapability::Values
+            | SemanticCapability::LocalFlow
+            | SemanticCapability::ParameterFlow => Self::VALUE,
+            SemanticCapability::ReceiverFlow => {
+                Self::VALUE.with(SemanticGapImpact::DispatchCoverage)
+            }
+            SemanticCapability::Allocations
+            | SemanticCapability::FieldMemory
+            | SemanticCapability::StaticMemory
+            | SemanticCapability::IndexMemory
+            | SemanticCapability::Captures => Self::MEMORY,
+            // A call-site-scoped omission leaves call-dependent values and
+            // aliases open, but it does not by itself weaken retained target
+            // coverage or caller-side evaluation. Broader Calls gaps and
+            // callable producer gaps need adapter-authored impacts for any
+            // specific downstream consequence. DeferredExecution always
+            // leaves evaluation effects open; adapters additionally attach
+            // CallEvaluation only when a represented call's caller-side
+            // evaluation or transfer is itself incomplete.
+            SemanticCapability::Calls => match subject {
+                SemanticGapSubject::CallSite(_) => Self::VALUE,
+                _ => Self::NONE,
+            },
+            SemanticCapability::CallableReferences => Self::NONE,
+            SemanticCapability::DeferredExecution => Self::DEFERRED_EFFECTS,
+            SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
+            SemanticCapability::DynamicDispatch => {
+                Self::single(SemanticGapImpact::DispatchCoverage)
+            }
+            SemanticCapability::NormalCallContinuation
+            | SemanticCapability::ExceptionalCallContinuation
+            | SemanticCapability::AsyncSuspendResume
+            | SemanticCapability::GeneratorSuspension
+            | SemanticCapability::ResourceManagement => Self::CALL_EVALUATION,
+        };
+        let subject_impacts = match subject {
+            SemanticGapSubject::Value(_) => Self::VALUE,
+            SemanticGapSubject::MemoryLocation(_) | SemanticGapSubject::Capture(_) => Self::MEMORY,
+            SemanticGapSubject::CallContinuation { .. }
+            | SemanticGapSubject::AsyncContinuation { .. } => Self::CALL_EVALUATION,
+            SemanticGapSubject::Procedure
+            | SemanticGapSubject::Point
+            | SemanticGapSubject::CallSite(_) => Self::NONE,
+        };
+        capability_impacts.union(subject_impacts)
+    }
+
+    /// Iterate in [`SemanticGapImpact::ALL`] order, which is part of the
+    /// deterministic semantic rendering contract.
+    pub fn iter(self) -> impl Iterator<Item = SemanticGapImpact> {
+        SemanticGapImpact::ALL
+            .into_iter()
+            .filter(move |impact| self.contains(*impact))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticGap {
     pub id: SemanticGapId,
     pub point: ProgramPointId,
     pub subject: SemanticGapSubject,
     pub capability: SemanticCapability,
+    pub impacts: SemanticGapImpacts,
     pub kind: SemanticGapKind,
     /// Required exactly when `kind` is `ExceededBudget`.
     pub budget: Option<SemanticBudgetExceeded>,

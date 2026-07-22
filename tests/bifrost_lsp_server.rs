@@ -846,6 +846,43 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
 }
 
 #[test]
+fn bifrost_lsp_server_runs_java_receiver_queries_with_workspace_semantics() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    fs::write(
+        root.join("Sample.java"),
+        r#"class Service { void run() {} }
+class Sample {
+    void caller() {
+        Service service = new Service();
+        service.run();
+    }
+}
+"#,
+    )
+    .expect("write Java receiver fixture");
+    let mut server = LspServer::start(&root);
+
+    let response = server.request(
+        "bifrost/queryCode",
+        json!({
+            "query": "(receiver-targets (language java (call :callee \"run\")))"
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let results = response["result"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected receiver results: {response}"));
+    assert_eq!(results.len(), 1, "{response}");
+    assert_eq!(results[0]["result_type"], "receiver_analysis", "{response}");
+    assert_eq!(results[0]["outcome"], "precise", "{response}");
+    assert_eq!(
+        results[0]["values"][0]["receiver_value_kind"], "allocation_site",
+        "{response}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_units() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canonical root");

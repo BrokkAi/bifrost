@@ -273,6 +273,12 @@ pub struct SymbolFacts {
     /// trailing `$` stripped); the spelling agents actually type.
     pub display_fq: String,
     pub kind: CodeUnitType,
+    /// The symbol's own analyzer language. Language-keyed checks (the I1(a)
+    /// containment gate) must key on this, not the run's corpus language:
+    /// corpus repos are multi-language and the corpus language is a label,
+    /// not a per-symbol property (a "js" run over a Go repo must still skip
+    /// Go class containment).
+    pub language: crate::analyzer::Language,
     pub file_index: usize,
     pub ranges: Vec<Range>,
     pub child_indexes: Vec<usize>,
@@ -473,6 +479,7 @@ pub fn collect_i1_input(
             identifier,
             display_fq: display_symbol_for_target(unit),
             kind: unit.kind(),
+            language: crate::analyzer::common::language_for_target(unit),
             file_index,
             ranges,
             child_indexes: Vec::new(),
@@ -606,7 +613,7 @@ pub fn check_i1_ex(
         }
         let file = &input.files[symbol.file_index];
 
-        if containment_check_applies(symbol.kind, language) {
+        if containment_check_applies(symbol.kind, symbol.language) {
             for &child_index in &symbol.child_indexes {
                 let child = &input.symbols[child_index];
                 let Some(child_primary) = primary_range(&child.ranges) else {
@@ -780,11 +787,17 @@ fn check_parse_error_boundary(
 /// so the type's declaration range legitimately does not cover its members.
 /// Callable parents are always checked — nested functions and closures are
 /// lexically enclosed in every corpus language.
-fn containment_check_applies(kind: CodeUnitType, language: &str) -> bool {
+fn containment_check_applies(kind: CodeUnitType, language: crate::analyzer::Language) -> bool {
     if !is_container_kind(kind) {
         return false;
     }
-    !(kind == CodeUnitType::Class && matches!(language, "rust" | "go" | "c" | "cpp"))
+    !(kind == CodeUnitType::Class
+        && matches!(
+            language,
+            crate::analyzer::Language::Rust
+                | crate::analyzer::Language::Go
+                | crate::analyzer::Language::Cpp
+        ))
 }
 
 /// I1(a) applies to symbols that can lexically contain others. Modules are

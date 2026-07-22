@@ -24711,3 +24711,37 @@ object Outer {
         "{value}"
     );
 }
+
+// A `use super::X` import inside a nested module must resolve against the
+// enclosing inline module (the coreutils tests-module shape, issue #1074):
+// previously the file-level resolver popped `super` from the file's parent
+// package and claimed the same-file type "is not indexed".
+#[test]
+fn rust_super_import_from_test_module_resolves_same_file_declaration() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/progress.rs",
+            "pub(crate) struct ProgUpdate { pub n: u32 }\n\n#[cfg(test)]\nmod tests {\n    use super::ProgUpdate;\n\n    fn check(u: ProgUpdate) -> u32 { u.n }\n}\n",
+        )
+        .build();
+
+    let line = "    fn check(u: ProgUpdate) -> u32 { u.n }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/progress.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "ProgUpdate")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/progress.rs",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "progress.ProgUpdate",
+        "{value}"
+    );
+}

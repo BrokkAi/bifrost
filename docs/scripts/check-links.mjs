@@ -5,7 +5,7 @@ import { normalizeBase } from '../rehype-base-path-links.mjs';
 
 const docsRoot = fileURLToPath(new URL('..', import.meta.url));
 const distRoot = join(docsRoot, 'dist');
-const base = normalizeBase(process.env.PUBLIC_DOCS_BASE ?? '/bifrost');
+const base = normalizeBase(process.env.PUBLIC_DOCS_BASE ?? '/');
 const origin = 'https://docs.invalid';
 
 function walkFiles(directory) {

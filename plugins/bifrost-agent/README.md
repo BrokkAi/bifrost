@@ -21,9 +21,11 @@ namespace-qualified install names.
 The plugin starts `./bin/bifrost-launcher.mjs --mcp "symbol|extended"`.
 The launcher uses `BIFROST_WORKSPACE_ROOT` when set, then a host-provided
 `--root` or `--workspace-root`. Without either explicit override, Bifrost
-starts unbound and requests the host's approved workspace through the standard
-MCP roots capability. It never treats the installed plugin directory as the
-analyzer workspace.
+starts unbound and requests the host's approved workspace through standard MCP
+roots. On a rootless connection without advertised roots, it offers the
+`codex/sandbox-state-meta` extension; current Codex uses that capability to
+supply the active task. Bifrost never treats the installed plugin directory as
+the analyzer workspace.
 Claude Code and Codex read this server entry from `.mcp.json`; Cursor reads the
 same entry from root `mcp.json`, using Cursor's documented `type: "stdio"`
 field. Amp uses a different direct server-map shape for `mcp.json` and
@@ -217,12 +219,14 @@ entry. It starts a separate stdio Bifrost process with:
 bifrost --mcp "symbol|extended"
 ```
 
-Codex must advertise the active task directory through MCP roots for that
-rootless process to bind. A Codex build without roots support leaves Bifrost
-safely unbound instead of indexing the plugin cache. `BIFROST_WORKSPACE_ROOT`
-remains an explicit compatibility override for such hosts. Client-root sessions
-also keep analyzer and semantic cache writes under the exact approved root,
-including for linked worktrees.
+For that rootless process, Bifrost prefers standard MCP roots. When the client
+did not advertise roots, Bifrost offers the `codex/sandbox-state-meta`
+capability. A compatible client may then attach its active task directory to
+each analyzer tool call; current Codex does so. Bifrost binds that exact
+directory and revokes it when the per-call scope disappears or changes.
+`BIFROST_WORKSPACE_ROOT` remains an explicit compatibility override. Client-root
+and sandbox-metadata sessions keep analyzer and semantic cache writes under the
+exact approved root, including for linked worktrees.
 
 The plugin gives Bifrost up to 180 seconds to download, verify, extract, and
 start a missing pinned release, and up to 300 seconds for individual analyzer

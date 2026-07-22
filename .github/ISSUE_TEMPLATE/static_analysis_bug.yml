@@ -86,4 +86,4 @@ body:
   - type: markdown
     attributes:
       value: |
-        For benchmark or large-repository reports, see [Reproduce an Analysis](https://brokkai.github.io/bifrost/reproduce-analysis/) for the fuller evidence format.
+        For benchmark or large-repository reports, see [Reproduce an Analysis](https://bifrost.brokk.ai/reproduce-analysis/) for the fuller evidence format.

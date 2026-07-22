@@ -90,6 +90,11 @@ impl ProjectSourceSnapshot {
         &self.source
     }
 
+    /// Consume the snapshot and retain its immutable source allocation.
+    pub fn into_source(self) -> Arc<str> {
+        self.source
+    }
+
     pub const fn origin(&self) -> ProjectSourceOrigin {
         self.origin
     }

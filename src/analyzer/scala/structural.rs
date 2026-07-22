@@ -465,7 +465,7 @@ mod structural_spec_tests {
     #[test]
     fn scala_kind_table_matches_grammar() {
         crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
-            tree_sitter_scala::LANGUAGE.into(),
+            crate::analyzer::scala::language::LANGUAGE.into(),
             "tree-sitter-scala",
             SCALA_KIND_TABLE,
         );

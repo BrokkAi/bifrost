@@ -5871,6 +5871,52 @@ mod tests {
     }
 
     #[test]
+    fn scala_contextual_extension_parser_epoch_invalidates_prior_parsed_blobs() {
+        // This is the Scala epoch published by 0.8.8 before `extension` became
+        // a contextual soft identifier. That grammar change altered parse-table
+        // behavior without changing the ABI, node-kind names, or field names
+        // covered by the automatic grammar fingerprint.
+        const PRE_CONTEXTUAL_EXTENSION_EPOCH: &str =
+            "47bfc278e012ccd40fae653b0709bdc20c9979303719d20f36922f13ee0d7a88";
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Enrichments.scala",
+            "trait Enrichments { implicit class Rich(value: String) { def extension = value } }\n",
+        );
+        let state = Arc::new(parse_state(&ScalaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_generation = store
+            .ensure_language_epoch_value("scala", PRE_CONTEXTUAL_EXTENSION_EPOCH)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                prior_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Scala, &tree_sitter_scala::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .unwrap(),
+            vec![(oid, "scala".to_string())]
+        );
+    }
+
+    #[test]
     fn structural_snapshot_roundtrips_replaces_and_updates_cascade_costs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");

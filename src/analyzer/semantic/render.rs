@@ -13,11 +13,12 @@ use super::ids::{
     SourceRevision,
 };
 use super::ir::{
-    AllocationKind, AllocationSite, BasicBlock, CallableTarget, CallableTargetResolution,
-    CallableValue, CaptureBinding, CaptureSource, ControlContinuation, ControlEdge, Evidence,
-    EvidenceCompleteness, MemoryLocation, MemoryLocationKind, ProcedureSemantics, ProgramPoint,
-    ProofStatus, SemanticArtifact, SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap,
-    SemanticGapSubject, SemanticValue, SemanticValueKind, SourceMapping,
+    AllocationKind, AllocationSite, ArgumentDomain, BasicBlock, CallableTarget,
+    CallableTargetResolution, CallableValue, CaptureBinding, CaptureSource, ControlContinuation,
+    ControlEdge, Evidence, EvidenceCompleteness, FormalMultiplicity, MemoryLocation,
+    MemoryLocationKind, ProcedureSemantics, ProgramPoint, ProofStatus, SemanticArtifact,
+    SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapSubject,
+    SemanticValue, SemanticValueKind, SourceMapping,
 };
 use super::{
     DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
@@ -313,7 +314,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
     if !state.writer.open_with(2, |writer| {
         write!(
             writer,
-            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {}",
+            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {} :dispatch-extensibility {}",
             procedure.id(),
             quoted(procedure.kind().label()),
             optional_id(procedure.lexical_parent()),
@@ -327,6 +328,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
             properties.is_static,
             properties.is_synthetic,
             quoted(properties.invocation.label()),
+            quoted(properties.dispatch_extensibility.label()),
         )
     }) {
         return false;
@@ -494,8 +496,21 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         quoted(value.kind.label())
     )?;
     match &value.kind {
-        SemanticValueKind::Parameter { ordinal } => {
-            write!(writer, " :ordinal {ordinal}")?;
+        SemanticValueKind::Parameter {
+            ordinal,
+            multiplicity,
+        } => {
+            write!(
+                writer,
+                " :ordinal {ordinal} :multiplicity {}",
+                quoted(multiplicity.label())
+            )?;
+            if let FormalMultiplicity::Rest(domain) = multiplicity {
+                write!(writer, " :argument-domain {}", quoted(domain.label()))?;
+                if let ArgumentDomain::LanguageDefined(detail) = domain {
+                    write!(writer, " :language-domain {}", quoted(detail))?;
+                }
+            }
         }
         SemanticValueKind::LanguageDefined(kind) => {
             write!(writer, " :language-kind {}", quoted(kind))?;
@@ -611,7 +626,26 @@ fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) ->
         call_site.callee,
         optional_id(call_site.receiver),
     )?;
-    write_id_list(writer, call_site.arguments.iter().copied())?;
+    writer.write_char('(')?;
+    for (index, argument) in call_site.arguments.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(
+            writer,
+            "(argument :value {} :expansion {}",
+            argument.value,
+            quoted(argument.expansion.label()),
+        )?;
+        if let Some(domain) = argument.expansion.domain() {
+            write!(writer, " :domain {}", quoted(domain.label()))?;
+            if let ArgumentDomain::LanguageDefined(detail) = domain {
+                write!(writer, " :language-domain {}", quoted(detail))?;
+            }
+        }
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')?;
     write!(
         writer,
         " :result {} :thrown {} :declared-targets (",
@@ -689,10 +723,16 @@ fn write_gap(writer: &mut dyn fmt::Write, gap: &SemanticGap) -> fmt::Result {
     write_gap_subject(writer, gap.subject)?;
     write!(
         writer,
-        " :capability {} :kind {} :budget ",
+        " :capability {} :impacts (",
         quoted(gap.capability.label()),
-        quoted(gap.kind.label()),
     )?;
+    for (index, impact) in gap.impacts.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(writer, "{}", quoted(impact.label()))?;
+    }
+    write!(writer, ") :kind {} :budget ", quoted(gap.kind.label()),)?;
     if let Some(budget) = gap.budget {
         write!(
             writer,
@@ -1314,9 +1354,9 @@ mod tests {
         ControlEdgeKind, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
         DependencyFingerprint, EvidenceId, ProcedureKind, ProcedureSemanticsParts, ProgramPointId,
         SemanticBudget, SemanticCapabilities, SemanticCapability, SemanticEvent, SemanticGapId,
-        SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole, SemanticWork,
-        SourceAnchor, SourceMappingId, SourceMappingKind, SourcePosition, SourceRevision,
-        SourceSpan, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+        SemanticGapImpacts, SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole,
+        SemanticWork, SourceAnchor, SourceMappingId, SourceMappingKind, SourcePosition,
+        SourceRevision, SourceSpan, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
     };
 
     #[test]
@@ -1618,7 +1658,10 @@ mod tests {
             point: ProgramPointId::new(4),
             callee: super::super::ids::ValueId::new(0),
             receiver: None,
-            arguments: Box::new([super::super::ids::ValueId::new(1)]),
+            arguments: Box::new([super::super::ir::SemanticCallArgument::direct(
+                super::super::ids::ValueId::new(1),
+                super::super::ir::ArgumentDomain::Positional,
+            )]),
             result: None,
             thrown: None,
             declared_targets: CallableTargetResolution::ExceededBudget(Box::new([
@@ -1653,6 +1696,13 @@ mod tests {
                 kind: super::super::ir::CallContinuationKind::Exceptional,
             },
             capability: SemanticCapability::ExceptionalCallContinuation,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalCallContinuation,
+                SemanticGapSubject::CallContinuation {
+                    call_site: super::super::ids::CallSiteId::new(0),
+                    kind: super::super::ir::CallContinuationKind::Exceptional,
+                },
+            ),
             kind: super::super::ir::SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
             detail: "bounded target proof".into(),
@@ -1663,6 +1713,9 @@ mod tests {
         write_gap(&mut gap_rendered, &gap).unwrap();
         assert!(gap_rendered.contains(":subject (subject :kind \"call_continuation\""));
         assert!(gap_rendered.contains(":continuation-kind \"exceptional\""));
+        assert!(gap_rendered.contains(
+            ":impacts (\"call_evaluation\" \"return_transfer\" \"value_flow\" \"heap_read\" \"heap_write\" \"aliasing\")"
+        ));
         assert!(gap_rendered.contains(":dimension \"program_points\" :limit 1 :attempted 2"));
 
         let capture = CaptureBinding {
@@ -1939,6 +1992,10 @@ mod tests {
             point: ProgramPointId::new(2),
             subject: SemanticGapSubject::Point,
             capability: SemanticCapability::ExceptionalControlFlow,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapSubject::Point,
+            ),
             kind: super::super::ir::SemanticGapKind::Unsupported,
             budget: None,
             detail,

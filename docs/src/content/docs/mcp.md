@@ -33,9 +33,13 @@ bifrost --root /path/to/project --mcp "symbol|workspace"
 bifrost --root /path/to/project --mcp "text|extended"
 ```
 
-The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound, requests `roots/list` from a roots-capable MCP client after initialization, and selects the first usable local filesystem root in client order. Clients can send `notifications/roots/list_changed` to replace that root; Bifrost revokes the old root immediately and remains unbound until the refreshed list is accepted. If the client does not support roots, analyzer calls return an actionable unbound-workspace error instead of analyzing process cwd.
+The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound, requests `roots/list` from a roots-capable MCP client after initialization, and selects the first usable local filesystem root in client order. Clients can send `notifications/roots/list_changed` to replace that root; Bifrost revokes the old root immediately and remains unbound until the refreshed list is accepted.
 
-Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use roots negotiation so package-local command resolution stays independent from analyzer scope.
+Current Codex does not advertise standard roots. For any rootless connection whose client did not advertise roots, Bifrost instead advertises the experimental `codex/sandbox-state-meta` capability. A compatible client may respond by attaching the active turn's canonical `sandboxCwd` file URI to every analyzer tool call; current Codex does so. Bifrost treats that per-call value as the current scope: a missing, invalid, or changed value revokes the previous metadata-derived workspace before the call fails or binds the replacement. A client that supports neither roots nor this negotiated extension remains unbound and receives an actionable error rather than analysis of process cwd.
+
+Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use client-provided roots or Codex sandbox-state metadata so package-local command resolution stays independent from analyzer scope.
+
+When standard roots or sandbox-state metadata controls a rootless connection, `activate_workspace` is unavailable even if the selected toolset exposes it. Change the workspace through the MCP host instead. This prevents a tool call from widening the client-approved scope; explicit-root integrations retain the normal workspace activation behavior.
 
 ## Toolsets
 

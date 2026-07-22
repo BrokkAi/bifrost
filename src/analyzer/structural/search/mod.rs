@@ -41,8 +41,8 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
 use crate::analyzer::usages::receiver_query::{
-    ReceiverQueryAnalysis, ReceiverQueryInput, ReceiverQueryOperation, ReceiverQueryReport,
-    ReceiverQueryService,
+    ReceiverQueryAnalysis, ReceiverQueryError, ReceiverQueryInput, ReceiverQueryOperation,
+    ReceiverQueryReport, ReceiverQueryService,
 };
 use crate::analyzer::usages::{
     CallBindingCache, CallBindingStatus, CallRelationDiagnostic, CallRelationDiagnosticCode,
@@ -50,7 +50,7 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHit,
     UsageHitKind, UsageProof, bind_call_site_arguments,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
@@ -620,6 +620,13 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResult {
     execute_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
 }
 
+/// Run `query` with access to the generation-bound semantic-oracle facade.
+/// Receiver traversal uses this entrypoint in product code; the analyzer-only
+/// entrypoint remains available for callers that do not own a workspace.
+pub fn execute_workspace(workspace: &WorkspaceAnalyzer, query: &CodeQuery) -> CodeQueryResult {
+    execute_workspace_with_limits(workspace, query, CodeQueryExecutionLimits::default())
+}
+
 /// Honor the query's root execution mode through the public Rust surface.
 /// Ordinary callers that always want rows may continue to use [`execute`].
 pub fn execute_request(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResponse {
@@ -631,7 +638,24 @@ pub fn execute_request_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, query, limits, None)
+    execute_request_internal(analyzer, None, query, limits, None)
+}
+
+/// Honor the query's root execution mode with access to generation-bound
+/// semantic oracles for receiver traversal.
+pub fn execute_workspace_request(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+) -> CodeQueryResponse {
+    execute_workspace_request_with_limits(workspace, query, CodeQueryExecutionLimits::default())
+}
+
+pub fn execute_workspace_request_with_limits(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResponse {
+    execute_request_internal(workspace.analyzer(), Some(workspace), query, limits, None)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -929,6 +953,7 @@ struct CachedSeedExecution {
 
 struct QueryExecutionState<'a> {
     analyzer: &'a dyn IAnalyzer,
+    workspace: Option<&'a WorkspaceAnalyzer>,
     cancellation: Option<&'a CancellationToken>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
@@ -981,6 +1006,24 @@ pub fn execute_with_limits(
     execute_code_query_detailed(analyzer, query, limits, None).result
 }
 
+#[doc(hidden)]
+pub fn execute_workspace_with_limits(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResult {
+    execute_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        None,
+        None,
+        false,
+    )
+    .result
+}
+
 #[cfg(test)]
 pub(crate) fn execute_with_cancellation(
     analyzer: &dyn IAnalyzer,
@@ -1002,18 +1045,46 @@ pub fn execute_request_with_cancellation(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, query, limits, Some(cancellation))
+    execute_request_internal(analyzer, None, query, limits, Some(cancellation))
+}
+
+/// Execute a mode-aware workspace query with explicit limits and cooperative
+/// cancellation. Explain mode remains planning-only and does not inspect the
+/// workspace.
+pub fn execute_workspace_request_with_cancellation(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResponse {
+    execute_request_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        Some(cancellation),
+    )
 }
 
 fn execute_request_internal(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> CodeQueryResponse {
     match query.execution_mode {
         CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
-            execute_code_query_detailed(analyzer, query, limits, cancellation).result,
+            execute_internal(
+                analyzer,
+                workspace,
+                query,
+                limits,
+                cancellation,
+                None,
+                false,
+            )
+            .result,
         ),
         CodeQueryExecutionMode::Explain => match select_physical_plan(
             query,
@@ -1031,7 +1102,8 @@ fn execute_request_internal(
             Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
         },
         CodeQueryExecutionMode::Profile => {
-            let detailed = execute_internal(analyzer, query, limits, cancellation, None, true);
+            let detailed =
+                execute_internal(analyzer, workspace, query, limits, cancellation, None, true);
             let DetailedCodeQueryResult {
                 result, profile, ..
             } = detailed;
@@ -1054,7 +1126,7 @@ pub(crate) fn execute_code_query_detailed(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, query, limits, cancellation, None, false)
+    execute_internal(analyzer, None, query, limits, cancellation, None, false)
 }
 
 /// Internal opt-in profile entry point used by the M2 measurement harness.
@@ -1065,7 +1137,7 @@ pub(crate) fn execute_code_query_profiled(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, query, limits, None, None, true)
+    execute_internal(analyzer, None, query, limits, None, None, true)
 }
 
 /// M4 benchmark/test entry point. A forced strategy still passes through the
@@ -1080,6 +1152,7 @@ pub(crate) fn execute_code_query_with_union_strategy(
 ) -> DetailedCodeQueryResult {
     execute_internal_with_strategy(
         analyzer,
+        None,
         query,
         limits,
         None,
@@ -1098,6 +1171,7 @@ fn execute_with_receiver_budget_for_test(
 ) -> CodeQueryResult {
     execute_internal(
         analyzer,
+        None,
         query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -1109,6 +1183,7 @@ fn execute_with_receiver_budget_for_test(
 
 fn execute_internal(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -1117,6 +1192,7 @@ fn execute_internal(
 ) -> DetailedCodeQueryResult {
     execute_internal_with_strategy(
         analyzer,
+        workspace,
         query,
         limits,
         cancellation,
@@ -1130,6 +1206,7 @@ fn execute_internal(
 #[allow(clippy::too_many_arguments)]
 fn execute_internal_with_strategy(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -1163,6 +1240,7 @@ fn execute_internal_with_strategy(
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
+        workspace,
         cancellation,
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
@@ -2498,6 +2576,9 @@ fn execute_parallel_seed_union(
                 let lease = coordinator.lease(branch);
                 let mut branch_state = QueryExecutionState {
                     analyzer,
+                    // Parallel union dependencies are seed scans only; receiver
+                    // steps execute later against the parent workspace state.
+                    workspace: None,
                     cancellation,
                     receiver_budget_override,
                     budget: base_budget,
@@ -2711,6 +2792,7 @@ fn append_diagnostic_terminations(
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+            | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
             | CodeQueryDiagnosticCode::CallRelationParseFailed
             | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
             | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
@@ -3279,6 +3361,7 @@ fn apply_plan_step(
     };
     let (mut rows, exhausted, step_truncated) = apply_pipeline_step(
         state.analyzer,
+        state.workspace,
         step,
         rows,
         state.import_graph.as_ref(),
@@ -3638,6 +3721,7 @@ fn ensure_forward_import_edges(
 #[allow(clippy::too_many_arguments)]
 fn apply_pipeline_step(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     step: &QueryStep,
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
@@ -3658,8 +3742,7 @@ fn apply_pipeline_step(
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
     let mut semantic_omissions: BTreeMap<(Language, &'static str), usize> = BTreeMap::new();
-    let mut receiver_diagnostics: BTreeMap<(Language, &'static str, String), usize> =
-        BTreeMap::new();
+    let mut receiver_diagnostics = ReceiverDiagnostics::new();
     let mut enclosing_declarations: HashMap<ProjectFile, EnclosingDeclarationIndex> =
         HashMap::default();
     let mut exhausted = false;
@@ -3668,7 +3751,12 @@ fn apply_pipeline_step(
         step,
         QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
     )
-    .then(|| ReceiverQueryService::new(analyzer));
+    .then(|| {
+        workspace.map_or_else(
+            || ReceiverQueryService::new(analyzer),
+            ReceiverQueryService::from_workspace,
+        )
+    });
     let mut instrumentation = instrumentation;
 
     let mut indexed_declarations = indexed_declarations;
@@ -4130,16 +4218,24 @@ fn apply_pipeline_step(
         });
     }
     append_semantic_omission_diagnostics(diagnostics, step, semantic_omissions);
-    for ((language, operation, reason), count) in receiver_diagnostics {
+    for ((code, language, operation, reason), count) in receiver_diagnostics {
+        let message = if code == CodeQueryDiagnosticCode::ReceiverAnalysisFailed {
+            format!(
+                "{operation} failed for {count} analysis input{}: {reason}",
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "{operation} returned {count} analysis row{} with {reason}",
+                if count == 1 { "" } else { "s" }
+            )
+        };
         diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+            code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: language.config_label(),
-            message: format!(
-                "{operation} returned {count} analysis row{} with {reason}",
-                if count == 1 { "" } else { "s" }
-            ),
+            message,
         });
     }
     if let Some(instrumentation) = instrumentation {
@@ -4178,6 +4274,9 @@ fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
         _ => unreachable!("receiver operation requested for a non-receiver step"),
     }
 }
+
+type ReceiverDiagnostics =
+    BTreeMap<(CodeQueryDiagnosticCode, Language, &'static str, String), usize>;
 
 fn structural_receiver_ranges(
     seed: &SeedMatch,
@@ -4255,7 +4354,7 @@ fn receiver_analysis_expansions(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
-    receiver_diagnostics: &mut BTreeMap<(Language, &'static str, String), usize>,
+    receiver_diagnostics: &mut ReceiverDiagnostics,
     shared_budget_exhausted: &mut bool,
     receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
@@ -4271,18 +4370,30 @@ fn receiver_analysis_expansions(
             .max_pipeline_rows
             .saturating_sub(budget.pipeline_rows);
         let base = receiver_budget_override.unwrap_or_default();
-        let receiver_budget = ReceiverAnalysisBudget {
-            context_depth: base.context_depth,
-            max_targets: base.max_targets.min(remaining_rows.saturating_sub(1)),
-            max_summary_expansions: base.max_summary_expansions.min(remaining_facts),
-            max_scope_nodes: base.max_scope_nodes.min(remaining_facts),
-        };
-        let Ok(report) =
-            service.analyze(operation, file, range, input, receiver_budget, cancellation)
-        else {
-            *shared_budget_exhausted = true;
-            break;
-        };
+        let receiver_budget = receiver_budget_for_remaining_work(
+            base,
+            remaining_facts,
+            remaining_rows.saturating_sub(1),
+        );
+        let report =
+            match service.analyze(operation, file, range, input, receiver_budget, cancellation) {
+                Ok(report) => report,
+                Err(ReceiverQueryError::Cancelled) => {
+                    *shared_budget_exhausted = true;
+                    break;
+                }
+                Err(ReceiverQueryError::SemanticProvider(error)) => {
+                    *receiver_diagnostics
+                        .entry((
+                            CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
+                            crate::analyzer::common::language_for_file(file),
+                            operation.as_str(),
+                            error.to_string(),
+                        ))
+                        .or_default() += 1;
+                    break;
+                }
+            };
 
         let candidate_count = receiver_candidate_count(&report);
         budget.fact_nodes = budget
@@ -4308,6 +4419,7 @@ fn receiver_analysis_expansions(
             }) => {
                 *receiver_diagnostics
                     .entry((
+                        CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                         language,
                         operation.as_str(),
                         format!("unsupported provider or shape: {reason}"),
@@ -4321,6 +4433,7 @@ fn receiver_analysis_expansions(
                 *receiver_truncated = true;
                 *receiver_diagnostics
                     .entry((
+                        CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                         language,
                         operation.as_str(),
                         format!("exceeded receiver limit {limit}"),
@@ -4342,6 +4455,7 @@ fn receiver_analysis_expansions(
             *receiver_truncated = true;
             *receiver_diagnostics
                 .entry((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                     language,
                     operation.as_str(),
                     "truncated candidates at max_targets".to_string(),
@@ -4359,6 +4473,40 @@ fn receiver_analysis_expansions(
         });
     }
     expansions
+}
+
+fn receiver_budget_for_remaining_work(
+    base: ReceiverAnalysisBudget,
+    remaining_facts: usize,
+    remaining_targets: usize,
+) -> ReceiverAnalysisBudget {
+    let desired_scope = base.max_scope_nodes.min(remaining_facts);
+    let desired_summaries = base.max_summary_expansions.min(remaining_facts);
+    if desired_scope.saturating_add(desired_summaries) <= remaining_facts {
+        return ReceiverAnalysisBudget {
+            context_depth: base.context_depth,
+            max_targets: base.max_targets.min(remaining_targets),
+            max_summary_expansions: desired_summaries,
+            max_scope_nodes: desired_scope,
+        };
+    }
+
+    // CodeQuery has one fact-node budget, while receiver analysis exposes
+    // separate scope and summary caps. Reserve up to one quarter for summary
+    // expansion, then give scope traversal the remainder; this prevents the
+    // two dimensions from each spending the same scalar remainder in full.
+    let summary_reserve = desired_summaries.min(remaining_facts / 4);
+    let max_scope_nodes = desired_scope.min(remaining_facts - summary_reserve);
+    let unallocated = remaining_facts - summary_reserve - max_scope_nodes;
+    let max_summary_expansions =
+        summary_reserve.saturating_add((desired_summaries - summary_reserve).min(unallocated));
+    debug_assert!(max_scope_nodes.saturating_add(max_summary_expansions) <= remaining_facts);
+    ReceiverAnalysisBudget {
+        context_depth: base.context_depth,
+        max_targets: base.max_targets.min(remaining_targets),
+        max_summary_expansions,
+        max_scope_nodes,
+    }
 }
 
 fn receiver_candidate_count(report: &ReceiverQueryReport) -> usize {

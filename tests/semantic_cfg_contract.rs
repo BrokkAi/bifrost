@@ -2745,6 +2745,12 @@ fn java_switch_yield_runs_finally_and_never_targets_procedure_exit() {
                 .outgoing_kind(ControlEdgeKind::Normal),
         )
         .bind(
+            "selected_binding",
+            PointSelector::new("selected = switch (input)")
+                .procedure("choose")
+                .effect("assignment"),
+        )
+        .bind(
             "return",
             PointSelector::new("return selected;")
                 .procedure("choose")
@@ -2760,6 +2766,10 @@ fn java_switch_yield_runs_finally_and_never_targets_procedure_exit() {
     graph.assert_reachable("primary_call", "yield_terminal");
     graph.assert_successors(
         "switch_merge",
+        &[expected_edge("selected_binding", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "selected_binding",
         &[expected_edge("after_statement", ControlEdgeKind::Normal)],
     );
     graph.assert_reachable("yield_terminal", "after_call");

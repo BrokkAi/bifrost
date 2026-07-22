@@ -6,165 +6,23 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
 
-use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-use crate::analyzer::usages::{
-    CallDispatchBoundaryKind, CallDispatchTarget, CallRelationLimits, CallRelationService,
-    ExactCallLocation, UsageProof, call_dispatch_equivalence_source,
-};
-use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, LanguageDialect, ProjectFile, ProjectSourceOrigin, Range,
-    WorkspaceAnalyzer,
-};
+use crate::analyzer::WorkspaceAnalyzer;
 use crate::hash::{HashMap, HashSet};
 
-use super::{
-    CallContinuationKind, CallSiteHandle, CallSiteId, ContentIdentity, ControlContinuation,
-    ControlEdgeKind, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
-    EvidenceCompleteness, OverlaySnapshotId, ProcedureHandle, ProcedureInvocationKind,
-    ProcedureKind, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapKind,
-    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceRevision, SourceSpan,
-    WorkspaceMountId, WorkspaceRelativePath,
+use super::workspace_oracle::{
+    WorkspaceSemanticOracle, exact_source_for_procedure, semantic_locator_work,
 };
-
-const MAX_DISPATCH_TARGETS: usize = 1_024;
-
-/// Source-scoped callable identity used only while stitching dispatch. The
-/// location-first resolver may return both a C/C++ declaration and a related
-/// body, but the ICFG never manufactures equivalents from a workspace-global
-/// FQN: external linkage does not identify one link unit.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CallableDefinitionIdentity {
-    kind: CodeUnitType,
-    fq_name: String,
-    signature: Option<String>,
-    source_scope: Option<ProjectFile>,
-}
-
-impl CallableDefinitionIdentity {
-    fn of(analyzer: &dyn IAnalyzer, definition: &CodeUnit) -> Self {
-        Self::with_source_scope(
-            definition,
-            call_dispatch_equivalence_source(analyzer, definition),
-        )
-    }
-
-    fn with_source_scope(definition: &CodeUnit, source_scope: Option<ProjectFile>) -> Self {
-        Self {
-            kind: definition.kind(),
-            fq_name: definition.fq_name(),
-            signature: definition.signature().map(str::to_owned),
-            source_scope,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DispatchTargetGroup {
-    representative: CodeUnit,
-    proof: UsageProof,
-}
-
-fn dispatch_target_groups(
-    analyzer: &dyn IAnalyzer,
-    targets: Vec<CallDispatchTarget>,
-) -> Vec<DispatchTargetGroup> {
-    let mut groups = Vec::<DispatchTargetGroup>::new();
-    let mut index = HashMap::<CallableDefinitionIdentity, usize>::default();
-    for target in targets {
-        let identity = CallableDefinitionIdentity::of(analyzer, &target.definition);
-        if let Some(group) = index
-            .get(&identity)
-            .and_then(|group| groups.get_mut(*group))
-        {
-            if target.definition < group.representative {
-                group.representative = target.definition;
-            }
-            if target.proof == UsageProof::Proven {
-                group.proof = UsageProof::Proven;
-            }
-            continue;
-        }
-        index.insert(identity.clone(), groups.len());
-        groups.push(DispatchTargetGroup {
-            representative: target.definition,
-            proof: target.proof,
-        });
-    }
-    groups
-}
-
-/// One materialized workspace target for an exact semantic call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchCandidate {
-    pub target: ProcedureHandle,
-    pub proof: ProofStatus,
-    pub completeness: EvidenceCompleteness,
-}
-
-/// A dispatch arm that cannot enter a materialized workspace procedure.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DispatchBoundaryKind {
-    /// The resolver proved that the target crosses the indexed workspace
-    /// boundary. Older resolver paths cannot always name that declaration.
-    External(Option<SemanticLocator>),
-    /// A declaration was resolved, but no callable body was published by the
-    /// language adapter for this generation.
-    Unmaterialized(SemanticLocator),
-    /// Dispatch resolved a callable body, but invoking it only creates a
-    /// suspended object. Entering that body requires a later language-level
-    /// resume operation that this control-only ICFG does not yet model.
-    Deferred {
-        target: SemanticLocator,
-        kind: DeferredInvocationKind,
-    },
-    Unresolved,
-    Truncated,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DeferredInvocationKind {
-    Async,
-    Generator,
-    AsyncGenerator,
-    LanguageDefined,
-}
-
-impl DeferredInvocationKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Async => "async",
-            Self::Generator => "generator",
-            Self::AsyncGenerator => "async_generator",
-            Self::LanguageDefined => "language_defined",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DispatchBoundary {
-    pub kind: DispatchBoundaryKind,
-    pub proof: ProofStatus,
-    pub completeness: EvidenceCompleteness,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DispatchResult {
-    pub candidates: Box<[DispatchCandidate]>,
-    pub boundaries: Box<[DispatchBoundary]>,
-}
-
-/// Location-first whole-program dispatch over one exact semantic call site.
-pub trait DispatchOracle {
-    fn resolve_call(
-        &self,
-        call: &CallSiteHandle,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError>;
-}
+use super::{
+    CallContinuationKind, CallSiteHandle, CallSiteId, ControlContinuation, ControlEdgeKind,
+    DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchOracle, DispatchResult,
+    EvidenceCompleteness, EvidenceHandle, OracleLimits, OracleRelationArena, OracleRelationHandle,
+    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
+    OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability,
+    SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallTransfer {
@@ -230,16 +88,22 @@ pub trait IcfgProvider: DispatchOracle {
 /// One provider is tied to one [`WorkspaceAnalyzer`] generation.
 #[derive(Clone, Copy)]
 pub struct WorkspaceIcfgProvider<'a> {
-    workspace: &'a WorkspaceAnalyzer,
+    oracle: WorkspaceSemanticOracle<'a>,
 }
 
 impl<'a> WorkspaceIcfgProvider<'a> {
-    pub(crate) const fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
-        Self { workspace }
+    pub(crate) fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
+        Self {
+            oracle: WorkspaceSemanticOracle::new(workspace),
+        }
     }
 
     pub const fn workspace(&self) -> &'a WorkspaceAnalyzer {
-        self.workspace
+        self.oracle.workspace()
+    }
+
+    pub const fn oracle(&self) -> &WorkspaceSemanticOracle<'a> {
+        &self.oracle
     }
 }
 
@@ -587,10 +451,7 @@ impl SnapshotBuilder {
             self.quality = SnapshotQuality::Truncated;
             return Ok(None);
         }
-        self.work = self
-            .work
-            .checked_add(work)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+        self.work = self.work.conservative_add(work);
         self.publish_node(key).map(|id| Some((id, true)))
     }
 
@@ -679,14 +540,8 @@ impl SnapshotBuilder {
             return Ok(Some(target));
         }
         *request.budget = staged_budget;
-        let work = node_work.map_or(edge_work, |node| {
-            node.checked_add(edge_work)
-                .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
-        });
-        self.work = self
-            .work
-            .checked_add(work)
-            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+        let work = node_work.map_or(edge_work, |node| node.conservative_add(edge_work));
+        self.work = self.work.conservative_add(work);
         self.edge_set.insert(edge.clone());
         self.edges.push(edge);
         Ok(Some(target))
@@ -799,8 +654,11 @@ fn merge_quality(current: SnapshotQuality, incoming: SnapshotQuality) -> Snapsho
     match (current, incoming) {
         (Cancelled, _) | (_, Cancelled) => Cancelled,
         (Truncated, _) | (_, Truncated) => Truncated,
-        (Unsupported(capability), _) => Unsupported(capability),
-        (_, Unsupported(capability)) => Unsupported(capability),
+        // The public outcome can carry only one unsupported capability. Use
+        // stable capability order so aggregation is independent of traversal
+        // and gap-emission order.
+        (Unsupported(left), Unsupported(right)) => Unsupported(left.min(right)),
+        (Unsupported(capability), _) | (_, Unsupported(capability)) => Unsupported(capability),
         (Unknown, _) | (_, Unknown) => Unknown,
         (Unproven, _) | (_, Unproven) => Unproven,
         (Ambiguous, _) | (_, Ambiguous) => Ambiguous,
@@ -865,398 +723,9 @@ impl DispatchOracle for WorkspaceIcfgProvider<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
-        if request.cancellation.is_cancelled() {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work: SemanticWork::default(),
-            });
-        }
-
-        let max_source_bytes = request.budget.remaining().source_bytes;
-        let Some((file, exact_source)) =
-            exact_source_for_procedure(self.workspace, call.procedure(), max_source_bytes)?
-        else {
-            let work = SemanticWork {
-                source_bytes: max_source_bytes.saturating_add(1),
-                ..SemanticWork::default()
-            };
-            let exceeded = request.budget.check(work).map_or_else(
-                |exceeded| exceeded,
-                |_| unreachable!("bounded source omission must exceed the remaining budget"),
-            );
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(DispatchResult {
-                    candidates: Box::new([]),
-                    boundaries: Box::new([truncated_dispatch_boundary()]),
-                }),
-                exceeded,
-                work,
-            });
-        };
-        let semantic_call = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .ok_or_else(|| SemanticProviderError::internal("semantic call-site handle is stale"))?;
-        let dynamic_dispatch_gap =
-            scoped_dynamic_dispatch_gap(call.procedure().semantics(), semantic_call);
-        let call_evaluation_gaps = scoped_cpp_call_evaluation_gaps(call.procedure(), semantic_call);
-        let procedure_call_gap = scoped_cpp_preprocessor_call_gap(call.procedure());
-        let mapping = call
-            .procedure()
-            .semantics()
-            .source_mapping(semantic_call.source)
-            .ok_or_else(|| {
-                SemanticProviderError::internal("semantic call site has no source mapping")
-            })?;
-        let span = mapping.locator.anchor().span();
-        let location = ExactCallLocation {
-            file,
-            call_span: Range {
-                start_byte: span.start_byte() as usize,
-                end_byte: span.end_byte() as usize,
-                start_line: span.start().line() as usize,
-                end_line: span.end().line() as usize,
-            },
-        };
-
-        let mut staged_budget = request.budget.clone();
-        let lookup = CallRelationService::dispatch_at_bounded(
-            self.workspace.analyzer(),
-            &location,
-            Arc::clone(&exact_source),
-            CallRelationLimits {
-                max_files: 1,
-                max_source_bytes,
-                max_candidates: MAX_DISPATCH_TARGETS,
-            },
-            Some(request.cancellation),
-        );
-        if lookup.cancelled || request.cancellation.is_cancelled() {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work: SemanticWork::default(),
-            });
-        }
-
-        debug_assert!(lookup.work.scanned_files <= 1);
-        debug_assert!(
-            lookup.status.is_none() || !lookup.targets.is_empty() || !lookup.boundaries.is_empty(),
-            "every completed dispatch status must retain a target or typed boundary"
-        );
-        let dispatch_work = SemanticWork {
-            source_bytes: lookup.work.scanned_source_bytes,
-            call_sites: 1,
-            nested_entries: lookup
-                .targets
-                .len()
-                .saturating_add(lookup.boundaries.len())
-                .saturating_add(lookup.work.examined_candidates),
-            ..SemanticWork::default()
-        };
-        if let Err(exceeded) = staged_budget.charge(dispatch_work) {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(DispatchResult {
-                    candidates: Box::new([]),
-                    boundaries: Box::new([truncated_dispatch_boundary()]),
-                }),
-                exceeded,
-                work: dispatch_work,
-            });
-        }
-        let mut reported_work = dispatch_work;
-        if lookup.budget_exhausted {
-            let attempted = SemanticWork {
-                source_bytes: exact_source.len().max(1),
-                call_sites: 1,
-                ..SemanticWork::default()
-            };
-            if let Err(exceeded) = request.budget.check(attempted) {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: Some(DispatchResult {
-                        candidates: Box::new([]),
-                        boundaries: Box::new([truncated_dispatch_boundary()]),
-                    }),
-                    exceeded,
-                    work: attempted,
-                });
-            }
-        }
-
-        let mut candidates = Vec::new();
-        let mut boundaries = lookup
-            .boundaries
-            .iter()
-            .map(low_level_boundary)
-            .collect::<Vec<_>>();
-        let target_groups = dispatch_target_groups(self.workspace.analyzer(), lookup.targets);
-        let target_group_count = target_groups.len();
-        let mut candidate_indexes = HashMap::<ProcedureHandle, usize>::default();
-        let mut materialization_quality = SnapshotQuality::Complete;
-        let mut materialization_exceeded = None;
-        let mut remaining_definition_materializations = MAX_DISPATCH_TARGETS;
-        let mut materialized_files: HashMap<
-            ProjectFile,
-            SemanticOutcome<Arc<super::SemanticArtifact>>,
-        > = HashMap::default();
-        let mut staged_request = SemanticRequest::new(&mut staged_budget, request.cancellation);
-
-        for (group_index, group) in target_groups.into_iter().enumerate() {
-            if request.cancellation.is_cancelled() {
-                materialization_quality = SnapshotQuality::Cancelled;
-                break;
-            }
-            // Exact dispatch already performed the structured, language-aware
-            // declaration/body expansion. Do not repeat it by global FQN here:
-            // that would cross C/C++ link units and bypass dispatch work bounds.
-            let mut definitions = vec![group.representative.clone()];
-            let definitions_truncated = definitions.len() > remaining_definition_materializations;
-            definitions.truncate(remaining_definition_materializations);
-            remaining_definition_materializations =
-                remaining_definition_materializations.saturating_sub(definitions.len());
-            if definitions_truncated {
-                boundaries.push(truncated_dispatch_boundary());
-                materialization_quality = SnapshotQuality::Truncated;
-            }
-
-            let mut matched_any = false;
-            let mut matched_quality = match group.proof {
-                UsageProof::Proven => SnapshotQuality::Complete,
-                UsageProof::Unproven => SnapshotQuality::Unproven,
-            };
-            let mut failure_quality = SnapshotQuality::Complete;
-            for definition in definitions {
-                if request.cancellation.is_cancelled() {
-                    materialization_quality = SnapshotQuality::Cancelled;
-                    break;
-                }
-                let outcome = if let Some(outcome) = materialized_files.get(definition.source()) {
-                    outcome.clone()
-                } else {
-                    let outcome = self
-                        .workspace
-                        .materialize_program_semantics(definition.source(), &mut staged_request)?;
-                    reported_work = reported_work
-                        .checked_add(outcome.work())
-                        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
-                    materialized_files.insert(definition.source().clone(), outcome.clone());
-                    outcome
-                };
-                match outcome {
-                    SemanticOutcome::Complete { value, .. } => {
-                        let matched = procedures_for_definition(
-                            self.workspace.analyzer(),
-                            &definition,
-                            &value,
-                        );
-                        matched_any |= !matched.is_empty();
-                        for procedure in matched {
-                            retain_dispatch_candidate(
-                                &mut candidates,
-                                &mut candidate_indexes,
-                                DispatchCandidate {
-                                    target: procedure,
-                                    proof: proof_from_usage(group.proof),
-                                    completeness: completeness_from_usage(group.proof),
-                                },
-                            );
-                        }
-                    }
-                    SemanticOutcome::Ambiguous {
-                        candidates: value, ..
-                    }
-                    | SemanticOutcome::Unproven { partial: value, .. } => {
-                        let matched = procedures_for_definition(
-                            self.workspace.analyzer(),
-                            &definition,
-                            &value,
-                        );
-                        let has_match = !matched.is_empty();
-                        matched_any |= has_match;
-                        if has_match {
-                            matched_quality =
-                                merge_quality(matched_quality, SnapshotQuality::Unproven);
-                        } else {
-                            failure_quality =
-                                merge_quality(failure_quality, SnapshotQuality::Unproven);
-                        }
-                        for procedure in matched {
-                            retain_dispatch_candidate(
-                                &mut candidates,
-                                &mut candidate_indexes,
-                                DispatchCandidate {
-                                    target: procedure,
-                                    proof: ProofStatus::Unproven(
-                                        "target semantic materialization is not authoritative"
-                                            .into(),
-                                    ),
-                                    completeness: EvidenceCompleteness::Partial(
-                                        "target semantic materialization is incomplete".into(),
-                                    ),
-                                },
-                            );
-                        }
-                    }
-                    SemanticOutcome::Unknown { .. } => {
-                        failure_quality = merge_quality(failure_quality, SnapshotQuality::Unknown);
-                    }
-                    SemanticOutcome::Unsupported { capability, .. } => {
-                        failure_quality = merge_quality(
-                            failure_quality,
-                            SnapshotQuality::Unsupported(capability),
-                        );
-                    }
-                    SemanticOutcome::ExceededBudget { exceeded, .. } => {
-                        boundaries.push(truncated_dispatch_boundary());
-                        materialization_exceeded = Some(exceeded);
-                        materialization_quality = SnapshotQuality::Truncated;
-                        break;
-                    }
-                    SemanticOutcome::Cancelled { .. } => {
-                        materialization_quality = SnapshotQuality::Cancelled;
-                        break;
-                    }
-                }
-            }
-
-            let interrupted = materialization_exceeded.is_some()
-                || materialization_quality == SnapshotQuality::Cancelled;
-            if matched_any {
-                materialization_quality = merge_quality(materialization_quality, matched_quality);
-            } else if !definitions_truncated && !interrupted {
-                boundaries.push(DispatchBoundary {
-                    kind: DispatchBoundaryKind::Unmaterialized(locator_for_definition(
-                        self.workspace.analyzer(),
-                        &group.representative,
-                    )?),
-                    proof: proof_from_usage(group.proof),
-                    completeness: EvidenceCompleteness::Partial(
-                        "equivalent callable declarations have no published workspace body".into(),
-                    ),
-                });
-                let missing_quality = if failure_quality == SnapshotQuality::Complete {
-                    SnapshotQuality::Unproven
-                } else {
-                    failure_quality
-                };
-                materialization_quality = merge_quality(materialization_quality, missing_quality);
-            }
-
-            let omitted_later_groups = remaining_definition_materializations == 0
-                && group_index.saturating_add(1) < target_group_count;
-            if interrupted || definitions_truncated || omitted_later_groups {
-                if omitted_later_groups
-                    && !boundaries
-                        .iter()
-                        .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated)
-                {
-                    boundaries.push(truncated_dispatch_boundary());
-                    materialization_quality = SnapshotQuality::Truncated;
-                }
-                break;
-            }
-        }
-
-        if let Some(gap) = dynamic_dispatch_gap {
-            materialization_quality = merge_quality(
-                materialization_quality,
-                apply_dynamic_dispatch_gap(gap, &mut candidates, &mut boundaries),
-            );
-        }
-        if !call_evaluation_gaps.is_empty() {
-            materialization_quality = merge_quality(
-                materialization_quality,
-                apply_call_evaluation_gaps(&call_evaluation_gaps, &mut candidates),
-            );
-        }
-        if let Some(gap) = procedure_call_gap {
-            materialization_quality = merge_quality(
-                materialization_quality,
-                apply_procedure_call_gap(gap, &mut candidates, &mut boundaries),
-            );
-        }
-
-        candidates.sort_by(|left, right| {
-            left.target
-                .semantics()
-                .locator()
-                .cmp(right.target.semantics().locator())
-        });
-        boundaries.sort_by(|left, right| {
-            dispatch_boundary_sort_key(left).cmp(&dispatch_boundary_sort_key(right))
-        });
-        boundaries.dedup();
-        if boundaries
-            .iter()
-            .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
-        {
-            // A typed unresolved arm is itself unproven, even when the
-            // low-level location lookup reported `Resolved`. That status can
-            // describe a lexical callable value (for example a function-typed
-            // parameter) without publishing any callable body.
-            materialization_quality =
-                merge_quality(materialization_quality, SnapshotQuality::Unproven);
-        }
-        if lookup.truncated {
-            if !boundaries
-                .iter()
-                .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated)
-            {
-                boundaries.push(truncated_dispatch_boundary());
-            }
-            materialization_quality =
-                merge_quality(materialization_quality, SnapshotQuality::Unproven);
-        }
-        let result = DispatchResult {
-            candidates: candidates.into_boxed_slice(),
-            boundaries: boundaries.into_boxed_slice(),
-        };
-        *request.budget = staged_budget;
-
-        if let Some(exceeded) = materialization_exceeded {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(result),
-                exceeded,
-                work: reported_work,
-            });
-        }
-        if materialization_quality == SnapshotQuality::Cancelled {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: Some(result),
-                work: reported_work,
-            });
-        }
-        let status_quality = match lookup.status {
-            Some(DefinitionLookupStatus::Resolved) => SnapshotQuality::Complete,
-            Some(DefinitionLookupStatus::Ambiguous) => SnapshotQuality::Ambiguous,
-            Some(DefinitionLookupStatus::UnsupportedLanguage) => {
-                SnapshotQuality::Unsupported(SemanticCapability::Calls)
-            }
-            Some(
-                DefinitionLookupStatus::NoDefinition
-                | DefinitionLookupStatus::InvalidLocation
-                | DefinitionLookupStatus::NotFound,
-            )
-            | None => SnapshotQuality::Unknown,
-            Some(DefinitionLookupStatus::UnresolvableImportBoundary) => SnapshotQuality::Complete,
-        };
-        let quality = if result.candidates.is_empty()
-            && status_quality == SnapshotQuality::Ambiguous
-            && matches!(
-                materialization_quality,
-                SnapshotQuality::Complete | SnapshotQuality::Ambiguous | SnapshotQuality::Unproven
-            ) {
-            // A zero-body ambiguous lookup still has a precise ambiguity
-            // classification. Dynamic/open-world incompleteness must not
-            // collapse that typed outcome into generic Unproven.
-            SnapshotQuality::Ambiguous
-        } else {
-            merge_quality(status_quality, materialization_quality)
-        };
-        dispatch_outcome(result, quality, reported_work)
+        self.oracle.resolve_call(call, request)
     }
 }
-
 impl IcfgProvider for WorkspaceIcfgProvider<'_> {
     fn call_transfers(
         &self,
@@ -1272,10 +741,17 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let origin = caller
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
-        Ok(self.resolve_call(&origin, request)?.map(|dispatch| {
+        let call_evaluation_gaps = scoped_call_evaluation_gaps(caller, &semantic_call);
+        let mut staged_budget = request.budget.clone();
+        let dispatch_outcome = self.resolve_call(
+            &origin,
+            &mut SemanticRequest::new(&mut staged_budget, request.cancellation),
+        )?;
+        let mapped = try_map_semantic_outcome(dispatch_outcome, |dispatch| {
             let mut transfers = Vec::new();
-            let mut boundaries = dispatch
-                .boundaries
+            let mut additional_work = SemanticWork::default();
+            let (candidates, dispatch_boundaries, _) = dispatch.into_parts();
+            let mut boundaries = dispatch_boundaries
                 .into_vec()
                 .into_iter()
                 .map(|dispatch| CallBoundary {
@@ -1284,26 +760,55 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     model: None,
                 })
                 .collect::<Vec<_>>();
-            for candidate in dispatch.candidates.into_vec() {
+            for candidate in candidates.into_vec() {
                 let properties = candidate.target.semantics().properties();
                 if properties.invocation == ProcedureInvocationKind::Deferred {
+                    let previous_reason_bytes = completeness_reason_bytes(&candidate.completeness);
+                    let completeness = EvidenceCompleteness::Partial(
+                        "callee body execution requires a later resume transfer".into(),
+                    );
+                    let added_reason_bytes = completeness_reason_bytes(&completeness)
+                        .saturating_sub(previous_reason_bytes);
+                    let target = candidate.target.semantics().locator().clone();
+                    let boundary_kind = DispatchBoundaryKind::Deferred {
+                        target: target.clone(),
+                        kind: deferred_invocation_kind(properties),
+                    };
+                    let (provenance, provenance_work) = deferred_boundary_provenance(
+                        &origin,
+                        &boundary_kind,
+                        &candidate.provenance,
+                        *self.oracle.limits(),
+                    )?;
                     boundaries.push(CallBoundary {
                         origin: origin.clone(),
                         dispatch: DispatchBoundary {
-                            kind: DispatchBoundaryKind::Deferred {
-                                target: candidate.target.semantics().locator().clone(),
-                                kind: deferred_invocation_kind(properties),
-                            },
+                            kind: boundary_kind,
                             proof: candidate.proof,
-                            completeness: EvidenceCompleteness::Partial(
-                                "callee body execution requires a later resume transfer".into(),
-                            ),
+                            completeness,
+                            provenance,
                         },
                         // Creating the suspended object normally returns to the
                         // caller, while argument binding or language call
                         // mechanics can still fail synchronously.
                         model: Some(CallToReturnModel::NormalAndExceptional),
                     });
+                    // The candidate row was already charged by dispatch. The
+                    // transfer projection additionally owns its cloned locator,
+                    // boundary-kind relation, and newly retained reason text.
+                    additional_work = sum_semantic_work(
+                        additional_work,
+                        sum_semantic_work(
+                            semantic_locator_work(&target),
+                            sum_semantic_work(
+                                provenance_work,
+                                SemanticWork {
+                                    owned_text_bytes: added_reason_bytes,
+                                    ..SemanticWork::default()
+                                },
+                            ),
+                        ),
+                    );
                     continue;
                 }
                 let Some(entry) = candidate
@@ -1322,11 +827,50 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     completeness: candidate.completeness,
                 });
             }
-            CallTransferSet {
+            let mut transfer_set = CallTransferSet {
                 transfers: transfers.into_boxed_slice(),
                 boundaries: boundaries.into_boxed_slice(),
-            }
-        }))
+            };
+            additional_work = sum_semantic_work(
+                additional_work,
+                SemanticWork {
+                    owned_text_bytes: apply_call_evaluation_gaps(
+                        &call_evaluation_gaps,
+                        &mut transfer_set,
+                    ),
+                    ..SemanticWork::default()
+                },
+            );
+            Ok((transfer_set, additional_work))
+        })?;
+        let additional_work = mapped
+            .available_value()
+            .map_or(SemanticWork::default(), |(_, work)| *work);
+        let original_work = mapped.work();
+        let total_work = sum_semantic_work(original_work, additional_work);
+        if let Some(outcome) = charge_call_transfer_projection(
+            &mapped,
+            &mut staged_budget,
+            additional_work,
+            total_work,
+            request.cancellation,
+        ) {
+            return Ok(outcome);
+        }
+        let mut outcome = weaken_call_transfer_outcome(
+            mapped.map(|(transfer_set, _)| transfer_set),
+            &call_evaluation_gaps,
+            total_work,
+        );
+        if request.cancellation.is_cancelled()
+            && !matches!(outcome, SemanticOutcome::Cancelled { .. })
+        {
+            outcome = cancelled_call_transfer_outcome(outcome, total_work);
+        }
+        if outcome.available_value().is_some() {
+            *request.budget = staged_budget;
+        }
+        Ok(outcome)
     }
 
     fn snapshot(
@@ -1346,7 +890,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         }
         let max_source_bytes = request.budget.remaining().source_bytes;
         let Some((_, root_source)) =
-            exact_source_for_procedure(self.workspace, root, max_source_bytes)?
+            exact_source_for_procedure(self.workspace(), root, max_source_bytes)?
         else {
             let work = SemanticWork {
                 source_bytes: max_source_bytes.saturating_add(1),
@@ -1451,10 +995,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     };
                     builder.absorb_quality(&outcome);
                     if newly_resolved {
-                        builder.work = builder
-                            .work
-                            .checked_add(outcome.work())
-                            .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+                        builder.work = builder.work.conservative_add(outcome.work());
                     }
                     if let Some(transfers) = outcome.available_value().cloned() {
                         builder.record_dispatch_boundaries(node, &transfers.boundaries);
@@ -1524,211 +1065,412 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let work = builder.work;
         let snapshot = builder.freeze()?;
         *request.budget = staged_budget;
-        if let Some(exceeded) = exceeded {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(snapshot),
-                exceeded,
-                work,
-            });
-        }
-        match quality {
-            SnapshotQuality::Complete => Ok(SemanticOutcome::Complete {
-                value: snapshot,
-                work,
-            }),
-            SnapshotQuality::Ambiguous => Ok(SemanticOutcome::Ambiguous {
-                candidates: snapshot,
-                work,
-            }),
-            SnapshotQuality::Unproven => Ok(SemanticOutcome::Unproven {
-                partial: snapshot,
-                work,
-            }),
-            SnapshotQuality::Unknown | SnapshotQuality::Truncated => Ok(SemanticOutcome::Unknown {
-                partial: Some(snapshot),
-                work,
-            }),
-            SnapshotQuality::Unsupported(capability) => Ok(SemanticOutcome::Unsupported {
-                capability,
-                partial: Some(snapshot),
-                work,
-            }),
-            SnapshotQuality::Cancelled => Ok(SemanticOutcome::Cancelled {
-                partial: Some(snapshot),
-                work,
-            }),
-        }
+        Ok(finish_snapshot_outcome(snapshot, quality, exceeded, work))
     }
 }
 
-fn exact_source_for_procedure(
-    workspace: &WorkspaceAnalyzer,
-    procedure: &ProcedureHandle,
-    max_source_bytes: usize,
-) -> Result<Option<(ProjectFile, Arc<String>)>, SemanticProviderError> {
-    let key = procedure.artifact().key();
-    let project = workspace.analyzer().project();
-    let root = project.root();
-    if key.mount() != WorkspaceMountId::from_root(root) {
-        return Err(SemanticProviderError::invalid_identity(
-            "call-site artifact belongs to a different workspace mount",
+fn charge_call_transfer_projection(
+    mapped: &SemanticOutcome<(CallTransferSet, SemanticWork)>,
+    budget: &mut super::SemanticBudget,
+    additional_work: SemanticWork,
+    total_work: SemanticWork,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Option<SemanticOutcome<CallTransferSet>> {
+    budget.charge(additional_work).err().map(|exceeded| {
+        if matches!(mapped, SemanticOutcome::Cancelled { .. }) || cancellation.is_cancelled() {
+            SemanticOutcome::Cancelled {
+                // The projected payload cannot be published when its atomic
+                // retained-work charge fails, but the operation-level
+                // cancellation still takes precedence over that failure.
+                partial: None,
+                work: total_work,
+            }
+        } else {
+            SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work: total_work,
+            }
+        }
+    })
+}
+
+fn cancelled_call_transfer_outcome(
+    outcome: SemanticOutcome<CallTransferSet>,
+    work: SemanticWork,
+) -> SemanticOutcome<CallTransferSet> {
+    let partial = match outcome {
+        SemanticOutcome::Complete { value, .. } => Some(value),
+        SemanticOutcome::Ambiguous { candidates, .. } => Some(candidates),
+        SemanticOutcome::Unproven { partial, .. } => Some(partial),
+        SemanticOutcome::Unknown { partial, .. }
+        | SemanticOutcome::Unsupported { partial, .. }
+        | SemanticOutcome::ExceededBudget { partial, .. }
+        | SemanticOutcome::Cancelled { partial, .. } => partial,
+    };
+    SemanticOutcome::Cancelled { partial, work }
+}
+
+fn finish_snapshot_outcome(
+    snapshot: IcfgSnapshot,
+    quality: SnapshotQuality,
+    exceeded: Option<SemanticBudgetExceeded>,
+    work: SemanticWork,
+) -> SemanticOutcome<IcfgSnapshot> {
+    if quality == SnapshotQuality::Cancelled {
+        return SemanticOutcome::Cancelled {
+            partial: Some(snapshot),
+            work,
+        };
+    }
+    if let Some(exceeded) = exceeded {
+        return SemanticOutcome::ExceededBudget {
+            partial: Some(snapshot),
+            exceeded,
+            work,
+        };
+    }
+    match quality {
+        SnapshotQuality::Complete => SemanticOutcome::Complete {
+            value: snapshot,
+            work,
+        },
+        SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
+            candidates: snapshot,
+            work,
+        },
+        SnapshotQuality::Unproven => SemanticOutcome::Unproven {
+            partial: snapshot,
+            work,
+        },
+        SnapshotQuality::Unknown | SnapshotQuality::Truncated => SemanticOutcome::Unknown {
+            partial: Some(snapshot),
+            work,
+        },
+        SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(snapshot),
+            work,
+        },
+        SnapshotQuality::Cancelled => unreachable!("cancelled snapshots return above"),
+    }
+}
+
+fn try_map_semantic_outcome<T, U>(
+    outcome: SemanticOutcome<T>,
+    mapper: impl FnOnce(T) -> Result<U, SemanticProviderError>,
+) -> Result<SemanticOutcome<U>, SemanticProviderError> {
+    Ok(match outcome {
+        SemanticOutcome::Complete { value, work } => SemanticOutcome::Complete {
+            value: mapper(value)?,
+            work,
+        },
+        SemanticOutcome::Ambiguous { candidates, work } => SemanticOutcome::Ambiguous {
+            candidates: mapper(candidates)?,
+            work,
+        },
+        SemanticOutcome::Unknown { partial, work } => SemanticOutcome::Unknown {
+            partial: partial.map(mapper).transpose()?,
+            work,
+        },
+        SemanticOutcome::Unsupported {
+            capability,
+            partial,
+            work,
+        } => SemanticOutcome::Unsupported {
+            capability,
+            partial: partial.map(mapper).transpose()?,
+            work,
+        },
+        SemanticOutcome::Unproven { partial, work } => SemanticOutcome::Unproven {
+            partial: mapper(partial)?,
+            work,
+        },
+        SemanticOutcome::ExceededBudget {
+            partial,
+            exceeded,
+            work,
+        } => SemanticOutcome::ExceededBudget {
+            partial: partial.map(mapper).transpose()?,
+            exceeded,
+            work,
+        },
+        SemanticOutcome::Cancelled { partial, work } => SemanticOutcome::Cancelled {
+            partial: partial.map(mapper).transpose()?,
+            work,
+        },
+    })
+}
+
+fn deferred_boundary_provenance(
+    origin: &CallSiteHandle,
+    boundary: &DispatchBoundaryKind,
+    candidate_provenance: &[OracleRelationHandle],
+    limits: OracleLimits,
+) -> Result<(Box<[OracleRelationHandle]>, SemanticWork), SemanticProviderError> {
+    let DispatchBoundaryKind::Deferred { target, .. } = boundary else {
+        return Err(SemanticProviderError::internal(
+            "deferred boundary provenance requires a deferred boundary identity",
+        ));
+    };
+    let expected_owner = OracleRelationOwner::Dispatch(origin.clone());
+    let mut evidence = Vec::<EvidenceHandle>::new();
+    for relation in candidate_provenance {
+        if relation.owner() != &expected_owner
+            || relation.record().kind() != OracleRelationKind::DispatchCandidate
+            || !matches!(
+                relation.record().subject(),
+                Some(OracleRelationSubject::DispatchCandidate(candidate))
+                    if candidate.semantics().locator() == target
+            )
+        {
+            return Err(SemanticProviderError::internal(
+                "deferred transfer candidate has invalid dispatch provenance",
+            ));
+        }
+        for retained in relation.record().evidence() {
+            if !evidence.contains(retained) {
+                evidence.push(retained.clone());
+            }
+        }
+    }
+    if evidence.is_empty() {
+        return Err(SemanticProviderError::internal(
+            "deferred transfer candidate has no semantic evidence",
         ));
     }
-    let file = ProjectFile::new(root.to_path_buf(), key.path().as_path());
-    let Some(snapshot) = project
-        .read_source_snapshot_limited(&file, max_source_bytes)
+    let evidence_entries = evidence.len();
+    let record = OracleRelationRecord::dispatch_boundary(boundary.clone(), evidence, limits)
         .map_err(|error| {
-            SemanticProviderError::source_access(format!(
-                "could not read exact semantic source: {error}"
+            SemanticProviderError::internal(format!(
+                "could not project deferred dispatch-boundary provenance: {error}"
             ))
-        })?
-    else {
-        return Ok(None);
-    };
-    let source = Arc::new(snapshot.source().to_owned());
-    let content = ContentIdentity::hash_bytes(source.as_bytes());
-    let revision = match snapshot.origin() {
-        ProjectSourceOrigin::Disk => SourceRevision::Disk { content },
-        ProjectSourceOrigin::Overlay(revision) => SourceRevision::Overlay {
-            content,
-            snapshot: OverlaySnapshotId::hash_bytes(revision.get().to_le_bytes()),
+        })?;
+    let arena =
+        OracleRelationArena::new(expected_owner, vec![record], limits).map_err(|error| {
+            SemanticProviderError::internal(format!(
+                "could not project deferred dispatch-boundary provenance: {error}"
+            ))
+        })?;
+    let relation = arena
+        .handle(OracleRelationId::new(0))
+        .expect("deferred dispatch-boundary relation was inserted");
+    let subject_work = semantic_locator_work(target);
+    Ok((
+        vec![relation].into_boxed_slice(),
+        SemanticWork {
+            // One payload handle, one arena record, and the record's evidence
+            // array are retained independently by this projection. The exact
+            // boundary subject additionally deep-clones its target locator.
+            nested_entries: 2usize
+                .saturating_add(evidence_entries)
+                .saturating_add(subject_work.nested_entries),
+            owned_text_bytes: subject_work.owned_text_bytes,
+            ..subject_work
         },
-    };
-    if revision != key.revision() {
-        return Err(SemanticProviderError::invalid_identity(format!(
-            "call-site artifact revision for `{file}` no longer matches the atomic project source snapshot"
-        )));
-    }
-    Ok(Some((file, source)))
+    ))
 }
 
-fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
-    match boundary {
-        CallDispatchBoundaryKind::External => DispatchBoundary {
-            kind: DispatchBoundaryKind::External(None),
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Partial(
-                "external declaration body is outside the indexed workspace".into(),
-            ),
-        },
-        CallDispatchBoundaryKind::Unresolved(status) => DispatchBoundary {
-            kind: DispatchBoundaryKind::Unresolved,
-            proof: ProofStatus::Unproven(
-                format!("exact dispatch status is {}", status.as_str()).into(),
-            ),
-            completeness: EvidenceCompleteness::Partial(
-                "no materialized workspace target is available".into(),
-            ),
-        },
-        CallDispatchBoundaryKind::UnprovenTargetIdentity => DispatchBoundary {
-            kind: DispatchBoundaryKind::Unresolved,
-            proof: ProofStatus::Unproven(
-                "C/C++ include evidence does not prove one link-unit target identity".into(),
-            ),
-            completeness: EvidenceCompleteness::Partial(
-                "additional or alternative linked bodies may exist".into(),
-            ),
-        },
-        CallDispatchBoundaryKind::Truncated => truncated_dispatch_boundary(),
-    }
-}
-
-fn truncated_dispatch_boundary() -> DispatchBoundary {
-    DispatchBoundary {
-        kind: DispatchBoundaryKind::Truncated,
-        proof: ProofStatus::Unproven("dispatch candidate set was truncated".into()),
-        completeness: EvidenceCompleteness::Partial(
-            "not every dispatch candidate was retained".into(),
-        ),
-    }
-}
-
-fn proof_from_usage(proof: UsageProof) -> ProofStatus {
-    match proof {
-        UsageProof::Proven => ProofStatus::Proven,
-        UsageProof::Unproven => ProofStatus::Unproven("dispatch target is ambiguous".into()),
-    }
-}
-
-fn completeness_from_usage(proof: UsageProof) -> EvidenceCompleteness {
-    match proof {
-        UsageProof::Proven => EvidenceCompleteness::Complete,
-        UsageProof::Unproven => EvidenceCompleteness::Partial(
-            "dispatch cannot prove one complete target identity".into(),
-        ),
-    }
-}
-
-fn scoped_dynamic_dispatch_gap<'a>(
-    procedure: &'a ProcedureSemantics,
-    call: &SemanticCallSite,
-) -> Option<&'a SemanticGap> {
-    procedure
-        .gaps()
-        .iter()
-        .filter(|gap| {
-            gap.point == call.point
-                && gap.capability == SemanticCapability::DynamicDispatch
-                && match gap.subject {
-                    SemanticGapSubject::Point => true,
-                    SemanticGapSubject::CallSite(call_site) => call_site == call.id,
-                    _ => false,
-                }
-        })
-        .max_by_key(|gap| dynamic_dispatch_gap_rank(gap.kind))
-}
-
-fn scoped_cpp_preprocessor_call_gap(procedure: &ProcedureHandle) -> Option<&SemanticGap> {
-    if procedure.artifact().key().language()
-        != LanguageDialect::Standard(crate::analyzer::Language::Cpp)
-    {
-        return None;
-    }
-    let semantics = procedure.semantics();
-    let has_configuration_control_gap = semantics.gaps().iter().any(|gap| {
-        gap.subject == SemanticGapSubject::Procedure
-            && gap.capability == SemanticCapability::NormalControlFlow
-            && gap.kind == SemanticGapKind::Unsupported
-    });
-    if !has_configuration_control_gap {
-        return None;
-    }
-    semantics
-        .gaps()
-        .iter()
-        .filter(|gap| {
-            gap.subject == SemanticGapSubject::Procedure
-                && matches!(
-                    gap.capability,
-                    SemanticCapability::Calls | SemanticCapability::CallableReferences
-                )
-        })
-        .max_by_key(|gap| dynamic_dispatch_gap_rank(gap.kind))
-}
-
-fn scoped_cpp_call_evaluation_gaps<'a>(
+fn scoped_call_evaluation_gaps<'a>(
     procedure: &'a ProcedureHandle,
     call: &SemanticCallSite,
 ) -> Vec<&'a SemanticGap> {
-    if procedure.artifact().key().language()
-        != LanguageDialect::Standard(crate::analyzer::Language::Cpp)
-    {
-        return Vec::new();
-    }
     procedure
         .semantics()
         .gaps()
         .iter()
-        .filter(|gap| {
-            gap.point == call.point
-                && gap.subject == SemanticGapSubject::CallSite(call.id)
-                && matches!(
-                    gap.capability,
-                    SemanticCapability::CleanupControlFlow
-                        | SemanticCapability::ExceptionalControlFlow
-                )
-        })
+        .filter(|gap| call_evaluation_gap_applies(gap, call))
         .collect()
+}
+
+fn call_evaluation_gap_applies(gap: &SemanticGap, call: &SemanticCallSite) -> bool {
+    gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+        && match gap.subject {
+            SemanticGapSubject::Procedure => true,
+            SemanticGapSubject::Point => gap.point == call.point,
+            SemanticGapSubject::CallSite(call_site) => {
+                call_site == call.id && gap.point == call.point
+            }
+            SemanticGapSubject::Value(_)
+            | SemanticGapSubject::MemoryLocation(_)
+            | SemanticGapSubject::Capture(_)
+            | SemanticGapSubject::CallContinuation { .. }
+            | SemanticGapSubject::AsyncContinuation { .. } => false,
+        }
+}
+
+fn apply_call_evaluation_gaps(gaps: &[&SemanticGap], transfers: &mut CallTransferSet) -> usize {
+    if gaps.is_empty() {
+        return 0;
+    }
+    let detail = gaps
+        .iter()
+        .map(|gap| {
+            format!(
+                "{} {}: {}",
+                gap.kind.label(),
+                gap.capability.label(),
+                gap.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    transfers
+        .transfers
+        .iter_mut()
+        .map(|transfer| {
+            let previous_reason_bytes = completeness_reason_bytes(&transfer.completeness);
+            transfer.completeness = EvidenceCompleteness::Partial(match &transfer.completeness {
+                EvidenceCompleteness::Complete => {
+                    format!("caller-side call evaluation is incomplete: {detail}").into()
+                }
+                EvidenceCompleteness::Partial(existing) => {
+                    format!("{existing}; caller-side call evaluation gaps: {detail}").into()
+                }
+            });
+            completeness_reason_bytes(&transfer.completeness).saturating_sub(previous_reason_bytes)
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn weaken_call_transfer_outcome(
+    outcome: SemanticOutcome<CallTransferSet>,
+    gaps: &[&SemanticGap],
+    work: SemanticWork,
+) -> SemanticOutcome<CallTransferSet> {
+    if gaps.is_empty() {
+        return call_transfer_outcome_with_work(outcome, work);
+    }
+    let gap_quality = gaps.iter().fold(SnapshotQuality::Complete, |quality, gap| {
+        merge_quality(quality, semantic_gap_quality(gap))
+    });
+    match outcome {
+        SemanticOutcome::Complete { value, .. } => call_transfer_outcome(value, gap_quality, work),
+        SemanticOutcome::Ambiguous { candidates, .. } => call_transfer_outcome(
+            candidates,
+            merge_quality(SnapshotQuality::Ambiguous, gap_quality),
+            work,
+        ),
+        SemanticOutcome::Unproven { partial, .. } => call_transfer_outcome(
+            partial,
+            merge_quality(SnapshotQuality::Unproven, gap_quality),
+            work,
+        ),
+        SemanticOutcome::Unknown {
+            partial: Some(partial),
+            ..
+        } => call_transfer_outcome(
+            partial,
+            merge_quality(SnapshotQuality::Unknown, gap_quality),
+            work,
+        ),
+        SemanticOutcome::Unknown { partial: None, .. } => SemanticOutcome::Unknown {
+            partial: None,
+            work,
+        },
+        SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(partial),
+            ..
+        } => call_transfer_outcome(
+            partial,
+            merge_quality(SnapshotQuality::Unsupported(capability), gap_quality),
+            work,
+        ),
+        SemanticOutcome::Unsupported {
+            capability,
+            partial: None,
+            ..
+        } => SemanticOutcome::Unsupported {
+            capability,
+            partial: None,
+            work,
+        },
+        SemanticOutcome::ExceededBudget {
+            partial, exceeded, ..
+        } => SemanticOutcome::ExceededBudget {
+            partial,
+            exceeded,
+            work,
+        },
+        SemanticOutcome::Cancelled { partial, .. } => SemanticOutcome::Cancelled { partial, work },
+    }
+}
+
+fn call_transfer_outcome(
+    transfers: CallTransferSet,
+    quality: SnapshotQuality,
+    work: SemanticWork,
+) -> SemanticOutcome<CallTransferSet> {
+    match quality {
+        SnapshotQuality::Complete => SemanticOutcome::Complete {
+            value: transfers,
+            work,
+        },
+        SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
+            candidates: transfers,
+            work,
+        },
+        SnapshotQuality::Unproven | SnapshotQuality::Truncated => SemanticOutcome::Unproven {
+            partial: transfers,
+            work,
+        },
+        SnapshotQuality::Unknown => SemanticOutcome::Unknown {
+            partial: Some(transfers),
+            work,
+        },
+        SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(transfers),
+            work,
+        },
+        SnapshotQuality::Cancelled => SemanticOutcome::Cancelled {
+            partial: Some(transfers),
+            work,
+        },
+    }
+}
+
+fn call_transfer_outcome_with_work(
+    outcome: SemanticOutcome<CallTransferSet>,
+    work: SemanticWork,
+) -> SemanticOutcome<CallTransferSet> {
+    match outcome {
+        SemanticOutcome::Complete { value, .. } => SemanticOutcome::Complete { value, work },
+        SemanticOutcome::Ambiguous { candidates, .. } => {
+            SemanticOutcome::Ambiguous { candidates, work }
+        }
+        SemanticOutcome::Unknown { partial, .. } => SemanticOutcome::Unknown { partial, work },
+        SemanticOutcome::Unsupported {
+            capability,
+            partial,
+            ..
+        } => SemanticOutcome::Unsupported {
+            capability,
+            partial,
+            work,
+        },
+        SemanticOutcome::Unproven { partial, .. } => SemanticOutcome::Unproven { partial, work },
+        SemanticOutcome::ExceededBudget {
+            partial, exceeded, ..
+        } => SemanticOutcome::ExceededBudget {
+            partial,
+            exceeded,
+            work,
+        },
+        SemanticOutcome::Cancelled { partial, .. } => SemanticOutcome::Cancelled { partial, work },
+    }
+}
+
+fn completeness_reason_bytes(completeness: &EvidenceCompleteness) -> usize {
+    match completeness {
+        EvidenceCompleteness::Complete => 0,
+        EvidenceCompleteness::Partial(reason) => reason.len(),
+    }
+}
+
+fn sum_semantic_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
+    left.conservative_add(right)
 }
 
 fn scoped_return_affecting_gap_indices(
@@ -1746,12 +1488,7 @@ fn scoped_return_affecting_gap_indices(
         .iter()
         .enumerate()
         .filter_map(|(index, gap)| {
-            let return_affecting = matches!(
-                gap.capability,
-                SemanticCapability::CleanupControlFlow
-                    | SemanticCapability::ExceptionalControlFlow
-                    | SemanticCapability::NonLocalControl
-            );
+            let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
             let scoped_to_return_path = match gap.subject {
                 SemanticGapSubject::Procedure => true,
                 _ => path_mask.get(gap.point.index()).copied() == Some(true),
@@ -1791,10 +1528,7 @@ fn cache_return_path_mask(
         builder.quality = merge_quality(builder.quality, SnapshotQuality::Truncated);
         return false;
     }
-    builder.work = builder
-        .work
-        .checked_add(scan_work)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX));
+    builder.work = builder.work.conservative_add(scan_work);
 
     let mut from_entry = vec![false; point_count];
     let mut stack = vec![semantics.entry_point()];
@@ -1840,391 +1574,12 @@ fn cache_return_path_mask(
     true
 }
 
-fn dynamic_dispatch_gap_rank(kind: SemanticGapKind) -> u8 {
-    match kind {
-        SemanticGapKind::Unproven => 0,
-        SemanticGapKind::Ambiguous => 1,
-        SemanticGapKind::Unknown => 2,
-        SemanticGapKind::Unsupported => 3,
-        SemanticGapKind::ExceededBudget => 4,
-    }
-}
-
 fn semantic_gap_quality(gap: &SemanticGap) -> SnapshotQuality {
     match gap.kind {
         SemanticGapKind::Ambiguous => SnapshotQuality::Ambiguous,
         SemanticGapKind::Unsupported => SnapshotQuality::Unsupported(gap.capability),
         SemanticGapKind::ExceededBudget => SnapshotQuality::Truncated,
         SemanticGapKind::Unknown | SemanticGapKind::Unproven => SnapshotQuality::Unproven,
-    }
-}
-
-fn apply_dynamic_dispatch_gap(
-    gap: &SemanticGap,
-    candidates: &mut [DispatchCandidate],
-    boundaries: &mut Vec<DispatchBoundary>,
-) -> SnapshotQuality {
-    let proof_reason = format!(
-        "{} dynamic-dispatch evidence does not prove the complete target set: {}",
-        gap.kind.label(),
-        gap.detail
-    );
-    let completeness_reason = format!(
-        "dynamic-dispatch target coverage is incomplete: {}",
-        gap.detail
-    );
-    if candidates.is_empty() {
-        // Preserve the specific boundary (external, unmaterialized, or a
-        // resolver-provided unresolved status), while retaining the distinct
-        // open-world dynamic arm. A point-scoped dynamic-dispatch gap can
-        // never yield a Complete outcome merely because no local body was
-        // materialized.
-        if !boundaries
-            .iter()
-            .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
-        {
-            boundaries.push(DispatchBoundary {
-                kind: DispatchBoundaryKind::Unresolved,
-                proof: ProofStatus::Unproven(proof_reason.into()),
-                completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
-            });
-        }
-        return semantic_gap_quality(gap);
-    }
-    for candidate in candidates.iter_mut() {
-        candidate.proof = ProofStatus::Unproven(match &candidate.proof {
-            ProofStatus::Proven => proof_reason.clone().into(),
-            ProofStatus::Unproven(existing) => format!("{existing}; {proof_reason}").into(),
-        });
-        candidate.completeness = EvidenceCompleteness::Partial(match &candidate.completeness {
-            EvidenceCompleteness::Complete => completeness_reason.clone().into(),
-            EvidenceCompleteness::Partial(existing) => {
-                format!("{existing}; {completeness_reason}").into()
-            }
-        });
-    }
-    if !boundaries
-        .iter()
-        .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
-    {
-        boundaries.push(DispatchBoundary {
-            kind: DispatchBoundaryKind::Unresolved,
-            proof: ProofStatus::Unproven(proof_reason.into()),
-            completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
-        });
-    }
-    semantic_gap_quality(gap)
-}
-
-fn apply_procedure_call_gap(
-    gap: &SemanticGap,
-    candidates: &mut [DispatchCandidate],
-    boundaries: &mut Vec<DispatchBoundary>,
-) -> SnapshotQuality {
-    let proof_reason = format!(
-        "procedure-wide {} evidence does not prove this complete call target set: {}",
-        gap.capability.label(),
-        gap.detail
-    );
-    let completeness_reason = format!(
-        "procedure-wide {} coverage is incomplete: {}",
-        gap.capability.label(),
-        gap.detail
-    );
-    for candidate in candidates.iter_mut() {
-        candidate.proof = ProofStatus::Unproven(match &candidate.proof {
-            ProofStatus::Proven => proof_reason.clone().into(),
-            ProofStatus::Unproven(existing) => format!("{existing}; {proof_reason}").into(),
-        });
-        candidate.completeness = EvidenceCompleteness::Partial(match &candidate.completeness {
-            EvidenceCompleteness::Complete => completeness_reason.clone().into(),
-            EvidenceCompleteness::Partial(existing) => {
-                format!("{existing}; {completeness_reason}").into()
-            }
-        });
-    }
-    if !candidates.is_empty()
-        && !boundaries
-            .iter()
-            .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
-    {
-        boundaries.push(DispatchBoundary {
-            kind: DispatchBoundaryKind::Unresolved,
-            proof: ProofStatus::Unproven(proof_reason.into()),
-            completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
-        });
-    }
-    SnapshotQuality::Unproven
-}
-
-fn apply_call_evaluation_gaps(
-    gaps: &[&SemanticGap],
-    candidates: &mut [DispatchCandidate],
-) -> SnapshotQuality {
-    let detail = gaps
-        .iter()
-        .map(|gap| {
-            format!(
-                "{} {}: {}",
-                gap.kind.label(),
-                gap.capability.label(),
-                gap.detail
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    for candidate in candidates {
-        candidate.completeness = EvidenceCompleteness::Partial(match &candidate.completeness {
-            EvidenceCompleteness::Complete => {
-                format!("caller-side call evaluation is incomplete: {detail}").into()
-            }
-            EvidenceCompleteness::Partial(existing) => {
-                format!("{existing}; caller-side call evaluation gaps: {detail}").into()
-            }
-        });
-    }
-    gaps.iter().fold(SnapshotQuality::Complete, |quality, gap| {
-        merge_quality(quality, semantic_gap_quality(gap))
-    })
-}
-
-fn retain_dispatch_candidate(
-    candidates: &mut Vec<DispatchCandidate>,
-    indexes: &mut HashMap<ProcedureHandle, usize>,
-    candidate: DispatchCandidate,
-) {
-    if let Some(existing) = indexes
-        .get(&candidate.target)
-        .and_then(|index| candidates.get_mut(*index))
-    {
-        if matches!(candidate.proof, ProofStatus::Proven) {
-            existing.proof = ProofStatus::Proven;
-        }
-        if matches!(candidate.completeness, EvidenceCompleteness::Complete) {
-            existing.completeness = EvidenceCompleteness::Complete;
-        }
-        return;
-    }
-    indexes.insert(candidate.target.clone(), candidates.len());
-    candidates.push(candidate);
-}
-
-fn dispatch_outcome(
-    result: DispatchResult,
-    quality: SnapshotQuality,
-    work: SemanticWork,
-) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
-    Ok(match quality {
-        SnapshotQuality::Complete => SemanticOutcome::Complete {
-            value: result,
-            work,
-        },
-        SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
-            candidates: result,
-            work,
-        },
-        SnapshotQuality::Unproven | SnapshotQuality::Truncated => SemanticOutcome::Unproven {
-            partial: result,
-            work,
-        },
-        SnapshotQuality::Unknown => SemanticOutcome::Unknown {
-            partial: Some(result),
-            work,
-        },
-        SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
-            capability,
-            partial: Some(result),
-            work,
-        },
-        SnapshotQuality::Cancelled => SemanticOutcome::Cancelled {
-            partial: Some(result),
-            work,
-        },
-    })
-}
-
-fn procedures_for_definition(
-    analyzer: &dyn IAnalyzer,
-    definition: &CodeUnit,
-    artifact: &Arc<super::SemanticArtifact>,
-) -> Vec<ProcedureHandle> {
-    let Some(indexed_source) = analyzer.indexed_source(definition.source()) else {
-        return Vec::new();
-    };
-    if ContentIdentity::hash_bytes(indexed_source.as_bytes()) != artifact.key().revision().content()
-    {
-        // Declaration ranges and target semantics came from different source
-        // generations. Never attach the stale range to a current procedure.
-        return Vec::new();
-    }
-    let mut ranges = analyzer.ranges_of(definition);
-    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
-    let compatible = artifact
-        .procedures()
-        .iter()
-        .filter(|procedure| procedure_matches_definition(procedure, definition))
-        .collect::<Vec<_>>();
-    let mut exact = compatible
-        .iter()
-        .copied()
-        .filter(|procedure| {
-            let span = procedure.locator().anchor().span();
-            ranges.iter().any(|range| {
-                range.start_byte == span.start_byte() as usize
-                    && range.end_byte == span.end_byte() as usize
-            })
-        })
-        .collect::<Vec<_>>();
-    if exact.is_empty() {
-        exact = compatible
-            .into_iter()
-            .filter(|procedure| {
-                let span = procedure.locator().anchor().span();
-                ranges.iter().any(|range| {
-                    (range.start_byte <= span.start_byte() as usize
-                        && range.end_byte >= span.end_byte() as usize)
-                        || (span.start_byte() as usize <= range.start_byte
-                            && span.end_byte() as usize >= range.end_byte)
-                })
-            })
-            .collect();
-    }
-    exact.sort_by(|left, right| left.locator().cmp(right.locator()));
-    exact
-        .into_iter()
-        .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
-        .collect()
-}
-
-fn procedure_matches_definition(
-    procedure: &super::ProcedureSemantics,
-    definition: &CodeUnit,
-) -> bool {
-    if definition.is_class() {
-        return procedure.kind() == ProcedureKind::Constructor;
-    }
-    if !definition.is_callable() {
-        return false;
-    }
-    let Some(name) = procedure
-        .locator()
-        .declaration()
-        .segments()
-        .last()
-        .and_then(DeclarationSegment::name)
-    else {
-        return definition.is_anonymous();
-    };
-    name == definition.identifier()
-        || (procedure.kind() == ProcedureKind::Constructor && name == definition.short_name())
-}
-
-fn locator_for_definition(
-    analyzer: &dyn IAnalyzer,
-    definition: &CodeUnit,
-) -> Result<SemanticLocator, SemanticProviderError> {
-    let source = analyzer
-        .indexed_source(definition.source())
-        .ok_or_else(|| {
-            SemanticProviderError::source_access(format!(
-                "indexed source is unavailable for resolved declaration `{}`",
-                definition.fq_name()
-            ))
-        })?;
-    let mut ranges = analyzer.ranges_of(definition);
-    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
-    let range = ranges.into_iter().next().unwrap_or(Range {
-        start_byte: 0,
-        end_byte: source.len(),
-        start_line: 0,
-        end_line: source.lines().count().saturating_sub(1),
-    });
-    let anchor = source_anchor_for_range(&source, &range)?;
-    let file_name = definition
-        .source()
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("source");
-    let file_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::File, file_name, anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let kind = match definition.kind() {
-        CodeUnitType::Class => DeclarationSegmentKind::Type,
-        CodeUnitType::Function => DeclarationSegmentKind::Function,
-        CodeUnitType::Field
-        | CodeUnitType::Module
-        | CodeUnitType::Macro
-        | CodeUnitType::FileScope => DeclarationSegmentKind::AnonymousCallable,
-    };
-    let declaration_segment =
-        DeclarationSegment::named(kind, definition.identifier(), anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let declaration = DeclarationLocator::new(vec![file_segment, declaration_segment])
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let path = WorkspaceRelativePath::try_from_path(definition.source().rel_path())
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    Ok(SemanticLocator::new(
-        WorkspaceMountId::from_root(definition.source().root()),
-        path,
-        LanguageDialect::for_path(
-            crate::analyzer::common::language_for_file(definition.source()),
-            definition.source().rel_path(),
-        ),
-        declaration,
-        SemanticRole::Procedure,
-        anchor,
-    ))
-}
-
-fn source_anchor_for_range(
-    source: &str,
-    range: &Range,
-) -> Result<SourceAnchor, SemanticProviderError> {
-    let start = source_position(source, range.start_byte)?;
-    let end = source_position(source, range.end_byte)?;
-    let span = SourceSpan::new(start, end)
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    Ok(SourceAnchor::new(span, 0))
-}
-
-fn source_position(source: &str, offset: usize) -> Result<SourcePosition, SemanticProviderError> {
-    if offset > source.len() || !source.is_char_boundary(offset) {
-        return Err(SemanticProviderError::invalid_identity(
-            "resolved declaration range is outside its UTF-8 source",
-        ));
-    }
-    let bytes = source.as_bytes();
-    let line_start = bytes[..offset]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |newline| newline.saturating_add(1));
-    let line = bytes[..offset]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
-    Ok(SourcePosition::new(
-        u32::try_from(offset)
-            .map_err(|_| SemanticProviderError::invalid_identity("source offset exceeds u32"))?,
-        u32::try_from(line)
-            .map_err(|_| SemanticProviderError::invalid_identity("source line exceeds u32"))?,
-        u32::try_from(offset.saturating_sub(line_start))
-            .map_err(|_| SemanticProviderError::invalid_identity("source column exceeds u32"))?,
-    ))
-}
-
-fn dispatch_boundary_sort_key(boundary: &DispatchBoundary) -> (u8, String) {
-    match &boundary.kind {
-        DispatchBoundaryKind::External(locator) => (
-            0,
-            locator.as_ref().map_or_else(String::new, locator_sort_key),
-        ),
-        DispatchBoundaryKind::Unmaterialized(locator) => (1, locator_sort_key(locator)),
-        DispatchBoundaryKind::Deferred { target, kind } => {
-            (2, format!("{}:{}", kind.label(), locator_sort_key(target)))
-        }
-        DispatchBoundaryKind::Unresolved => (3, String::new()),
-        DispatchBoundaryKind::Truncated => (4, String::new()),
     }
 }
 
@@ -2303,17 +1658,6 @@ fn link_boundary_continuations(
         )?;
     }
     Ok(())
-}
-
-fn locator_sort_key(locator: &SemanticLocator) -> String {
-    let span = locator.anchor().span();
-    format!(
-        "{}:{}:{}:{}",
-        locator.path(),
-        span.start_byte(),
-        span.end_byte(),
-        locator.anchor().occurrence()
-    )
 }
 
 fn expand_return(
@@ -2490,9 +1834,417 @@ fn is_call_scaffolding(edge: &super::ControlEdge, call: &super::SemanticCallSite
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::SemanticBudget;
+    use crate::analyzer::semantic::workspace_oracle::{
+        CallableDefinitionIdentity, retain_dispatch_candidate,
+    };
+    use crate::analyzer::semantic::{
+        CandidateCoverage, DeclarationSegment, DispatchCandidate, ProcedureKind, SemanticBudget,
+        SemanticGapId, SemanticGapImpacts,
+    };
+    use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn unsupported_snapshot_quality_uses_stable_capability_order() {
+        let deferred = SnapshotQuality::Unsupported(SemanticCapability::DeferredExecution);
+        let cleanup = SnapshotQuality::Unsupported(SemanticCapability::CleanupControlFlow);
+
+        let expected = SnapshotQuality::Unsupported(SemanticCapability::CleanupControlFlow);
+        assert_eq!(merge_quality(deferred, cleanup), expected);
+        assert_eq!(merge_quality(cleanup, deferred), expected);
+    }
+
+    #[test]
+    fn cancelled_dispatch_precedes_a_failed_call_transfer_projection_charge() {
+        let cancellation = CancellationToken::default();
+        let additional_work = SemanticWork {
+            nested_entries: 2,
+            ..SemanticWork::default()
+        };
+        let mapped = SemanticOutcome::Cancelled {
+            partial: Some((CallTransferSet::default(), additional_work)),
+            work: SemanticWork::default(),
+        };
+        let mut budget = SemanticBudget::uniform(1).expect("positive semantic budget");
+
+        let outcome = charge_call_transfer_projection(
+            &mapped,
+            &mut budget,
+            additional_work,
+            additional_work,
+            &cancellation,
+        )
+        .expect("projection work must exceed the nested-entry budget");
+
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            } if work == additional_work
+        ));
+        assert_eq!(budget.used(), SemanticWork::default());
+    }
+
+    #[test]
+    fn snapshot_cancellation_precedes_an_existing_budget_exhaustion() {
+        let attempted_work = SemanticWork {
+            nested_entries: 2,
+            ..SemanticWork::default()
+        };
+        let exceeded = SemanticBudget::uniform(1)
+            .expect("positive semantic budget")
+            .check(attempted_work)
+            .expect_err("snapshot work must exceed the nested-entry budget");
+
+        let outcome = finish_snapshot_outcome(
+            IcfgSnapshot::empty(),
+            SnapshotQuality::Cancelled,
+            Some(exceeded),
+            attempted_work,
+        );
+
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled {
+                partial: Some(_),
+                work,
+            } if work == attempted_work
+        ));
+    }
+
+    #[test]
+    fn call_evaluation_gap_scope_covers_procedure_point_and_call_site() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[(
+                "scope.ts",
+                "function target() {}\nexport function caller() { target(); }\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "scope.ts");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let call = artifact
+            .procedures()
+            .iter()
+            .find_map(|procedure| procedure.call_sites().first().cloned())
+            .expect("semantic call site");
+        let different_point = ProgramPointId::new(call.point.get().saturating_add(1));
+        let gap = |subject, point, impacts| SemanticGap {
+            id: SemanticGapId::new(0),
+            point,
+            subject,
+            capability: SemanticCapability::Calls,
+            impacts,
+            kind: SemanticGapKind::Unproven,
+            budget: None,
+            detail: "caller-side evaluation is incomplete".into(),
+            source: call.source,
+            evidence: call.evidence,
+        };
+
+        assert!(call_evaluation_gap_applies(
+            &gap(
+                SemanticGapSubject::Procedure,
+                different_point,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+            ),
+            &call,
+        ));
+        assert!(call_evaluation_gap_applies(
+            &gap(
+                SemanticGapSubject::Point,
+                call.point,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+            ),
+            &call,
+        ));
+        assert!(!call_evaluation_gap_applies(
+            &gap(
+                SemanticGapSubject::Point,
+                different_point,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+            ),
+            &call,
+        ));
+        assert!(call_evaluation_gap_applies(
+            &gap(
+                SemanticGapSubject::CallSite(call.id),
+                call.point,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+            ),
+            &call,
+        ));
+        assert!(!call_evaluation_gap_applies(
+            &gap(
+                SemanticGapSubject::CallSite(CallSiteId::new(call.id.get().saturating_add(1),)),
+                call.point,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+            ),
+            &call,
+        ));
+        assert!(!call_evaluation_gap_applies(
+            &gap(
+                SemanticGapSubject::Procedure,
+                call.point,
+                SemanticGapImpacts::NONE,
+            ),
+            &call,
+        ));
+    }
+
+    #[test]
+    fn procedure_deferred_scheduling_does_not_weaken_a_nested_call_transfer() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Rust,
+            &[(
+                "lib.rs",
+                "pub fn leaf() -> i32 { 7 }\npub async fn scheduled() -> i32 { leaf() }\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Rust semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Rust semantic artifact");
+        let scheduled = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("scheduled")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("scheduled procedure");
+        let scheduling_gap = scheduled
+            .semantics()
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.subject == SemanticGapSubject::Procedure
+                    && gap.capability == SemanticCapability::DeferredExecution
+            })
+            .expect("async procedure scheduling gap");
+        assert!(
+            !scheduling_gap
+                .impacts
+                .contains(SemanticGapImpact::CallEvaluation),
+            "procedure scheduling must not claim that every represented nested call is incomplete"
+        );
+        let call = scheduled
+            .semantics()
+            .call_sites()
+            .first()
+            .expect("nested leaf call");
+        let mut transfer_budget = SemanticBudget::default();
+        let outcome = fixture
+            .analyzer
+            .icfg_provider()
+            .call_transfers(
+                &scheduled,
+                call.id,
+                &mut SemanticRequest::new(&mut transfer_budget, &cancellation),
+            )
+            .expect("nested leaf call transfer");
+        assert!(
+            !matches!(
+                &outcome,
+                SemanticOutcome::Unsupported {
+                    capability: SemanticCapability::DeferredExecution,
+                    ..
+                }
+            ),
+            "procedure scheduling uncertainty must not downgrade the nested call: {outcome:#?}"
+        );
+        let transfers = outcome
+            .available_value()
+            .expect("nested call transfer payload");
+        assert_eq!(transfers.transfers.len(), 1, "{transfers:#?}");
+        assert!(transfers.transfers.iter().all(|transfer| {
+            !matches!(
+                &transfer.completeness,
+                EvidenceCompleteness::Partial(reason)
+                    if reason.contains("caller-side call evaluation")
+            )
+        }));
+    }
+
+    #[test]
+    fn deferred_call_transfer_reprojects_provenance_and_charges_payload_atomically() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Rust,
+            &[
+                ("leaf.rs", "pub async fn async_leaf() -> i32 { 7 }\n"),
+                (
+                    "lib.rs",
+                    "mod leaf;\nuse crate::leaf::async_leaf;\npub fn make_future() { let _pending = async_leaf(); }\n",
+                ),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Rust caller materialization")
+            .available_value()
+            .cloned()
+            .expect("Rust caller artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("make_future")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("make_future procedure");
+        let call = caller
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| caller.call_site_handle(call.id))
+            .expect("async_leaf call site");
+        let provider = fixture.analyzer.icfg_provider();
+
+        let mut dispatch_budget = SemanticBudget::default();
+        let dispatch_outcome = provider
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+            )
+            .expect("Rust async dispatch");
+        assert_eq!(
+            dispatch_outcome
+                .available_value()
+                .unwrap()
+                .candidates()
+                .len(),
+            1
+        );
+
+        let mut transfer_budget = SemanticBudget::default();
+        let transfer_outcome = provider
+            .call_transfers(
+                &caller,
+                call.id(),
+                &mut SemanticRequest::new(&mut transfer_budget, &cancellation),
+            )
+            .expect("Rust async call transfer");
+        let transfers = transfer_outcome
+            .available_value()
+            .expect("deferred transfer payload");
+        let deferred = transfers
+            .boundaries
+            .iter()
+            .find(|boundary| {
+                matches!(
+                    boundary.dispatch.kind,
+                    DispatchBoundaryKind::Deferred { .. }
+                )
+            })
+            .expect("deferred call boundary");
+        assert_eq!(deferred.dispatch.provenance.len(), 1);
+        assert_eq!(
+            deferred.dispatch.provenance[0].owner(),
+            &OracleRelationOwner::Dispatch(call.clone())
+        );
+        assert_eq!(
+            deferred.dispatch.provenance[0].record().kind(),
+            OracleRelationKind::DispatchBoundary
+        );
+        assert!(matches!(
+            deferred.dispatch.provenance[0].record().subject(),
+            Some(OracleRelationSubject::DispatchBoundary(subject))
+                if subject == &deferred.dispatch.kind
+        ));
+        assert!(
+            !deferred.dispatch.provenance[0]
+                .record()
+                .evidence()
+                .is_empty()
+        );
+        let candidate = &dispatch_outcome.available_value().unwrap().candidates()[0];
+        let (projected, projected_work) = deferred_boundary_provenance(
+            &call,
+            &deferred.dispatch.kind,
+            &candidate.provenance,
+            OracleLimits::default(),
+        )
+        .expect("direct deferred provenance projection");
+        let DispatchBoundaryKind::Deferred { target, .. } = &deferred.dispatch.kind else {
+            unreachable!("selected boundary is deferred")
+        };
+        let locator_work = semantic_locator_work(target);
+        assert_eq!(
+            projected_work.owned_text_bytes,
+            locator_work.owned_text_bytes
+        );
+        assert_eq!(
+            projected_work.nested_entries,
+            2 + projected[0].record().evidence().len() + locator_work.nested_entries
+        );
+        assert!(
+            transfer_outcome.work().nested_entries
+                >= dispatch_outcome.work().nested_entries.saturating_add(3)
+        );
+        assert_eq!(transfer_budget.used(), transfer_outcome.work());
+
+        let mut limited = SemanticBudget::default().limits();
+        limited.nested_entries = transfer_outcome.work().nested_entries.saturating_sub(1);
+        let mut limited_budget =
+            SemanticBudget::new(limited).expect("positive deferred projection budget");
+        let limited_outcome = provider
+            .call_transfers(
+                &caller,
+                call.id(),
+                &mut SemanticRequest::new(&mut limited_budget, &cancellation),
+            )
+            .expect("limited Rust async call transfer");
+        assert!(matches!(
+            limited_outcome,
+            SemanticOutcome::ExceededBudget {
+                partial: None,
+                work,
+                ..
+            } if work == transfer_outcome.work()
+        ));
+        assert_eq!(limited_budget.used(), SemanticWork::default());
+    }
 
     #[test]
     fn cpp_header_definition_coalescing_is_unproven_and_excludes_unrelated_link_unit() {
@@ -2566,17 +2318,17 @@ mod tests {
         let dispatch = outcome.available_value().expect("dispatch payload");
 
         assert!(matches!(&outcome, SemanticOutcome::Unproven { .. }));
-        assert_eq!(dispatch.candidates.len(), 1, "{dispatch:#?}");
+        assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
         assert!(matches!(
-            &dispatch.candidates[0].proof,
+            &dispatch.candidates()[0].proof,
             ProofStatus::Unproven(_)
         ));
         assert!(matches!(
-            &dispatch.candidates[0].completeness,
+            &dispatch.candidates()[0].completeness,
             EvidenceCompleteness::Partial(_)
         ));
         assert_eq!(
-            dispatch.candidates[0]
+            dispatch.candidates()[0]
                 .target
                 .artifact()
                 .key()
@@ -2584,15 +2336,35 @@ mod tests {
                 .as_str(),
             "target.cpp"
         );
-        assert!(dispatch.boundaries.iter().any(|boundary| {
+        assert!(dispatch.boundaries().iter().any(|boundary| {
             boundary.kind == DispatchBoundaryKind::Unresolved
                 && matches!(&boundary.proof, ProofStatus::Unproven(_))
                 && matches!(&boundary.completeness, EvidenceCompleteness::Partial(_))
         }));
+
+        let pre_cancelled = CancellationToken::default();
+        pre_cancelled.cancel();
+        let mut cancelled_budget = SemanticBudget::default();
+        let cancelled = fixture
+            .analyzer
+            .icfg_provider()
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut cancelled_budget, &pre_cancelled),
+            )
+            .expect("pre-cancelled dispatch");
+        assert!(matches!(
+            cancelled,
+            SemanticOutcome::Cancelled {
+                partial: None,
+                work
+            } if work == SemanticWork::default()
+        ));
+        assert_eq!(cancelled_budget.used(), SemanticWork::default());
     }
 
     #[test]
-    fn cpp_preprocessor_call_gap_downgrades_the_retained_target_set() {
+    fn cpp_preprocessor_call_gap_opens_the_set_without_weakening_retained_candidates() {
         let source = r#"
 int enabled_target(int value) { return value + 1; }
 int disabled_target(int value) { return value + 2; }
@@ -2640,6 +2412,7 @@ int configured_caller(int value) {
             gap.subject == SemanticGapSubject::Procedure
                 && gap.capability == SemanticCapability::Calls
                 && gap.kind == SemanticGapKind::Unsupported
+                && gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
         }));
         let call = caller
             .semantics()
@@ -2660,16 +2433,17 @@ int configured_caller(int value) {
         let dispatch = outcome.available_value().expect("dispatch payload");
 
         assert!(matches!(&outcome, SemanticOutcome::Unproven { .. }));
-        assert_eq!(dispatch.candidates.len(), 1, "{dispatch:#?}");
+        assert_eq!(dispatch.coverage(), CandidateCoverage::Open);
+        assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
         assert!(matches!(
-            &dispatch.candidates[0].proof,
-            ProofStatus::Unproven(_)
+            &dispatch.candidates()[0].proof,
+            ProofStatus::Proven
         ));
         assert!(matches!(
-            &dispatch.candidates[0].completeness,
-            EvidenceCompleteness::Partial(_)
+            &dispatch.candidates()[0].completeness,
+            EvidenceCompleteness::Complete
         ));
-        assert!(dispatch.boundaries.iter().any(|boundary| {
+        assert!(dispatch.boundaries().iter().any(|boundary| {
             boundary.kind == DispatchBoundaryKind::Unresolved
                 && matches!(&boundary.proof, ProofStatus::Unproven(_))
                 && matches!(&boundary.completeness, EvidenceCompleteness::Partial(_))
@@ -2717,8 +2491,14 @@ end
             gap.subject == SemanticGapSubject::Procedure
                 && gap.capability == SemanticCapability::Calls
                 && gap.kind == SemanticGapKind::Unsupported
+                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
         }));
-        assert!(scoped_cpp_preprocessor_call_gap(&constructor).is_none());
+        assert!(
+            crate::analyzer::semantic::workspace_oracle::scoped_procedure_dispatch_gap(
+                &constructor
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2783,17 +2563,18 @@ end
         let dispatch = outcome.available_value().expect("dispatch payload");
 
         assert!(matches!(&outcome, SemanticOutcome::Unproven { .. }));
-        assert_eq!(dispatch.candidates.len(), 1, "{dispatch:#?}");
+        assert_eq!(dispatch.coverage(), CandidateCoverage::Open);
+        assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
         assert!(matches!(
-            &dispatch.candidates[0].proof,
-            ProofStatus::Unproven(_)
+            &dispatch.candidates()[0].proof,
+            ProofStatus::Proven
         ));
         assert!(matches!(
-            &dispatch.candidates[0].completeness,
-            EvidenceCompleteness::Partial(_)
+            &dispatch.candidates()[0].completeness,
+            EvidenceCompleteness::Complete
         ));
         assert_eq!(
-            dispatch.candidates[0]
+            dispatch.candidates()[0]
                 .target
                 .artifact()
                 .key()
@@ -2801,7 +2582,7 @@ end
                 .as_str(),
             "target.ts"
         );
-        assert!(dispatch.boundaries.iter().any(|boundary| {
+        assert!(dispatch.boundaries().iter().any(|boundary| {
             boundary.kind == DispatchBoundaryKind::Unresolved
                 && matches!(&boundary.proof, ProofStatus::Unproven(_))
                 && matches!(&boundary.completeness, EvidenceCompleteness::Partial(_))
@@ -2873,6 +2654,7 @@ int invoke_direct(Base* receiver) {
         assert!(dynamic_caller.semantics().gaps().iter().any(|gap| {
             gap.point == dynamic_call.point
                 && gap.capability == SemanticCapability::DynamicDispatch
+                && gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
                 && (gap.subject == SemanticGapSubject::Point
                     || gap.subject == SemanticGapSubject::CallSite(dynamic_call.id))
         }));
@@ -2882,8 +2664,82 @@ int invoke_direct(Base* receiver) {
                 && (gap.subject == SemanticGapSubject::Point
                     || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
         }));
+        assert!(direct_caller.semantics().gaps().iter().any(|gap| {
+            gap.point == direct_call.point
+                && gap.subject == SemanticGapSubject::CallSite(direct_call.id)
+                && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
+        }));
 
         let provider = fixture.analyzer.icfg_provider();
+        let dynamic_call_handle = dynamic_caller
+            .call_site_handle(dynamic_call.id)
+            .expect("dynamic call handle");
+        let direct_call_handle = direct_caller
+            .call_site_handle(direct_call.id)
+            .expect("direct call handle");
+        let mut dynamic_dispatch_budget = SemanticBudget::default();
+        let dynamic_dispatch = provider
+            .resolve_call(
+                &dynamic_call_handle,
+                &mut SemanticRequest::new(&mut dynamic_dispatch_budget, &cancellation),
+            )
+            .expect("virtual C++ dispatch")
+            .available_value()
+            .cloned()
+            .expect("virtual C++ dispatch payload");
+        assert_eq!(dynamic_dispatch.coverage(), CandidateCoverage::Open);
+
+        let mut direct_dispatch_budget = SemanticBudget::default();
+        let direct_dispatch_outcome = provider
+            .resolve_call(
+                &direct_call_handle,
+                &mut SemanticRequest::new(&mut direct_dispatch_budget, &cancellation),
+            )
+            .expect("qualified C++ dispatch");
+        assert!(matches!(
+            &direct_dispatch_outcome,
+            SemanticOutcome::Complete { .. }
+        ));
+        let direct_dispatch = direct_dispatch_outcome
+            .available_value()
+            .cloned()
+            .expect("qualified C++ dispatch payload");
+        assert_eq!(direct_dispatch.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(
+            direct_dispatch.candidates().len(),
+            1,
+            "{direct_dispatch:#?}"
+        );
+        assert!(matches!(
+            direct_dispatch.candidates()[0].proof,
+            ProofStatus::Proven
+        ));
+        assert!(matches!(
+            direct_dispatch.candidates()[0].completeness,
+            EvidenceCompleteness::Complete
+        ));
+        let direct_dispatch_work = direct_dispatch_outcome.work();
+        let mut projection_limits = SemanticBudget::default().limits();
+        projection_limits.nested_entries = direct_dispatch_work.nested_entries.saturating_sub(1);
+        let mut projection_budget = SemanticBudget::new(projection_limits)
+            .expect("dispatch projection limits remain positive");
+        let projection_limited = provider
+            .resolve_call(
+                &direct_call_handle,
+                &mut SemanticRequest::new(&mut projection_budget, &cancellation),
+            )
+            .expect("projection-limited dispatch");
+        assert!(matches!(
+            projection_limited,
+            SemanticOutcome::ExceededBudget {
+                partial: None,
+                work,
+                ..
+            } if work.nested_entries == direct_dispatch_work.nested_entries
+        ));
+        assert_eq!(projection_budget.used(), SemanticWork::default());
+
         let mut dynamic_budget = SemanticBudget::default();
         let dynamic_outcome = provider
             .call_transfers(
@@ -2897,12 +2753,12 @@ int invoke_direct(Base* receiver) {
             .available_value()
             .expect("virtual dispatch transfers");
         assert_eq!(dynamic.transfers.len(), 1, "{dynamic:#?}");
-        assert!(matches!(
-            &dynamic.transfers[0].proof,
-            ProofStatus::Unproven(_)
-        ));
+        assert!(matches!(&dynamic.transfers[0].proof, ProofStatus::Proven));
         assert!(matches!(
             &dynamic.transfers[0].completeness,
+            // The open virtual target set does not weaken this retained
+            // candidate's proof. Independent caller-side evaluation gaps do
+            // still make the executable transfer incomplete.
             EvidenceCompleteness::Partial(_)
         ));
         assert!(dynamic.boundaries.iter().any(|boundary| {
@@ -2933,6 +2789,81 @@ int invoke_direct(Base* receiver) {
             EvidenceCompleteness::Partial(_)
         ));
         assert!(direct.boundaries.is_empty(), "{direct:#?}");
+        assert!(
+            direct_outcome.work().owned_text_bytes > direct_dispatch_work.owned_text_bytes,
+            "call-evaluation reason text must be retained and charged only by call transfer"
+        );
+        assert_eq!(direct_budget.used(), direct_outcome.work());
+    }
+
+    #[test]
+    fn cpp_syntax_error_elsewhere_does_not_weaken_an_exact_call_dispatch() {
+        let source = r#"
+int exact_target() { return 1; }
+
+int caller_with_error() {
+    int malformed = ;
+    return exact_target();
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Cpp,
+            &[("syntax_error.cpp", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "syntax_error.cpp");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("C++ syntax-error materialization")
+            .available_value()
+            .cloned()
+            .expect("C++ syntax-error artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("caller_with_error")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let call = caller
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| caller.call_site_handle(call.id))
+            .expect("exact target call site");
+
+        assert!(caller.semantics().gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Procedure
+                && gap.capability == SemanticCapability::Calls
+                && gap.kind == SemanticGapKind::Unsupported
+                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
+        }));
+
+        let mut dispatch_budget = SemanticBudget::default();
+        let outcome = fixture
+            .analyzer
+            .icfg_provider()
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+            )
+            .expect("exact C++ dispatch despite unrelated syntax error");
+        assert!(matches!(&outcome, SemanticOutcome::Complete { .. }));
+        let dispatch = outcome.available_value().expect("exact dispatch payload");
+        assert_eq!(dispatch.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
     }
 
     #[test]
@@ -3134,12 +3065,84 @@ void raii_caller() {
             .expect("C++ exact dispatch");
         let dispatch = outcome.available_value().expect("dispatch payload");
 
-        assert!(dispatch.candidates.is_empty(), "{dispatch:#?}");
-        assert_eq!(dispatch.boundaries.len(), 1, "{dispatch:#?}");
+        assert!(dispatch.candidates().is_empty(), "{dispatch:#?}");
+        assert_eq!(dispatch.boundaries().len(), 1, "{dispatch:#?}");
         assert!(matches!(
-            dispatch.boundaries[0].kind,
+            dispatch.boundaries()[0].kind,
             DispatchBoundaryKind::Unmaterialized(_)
         ));
+    }
+
+    #[test]
+    fn final_dispatch_limit_counts_unique_materialized_procedures() {
+        let source = concat!(
+            "export function first() { return 1; }\n",
+            "export function second() { return 2; }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("targets.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "targets.ts");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("TypeScript materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript artifact");
+        let mut procedures = artifact
+            .procedures()
+            .iter()
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .collect::<Vec<_>>();
+        procedures
+            .sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
+        assert_eq!(procedures.len(), 2);
+
+        let candidate = |target: ProcedureHandle| {
+            DispatchCandidate::new(
+                target,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                std::iter::empty(),
+                OracleLimits::default(),
+            )
+            .expect("an empty dispatch draft fits every positive provenance limit")
+        };
+        let mut retained = Vec::new();
+        let mut indexes = HashMap::default();
+        assert!(!retain_dispatch_candidate(
+            &mut retained,
+            &mut indexes,
+            candidate(procedures[0].clone()),
+            1,
+        ));
+        assert!(!retain_dispatch_candidate(
+            &mut retained,
+            &mut indexes,
+            candidate(procedures[0].clone()),
+            1,
+        ));
+        assert!(retain_dispatch_candidate(
+            &mut retained,
+            &mut indexes,
+            candidate(procedures[1].clone()),
+            1,
+        ));
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].target, procedures[0]);
+    }
+
+    #[test]
+    fn workspace_icfg_provider_remains_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<WorkspaceIcfgProvider<'static>>();
     }
 
     #[test]

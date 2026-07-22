@@ -12,6 +12,14 @@ homepage = "https://github.com/BrokkAi/bifrost"
 readme = "README.md"
 keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
+exclude = [
+    ".agents/**",
+    "vendor/tree-sitter-scala/README.md",
+    "vendor/tree-sitter-scala/queries/**",
+    "vendor/tree-sitter-scala/src/grammar.json",
+    "vendor/tree-sitter-scala/src/node-types.json",
+    "vendor/tree-sitter-scala/tree-sitter.json",
+]
 
 [lib]
 name = "brokk_bifrost"
@@ -77,7 +85,10 @@ tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-tree-sitter-scala = "0.25.0"
+# Scala's generated parser is compiled from vendor/tree-sitter-scala because
+# its Bifrost fixes are not available together in a published grammar crate.
+# See vendor/tree-sitter-scala/BIFROST_PATCH.md for provenance and regeneration.
+tree-sitter-language = "0.1"
 
 # Grammars that still need older published releases for this port.
 tree-sitter-c-sharp = "0.23.1"
@@ -97,6 +108,9 @@ xot = "0.31"
 jclassfile = "0.6.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
+[build-dependencies]
+cc = "1.2"
+
 [features]
 default = []
 # Semantic search: voyageai/voyage-4-nano embeddings via the PyTorch SDPA sidecar.
@@ -114,6 +128,8 @@ jsonschema = { version = "0.48.0", default-features = false }
 pretty_assertions = "1.4.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rusqlite_migration = "=1.3.1"
+# Proves Bifrost's private native symbols coexist with the published grammar.
+tree-sitter-scala = "=0.25.1"
 
 # Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
 [target.'cfg(unix)'.dependencies]

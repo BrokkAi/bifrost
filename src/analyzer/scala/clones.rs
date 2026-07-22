@@ -128,7 +128,7 @@ fn parse_scala_tree(source: &str) -> Option<Tree> {
     }
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_scala::LANGUAGE.into())
+        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
         .expect("failed to load scala parser");
     parser.parse(source, None)
 }
