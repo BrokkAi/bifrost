@@ -77,7 +77,10 @@ tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-tree-sitter-scala = { version = "0.25.1", path = "vendor/tree-sitter-scala" }
+# Scala's generated parser is compiled from vendor/tree-sitter-scala because
+# its Bifrost fixes are not available together in a published grammar crate.
+# See vendor/tree-sitter-scala/BIFROST_PATCH.md for provenance and regeneration.
+tree-sitter-language = "0.1"
 
 # Grammars that still need older published releases for this port.
 tree-sitter-c-sharp = "0.23.1"
@@ -96,6 +99,9 @@ xee-xpath = "0.1.5"
 xot = "0.31"
 jclassfile = "0.6.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+cc = "1.2"
 
 [features]
 default = []

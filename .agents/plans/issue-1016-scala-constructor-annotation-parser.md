@@ -13,10 +13,10 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 - [x] (2026-07-22 11:05Z) Reproduced the existing property-fuzzer violation and confirmed the installed `tree-sitter-scala` is 0.25.1.
 - [x] (2026-07-22 11:05Z) Located upstream's constructor-annotation grammar fix and selected the first immutable generated-parser commit containing it.
 - [x] (2026-07-22 11:05Z) Chose vendoring over a git dependency so crates.io packages, wheels, and binaries all compile the same corrected parser.
-- [ ] Vendor and compile the fixed parser through Bifrost's root crate.
-- [ ] Route every Scala parser consumer through the internal language binding and invalidate persisted Scala analysis.
+- [x] (2026-07-22 11:13Z) Vendored the fixed generated parser, recorded its checksums, and compiled it through Bifrost's root crate.
+- [x] (2026-07-22 11:13Z) Routed every Scala parser consumer through the internal language binding and explicitly invalidated persisted Scala analysis.
 - [ ] Add exact analyzer, property-fuzzer, and SearchTools regressions.
-- [ ] Update third-party notices and verify crate packaging.
+- [ ] Update third-party notices and verify crate packaging (completed: notice generator and tracked notice; remaining: packaged-crate inspection and build).
 - [ ] Run focused tests, all-feature lint/tests, corpus replays, and the final multi-angle review.
 
 ## Surprises & Discoveries
@@ -35,6 +35,9 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 
 - Observation: The connected Bifrost code-intelligence plugin is rooted at its installed plugin cache rather than this worktree and returns false negatives for repository files.
   Evidence: plugin git operations reported `/Users/dave/.codex/plugins/cache/bifrost/brokk/0.8.7` as the project root. Repository exploration for this issue uses direct worktree reads until that separate tooling defect is addressed.
+
+- Observation: The existing worktree `target` consumed 6.9 GiB and the first regression build failed while writing an incremental dependency graph, despite the volume reporting free space.
+  Evidence: Cargo returned `No space left on device (os error 28)`; `cargo clean` removed 9,599 regenerable build files before validation resumed.
 
 ## Decision Log
 

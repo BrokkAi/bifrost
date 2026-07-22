@@ -213,7 +213,7 @@ impl ScalaCallableParameterList {
 pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_scala::LANGUAGE.into())
+        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(source, None)?;
     let mut facts = ScalaSourceFacts::default();
@@ -2066,7 +2066,7 @@ mod tests {
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut calls = Vec::new();
@@ -2230,7 +2230,7 @@ mod tests {
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut actual = Vec::new();
@@ -2268,7 +2268,7 @@ enum Event:
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut simple_case = None;
@@ -2381,7 +2381,7 @@ object Use { val value = new ArrayOps(1) }
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let index = ScalaPackageContextIndex::new(tree.root_node(), source);
@@ -2415,7 +2415,7 @@ object Use { val value = new ArrayOps(1) }
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut value_roles = Vec::new();

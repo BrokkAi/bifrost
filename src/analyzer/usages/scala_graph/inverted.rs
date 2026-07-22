@@ -6284,7 +6284,7 @@ where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let language = tree_sitter_scala::LANGUAGE.into();
+    let language = crate::analyzer::scala::language::LANGUAGE.into();
     build_edge_output(&graph.files, keep_file, |file| {
         let state = graph.types.bulk_file_state(file)?;
         let declarations = build_file_declarations_from_state(state);
@@ -6358,7 +6358,7 @@ pub(super) fn scan_scala_query_file(
     }
     let mut parser = Parser::new();
     if parser
-        .set_language(&tree_sitter_scala::LANGUAGE.into())
+        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
         .is_err()
     {
         return false;
