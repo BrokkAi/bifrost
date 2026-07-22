@@ -1771,6 +1771,40 @@ fn resolve_definition_context_query(
     collapse_context_outcomes(analyzer, query, outcomes)
 }
 
+/// Group a resolved candidate set for the `definitions` (reference) surface the
+/// same way the anchored branch and the other symbol tools do: run
+/// `distinct_definitions` and report `ambiguous_symbol` when more than one
+/// distinct declaration matches. This keeps bare and fully-qualified spellings
+/// symmetric with `get_symbol_sources`/`get_summaries` (#1057). The
+/// `ambiguous_symbol` message format and the `symbol_not_found` shape are those
+/// the MCP property fuzzer's `classify_spelling` already reads; do not change
+/// the diagnostic vocabulary here.
+fn group_definition_context_symbols(
+    analyzer: &dyn IAnalyzer,
+    symbol: &str,
+    units: Vec<CodeUnit>,
+) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
+    let groups = distinct_definitions(analyzer, units);
+    match groups.as_slice() {
+        [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
+        [] => Err(vec![DefinitionDiagnostic {
+            kind: "symbol_not_found".to_string(),
+            message: format!("`{symbol}` does not resolve to a workspace symbol"),
+        }]),
+        _ => Err(vec![DefinitionDiagnostic {
+            kind: "ambiguous_symbol".to_string(),
+            message: format!(
+                "`{symbol}` is ambiguous; matches: {}",
+                groups
+                    .into_iter()
+                    .map(|(selector, _)| selector)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }]),
+    }
+}
+
 fn resolve_definition_context_symbol(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
@@ -1782,9 +1816,20 @@ fn resolve_definition_context_symbol(
         }]);
     }
 
-    let exact = resolve_codeunit_exact(analyzer, symbol);
-    if !exact.is_empty() {
-        return Ok(exact);
+    // For qualified/multi-segment names keep exact-first resolution so canonical
+    // `/`- or `::`-bearing spellings (Go import paths, `fmt::formatter`) are
+    // never misrouted, but route the exact result through the shared grouping
+    // helper: a fully-qualified twin spelling (same FQN in two files) now
+    // reports `ambiguous_symbol` instead of silently returning both twins,
+    // while a unique qualified name still returns Ok. A bare name skips the
+    // exact short-circuit entirely and falls through to the member-aware fuzzy
+    // path, so a top-level namesake can no longer silently win over a same-named
+    // member (#1057), mirroring `exact_codeunit_resolution`.
+    if !is_bare_symbol_query(analyzer, symbol) {
+        let exact = resolve_codeunit_exact(analyzer, symbol);
+        if !exact.is_empty() {
+            return group_definition_context_symbols(analyzer, symbol, exact);
+        }
     }
 
     let anchored = match split_definition_selector(symbol) {
@@ -1815,36 +1860,13 @@ fn resolve_definition_context_symbol(
             .into_iter()
             .filter(|unit| rel_path_string(unit.source()) == anchor)
             .collect();
-        let groups = distinct_definitions(analyzer, narrowed);
-        return match groups.as_slice() {
-            [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
-            [] => Err(vec![DefinitionDiagnostic {
-                kind: "symbol_not_found".to_string(),
-                message: format!("`{symbol}` does not resolve to a workspace symbol"),
-            }]),
-            _ => Err(vec![DefinitionDiagnostic {
-                kind: "ambiguous_symbol".to_string(),
-                message: format!(
-                    "`{symbol}` is ambiguous; matches: {}",
-                    groups
-                        .into_iter()
-                        .map(|(selector, _)| selector)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }]),
-        };
+        return group_definition_context_symbols(analyzer, symbol, narrowed);
     }
 
     match resolve_codeunit_fuzzy(analyzer, symbol) {
-        CodeUnitResolution::Resolved(units) => Ok(units),
-        CodeUnitResolution::Ambiguous(matches) => Err(vec![DefinitionDiagnostic {
-            kind: "ambiguous_symbol".to_string(),
-            message: format!(
-                "`{symbol}` is ambiguous; matches: {}",
-                code_unit_match_names(analyzer, &matches).join(", ")
-            ),
-        }]),
+        CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => {
+            group_definition_context_symbols(analyzer, symbol, units)
+        }
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
             kind: "symbol_not_found".to_string(),
             message: path_like_symbol_guidance(
