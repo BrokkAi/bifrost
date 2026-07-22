@@ -1925,16 +1925,21 @@ pub fn check_i3a(
             // an ambiguity answer is consistent when it offers the listed
             // file's own `path#symbol` selector, because the listing itself
             // supplies the disambiguating path (an agent following the
-            // summary resolves in one guided re-call). The violation is
-            // resolvability from the listing context: a hard not_found, or
-            // matches that exclude the listed path (the bfg shape, where the
-            // emitted spelling maps to no exact declaration at all).
+            // summary resolves in one guided re-call). It is also consistent
+            // when the ambiguity offers the listed name itself — the element
+            // resolves by name (laravel's identical types/ stub twins).
+            // The violation is resolvability from the listing context: a hard
+            // not_found, or matches that offer only *other* names — never the
+            // listed one (the bfg shape: `LFS.Pointer` offered only
+            // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
             let own_selector = format!("{element_path}#");
             let resolvable_from_listing = array_field(structured, "ambiguous")
                 .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
                 .flatten()
                 .filter_map(Value::as_str)
-                .any(|candidate| candidate.starts_with(&own_selector));
+                .any(|candidate| {
+                    candidate.starts_with(&own_selector) || candidate == record.symbol_fq
+                });
             if !resolvable_from_listing {
                 sink.record(violation(
                     InvariantKind::I3,
