@@ -484,6 +484,20 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
         variants.push(dollar_split);
     }
 
+    // C# generic arity: indexed names carry `Type`1`, but nobody types
+    // arity — the query side already strips it
+    // (query_symbol_interpretations), so aliases must offer the
+    // arity-free form too or generic types are unaddressable (#1063).
+    if language == Language::CSharp {
+        let normalized: Vec<_> = primary
+            .iter()
+            .map(|segment| strip_csharp_generic_arity(segment).to_string())
+            .collect();
+        if normalized != primary && normalized.iter().all(|segment| !segment.is_empty()) {
+            variants.push(normalized);
+        }
+    }
+
     if language == Language::TypeScript
         && let Some(ts_static) = trim_trailing_static_member_segment(&primary)
     {

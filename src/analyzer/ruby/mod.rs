@@ -13,7 +13,7 @@ use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, CodeUnitType,
     DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, RubyMethodDispatchMode, SignatureMetadata, TestDetectionProvider,
+    ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata, TestDetectionProvider,
     TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -21,6 +21,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use tree_sitter::Node;
 
 pub(crate) use adapter::RubyAdapter;
 use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
@@ -30,6 +31,56 @@ pub(crate) use declarations::{
     ruby_field_short_name, ruby_variable_field_name,
 };
 pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
+
+pub(crate) fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.named_child_count() != 1 {
+        return None;
+    }
+    let content = node.named_child(0)?;
+    (content.kind() == "string_content").then_some(content)
+}
+
+/// Returns the source range of the semantic identifier carried by a Ruby symbol.
+///
+/// Tree-sitter represents an unquoted symbol such as `:audit` as one leaf
+/// `simple_symbol` node, so its parser range includes the leading colon. Static
+/// quoted symbols have a structured `string_content` child that excludes both
+/// the colon and quote delimiters. Other nodes keep their parser range.
+pub(crate) fn ruby_semantic_identifier_range(node: Node<'_>, source: &str) -> Range {
+    let node_range = || Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+
+    match node.kind() {
+        "simple_symbol" => {
+            let text = source.get(node.start_byte()..node.end_byte()).unwrap_or("");
+            if text.strip_prefix(':').is_none_or(str::is_empty) {
+                return node_range();
+            }
+            Range {
+                start_byte: node.start_byte() + ':'.len_utf8(),
+                end_byte: node.end_byte(),
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            }
+        }
+        "delimited_symbol" => {
+            let Some(content) = single_static_string_content_node(node) else {
+                return node_range();
+            };
+            Range {
+                start_byte: content.start_byte(),
+                end_byte: content.end_byte(),
+                start_line: content.start_position().row,
+                end_line: content.end_position().row,
+            }
+        }
+        _ => node_range(),
+    }
+}
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {

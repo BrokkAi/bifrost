@@ -1496,14 +1496,34 @@ fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
         // keyword, rendering the field as a type declaration over the
         // file's own field text.
         return expected[0].contains(line)
-            || line
-                .strip_prefix("type ")
-                .is_some_and(|stripped| expected[0].contains(stripped));
+            || strip_type_keyword(line).is_some_and(|stripped| expected[0].contains(&stripped));
     }
     let last = expected.len() - 1;
-    expected[0].ends_with(text_lines[0])
-        && expected[last].starts_with(text_lines[last])
-        && (1..last).all(|index| expected[index] == text_lines[index])
+    // The same `type ` re-insertion can land on the declaration's first
+    // line anywhere in the block (doc-comment expansion makes it the
+    // last line): compare each position tolerantly.
+    let first = text_lines[0];
+    let last_line = text_lines[last];
+    (expected[0].ends_with(first)
+        || strip_type_keyword(first).is_some_and(|stripped| expected[0].ends_with(&stripped)))
+        && (expected[last].starts_with(last_line)
+            || strip_type_keyword(last_line)
+                .is_some_and(|stripped| expected[last].starts_with(&stripped)))
+        && (1..last).all(|index| {
+            expected[index] == text_lines[index]
+                || strip_type_keyword(text_lines[index])
+                    .is_some_and(|stripped| expected[index] == stripped)
+        })
+}
+
+/// Strip a deliberately re-inserted `type` keyword (Go embedded fields
+/// rendered as type declarations), preserving the line's indentation so
+/// affix comparisons keep working.
+fn strip_type_keyword(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let stripped = trimmed.strip_prefix("type ")?;
+    let indent = &line[..line.len() - trimmed.len()];
+    Some(format!("{indent}{stripped}"))
 }
 
 /// 1-based inclusive line slice, mirroring the SourceBlock range convention.

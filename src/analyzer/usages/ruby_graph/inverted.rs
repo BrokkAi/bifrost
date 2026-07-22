@@ -86,17 +86,19 @@ impl RubyEdgeScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
+        let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, self.source);
         self.collector.record_kind(
             callee,
             classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
+            range.start_byte,
+            range.end_byte,
         );
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
+        let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, self.source);
         self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+            .record_unproven_name(name, range.start_byte, range.end_byte);
     }
 }
 

@@ -32,6 +32,9 @@ jobs:
       - name: Install pinned cargo-about
         run: cargo install --locked cargo-about --version 0.9.1 --features cli
 
+      - name: Fetch locked dependencies for offline notice report
+        run: cargo fetch --locked
+
       - name: Generate Rust notice report
         run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
 

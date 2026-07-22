@@ -1,6 +1,6 @@
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_signature_param_types,
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_signature_param_types,
     cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 use crate::analyzer::usages::cpp_graph::hits::{
@@ -1577,10 +1577,9 @@ fn call_argument_types(call: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Option<CppArgTy
 fn expression_arg_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppArgType> {
     match node.kind() {
         "number_literal" | "true" | "false" | "char_literal" | "string_literal"
-        | "unary_expression" => cpp_literal_type_name(node, ctx.source).map(|name| CppArgType {
-            name: name.to_string(),
-            unit: ctx.visibility.resolve_type(ctx.file, name),
-            indirection: 0,
+        | "unary_expression" => cpp_literal_arg_type(node, ctx.source).map(|mut literal| {
+            literal.unit = ctx.visibility.resolve_type(ctx.file, &literal.name);
+            literal
         }),
         "identifier" => ctx
             .bindings
