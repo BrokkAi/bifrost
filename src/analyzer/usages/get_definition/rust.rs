@@ -2574,7 +2574,7 @@ fn resolve_rust_field(
             return None;
         }
         let member = rust_node_text(field, source).trim();
-        let owner = rust_expression_type_fqn(
+        let Some(owner) = rust_expression_type_fqn(
             analyzer,
             support,
             file,
@@ -2583,7 +2583,19 @@ fn resolve_rust_field(
             receiver,
             field_expression.start_byte(),
             cache,
-        )?;
+        ) else {
+            // The receiver's type could not be resolved to an indexed
+            // definition at all (e.g. the owning struct is declared inside a
+            // macro invocation Bifrost does not expand into declarations,
+            // #1015). Returning `None` here used to fall all the way back to
+            // `resolve_rust_unscoped`'s generic fallback, which reported the
+            // *entire* dotted chain as unresolved with no hint (#1019). Name
+            // the owner type when it can still be read syntactically from the
+            // enclosing `impl` block so the caller has a concrete next query.
+            return Some(rust_field_owner_unresolved_outcome(
+                source, node, receiver, member,
+            ));
+        };
         let candidates = rust_member_candidates(
             support.fqn(&format!("{owner}.{member}")),
             rust_field_expression_member_kind(field_expression),
@@ -2618,13 +2630,59 @@ fn resolve_rust_field(
         return if candidates.is_empty() {
             Some(no_definition(
                 "no_indexed_definition",
-                format!("`{owner}.{member}` is not indexed as a Rust definition"),
+                format!(
+                    "`{owner}.{member}` is not indexed as a Rust definition; try get_symbol_sources with \"{owner}.{member}\" or search_symbols for \"{member}\""
+                ),
             ))
         } else {
             Some(candidates_outcome(candidates))
         };
     }
     None
+}
+
+/// Build an actionable `no_indexed_definition` outcome for a `receiver.member`
+/// field access whose receiver type could not be resolved at all. When the
+/// receiver is `self`, the enclosing `impl`'s type name can still be read
+/// straight off the syntax tree even though it never resolved to an indexed
+/// definition, so the hint can name it and suggest a concrete retry (#1019).
+fn rust_field_owner_unresolved_outcome(
+    source: &str,
+    node: Node<'_>,
+    receiver: Node<'_>,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    if rust_node_text(receiver, source).trim() == "self"
+        && let Some(owner_name) = rust_enclosing_impl_type_name_text(node, source)
+    {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{member}` looks like a field of `{owner_name}`, but `{owner_name}` did not resolve to an indexed Rust definition (it may be declared inside a macro invocation Bifrost does not expand); try get_symbol_sources with \"{owner_name}.{member}\" or search_symbols for \"{member}\""
+            ),
+        );
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!(
+            "`{member}` did not resolve to an indexed Rust definition because its receiver's type could not be determined; try search_symbols for \"{member}\""
+        ),
+    )
+}
+
+/// Like [`rust_enclosing_impl_type_fqn`] but reads the impl's `Self` type name
+/// straight from the syntax tree instead of resolving it to an indexed FQN, so
+/// it still produces a name when the type itself is not indexed.
+fn rust_enclosing_impl_type_name_text(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node.parent()?;
+    loop {
+        if current.kind() == "impl_item"
+            && let Some(type_node) = current.child_by_field_name("type")
+        {
+            return rust_type_ref(type_node, source).map(|type_ref| type_ref.name);
+        }
+        current = current.parent()?;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
