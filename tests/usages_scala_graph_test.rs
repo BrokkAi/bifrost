@@ -9901,8 +9901,10 @@ object External {
         "scan_usages_by_reference",
         &json!({
             "symbols": [
-                "replica.RingBuffer$.STATE_FULL",
-                "replica.RingBuffer$.STATE_RESERVED"
+                "jvm/replica/RingBuffer.scala#replica.RingBuffer$.STATE_FULL",
+                "native/replica/RingBuffer.scala#replica.RingBuffer$.STATE_FULL",
+                "jvm/replica/RingBuffer.scala#replica.RingBuffer$.STATE_RESERVED",
+                "native/replica/RingBuffer.scala#replica.RingBuffer$.STATE_RESERVED"
             ],
             "include_tests": true,
         })

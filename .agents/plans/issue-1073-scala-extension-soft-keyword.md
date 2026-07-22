@@ -14,7 +14,7 @@ After this change, valid Scala 2 code may use `extension` as an ordinary value o
 - [x] (2026-07-22 15:42Z) Vendored a narrow derivative of official v0.25.1 under `vendor/tree-sitter-scala`, retained its MIT license, added explicit patch provenance, and switched Cargo to the local path dependency without changing the public crate API.
 - [x] (2026-07-22 15:49Z) Added `tests/scala_extension_soft_keyword_test.rs`; raw Scala 2 and Scala 3 parser controls plus the public forward/inverse symbol round trip all pass.
 - [x] (2026-07-22 15:54Z) Repeated the focused feature-enabled target (6 passed), formatted the new test directly, and passed file-scoped `git diff --check`.
-- [x] (2026-07-22 20:00Z) Root integrated all concurrent Scala changes. Repository-wide formatting and diff hygiene pass; the 51-test definition-precedence target, 147-test inverse graph target, 6-test parser/public target, and isolated all-feature Clippy gate are green. The exact Metals witness now resolves and round-trips as `ScalametaCommonEnrichments.XtensionAbsolutePath.isWorksheet`. The full feature-enabled gate reached 1,566 passing library tests before three sandbox-denied Unix-socket tests; root will repeat it outside the sandbox after merging the latest `origin/master`.
+- [x] (2026-07-22 20:00Z) Root integrated all concurrent Scala changes. Repository-wide formatting and diff hygiene pass; the 51-test definition-precedence target, 147-test inverse graph target, 6-test parser/public target, post-merge all-feature Clippy, and complete out-of-sandbox `cargo test --features nlp,python` gate are green. The exact Metals witness resolves and round-trips as `ScalametaCommonEnrichments.XtensionAbsolutePath.isWorksheet`.
 
 ## Surprises & Discoveries
 
@@ -39,7 +39,7 @@ After this change, valid Scala 2 code may use `extension` as an ordinary value o
 
 ## Outcomes & Retrospective
 
-Issue #1073 is implemented locally without analyzer recovery. Bifrost now builds against a source-controlled v0.25.1 grammar derivative that treats `extension` contextually, and the focused acceptance target proves an error-free Scala 2 parse, preserved Scala 3 extension syntax, correct nested forward identity, and an inverse hit for that exact identity. Six focused tests pass, the production witness is consistent, and repository-wide formatting, diff hygiene, and isolated all-feature Clippy pass. The only incomplete local gate is the post-merge out-of-sandbox full feature-enabled test rerun required because the restricted sandbox denied three unrelated Unix-socket tests.
+Issue #1073 is implemented locally without analyzer recovery. Bifrost now builds against a source-controlled v0.25.1 grammar derivative that treats `extension` contextually, and the focused acceptance target proves an error-free Scala 2 parse, preserved Scala 3 extension syntax, correct nested forward identity, and an inverse hit for that exact identity. Six focused tests pass, the production witness is consistent, and repository-wide formatting, diff hygiene, post-merge all-feature Clippy, and the complete out-of-sandbox feature-enabled Cargo suite pass.
 
 ## Context and Orientation
 
@@ -111,3 +111,5 @@ Revision note: 2026-07-22 created the plan after reproducing #1073 across all re
 Revision note: 2026-07-22 recorded the vendored v0.25.1 derivative, provenance, public behavior tests, and focused acceptance; broad integrated formatting and Clippy remain root-owned because other agents are actively editing the affected Scala files.
 
 Revision note: 2026-07-22 recorded the completed integrated review, production exact witness, focused suites, and Clippy gate; the full test rerun remains a post-merge publication gate because restricted process-I/O permissions rejected three unrelated benchmark harness tests.
+
+Revision note: 2026-07-22 completed the post-merge publication gates outside the restricted sandbox; all feature-enabled Cargo tests pass, including the process-I/O harness tests.

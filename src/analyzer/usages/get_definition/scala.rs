@@ -3271,17 +3271,6 @@ fn resolve_scala_call(
                     }
                 }
             }
-            if let Some(owner) = scala_resolve_visible_type_declaration(ctx, resolver, function)
-                && owner.is_class()
-                && !ctx.scala.is_type_alias(&owner)
-            {
-                return scala_exact_type_apply_or_constructor_outcome(
-                    ctx,
-                    &owner,
-                    name,
-                    call_shape.as_ref(),
-                );
-            }
             match resolver.resolve_explicit_singleton(name) {
                 ScalaNameResolution::Resolved(owner) => {
                     return scala_apply_or_constructor_outcome(
@@ -3329,6 +3318,17 @@ fn resolve_scala_call(
                     );
                 }
                 ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
+            }
+            if let Some(owner) = scala_resolve_visible_type_declaration(ctx, resolver, function)
+                && owner.is_class()
+                && !ctx.scala.is_type_alias(&owner)
+            {
+                return scala_exact_type_apply_or_constructor_outcome(
+                    ctx,
+                    &owner,
+                    name,
+                    call_shape.as_ref(),
+                );
             }
             if let Some(owner_fqn) = resolver.resolve_singleton(name).or_else(|| {
                 scala_resolve_visible_type_annotation(ctx, resolver, name, function.start_byte())
