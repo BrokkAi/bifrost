@@ -284,6 +284,9 @@ pub struct ProbeSummary {
     /// package/module declaration, whose "path" is a convention rather than
     /// a per-file contract.
     pub skipped_module_summary_element: usize,
+    /// Summary probes skipped for empty files (e.g. 0-byte `__init__.py`):
+    /// an all-empty response is a valid result there, not a refusal.
+    pub skipped_empty_file_summaries: usize,
     /// I2 probes skipped because the sampled symbol is a module unit, whose
     /// name is its file, not a selector-resolvable symbol.
     pub symbols_excluded_module_spelling: usize,
@@ -779,7 +782,17 @@ fn generate_probes(
         for &index in &service_symbols {
             let symbol = &input.symbols[index];
             let file = &input.files[symbol.file_index];
-            if seen_files.insert(file.path.clone()) {
+            // Empty files (e.g. 0-byte `__init__.py` package markers) have
+            // nothing to summarize; an all-empty response is a valid result,
+            // not a refusal (the celery/freqtrade I5 false fires).
+            let empty_file = file
+                .text
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty());
+            if empty_file {
+                summary.skipped_empty_file_summaries += 1;
+            }
+            if seen_files.insert(file.path.clone()) && !empty_file {
                 probes.push(ProbeRecord {
                     id: format!("i3:get_summaries:{}", file.path),
                     tool: "get_summaries",
