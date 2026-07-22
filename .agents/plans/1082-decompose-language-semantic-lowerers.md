@@ -23,7 +23,7 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
 - [x] (2026-07-22 20:08Z) Passed `cargo fmt --all -- --check`, full-feature clippy with warnings denied, all three unchanged semantic contract suites, and the complete `nlp,python` feature-enabled test suite in the repository's self-cleaning isolated Cargo target.
 - [x] (2026-07-22 20:08Z) Fetched and rebased cleanly onto live `origin/master` at `3bd7c9e8`; `git diff --check` remained clean and no language-semantic visibility expanded beyond the existing JS/TS facade constructors.
 - [x] (2026-07-22 20:14Z) Completed security, duplication, intent, operations, and architecture reviews. Restored the two moved cancellation test modules after reviewers identified missing `#[cfg(test)] mod tests;` declarations; both tests and the corrected full-feature clippy graph pass.
-- [ ] Commit the review fix and final plan, push the branch, and open a ready-for-review pull request that fixes #1082.
+- [x] (2026-07-22 20:16Z) Committed the review fix and final plan, pushed the clean rebased branch, and opened ready-for-review PR #1094 to fix #1082.
 
 ## Surprises & Discoveries
 
@@ -72,7 +72,7 @@ The Java and shared JavaScript/TypeScript semantic adapters already implement th
 
 ## Outcomes & Retrospective
 
-Implementation, local validation, and specialist review are complete. Publication remains; at completion this section will record the PR URL. The only tooling follow-up is the Bifrost MCP installation being unbound to this worktree with no exposed activation tool.
+Implementation, local validation, specialist review, and publication are complete in ready-for-review PR #1094: https://github.com/BrokkAi/bifrost/pull/1094. The only tooling follow-up is the Bifrost MCP installation being unbound to this worktree with no exposed activation tool.
 
 The Java milestone now replaces the 3,657-line monolith with `control.rs` (2,331 lines), `inventory.rs` (176), `mod.rs` (276), `syntax.rs` (505), `tests.rs` (35), and `values.rs` (358). The representative Java artifact retained render digest `4e0bd646...cf1c`, key fingerprint `0a787864...2e8d`, and every original work counter. No Java consumer path or adapter byte changed.
 
@@ -177,4 +177,4 @@ No new external dependency or public interface is permitted. `impl_program_seman
 
 Child modules are private. Inventory records and cross-module inherent methods may use `pub(super)` because that visibility stops at the language's `semantic` parent. Do not use `pub(crate)` merely to cross a sibling boundary, do not re-export child implementation modules, and do not introduce a common Java/JS statement or expression layer.
 
-Revision note (2026-07-22 20:14Z): Recorded all five specialist reviews, the corrected private test-module declarations, and the post-fix focused tests and full-feature clippy result.
+Revision note (2026-07-22 20:16Z): Recorded publication of ready-for-review PR #1094 and completed the plan.
