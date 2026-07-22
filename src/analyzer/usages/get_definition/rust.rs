@@ -1204,18 +1204,39 @@ fn rust_visible_import_resolution(
         let mut expected_fqns = HashSet::default();
         if explicitly_bound {
             for (local_name, binding) in &binder.bindings {
-                if local_name != reference || binding.kind != ImportKind::Named {
+                if local_name != reference {
                     continue;
                 }
-                let imported = binding.imported_name.as_deref().unwrap_or(reference);
-                if let Some(package) = resolve_import_package_scoped(
-                    rust,
-                    file,
-                    source,
-                    scope_start,
-                    &binding.module_specifier,
-                ) {
-                    expected_fqns.insert(format!("{package}.{imported}"));
+                // Scope-aware fqn for `self`/`super` specifiers: Named
+                // bindings (`use super::{X}`) resolve the package and append
+                // the item; Namespace bindings (`use super::X`) resolve the
+                // full path directly. File-level resolution pops from the
+                // file's parent package and misses both (#1074).
+                match binding.kind {
+                    ImportKind::Named => {
+                        let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                        if let Some(package) = resolve_import_package_scoped(
+                            rust,
+                            file,
+                            source,
+                            scope_start,
+                            &binding.module_specifier,
+                        ) {
+                            expected_fqns.insert(format!("{package}.{imported}"));
+                        }
+                    }
+                    ImportKind::Namespace => {
+                        if let Some(fqn) = resolve_import_package_scoped(
+                            rust,
+                            file,
+                            source,
+                            scope_start,
+                            &binding.module_specifier,
+                        ) {
+                            expected_fqns.insert(fqn);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1224,12 +1245,32 @@ fn rust_visible_import_resolution(
         // standard target resolution looks in the file's parent package and
         // misses them, so steer them to the current file directly.
         for (local_name, binding) in &binder.bindings {
-            if local_name != reference || binding.kind != ImportKind::Named {
+            if local_name != reference {
                 continue;
             }
-            let imported = binding.imported_name.as_deref().unwrap_or(reference);
-            if import_resolves_within_file(file, source, scope_start, &binding.module_specifier) {
-                targets.push((file.clone(), imported.to_string()));
+            match binding.kind {
+                ImportKind::Named => {
+                    let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                    if import_package_resolves_to_file(
+                        file,
+                        source,
+                        scope_start,
+                        &binding.module_specifier,
+                    ) {
+                        targets.push((file.clone(), imported.to_string()));
+                    }
+                }
+                ImportKind::Namespace => {
+                    if let Some(name) = import_path_resolves_within_file(
+                        file,
+                        source,
+                        scope_start,
+                        &binding.module_specifier,
+                    ) {
+                        targets.push((file.clone(), name));
+                    }
+                }
+                _ => {}
             }
         }
         let mut candidates = Vec::new();
@@ -1303,8 +1344,8 @@ fn resolve_import_package_scoped(
 /// True when a `self`/`super` import's module specifier resolves to the
 /// current file's own package — i.e. the import targets a declaration in
 /// this file, which the file-level target resolution (looking in the file's
-/// parent package) cannot see.
-fn import_resolves_within_file(
+/// parent package) cannot see. Used for Named bindings (`use super::{X}`).
+fn import_package_resolves_to_file(
     file: &ProjectFile,
     source: &str,
     scope_start: usize,
@@ -1329,6 +1370,35 @@ fn import_resolves_within_file(
         &segments,
     )
     .is_some_and(|resolved| resolved == file_package)
+}
+
+/// For Namespace bindings (`use super::X` — the full path is the specifier):
+/// when the scope-aware resolution lands inside the current file, return the
+/// imported declaration's terminal name so the file can be targeted directly.
+fn import_path_resolves_within_file(
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    module_specifier: &str,
+) -> Option<String> {
+    let first = module_specifier.split("::").next()?;
+    if !matches!(first, "self" | "super") {
+        return None;
+    }
+    let file_package = crate::analyzer::rust::rust_package_name(file);
+    let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
+    let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
+    let segments: Vec<&str> = module_specifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let resolved = crate::analyzer::rust::resolve_rust_module_segments_with_crate(
+        &lexical_package,
+        &crate_package,
+        &segments,
+    )?;
+    let (parent, name) = resolved.rsplit_once('.')?;
+    (parent == file_package).then(|| name.to_string())
 }
 
 fn rust_import_target_candidates(

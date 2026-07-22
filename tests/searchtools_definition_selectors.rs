@@ -2457,3 +2457,48 @@ class Solo {
     assert_symbol_source_contains(&project, "demo.Solo", "class Solo");
     assert_symbol_source_contains(&project, "demo.Solo.onlyOne", "def onlyOne");
 }
+
+#[test]
+fn bare_name_ambiguity_includes_arrow_function_consts() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/a.tsx",
+            "export const Input = (props) => {\n  return <input {...props} />;\n};\n",
+        )
+        .file(
+            "src/b.tsx",
+            "export function Input(props) {\n  return <input {...props} />;\n}\n",
+        )
+        .build();
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Input"]}"#);
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert!(
+        matches.iter().any(|m| m.contains("src/a.tsx")),
+        "arrow const must be a candidate: {result}"
+    );
+    assert!(
+        matches.iter().any(|m| m.contains("src/b.tsx")),
+        "function must be a candidate: {result}"
+    );
+}
+
+#[test]
+fn arrow_const_named_input_indexes_and_resolves() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "examples/V6/customMaskedInputWithController.tsx",
+            "import React from 'react';\nimport MaskedInput from 'react-input-mask';\nimport { useForm, Controller } from 'react-hook-form';\n\nimport './styles.css';\n\nexport const clearTel = (tel) => tel.replace(/[^0-9]/g, '');\n\nconst isNotFilledTel = (v) => {\n  const clearedTel = clearTel(v);\n  return clearedTel.length < 11 ? 'Phone number is required.' : undefined;\n};\n\nconst Input = (props) => {\n  const { onChange, ...restProps } = props;\n  return <input {...restProps} onChange={onChange} />;\n};\n\nconst CustomMaskedInput = (props) => {\n  const { value, onChange, name } = props;\n  return (\n    <MaskedInput name={name} value={value} mask=\"+7 (999) 999-99-99\" />\n  );\n};\n",
+        )
+        .build();
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Input"]}"#);
+    let rendered = format!("{result}");
+    assert!(
+        result["not_found"].as_array().unwrap().is_empty(),
+        "Input must resolve: {rendered}"
+    );
+    assert!(
+        !result["sources"].as_array().unwrap().is_empty()
+            || !result["ambiguous"].as_array().unwrap().is_empty(),
+        "Input must produce sources or ambiguity: {rendered}"
+    );
+}
