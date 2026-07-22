@@ -10859,7 +10859,7 @@ export class ErrorBoundary {
 }
 
 #[test]
-fn typescript_this_member_does_not_use_same_named_class_from_another_file() {
+fn typescript_this_member_uses_same_file_constructor_field_not_other_class() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
             "z/current.ts",
@@ -10894,7 +10894,15 @@ export class ErrorBoundary {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "z/current.ts", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
 }
 
 #[test]
