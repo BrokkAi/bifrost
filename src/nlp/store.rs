@@ -677,6 +677,7 @@ mod tests {
     fn run_git<const N: usize>(dir: &Path, args: [&str; N]) {
         let status = Command::new("git")
             .current_dir(dir)
+            .args(["-c", "commit.gpgSign=false"])
             .args(args)
             .status()
             .unwrap();

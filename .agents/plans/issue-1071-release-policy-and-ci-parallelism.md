@@ -20,6 +20,9 @@ The observable result is that `node scripts/release-version.mjs check` succeeds 
 - [x] (2026-07-22 17:23Z) Replaced the serial repository-policy job with a quick gate plus parallel dependency-license and crate-package jobs.
 - [x] (2026-07-22 17:23Z) Started Python and Rust matrices after the same quick gate while keeping each Rust target's clippy and tests together.
 - [x] (2026-07-22 17:28Z) Validated and reviewed the final CI graph, including all local quick-gate commands, crate packaging, YAML parsing, `actionlint`, dependency audits, and diff checks; remote timing is intentionally deferred until an ordinary pushed CI run exists.
+- [x] (2026-07-22 18:33Z) Rebased the two implementation checkpoints onto `origin/master` at `1584751d` and confirmed the branch is exactly two commits ahead with no missing master commits.
+- [x] (2026-07-22 18:33Z) Completed broad local validation: Pi on Node 22.19 and Node 24, VS Code packaging/notices, release policy, dependency licenses, crate packaging, C# and Java fixtures, 1,624 NLP-enabled Rust library tests, 56 Python wheel tests, formatting, and all-target/all-feature Clippy with warnings denied.
+- [x] (2026-07-22 18:33Z) Removed three host-dependent test failures by disabling inherited Git commit signing in temporary repositories and isolating the Voyage sidecar test's `uv` project discovery and cache.
 
 ## Surprises & Discoveries
 
@@ -32,8 +35,14 @@ The observable result is that `node scripts/release-version.mjs check` succeeds 
 - Observation: Python has no artifact or data dependency on Rust despite `needs: rust`.
   Evidence: in successful run `29935145163`, all Python jobs checked out the repository, installed their own toolchain/cache, and started only after the slowest Rust matrix job ended. They added roughly 3 to 6 minutes to the workflow critical path.
 
-- Observation: The broader Pi package suite is not currently runnable under the host's Node 24 even after `npm ci`.
-  Evidence: 47 tests pass, while four unchanged suites fail resolving `@earendil-works/pi-ai/compat` from `@earendil-works/pi-coding-agent`. The release-version integration file itself passes in both the focused run and the broader invocation; CI pins Node 22.
+- Observation: Pi does not require Node 22 for correctness; its declared floor is Node 22.19, while a clean Node 24 install also passes.
+  Evidence: under exact Node 22.19 and host Node 24, `npm run check`, all 112 tests, and the packed-install discovery test pass. The earlier Node 24 failure came from an incomplete install plus a root-owned global npm cache; an isolated cache removed it.
+
+- Observation: Several apparent Rust failures came from host policy rather than nondeterministic source behavior.
+  Evidence: restricted execution denied localhost listener creation, Homebrew's `cargo-clippy` shadowed rustup with a mismatched driver, and macOS PyO3 test linking needs the same `-undefined dynamic_lookup` flags used by CI. Rerunning at the intended boundary produced 1,624 passed library tests and a clean all-feature Clippy run.
+
+- Observation: Three tests genuinely inherited mutable user configuration.
+  Evidence: two temporary Git-repository tests failed when global `commit.gpgSign` was enabled, and the Voyage sidecar timeout test used the host's root-owned `uv` cache and discovered the repository project. Explicit test Git configuration plus an isolated cache, together with `uv run --no-project` for the standalone PEP 723 sidecar, made the full suite green.
 
 - Observation: The system Ruby is 2.6, whose `YAML.load_file` does not accept the newer `aliases:` keyword.
   Evidence: the first generic syntax command failed on that argument; the compatible `YAML.load_file(path)` form parsed every workflow, and pinned `actionlint` 1.7.12 then validated their GitHub Actions semantics.
@@ -62,9 +71,9 @@ The observable result is that `node scripts/release-version.mjs check` succeeds 
 
 ## Outcomes & Retrospective
 
-The release-policy implementation is locally complete. Eleven focused unit and subprocess tests pass; a real repository check, sync idempotence check, and tag/GitHub-output smoke pass; every workflow parses as YAML; the release jobs' direct output dependencies were audited; and `actionlint` 1.7.12 reports no findings. The only broad-suite caveat is the pre-existing Node 24 Pi dependency-resolution failure noted above; the affected release test passes independently and GitHub Actions uses Node 22. Remote release execution is deliberately deferred because these workflows publish artifacts.
+The release-policy implementation is locally complete. Eleven focused unit and subprocess tests pass; a real repository check, sync idempotence check, and tag/GitHub-output smoke pass; every workflow parses as YAML; the release jobs' direct output dependencies were audited; and `actionlint` 1.7.12 reports no findings. Pi's check, 112-test suite, and packed-install test pass under both exact Node 22.19 and host Node 24 when run from a clean install with an isolated npm cache. Remote release execution is deliberately deferred because these workflows publish artifacts.
 
-The CI implementation is also locally complete. `quick-policy` contains only toolchain setup, formatting, the focused release-policy tests, and the read-only repository projection check. Every other CI job directly needs that gate, with Python and Rust becoming eligible at the same point. Dependency licenses and crate packaging are independent jobs; the latter reproduced the real package verification successfully at 8,199,282 bytes against its 10,000,000-byte budget. The matrix definitions, Rust clippy/test grouping, publishing surfaces, credentials, permissions, and Action versions are unchanged. A pinned final `actionlint` run reports no findings, and a programmatic graph audit confirms all non-gate jobs depend directly on `quick-policy`. The next ordinary pushed run will provide the remote wall-clock comparison to the 7-minute-48-second policy baseline and the previous Python tail; no workflow was dispatched from this implementation session.
+The CI implementation is also locally complete. `quick-policy` contains only toolchain setup, formatting, the focused release-policy tests, and the read-only repository projection check. Every other CI job directly needs that gate, with Python and Rust becoming eligible at the same point. Dependency licenses and crate packaging are independent jobs; the latter reproduced the real package verification successfully at 8,199,282 bytes against its 10,000,000-byte budget. The matrix definitions, Rust clippy/test grouping, publishing surfaces, credentials, permissions, and Action versions are unchanged. A pinned final `actionlint` run reports no findings, and a programmatic graph audit confirms all non-gate jobs depend directly on `quick-policy`. Broader validation also passes for the VS Code package/notices, external C# and Java fixtures, 1,624 NLP-enabled Rust library tests, 56 Python wheel tests, and all-target/all-feature Clippy with warnings denied. Temporary-repository and sidecar tests no longer inherit global GPG or cache/project state. The next ordinary pushed run will provide the remote wall-clock comparison to the 7-minute-48-second policy baseline and the previous Python tail; no workflow was dispatched from this implementation session.
 
 ## Context and Orientation
 
@@ -147,3 +156,5 @@ It uses only Node built-ins and introduces no package dependency. Its importable
 `.github/workflows/release-context.yml` accepts `tag: string` and emits `tag: string` plus `version: string`. `.github/workflows/rust-notices.yml` accepts `ref: string` and emits the fixed Actions artifact `rust-third-party-licenses`. Neither reusable workflow accepts secrets or elevates permissions.
 
 Revision note (2026-07-22): Initial implementation-ready plan recorded after live repository, issue, workflow, and Actions timing inspection.
+
+Revision note (2026-07-22): Recorded the post-rebase broad-validation pass, corrected the Node-version diagnosis, and documented test-hermeticity fixes discovered while eliminating local failures.
