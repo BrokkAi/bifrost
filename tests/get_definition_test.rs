@@ -10894,6 +10894,9 @@ export class ErrorBoundary {
         ),
     );
 
+    // With constructor-assigned fields indexed, the reference resolves to
+    // the same-file assignment — and critically NOT to the same-named
+    // class in the other file.
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
@@ -10901,7 +10904,14 @@ export class ErrorBoundary {
         Some(1),
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "z/current.ts", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "z/current.ts",
+        "must not leak to the other file's class: {value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ErrorBoundary.state",
+        "{value}"
+    );
     assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
 }
 

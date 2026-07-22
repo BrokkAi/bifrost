@@ -1853,6 +1853,43 @@ fn mixed_symbol_sources_render_recovery_before_source_bodies() {
     assert!(recovery < source, "{rendered}");
 }
 
+// C# generic types are indexed with arity (`CountingCollection`1`) but
+// users spell them without it; every natural spelling must still resolve
+// (issue #1063).
+#[test]
+fn csharp_generic_type_resolves_without_arity_spelling() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Primitives/CountingCollection.cs",
+            "namespace ScottPlot;\n\npublic class CountingCollection<T> {\n    private readonly List<T> _items = new();\n    public void Add(T item) { _items.Add(item); }\n}\n",
+        )
+        .file("src/App.cs", "namespace App;\n\npublic class App {\n    public void Run() { var c = new ScottPlot.CountingCollection<int>(); }\n}\n")
+        .build();
+
+    for selector in [
+        "CountingCollection",
+        "ScottPlot.CountingCollection",
+        "src/Primitives/CountingCollection.cs#CountingCollection",
+        "ScottPlot.CountingCollection.Add",
+    ] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &format!(r#"{{"symbols":["{selector}"]}}"#),
+        );
+        assert_eq!(
+            0,
+            result["not_found"].as_array().unwrap().len(),
+            "{selector} must resolve: {result}"
+        );
+        assert!(
+            !result["sources"].as_array().unwrap().is_empty()
+                || !result["ambiguous"].as_array().unwrap().is_empty(),
+            "{selector} must produce sources or ambiguity: {result}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `path#terminal` member resolution (issue #1056)
 //
