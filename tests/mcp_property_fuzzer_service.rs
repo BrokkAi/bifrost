@@ -1295,3 +1295,34 @@ fn go_blank_identifiers_are_excluded_from_probing() {
         "blank identifier should be excluded: {summary:?}"
     );
 }
+
+// Module units are named after their file, not a symbol in it; selector
+// spellings for them are the I1(b) module naming convention, not contract
+// checks (the react-hook-form `path#tsx` → no_definition drift shape).
+#[test]
+fn ts_module_units_are_excluded_from_spelling_probes() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/utils.ts",
+            "import { readFileSync } from 'node:fs';\n\nexport function helper(): number {\n  return readFileSync.length;\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("ts"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    let summary = report.probe_summary.as_ref().expect("probe summary");
+    assert!(
+        summary.symbols_excluded_module_spelling > 0,
+        "module unit should be excluded from spelling probes: {summary:?}"
+    );
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}

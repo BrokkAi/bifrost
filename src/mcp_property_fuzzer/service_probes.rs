@@ -284,6 +284,9 @@ pub struct ProbeSummary {
     /// package/module declaration, whose "path" is a convention rather than
     /// a per-file contract.
     pub skipped_module_summary_element: usize,
+    /// I2 probes skipped because the sampled symbol is a module unit, whose
+    /// name is its file, not a selector-resolvable symbol.
+    pub symbols_excluded_module_spelling: usize,
     pub i2_spelling_groups: usize,
     pub i3a_summary_element_checks: usize,
     pub i3b_scan_resolution_checks: usize,
@@ -691,6 +694,13 @@ fn generate_probes(
     if config.invariants.contains(&InvariantKind::I2) {
         for &index in &service_symbols {
             let symbol = &input.symbols[index];
+            // Module units are named after their file, not a symbol in it:
+            // selector-based spelling consistency cannot apply (the I1(b)
+            // module naming convention).
+            if symbol.kind == CodeUnitType::Module {
+                summary.symbols_excluded_module_spelling += 1;
+                continue;
+            }
             let path = input.files[symbol.file_index].path.as_str();
             let spellings = spelling_set(symbol, path);
             for (order, spelling) in spellings.iter().enumerate() {
