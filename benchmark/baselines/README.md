@@ -38,22 +38,23 @@ the same 10 repositories and 76 scenarios. It was checked in by commit
 recorded in the repository.
 
 The issue #920 query-regression baseline is promoted from the complete full
-manual benchmark artifact on July 22, 2026 (`run-20260722T210340Z.json` from
-Actions run 29956839833, Bifrost commit
-`3ed81cc526df464b6b9430da0ffa81cc07e03f59`). The harness had zero scenario
+manual benchmark artifact on July 22, 2026 (`run-20260722T214543Z.json` from
+Actions run 29959610518, Bifrost commit
+`ba488b66a840356ed946f19d2d81e2960c84d7f2`). The harness had zero scenario
 failures across the same 10 repositories and 92 scenarios, including all 16 new
 `query_code` cases with stable result cardinalities and no query diagnostics.
 The artifact also passes strict comparison against itself, including the
-dual-arm first-to-warm retention invariant. The original workflow failed strict
-enforcement because the Dapper workspace query measured 10.32x first-to-warm
-while exceeding the 10x budget by only 11.0 ms, before the comparator applied its
-ordinary 50 ms absolute noise floor. Under the corrected comparator, comparison
-with the preceding #920 candidate reports 16 improvements and one
-existing-scenario Rust definition timing regression after the final master
-integration. This promotion deliberately establishes the reviewed final-head
-post-#920 floor so subsequent strict runs exercise the new query correctness,
-cache-path, and timing contracts instead of treating all 16 cases as absent from
-the baseline.
+dual-arm first-to-warm retention invariant. A provisional artifact from run
+29956839833 was rejected as an unusually fast sample after two current-head
+replays produced 27 and 21 timing flags against it. The promoted artifact has no
+regressions when compared with either the immediately preceding current-head
+artifact from run 29958615453 or the earlier representative artifact from run
+29955662059. The cold-retention comparator also applies its ordinary 50 ms
+absolute noise floor to the 10x ratio gate, retaining the original eager-build
+failure while ignoring 1-11 ms boundary jitter. This promotion deliberately
+establishes the reviewed final-head post-#920 floor so subsequent strict runs
+exercise the new query correctness, cache-path, and timing contracts instead of
+treating all 16 cases as absent from the baseline.
 
 It is not written automatically. Promote it deliberately:
 
