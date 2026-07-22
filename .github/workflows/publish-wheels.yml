@@ -15,69 +15,26 @@ permissions:
   contents: read
 
 jobs:
+  release-context:
+    name: validate release context
+    uses: ./.github/workflows/release-context.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
+
   notices:
     name: generate Rust notices
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.96.0
-
-      - name: Install pinned cargo-about
-        run: cargo install --locked cargo-about --version 0.9.1 --features cli
-
-      - name: Fetch locked dependencies for offline notice report
-        run: cargo fetch --locked
-
-      - name: Generate Rust notice report
-        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
-
-      - name: Upload Rust notice report
-        uses: actions/upload-artifact@v6
-        with:
-          name: rust-third-party-licenses
-          path: dist/THIRD_PARTY_LICENSES.html
-          if-no-files-found: error
-
-  verify-version:
-    name: verify version matches tag
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Verify version is in sync (tag == Cargo.toml, pyproject inherits)
-        shell: bash
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          tag_version="${TAG#v}"
-          # Cargo.toml is the single source of truth; the wheel inherits it via
-          # maturin's dynamic version.
-          crate_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
-          if [ "$tag_version" != "$crate_version" ]; then
-            echo "Tag version $tag_version != Cargo.toml $crate_version" >&2
-            exit 1
-          fi
-          # Guard the single-source invariant: pyproject must NOT hardcode a
-          # version (it would silently override Cargo.toml and re-introduce drift).
-          if grep -qE '^version *=' pyproject.toml; then
-            echo "pyproject.toml declares a hardcoded version; it must use dynamic = [\"version\"]" >&2
-            exit 1
-          fi
-          echo "Version $crate_version matches tag $TAG (pyproject inherits via maturin)"
+    needs: release-context
+    uses: ./.github/workflows/rust-notices.yml
+    with:
+      ref: ${{ needs.release-context.outputs.tag }}
+    permissions:
+      contents: read
 
   build:
     name: build (${{ matrix.target }})
-    needs: [verify-version, notices]
+    needs: [release-context, notices]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -106,7 +63,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download Rust notice report
         uses: actions/download-artifact@v7
@@ -133,13 +90,13 @@ jobs:
 
   sdist:
     name: build sdist
-    needs: [verify-version, notices]
+    needs: [release-context, notices]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download Rust notice report
         uses: actions/download-artifact@v7
@@ -162,7 +119,7 @@ jobs:
 
   publish:
     name: publish to PyPI
-    needs: [verify-version, build, sdist]
+    needs: [release-context, build, sdist]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -184,11 +141,10 @@ jobs:
       - name: Verify built artifacts carry the tagged version
         shell: bash
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          EXPECTED_VERSION: ${{ needs.release-context.outputs.version }}
         run: |
           # Last line of defence: confirm every wheel/sdist about to hit PyPI
           # actually carries the tagged version, whatever maturin resolved.
-          expected="${TAG#v}"
           shopt -s nullglob
           artifacts=(dist/*.whl dist/*.tar.gz)
           if [ ${#artifacts[@]} -eq 0 ]; then
@@ -198,12 +154,12 @@ jobs:
           bad=0
           for f in "${artifacts[@]}"; do
             case "$(basename "$f")" in
-              *-"${expected}"-*|*-"${expected}".tar.gz) ;;
-              *) echo "Artifact $(basename "$f") does not carry version $expected" >&2; bad=1 ;;
+              *-"${EXPECTED_VERSION}"-*|*-"${EXPECTED_VERSION}".tar.gz) ;;
+              *) echo "Artifact $(basename "$f") does not carry version $EXPECTED_VERSION" >&2; bad=1 ;;
             esac
           done
           [ "$bad" -eq 0 ] || exit 1
-          echo "All ${#artifacts[@]} artifacts carry version $expected"
+          echo "All ${#artifacts[@]} artifacts carry version $EXPECTED_VERSION"
 
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

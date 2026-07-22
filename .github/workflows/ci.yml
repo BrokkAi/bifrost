@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  repository-policy:
-    name: repository policy
+  quick-policy:
+    name: quick policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -27,13 +27,36 @@ jobs:
         with:
           node-version: 22
 
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test release policy
+        run: node --test scripts/release-version.test.mjs plugins/bifrost-agent/test/sync-release-version.test.mjs
+
+      - name: Check release metadata projections
+        run: node scripts/release-version.mjs check
+
+  dependency-licenses:
+    name: dependency licenses
+    needs: quick-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
       - name: Install pinned license tools
         run: |
           cargo install --locked cargo-about --version 0.9.1 --features cli
           cargo install --locked cargo-deny --version 0.20.2
-
-      - name: Check formatting
-        run: cargo fmt --check
 
       - name: Check all-feature license policy
         run: cargo deny --config licenses/deny.toml --locked check licenses
@@ -44,8 +67,17 @@ jobs:
           node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
           cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
 
-      - name: Test release scripts
-        run: node --test scripts/check-release-version.test.mjs
+  crate-package:
+    name: crate package
+    needs: quick-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
 
       - name: Check publishable crate
         run: scripts/check-crate-package.sh
@@ -54,6 +86,7 @@ jobs:
   # updates; release packaging repeats the focused launcher tests before upload.
   agent-plugin:
     name: agent plugin (${{ matrix.os }})
+    needs: quick-policy
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -78,6 +111,7 @@ jobs:
   # versioned source with pinned toolchains to reject tampered or malicious test payloads.
   external-fixture:
     name: ${{ matrix.name }} fixture provenance
+    needs: quick-policy
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -113,6 +147,7 @@ jobs:
 
   vscode:
     name: vscode
+    needs: quick-policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -145,6 +180,7 @@ jobs:
 
   pi-package:
     name: Pi package (${{ matrix.os }})
+    needs: quick-policy
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -164,9 +200,6 @@ jobs:
         run: npm ci
         working-directory: plugins/bifrost-agent
 
-      - name: Check release version projections
-        run: node scripts/sync-release-version.mjs --check
-
       - name: Check package
         run: npm run check
         working-directory: plugins/bifrost-agent
@@ -184,6 +217,7 @@ jobs:
 
   rust:
     name: rust (${{ matrix.target }})
+    needs: quick-policy
     runs-on: ${{ matrix.runner }}
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -294,7 +328,7 @@ jobs:
 
   python:
     name: python (${{ matrix.target }})
-    needs: rust
+    needs: quick-policy
     runs-on: ${{ matrix.runner }}
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}

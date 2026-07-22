@@ -12,7 +12,7 @@
 //! The child emits one ready frame (`{"ready":true,"dim":512}`) after model load.
 
 use std::io::{BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -224,7 +224,14 @@ fn spawn_sidecar(
     tokenizer: Arc<Tokenizer>,
     label: String,
 ) -> Result<SingleSidecar, String> {
-    spawn_sidecar_with_timeout(device, tokenizer, label, script_path(), ready_timeout())
+    spawn_sidecar_with_timeout(
+        device,
+        tokenizer,
+        label,
+        script_path(),
+        ready_timeout(),
+        None,
+    )
 }
 
 fn spawn_sidecar_with_timeout(
@@ -233,9 +240,13 @@ fn spawn_sidecar_with_timeout(
     label: String,
     script: PathBuf,
     timeout: Duration,
+    uv_cache_dir: Option<&Path>,
 ) -> Result<SingleSidecar, String> {
     let mut cmd = Command::new("uv");
-    cmd.arg("run").arg(&script);
+    cmd.arg("run").arg("--no-project").arg(&script);
+    if let Some(cache_dir) = uv_cache_dir {
+        cmd.env("UV_CACHE_DIR", cache_dir);
+    }
     cmd.env("CUDA_VISIBLE_DEVICES", device);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -355,6 +366,7 @@ mod tests {
     fn spawn_sidecar_times_out_and_reaps_child() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("sleep_sidecar.py");
+        let uv_cache_dir = dir.path().join("uv-cache");
         let mut file = std::fs::File::create(&script).unwrap();
         writeln!(file, "import time").unwrap();
         writeln!(file, "time.sleep(60)").unwrap();
@@ -365,6 +377,7 @@ mod tests {
             "test-sidecar".to_string(),
             script,
             Duration::from_secs(1),
+            Some(&uv_cache_dir),
         );
         let err = match result {
             Ok(_) => panic!("sleeping sidecar should hit ready timeout"),
