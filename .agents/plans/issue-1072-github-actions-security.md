@@ -19,9 +19,9 @@ The user explicitly does not want Dependabot or Renovate update pull requests. P
 - [x] (2026-07-22 19:42Z) Re-synchronized branch `brokk/issue-1072-harden-github-actions-permissions` to `origin/master` at `38b3bedb` before implementation.
 - [x] (2026-07-22 19:55Z) Resolved and verified the immutable commit corresponding to all nineteen currently selected external Action repositories and recorded readable upstream refs beside every pin.
 - [x] (2026-07-22 19:55Z) Applied least-privilege permissions, credential isolation, Slack secret scoping, privileged-cache removal, setup-node cache disabling, and immutable Action pins across all eight workflows.
-- [ ] Add the local/CI zizmor command, readable-pin policy test, and contributor-facing security documentation.
+- [x] (2026-07-22 20:00Z) Added the pinned local/CI zizmor command, generic readable-pin policy test, early quick-policy gate, and contributor-facing security documentation without an update bot.
 - [x] (2026-07-22 19:55Z) Validated Milestone 1 with zizmor, YAML parsing, release-policy tests, the benchmark workflow policy test, rustfmt, immutable-ref search, and diff checks.
-- [ ] Validate the complete workflow surface and checkpoint each milestone.
+- [x] (2026-07-22 20:00Z) Validated the complete workflow surface and checkpointed both implementation milestones independently.
 - [ ] Run the five guided specialist reviews, triage findings, and prepare the reviewed branch for a pull request.
 
 ## Surprises & Discoveries
@@ -37,6 +37,9 @@ The user explicitly does not want Dependabot or Renovate update pull requests. P
 
 - Observation: `actions/setup-node@v6` may enable package-manager caching without an explicit `cache` input.
   Evidence: its checked-in `action.yml` defines `package-manager-cache: true` by default when a package manager is declared. Publishing and deployment workflows must set that input to false, not merely remove explicit cache lines.
+
+- Observation: Generic YAML loading and zizmor both accepted a duplicated checkout input introduced during the credential-isolation pass, while actionlint rejected it precisely.
+  Evidence: actionlint 1.7.12 identified the duplicate `persist-credentials` key in `docs.yml`; removing the duplicate produced a clean rerun. Keeping actionlint as an independent final check adds useful coverage even though zizmor is the single enforced CI scanner.
 
 ## Decision Log
 
@@ -64,7 +67,9 @@ The user explicitly does not want Dependabot or Renovate update pull requests. P
 
 Milestone 1 is complete. All existing Action dependencies now execute at verified immutable commits; workflows default to read-only permissions; publishing OIDC is scoped to the crate publish job; and checkout credentials, release caches, setup-node caches, the benchmark Slack webhook, and the metadata-push token now follow their narrow trust boundaries. Zizmor reports no medium-or-higher findings, all eight YAML files parse, eleven release-policy tests and two benchmark-policy tests pass, rustfmt is clean, the mutable-ref search prints nothing, and `git diff --check` passes.
 
-The first Rust test attempt exhausted the nearly full local disk during a cold compile. The repository cleanup helper removed only its reviewed older-than-24-hours Bifrost temporary candidates, skipped newer/live/open directories, and freed enough space for the unchanged command to pass. This was an environment limitation rather than a source failure. Milestone 2 and specialist review remain.
+The first Rust test attempt exhausted the nearly full local disk during a cold compile. The repository cleanup helper removed only its reviewed older-than-24-hours Bifrost temporary candidates, skipped newer/live/open directories, and freed enough space for the unchanged command to pass. This was an environment limitation rather than a source failure.
+
+Milestone 2 is complete. `quick-policy` installs pinned uv and executes the offline zizmor audit before downloading Rust or Node toolchains, so workflow-security failures stop the expensive fan-out early. A Node-built-ins-only test independently requires immutable hashes plus readable comments, and `SECURITY.md` documents both checks and the deliberate no-bot update policy. Final validation passes all sixteen Node policy tests, release metadata validation, zizmor with zero medium-or-higher findings, rustfmt, the two benchmark workflow tests, actionlint 1.7.12, all eight YAML parses, immutable-ref search, and diff checks. Specialist review remains.
 
 ## Context and Orientation
 
@@ -168,3 +173,5 @@ These settings are evidence for the branch changes, not permission to mutate rep
 The only new CI dependency is `astral-sh/setup-uv`, itself pinned to a verified full commit with a readable version comment. No updater service, secret, new job, security-events permission, or package manifest entry is introduced.
 
 Revision note (2026-07-22): Initial implementation-ready plan recorded after the live issue diagnosis, user approval of the no-bot policy, current zizmor baseline, and final pre-implementation synchronization with `origin/master`.
+
+Revision note (2026-07-22): Recorded both completed implementation milestones, the actionlint-only duplicate-key finding and fix, complete validation evidence, and the remaining specialist review phase.

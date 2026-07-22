@@ -26,3 +26,23 @@ Please include, where possible:
 - Whether you would like public credit after disclosure
 
 We will review the report, request additional information if necessary, and coordinate remediation and disclosure with you. Please allow time for a fix to be prepared and released before publishing details.
+
+## GitHub Actions Security Policy
+
+Every external `uses:` reference in `.github/workflows/` must use a full, lowercase, 40-character commit SHA followed by a comment naming the reviewed upstream tag or branch. Local actions and reusable workflows beginning with `./` are exempt because their code is part of the same reviewed commit.
+
+Workflows default to `contents: read`. A job may grant write or OIDC permissions only for the publishing or deployment step that requires them. Checkout credentials must not persist between steps, secrets must be scoped to the smallest possible step, and publishing or deployment jobs must not consume writable Actions caches.
+
+Run the enforced security audit locally with:
+
+```bash
+bash scripts/check-github-actions-security.sh
+```
+
+The script runs the pinned zizmor 1.28.0 release offline, requires strict workflow collection, and fails on findings of medium severity or higher. The companion Node test enforces immutable references and readable comments:
+
+```bash
+node --test scripts/github-actions-policy.test.mjs
+```
+
+Action updates are deliberate, reviewed maintenance. Resolve the desired upstream tag in the action's authoritative repository, verify the commit, update both the SHA and its comment, and run both checks. This repository intentionally does not use an automated action-update bot.

@@ -34,7 +34,6 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           fetch-tags: true
-          persist-credentials: false
 
       - name: Resolve docs version
         id: docs_version
