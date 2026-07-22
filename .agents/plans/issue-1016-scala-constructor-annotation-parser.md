@@ -19,6 +19,7 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 - [x] (2026-07-22 12:00Z) Added the vendored MIT notice, byte-compared regenerated notices, passed `cargo deny`, and verified the packaged crate contains and builds the vendored parser snapshot.
 - [x] (2026-07-22 12:00Z) Replayed Chisel's exact `VCSSpec` record with ephemeral cache and confirmed its distinct grammar error remains unchanged.
 - [x] (2026-07-22 12:28Z) Passed the complete all-feature unit/integration suite and coherent-toolchain doc phase, repeated all-feature clippy, and completed the final multi-angle review with no blocking findings.
+- [x] (2026-07-22 12:48Z) Marked the 1.1-million-line vendored parse table as generated and disabled textual diffs for it, keeping reviews and repository language statistics usable without adding release-time generation machinery.
 
 ## Surprises & Discoveries
 
@@ -79,6 +80,10 @@ After this change, the same class is parsed as one complete declaration. `get_sy
 - Decision: Treat a residual Chisel `VCSSpec` truncation as separate follow-up evidence.
   Rationale: It does not use an annotated constructor. This issue must not grow a broad range-repair fallback to hide a distinct grammar failure.
   Date/Author: 2026-07-22 / Codex.
+
+- Decision: Keep the generated `parser.c` checked in, but mark it `linguist-generated=true -diff` in `.gitattributes`.
+  Rationale: The exact upstream file is 32.4 MB in a checkout but compresses to about 1.52 MB. Generating it during Cargo builds or only during release would introduce a pinned tree-sitter CLI and a second build state for a temporary vendor snapshot; generated-file attributes remove review noise while retaining ordinary, reproducible source builds.
+  Date/Author: 2026-07-22 / Codex and user.
 
 ## Outcomes & Retrospective
 
