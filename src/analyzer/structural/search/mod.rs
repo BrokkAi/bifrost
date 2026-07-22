@@ -1172,6 +1172,7 @@ pub(crate) fn execute_code_query_with_access_mode(
     let mut failure = None;
     let detailed = execute_internal_with_strategy(
         analyzer,
+        None,
         query,
         limits,
         None,
