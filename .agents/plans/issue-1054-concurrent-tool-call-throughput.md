@@ -16,7 +16,7 @@ The cap is a stack of five serializers, ranked by measured impact. This plan rem
 
 ## Progress
 
-- [ ] M1 — Store read-connection pool + single-writer routing + statement hygiene.
+- [x] (2026-07-22) M1 — Store read-connection pool + single-writer routing + statement hygiene. `ReaderPool` (readonly WAL connections, lazy checkout, transient over-capacity burst, capacity = available_parallelism) inside `AnalyzerStore`; 44 pure-read methods routed off the writer mutex; ephemeral workspaces moved to delete-on-drop temp-file DBs (with a single-connection fallback path); statement cache 64 on every connection; `read_unit_rows`/`contains_parsed_blob_conn`/`parsed_blob_keys_conn` on `prepare_cached`; ALL 14 `_bulk` IN-list readers plus the cascade-cost VALUES query padded to fixed arity ladders with NULLs (root-cause generalization of the plan's two named sites). Measured at jobs=24 on the baseline repo (cold index, comparable load): CPU 267%→687%, wall 5:02→2:59, get_symbol_sources p50 719ms→60ms (12x), get_definitions p50 1.8s→369ms, scan p50 51.3s→29.4s; get_summaries (n=77) and search_symbols (n=19) regressed modestly — both sit behind the M4 projection-cache and M5 git-subprocess serializers, next in line. Peak RSS 1.4GB→3.0GB (per-connection page caches + real concurrency). Note: `analyzer_persistence` has a PRE-EXISTING load-correlated flake in the warm-* test family (fails 1-3 tests under heavy box load with or without M1; stash-controlled repetition proved independence) — tracked separately.
 - [ ] M2 — Session read-first locking (write lock only when the watcher reports changes).
 - [ ] M3 — Watcher-driven liveness validation (kill the per-call stat storm).
 - [ ] M4 — Cache hygiene: O(1) LRU touch, bigger caps, route handler reads through in-memory sources.
@@ -53,7 +53,12 @@ The cap is a stack of five serializers, ranked by measured impact. This plan rem
 
 ## Outcomes & Retrospective
 
-Nothing yet recorded.
+Baseline captured (2026-07-22, pre-M1 HEAD, local git-initialized copy of oh-my-openagent, fuzzer probe phase `--invariants I2,I3,I5 --max-service-symbols 300 --max-scan-probes 20 --cache-mode persisted`, 2,555 calls; note: moderate background load from concurrent agent builds, treat as indicative — a clean re-run happens before/after M1 integration):
+
+    jobs=1  : 101% CPU, wall 14:04 | p50 sources 15ms, defs 273ms, summaries 146ms, scan 3.2s, search 1.1s
+    jobs=24 : 267% CPU, wall  5:02 | p50 sources 719ms (48x), defs 1.8s (6.6x), summaries 450ms, scan 51.3s (16x), search 4.1s
+
+24x workers bought only 2.8x throughput; under load calls spend ~95% of wall time lock-waiting. Matches the issue's production table shape.
 
 ## Context and Orientation
 

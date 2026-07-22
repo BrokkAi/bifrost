@@ -77,6 +77,12 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-connection prepared-statement cache capacity. rusqlite defaults to 16,
+/// which is far too small for our query surface: `format!`-spliced predicates
+/// and (now fixed-arity) `IN` lists produce dozens of distinct SQL shapes, and
+/// a 16-slot cache thrashes, re-preparing/finalizing hot statements inside the
+/// critical section. 64 covers the observed shape count with headroom.
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 const INITIALIZATION_RETRY_DEADLINE: Duration = BUSY_TIMEOUT;
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -100,6 +106,46 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
         delete_legacy_cache_files(&db_path);
     }
     Ok(conn)
+}
+
+/// Open a read-only connection to an already-initialized cache DB.
+///
+/// The writer connection (`open_unified_connection`) is responsible for
+/// creating the file, running migrations, and establishing WAL mode — all of
+/// which are persistent database properties. A reader therefore opens with
+/// `SQLITE_OPEN_READ_ONLY` (making "a reader cannot write" a hard, SQLite-level
+/// invariant) and applies only the read-relevant pragmas. Under WAL a read-only
+/// connection still reads the writer's committed snapshots as long as the
+/// process can access the `-wal`/`-shm` sidecars, which it can: the same process
+/// created the DB and holds the writer open for the store's lifetime.
+pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
+    ensure_safe_cache_path(db_path)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
+    install_busy_timeout(&conn)?;
+    configure_readonly_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Apply the pragmas that matter for a read-only WAL connection. Deliberately
+/// omits every write/schema-mutating pragma the writer path runs
+/// (`journal_mode`, `auto_vacuum`, `foreign_keys`, `wal_autocheckpoint`,
+/// `synchronous`, …): those are either persistent file properties already
+/// established by the writer or illegal to set on a read-only handle.
+fn configure_readonly_connection(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "cache_size", -65536)
+        .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "mmap_size", 268435456i64)
+        .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
+    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+    Ok(())
 }
 
 fn unified_cache_initialized(conn: &Connection) -> Result<bool> {
@@ -172,6 +218,7 @@ fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> 
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "wal_autocheckpoint", 2000)
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
 }
 
