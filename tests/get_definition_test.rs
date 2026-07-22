@@ -3844,6 +3844,177 @@ fn run() {
 }
 
 #[test]
+fn rust_function_local_dependency_glob_beats_same_named_crate_module_for_scoped_owner() {
+    let source = r#"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_task() {
+        use tokio_test::*;
+
+        let mut task = task::spawn();
+        let _ = &mut task;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tokio\", \"tokio-test\"]\nresolver = \"2\"\n\n[patch.crates-io]\ntokio-test = { path = \"tokio-test\" }\n",
+        )
+        .file(
+            "tokio-test/Cargo.toml",
+            "[package]\nname = \"tokio-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("tokio-test/src/lib.rs", "pub mod task;\n")
+        .file("tokio-test/src/task.rs", "pub fn spawn() {}\n")
+        .file(
+            "tokio/Cargo.toml",
+            "[package]\nname = \"tokio\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dev-dependencies]\ntokio-test = \"0.1.0\"\n",
+        )
+        .file("tokio/src/lib.rs", "pub mod task;\n")
+        .file("tokio/src/task/mod.rs", "pub mod coop;\n")
+        .file("tokio/src/task/coop/mod.rs", source)
+        .build();
+
+    let start = source.find("task::spawn").expect("scoped task reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("tokio/src/task/coop/mod.rs", source, start),
+    );
+    let result = &value["results"][0];
+
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "tokio-test/src/lib.rs",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "tokio-test.src.task",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_current_module_item_beats_glob_import_for_scoped_owner() {
+    let source = r#"
+mod imported {
+    pub mod task {
+        pub fn spawn() {}
+    }
+}
+use imported::*;
+
+mod task {
+    pub fn spawn() {}
+}
+
+fn run() {
+    task::spawn();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", source)
+        .build();
+
+    let start = source.find("task::spawn").expect("scoped task reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.rs", source, start),
+    );
+    let result = &value["results"][0];
+
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "task", "{value}");
+}
+
+#[test]
+fn rust_bare_name_does_not_cross_independent_cargo_example_targets() {
+    let source = "fn use_it(_: Args) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "pub fn library() {}\n")
+        .file("examples/a.rs", source)
+        .file("examples/b.rs", "struct Args;\n")
+        .build();
+
+    let start = source.find("Args").expect("bare type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("examples/a.rs", source, start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_path_module_reference_keeps_the_current_example_declaration_identity() {
+    let first = r#"
+#[path = "shared.rs"]
+mod shared;
+
+fn run() {
+    shared::exercise();
+}
+"#;
+    let second = r#"
+#[path = "shared.rs"]
+mod shared;
+
+fn run() {
+    shared::exercise();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "pub fn library() {}\n")
+        .file("examples/first.rs", first)
+        .file("examples/second.rs", second)
+        .file("examples/shared.rs", "pub fn exercise() {}\n")
+        .build();
+
+    let start = first.find("shared::exercise").expect("module reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("examples/first.rs", first, start),
+    );
+    let result = &value["results"][0];
+
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "examples.shared",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "examples/first.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_glob_import_does_not_resolve_private_name() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("service.rs", "struct Hidden;\n")
@@ -4194,6 +4365,7 @@ fn demo() {
     }
     let _after = range;
 }
+
 "#,
         )
         .build();
@@ -4244,6 +4416,30 @@ fn demo() {
     assert_eq!(
         constructor["results"][0]["definitions"][0]["fqn"], "Some",
         "{constructor}"
+    );
+}
+
+#[test]
+fn rust_scoped_if_let_variant_is_not_a_local_pattern_binding() {
+    let source = r#"
+enum Foo { Bar }
+fn input() -> Foo { Foo::Bar }
+fn demo() {
+    if let Foo::Bar = input() {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+    let reference = source.rfind("Foo::Bar").expect("if-let variant") + "Foo::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, reference),
+    );
+
+    assert_ne!(
+        value["results"][0]["diagnostics"][0]["kind"], "local_binding",
+        "a scoped pattern path is not a local binding: {value}"
     );
 }
 
@@ -4678,6 +4874,124 @@ fn imports() {
 }
 
 #[test]
+fn rust_focused_reexport_module_segment_does_not_collapse_to_terminal_function() {
+    let source = "mod copy;\npub use self::copy::copy;\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"focused-use\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", source)
+        .file("src/copy.rs", "pub fn copy() {}\n")
+        .build();
+    let focused = source
+        .find("copy::copy")
+        .expect("nonterminal module segment");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, focused),
+    );
+    let result = &value["results"][0];
+
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "copy", "{value}");
+}
+
+#[test]
+fn rust_cargo_dependency_kinds_scope_public_forward_resolution() {
+    let library = r#"
+fn normal(_: normal_dep::Shared) {}
+
+#[cfg(test)]
+mod tests {
+    fn development(_: dev_dep::Shared) {}
+}
+
+fn invalid_build(_: build_dep::Shared) {}
+"#;
+    let example = "fn development(_: dev_dep::Shared) {}\n";
+    let build_script =
+        "fn build_only(_: build_dep::Shared) {}\nfn invalid_normal(_: normal_dep::Shared) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\", \"normal\", \"development\", \"build-dep\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "normal/Cargo.toml",
+            "[package]\nname = \"normal-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("normal/src/lib.rs", "pub struct Shared;\n")
+        .file(
+            "development/Cargo.toml",
+            "[package]\nname = \"development-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("development/src/lib.rs", "pub struct Shared;\n")
+        .file(
+            "build-dep/Cargo.toml",
+            "[package]\nname = \"build-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("build-dep/src/lib.rs", "pub struct Shared;\n")
+        .file(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nnormal_dep = { package = \"normal-package\", path = \"../normal\" }\n\n[dev-dependencies]\ndev_dep = { package = \"development-package\", path = \"../development\" }\n\n[build-dependencies]\nbuild_dep = { package = \"build-package\", path = \"../build-dep\" }\n",
+        )
+        .file("app/src/lib.rs", library)
+        .file("app/examples/demo.rs", example)
+        .file("app/build.rs", build_script)
+        .build();
+
+    for (path, source, needle, expected_path) in [
+        (
+            "app/src/lib.rs",
+            library,
+            "normal_dep::Shared",
+            "normal/src/lib.rs",
+        ),
+        (
+            "app/src/lib.rs",
+            library,
+            "dev_dep::Shared",
+            "development/src/lib.rs",
+        ),
+        (
+            "app/examples/demo.rs",
+            example,
+            "dev_dep::Shared",
+            "development/src/lib.rs",
+        ),
+        (
+            "app/build.rs",
+            build_script,
+            "build_dep::Shared",
+            "build-dep/src/lib.rs",
+        ),
+    ] {
+        let start = source.find(needle).expect("reference") + needle.find("Shared").unwrap();
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["path"], expected_path,
+            "{value}"
+        );
+    }
+
+    for (path, source, needle) in [
+        ("app/src/lib.rs", library, "build_dep::Shared"),
+        ("app/build.rs", build_script, "normal_dep::Shared"),
+    ] {
+        let start =
+            source.find(needle).expect("invalid reference") + needle.find("Shared").unwrap();
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        assert_ne!(value["results"][0]["status"], "resolved", "{value}");
+        assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+    }
+}
+
+#[test]
 fn rust_definition_fallback_respects_reference_roles_and_local_bindings() {
     let source = r#"
 macro_rules! local_macro { () => {} }
@@ -4688,9 +5002,12 @@ trait Serializer { type Error; }
 
 mod errors { pub struct Error; }
 use errors::Error;
+use std::sync::atomic::Ordering::*;
 
 struct LocalSerializer;
 impl Serializer for LocalSerializer { type Error = Error; }
+
+struct Acquire { marker: usize }
 
 struct Decoy {
     write: usize,
@@ -4715,6 +5032,7 @@ where
     local_macro!();
     let Item = 1;
     let _ = Item;
+    let _ = Acquire;
     let produced = &root;
     let _ = produced.root;
     let _ = root.root;
@@ -4731,6 +5049,7 @@ where
         "T: Values",
         "writer> Borrowed",
         "let _ = Item",
+        "let _ = Acquire",
         "produced.root",
     ] {
         let start = source.find(marker).expect("reference marker");
@@ -5232,6 +5551,93 @@ fn exercise() {
         result["definitions"][0]["path"], "src/outer/error.rs",
         "{value}"
     );
+}
+
+#[test]
+fn rust_enclosing_inline_module_name_does_not_shadow_extern_prelude_root() {
+    let source = r#"
+mod serde_json {
+    fn exercise(value: &str) {
+        let _ = serde_json::to_string_pretty(value);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+    let external = source
+        .find("serde_json::to_string_pretty")
+        .expect("extern-prelude root");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, external),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_self_scoped_path_keeps_independent_example_target_identity() {
+    let first = r#"
+trait Service { type Future; fn call() -> Self::Future; }
+struct Svc;
+impl Service for Svc {
+    type Future = ();
+    fn call() -> Self::Future { () }
+}
+"#;
+    let second = r#"
+trait Service { type Future; fn call() -> Self::Future; }
+struct Svc;
+impl Service for Svc {
+    type Future = ();
+    fn call() -> Self::Future { () }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"examples\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "examples/Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\n\n[[example]]\nname = \"first\"\npath = \"examples/first.rs\"\n\n[[example]]\nname = \"second\"\npath = \"examples/second.rs\"\n",
+        )
+        .file("examples/src/lib.rs", "pub fn library_marker() {}\n")
+        .file("examples/examples/first.rs", first)
+        .file("examples/examples/second.rs", second)
+        .build();
+    let reference = first.rfind("Self::Future").expect("Self associated type");
+
+    for (start, fqn, kind) in [
+        (reference, "examples.examples.Svc", "class"),
+        (
+            reference + "Self::".len(),
+            "examples.examples.Svc.Future",
+            "field",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("examples/examples/first.rs", first, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().expect("definitions").len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "examples/examples/first.rs",
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["kind"], kind, "{value}");
+    }
 }
 
 #[test]
@@ -5819,6 +6225,52 @@ fn run() {
             "{value}"
         );
     }
+}
+
+#[test]
+fn rust_macro_token_tree_declaration_names_are_not_forward_references() {
+    let source = r#"
+macro_rules! cfg_aio { ($($item:item)*) => { $($item)* }; }
+
+const AIO: usize = 0b0100;
+struct Interest(usize);
+
+impl Interest {
+    cfg_aio! {
+        pub const AIO: Interest = Interest(AIO);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let declaration = source.find("pub const AIO").expect("macro declaration") + "pub const ".len();
+    let declaration_result = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, declaration),
+    );
+    assert_eq!(
+        declaration_result["results"][0]["status"], "no_definition",
+        "a token-tree declaration name is not a forward reference: {declaration_result}"
+    );
+
+    let initializer = source
+        .find("Interest(AIO)")
+        .expect("macro initializer reference")
+        + "Interest(".len();
+    let initializer_result = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, initializer),
+    );
+    assert_eq!(
+        initializer_result["results"][0]["status"], "resolved",
+        "the same-name initializer remains a genuine reference: {initializer_result}"
+    );
+    assert_eq!(
+        initializer_result["results"][0]["definitions"][0]["fqn"], "_module_.AIO",
+        "{initializer_result}"
+    );
 }
 
 #[test]
@@ -7311,6 +7763,383 @@ pub fn run() {
         value["results"][0]["definitions"][0]["path"], "tests/helper.rs",
         "{value}"
     );
+}
+
+#[test]
+fn rust_cargo_example_targets_keep_same_named_types_physically_scoped() {
+    let left = r#"
+struct Shared;
+
+fn consume(_: crate::Shared) {}
+fn imported(_: demo::Shared) {}
+fn library(_: demo::LibraryOnly) {}
+"#;
+    let right = r#"
+pub struct Shared;
+
+fn consume(_: crate::Shared) {}
+fn imported(_: demo::Shared) {}
+fn library(_: demo::LibraryOnly) {}
+"#;
+    let build = r#"
+struct Shared;
+
+fn consume(_: crate::Shared) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "pub struct Shared;\npub struct LibraryOnly;\n",
+        )
+        .file("examples/left.rs", left)
+        .file("examples/right.rs", right)
+        .file("build.rs", build)
+        .build();
+
+    for (path, source) in [
+        ("examples/left.rs", left),
+        ("examples/right.rs", right),
+        ("build.rs", build),
+    ] {
+        let start = source.find("crate::Shared").expect("Shared reference") + "crate::".len();
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], path, "{value}");
+
+        if path == "build.rs" {
+            continue;
+        }
+
+        let imported_start =
+            source.find("demo::Shared").expect("imported reference") + "demo::".len();
+        let value = lookup(
+            project.root(),
+            &location_reference(path, source, imported_start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+
+        let library_start =
+            source.find("demo::LibraryOnly").expect("library reference") + "demo::".len();
+        let value = lookup(
+            project.root(),
+            &location_reference(path, source, library_start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+    }
+}
+
+#[test]
+fn rust_binary_only_explicit_targets_infer_paths_and_isolate_same_named_types() {
+    let left = "struct Shared;\nfn consume(_: crate::Shared) {}\n";
+    let right = "struct Shared;\nfn consume(_: crate::Shared) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nautolib = false\nautobins = false\n\n[[bin]]\nname = \"left\"\n\n[[bin]]\nname = \"right\"\n",
+        )
+        .file("src/bin/left.rs", left)
+        .file("src/bin/right.rs", right)
+        .build();
+
+    for (path, source) in [("src/bin/left.rs", left), ("src/bin/right.rs", right)] {
+        let start = source.find("crate::Shared").expect("Shared reference") + "crate::".len();
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], path, "{value}");
+    }
+}
+
+#[test]
+fn rust_direct_crate_root_recovery_rejects_nested_declarations() {
+    let source = r#"
+mod nested {
+    pub struct NestedType;
+}
+
+struct Host;
+impl Host {
+    fn method_only() {}
+}
+
+fn invalid_type(_: crate::NestedType) {}
+fn invalid_method(_: crate::method_only) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", source)
+        .build();
+
+    for name in ["NestedType", "method_only"] {
+        let needle = format!("crate::{name}");
+        let start = source.find(&needle).expect("crate-root reference") + "crate::".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{name}: {value}");
+        assert!(result["definitions"][0].is_null(), "{name}: {value}");
+    }
+}
+
+#[test]
+fn rust_direct_crate_root_reference_resolves_root_reexport() {
+    let root = "mod nested;\npub use nested::NestedType;\nfn consume(_: crate::NestedType) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", root)
+        .file("src/nested.rs", "pub struct NestedType;\n")
+        .build();
+
+    let start = root
+        .find("crate::NestedType")
+        .expect("crate-root reference")
+        + "crate::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", root, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "src/nested.rs", "{value}");
+}
+
+#[test]
+fn rust_explicit_dependency_route_wins_over_same_fqn_local_targets() {
+    let consumer =
+        "struct Shared;\nfn external(_: dep::Shared) {}\nfn local(_: crate::Shared) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"dep\", \"app\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "dep/Cargo.toml",
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+        )
+        .file("dep/src/lib.rs", "pub struct Shared;\n")
+        .file(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .file("app/src/lib.rs", "pub struct Shared;\n")
+        .file("app/examples/consumer.rs", consumer)
+        .build();
+
+    for (needle, prefix, expected) in [
+        ("dep::Shared", "dep::", "dep/src/lib.rs"),
+        ("crate::Shared", "crate::", "app/examples/consumer.rs"),
+    ] {
+        let start = consumer.find(needle).expect("reference") + prefix.len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/examples/consumer.rs", consumer, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], expected, "{value}");
+    }
+}
+
+#[test]
+fn rust_passthrough_macros_follow_their_physical_cargo_target() {
+    let left = r#"
+macro_rules! configure { (mod $name:ident;) => {} }
+configure! { mod hidden; }
+fn invalid(_: crate::Hidden) {}
+"#;
+    let right = r#"
+macro_rules! configure { ($($item:item)*) => { $($item)* }; }
+configure! { mod generated; }
+fn valid(_: crate::generated::Visible) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nautolib = false\nautobins = false\n\n[[bin]]\nname = \"left\"\n\n[[bin]]\nname = \"right\"\n",
+        )
+        .file("src/bin/left.rs", left)
+        .file("src/bin/right.rs", right)
+        .file("src/bin/hidden.rs", "pub struct Hidden;\n")
+        .file("src/bin/generated.rs", "pub struct Visible;\n")
+        .build();
+
+    let invalid_start = left.find("crate::Hidden").expect("invalid reference") + "crate::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/bin/left.rs", left, invalid_start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_passthrough_macro_routes_reject_mixed_rules_and_scoped_name_collisions() {
+    let source = r#"
+early! { mod early_module; }
+macro_rules! early { ($($item:item)*) => { $($item)* }; }
+macro_rules! mixed {
+    (mod $name:ident;) => {};
+    ($($item:item)*) => { $($item)* };
+}
+macro_rules! dependency_wrapper { ($($item:item)*) => { $($item)* }; }
+
+mixed! { mod swallowed; }
+dependency::dependency_wrapper! { mod scoped; }
+
+fn invalid_mixed(_: crate::Swallowed) {}
+fn invalid_scoped(_: crate::Scoped) {}
+fn invalid_early(_: crate::Early) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", source)
+        .file("src/swallowed.rs", "pub struct Swallowed;\n")
+        .file("src/scoped.rs", "pub struct Scoped;\n")
+        .file("src/early_module.rs", "pub struct Early;\n")
+        .build();
+
+    for name in ["Swallowed", "Scoped", "Early"] {
+        let needle = format!("crate::{name}");
+        let start = source.find(&needle).expect("invalid reference") + "crate::".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+        assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+    }
+}
+
+#[test]
+fn rust_passthrough_macro_target_provenance_reaches_nested_generated_modules() {
+    let root = r#"
+#[macro_use]
+mod macros;
+cfg_items! { mod first; }
+fn valid(_: crate::first::second::Nested) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", root)
+        .file("src/macros/mod.rs", "#[macro_use]\nmod cfg;\n")
+        .file(
+            "src/macros/cfg.rs",
+            "macro_rules! cfg_items { ($($item:item)*) => { $($item)* }; }\n",
+        )
+        .file("src/first.rs", "cfg_items! { pub mod second; }\n")
+        .file("src/first/second.rs", "pub struct Nested;\n")
+        .build();
+
+    let start = root
+        .find("crate::first::second::Nested")
+        .expect("nested reference")
+        + "crate::first::second::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", root, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "src/first/second.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_private_sibling_macro_does_not_authorize_same_target_invocations() {
+    let consumer = r#"
+cfg_items! { mod hidden; }
+fn invalid(_: self::hidden::Hidden) {}
+"#;
+    let before = "too_late! { mod generated; }\nfn invalid(_: self::generated::Generated) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "mod private_macros;\nmod consumer;\nmod before;\nmacro_rules! too_late { ($($item:item)*) => { $($item)* }; }\n",
+        )
+        .file(
+            "src/private_macros.rs",
+            "macro_rules! cfg_items { ($($item:item)*) => { $($item)* }; }\n",
+        )
+        .file("src/consumer.rs", consumer)
+        .file("src/consumer/hidden.rs", "pub struct Hidden;\n")
+        .file("src/before.rs", before)
+        .file("src/before/generated.rs", "pub struct Generated;\n")
+        .build();
+
+    let start = consumer
+        .find("self::hidden::Hidden")
+        .expect("private sibling reference")
+        + "self::hidden::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/consumer.rs", consumer, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+
+    let start = before
+        .find("self::generated::Generated")
+        .expect("early child reference")
+        + "self::generated::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/before.rs", before, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
 }
 
 #[test]

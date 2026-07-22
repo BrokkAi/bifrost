@@ -24,10 +24,11 @@ use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
 pub(crate) use resolver::{
-    RustDefinitionProvider, RustTokenPathRole, resolve_rust_path_fqn,
-    resolve_rust_token_tree_paths, resolve_scoped_associated_item,
+    RustBareTokenTreeRole, RustDefinitionProvider, RustTokenPathRole, lexical_explicit_import_fqn,
+    resolve_rust_path_fqn, resolve_rust_token_tree_paths, resolve_scoped_associated_item,
     resolve_scoped_associated_item_matching, resolve_trait_associated_item,
-    resolve_trait_associated_item_matching,
+    resolve_trait_associated_item_matching, rust_bare_token_tree_non_reference_role,
+    rust_bare_token_tree_role,
 };
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass
@@ -135,7 +136,6 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 scan_files,
                 scan_target,
                 target,
-                &seeds,
                 scan_scope.cancellation(),
             );
             (result.hits, result.unproven_hits)

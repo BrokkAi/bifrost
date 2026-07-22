@@ -10,7 +10,7 @@ use super::RustAnalyzer;
 use super::declarations::rust_package_name;
 use super::imports::{
     RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
-    rust_imports_with_visibility_from_use_declaration,
+    rust_imports_with_visibility_from_use_declaration, rust_item_visibility,
 };
 use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree, visible_import_binder_at};
 
@@ -175,6 +175,29 @@ fn rust_declaration_targets_in_files(
 }
 
 impl RustAnalyzer {
+    pub(crate) fn resolve_visible_import_targets_forward(
+        &self,
+        file: &ProjectFile,
+        binder: &crate::analyzer::usages::ImportBinder,
+        reference: &str,
+    ) -> Vec<(ProjectFile, String)> {
+        let mut targets = self.resolve_imported_export_from_binder_forward(file, binder, reference);
+        for (local_name, binding) in &binder.bindings {
+            if local_name != reference || binding.kind != ImportKind::Named {
+                continue;
+            }
+            let imported = binding.imported_name.as_deref().unwrap_or(reference);
+            targets.extend(
+                self.resolve_module_files(file, &binding.module_specifier)
+                    .into_iter()
+                    .map(|target_file| (target_file, imported.to_string())),
+            );
+        }
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         if let Some(cached) = self.export_indexes.get(file) {
             return (*cached).clone();
@@ -373,13 +396,17 @@ impl RustAnalyzer {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Option<String> {
-        if let Some(package) =
-            super::cargo_routes::resolve_module_package_for_file(importing_file, module_specifier)
+        let package = rust_package_name(importing_file);
+        let crate_package = rust_crate_root_package(importing_file);
+        if is_rooted_rust_module_path(module_specifier) {
+            return resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier);
+        }
+        if let Some(package) = self
+            .cargo_routes()
+            .resolve_module_package(importing_file, module_specifier)
         {
             return Some(package);
         }
-        let package = rust_package_name(importing_file);
-        let crate_package = rust_crate_root_package(importing_file);
         resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
     }
 
@@ -676,23 +703,24 @@ impl RustAnalyzer {
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
         let analyzed_files = self.get_analyzed_files();
-        if let Some(root_file) = self
-            .cargo_routes()
-            .resolve_crate_root_file(importing_file, module_specifier)
+        let package = rust_package_name(importing_file);
+        let crate_package = rust_crate_root_package(importing_file);
+        let rooted = is_rooted_rust_module_path(module_specifier);
+        if !rooted
+            && let Some(root_file) = self
+                .cargo_routes()
+                .resolve_crate_root_file(importing_file, module_specifier)
         {
             return analyzed_files
                 .into_iter()
                 .filter(|file| file == &root_file)
                 .collect();
         }
-        let package = rust_package_name(importing_file);
-        let crate_package = rust_crate_root_package(importing_file);
-        let Some(resolved_module) = self
-            .resolve_module_package(importing_file, module_specifier)
-            .or_else(|| {
-                resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
-            })
-        else {
+        let Some(resolved_module) = (if rooted {
+            resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+        } else {
+            self.resolve_module_package(importing_file, module_specifier)
+        }) else {
             return rust_module_files_from_path(importing_file, module_specifier);
         };
 
@@ -848,12 +876,32 @@ impl RustAnalyzer {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "struct_item")
     }
 
+    pub(crate) fn has_rust_value_constructor(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, source| {
+            rust_value_constructor_visibilities(node, source).is_some()
+        })
+    }
+
     pub(crate) fn is_rust_enum_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "enum_item")
     }
 
+    pub(crate) fn is_rust_const_or_static_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, _source| {
+            matches!(node.kind(), "const_item" | "static_item")
+        })
+    }
+
     pub(crate) fn is_rust_type_alias_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "type_item")
+    }
+
+    pub(crate) fn is_rust_macro_export_declaration(&self, code_unit: &CodeUnit) -> bool {
+        code_unit.is_macro()
+            && self.rust_declaration_node_is(code_unit, |node, source| {
+                node.kind() == "macro_definition"
+                    && rust_item_has_attribute(node, source, "macro_export")
+            })
     }
 
     pub(crate) fn is_rust_public_like_declaration(&self, code_unit: &CodeUnit) -> bool {
@@ -974,7 +1022,7 @@ impl RustAnalyzer {
             .unwrap_or(false)
     }
 
-    fn rust_named_declaration_node<'tree>(
+    pub(super) fn rust_named_declaration_node<'tree>(
         &self,
         code_unit: &CodeUnit,
         root: Node<'tree>,
@@ -1032,6 +1080,67 @@ impl RustAnalyzer {
             RustTraitMemberKind::AssociatedType,
         )
     }
+}
+
+/// The visibility constraints on the value constructor introduced by a tuple
+/// or unit struct. Named-field structs are constructed in the type namespace
+/// and therefore return `None`.
+pub(super) fn rust_value_constructor_visibilities(
+    node: Node<'_>,
+    source: &str,
+) -> Option<Vec<RustVisibility>> {
+    if node.kind() != "struct_item" {
+        return None;
+    }
+
+    let mut visibilities = vec![rust_item_visibility(node, source)];
+    match node.child_by_field_name("body") {
+        None => {}
+        Some(body) if body.kind() == "ordered_field_declaration_list" => {
+            let mut pending_visibility = None;
+            let mut cursor = body.walk();
+            for child in body.named_children(&mut cursor) {
+                match child.kind() {
+                    "attribute_item" => {}
+                    "visibility_modifier" => {
+                        pending_visibility = Some(rust_visibility_modifier(child, source));
+                    }
+                    _ => visibilities
+                        .push(pending_visibility.take().unwrap_or(RustVisibility::Private)),
+                }
+            }
+        }
+        Some(_) => return None,
+    }
+
+    if rust_item_has_attribute(node, source, "non_exhaustive") {
+        visibilities.push(RustVisibility::Crate);
+    }
+    Some(visibilities)
+}
+
+fn rust_visibility_modifier(node: Node<'_>, source: &str) -> RustVisibility {
+    super::imports::rust_visibility_from_modifier(node, source)
+}
+
+fn rust_item_has_attribute(node: Node<'_>, source: &str, expected: &str) -> bool {
+    let mut sibling = node.prev_named_sibling();
+    while let Some(attribute_item) = sibling {
+        if attribute_item.kind() != "attribute_item" {
+            break;
+        }
+        let Some(attribute) = attribute_item.named_child(0) else {
+            break;
+        };
+        let Some(path) = attribute.named_child(0) else {
+            break;
+        };
+        if source.get(path.start_byte()..path.end_byte()) == Some(expected) {
+            return true;
+        }
+        sibling = attribute_item.prev_named_sibling();
+    }
+    false
 }
 
 #[derive(Clone, Copy)]

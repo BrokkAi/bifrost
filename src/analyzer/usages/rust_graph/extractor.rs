@@ -7,7 +7,8 @@ use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_itera
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
     rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    rust_forward_bare_token_reference_fqn, rust_is_type_definition, rust_resolve_type_node_fqn,
+    rust_type_node_definition_candidates_cached,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -17,8 +18,10 @@ use crate::analyzer::usages::rust_graph::hits::{
     record_hit, record_import_hit, record_module_qualified_hits, rust_path_segments,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    is_trait_owner, resolve_exact_owner_associated_item_matching, resolve_rust_path_fqn,
-    rust_token_path_segment_is_qualified, trait_member_for_impl_member,
+    RustBareTokenTreeRole, RustTokenTreeRoleCache, canonical_imported_impl_target,
+    is_graph_visible_member_target, is_trait_owner, resolve_exact_owner_associated_item_matching,
+    resolve_rust_path_fqn, rust_token_path_segment_is_qualified,
+    rust_unique_nominal_reference_namespace, trait_member_for_impl_member,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
@@ -176,8 +179,11 @@ pub(super) fn scan_files_for_target(
             target,
             target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
             target_is_module: target.is_module(),
+            target_is_macro: target.is_macro(),
+            target_is_pattern_value: rust.is_rust_const_or_static_declaration(target),
             direct_names: &direct_names,
             lexical_scope: &lexical_scope,
+            token_tree_roles: RustTokenTreeRoleCache::default(),
             hits: &mut local_hits,
         };
         scan_node(tree.root_node(), &mut ctx);
@@ -204,12 +210,64 @@ pub(super) struct ScanCtx<'a> {
     target: &'a CodeUnit,
     pub(super) target_is_path_qualifier: bool,
     pub(super) target_is_module: bool,
+    target_is_macro: bool,
+    target_is_pattern_value: bool,
     direct_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
+    token_tree_roles: RustTokenTreeRoleCache,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
+    pub(super) fn target_identifier(&self) -> &str {
+        self.target.identifier()
+    }
+
+    pub(super) fn matches_unique_resolved_fqn(&self, fqn: &str) -> bool {
+        if self.target.fq_name() != fqn {
+            return false;
+        }
+        let mut declarations = self.support.fqn(fqn);
+        declarations.sort();
+        declarations.dedup();
+        declarations.len() == 1 && declarations.first() == Some(self.target)
+    }
+
+    pub(super) fn matches_unique_resolved_fqn_in_namespace(
+        &self,
+        fqn: &str,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        if self.target.fq_name() != fqn {
+            return false;
+        }
+        let mut declarations = self
+            .support
+            .fqn(fqn)
+            .into_iter()
+            .filter(|candidate| match namespace {
+                RustReferenceNamespace::Type => {
+                    candidate.is_class() || self.rust.is_type_alias(candidate)
+                }
+                RustReferenceNamespace::Value => {
+                    candidate.is_function()
+                        || candidate.is_field()
+                        || self.rust.has_rust_value_constructor(candidate)
+                }
+                RustReferenceNamespace::Macro => candidate.is_macro(),
+                RustReferenceNamespace::PathPrefix => {
+                    candidate.is_module()
+                        || candidate.is_class()
+                        || self.rust.is_type_alias(candidate)
+                }
+                RustReferenceNamespace::Any => true,
+            })
+            .collect::<Vec<_>>();
+        declarations.sort();
+        declarations.dedup();
+        declarations.len() == 1 && declarations.first() == Some(self.target)
+    }
+
     pub(super) fn matches_identifier(
         &self,
         text: &str,
@@ -220,17 +278,19 @@ impl ScanCtx<'_> {
             return false;
         }
         self.seeds.is_none_or(|seeds| {
-            self.rust
-                .usage_reference_at(
-                    self.file,
-                    seeds,
-                    &[text],
-                    byte,
-                    namespace,
-                    self.lexical_scope.name_bound_at(text, byte)
-                        || self.item_shadows_target(text, byte),
-                )
-                .is_exact()
+            let shadowed = namespace != RustReferenceNamespace::Macro
+                && (self.lexical_scope.name_bound_at(text, byte)
+                    || self.item_shadows_target(text, byte));
+            let resolution = self.rust.usage_reference_at(
+                self.file,
+                seeds,
+                &[text],
+                byte,
+                namespace,
+                shadowed,
+                false,
+            );
+            resolution.is_exact()
         })
     }
 
@@ -240,18 +300,28 @@ impl ScanCtx<'_> {
         byte: usize,
         namespace: RustReferenceNamespace,
         root_shadowed: bool,
+        leading_absolute: bool,
     ) -> bool {
         self.seeds.is_some_and(|seeds| {
-            self.rust
-                .usage_reference_at(self.file, seeds, segments, byte, namespace, root_shadowed)
-                .is_exact()
+            let resolution = self.rust.usage_reference_at(
+                self.file,
+                seeds,
+                segments,
+                byte,
+                namespace,
+                root_shadowed,
+                leading_absolute,
+            );
+            resolution.is_exact()
         })
     }
 
     pub(super) fn path_root_shadowed_at(&self, name: &str, byte: usize) -> bool {
+        // A value binding does not shadow Rust's type/module path namespace:
+        // `fn f(value: T) { value::Serializer::new() }` may still name an
+        // imported `value` module. Item bindings remain namespace-relevant.
         !matches!(name, "crate" | "self" | "super" | "$crate")
-            && (self.lexical_scope.name_bound_at(name, byte)
-                || self.item_shadows_target(name, byte))
+            && self.item_shadows_target(name, byte)
     }
 
     fn item_shadows_target(&self, name: &str, byte: usize) -> bool {
@@ -283,6 +353,9 @@ pub(super) fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace
         ancestor = current.parent();
     }
 
+    if node.kind() == "type_identifier" && rust_type_identifier_is_call_target(node) {
+        return RustReferenceNamespace::Value;
+    }
     if matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
         return RustReferenceNamespace::Type;
     }
@@ -301,6 +374,21 @@ pub(super) fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace
     RustReferenceNamespace::Value
 }
 
+fn rust_type_identifier_is_call_target(node: Node<'_>) -> bool {
+    let mut expression = node;
+    while let Some(parent) = expression.parent()
+        && matches!(parent.kind(), "generic_function" | "generic_type")
+    {
+        expression = parent;
+    }
+    expression.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == expression.id())
+    })
+}
+
 fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
     walk_tree_iterative(
         root,
@@ -311,21 +399,85 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     record_use_import_hits(node, ctx);
                     return TreeWalkAction::Skip;
                 }
+                "macro_invocation" if ctx.target_is_macro => {
+                    record_macro_invocation_hit(node, ctx);
+                    // Macro arguments can themselves contain parsed invocations
+                    // (`wrapper! { target!() }`). Keep walking after recording
+                    // the outer path so nested invocations remain visible.
+                    return TreeWalkAction::Descend;
+                }
                 "identifier" | "type_identifier" if !ctx.target_is_module => {
                     let text = node
                         .utf8_text(ctx.source.as_bytes())
                         .ok()
                         .map(str::trim)
                         .unwrap_or_default();
+                    let in_token_tree = node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "token_tree");
+                    let token_tree_role = ctx.token_tree_roles.role(node, ctx.source);
+                    let token_tree_candidate = token_tree_role.is_reference_candidate()
+                        || (token_tree_role == RustBareTokenTreeRole::Pattern
+                            && ctx.target_is_pattern_value);
+                    let token_tree_namespace = (in_token_tree && token_tree_candidate).then(|| {
+                        if ctx.target_is_macro
+                            && node
+                                .next_sibling()
+                                .is_some_and(|sibling| sibling.kind() == "!")
+                        {
+                            Some(RustReferenceNamespace::Macro)
+                        } else {
+                            rust_unique_nominal_reference_namespace(
+                                ctx.rust,
+                                ctx.support,
+                                &ctx.target.fq_name(),
+                            )
+                        }
+                    });
+                    let namespace = token_tree_namespace
+                        .flatten()
+                        .unwrap_or_else(|| rust_reference_namespace(node));
+                    let token_tree_role_matches = !in_token_tree
+                        || namespace != RustReferenceNamespace::Macro
+                        || node
+                            .next_sibling()
+                            .is_some_and(|sibling| sibling.kind() == "!");
                     let matching_self_type =
                         text == "Self" && self_reference_matches_target(node, ctx);
-                    let matching_identifier = !identifier_is_scoped_path_part(node)
-                        && ctx.matches_identifier(
-                            text,
-                            node.start_byte(),
-                            rust_reference_namespace(node),
-                        )
-                        && !is_shadowed_identifier(text, node, ctx);
+                    let matching_forward_token = token_tree_candidate
+                        && token_tree_namespace.flatten().is_some()
+                        && (namespace == RustReferenceNamespace::Macro
+                            || !ctx.lexical_scope.name_bound_at(text, node.start_byte()))
+                        && if namespace == RustReferenceNamespace::Macro {
+                            ctx.matches_identifier(text, node.start_byte(), namespace)
+                        } else {
+                            rust_forward_bare_token_reference_fqn(
+                                ctx.analyzer,
+                                ctx.rust,
+                                ctx.support,
+                                ctx.file,
+                                ctx.source,
+                                node,
+                                namespace,
+                            )
+                            .is_some_and(|fqn| {
+                                ctx.matches_unique_resolved_fqn_in_namespace(&fqn, namespace)
+                            })
+                        };
+                    // `matches_identifier` has already applied lexical/item shadowing and
+                    // proven the exact seed identity. A second nearest-declaration veto can
+                    // mistake that same declaration for a shadow merely because its range
+                    // differs from this reference site.
+                    let matching_identifier = (!in_token_tree
+                        || token_tree_namespace.flatten().is_some())
+                        && token_tree_role_matches
+                        && !identifier_is_scoped_path_part(node)
+                        && if in_token_tree {
+                            matching_forward_token
+                        } else {
+                            ctx.matches_identifier(text, node.start_byte(), namespace)
+                        }
+                        && !lexical_scope::is_pattern_binding_identifier(node);
                     if matching_self_type || matching_identifier {
                         record_hit(node, ctx);
                     }
@@ -336,6 +488,46 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
         },
         |_| {},
     );
+}
+
+fn record_macro_invocation_hit(invocation: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(macro_path) = invocation.child_by_field_name("macro") else {
+        return;
+    };
+    let Some(path) = rust_path_segments(macro_path) else {
+        return;
+    };
+    let segments = path
+        .iter()
+        .map(|segment| {
+            segment
+                .utf8_text(ctx.source.as_bytes())
+                .ok()
+                .map(str::trim)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return;
+    }
+    let matches = if segments.len() == 1 {
+        ctx.matches_identifier(
+            segments[0],
+            macro_path.start_byte(),
+            RustReferenceNamespace::Macro,
+        )
+    } else {
+        ctx.matches_path(
+            &segments,
+            macro_path.start_byte(),
+            RustReferenceNamespace::Macro,
+            false,
+            crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(macro_path),
+        )
+    };
+    if matches && let Some(name) = path.last() {
+        record_hit(*name, ctx);
+    }
 }
 
 fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
@@ -357,6 +549,27 @@ fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     else {
         return false;
     };
+    if let Some(path) = rust_path_segments(type_node) {
+        let segments = path
+            .iter()
+            .filter_map(|segment| simple_node_text(*segment, ctx.source))
+            .collect::<Vec<_>>();
+        if segments.len() == path.len() {
+            let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+            let root = path[0];
+            let root_name = segment_refs[0];
+            let root_shadowed = ctx.path_root_shadowed_at(root_name, root.start_byte());
+            if ctx.matches_path(
+                &segment_refs,
+                type_node.start_byte(),
+                RustReferenceNamespace::Type,
+                root_shadowed,
+                crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(type_node),
+            ) {
+                return true;
+            }
+        }
+    }
     let resolved = rust_resolve_type_node_fqn(
         ctx.analyzer,
         ctx.support,
@@ -407,23 +620,6 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
     true
 }
 
-fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if lexical_scope::is_pattern_binding_identifier(node)
-        || ctx.lexical_scope.name_bound_at(text, node.start_byte())
-        || ctx.item_shadows_target(text, node.start_byte())
-    {
-        return true;
-    }
-    let start = node.start_byte();
-    let end = node.end_byte();
-    ctx.analyzer
-        .find_nearest_declaration(ctx.file, start, end, text)
-        .is_some_and(|decl| {
-            decl.identifier == text
-                && (decl.range.start_byte != start || decl.range.end_byte != end)
-        })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_member_target(
     analyzer: &dyn IAnalyzer,
@@ -432,7 +628,6 @@ pub(super) fn scan_files_for_member_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     requested_target: &CodeUnit,
-    seeds: &RustBindingSeeds,
     cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
     let Some(owner) = rust
@@ -441,6 +636,9 @@ pub(super) fn scan_files_for_member_target(
     else {
         return RustMemberScanResult::default();
     };
+    let owner = canonical_member_owner(rust, owner);
+    let owner_roots = BTreeSet::from([owner.clone()]);
+    let owner_seeds = rust.usage_binding_seeds(&owner_roots);
     let member_name = target.identifier().to_string();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
@@ -471,7 +669,7 @@ pub(super) fn scan_files_for_member_target(
         let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
-            rust.usage_binding_local_names(file, seeds)
+            rust.usage_binding_local_names(file, &owner_seeds)
         };
         owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
         let trait_owner = is_trait_owner(rust, &owner);
@@ -512,6 +710,11 @@ pub(super) fn scan_files_for_member_target(
         let mut type_lookup_cache = RustTypeLookupCache::default();
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
+        let target_is_enum_variant = requested_target.is_field()
+            && rust
+                .structural_parent_of(requested_target)
+                .or_else(|| rust.parent_of(requested_target))
+                .is_some_and(|owner| rust.is_rust_enum_declaration(&owner));
         let mut ctx = MemberScanCtx {
             analyzer,
             rust,
@@ -526,18 +729,17 @@ pub(super) fn scan_files_for_member_target(
             member_name: &member_name,
             scan_target: target,
             requested_target,
-            seeds,
+            owner_seeds: &owner_seeds,
             target_is_field: requested_target.is_field(),
-            target_is_enum_variant: requested_target.is_field()
-                && rust
-                    .structural_parent_of(requested_target)
-                    .or_else(|| rust.parent_of(requested_target))
-                    .is_some_and(|owner| rust.is_rust_enum_declaration(&owner)),
+            target_is_enum_variant,
+            target_is_pattern_value: target_is_enum_variant
+                || rust.is_rust_const_or_static_declaration(requested_target),
             target_owner_is_trait: trait_owner,
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
             record_unproven_receivers,
             type_lookup_cache: &mut type_lookup_cache,
+            token_tree_roles: RustTokenTreeRoleCache::default(),
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -583,14 +785,16 @@ struct MemberScanCtx<'a> {
     member_name: &'a str,
     scan_target: &'a CodeUnit,
     requested_target: &'a CodeUnit,
-    seeds: &'a RustBindingSeeds,
+    owner_seeds: &'a RustBindingSeeds,
     target_is_field: bool,
     target_is_enum_variant: bool,
+    target_is_pattern_value: bool,
     target_owner_is_trait: bool,
     receiver_names: &'a Vec<String>,
     receiver_type_names: &'a HashSet<String>,
     record_unproven_receivers: bool,
     type_lookup_cache: &'a mut RustTypeLookupCache,
+    token_tree_roles: RustTokenTreeRoleCache,
     hits: &'a mut BTreeSet<UsageHit>,
     unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -609,7 +813,15 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             record_associated_type_binding_hit(node, ctx)
         }
         "tuple_struct_pattern" if ctx.target_is_enum_variant => {
-            record_unqualified_tuple_variant_pattern_hit(node, ctx)
+            record_tuple_variant_pattern_hit(node, ctx)
+        }
+        "identifier"
+            if ctx.target_is_pattern_value
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "token_tree") =>
+        {
+            record_bare_token_tree_variant_pattern_hit(node, ctx)
         }
         "struct_expression" | "struct_pattern" if ctx.target_is_field => {
             record_struct_field_hits(node, ctx)
@@ -668,10 +880,14 @@ fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx
     );
 }
 
-fn record_unqualified_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some(name) = pattern.child_by_field_name("type") else {
         return;
     };
+    if name.kind() == "scoped_identifier" {
+        record_qualified_tuple_variant_pattern_hit(name, ctx);
+        return;
+    }
     if name.kind() != "identifier"
         || simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name)
         || ctx
@@ -684,6 +900,49 @@ fn record_unqualified_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut Mem
         return;
     }
 
+    if unqualified_enum_variant_matches(name, ctx) {
+        record_static_member_name_hit(name, ctx);
+    }
+}
+
+fn record_bare_token_tree_variant_pattern_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    if simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name)
+        || ctx.token_tree_roles.role(name, ctx.source) != RustBareTokenTreeRole::Pattern
+    {
+        return;
+    }
+    let matches = if ctx.target_is_enum_variant {
+        unqualified_enum_variant_matches(name, ctx)
+    } else {
+        exact_forward_pattern_value_matches(name, ctx)
+    };
+    if matches {
+        record_static_member_name_hit(name, ctx);
+    }
+}
+
+fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    let Some(fqn) = rust_forward_bare_token_reference_fqn(
+        ctx.analyzer,
+        ctx.rust,
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        name,
+        RustReferenceNamespace::Value,
+    ) else {
+        return false;
+    };
+    let mut candidates = ctx.support.fqn(&fqn);
+    candidates.sort();
+    candidates.dedup();
+    candidates.len() == 1
+        && candidates.first().is_some_and(|candidate| {
+            same_rust_declaration_identity(candidate, ctx.requested_target)
+        })
+}
+
+fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
     let binder =
         lexical_scope::visible_import_binder_in_tree(ctx.root, ctx.source, name.start_byte());
     let mut candidates = BTreeSet::new();
@@ -691,7 +950,7 @@ fn record_unqualified_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut Mem
         // An explicit binding is authoritative over all glob imports. Only a
         // named enum-variant import can prove this unqualified pattern.
         if binding.kind != ImportKind::Named {
-            return;
+            return false;
         }
         let imported_name = binding.imported_name.as_deref().unwrap_or(ctx.member_name);
         collect_enum_variant_candidates(
@@ -726,13 +985,35 @@ fn record_unqualified_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut Mem
         }
     }
 
-    if candidates.len() == 1
+    candidates.len() == 1
         && candidates.first().is_some_and(|candidate| {
             same_rust_declaration_identity(candidate, ctx.requested_target)
         })
-    {
-        record_static_member_name_hit(name, ctx);
+}
+
+fn record_qualified_tuple_variant_pattern_hit(variant_path: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(name) = variant_path.child_by_field_name("name") else {
+        return;
+    };
+    if simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name) {
+        return;
     }
+    let Some(owner_path) = variant_path.child_by_field_name("path") else {
+        return;
+    };
+    let Some(owner_segments) = rust_path_segments(owner_path) else {
+        return;
+    };
+    let Some(resolved_owner) = exact_ast_owner(&owner_segments, ctx.owner_seeds, ctx) else {
+        return;
+    };
+    let Some(requested_owner) = ctx.rust.canonical_rust_hierarchy_type(ctx.owner.clone()) else {
+        return;
+    };
+    if resolved_owner != requested_owner {
+        return;
+    }
+    record_static_member_name_hit(name, ctx);
 }
 
 fn collect_enum_variant_candidates(
@@ -1103,7 +1384,15 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some((type_node, fields)) = rust_struct_field_references(node) else {
         return;
     };
-    if !resolved_type_matches_owner(type_node, ctx) {
+    let owner_candidates = rust_type_node_definition_candidates_cached(
+        ctx.analyzer,
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        type_node,
+        ctx.type_lookup_cache,
+    );
+    if !type_candidates_match_owner(&owner_candidates, ctx) {
         return;
     }
     for field in fields {
@@ -1401,6 +1690,11 @@ fn enclosing_impl_item(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    if let Some(segments) = rust_path_segments(type_node)
+        && exact_ast_owner(&segments, ctx.owner_seeds, ctx).as_ref() == Some(ctx.owner)
+    {
+        return true;
+    }
     let Some(fqn) = rust_resolve_type_node_fqn(
         ctx.analyzer,
         ctx.support,
@@ -1429,6 +1723,12 @@ fn fqn_matches_owner(
         return false;
     };
     canonical.len() == 1 && canonical.first().is_some_and(|unit| unit == owner)
+}
+
+fn canonical_member_owner(rust: &RustAnalyzer, owner: CodeUnit) -> CodeUnit {
+    let owner = canonical_imported_impl_target(rust, &owner).unwrap_or(owner);
+    rust.canonical_rust_hierarchy_type(owner.clone())
+        .unwrap_or(owner)
 }
 
 fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &mut MemberScanCtx<'_>) -> bool {
@@ -1553,7 +1853,7 @@ fn structured_static_member_matches_target(
     } else {
         CodeUnit::is_function
     };
-    let owner = exact_ast_owner(segments, ctx.seeds, ctx).or_else(|| {
+    let owner = exact_ast_owner(segments, ctx.owner_seeds, ctx).or_else(|| {
         (!ctx.target_owner_is_trait)
             .then(|| exact_type_alias_owner(owner_node, segments, ctx))
             .flatten()
@@ -1576,10 +1876,10 @@ fn structured_static_member_matches_target(
                 .rust
                 .structural_parent_of(candidate)
                 .or_else(|| ctx.rust.parent_of(candidate));
-            let canonical_parent = parent
-                .clone()
-                .and_then(|parent| ctx.rust.canonical_rust_hierarchy_type(parent));
-            let owner_matches = canonical_parent.as_ref() == Some(&owner);
+            let owner_matches = parent
+                .map(|parent| canonical_member_owner(ctx.rust, parent))
+                .as_ref()
+                == Some(&owner);
             name_matches && role_matches && owner_matches
         })
         .cloned()
@@ -1636,24 +1936,21 @@ fn exact_ast_owner(
     let root_name = segment_names.first()?;
     let rooted = matches!(root_name.as_str(), "crate" | "self" | "super");
     let root_shadowed = !rooted
-        && (ctx
+        && ctx
             .lexical_scope
-            .name_bound_at(root_name, root.start_byte())
-            || (ctx
-                .lexical_scope
-                .item_bound_at(root_name, root.start_byte())
-                && !ctx.rust.usage_root_declaration_matches_at(
-                    ctx.file,
-                    seeds,
-                    root_name,
-                    root.start_byte(),
-                )
-                && !ctx.rust.usage_local_module_prefix_visible_at(
-                    ctx.file,
-                    seeds,
-                    root_name,
-                    root.start_byte(),
-                )));
+            .item_bound_at(root_name, root.start_byte())
+        && !ctx.rust.usage_root_declaration_matches_at(
+            ctx.file,
+            seeds,
+            root_name,
+            root.start_byte(),
+        )
+        && !ctx.rust.usage_local_module_prefix_visible_at(
+            ctx.file,
+            seeds,
+            root_name,
+            root.start_byte(),
+        );
     let resolution = ctx.rust.usage_reference_at(
         ctx.file,
         seeds,
@@ -1661,6 +1958,7 @@ fn exact_ast_owner(
         segments.last()?.start_byte(),
         RustReferenceNamespace::Type,
         root_shadowed,
+        crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(*segments.last()?),
     );
     let root = ctx
         .rust
@@ -1751,10 +2049,7 @@ fn associated_candidates_match_target(
             let owner_matches = expected_owner.is_none_or(|expected| {
                 parent.as_ref().is_some_and(|parent| {
                     ctx.rust.is_rust_trait_declaration(parent)
-                        || ctx
-                            .rust
-                            .canonical_rust_hierarchy_type(parent.clone())
-                            .is_some_and(|owner| owner == *expected)
+                        || canonical_member_owner(ctx.rust, parent.clone()) == *expected
                 })
             });
             let mapped_trait = ctx
@@ -1769,16 +2064,25 @@ fn associated_candidates_match_target(
                 .filter(|parent| ctx.rust.is_rust_enum_declaration(parent));
             let visibility_declaration =
                 mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
-            let visible = ctx.rust.usage_declaration_visible_at(
+            let directly_visible = ctx.rust.usage_declaration_visible_at(
                 visibility_declaration,
                 ctx.file,
                 owner_node.start_byte(),
             );
+            let unindexed_trait_impl_visible_through_owner = mapped_trait.is_none()
+                && ctx.rust.is_rust_trait_impl_member_declaration(&candidate)
+                && is_graph_visible_member_target(ctx.rust, &candidate)
+                && parent.as_ref().is_some_and(|owner| {
+                    ctx.rust
+                        .usage_declaration_visible_at(owner, ctx.file, owner_node.start_byte())
+                });
             let identity_matches = same_rust_declaration_identity(&candidate, ctx.requested_target)
                 || mapped_trait.as_ref().is_some_and(|trait_member| {
                     same_rust_declaration_identity(trait_member, ctx.requested_target)
                 });
-            visible && owner_matches && identity_matches
+            (directly_visible || unindexed_trait_impl_visible_through_owner)
+                && owner_matches
+                && identity_matches
         }),
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown

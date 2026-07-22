@@ -32,7 +32,7 @@ pub(crate) use adapter::RustAdapter;
 use cache::{
     weight_code_unit_set, weight_export_index, weight_project_file_set, weight_reference_context,
 };
-use cargo_routes::RustCargoRouteIndex;
+use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use declarations::collect_rust_type_identifiers;
 pub(crate) use field_roles::rust_is_field_declaration_name;
 pub(crate) use imports::rust_focused_use_path;
@@ -105,9 +105,46 @@ impl RustAnalyzer {
         self.cargo_routes
             .get_or_init(|| {
                 let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-                Arc::new(RustCargoRouteIndex::build(&files))
+                Arc::new(RustCargoRouteIndex::build(&files, |file| {
+                    self.prepared_syntax(file)
+                }))
             })
             .clone()
+    }
+
+    pub(crate) fn candidates_in_same_cargo_target_root(
+        &self,
+        file: &ProjectFile,
+        candidates: Vec<CodeUnit>,
+    ) -> Option<Vec<CodeUnit>> {
+        self.cargo_routes()
+            .candidates_in_same_target_root(file, candidates)
+    }
+
+    pub(crate) fn cargo_target_roots_for_file(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        self.cargo_routes().target_roots_for_file(file)
+    }
+
+    pub(crate) fn files_share_cargo_target(
+        &self,
+        left: &ProjectFile,
+        right: &ProjectFile,
+    ) -> Option<bool> {
+        match self.cargo_routes().target_relation(left, right) {
+            RustCargoTargetRelation::Shared => Some(true),
+            RustCargoTargetRelation::Disjoint => Some(false),
+            RustCargoTargetRelation::Unknown => None,
+        }
+    }
+
+    pub(crate) fn candidates_in_cargo_library_route(
+        &self,
+        file: &ProjectFile,
+        route: &str,
+        candidates: Vec<CodeUnit>,
+    ) -> Option<Vec<CodeUnit>> {
+        self.cargo_routes()
+            .candidates_in_library_route(file, route, candidates)
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {

@@ -1,9 +1,10 @@
-use crate::analyzer::rust::RustReferenceNamespace;
+use crate::analyzer::rust::{RustReferenceNamespace, rust_focused_use_path};
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::extractor::{ScanCtx, rust_reference_namespace};
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustTokenPathRole, resolve_rust_token_tree_paths,
+    RustDefinitionProvider, RustTokenPathRole, lexical_explicit_import_fqn,
+    resolve_rust_token_tree_paths, rust_unique_nominal_reference_namespace,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
@@ -16,6 +17,11 @@ pub(super) fn record_module_qualified_hits(root: Node<'_>, ctx: &mut ScanCtx<'_>
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {
                 record_scoped_identifier_hit(node, ctx)
+            }
+            "scoped_use_list" | "use_wildcard"
+                if ctx.target_is_module || ctx.target_is_path_qualifier =>
+            {
+                record_use_tree_prefix_hit(node, ctx)
             }
             "token_tree" => record_token_tree_qualified_hits(node, ctx),
             _ => {}
@@ -39,27 +45,40 @@ fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let namespace = match segment.role {
             RustTokenPathRole::Prefix => RustReferenceNamespace::PathPrefix,
             RustTokenPathRole::Call => RustReferenceNamespace::Value,
-            RustTokenPathRole::Value => RustReferenceNamespace::Any,
+            RustTokenPathRole::Macro => RustReferenceNamespace::Macro,
+            RustTokenPathRole::Value => {
+                let Some(namespace) =
+                    rust_unique_nominal_reference_namespace(ctx.rust, ctx.support, &segment.fqn)
+                else {
+                    continue;
+                };
+                namespace
+            }
         };
+        let root_shadowed = path_root_shadowed(&segment.path, ctx);
         if !segments.is_empty()
-            && ctx.matches_path(
-                &segments,
-                segment.node.start_byte(),
-                namespace,
-                path_root_shadowed(&segment.path, ctx),
-            )
+            && !root_shadowed
+            && (ctx.matches_unique_resolved_fqn_in_namespace(&segment.fqn, namespace)
+                || ctx.matches_path(
+                    &segments,
+                    segment.node.start_byte(),
+                    namespace,
+                    root_shadowed,
+                    false,
+                ))
         {
-            record_target_segment(segment.node, ctx);
+            record_target_segment(segment.node, false, ctx);
         }
     }
 }
 
 fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if has_ancestor_kind(node, "use_declaration") {
+    let in_use_declaration = has_ancestor_kind(node, "use_declaration");
+    if ctx.target_is_module || ctx.target_is_path_qualifier {
+        record_scoped_target_segment_hit(node, in_use_declaration, ctx);
         return;
     }
-    if ctx.target_is_module || ctx.target_is_path_qualifier {
-        record_scoped_target_segment_hit(node, ctx);
+    if in_use_declaration {
         return;
     }
 
@@ -70,12 +89,15 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let segments = path_segment_texts(&path, ctx.source);
+    let root_shadowed = path_root_shadowed(&path, ctx);
     if !ctx.matches_path(
         &segments,
         node.start_byte(),
         rust_reference_namespace(node),
-        path_root_shadowed(&path, ctx),
-    ) {
+        root_shadowed,
+        rust_path_is_leading_absolute(node),
+    ) && (root_shadowed || !structured_path_matches_unique_target(node, ctx))
+    {
         return;
     }
 
@@ -96,39 +118,158 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn record_scoped_target_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_scoped_target_segment_hit(
+    node: Node<'_>,
+    in_use_declaration: bool,
+    ctx: &mut ScanCtx<'_>,
+) {
     let Some(path) = node.child_by_field_name("path") else {
         return;
     };
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
-    let Some(path_segments) = rust_path_segments(path) else {
-        return;
-    };
-    let path_text = path_segment_texts(&path_segments, ctx.source);
-    if ctx.matches_path(
-        &path_text,
-        path.start_byte(),
-        RustReferenceNamespace::PathPrefix,
-        path_root_shadowed(&path_segments, ctx),
-    ) && let Some(segment) = path_segments.last().copied()
-    {
-        record_target_segment(segment, ctx);
+    if in_use_declaration {
+        if focused_use_path_matches(path, RustReferenceNamespace::PathPrefix, ctx) {
+            if let Some(segment) = rust_path_segments(path).and_then(|path| path.last().copied()) {
+                record_target_segment(segment, true, ctx);
+            }
+            // A module can contain an item with the same name as the module itself,
+            // as in `future::maybe_done::miri_tests` importing
+            // `super::maybe_done`. Forward lookup exposes the terminal import token
+            // under the enclosing module identity. Once the structured prefix has
+            // proven that exact module, preserve the same identity for its matching
+            // terminal token without widening unrelated import paths.
+            if ctx.target_is_module && node_text(name, ctx.source) == ctx.target_identifier() {
+                record_target_segment(name, true, ctx);
+            }
+        }
+    } else {
+        let Some(path_segments) = rust_path_segments(path) else {
+            return;
+        };
+        let path_text = path_segment_texts(&path_segments, ctx.source);
+        let root_shadowed = path_root_shadowed(&path_segments, ctx);
+        if (ctx.matches_path(
+            &path_text,
+            path.start_byte(),
+            RustReferenceNamespace::PathPrefix,
+            root_shadowed,
+            rust_path_is_leading_absolute(path),
+        ) || (!root_shadowed && structured_path_matches_unique_target(path, ctx)))
+            && let Some(segment) = path_segments.last().copied()
+        {
+            record_target_segment(segment, false, ctx);
+        }
     }
 
-    let Some(full_segments) = rust_path_segments(node) else {
+    if in_use_declaration {
+        if focused_use_path_matches(node, rust_reference_namespace(node), ctx) {
+            record_target_segment(name, true, ctx);
+        }
+    } else {
+        let Some(full_segments) = rust_path_segments(node) else {
+            return;
+        };
+        let full_text = path_segment_texts(&full_segments, ctx.source);
+        let root_shadowed = path_root_shadowed(&full_segments, ctx);
+        if ctx.matches_path(
+            &full_text,
+            node.start_byte(),
+            rust_reference_namespace(node),
+            root_shadowed,
+            rust_path_is_leading_absolute(node),
+        ) || (!root_shadowed && structured_path_matches_unique_target(node, ctx))
+        {
+            record_target_segment(name, false, ctx);
+        }
+    }
+}
+
+fn structured_path_matches_unique_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    structured_scoped_type_fqn(node, ctx).is_some_and(|fqn| ctx.matches_unique_resolved_fqn(&fqn))
+}
+
+fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    if node.kind() != "scoped_type_identifier"
+        && !(node.kind() == "scoped_identifier" && ctx.target_is_path_qualifier)
+    {
+        return None;
+    }
+    let path = node.child_by_field_name("path")?;
+    let name = node.child_by_field_name("name")?;
+    let owner_fqn = lexical_explicit_import_fqn(ctx.rust, ctx.support, ctx.file, ctx.source, path);
+    if let Some(owner_fqn) = owner_fqn {
+        let owners = ctx
+            .support
+            .fqn(&owner_fqn)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_module() || candidate.is_class() || ctx.rust.is_type_alias(candidate)
+            })
+            .filter(|candidate| {
+                ctx.rust
+                    .usage_declaration_visible_at(candidate, ctx.file, path.start_byte())
+            })
+            .collect::<BTreeSet<_>>();
+        if owners.len() != 1 {
+            return None;
+        }
+        let fqns: BTreeSet<_> = RustDefinitionProvider::members_for_owner_name(
+            ctx.support,
+            &owner_fqn,
+            node_text(name, ctx.source),
+        )
+        .into_iter()
+        .filter(|candidate| {
+            ctx.rust
+                .usage_declaration_visible_at(candidate, ctx.file, name.start_byte())
+        })
+        .map(|candidate| candidate.fq_name())
+        .collect();
+        if fqns.len() == 1 {
+            return fqns.into_iter().next();
+        }
+    }
+    None
+}
+
+fn record_use_tree_prefix_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let path = if node.kind() == "scoped_use_list" {
+        node.child_by_field_name("path")
+    } else {
+        first_named_child(node)
+    };
+    let Some(path) = path else {
         return;
     };
-    let full_text = path_segment_texts(&full_segments, ctx.source);
-    if ctx.matches_path(
-        &full_text,
-        node.start_byte(),
-        rust_reference_namespace(node),
-        path_root_shadowed(&full_segments, ctx),
-    ) {
-        record_target_segment(name, ctx);
+    if focused_use_path_matches(path, RustReferenceNamespace::PathPrefix, ctx)
+        && let Some(segment) = rust_path_segments(path).and_then(|path| path.last().copied())
+    {
+        record_target_segment(segment, true, ctx);
     }
+}
+
+fn focused_use_path_matches(
+    focused: Node<'_>,
+    namespace: RustReferenceNamespace,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    let Some(path) = rust_focused_use_path(focused, ctx.source) else {
+        return false;
+    };
+    let segments = path.segments.iter().map(String::as_str).collect::<Vec<_>>();
+    ctx.matches_path(
+        &segments,
+        focused.start_byte(),
+        namespace,
+        ctx.path_root_shadowed_at(node_text(path.root, ctx.source), path.root.start_byte()),
+        // A focused node inside `use ::dep::{nested::Item}` stops at the
+        // enclosing `scoped_use_list`, so walking upward from `focused` loses
+        // the leading `::`. The reconstructed path's root is the outer `dep`
+        // path and still carries that syntax.
+        rust_path_is_leading_absolute(path.root),
+    )
 }
 
 pub(super) fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
@@ -137,7 +278,13 @@ pub(super) fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {
                 reversed.push(node.child_by_field_name("name")?);
-                node = node.child_by_field_name("path")?;
+                let Some(path) = node.child_by_field_name("path") else {
+                    if node.child(0).is_some_and(|child| child.kind() == "::") {
+                        break;
+                    }
+                    return None;
+                };
+                node = path;
             }
             "generic_type" => node = node.child_by_field_name("type")?,
             "generic_function" => node = node.child_by_field_name("function")?,
@@ -150,6 +297,41 @@ pub(super) fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
     }
     reversed.reverse();
     Some(reversed)
+}
+
+pub(super) fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent()
+        && matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier" | "generic_type" | "generic_function"
+        )
+    {
+        node = parent;
+    }
+    loop {
+        match node.kind() {
+            "generic_type" => {
+                let Some(inner) = node.child_by_field_name("type") else {
+                    return false;
+                };
+                node = inner;
+            }
+            "generic_function" => {
+                let Some(inner) = node.child_by_field_name("function") else {
+                    return false;
+                };
+                node = inner;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(path) = node.child_by_field_name("path") {
+                    node = path;
+                } else {
+                    return node.child(0).is_some_and(|child| child.kind() == "::");
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn path_segment_texts<'a>(path: &[Node<'_>], source: &'a str) -> Vec<&'a str> {
@@ -172,7 +354,11 @@ fn path_root_shadowed(path: &[Node<'_>], ctx: &ScanCtx<'_>) -> bool {
     })
 }
 
-fn record_target_segment(segment: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_target_segment(segment: Node<'_>, in_use_declaration: bool, ctx: &mut ScanCtx<'_>) {
+    if in_use_declaration {
+        record_import_hit(segment, ctx);
+        return;
+    }
     let start = segment.start_byte();
     let end = segment.end_byte();
     if let Some(enclosing) =
@@ -205,6 +391,11 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
         .trim()
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
 }
 
 pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

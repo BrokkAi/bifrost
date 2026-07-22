@@ -61,10 +61,11 @@ fn authoritative_hits(
     target: CodeUnit,
     candidates: HashSet<brokk_bifrost::ProjectFile>,
 ) -> BTreeSet<UsageHit> {
+    let max_files = candidates.len();
     let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
     match UsageFinder::new()
         .with_authoritative_scope(true)
-        .query_with_provider(analyzer, &[target], Some(&provider), 1, 100)
+        .query_with_provider(analyzer, &[target], Some(&provider), max_files, 100)
         .result
     {
         FuzzyResult::Success {
@@ -72,6 +73,192 @@ fn authoritative_hits(
         } => hits_by_overload.into_values().flatten().collect(),
         other => panic!("expected authoritative Rust usage success, got {other:#?}"),
     }
+}
+
+#[test]
+fn inverse_rust_associated_member_uses_physical_owner_beneath_reexport() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"owner-seed\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "mod ready;\npub use ready::Ready;\nmod consumer;\n",
+        )
+        .file(
+            "src/ready.rs",
+            "pub struct Ready(usize);\nimpl Ready { pub(crate) fn from_usize(value: usize) -> Self { Self(value) } }\n",
+        )
+        .file(
+            "src/consumer.rs",
+            "use crate::ready::Ready;\nfn make() { let _ = Ready::from_usize(1); }\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .exact_member(&project.file("src/ready.rs"), "Ready", "from_usize", true)
+        .expect("Ready::from_usize declaration");
+    let found = authoritative_hits(
+        &analyzer,
+        target,
+        [project.file("src/consumer.rs")].into_iter().collect(),
+    );
+    let source = "use crate::ready::Ready;\nfn make() { let _ = Ready::from_usize(1); }\n";
+    let start = source.find("from_usize").expect("associated call");
+
+    assert!(
+        found.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && (hit.start_offset, hit.end_offset) == (start, start + "from_usize".len())
+        }),
+        "a public reexport must not replace the physical associated owner seed: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_preserves_external_module_visibility_through_item_macro_routes() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"macro-modules\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "macro_rules! cfg_item { ($($item:item)*) => { $(#[cfg(any())] $item)* }; }\nmod parent { cfg_item! { pub(crate) mod child; mod hidden; } }\nmod consumer;\nmod outsider;\nmod outsider_two;\n",
+        )
+        .file("src/parent/child.rs", "pub(crate) const TARGET: usize = 1;\n")
+        .file("src/parent/hidden.rs", "pub(crate) const HIDDEN: usize = 2;\n")
+        .file(
+            "src/consumer.rs",
+            "mod nested { use crate::parent::child::TARGET; fn value() { let _ = TARGET; } }\n",
+        )
+        .file(
+            "src/outsider.rs",
+            "fn values() { let _ = crate::parent::child::TARGET; let _ = crate::parent::hidden::HIDDEN; }\n",
+        )
+        .file(
+            "src/outsider_two.rs",
+            "fn values() { let _ = crate::parent::child::TARGET; let _ = crate::parent::hidden::HIDDEN; }\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition_in_file(&analyzer, &project.file("src/parent/child.rs"), "TARGET");
+    for candidate in ["src/outsider.rs", "src/outsider_two.rs"] {
+        let target_hits = authoritative_hits(
+            &analyzer,
+            target.clone(),
+            [project.file(candidate)].into_iter().collect(),
+        );
+        assert_eq!(
+            1,
+            target_hits.len(),
+            "pub(crate) module visibility must survive the proven item-macro route in {candidate}: {target_hits:#?}"
+        );
+    }
+    let nested_hits = authoritative_hits(
+        &analyzer,
+        target,
+        [project.file("src/consumer.rs")].into_iter().collect(),
+    );
+    assert_eq!(
+        2,
+        nested_hits.len(),
+        "an import owned by an inline module must retain the exact physical target: {nested_hits:#?}"
+    );
+    assert!(nested_hits.iter().any(|hit| hit.start_offset == 68));
+
+    let hidden = definition_in_file(&analyzer, &project.file("src/parent/hidden.rs"), "HIDDEN");
+    for candidate in ["src/outsider.rs", "src/outsider_two.rs"] {
+        let hidden_hits = authoritative_hits(
+            &analyzer,
+            hidden.clone(),
+            [project.file(candidate)].into_iter().collect(),
+        );
+        assert!(
+            hidden_hits.is_empty(),
+            "a private macro-routed module must remain inaccessible in {candidate}: {hidden_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn inverse_rust_resolves_descendants_through_imported_module_aliases() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"module-alias\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "pub(crate) mod util;\nmod consumer;\n")
+        .file("src/util/mod.rs", "pub(crate) mod time;\n")
+        .file(
+            "src/util/time.rs",
+            "pub(crate) fn next_expiration_time() {}\n",
+        )
+        .file(
+            "src/consumer.rs",
+            "use crate::util;\nfn call() { util::time::next_expiration_time(); }\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition_in_file(
+        &analyzer,
+        &project.file("src/util/time.rs"),
+        "next_expiration_time",
+    );
+    let found = authoritative_hits(
+        &analyzer,
+        target,
+        [project.file("src/consumer.rs")].into_iter().collect(),
+    );
+    let source = "use crate::util;\nfn call() { util::time::next_expiration_time(); }\n";
+    let start = source
+        .rfind("next_expiration_time")
+        .expect("qualified call");
+
+    assert!(found.iter().any(|hit| {
+        hit.file == project.file("src/consumer.rs")
+            && (hit.start_offset, hit.end_offset) == (start, start + "next_expiration_time".len())
+    }));
+}
+
+#[test]
+fn inverse_rust_macro_export_crosses_own_library_example_boundary() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"own-macros\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "#[macro_export]\nmacro_rules! exported_dbg { () => {} }\nmacro_rules! private_dbg { () => {} }\n",
+        )
+        .file(
+            "examples/demo.rs",
+            "use own_macros::{exported_dbg, private_dbg};\nfn main() { exported_dbg!(); private_dbg!(); }\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let candidate: HashSet<brokk_bifrost::ProjectFile> =
+        [project.file("examples/demo.rs")].into_iter().collect();
+
+    let exported = definition_in_file(&analyzer, &project.file("src/lib.rs"), "exported_dbg");
+    let exported_hits = authoritative_hits(&analyzer, exported, candidate.clone());
+    let example = "use own_macros::{exported_dbg, private_dbg};\nfn main() { exported_dbg!(); private_dbg!(); }\n";
+    let exported_call = example.find("exported_dbg!").expect("exported call");
+    assert!(
+        exported_hits
+            .iter()
+            .any(|hit| hit.start_offset == exported_call),
+        "macro_export must be public to the package example target: {exported_hits:#?}"
+    );
+
+    let private = definition_in_file(&analyzer, &project.file("src/lib.rs"), "private_dbg");
+    let private_hits = authoritative_hits(&analyzer, private, candidate);
+    assert!(
+        private_hits.is_empty(),
+        "an unexported macro must not cross into the package example target: {private_hits:#?}"
+    );
 }
 
 #[test]

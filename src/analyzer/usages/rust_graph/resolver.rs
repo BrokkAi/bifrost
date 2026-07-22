@@ -4,9 +4,9 @@ use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
     RustReferenceContext, TypeHierarchyProvider,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
 ///
@@ -60,6 +60,7 @@ pub(crate) enum RustTokenPathRole {
     Prefix,
     Value,
     Call,
+    Macro,
 }
 
 pub(crate) struct ResolvedRustTokenPathSegment<'tree> {
@@ -121,6 +122,11 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
                 RustTokenPathRole::Prefix
             } else if children
                 .get(segment_index + 1)
+                .is_some_and(|bang| bang.kind() == "!")
+            {
+                RustTokenPathRole::Macro
+            } else if children
+                .get(segment_index + 1)
                 .is_some_and(rust_token_call_arguments)
             {
                 RustTokenPathRole::Call
@@ -128,22 +134,37 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
                 RustTokenPathRole::Value
             };
 
-            let macro_call = !continues
-                && children
-                    .get(segment_index + 1)
-                    .is_some_and(|bang| bang.kind() == "!")
-                && children
-                    .get(segment_index + 2)
-                    .is_some_and(|arguments| arguments.kind() == "token_tree");
-            let fqn = if dollar_crate_root && macro_call {
-                None
-            } else if dollar_crate_root {
+            let fqn = if dollar_crate_root {
                 if segment_index == index {
                     None
                 } else {
-                    dollar_crate_owner.as_deref().and_then(|owner| {
-                        resolve_direct_token_path_child(support, source, owner, segment)
-                    })
+                    let normalized_path = path
+                        .iter()
+                        .filter_map(|node| {
+                            if rust_token_is_dollar_crate(*node, source) {
+                                Some("crate")
+                            } else {
+                                source
+                                    .get(node.start_byte()..node.end_byte())
+                                    .map(str::trim)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    resolve_rust_path_fqn(rust, refs, file, &normalized_path)
+                        .filter(|fqn| !support.fqn(fqn).is_empty())
+                        .or_else(|| {
+                            (path.len() == 2).then(|| {
+                                resolve_crate_exported_token_path_child(
+                                    rust, support, file, source, segment,
+                                )
+                            })?
+                        })
+                        .or_else(|| {
+                            dollar_crate_owner.as_deref().and_then(|owner| {
+                                resolve_direct_token_path_child(support, source, owner, segment)
+                            })
+                        })
                 }
             } else {
                 resolve_token_path_segment_fqn(
@@ -177,6 +198,23 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
         }
     }
     resolved
+}
+
+fn resolve_crate_exported_token_path_child(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    segment: Node<'_>,
+) -> Option<String> {
+    let name = source.get(segment.start_byte()..segment.end_byte())?;
+    let fqns = rust
+        .usage_crate_export_targets(file, name)
+        .into_iter()
+        .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
+        .map(|candidate| candidate.fq_name())
+        .collect::<BTreeSet<_>>();
+    (fqns.len() == 1).then(|| fqns.into_iter().next()).flatten()
 }
 
 fn resolve_direct_token_path_child(
@@ -237,6 +275,19 @@ fn resolve_token_path_segment_fqn(
             return fqns.into_iter().next();
         }
     }
+    // Resolve the written owner first, then select its written child. This keeps
+    // aliases as their own declaration identity instead of allowing the full
+    // type path resolver to canonicalize `module::Alias` to the aliased type.
+    if let Some(owner_fqn) = resolve_rust_path_fqn(rust, refs, file, owner) {
+        let fqns: BTreeSet<_> = support
+            .members_for_owner_name(&owner_fqn, name)
+            .into_iter()
+            .map(|candidate| candidate.fq_name())
+            .collect();
+        if fqns.len() == 1 {
+            return fqns.into_iter().next();
+        }
+    }
     let full_path = source.get(root.start_byte()..segment.end_byte())?.trim();
     if let Some(fqn) = resolve_rust_path_fqn(rust, refs, file, full_path)
         && !support.fqn(&fqn).is_empty()
@@ -264,7 +315,24 @@ fn resolve_token_path_segment_fqn(
     }
 }
 
-fn lexical_import_fqn(
+pub(crate) fn lexical_import_fqn(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    segment: Node<'_>,
+) -> Option<String> {
+    let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
+    lexical_explicit_import_fqn(rust, support, file, source, segment).or_else(|| {
+        let forward = rust.forward_reference_context_of(file);
+        forward
+            .resolve_bare(name)
+            .filter(|fqn| !support.fqn(fqn).is_empty())
+            .map(str::to_string)
+    })
+}
+
+pub(crate) fn lexical_explicit_import_fqn(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
@@ -281,13 +349,47 @@ fn lexical_import_fqn(
         .resolve_imported_export_from_binder_forward(file, &binder, name)
         .into_iter()
         .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
+        .filter(|candidate| {
+            candidate.is_module() || candidate.is_class() || rust.is_type_alias(candidate)
+        })
         .map(|candidate| candidate.fq_name())
         .collect();
     if fqns.len() == 1 {
-        fqns.into_iter().next()
-    } else {
-        None
+        return fqns.into_iter().next();
     }
+    let mut pending = rust.resolve_visible_import_targets_forward(file, &binder, name);
+    let mut visited = HashSet::default();
+    let mut imported_fqns = BTreeSet::new();
+    while let Some((target_file, target_name)) = pending.pop() {
+        if !visited.insert((target_file.clone(), target_name.clone())) {
+            continue;
+        }
+        let direct = support
+            .file_identifier(&target_file, &target_name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_module() || candidate.is_class() || rust.is_type_alias(candidate)
+            })
+            .collect::<Vec<_>>();
+        if !direct.is_empty() {
+            imported_fqns.extend(direct.into_iter().map(|candidate| candidate.fq_name()));
+            continue;
+        }
+        let Ok(target_source) = target_file.read_to_string() else {
+            continue;
+        };
+        let target_binder =
+            lexical_scope::visible_import_binder_at(&target_source, target_source.len());
+        pending.extend(rust.resolve_visible_import_targets_forward(
+            &target_file,
+            &target_binder,
+            &target_name,
+        ));
+    }
+    if imported_fqns.len() == 1 {
+        return imported_fqns.into_iter().next();
+    }
+    None
 }
 
 fn rust_token_path_segment(node: Node<'_>) -> bool {
@@ -322,6 +424,315 @@ pub(crate) fn rust_token_path_segment_is_qualified(node: Node<'_>) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RustBareTokenTreeRole {
+    Reference,
+    TypeReference,
+    Pattern,
+    Binding,
+    Declaration,
+}
+
+impl RustBareTokenTreeRole {
+    pub(crate) fn is_reference_candidate(self) -> bool {
+        matches!(self, Self::Reference | Self::TypeReference)
+    }
+}
+
+/// Per-file cache of roles projected from reparsed macro token trees.
+///
+/// The inverse and forward usage scans can visit every raw identifier in a
+/// token tree. Cache the complete projection on the first visit so each nearest
+/// or enclosing token tree is parsed at most once per scan rather than once per
+/// identifier. Enclosing groups supply context such as `match { pattern => }`,
+/// while a nested macro's nearest group supplies its closure-parameter roles.
+#[derive(Default)]
+pub(crate) struct RustTokenTreeRoleCache {
+    roles: HashMap<(usize, usize), HashMap<(usize, usize), RustBareTokenTreeRole>>,
+}
+
+impl RustTokenTreeRoleCache {
+    pub(crate) fn role(&mut self, node: Node<'_>, source: &str) -> RustBareTokenTreeRole {
+        if !rust_bare_token_tree_identifier(node) {
+            return RustBareTokenTreeRole::Reference;
+        }
+        let Some(mut token_tree) = direct_token_tree(node) else {
+            return RustBareTokenTreeRole::Reference;
+        };
+        loop {
+            let tree_key = (token_tree.start_byte(), token_tree.end_byte());
+            self.roles
+                .entry(tree_key)
+                .or_insert_with(|| parse_token_tree_roles(token_tree, source).unwrap_or_default());
+            if let Some(role) = self
+                .roles
+                .get(&tree_key)
+                .and_then(|roles| roles.get(&(node.start_byte(), node.end_byte())))
+                .copied()
+                && role != RustBareTokenTreeRole::Reference
+            {
+                return role;
+            }
+            let Some(enclosing) = enclosing_token_tree(token_tree) else {
+                break;
+            };
+            token_tree = enclosing;
+        }
+        direct_token_tree_role(node)
+    }
+}
+
+/// Classify a bare identifier represented directly by a macro token tree.
+///
+/// Tree-sitter intentionally leaves macro input as raw tokens. For the few
+/// spellings whose sibling punctuation is ambiguous (`as`, `=>`, and `|`),
+/// parse the enclosing token-tree fragment with the Rust grammar and project
+/// the original byte range into that tree. This distinguishes cast types from
+/// import aliases, unit variants from match bindings, closure parameters from
+/// bitwise operands, and declaration names from their referenced types without
+/// a source-text mini-parser or delimiter scan.
+pub(crate) fn rust_bare_token_tree_role(node: Node<'_>, source: &str) -> RustBareTokenTreeRole {
+    RustTokenTreeRoleCache::default().role(node, source)
+}
+
+fn direct_token_tree_role(node: Node<'_>) -> RustBareTokenTreeRole {
+    let previous = node.prev_sibling();
+    let next = node.next_sibling();
+    if previous.is_some_and(|token| {
+        matches!(
+            token.kind(),
+            "$" | "'"
+                | "label"
+                | "struct"
+                | "enum"
+                | "union"
+                | "trait"
+                | "type"
+                | "fn"
+                | "mod"
+                | "const"
+                | "static"
+                | "let"
+        )
+    }) {
+        return RustBareTokenTreeRole::Declaration;
+    }
+    if next.is_some_and(|token| matches!(token.kind(), ":" | "label")) {
+        return RustBareTokenTreeRole::Binding;
+    }
+    RustBareTokenTreeRole::Reference
+}
+
+pub(crate) fn rust_bare_token_tree_non_reference_role(node: Node<'_>, source: &str) -> bool {
+    matches!(
+        rust_bare_token_tree_role(node, source),
+        RustBareTokenTreeRole::Binding | RustBareTokenTreeRole::Declaration
+    )
+}
+
+fn rust_bare_token_tree_identifier(node: Node<'_>) -> bool {
+    matches!(node.kind(), "identifier" | "type_identifier")
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "token_tree")
+        && !rust_token_path_segment_is_qualified(node)
+}
+
+fn direct_token_tree(node: Node<'_>) -> Option<Node<'_>> {
+    node.parent().filter(|parent| parent.kind() == "token_tree")
+}
+
+fn enclosing_token_tree(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "token_tree" {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn parse_token_tree_roles(
+    token_tree: Node<'_>,
+    source: &str,
+) -> Option<HashMap<(usize, usize), RustBareTokenTreeRole>> {
+    let open = token_tree.child(0)?;
+    let close = token_tree.child(token_tree.child_count().checked_sub(1)?)?;
+    if !matches!(open.kind(), "(" | "[" | "{") || !matches!(close.kind(), ")" | "]" | "}") {
+        return None;
+    }
+    let fragment = source.get(open.end_byte()..close.start_byte())?;
+    let tree = lexical_scope::parse_rust_tree(fragment)?;
+    let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), fragment);
+    let mut roles = HashMap::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(parsed) = stack.pop() {
+        if matches!(parsed.kind(), "identifier" | "type_identifier") {
+            let role = parsed_identifier_role(parsed, fragment, &lexical_scope);
+            roles.insert(
+                (
+                    open.end_byte() + parsed.start_byte(),
+                    open.end_byte() + parsed.end_byte(),
+                ),
+                role,
+            );
+        }
+        for index in (0..parsed.named_child_count()).rev() {
+            if let Some(child) = parsed.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(roles)
+}
+
+fn parsed_identifier_role(
+    parsed: Node<'_>,
+    fragment: &str,
+    lexical_scope: &RustLexicalScopeIndex,
+) -> RustBareTokenTreeRole {
+    if parsed_identifier_is_declaration(parsed) {
+        return RustBareTokenTreeRole::Declaration;
+    }
+    if parsed_identifier_is_direct_pattern(parsed) {
+        return RustBareTokenTreeRole::Pattern;
+    }
+    if lexical_scope::is_pattern_binding_identifier(parsed) {
+        return RustBareTokenTreeRole::Binding;
+    }
+    if parsed_identifier_is_shadowed_by_closure_binding(parsed, fragment) {
+        return RustBareTokenTreeRole::Binding;
+    }
+    if parsed.kind() == "type_identifier" {
+        return RustBareTokenTreeRole::TypeReference;
+    }
+    let name = fragment
+        .get(parsed.start_byte()..parsed.end_byte())
+        .unwrap_or_default();
+    if lexical_scope.name_bound_at(name, parsed.start_byte()) {
+        return RustBareTokenTreeRole::Binding;
+    }
+    RustBareTokenTreeRole::Reference
+}
+
+fn parsed_identifier_is_declaration(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() == "use_as_clause"
+        && parent
+            .child_by_field_name("alias")
+            .is_some_and(|alias| alias.id() == node.id())
+    {
+        return true;
+    }
+    matches!(
+        parent.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "type_item"
+            | "mod_item"
+            | "const_item"
+            | "static_item"
+            | "field_declaration"
+            | "enum_variant"
+            | "macro_definition"
+            | "type_parameter"
+            | "const_parameter"
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id())
+}
+
+fn parsed_identifier_is_shadowed_by_closure_binding(node: Node<'_>, source: &str) -> bool {
+    let Some(name) = source.get(node.start_byte()..node.end_byte()) else {
+        return false;
+    };
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        // A token-tree fragment containing only a closure can recover as an
+        // ERROR node whose structured children are `closure_parameters` plus
+        // the body expression. Preserve that AST relationship as well as the
+        // ordinary `closure_expression` shape.
+        if matches!(parent.kind(), "closure_expression" | "ERROR")
+            && (0..parent.named_child_count())
+                .filter_map(|index| parent.named_child(index))
+                .find(|child| child.kind() == "closure_parameters")
+                .is_some_and(|parameters| closure_parameters_bind_name(parameters, source, name))
+        {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn closure_parameters_bind_name(parameters: Node<'_>, source: &str, name: &str) -> bool {
+    let mut stack = vec![parameters];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && lexical_scope::is_pattern_binding_identifier(node)
+            && source.get(node.start_byte()..node.end_byte()) == Some(name)
+        {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+fn parsed_identifier_is_direct_pattern(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "match_pattern"
+            || (parent.kind() == "let_condition"
+                && parent
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| pattern.id() == node.id()))
+    })
+}
+
+pub(crate) fn rust_unique_nominal_reference_namespace(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    fqn: &str,
+) -> Option<crate::analyzer::rust::RustReferenceNamespace> {
+    use crate::analyzer::rust::RustReferenceNamespace;
+
+    let declarations = support.fqn(fqn);
+    let has_type = declarations
+        .iter()
+        .any(|declaration| declaration.is_class() || rust.is_type_alias(declaration));
+    let has_value = declarations.iter().any(|declaration| {
+        !rust.is_type_alias(declaration) && (declaration.is_function() || declaration.is_field())
+    });
+    let has_macro = declarations.iter().any(CodeUnit::is_macro);
+    let has_module = declarations.iter().any(CodeUnit::is_module);
+    let namespace_count = [has_type, has_value, has_macro, has_module]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if namespace_count != 1 {
+        return None;
+    }
+    if has_type {
+        Some(RustReferenceNamespace::Type)
+    } else if has_value {
+        Some(RustReferenceNamespace::Value)
+    } else if has_macro {
+        Some(RustReferenceNamespace::Macro)
+    } else {
+        Some(RustReferenceNamespace::PathPrefix)
+    }
+}
+
 fn rust_token_call_arguments(node: &Node<'_>) -> bool {
     node.kind() == "token_tree" && node.child(0).is_some_and(|open| open.kind() == "(")
 }
@@ -336,7 +747,7 @@ pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bo
             // types. A same-FQN module/macro collision can otherwise attach a
             // free item to a macro CodeUnit and incorrectly route it through
             // receiver-based member scanning.
-            parent.is_class()
+            parent.is_class() || analyzer.is_type_alias(&parent)
         })
 }
 
@@ -680,6 +1091,7 @@ fn trait_visible_at_call_site(
             reference_byte,
             crate::analyzer::rust::RustReferenceNamespace::Type,
             root_shadowed,
+            false,
         );
         rust.usage_exact_root_for_resolution(&resolution, &seeds)
             .is_some_and(|resolved| resolved == *trait_unit)
@@ -806,7 +1218,10 @@ fn is_local_declaration(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
         .any(|declaration| &declaration == target)
 }
 
-fn canonical_imported_impl_target(rust: &RustAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+pub(super) fn canonical_imported_impl_target(
+    rust: &RustAnalyzer,
+    target: &CodeUnit,
+) -> Option<CodeUnit> {
     let resolved_fqn = imported_impl_target_fqn(rust, target)?;
     let mut definitions = rust
         .definitions(&resolved_fqn)
@@ -816,35 +1231,16 @@ fn canonical_imported_impl_target(rust: &RustAnalyzer, target: &CodeUnit) -> Opt
 }
 
 fn imported_impl_target_fqn(rust: &RustAnalyzer, target: &CodeUnit) -> Option<String> {
-    if !target.is_class() || rust.parent_of(target).is_some() || !is_impl_target_unit(rust, target)
+    if !target.is_class()
+        || rust
+            .definitions(&target.fq_name())
+            .any(|definition| definition == *target)
     {
         return None;
     }
     let refs = rust.reference_context_of(target.source());
     let resolved = refs.resolve_bare(target.identifier())?;
-    (resolved != target.fq_name()).then(|| resolved.to_string())
-}
-
-fn is_impl_target_unit(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
-    let Ok(source) = target.source().read_to_string() else {
-        return false;
-    };
-    let Some(range) = rust.ranges(target).into_iter().next() else {
-        return false;
-    };
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .is_err()
-    {
-        return false;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return false;
-    };
-    tree.root_node()
-        .descendant_for_byte_range(range.start_byte, range.end_byte)
-        .is_some_and(|node| node.kind() == "impl_item")
+    Some(resolved.to_string())
 }
 
 fn infer_export_names(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<String> {

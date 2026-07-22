@@ -129,6 +129,672 @@ pub fn get_summaries() {
 }
 
 #[test]
+fn rust_same_file_exact_functions_survive_shadow_checks_in_and_outside_token_trees() {
+    let source = r#"
+macro_rules! evaluate { ($expression:expr) => { $expression }; }
+
+fn exact_value(value: usize) -> usize {
+    value
+}
+
+fn nested_calls(left: usize, right: usize) -> bool {
+    exact_value(left) < exact_value(right)
+}
+
+fn token_tree_calls(left: usize, right: usize) -> bool {
+    evaluate!(exact_value(left) < exact_value(right))
+}
+
+fn lexical_shadows(value: usize) -> usize {
+    let exact_value = |value| value + 2;
+    exact_value(value)
+}
+
+mod shadowed {
+    fn exact_value(value: usize) -> usize { value + 1 }
+    fn nested_call(value: usize) -> usize { exact_value(value) }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+
+    let target_function = definition(&analyzer, "exact_value");
+    let function_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target_function])
+        .all_hits();
+    let ordinary_first = source
+        .find("exact_value(left)")
+        .expect("first nested comparison call");
+    let ordinary_second = source
+        .find("exact_value(right)")
+        .expect("second nested comparison call");
+    let token_tree_start = source.find("evaluate!(").expect("token-tree call");
+    let token_tree_first = token_tree_start
+        + source[token_tree_start..]
+            .find("exact_value(left)")
+            .expect("first token-tree comparison call");
+    let token_tree_second = token_tree_start
+        + source[token_tree_start..]
+            .find("exact_value(right)")
+            .expect("second token-tree comparison call");
+    assert_eq!(
+        vec![
+            ordinary_first,
+            ordinary_second,
+            token_tree_first,
+            token_tree_second,
+        ],
+        function_hits
+            .iter()
+            .filter(|hit| hit.file == project.file("src/lib.rs"))
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "exact ordinary and token-tree calls must survive while lexical and item shadows stay excluded: {function_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_bare_token_tree_nominals_require_one_structured_namespace_identity() {
+    let consumer = r#"
+use crate::defs::Ambiguous;
+use crate::defs::UniqueType;
+use crate::defs::unique_value;
+
+macro_rules! declarations_and_bindings {
+    ($UniqueType:ident) => {
+        struct UniqueType;
+        fn unique_value() {}
+        let UniqueType = ();
+        'UniqueType: loop { break 'UniqueType; }
+        $UniqueType;
+    };
+}
+
+macro_rules! references {
+    () => {
+        let _: Option<UniqueType> = None; // BARE_TYPE_BODY
+        unique_value(); // BARE_VALUE_BODY
+        let _: crate::defs::UniqueType; // QUALIFIED_TYPE_BODY
+        let _: Option<Ambiguous> = None; // AMBIGUOUS_TYPE
+        Ambiguous(); // AMBIGUOUS_VALUE
+    };
+}
+
+macro_rules! consume_type { ($ty:ty) => {}; }
+consume_type!(UniqueType); // BARE_TYPE_ARGUMENT
+references!();
+"#;
+    let binary = r#"
+struct UniqueType;
+macro_rules! unrelated { () => { let _: Option<UniqueType> = None; }; }
+unrelated!();
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"tokens\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod defs;\npub mod consumer;\n"),
+        (
+            "src/defs.rs",
+            "pub struct UniqueType;\npub struct Ambiguous;\n#[allow(non_snake_case)] pub fn Ambiguous() {}\npub fn unique_value() {}\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", binary),
+    ]);
+    let candidates: HashSet<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
+
+    let unique_type = definition(&analyzer, "defs.UniqueType");
+    let type_hits = authoritative_hits(&analyzer, &unique_type, candidates.clone());
+    let body_type = consumer.find("Option<UniqueType>").expect("body type") + "Option<".len();
+    let qualified_type = consumer
+        .rfind("crate::defs::UniqueType")
+        .expect("qualified macro-body type")
+        + "crate::defs::".len();
+    let argument_type = consumer
+        .find("consume_type!(UniqueType)")
+        .expect("macro type argument")
+        + "consume_type!(".len();
+    assert_eq!(
+        vec![body_type, qualified_type, argument_type],
+        type_hits
+            .iter()
+            .filter(|hit| {
+                hit.file == project.file("src/consumer.rs") && hit.kind == UsageHitKind::Reference
+            })
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "bare and qualified nominal references must be exact while declarations, bindings, labels, metavariables, and the binary target stay excluded: {type_hits:#?}"
+    );
+    assert!(
+        type_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/main.rs")),
+        "an unrelated Cargo target must not contribute token-tree hits: {type_hits:#?}"
+    );
+
+    let defs_module = analyzer
+        .get_definitions("defs")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("defs module");
+    let module_hits = authoritative_hits(&analyzer, &defs_module, candidates.clone());
+    let qualified_module = consumer
+        .rfind("crate::defs::UniqueType")
+        .expect("qualified macro-body module")
+        + "crate::".len();
+    assert!(
+        module_hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && hit.kind == UsageHitKind::Reference
+                && hit.start_offset == qualified_module
+                && hit.end_offset == qualified_module + "defs".len()
+        }),
+        "qualified token-tree paths must preserve the exact module segment: {module_hits:#?}"
+    );
+
+    let unique_value = definition(&analyzer, "defs.unique_value");
+    let value_hits = authoritative_hits(&analyzer, &unique_value, candidates.clone());
+    let value_reference = consumer
+        .find("unique_value(); // BARE_VALUE_BODY")
+        .expect("body value");
+    assert_eq!(
+        vec![value_reference],
+        value_hits
+            .iter()
+            .filter(|hit| {
+                hit.file == project.file("src/consumer.rs") && hit.kind == UsageHitKind::Reference
+            })
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "the function declaration token must not be reported as its usage: {value_hits:#?}"
+    );
+
+    let ambiguous = analyzer.get_definitions("defs.Ambiguous");
+    let ambiguous_type = ambiguous
+        .iter()
+        .find(|definition| definition.is_class())
+        .cloned()
+        .expect("same-name type");
+    let ambiguous_value = ambiguous
+        .iter()
+        .find(|definition| definition.is_function())
+        .cloned()
+        .expect("same-name value");
+    let ambiguous_type_hits = authoritative_hits(&analyzer, &ambiguous_type, candidates.clone());
+    assert!(
+        ambiguous_type_hits.iter().all(|hit| {
+            hit.file != project.file("src/consumer.rs") || hit.kind != UsageHitKind::Reference
+        }),
+        "raw token-tree syntax must fail closed for a type/value collision: {ambiguous_type_hits:#?}"
+    );
+    let ambiguous_value_hits = authoritative_hits(&analyzer, &ambiguous_value, candidates);
+    assert!(
+        ambiguous_value_hits.iter().all(|hit| {
+            hit.file != project.file("src/consumer.rs") || hit.kind != UsageHitKind::Reference
+        }),
+        "raw token-tree syntax must fail closed for a value/type collision: {ambiguous_value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_bare_token_tree_values_use_exact_forward_module_identity() {
+    let source = r#"
+macro_rules! evaluate { ($expression:expr) => { $expression }; }
+
+const EXACT: usize = 1;
+
+struct Other;
+impl Other {
+    const EXACT: usize = 2;
+}
+
+fn module_reference() -> usize {
+    evaluate!(EXACT) + evaluate!(EXACT | 8)
+}
+
+fn associated_decoy() -> usize {
+    evaluate!(Other::EXACT)
+}
+
+fn lexical_decoy() -> usize {
+    let EXACT = 3;
+    evaluate!(EXACT)
+}
+
+fn local_item_decoy() -> usize {
+    const EXACT: usize = 4;
+    evaluate!(EXACT)
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = definition(&analyzer, "_module_.EXACT");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = ["evaluate!(EXACT)", "evaluate!(EXACT | 8)"]
+        .into_iter()
+        .map(|expression| {
+            source
+                .find(expression)
+                .expect("module token-tree reference")
+                + "evaluate!(".len()
+        })
+        .collect::<Vec<_>>();
+    let token_tree_offsets = source
+        .match_indices("evaluate!(EXACT")
+        .map(|(offset, _)| offset + "evaluate!(".len())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected,
+        hits.iter()
+            .filter(|hit| {
+                hit.file == project.file("src/lib.rs") && hit.kind == UsageHitKind::Reference
+            })
+            .map(|hit| hit.start_offset)
+            .filter(|offset| token_tree_offsets.contains(offset))
+            .collect::<Vec<_>>(),
+        "the module constant must resolve while associated, lexical, and local-item names remain exact decoys: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_bare_token_tree_roles_distinguish_casts_bindings_aliases_and_operators() {
+    let consumer = r#"
+use crate::defs::{x, CastType, Choice, Other, LEFT, MODULE_CONST, RIGHT};
+use crate::defs::Choice::Variant;
+
+macro_rules! capture { ($($tokens:tt)*) => {}; }
+macro_rules! outer { ($($tokens:tt)*) => {}; }
+
+fn witnesses(value: usize) {
+    capture!(value as CastType); // CAST_TYPE_REFERENCE
+    capture!(type CastType = Other); // TYPE_DECLARATION
+    capture!(use crate::defs::Other as CastType); // IMPORT_ALIAS
+    capture!(let CastType = value); // PATTERN_BINDING
+
+    capture!(LEFT | RIGHT); // BITWISE_REFERENCES
+    capture!(|LEFT, RIGHT| LEFT | RIGHT); // CLOSURE_BINDINGS
+    outer!(inner!(|LEFT, RIGHT| LEFT | RIGHT)); // NESTED_CLOSURE_BINDINGS
+    capture!(match value { x => x }); // MATCH_BINDING
+    capture!(if let x = value { x }); // IF_LET_BINDING
+    capture!(match value { Variant => 1, _ => 0 }); // UNIT_VARIANT_PATTERN
+    capture!(if let Variant = value { 1 } else { 0 }); // IF_LET_VARIANT
+    capture!(while let Variant = value {}); // WHILE_LET_VARIANT
+    capture!(match value { MODULE_CONST => 1, _ => 0 }); // MODULE_CONST_PATTERN
+    capture!(if let MODULE_CONST = value { 1 } else { 0 }); // IF_LET_CONST
+    capture!(match value { Choice::ASSOCIATED => 1, _ => 0 }); // ASSOCIATED_CONST_PATTERN
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod defs;\npub mod consumer;\n"),
+        (
+            "src/defs.rs",
+            "pub trait CastType {}\npub struct Other;\npub enum Choice { Variant }\nimpl Choice { pub const ASSOCIATED: usize = 3; }\npub const MODULE_CONST: usize = 4;\npub const LEFT: usize = 1;\npub const RIGHT: usize = 2;\npub fn x() {}\n",
+        ),
+        ("src/consumer.rs", consumer),
+    ]);
+    let file = project.file("src/consumer.rs");
+    let candidates: HashSet<ProjectFile> = [file.clone()].into_iter().collect();
+
+    let cast_type = definition(&analyzer, "defs.CastType");
+    let cast_hits = authoritative_hits(&analyzer, &cast_type, candidates.clone());
+    let cast_reference = consumer
+        .find("CastType); // CAST_TYPE_REFERENCE")
+        .expect("cast type reference");
+    assert_eq!(
+        vec![cast_reference],
+        cast_hits
+            .iter()
+            .filter(|hit| hit.file == file && hit.kind == UsageHitKind::Reference)
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "a cast type must remain a type reference while declaration, alias, and pattern roles stay excluded: {cast_hits:#?}"
+    );
+
+    for (fqn, marker) in [
+        ("defs._module_.LEFT", "LEFT | RIGHT); // BITWISE_REFERENCES"),
+        ("defs._module_.RIGHT", "RIGHT); // BITWISE_REFERENCES"),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let hits = authoritative_hits(&analyzer, &target, candidates.clone());
+        let expected = consumer.find(marker).expect("bitwise reference");
+        assert_eq!(
+            vec![expected],
+            hits.iter()
+                .filter(|hit| hit.file == file && hit.kind == UsageHitKind::Reference)
+                .map(|hit| hit.start_offset)
+                .collect::<Vec<_>>(),
+            "bitwise operands must remain references while both direct and nested multi-parameter closure bindings stay excluded for {fqn}: {hits:#?}"
+        );
+    }
+
+    let function = definition(&analyzer, "defs.x");
+    let function_hits = authoritative_hits(&analyzer, &function, candidates);
+    assert!(
+        function_hits
+            .iter()
+            .all(|hit| hit.file != file || hit.kind != UsageHitKind::Reference),
+        "a bare match-arm binding and its body uses must not become references to a same-named global function: {function_hits:#?}"
+    );
+
+    let variant = analyzer
+        .exact_member(&project.file("src/defs.rs"), "Choice", "Variant", false)
+        .expect("Choice::Variant definition");
+    let variant_hits =
+        authoritative_hits(&analyzer, &variant, [file.clone()].into_iter().collect());
+    let variant_reference = consumer
+        .find("Variant => 1")
+        .expect("unit variant pattern reference");
+    assert!(
+        variant_hits.iter().any(|hit| {
+            hit.file == file
+                && hit.kind == UsageHitKind::Reference
+                && hit.start_offset == variant_reference
+        }),
+        "a Pattern role may resolve only through the exact enum-variant member path: {variant_hits:#?}"
+    );
+    for marker in ["if let Variant", "while let Variant"] {
+        let expected =
+            consumer.find(marker).expect("variant let pattern") + marker.len() - "Variant".len();
+        assert!(
+            variant_hits
+                .iter()
+                .any(|hit| hit.file == file && hit.start_offset == expected),
+            "{marker} must retain the exact imported enum variant identity: {variant_hits:#?}"
+        );
+    }
+
+    let module_const = definition(&analyzer, "defs._module_.MODULE_CONST");
+    let module_const_hits = authoritative_hits(
+        &analyzer,
+        &module_const,
+        [file.clone()].into_iter().collect(),
+    );
+    for (marker, prefix) in [("MODULE_CONST =>", ""), ("if let MODULE_CONST", "if let ")] {
+        let expected = consumer.find(marker).expect("module const pattern") + prefix.len();
+        assert!(
+            module_const_hits
+                .iter()
+                .any(|hit| hit.file == file && hit.start_offset == expected),
+            "{marker} must resolve the exact imported module constant: {module_const_hits:#?}"
+        );
+    }
+
+    let associated = analyzer
+        .exact_member(&project.file("src/defs.rs"), "Choice", "ASSOCIATED", false)
+        .expect("Choice::ASSOCIATED definition");
+    let associated_hits =
+        authoritative_hits(&analyzer, &associated, [file.clone()].into_iter().collect());
+    let associated_reference = consumer
+        .find("Choice::ASSOCIATED =>")
+        .expect("associated const pattern")
+        + "Choice::".len();
+    assert!(
+        associated_hits
+            .iter()
+            .any(|hit| hit.file == file && hit.start_offset == associated_reference),
+        "a qualified associated const pattern must keep exact member identity: {associated_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_tuple_and_unit_structs_have_exact_value_constructor_identities() {
+    let definitions = r#"
+pub struct Tuple(pub usize);
+pub struct Unit;
+pub struct Named { pub value: usize }
+#[allow(non_snake_case)]
+pub fn Named() -> usize { 0 }
+
+pub fn local() {
+    let _: Tuple = Tuple(0);
+    let _: Unit = Unit;
+    let _ = Named { value: 0 };
+    let _ = Named();
+}
+"#;
+    let consumer = r#"
+use crate::definitions::{Named, Tuple, Unit};
+
+pub fn imported() {
+    let _: Tuple = Tuple(1);
+    let _: Unit = Unit;
+    let _ = Named { value: 1 };
+    let _ = Named();
+}
+
+pub fn qualified() {
+    let _ = crate::definitions::Tuple(2);
+    let _ = crate::definitions::Unit;
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"constructors\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod definitions;\npub mod consumer;\n"),
+        ("src/definitions.rs", definitions),
+        ("src/consumer.rs", consumer),
+        (
+            "examples/decoy.rs",
+            "struct Tuple(usize);\nstruct Unit;\nfn run() { let _ = Tuple(9); let _ = Unit; }\n",
+        ),
+    ]);
+    let tuple = analyzer
+        .get_definitions("definitions.Tuple")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("tuple struct definition");
+    let unit = analyzer
+        .get_definitions("definitions.Unit")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("unit struct definition");
+    let named = analyzer
+        .get_definitions("definitions.Named")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("named-field struct definition");
+
+    let tuple_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[tuple])
+        .all_hits();
+    let unit_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[unit])
+        .all_hits();
+    let named_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[named])
+        .all_hits();
+
+    let expected_tuple = [
+        (
+            project.file("src/definitions.rs"),
+            definitions
+                .find("Tuple(0)")
+                .expect("local tuple constructor"),
+        ),
+        (
+            project.file("src/consumer.rs"),
+            consumer
+                .find("Tuple(1)")
+                .expect("imported tuple constructor"),
+        ),
+        (
+            project.file("src/consumer.rs"),
+            consumer
+                .find("crate::definitions::Tuple(2)")
+                .expect("qualified tuple constructor")
+                + "crate::definitions::".len(),
+        ),
+    ];
+    for (file, offset) in expected_tuple {
+        assert!(
+            tuple_hits
+                .iter()
+                .any(|hit| hit.file == file && hit.start_offset == offset),
+            "missing exact tuple constructor at {file}:{offset}: {tuple_hits:#?}"
+        );
+    }
+
+    let expected_unit = [
+        (
+            project.file("src/definitions.rs"),
+            definitions.find("= Unit;").expect("local unit constructor") + 2,
+        ),
+        (
+            project.file("src/consumer.rs"),
+            consumer.find("= Unit;").expect("imported unit constructor") + 2,
+        ),
+        (
+            project.file("src/consumer.rs"),
+            consumer
+                .find("crate::definitions::Unit;")
+                .expect("qualified unit constructor")
+                + "crate::definitions::".len(),
+        ),
+    ];
+    for (file, offset) in expected_unit {
+        assert!(
+            unit_hits
+                .iter()
+                .any(|hit| hit.file == file && hit.start_offset == offset),
+            "missing exact unit constructor at {file}:{offset}: {unit_hits:#?}"
+        );
+    }
+
+    for (file, source) in [
+        (project.file("src/definitions.rs"), definitions),
+        (project.file("src/consumer.rs"), consumer),
+    ] {
+        let literal = source.find("Named { value").expect("named struct literal");
+        let function = source.find("Named();").expect("same-name function call");
+        assert!(
+            named_hits
+                .iter()
+                .any(|hit| hit.file == file && hit.start_offset == literal),
+            "named-field struct literals remain type references: {named_hits:#?}"
+        );
+        assert!(
+            named_hits
+                .iter()
+                .all(|hit| hit.file != file || hit.start_offset != function),
+            "the same-name value function must not become a struct constructor: {named_hits:#?}"
+        );
+    }
+    assert!(
+        tuple_hits
+            .iter()
+            .chain(unit_hits.iter())
+            .all(|hit| hit.file != project.file("examples/decoy.rs")),
+        "constructors from an independent Cargo example must remain unrelated"
+    );
+}
+
+#[test]
+fn rust_tuple_constructor_identities_respect_fields_and_non_exhaustive_boundaries() {
+    let definitions = r#"
+pub struct PrivateTuple(usize);
+pub struct PublicTuple(pub usize);
+#[non_exhaustive]
+pub struct LocalNonExhaustive(pub usize);
+
+fn local() {
+    let _ = PrivateTuple(0); // PRIVATE_LOCAL
+    let _ = PublicTuple(0); // PUBLIC_LOCAL
+    let _ = LocalNonExhaustive(0); // NON_EXHAUSTIVE_LOCAL
+}
+"#;
+    let sibling = r#"
+use crate::definitions::{LocalNonExhaustive, PrivateTuple};
+fn calls() {
+    let _ = PrivateTuple(1); // PRIVATE_SIBLING_INVALID
+    let _ = LocalNonExhaustive(1); // NON_EXHAUSTIVE_SAME_CRATE
+}
+"#;
+    let external = r#"
+use constructors::{LocalNonExhaustive, PublicTuple};
+fn calls() {
+    let _ = PublicTuple(2); // PUBLIC_EXTERNAL
+    let _ = LocalNonExhaustive(2); // NON_EXHAUSTIVE_EXTERNAL_INVALID
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"constructors\", \"consumer\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "constructors/Cargo.toml",
+            "[package]\nname = \"constructors\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "constructors/src/lib.rs",
+            "pub mod definitions;\npub use definitions::{LocalNonExhaustive, PublicTuple};\nmod sibling;\n",
+        ),
+        ("constructors/src/definitions.rs", definitions),
+        ("constructors/src/sibling.rs", sibling),
+        (
+            "consumer/Cargo.toml",
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\nconstructors = { path = \"../constructors\" }\n",
+        ),
+        ("consumer/src/lib.rs", external),
+    ]);
+    let definitions_file = project.file("constructors/src/definitions.rs");
+    let class = |name: &str| {
+        analyzer
+            .declarations(&definitions_file)
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.identifier() == name)
+            .unwrap_or_else(|| panic!("missing {name} class"))
+    };
+    let candidates: HashSet<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
+    let private_hits = authoritative_hits(&analyzer, &class("PrivateTuple"), candidates.clone());
+    let public_hits = authoritative_hits(&analyzer, &class("PublicTuple"), candidates.clone());
+    let non_exhaustive_hits =
+        authoritative_hits(&analyzer, &class("LocalNonExhaustive"), candidates);
+
+    let private_local = definitions.find("PrivateTuple(0)").expect("private local");
+    assert!(
+        private_hits
+            .iter()
+            .any(|hit| { hit.file == definitions_file && hit.start_offset == private_local })
+    );
+    assert!(
+        private_hits.iter().all(|hit| {
+            hit.file != project.file("constructors/src/sibling.rs")
+                || hit.start_offset != sibling.find("PrivateTuple(1)").expect("private sibling")
+        }),
+        "a tuple field's private visibility must keep its constructor module-private: {private_hits:#?}"
+    );
+
+    let public_external = external.find("PublicTuple(2)").expect("public external");
+    assert!(
+        public_hits.iter().any(|hit| {
+            hit.file == project.file("consumer/src/lib.rs") && hit.start_offset == public_external
+        }),
+        "a fully public tuple constructor must remain externally visible: {public_hits:#?}"
+    );
+
+    let same_crate = sibling
+        .find("LocalNonExhaustive(1)")
+        .expect("same-crate non-exhaustive");
+    assert!(non_exhaustive_hits.iter().any(|hit| {
+        hit.file == project.file("constructors/src/sibling.rs") && hit.start_offset == same_crate
+    }));
+    assert!(
+        non_exhaustive_hits.iter().all(|hit| {
+            hit.file != project.file("consumer/src/lib.rs")
+                || hit.start_offset
+                    != external
+                        .find("LocalNonExhaustive(2)")
+                        .expect("external non-exhaustive")
+        }),
+        "a non-exhaustive constructor must not escape its defining crate: {non_exhaustive_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_same_file_private_module_function_calls() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         ("src/lib.rs", "mod agent;\n"),
@@ -202,7 +868,7 @@ fn drive(tracker: RequestTracker) {
         "RequestTracker",
         "run_request",
     );
-    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates: HashSet<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
     let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
@@ -1224,6 +1890,145 @@ fn call_trait_method(waiter: &impl Link) -> usize {
 }
 
 #[test]
+fn authoritative_rust_struct_expression_fields_keep_their_physical_owner() {
+    let valuable = r#"
+struct User {
+    name: String,
+}
+
+struct Other {
+    name: String,
+}
+
+fn build(name: String, other: Other) {
+    let _ = User {
+        name: "Arwen Undomiel".to_string(), // EXPLICIT_FIELD
+    };
+    let _ = User { name }; // SHORTHAND_FIELD
+    let _ = User { name: name.clone() }; // EXPLICIT_WITH_LOCAL_VALUE
+    let Other { name } = other; // UNRELATED_PATTERN_BINDING
+    let _ = Other { name }; // UNRELATED_SHORTHAND_FIELD
+}
+"#;
+    let valuable_json = r#"
+struct User {
+    name: String,
+}
+
+fn build(name: String) {
+    let _ = User { name }; // SIBLING_SAME_FQN_FIELD
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("examples/examples/valuable.rs", valuable),
+        ("examples/examples/valuable_json.rs", valuable_json),
+    ]);
+    let target_file = project.file("examples/examples/valuable.rs");
+    let sibling_file = project.file("examples/examples/valuable_json.rs");
+    let target = member(&analyzer, &target_file, "User", "name");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = authoritative_hits(&analyzer, &target, candidates);
+
+    let explicit = valuable
+        .find("name: \"Arwen")
+        .expect("explicit field label");
+    let shorthand = valuable
+        .find("name }; // SHORTHAND")
+        .expect("shorthand label");
+    let explicit_with_local = valuable
+        .find("name: name.clone()")
+        .expect("explicit field with local value");
+    let expected = vec![explicit, shorthand, explicit_with_local];
+    let local_value = explicit_with_local + "name: ".len();
+    let pattern_binding = valuable
+        .find("name } = other")
+        .expect("unrelated pattern binding");
+    let unrelated_shorthand = valuable
+        .find("name }; // UNRELATED_SHORTHAND")
+        .expect("unrelated shorthand field");
+
+    assert_eq!(
+        expected,
+        hits.iter()
+            .filter(|hit| hit.file == target_file)
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "explicit and shorthand struct-expression labels must retain exact identifier ranges: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.file != sibling_file),
+        "same-FQN sibling fields must remain excluded: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != target_file
+                || ![local_value, pattern_binding, unrelated_shorthand].contains(&hit.start_offset)
+        }),
+        "local values, pattern bindings, and unrelated field labels must remain excluded: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.end_offset == hit.start_offset + "name".len()),
+        "field hits must cover only the field identifier: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_struct_expression_fields_use_the_importing_cargo_target_owner() {
+    let consumer = r#"
+use crate::User;
+
+fn build(name: String) {
+    let _ = User { name }; // IMPORTED_OWNER
+    let _ = crate::User { name: String::new() }; // QUALIFIED_OWNER
+}
+"#;
+    let binary = r#"
+struct User { name: String }
+fn build(name: String) { let _ = User { name }; } // BINARY_DECOY
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"field-owner\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub struct User { pub name: String }\nmod consumer;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", binary),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "User", "name");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        analyzer.get_analyzed_files().into_iter().collect(),
+    );
+    let expected = [
+        consumer
+            .find("name }; // IMPORTED")
+            .expect("imported label"),
+        consumer.find("name: String::new").expect("qualified label"),
+    ];
+
+    assert!(
+        expected.into_iter().all(|start| {
+            hits.iter().any(|hit| {
+                hit.file == project.file("src/consumer.rs")
+                    && (hit.start_offset, hit.end_offset) == (start, start + "name".len())
+            })
+        }),
+        "same-FQN owners must be narrowed through the consumer's Cargo target: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/main.rs")),
+        "the binary's same-FQN field must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_rust_enum_variants_are_not_routed_to_same_named_trait_methods() {
     let source = r#"
 #[allow(non_snake_case)]
@@ -1437,6 +2242,51 @@ pub fn free() {}
             "{target_fqn} must retain its exact segment ranges: {hits:#?}"
         );
     }
+}
+
+#[test]
+fn rust_qualified_macro_import_owner_ignores_same_named_field() {
+    let consumer = r#"
+use crate::options;
+
+macro_rules! consume { ($($tokens:tt)*) => {}; }
+
+pub fn run() {
+    consume!(options::Extension);
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"owner_filter\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod parser;\npub use parser::options;\npub mod consumer;\n",
+        ),
+        (
+            "src/parser/mod.rs",
+            "pub mod options;\npub struct Parser { pub options: usize }\n",
+        ),
+        ("src/parser/options.rs", "pub struct Extension;\n"),
+        ("src/consumer.rs", consumer),
+    ]);
+    let target = definition(&analyzer, "parser.options");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        analyzer.get_analyzed_files().into_iter().collect(),
+    );
+    let expected = consumer
+        .find("options::Extension")
+        .expect("qualified macro owner");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "options".len())
+        }),
+        "an imported module owner must win over a same-named struct field in its declaring file: {hits:#?}"
+    );
 }
 
 #[test]
@@ -2021,6 +2871,220 @@ fn run() {
             .into_either()
             .expect("associated const success")
             .len()
+    );
+}
+
+#[test]
+fn authoritative_rust_usage_finds_same_file_explicit_associated_calls() {
+    let source = r#"
+struct OptionalWriter<T>(Option<T>);
+
+impl<T> OptionalWriter<T> {
+    fn none() -> Self { Self(None) }
+    fn some(value: T) -> Self { Self(Some(value)) }
+}
+
+fn build() {
+    let _ = OptionalWriter::some(1usize); // SOME_ONE
+    let _ = OptionalWriter::some(2usize); // SOME_TWO
+    let _: OptionalWriter<usize> = OptionalWriter::none(); // NONE
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/writer.rs", source)]);
+    let file = project.file("src/writer.rs");
+    let candidates: HashSet<ProjectFile> = [file.clone()].into_iter().collect();
+    let some = member(&analyzer, &file, "OptionalWriter", "some");
+    let none = member(&analyzer, &file, "OptionalWriter", "none");
+
+    let some_hits = authoritative_hits(&analyzer, &some, candidates.clone());
+    let none_hits = authoritative_hits(&analyzer, &none, candidates);
+
+    assert_eq!(
+        2,
+        some_hits.len(),
+        "same-file OptionalWriter::some: {some_hits:#?}"
+    );
+    assert!(some_hits.iter().any(|hit| hit.snippet.contains("SOME_ONE")));
+    assert!(some_hits.iter().any(|hit| hit.snippet.contains("SOME_TWO")));
+    assert_eq!(
+        1,
+        none_hits.len(),
+        "same-file OptionalWriter::none: {none_hits:#?}"
+    );
+    assert!(none_hits.iter().all(|hit| hit.snippet.contains("NONE")));
+}
+
+#[test]
+fn authoritative_rust_associated_calls_resolve_canonical_owner_routes() {
+    let library = r#"
+pub struct OptionalWriter;
+
+impl OptionalWriter {
+    pub(crate) fn some() -> Self { Self }
+    pub(crate) fn none() -> Self { Self }
+}
+
+pub struct OtherWriter;
+impl OtherWriter {
+    pub(crate) fn some() -> Self { Self }
+}
+
+pub mod facade {
+    pub use crate::OptionalWriter;
+}
+
+mod named;
+mod globbed;
+mod reexported;
+mod qualified;
+mod decoy;
+
+fn local() {
+    let _ = OptionalWriter::some(); // SAME_FILE
+    let _ = OptionalWriter::none(); // SAME_OWNER_OTHER_MEMBER
+    let _ = OtherWriter::some(); // SAME_MEMBER_OTHER_OWNER
+}
+"#;
+    let named = r#"
+use crate::OptionalWriter;
+fn call() { let _ = OptionalWriter::some(); } // NAMED_IMPORT
+"#;
+    let globbed = r#"
+use crate::*;
+fn call() { let _ = OptionalWriter::some(); } // GLOB_IMPORT
+"#;
+    let reexported = r#"
+use crate::facade::OptionalWriter;
+fn call() { let _ = OptionalWriter::some(); } // REEXPORTED_OWNER
+"#;
+    let qualified = r#"
+fn call() { let _ = crate::OptionalWriter::some(); } // CRATE_QUALIFIED
+"#;
+    let decoy = r#"
+struct OptionalWriter;
+impl OptionalWriter { fn some() -> Self { Self } }
+fn call() { let _ = OptionalWriter::some(); } // SAME_NAME_OWNER_MEMBER
+"#;
+    let binary = r#"
+struct OptionalWriter;
+impl OptionalWriter { fn some() -> Self { Self } }
+fn main() { let _ = OptionalWriter::some(); } // INDEPENDENT_CARGO_TARGET
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"associated-routes\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", library),
+        ("src/named.rs", named),
+        ("src/globbed.rs", globbed),
+        ("src/reexported.rs", reexported),
+        ("src/qualified.rs", qualified),
+        ("src/decoy.rs", decoy),
+        ("src/main.rs", binary),
+    ]);
+    let target = member(
+        &analyzer,
+        &project.file("src/lib.rs"),
+        "OptionalWriter",
+        "some",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = authoritative_hits(&analyzer, &target, candidates);
+
+    for (path, marker) in [
+        ("src/lib.rs", "SAME_FILE"),
+        ("src/named.rs", "NAMED_IMPORT"),
+        ("src/globbed.rs", "GLOB_IMPORT"),
+        ("src/reexported.rs", "REEXPORTED_OWNER"),
+        ("src/qualified.rs", "CRATE_QUALIFIED"),
+    ] {
+        assert!(
+            hits.iter()
+                .any(|hit| hit.file == project.file(path) && hit.snippet.contains(marker)),
+            "missing associated call through {marker}: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        5,
+        hits.len(),
+        "unexpected associated-call matches: {hits:#?}"
+    );
+    let other_member =
+        library.find("OptionalWriter::none").expect("other member") + "OptionalWriter::".len();
+    let other_owner =
+        library.find("OtherWriter::some").expect("other owner") + "OtherWriter::".len();
+    let library_file = project.file("src/lib.rs");
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != library_file || ![other_member, other_owner].contains(&hit.start_offset)
+        }),
+        "same-owner/different-member and different-owner/same-member calls must stay excluded: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/decoy.rs") && hit.file != project.file("src/main.rs")
+        }),
+        "same-name owners and independent Cargo targets must stay excluded: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_associated_calls_canonicalize_cross_file_imported_impl_owners() {
+    let implementation = r#"
+use crate::model::Builder;
+
+impl Builder {
+    pub(crate) fn build() -> Self { Self }
+}
+"#;
+    let consumer = r#"
+use crate::model::Builder;
+fn call() { let _ = Builder::build(); } // IMPORTED_IMPL_OWNER
+"#;
+    let binary = r#"
+struct Builder;
+impl Builder { fn build() -> Self { Self } }
+fn call() { let _ = Builder::build(); } // BINARY_IMPL_DECOY
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"imported-impl\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod model;\nmod implementation;\nmod consumer;\n",
+        ),
+        ("src/model.rs", "pub struct Builder;\n"),
+        ("src/implementation.rs", implementation),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", binary),
+    ]);
+    let target = member(
+        &analyzer,
+        &project.file("src/implementation.rs"),
+        "Builder",
+        "build",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        analyzer.get_analyzed_files().into_iter().collect(),
+    );
+    let expected = consumer.find("build();").expect("consumer call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "build".len())
+        }),
+        "an imported inherent impl owner must canonicalize to its declaration: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/main.rs")),
+        "an independent Cargo target's same-FQN impl must remain unrelated: {hits:#?}"
     );
 }
 
@@ -3458,6 +4522,123 @@ fn run() {
             .into_either()
             .expect("struct variant success")
             .len()
+    );
+}
+
+#[test]
+fn rust_reexported_types_and_tuple_variant_patterns_keep_exact_identity() {
+    let consumer = r#"
+use crate::{Lifecycle, PublicType};
+use dep_alias::{Lifecycle as DepLifecycle, PublicType as DepPublicType};
+
+fn named(_: PublicType) {}
+fn qualified(_: crate::PublicType) {}
+fn dependency(_: DepPublicType) {}
+
+fn named_pattern(value: Lifecycle) {
+    match value {
+        Lifecycle::Completed(_) => {} // NAMED_VARIANT
+        Lifecycle::Ready => {}
+    }
+}
+
+fn qualified_pattern(value: crate::Lifecycle) {
+    match value {
+        crate::Lifecycle::Completed(_) => {} // CRATE_QUALIFIED_VARIANT
+        crate::Lifecycle::Ready => {}
+    }
+}
+
+fn dependency_pattern(value: DepLifecycle) {
+    match value {
+        DepLifecycle::Completed(_) => {} // DEPENDENCY_VARIANT_DECOY
+        DepLifecycle::Ready => {}
+    }
+}
+"#;
+    let binary = r#"
+struct PublicType;
+enum Lifecycle { Completed(usize), Ready }
+fn main() {
+    let _: Option<PublicType> = None;
+    if let Lifecycle::Completed(_) = Lifecycle::Ready {} // CARGO_TARGET_VARIANT_DECOY
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"identity-routes\"\nversion = \"0.1.0\"\n[dependencies]\ndep_alias = { path = \"dep\" }\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod model; mod consumer;\npub use model::{Lifecycle, PublicType};\n",
+        ),
+        (
+            "src/model.rs",
+            "pub struct PublicType;\npub enum Lifecycle { Completed(usize), Ready }\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", binary),
+        (
+            "dep/Cargo.toml",
+            "[package]\nname = \"dep_alias\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "dep/src/lib.rs",
+            "pub struct PublicType;\npub enum Lifecycle { Completed(usize), Ready }\n",
+        ),
+    ]);
+    let model_file = project.file("src/model.rs");
+    let consumer_file = project.file("src/consumer.rs");
+    let public_type = definition(&analyzer, "model.PublicType");
+    let completed = member(&analyzer, &model_file, "Lifecycle", "Completed");
+    let candidates: HashSet<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
+
+    let type_hits = authoritative_hits(&analyzer, &public_type, candidates.clone());
+    let variant_hits = authoritative_hits(&analyzer, &completed, candidates);
+    let named_type = consumer.find("named(_: PublicType)").expect("named type") + "named(_: ".len();
+    let qualified_type = consumer
+        .find("qualified(_: crate::PublicType)")
+        .expect("qualified type")
+        + "qualified(_: crate::".len();
+    assert_eq!(
+        vec![named_type, qualified_type],
+        type_hits
+            .iter()
+            .filter(|hit| hit.file == consumer_file)
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "named and crate-qualified uses must resolve through the public re-export: {type_hits:#?}"
+    );
+    assert!(
+        type_hits.iter().all(|hit| {
+            hit.file != project.file("dep/src/lib.rs") && hit.file != project.file("src/main.rs")
+        }),
+        "same-name dependency and Cargo-target types must stay unrelated: {type_hits:#?}"
+    );
+
+    let named_variant = consumer
+        .find("Lifecycle::Completed")
+        .expect("named variant pattern")
+        + "Lifecycle::".len();
+    let qualified_variant = consumer
+        .find("crate::Lifecycle::Completed")
+        .expect("qualified variant pattern")
+        + "crate::Lifecycle::".len();
+    assert_eq!(
+        vec![named_variant, qualified_variant],
+        variant_hits
+            .iter()
+            .filter(|hit| hit.file == consumer_file)
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "named and crate-qualified tuple-variant patterns must retain exact terminal ranges: {variant_hits:#?}"
+    );
+    assert!(
+        variant_hits.iter().all(|hit| {
+            hit.file != project.file("dep/src/lib.rs") && hit.file != project.file("src/main.rs")
+        }),
+        "same-name dependency and Cargo-target variants must stay unrelated: {variant_hits:#?}"
     );
 }
 
@@ -4984,6 +6165,7 @@ mod consumer {
         alias(); // VALUE_ALIAS_USE
     }
 }
+
 "#,
     )]);
     let definitions = analyzer.get_definitions("same");
@@ -5027,6 +6209,271 @@ mod consumer {
         value_hits
             .iter()
             .all(|hit| !hit.snippet.contains("MACRO_ALIAS_USE"))
+    );
+}
+
+#[test]
+fn rust_graph_tracks_bare_macro_invocations_through_structured_visibility() {
+    let definitions = r#"
+macro_rules! target_macro { () => {}; }
+macro_rules! wrapper { ($($tokens:tt)*) => {}; }
+pub(crate) use target_macro;
+pub fn target_macro() {}
+fn direct() {
+    let target_macro = 1;
+    target_macro!(); // DIRECT_MACRO_USE
+    let _ = target_macro; // SAME_NAME_VALUE_USE
+    wrapper! { target_macro!() } // NESTED_MACRO_USE
+    wrapper!(target_macro); // BARE_MACRO_ARGUMENT
+}
+"#;
+    let consumer = r#"
+use crate::definitions::target_macro as imported_macro;
+use crate::exports::exported_macro;
+fn target_macro() {}
+fn run() {
+    let target_macro = 1;
+    target_macro!(); // MACRO_USE_INHERITED
+    imported_macro!(); // MACRO_USE_IMPORTED
+    exported_macro!(); // MACRO_USE_REEXPORTED
+    crate::definitions::target_macro!(); // MACRO_USE_QUALIFIED
+    target_macro(); // SAME_NAME_FUNCTION_USE
+    let _ = target_macro; // SAME_NAME_LOCAL_USE
+}
+mod shadowed {
+    macro_rules! target_macro { () => {}; }
+    fn run() { target_macro!(); } // SHADOW_MACRO_USE
+}
+"#;
+    let early = "target_macro!(); // INVISIBLE_EARLY_USE\n";
+    let private_consumer = "private_macro!(); // INVISIBLE_PRIVATE_USE\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"macro-demo\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod early;\n#[macro_use]\npub mod definitions;\npub(crate) use definitions::target_macro;\nmacro_rules! rooted_call { () => { $crate::target_macro!(); }; }\npub mod exports;\npub mod consumer;\nmod private_macros;\nmod private_consumer;\n",
+        ),
+        ("src/definitions.rs", definitions),
+        (
+            "src/exports.rs",
+            "pub(crate) use crate::definitions::target_macro as exported_macro;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/early.rs", early),
+        (
+            "src/private_macros.rs",
+            "macro_rules! private_macro { () => {}; }\n",
+        ),
+        ("src/private_consumer.rs", private_consumer),
+    ]);
+    let target = analyzer
+        .get_definitions("definitions.target_macro")
+        .into_iter()
+        .find(CodeUnit::is_macro)
+        .expect("target macro definition");
+    assert!(target.is_macro(), "expected macro target: {target:?}");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits: Vec<_> = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[target], &candidates, 1000)
+        .into_either()
+        .expect("target macro usage scan")
+        .into_iter()
+        .collect();
+
+    for (file, source, needle, name) in [
+        (
+            "src/definitions.rs",
+            definitions,
+            "target_macro!(); // DIRECT_MACRO_USE",
+            "target_macro",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "target_macro!(); // MACRO_USE_INHERITED",
+            "target_macro",
+        ),
+        (
+            "src/definitions.rs",
+            definitions,
+            "target_macro!() } // NESTED_MACRO_USE",
+            "target_macro",
+        ),
+        (
+            "src/lib.rs",
+            "mod early;\n#[macro_use]\npub mod definitions;\npub(crate) use definitions::target_macro;\nmacro_rules! rooted_call { () => { $crate::target_macro!(); }; }\npub mod exports;\npub mod consumer;\nmod private_macros;\nmod private_consumer;\n",
+            "target_macro!(); }; }",
+            "target_macro",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "imported_macro!(); // MACRO_USE_IMPORTED",
+            "imported_macro",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "exported_macro!(); // MACRO_USE_REEXPORTED",
+            "exported_macro",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "target_macro!(); // MACRO_USE_QUALIFIED",
+            "target_macro",
+        ),
+    ] {
+        let expected = source.find(needle).expect("positive macro invocation");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == project.file(file)
+                    && hit.start_offset == expected
+                    && hit.end_offset == expected + name.len()
+            }),
+            "missing {needle}: {hits:#?}"
+        );
+    }
+    for (file, source, needle) in [
+        (
+            "src/definitions.rs",
+            definitions,
+            "target_macro; // SAME_NAME_VALUE_USE",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "target_macro(); // SAME_NAME_FUNCTION_USE",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "target_macro; // SAME_NAME_LOCAL_USE",
+        ),
+        (
+            "src/consumer.rs",
+            consumer,
+            "target_macro!(); } // SHADOW_MACRO_USE",
+        ),
+        (
+            "src/definitions.rs",
+            definitions,
+            "target_macro); // BARE_MACRO_ARGUMENT",
+        ),
+    ] {
+        let excluded = source.find(needle).expect("same-name negative");
+        assert!(
+            hits.iter()
+                .all(|hit| hit.file != project.file(file) || hit.start_offset != excluded),
+            "same-name non-target `{needle}` leaked: {hits:#?}"
+        );
+    }
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/early.rs")),
+        "macro imported after `mod early` must not be visible there: {hits:#?}"
+    );
+    let private_target = analyzer
+        .get_definitions("private_macros.private_macro")
+        .into_iter()
+        .find(CodeUnit::is_macro)
+        .expect("private macro definition");
+    let private_hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[private_target], &candidates, 1000)
+        .into_either()
+        .expect("private macro usage scan");
+    assert!(
+        private_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/private_consumer.rs")),
+        "private sibling macro must not leak: {private_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_scope_uses_definition_order_and_exact_declaration_identity() {
+    let consumer = r#"
+fn before_shadow() { target_macro!(); } // IMPORTED_BEFORE_SHADOW
+macro_rules! target_macro { () => {}; }
+fn between_shadows() { target_macro!(); } // FIRST_LOCAL_SHADOW
+macro_rules! target_macro { () => {}; }
+fn after_shadow() { target_macro!(); } // SECOND_LOCAL_SHADOW
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "#[macro_use]\npub mod definitions;\npub mod consumer;\n",
+        ),
+        (
+            "src/definitions.rs",
+            "macro_rules! target_macro { () => {}; }\npub(crate) use target_macro;\n",
+        ),
+        ("src/consumer.rs", consumer),
+    ]);
+    let imported = analyzer
+        .get_definitions("definitions.target_macro")
+        .into_iter()
+        .find(CodeUnit::is_macro)
+        .expect("imported macro");
+    let imported_hits = rust_graph_hits_for_target(&analyzer, imported);
+    let before = consumer.find("target_macro!(); } // IMPORTED").unwrap();
+    let first_shadow = consumer.find("target_macro!(); } // FIRST_LOCAL").unwrap();
+    let second_shadow = consumer
+        .rfind("target_macro!(); } // SECOND_LOCAL")
+        .unwrap();
+    assert!(
+        imported_hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs") && hit.start_offset == before
+        }),
+        "imported target before local shadow: {imported_hits:#?}"
+    );
+    for shadow in [first_shadow, second_shadow] {
+        assert!(imported_hits.iter().all(|hit| {
+            hit.file != project.file("src/consumer.rs") || hit.start_offset != shadow
+        }));
+    }
+}
+
+#[test]
+fn rust_macro_scope_edges_do_not_cross_disjoint_cargo_targets() {
+    let lib_consumer = "fn use_macro() { target_macro!(); } // LIB_TARGET_USE\n";
+    let main = r#"
+#[macro_use]
+mod child { macro_rules! target_macro { () => {}; } }
+fn main() { target_macro!(); } // BIN_DECOY_USE
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"macro-targets\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "#[macro_use]\nmod child;\nmod lib_consumer;\n",
+        ),
+        ("src/child.rs", "macro_rules! target_macro { () => {}; }\n"),
+        ("src/lib_consumer.rs", lib_consumer),
+        ("src/main.rs", main),
+    ]);
+    let target = analyzer
+        .get_definitions("child.target_macro")
+        .into_iter()
+        .find(|definition| {
+            definition.is_macro() && definition.source() == &project.file("src/child.rs")
+        })
+        .expect("library child macro");
+    let hits = rust_graph_hits_for_target(&analyzer, target);
+    let expected = lib_consumer.find("target_macro!").unwrap();
+    let decoy = main.find("target_macro!(); } // BIN").unwrap();
+    assert!(hits.iter().any(|hit| {
+        hit.file == project.file("src/lib_consumer.rs") && hit.start_offset == expected
+    }));
+    assert!(
+        hits.iter()
+            .all(|hit| { hit.file != project.file("src/main.rs") || hit.start_offset != decoy })
     );
 }
 
@@ -5189,6 +6636,19 @@ fn rust_graph_hits(analyzer: &RustAnalyzer, fq_name: &str) -> Vec<brokk_bifrost:
         .find_usages(analyzer, std::slice::from_ref(&target), &candidates, 1000)
         .into_either()
         .unwrap_or_else(|_| panic!("expected graph success (not a fallback/failure) for {fq_name}"))
+        .into_iter()
+        .collect()
+}
+
+fn rust_graph_hits_for_target(
+    analyzer: &RustAnalyzer,
+    target: CodeUnit,
+) -> Vec<brokk_bifrost::usages::UsageHit> {
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("expected graph success for explicit Rust target")
         .into_iter()
         .collect()
 }
@@ -5571,6 +7031,101 @@ macro_rules! call_other_task {
         !actual.contains(&(forbidden_start, forbidden_start + "other_task".len())),
         "crate-qualified macro module segment must preserve identity: {hits:#?}"
     );
+}
+
+#[test]
+fn authoritative_rust_tracing_macro_paths_reject_disjoint_crate_roots() {
+    let lib_source = r#"
+pub mod field;
+pub use tracing_core::metadata;
+mod macros;
+
+pub mod __macro_support {
+    pub use tracing_core::__macro_support::Marker;
+}
+"#;
+    let macro_source = r#"
+macro_rules! tracing_event {
+    () => {
+        let _: $crate::__macro_support::Marker;
+        let _: $crate::field::Value;
+        let _ = $crate::metadata::Kind::EVENT;
+    };
+}
+"#;
+    let binary_source = r#"
+mod field { pub struct Value; }
+mod metadata { pub enum Kind { EVENT } }
+mod __macro_support { pub struct Marker; }
+
+macro_rules! tracing_event {
+    () => {
+        let _: $crate::__macro_support::Marker;
+        let _: $crate::field::Value;
+        let _ = $crate::metadata::Kind::EVENT;
+    };
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tracing\", \"tracing-core\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "tracing/Cargo.toml",
+            "[package]\nname = \"tracing\"\nversion = \"0.1.0\"\n[dependencies]\ntracing-core = { path = \"../tracing-core\" }\n",
+        ),
+        ("tracing/src/lib.rs", lib_source),
+        ("tracing/src/macros.rs", macro_source),
+        ("tracing/src/field.rs", "pub use tracing_core::field::*;\n"),
+        ("tracing/src/bin/decoy.rs", binary_source),
+        (
+            "tracing-core/Cargo.toml",
+            "[package]\nname = \"tracing-core\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "tracing-core/src/lib.rs",
+            "pub mod field;\npub mod metadata;\npub mod __macro_support { pub struct Marker; }\n",
+        ),
+        ("tracing-core/src/field.rs", "pub struct Value;\n"),
+        (
+            "tracing-core/src/metadata.rs",
+            "pub enum Kind { EVENT, SPAN }\n",
+        ),
+    ]);
+    let candidates: HashSet<_> = [project.file("tracing/src/macros.rs")]
+        .into_iter()
+        .collect();
+
+    for (target_fqn, token) in [
+        ("tracing.src.__macro_support", "__macro_support"),
+        ("tracing.src.field", "field"),
+        ("tracing-core.src.metadata.Kind", "Kind"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = authoritative_hits(&analyzer, &target, candidates.clone());
+        let expected = macro_source
+            .rfind(token)
+            .expect("tracing-shaped macro token");
+        let decoy = binary_source
+            .rfind(token)
+            .expect("disjoint binary macro token");
+
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == project.file("tracing/src/macros.rs")
+                    && hit.start_offset == expected
+                    && hit.end_offset == expected + token.len()
+            }),
+            "{target_fqn} must retain its rooted token-tree reference: {hits:#?}"
+        );
+        assert!(
+            hits.iter().all(|hit| {
+                hit.file != project.file("tracing/src/bin/decoy.rs") || hit.start_offset != decoy
+            }),
+            "{target_fqn} must not cross into a Cargo-disjoint crate root: {hits:#?}"
+        );
+    }
 }
 
 #[test]
@@ -6768,6 +8323,90 @@ fn invalid() { let _ = MANIFESTS; }
 }
 
 #[test]
+fn rust_rooted_import_does_not_attach_undeclared_orphan_modules() {
+    let orphan = r#"
+use crate::orphan_target::Thing;
+fn invalid(_: Thing) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub fn root() {}\n"),
+        ("src/orphan_target.rs", "pub struct Thing;\n"),
+        ("src/orphan_consumer.rs", orphan),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "orphan_target.Thing");
+    let invalid = orphan.find("invalid(_: Thing)").expect("orphan use") + "invalid(_: ".len();
+
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/orphan_consumer.rs") || hit.start_offset != invalid
+        }),
+        "analyzed files absent from every module tree must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_binary_only_passthrough_macro_owns_its_external_module() {
+    let main = r#"
+macro_rules! cfg_items { ($($item:item)*) => { $($item)* }; }
+cfg_items! { mod fixtures; }
+
+use crate::fixtures::VALUE;
+fn valid() { let _ = VALUE; }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nautolib = false\n",
+        ),
+        ("src/main.rs", main),
+        ("src/fixtures.rs", "pub const VALUE: usize = 1;\n"),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "fixtures._module_.VALUE");
+    let expected = main.find("let _ = VALUE").expect("binary use") + "let _ = ".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/main.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "VALUE".len()
+        }),
+        "the binary target must own modules emitted by its item-passthrough macro: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_nested_path_module_shares_its_cargo_target_without_escaping_workspace() {
+    let consumer = "use super::mapped::VALUE;\nfn valid() { let _ = VALUE; }\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod outer {\n    #[path = \"mapped.rs\"]\n    pub mod mapped;\n    pub mod consumer;\n}\n#[path = \"/outside.rs\"]\nmod outside;\n",
+        ),
+        ("src/outer/mapped.rs", "pub const VALUE: usize = 1;\n"),
+        ("src/outer/consumer.rs", consumer),
+    ]);
+    let hits = rust_graph_hits(&analyzer, "outer.mapped._module_.VALUE");
+    let expected = consumer.find("let _ = VALUE").expect("nested path use") + "let _ = ".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/outer/consumer.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "VALUE".len()
+        }),
+        "a contained nested #[path] module must inherit its actual Cargo target: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_unrooted_local_import_requires_shared_physical_owner() {
     let consumer = r#"
 use fixtures::MANIFESTS;
@@ -6805,11 +8444,12 @@ fn rust_binary_can_import_own_library_crate_name_through_alias() {
 use demo_app as own_library;
 use own_library::Item as LibraryItem;
 fn consume(_: LibraryItem) {}
+fn consume_absolute(_: ::demo_app::Item) {}
 "#;
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "Cargo.toml",
-            "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         ),
         ("src/lib.rs", "pub struct Item;\n"),
         ("src/main.rs", main),
@@ -6827,6 +8467,18 @@ fn consume(_: LibraryItem) {}
                 && hit.end_offset == expected + "LibraryItem".len()
         }),
         "a binary target must resolve its own Cargo library through an alias: {hits:#?}"
+    );
+    let absolute = main
+        .find("::demo_app::Item")
+        .expect("leading-absolute own-library use")
+        + "::demo_app::".len();
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/main.rs")
+                && hit.start_offset == absolute
+                && hit.end_offset == absolute + "Item".len()
+        }),
+        "a Rust 2018+ binary must resolve its own library through the extern prelude: {hits:#?}"
     );
 }
 
@@ -6865,4 +8517,1097 @@ fn valid(_: chained_model::Item) {}
         }),
         "a path dependency must retain External provenance through module aliases: {hits:#?}"
     );
+}
+
+#[test]
+fn rust_dependency_module_qualifier_from_nested_module_is_exact() {
+    let consumer = "pub fn consume(_: &toml_parser::parser::Event) {}\npub fn unrelated(_: &other_parser::parser::Event) {}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/toml_parser/Cargo.toml",
+            "[package]\nname = \"toml_parser\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/toml_parser/src/lib.rs", "pub mod parser;\n"),
+        ("crates/toml_parser/src/parser.rs", "pub struct Event;\n"),
+        (
+            "crates/other_parser/Cargo.toml",
+            "[package]\nname = \"other_parser\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/other_parser/src/lib.rs", "pub mod parser;\n"),
+        ("crates/other_parser/src/parser.rs", "pub struct Event;\n"),
+        (
+            "crates/toml/Cargo.toml",
+            "[package]\nname = \"toml\"\nversion = \"0.1.0\"\n[dependencies]\ntoml_parser = { path = \"../toml_parser\" }\nother_parser = { path = \"../other_parser\" }\n",
+        ),
+        ("crates/toml/src/lib.rs", "pub mod de;\n"),
+        ("crates/toml/src/de/mod.rs", "pub mod parser;\n"),
+        ("crates/toml/src/de/parser/mod.rs", "pub mod document;\n"),
+        ("crates/toml/src/de/parser/document.rs", consumer),
+    ]);
+    let target = definition(&analyzer, "crates.toml_parser.src.parser");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer.find("::parser").expect("module qualifier") + 2;
+    let unrelated = consumer.rfind("::parser").expect("unrelated qualifier") + 2;
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("crates/toml/src/de/parser/document.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "parser".len()
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "expected exact dependency module-qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("crates/toml/src/de/parser/document.rs")
+                || hit.start_offset != unrelated
+        }),
+        "a same-named module reached through another dependency must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_rooted_module_qualifier_inside_use_path_is_exact() {
+    let consumer =
+        "use crate::de::DeString;\nuse crate::other::de::Thing;\npub type Alias = DeString;\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"toml\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod de;\npub mod detable;\npub mod other { pub mod de { pub struct Thing; } }\n",
+        ),
+        ("src/de.rs", "pub struct DeString;\n"),
+        ("src/detable.rs", consumer),
+    ]);
+    let target = definition(&analyzer, "de");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer.find("::de").expect("module qualifier") + 2;
+    let unrelated = consumer.rfind("::de").expect("unrelated qualifier") + 2;
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/detable.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "de".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact module-prefix import hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/detable.rs") || hit.start_offset != unrelated
+        }),
+        "a nested same-named module qualifier must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_use_module_qualifier_reconstructs_outer_dependency_path() {
+    let consumer = "use toml_parser::{parser::Event};\nuse other_parser::{parser::Other};\npub fn consume(_: Event) {}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/toml_parser/Cargo.toml",
+            "[package]\nname = \"toml_parser\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/toml_parser/src/lib.rs", "pub mod parser;\n"),
+        ("crates/toml_parser/src/parser.rs", "pub struct Event;\n"),
+        (
+            "crates/other_parser/Cargo.toml",
+            "[package]\nname = \"other_parser\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/other_parser/src/lib.rs", "pub mod parser;\n"),
+        ("crates/other_parser/src/parser.rs", "pub struct Other;\n"),
+        (
+            "crates/app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ntoml_parser = { path = \"../toml_parser\" }\nother_parser = { path = \"../other_parser\" }\n",
+        ),
+        ("crates/app/src/lib.rs", consumer),
+    ]);
+    let target = definition(&analyzer, "crates.toml_parser.src.parser");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer.find("parser::Event").expect("grouped qualifier");
+    let unrelated = consumer.find("parser::Other").expect("collision qualifier");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("crates/app/src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "parser".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a grouped use qualifier must retain its outer dependency path: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("crates/app/src/lib.rs") || hit.start_offset != unrelated
+        }),
+        "the same qualifier under a different grouped dependency must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_glob_module_qualifier_reconstructs_outer_dependency_path() {
+    let consumer =
+        "use toml_parser::{parser::*};\nuse other_parser::{parser::*};\npub fn marker() {}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/toml_parser/Cargo.toml",
+            "[package]\nname = \"toml_parser\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/toml_parser/src/lib.rs", "pub mod parser;\n"),
+        ("crates/toml_parser/src/parser.rs", "pub struct Event;\n"),
+        (
+            "crates/other_parser/Cargo.toml",
+            "[package]\nname = \"other_parser\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/other_parser/src/lib.rs", "pub mod parser;\n"),
+        ("crates/other_parser/src/parser.rs", "pub struct Other;\n"),
+        (
+            "crates/app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ntoml_parser = { path = \"../toml_parser\" }\nother_parser = { path = \"../other_parser\" }\n",
+        ),
+        ("crates/app/src/lib.rs", consumer),
+    ]);
+    let target = definition(&analyzer, "crates.toml_parser.src.parser");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer.find("parser::*").expect("grouped glob qualifier");
+    let unrelated = consumer
+        .rfind("parser::*")
+        .expect("collision glob qualifier");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("crates/app/src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "parser".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a grouped glob qualifier must retain its outer dependency path: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("crates/app/src/lib.rs") || hit.start_offset != unrelated
+        }),
+        "the same glob qualifier under another dependency must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_leading_absolute_use_prefers_dependency_over_same_named_local_module() {
+    let app = r#"
+mod upstream;
+use ::upstream::{nested::Item};
+
+pub fn consume(_: Item) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/upstream/Cargo.toml",
+            "[package]\nname = \"upstream\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "crates/upstream/src/lib.rs",
+            "pub mod nested { pub struct Item; }\n",
+        ),
+        (
+            "crates/app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nupstream = { path = \"../upstream\" }\n",
+        ),
+        ("crates/app/src/lib.rs", app),
+        (
+            "crates/app/src/upstream.rs",
+            "pub mod nested { pub struct Item; }\n",
+        ),
+    ]);
+    let candidate = project.file("crates/app/src/lib.rs");
+    let files: HashSet<ProjectFile> = [candidate.clone()].into_iter().collect();
+    let import_item = app.find("Item};").expect("absolute grouped import item");
+
+    let dependency_item = definition(&analyzer, "crates.upstream.src.nested.Item");
+    let dependency_hits = authoritative_hits(&analyzer, &dependency_item, files.clone());
+    assert!(
+        dependency_hits.iter().any(|hit| {
+            hit.file == candidate
+                && hit.start_offset == import_item
+                && hit.kind == UsageHitKind::Import
+        }),
+        "leading-absolute grouped use must resolve through the Cargo dependency: {dependency_hits:#?}"
+    );
+
+    let local_item = definition(&analyzer, "crates.app.src.upstream.nested.Item");
+    let local_hits = authoritative_hits(&analyzer, &local_item, files);
+    assert!(
+        local_hits
+            .iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != import_item),
+        "a same-named local module must not capture a leading-absolute grouped use: {local_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_qualified_type_path_ignores_value_shadow_but_respects_item_shadow() {
+    let app = r#"
+pub fn value_shadow() {
+    let value = 0;
+    let _: Option<value::Type> = None; // VALUE_SHADOW
+}
+
+pub fn item_shadow() {
+    struct value;
+    let _: Option<value::Type> = None; // ITEM_SHADOW
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/value/Cargo.toml",
+            "[package]\nname = \"value\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/value/src/lib.rs", "pub struct Type;\n"),
+        (
+            "crates/app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nvalue = { path = \"../value\" }\n",
+        ),
+        ("crates/app/src/lib.rs", app),
+    ]);
+    let candidate = project.file("crates/app/src/lib.rs");
+    let target = definition(&analyzer, "crates.value.src.Type");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let value_shadow = app
+        .find("Type> = None; // VALUE_SHADOW")
+        .expect("value-shadowed qualified type");
+    let item_shadow = app
+        .find("Type> = None; // ITEM_SHADOW")
+        .expect("item-shadowed qualified type");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == candidate && hit.start_offset == value_shadow),
+        "a value binding must not shadow a qualified type/module root: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != item_shadow),
+        "a local item in the type namespace must shadow the imported module root: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_direct_module_imports_preserve_grouped_parent_and_lexical_module_routes() {
+    let app = r#"
+use tokio::{sync::Semaphore, task};
+use ::tokio::{task as absolute_task};
+use other_runtime::{task as other_task};
+
+pub fn run(_: Semaphore) {
+    task::spawn(); // GROUPED_MODULE
+    absolute_task::spawn(); // ABSOLUTE_GROUPED_MODULE
+    other_task::spawn(); // OTHER_DEPENDENCY
+}
+
+mod inline_consumer {
+    use tokio::{task};
+    pub fn run() { task::spawn(); } // INLINE_GROUPED_MODULE
+}
+"#;
+    let maybe_done_source = r#"
+pub fn maybe_done() {}
+mod miri_tests {
+    use super::maybe_done; // SUPER_MODULE_IMPORT
+    fn run() { maybe_done(); }
+}
+"#;
+    let bench = r#"
+use tokio::{sync::Semaphore, task};
+async fn task(_: Semaphore) {}
+fn run(value: Semaphore) { task::spawn(task(value)); } // SAME_PACKAGE_BENCH
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/tokio/Cargo.toml",
+            "[package]\nname = \"tokio\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "crates/tokio/src/lib.rs",
+            "pub mod sync;\npub mod task;\npub mod future;\n",
+        ),
+        ("crates/tokio/src/sync/mod.rs", "pub struct Semaphore;\n"),
+        ("crates/tokio/src/task/mod.rs", "pub fn spawn() {}\n"),
+        ("crates/tokio/src/future/mod.rs", "pub mod maybe_done;\n"),
+        ("crates/tokio/src/future/maybe_done.rs", maybe_done_source),
+        (
+            "crates/other_runtime/Cargo.toml",
+            "[package]\nname = \"other_runtime\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "crates/other_runtime/src/lib.rs",
+            "pub mod task { pub fn spawn() {} }\n",
+        ),
+        (
+            "crates/app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ntokio = { path = \"../tokio\" }\nother_runtime = { path = \"../other_runtime\" }\n",
+        ),
+        ("crates/app/src/lib.rs", app),
+        (
+            "crates/benches/Cargo.toml",
+            "[package]\nname = \"benches\"\nversion = \"0.1.0\"\n[dependencies]\ntokio = { path = \"../tokio\" }\n[[bench]]\nname = \"sync_semaphore\"\npath = \"sync_semaphore.rs\"\nharness = false\n",
+        ),
+        ("crates/benches/sync_semaphore.rs", bench),
+    ]);
+    let task = definition(&analyzer, "crates.tokio.src.task");
+    let task_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&task))
+        .all_hits_including_imports();
+    for marker in [
+        "task::spawn(); // GROUPED_MODULE",
+        "absolute_task::spawn(); // ABSOLUTE_GROUPED_MODULE",
+        "task::spawn(); } // INLINE_GROUPED_MODULE",
+    ] {
+        let expected = app.find(marker).expect("task module witness");
+        assert!(
+            task_hits.iter().any(|hit| {
+                hit.file == project.file("crates/app/src/lib.rs")
+                    && hit.start_offset == expected
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "missing direct grouped module reference `{marker}`: {task_hits:#?}"
+        );
+    }
+    let bench_reference = bench.find("task::spawn").expect("bench module witness");
+    assert!(
+        task_hits.iter().any(|hit| {
+            hit.file == project.file("crates/benches/sync_semaphore.rs")
+                && hit.start_offset == bench_reference
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "missing direct grouped module reference from a same-package Cargo bench: {task_hits:#?}"
+    );
+    let bench_hits = authoritative_hits(
+        &analyzer,
+        &task,
+        [project.file("crates/benches/sync_semaphore.rs")]
+            .into_iter()
+            .collect(),
+    );
+    assert!(
+        bench_hits
+            .iter()
+            .any(|hit| hit.start_offset == bench_reference),
+        "authoritative exact-file scope must retain the grouped module qualifier: {bench_hits:#?}"
+    );
+    let other = app.find("other_task::spawn").expect("dependency decoy");
+    assert!(
+        task_hits.iter().all(|hit| {
+            hit.file != project.file("crates/app/src/lib.rs") || hit.start_offset != other
+        }),
+        "same-named module from another dependency must remain unrelated: {task_hits:#?}"
+    );
+
+    let maybe_done = definition(&analyzer, "crates.tokio.src.future.maybe_done");
+    let maybe_done_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[maybe_done])
+        .all_hits_including_imports();
+    let super_use = maybe_done_source
+        .find("use super::maybe_done")
+        .expect("super import")
+        + "use super::".len();
+    assert!(
+        maybe_done_hits.iter().any(|hit| {
+            hit.file == project.file("crates/tokio/src/future/maybe_done.rs")
+                && hit.start_offset == super_use
+                && hit.kind == UsageHitKind::Import
+        }),
+        "missing same-named item imported through its enclosing module: {maybe_done_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_2015_leading_absolute_path_resolves_local_crate_module() {
+    let source = r#"
+mod local {
+    pub struct Type;
+}
+
+pub fn consume(_: ::local::Type) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"2015\"\n",
+        ),
+        ("src/lib.rs", source),
+    ]);
+    let candidate = project.file("src/lib.rs");
+    let target = analyzer
+        .declarations(&candidate)
+        .into_iter()
+        .find(|declaration| declaration.identifier() == "Type")
+        .expect("local Type definition");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let expected = source.find("Type) {}").expect("leading-absolute type");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == candidate && hit.start_offset == expected),
+        "Rust 2015 leading-absolute paths must retain crate-local module semantics: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_explicit_bench_resolves_leading_absolute_dev_dependency_path() {
+    let bench = r#"
+mod parser_dep {
+    pub mod decoder {
+        pub struct Encoding;
+    }
+}
+
+fn exercise(_: ::parser_dep::decoder::Encoding) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"3\"\n\n[workspace.package]\nedition = \"2024\"\n",
+        ),
+        (
+            "crates/parser-dep/Cargo.toml",
+            "[package]\nname = \"parser-dep\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+        ),
+        ("crates/parser-dep/src/lib.rs", "pub mod decoder;\n"),
+        (
+            "crates/parser-dep/src/decoder/mod.rs",
+            "pub struct Encoding;\n",
+        ),
+        (
+            "crates/benches/Cargo.toml",
+            "[package]\nname = \"benches\"\nversion = \"0.1.0\"\nedition.workspace = true\n\n[dev-dependencies]\nparser_dep = { package = \"parser-dep\", path = \"../parser-dep\" }\n\n[[bench]]\nname = \"routes\"\nharness = false\n",
+        ),
+        ("crates/benches/benches/routes.rs", bench),
+    ]);
+    let candidate = project.file("crates/benches/benches/routes.rs");
+    let candidates: HashSet<ProjectFile> = [candidate.clone()].into_iter().collect();
+
+    for (target_fqn, marker, expected_len) in [
+        (
+            "crates.parser-dep.src.decoder",
+            "decoder::Encoding",
+            "decoder".len(),
+        ),
+        (
+            "crates.parser-dep.src.decoder.Encoding",
+            "Encoding) {}",
+            "Encoding".len(),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = authoritative_hits(&analyzer, &target, candidates.clone());
+        let expected = bench.find(marker).expect("route witness");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && hit.start_offset == expected
+                    && hit.end_offset == expected + expected_len
+            }),
+            "missing authoritative explicit-bench route for {target_fqn}: {hits:#?}"
+        );
+    }
+
+    let local_encoding = analyzer
+        .declarations(&candidate)
+        .into_iter()
+        .find(|declaration| declaration.identifier() == "Encoding")
+        .expect("same-named local Encoding decoy");
+    let absolute_encoding = bench
+        .find("Encoding) {}")
+        .expect("absolute dependency type");
+    let local_hits = authoritative_hits(&analyzer, &local_encoding, candidates);
+    assert!(
+        local_hits
+            .iter()
+            .all(|hit| { hit.file != candidate || hit.start_offset != absolute_encoding }),
+        "a leading-absolute dependency path must not resolve through a same-named local module: {local_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_inline_test_super_glob_keeps_parent_imported_module_paths() {
+    let dispatcher = r#"
+use crate::{marker, span};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exercise(_: &span::Attributes) -> span::Id {
+        span::Id::from_u64(1)
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tracing-core\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "tracing-core/Cargo.toml",
+            "[package]\nname = \"tracing-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "tracing-core/src/lib.rs",
+            "pub mod dispatcher;\npub mod marker;\npub mod span;\n",
+        ),
+        ("tracing-core/src/marker.rs", "pub struct Marker;\n"),
+        (
+            "tracing-core/src/span.rs",
+            "pub struct Id;\npub struct Attributes;\nimpl Id { pub fn from_u64(_: u64) -> Self { Self } }\n",
+        ),
+        ("tracing-core/src/dispatcher.rs", dispatcher),
+    ]);
+    let candidate = project.file("tracing-core/src/dispatcher.rs");
+    let candidates: HashSet<ProjectFile> = [candidate.clone()].into_iter().collect();
+
+    for (fqn, marker) in [
+        ("tracing-core.src.span.Attributes", "Attributes"),
+        ("tracing-core.src.span.Id", "Id {"),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let hits = authoritative_hits(&analyzer, &target, candidates.clone());
+        let expected = dispatcher.find(marker).expect("scoped type reference");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.file == candidate && hit.start_offset == expected),
+            "missing inherited parent-module path for {fqn}: {hits:#?}"
+        );
+    }
+
+    let id = definition(&analyzer, "tracing-core.src.span.Id");
+    let id_hits = authoritative_hits(&analyzer, &id, candidates.clone());
+    for expected in dispatcher
+        .match_indices("span::Id")
+        .map(|(offset, _)| offset + "span::".len())
+    {
+        assert!(
+            id_hits
+                .iter()
+                .any(|hit| hit.file == candidate && hit.start_offset == expected),
+            "missing inherited span::Id reference at {expected}: {id_hits:#?}"
+        );
+    }
+
+    let span = definition(&analyzer, "tracing-core.src.span");
+    let span_hits = authoritative_hits(&analyzer, &span, candidates);
+    for expected in dispatcher.match_indices("span::").map(|(offset, _)| offset) {
+        assert!(
+            span_hits
+                .iter()
+                .any(|hit| hit.file == candidate && hit.start_offset == expected),
+            "missing inherited span module qualifier at {expected}: {span_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn rust_authoritative_examples_resolve_own_library_nested_types_and_aliases() {
+    let manifest_example =
+        "fn parse<T>() {}\nfn exercise() { parse::<::toml_benchmarks::manifest::Manifest>(); }\n";
+    let alias_example =
+        "fn exercise(_: comrak::nodes::AstNode) {}\nfn invalid(_: comrak::nodes::Private) {}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"toml-benchmarks\", \"comrak\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "toml-benchmarks/Cargo.toml",
+            "[package]\nname = \"toml_benchmarks\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("toml-benchmarks/src/lib.rs", "pub mod manifest;\n"),
+        ("toml-benchmarks/src/manifest.rs", "pub struct Manifest;\n"),
+        ("toml-benchmarks/examples/bench.rs", manifest_example),
+        (
+            "comrak/Cargo.toml",
+            "[package]\nname = \"comrak\"\nversion = \"0.1.0\"\n",
+        ),
+        ("comrak/src/lib.rs", "pub mod nodes;\n"),
+        (
+            "comrak/src/nodes.rs",
+            "pub type AstNode = usize;\npub(crate) struct Private;\n",
+        ),
+        ("comrak/examples/custom.rs", alias_example),
+    ]);
+
+    for (target_fqn, path, source, marker, expected_len) in [
+        (
+            "toml-benchmarks.src.manifest.Manifest",
+            "toml-benchmarks/examples/bench.rs",
+            manifest_example,
+            "Manifest>();",
+            "Manifest".len(),
+        ),
+        (
+            "comrak.src.nodes.AstNode",
+            "comrak/examples/custom.rs",
+            alias_example,
+            "AstNode) {}",
+            "AstNode".len(),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let candidate = project.file(path);
+        let hits = authoritative_hits(
+            &analyzer,
+            &target,
+            [candidate.clone()].into_iter().collect(),
+        );
+        let expected = source.find(marker).expect("own-library type witness");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && hit.start_offset == expected
+                    && hit.end_offset == expected + expected_len
+            }),
+            "missing authoritative own-library route for {target_fqn}: {hits:#?}"
+        );
+    }
+
+    let private = definition(&analyzer, "comrak.src.nodes.Private");
+    let alias_candidate = project.file("comrak/examples/custom.rs");
+    let private_hits = authoritative_hits(
+        &analyzer,
+        &private,
+        [alias_candidate.clone()].into_iter().collect(),
+    );
+    let private_reference = alias_example.find("Private) {}").expect("private witness");
+    assert!(
+        private_hits
+            .iter()
+            .all(|hit| { hit.file != alias_candidate || hit.start_offset != private_reference }),
+        "a separate example crate must not see a pub(crate) current-library type: {private_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_relative_module_alias_resolves_associated_owner_type() {
+    let consumer = r#"
+use super::value;
+fn exercise(value: &str) { value::ValueSerializer::with_style(); }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"toml\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "mod ser;\n"),
+        ("src/ser/mod.rs", "mod document;\nmod value;\n"),
+        ("src/ser/document.rs", consumer),
+        (
+            "src/ser/value.rs",
+            "pub struct ValueSerializer;\nimpl ValueSerializer { pub fn with_style() {} }\n",
+        ),
+    ]);
+    let target = definition(&analyzer, "ser.value.ValueSerializer");
+    let candidate = project.file("src/ser/document.rs");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let expected = consumer
+        .find("ValueSerializer::with_style")
+        .expect("associated owner");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "ValueSerializer".len()
+        }),
+        "relative module alias must retain the exact associated owner type: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_self_type_keeps_independent_example_identity() {
+    let first = "struct FooError;\nimpl FooError { fn new() -> Self { Self } }\n";
+    let second = "struct FooError;\nimpl FooError { fn new() -> Self { Self } }\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"examples\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "examples/Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\n\n[[example]]\nname = \"first\"\npath = \"examples/first.rs\"\n\n[[example]]\nname = \"second\"\npath = \"examples/second.rs\"\n",
+        ),
+        ("examples/src/lib.rs", "pub fn library_marker() {}\n"),
+        ("examples/examples/first.rs", first),
+        ("examples/examples/second.rs", second),
+    ]);
+    let first_file = project.file("examples/examples/first.rs");
+    let second_file = project.file("examples/examples/second.rs");
+    let target = analyzer
+        .declarations(&first_file)
+        .into_iter()
+        .find(|declaration| declaration.is_class() && declaration.identifier() == "FooError")
+        .expect("first example FooError");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [first_file.clone(), second_file.clone()]
+            .into_iter()
+            .collect(),
+    );
+    let expected = first.find("Self { Self").expect("first Self return type");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == first_file
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "Self".len())
+        }),
+        "same-FQN examples must retain the physical Self owner: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.file != second_file),
+        "the independent same-FQN example must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_self_call_resolves_separate_inherent_impl_by_physical_owner() {
+    let first = r#"
+trait Service { fn call(); }
+struct Svc;
+impl Service for Svc { fn call() { Self::handle_request(); } }
+impl Svc { fn handle_request() {} }
+"#;
+    let second = r#"
+trait Service { fn call(); }
+struct Svc;
+impl Service for Svc { fn call() { Self::handle_request(); } }
+impl Svc { fn handle_request() {} }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"examples\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "examples/Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\n\n[[example]]\nname = \"first\"\npath = \"examples/first.rs\"\n\n[[example]]\nname = \"second\"\npath = \"examples/second.rs\"\n",
+        ),
+        ("examples/src/lib.rs", "pub fn library_marker() {}\n"),
+        ("examples/examples/first.rs", first),
+        ("examples/examples/second.rs", second),
+    ]);
+    let first_file = project.file("examples/examples/first.rs");
+    let second_file = project.file("examples/examples/second.rs");
+    let target = analyzer
+        .exact_member(&first_file, "Svc", "handle_request", true)
+        .expect("first Svc::handle_request");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [first_file.clone(), second_file.clone()]
+            .into_iter()
+            .collect(),
+    );
+    let expected = first
+        .find("handle_request();")
+        .expect("first Self-associated terminal");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == first_file
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "handle_request".len())
+        }),
+        "Self in a trait impl must resolve a separate inherent impl on the same physical owner: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.file != second_file),
+        "an independent same-FQN owner must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_self_associated_type_keeps_physical_impl_owner() {
+    let first = r#"
+trait Service { type Future; fn call() -> Self::Future; }
+struct Svc;
+impl Service for Svc {
+    type Future = ();
+    fn call() -> Self::Future { () }
+}
+"#;
+    let second = r#"
+trait Service { type Future; fn call() -> Self::Future; }
+struct Svc;
+impl Service for Svc {
+    type Future = ();
+    fn call() -> Self::Future { () }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"examples\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "examples/Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\n\n[[example]]\nname = \"first\"\npath = \"examples/first.rs\"\n\n[[example]]\nname = \"second\"\npath = \"examples/second.rs\"\n",
+        ),
+        ("examples/src/lib.rs", "pub fn library_marker() {}\n"),
+        ("examples/examples/first.rs", first),
+        ("examples/examples/second.rs", second),
+    ]);
+    let first_file = project.file("examples/examples/first.rs");
+    let second_file = project.file("examples/examples/second.rs");
+    let target = analyzer
+        .exact_member(&first_file, "Svc", "Future", false)
+        .expect("first Svc::Future associated type");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [first_file.clone(), second_file.clone()]
+            .into_iter()
+            .collect(),
+    );
+    let expected = first
+        .rfind("Self::Future")
+        .expect("first associated type reference")
+        + "Self::".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == first_file
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "Future".len())
+        }),
+        "Self::Future must retain its physical trait-impl associated type: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.file != second_file),
+        "an independent same-FQN associated type must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_dependency_reexport_resolves_associated_call_owner() {
+    let consumer = "use tracing_error::ErrorLayer;\nfn install() { let _ = ErrorLayer::default(); let _ = ErrorLayer::hidden(); }\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tracing-error\", \"examples\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "tracing-error/Cargo.toml",
+            "[package]\nname = \"tracing-error\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "tracing-error/src/lib.rs",
+            "mod layer;\npub use self::layer::ErrorLayer;\n",
+        ),
+        (
+            "tracing-error/src/layer.rs",
+            "pub struct ErrorLayer;\nimpl Default for ErrorLayer { fn default() -> Self { Self } }\ntrait Hidden { fn hidden() -> Self; }\nimpl Hidden for ErrorLayer { fn hidden() -> Self { Self } }\n",
+        ),
+        (
+            "examples/Cargo.toml",
+            "[package]\nname = \"examples\"\nversion = \"0.1.0\"\n\n[dependencies]\ntracing_error = { package = \"tracing-error\", path = \"../tracing-error\" }\n",
+        ),
+        ("examples/src/lib.rs", consumer),
+    ]);
+    let target = analyzer
+        .exact_member(
+            &project.file("tracing-error/src/layer.rs"),
+            "ErrorLayer",
+            "default",
+            true,
+        )
+        .expect("ErrorLayer::default");
+    let candidate = project.file("examples/src/lib.rs");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let expected = consumer.rfind("default").expect("associated terminal");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "default".len())
+        }),
+        "an associated call through a dependency's public owner reexport must resolve physically: {hits:#?}"
+    );
+
+    let hidden = analyzer
+        .exact_member(
+            &project.file("tracing-error/src/layer.rs"),
+            "ErrorLayer",
+            "hidden",
+            true,
+        )
+        .expect("private Hidden::hidden impl");
+    let hidden_hits = authoritative_hits(
+        &analyzer,
+        &hidden,
+        [candidate.clone()].into_iter().collect(),
+    );
+    assert!(
+        hidden_hits.is_empty(),
+        "a private dependency trait must not become callable through its public impl owner: {hidden_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_authoritative_associated_member_declared_on_type_alias_is_scanned_as_member() {
+    let source = r#"
+pub enum EitherWriter<A, B> { A(A), B(B) }
+pub type OptionalWriter<T> = EitherWriter<T, ()>;
+
+impl<T> OptionalWriter<T> {
+    pub fn some(value: T) -> Self { EitherWriter::A(value) }
+}
+
+fn make() { let _ = OptionalWriter::some(1usize); }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let file = project.file("src/lib.rs");
+    let target = analyzer
+        .exact_member(&file, "OptionalWriter", "some", true)
+        .expect("OptionalWriter::some declaration");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+    let expected = source.rfind("some").expect("associated call terminal");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == file
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "some".len())
+        }),
+        "an impl member declared through a type alias must use member routing: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_cargo_dependency_kinds_scope_public_inverse_resolution() {
+    let library = r#"
+fn normal(_: normal_dep::Shared) {}
+#[cfg(test)]
+mod tests { fn development(_: dev_dep::Shared) {} }
+fn invalid_build(_: build_dep::Shared) {}
+"#;
+    let example = "fn development(_: dev_dep::Shared) {}\n";
+    let build_script =
+        "fn build_only(_: build_dep::Shared) {}\nfn invalid_normal(_: normal_dep::Shared) {}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\", \"normal\", \"development\", \"build-dep\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "normal/Cargo.toml",
+            "[package]\nname = \"normal-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("normal/src/lib.rs", "pub struct Shared;\n"),
+        (
+            "development/Cargo.toml",
+            "[package]\nname = \"development-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("development/src/lib.rs", "pub struct Shared;\n"),
+        (
+            "build-dep/Cargo.toml",
+            "[package]\nname = \"build-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("build-dep/src/lib.rs", "pub struct Shared;\n"),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nnormal_dep = { package = \"normal-package\", path = \"../normal\" }\n\n[dev-dependencies]\ndev_dep = { package = \"development-package\", path = \"../development\" }\n\n[build-dependencies]\nbuild_dep = { package = \"build-package\", path = \"../build-dep\" }\n",
+        ),
+        ("app/src/lib.rs", library),
+        ("app/examples/demo.rs", example),
+        ("app/build.rs", build_script),
+    ]);
+
+    let normal_hits = rust_graph_hits(&analyzer, "normal.src.Shared");
+    let normal = library.find("normal_dep::Shared").unwrap() + "normal_dep::".len();
+    let invalid_normal = build_script.find("normal_dep::Shared").unwrap() + "normal_dep::".len();
+    assert!(
+        normal_hits.iter().any(|hit| {
+            hit.file == project.file("app/src/lib.rs") && hit.start_offset == normal
+        }),
+        "{normal_hits:#?}"
+    );
+    assert!(normal_hits.iter().all(|hit| {
+        hit.file != project.file("app/build.rs") || hit.start_offset != invalid_normal
+    }));
+
+    let development_hits = rust_graph_hits(&analyzer, "development.src.Shared");
+    let unit_test = library.find("dev_dep::Shared").unwrap() + "dev_dep::".len();
+    let example_use = example.find("dev_dep::Shared").unwrap() + "dev_dep::".len();
+    for (path, start) in [
+        ("app/src/lib.rs", unit_test),
+        ("app/examples/demo.rs", example_use),
+    ] {
+        assert!(
+            development_hits
+                .iter()
+                .any(|hit| { hit.file == project.file(path) && hit.start_offset == start })
+        );
+    }
+
+    let build_hits = rust_graph_hits(&analyzer, "build-dep.src.Shared");
+    let build_use = build_script.find("build_dep::Shared").unwrap() + "build_dep::".len();
+    let invalid_build = library.find("build_dep::Shared").unwrap() + "build_dep::".len();
+    assert!(
+        build_hits.iter().any(|hit| {
+            hit.file == project.file("app/build.rs") && hit.start_offset == build_use
+        }),
+        "{build_hits:#?}"
+    );
+    assert!(build_hits.iter().all(|hit| {
+        hit.file != project.file("app/src/lib.rs") || hit.start_offset != invalid_build
+    }));
 }

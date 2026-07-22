@@ -1,7 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, ParameterMetadata, ProjectFile, Range, SignatureMetadata};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::{Node, Tree};
 
@@ -15,7 +15,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
     let mut parsed = ParsedFile::new(rust_package_name(file));
     let root = tree.root_node();
     collect_rust_type_identifiers(root, source, &mut parsed.type_identifiers);
-    let item_passthrough_macros = rust_item_passthrough_macros(root, source);
+    let item_macro_definitions = rust_rules_item_macro_definitions(root, source);
     let mut impl_import_binder = ImportBinder::empty();
 
     for index in 0..root.named_child_count() {
@@ -56,7 +56,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
-                    &item_passthrough_macros,
+                    &item_macro_definitions,
                     &mut parsed,
                 );
             }
@@ -97,7 +97,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
-                    &item_passthrough_macros,
+                    &item_macro_definitions,
                     &mut parsed,
                 );
             }
@@ -235,7 +235,7 @@ fn visit_rust_module(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
-    item_passthrough_macros: &HashSet<String>,
+    item_macro_definitions: &[RustRulesItemMacroDefinition],
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
@@ -296,7 +296,7 @@ fn visit_rust_module(
                         child,
                         Some(&code_unit),
                         package_name,
-                        item_passthrough_macros,
+                        item_macro_definitions,
                         parsed,
                     );
                 }
@@ -310,7 +310,7 @@ fn visit_rust_module(
                         child,
                         Some(&code_unit),
                         package_name,
-                        item_passthrough_macros,
+                        item_macro_definitions,
                         parsed,
                     );
                 }
@@ -422,13 +422,19 @@ fn visit_rust_macro_invocation_definitions(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
-    item_passthrough_macros: &HashSet<String>,
+    item_macro_definitions: &[RustRulesItemMacroDefinition],
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
-    let Some(invoked_macro) = rust_macro_invocation_name(node, source) else {
+    let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
         return;
     };
-    if !item_passthrough_macros.contains(invoked_macro) {
+    if !rust_latest_visible_rules_item_macro(
+        item_macro_definitions,
+        invoked_macro,
+        node.start_byte(),
+    )
+    .unwrap_or(false)
+    {
         return;
     }
 
@@ -496,17 +502,19 @@ fn rust_embedded_macro_match<'tree>(
         .then_some((macro_rules, name_node, body_node))
 }
 
-fn rust_macro_invocation_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+pub(super) fn rust_unqualified_macro_invocation_name<'a>(
+    node: Node<'_>,
+    source: &'a str,
+) -> Option<&'a str> {
     let macro_node = node.child_by_field_name("macro")?;
-    let name_node = match macro_node.kind() {
-        "scoped_identifier" => macro_node.child_by_field_name("name").unwrap_or(macro_node),
-        _ => macro_node,
-    };
-    let name = rust_node_text(name_node, source).trim();
+    if !rust_is_identifier_like(macro_node) {
+        return None;
+    }
+    let name = rust_node_text(macro_node, source).trim();
     (!name.is_empty()).then_some(name)
 }
 
-fn rust_macro_invocation_arguments(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn rust_macro_invocation_arguments(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("arguments").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor)
@@ -525,21 +533,218 @@ fn rust_is_identifier_like(node: Node<'_>) -> bool {
     )
 }
 
-fn rust_item_passthrough_macros(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut macros = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "macro_definition"
-            && rust_macro_definition_emits_item_parameter(node, source)
-            && let Some(name) = rust_macro_definition_name(node, source)
-        {
-            macros.insert(name.to_string());
-        }
+#[derive(Debug, Clone)]
+pub(super) struct RustRulesItemMacroDefinition {
+    pub(super) name: String,
+    pub(super) visible_after: usize,
+    pub(super) scope_start: usize,
+    pub(super) scope_end: usize,
+    pub(super) passthrough: bool,
+}
 
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+pub(super) fn rust_rules_item_macro_definitions(
+    root: Node<'_>,
+    source: &str,
+) -> Vec<RustRulesItemMacroDefinition> {
+    let mut definitions = Vec::new();
+    let mut pending_scopes = vec![root];
+    while let Some(scope) = pending_scopes.pop() {
+        let mut cursor = scope.walk();
+        let mut children = scope.named_children(&mut cursor).collect::<Vec<_>>();
+        children.reverse();
+        for child in children {
+            if child.kind() == "macro_definition" {
+                if let Some(name) = rust_macro_definition_name(child, source) {
+                    definitions.push((
+                        RustRulesItemMacroDefinition {
+                            name: name.to_string(),
+                            visible_after: child.end_byte(),
+                            scope_start: scope.start_byte(),
+                            scope_end: scope.end_byte(),
+                            passthrough: rust_macro_definition_all_rules_replay_item_parameters(
+                                child, source,
+                            ),
+                        },
+                        rust_macro_definition_item_delegate(child, source),
+                    ));
+                }
+                continue;
+            }
+            if child.kind() == "mod_item"
+                && let Some(body) = child.child_by_field_name("body")
+            {
+                pending_scopes.push(body);
+            }
+        }
     }
-    macros
+    definitions.sort_by_key(|(definition, _)| definition.visible_after);
+    loop {
+        let mut changed = false;
+        for index in 0..definitions.len() {
+            if definitions[index].0.passthrough {
+                continue;
+            }
+            let Some(delegate) = definitions[index].1.as_deref() else {
+                continue;
+            };
+            let wrapper = &definitions[index].0;
+            let delegated = definitions[..index]
+                .iter()
+                .filter(|(definition, _)| {
+                    definition.name == delegate
+                        && definition.visible_after <= wrapper.visible_after
+                        && definition.scope_start <= wrapper.visible_after
+                        && wrapper.visible_after < definition.scope_end
+                })
+                .max_by_key(|(definition, _)| (definition.scope_start, definition.visible_after))
+                .is_some_and(|(definition, _)| definition.passthrough);
+            if delegated {
+                definitions[index].0.passthrough = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    definitions
+        .into_iter()
+        .map(|(definition, _)| definition)
+        .collect()
+}
+
+fn rust_macro_definition_item_delegate(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let rules: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "macro_rule")
+        .collect();
+    let mut delegate = None;
+    for rule in rules {
+        let candidate = rust_macro_rule_item_delegate(rule, source)?;
+        if delegate.as_ref().is_some_and(|known| known != &candidate) {
+            return None;
+        }
+        delegate = Some(candidate);
+    }
+    delegate
+}
+
+fn rust_macro_rule_item_delegate(rule: Node<'_>, source: &str) -> Option<String> {
+    let pattern = rule.child_by_field_name("left")?;
+    let expansion = rule.child_by_field_name("right")?;
+    let item_parameters = rust_macro_rule_item_parameters(pattern, source);
+    if item_parameters.is_empty()
+        || !rust_macro_rule_matcher_is_item_stream(pattern, source, &item_parameters)
+    {
+        return None;
+    }
+
+    let mut cursor = expansion.walk();
+    let children = expansion.children(&mut cursor).collect::<Vec<_>>();
+    let mut index = 1;
+    let end = children.len().checked_sub(1)?;
+    while index + 1 < end
+        && children[index].kind() == "#"
+        && rust_is_conditional_attribute_token_tree(children[index + 1], source)
+    {
+        index += 2;
+    }
+    let name = *children.get(index)?;
+    let bang = *children.get(index + 1)?;
+    let arguments = *children.get(index + 2)?;
+    if index + 3 != end
+        || !rust_is_identifier_like(name)
+        || bang.kind() != "!"
+        || arguments.kind() != "token_tree"
+        || !rust_macro_delegate_arguments_replay_items(arguments, source, &item_parameters)
+    {
+        return None;
+    }
+    Some(rust_node_text(name, source).trim().to_string())
+}
+
+fn rust_is_conditional_attribute_token_tree(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "token_tree"
+        && node.child(0).is_some_and(|child| child.kind() == "[")
+        && node
+            .child(node.child_count().saturating_sub(1))
+            .is_some_and(|child| child.kind() == "]")
+        && node
+            .named_child(0)
+            .filter(|child| rust_is_identifier_like(*child))
+            .map(|child| rust_node_text(child, source).trim())
+            .is_some_and(|name| matches!(name, "cfg" | "cfg_attr"))
+}
+
+fn rust_macro_delegate_arguments_replay_items(
+    arguments: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut cursor = arguments.walk();
+    let children = arguments.children(&mut cursor).collect::<Vec<_>>();
+    let Some(inner) = children.get(1..children.len().saturating_sub(1)) else {
+        return false;
+    };
+    if inner.is_empty()
+        || inner.iter().any(|child| {
+            child.kind() != "token_repetition"
+                || !rust_item_repetition_replays_parameters(*child, source, item_parameters)
+        })
+    {
+        return false;
+    }
+    let mut seen = HashMap::default();
+    for child in inner {
+        let mut pending = vec![*child];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "metavariable" {
+                *seen
+                    .entry(rust_node_text(node, source).trim().to_string())
+                    .or_insert(0usize) += 1;
+                continue;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    item_parameters
+        .keys()
+        .all(|parameter| seen.get(parameter) == Some(&1))
+        && seen.len() == item_parameters.len()
+}
+
+fn rust_item_repetition_replays_parameters(
+    repetition: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut cursor = repetition.walk();
+    repetition
+        .children(&mut cursor)
+        .all(|child| match child.kind() {
+            "$" | "(" | ")" | "*" | "+" | "?" => true,
+            "metavariable" => item_parameters.contains_key(rust_node_text(child, source).trim()),
+            _ => false,
+        })
+}
+
+fn rust_latest_visible_rules_item_macro(
+    definitions: &[RustRulesItemMacroDefinition],
+    name: &str,
+    invocation_start: usize,
+) -> Option<bool> {
+    definitions
+        .iter()
+        .filter(|definition| {
+            definition.name == name
+                && definition.visible_after <= invocation_start
+                && definition.scope_start <= invocation_start
+                && invocation_start < definition.scope_end
+        })
+        .max_by_key(|definition| (definition.scope_start, definition.visible_after))
+        .map(|definition| definition.passthrough)
 }
 
 fn rust_macro_definition_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -548,67 +753,190 @@ fn rust_macro_definition_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a
     (!name.is_empty()).then_some(name)
 }
 
-fn rust_macro_definition_emits_item_parameter(node: Node<'_>, source: &str) -> bool {
+fn rust_macro_definition_all_rules_replay_item_parameters(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).any(|child| {
-        child.kind() == "macro_rule" && rust_macro_rule_emits_item_parameter(child, source)
-    })
+    let rules: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "macro_rule")
+        .collect();
+    !rules.is_empty()
+        && rules
+            .into_iter()
+            .all(|rule| rust_macro_rule_replays_item_parameters(rule, source))
 }
 
-fn rust_macro_rule_emits_item_parameter(rule: Node<'_>, source: &str) -> bool {
-    let mut cursor = rule.walk();
-    let mut children = rule.named_children(&mut cursor);
-    let Some(pattern) = children.find(|child| child.kind() == "token_tree_pattern") else {
+fn rust_macro_rule_replays_item_parameters(rule: Node<'_>, source: &str) -> bool {
+    let Some(pattern) = rule.child_by_field_name("left") else {
         return false;
     };
-    let Some(expansion) = children.find(|child| child.kind() == "token_tree") else {
+    let Some(expansion) = rule.child_by_field_name("right") else {
         return false;
     };
 
     let item_parameters = rust_macro_rule_item_parameters(pattern, source);
-    if item_parameters.is_empty() {
+    if item_parameters.is_empty()
+        || !rust_macro_rule_matcher_is_item_stream(pattern, source, &item_parameters)
+    {
         return false;
     }
 
-    let mut expansion_cursor = expansion.walk();
-    expansion
-        .named_children(&mut expansion_cursor)
-        .filter(|child| child.kind() == "metavariable")
-        .map(|child| rust_node_text(child, source).trim())
-        .any(|metavariable| item_parameters.contains(metavariable))
+    let mut occurrences: HashMap<String, usize> = HashMap::default();
+    let mut stack = vec![expansion];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "metavariable" {
+            let name = rust_node_text(node, source).trim();
+            let Some(pattern_depth) = item_parameters.get(name) else {
+                continue;
+            };
+            let mut repetition_depth = 0;
+            let mut ancestor = node;
+            loop {
+                let Some(parent) = ancestor.parent() else {
+                    return false;
+                };
+                if parent == expansion {
+                    break;
+                }
+                if parent.kind() != "token_repetition" {
+                    return false;
+                }
+                repetition_depth += 1;
+                ancestor = parent;
+            }
+            if repetition_depth != *pattern_depth {
+                return false;
+            }
+            *occurrences.entry(name.to_string()).or_default() += 1;
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    item_parameters
+        .keys()
+        .all(|parameter| occurrences.get(parameter) == Some(&1))
 }
 
-fn rust_macro_rule_item_parameters(pattern: Node<'_>, source: &str) -> HashSet<String> {
-    let mut parameters = HashSet::default();
-    let mut stack = vec![pattern];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "token_binding_pattern" {
-            let mut metavariable = None;
-            let mut is_item = false;
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                match child.kind() {
-                    "metavariable" => {
-                        let text = rust_node_text(child, source).trim();
-                        if !text.is_empty() {
-                            metavariable = Some(text.to_string());
-                        }
-                    }
-                    "fragment_specifier" => {
-                        is_item = rust_node_text(child, source).trim() == "item";
-                    }
-                    _ => {}
-                }
-            }
-            if is_item && let Some(metavariable) = metavariable {
-                parameters.insert(metavariable);
+fn rust_macro_rule_item_parameters(pattern: Node<'_>, source: &str) -> HashMap<String, usize> {
+    let mut parameters = HashMap::default();
+    let mut stack = vec![(pattern, 0)];
+    while let Some((node, repetition_depth)) = stack.pop() {
+        if node.kind() == "token_binding_pattern"
+            && rust_macro_binding_fragment(node, source) == Some("item")
+            && let Some(metavariable) = node.child_by_field_name("name")
+        {
+            let name = rust_node_text(metavariable, source).trim();
+            if !name.is_empty() {
+                parameters.insert(name.to_string(), repetition_depth);
             }
         }
 
         let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        stack.extend(node.named_children(&mut cursor).map(|child| {
+            (
+                child,
+                repetition_depth + usize::from(child.kind() == "token_repetition_pattern"),
+            )
+        }));
     }
     parameters
+}
+
+fn rust_macro_binding_fragment<'a>(binding: Node<'_>, source: &'a str) -> Option<&'a str> {
+    binding
+        .child_by_field_name("type")
+        .map(|fragment| rust_node_text(fragment, source).trim())
+}
+
+fn rust_macro_rule_matcher_is_item_stream(
+    pattern: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut cursor = pattern.walk();
+    let children = pattern.children(&mut cursor).collect::<Vec<_>>();
+    let mut index = 1;
+    let end = children.len().saturating_sub(1);
+    while index < end {
+        let child = children[index];
+        match child.kind() {
+            "token_binding_pattern" => {
+                if rust_macro_binding_fragment(child, source) != Some("item") {
+                    return false;
+                }
+                index += 1;
+            }
+            "token_repetition_pattern" => {
+                if !rust_item_repetition_pattern_is_safe(child, source, item_parameters) {
+                    return false;
+                }
+                index += 1;
+            }
+            "#" => {
+                index += 1;
+                if index < end && children[index].kind() == "!" {
+                    index += 1;
+                }
+                if index >= end
+                    || children[index].kind() != "token_tree_pattern"
+                    || !rust_attribute_meta_pattern_is_safe(children[index], source)
+                {
+                    return false;
+                }
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn rust_item_repetition_pattern_is_safe(
+    repetition: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut saw_item = false;
+    let mut cursor = repetition.walk();
+    for child in repetition.children(&mut cursor) {
+        match child.kind() {
+            "$" | "(" | ")" | "*" | "+" | "?" => {}
+            "token_binding_pattern" => {
+                let Some(name) = child.child_by_field_name("name") else {
+                    return false;
+                };
+                let name = rust_node_text(name, source).trim();
+                if rust_macro_binding_fragment(child, source) != Some("item")
+                    || !item_parameters.contains_key(name)
+                {
+                    return false;
+                }
+                saw_item = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_item
+}
+
+fn rust_attribute_meta_pattern_is_safe(attribute: Node<'_>, source: &str) -> bool {
+    let mut saw_meta = false;
+    let mut pending = vec![attribute];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "token_binding_pattern" {
+            if rust_macro_binding_fragment(node, source) != Some("meta") {
+                return false;
+            }
+            saw_meta = true;
+            continue;
+        }
+        if node != attribute && node.kind() == "token_tree_pattern" {
+            return false;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    saw_meta
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1118,6 +1446,92 @@ pub(super) fn collect_rust_type_identifiers(
             if let Some(child) = node.named_child(index) {
                 pending.push(child);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod passthrough_macro_tests {
+    use super::*;
+
+    #[test]
+    fn item_passthrough_classifier_requires_a_safe_matcher_and_faithful_replay() {
+        let source = r#"
+macro_rules! replay { ($($item:item)*) => { $( #[cfg(any())] $item )* }; }
+macro_rules! feature { (#![$meta:meta] $($item:item)*) => { $( #[$meta] $item )* }; }
+macro_rules! base { ($($item:item)*) => { $( #[cfg(any())] $item )* }; }
+macro_rules! delegated { ($($item:item)*) => { #[cfg(unix)] base! { $($item)* } }; }
+macro_rules! attributed_nested { ($($item:item)*) => { #[allow(dead_code)] base! { $($item)* } }; }
+macro_rules! dropped { ($($left:item)* $($right:item)*) => { $($left)* }; }
+macro_rules! stringified { ($($item:item)*) => { stringify!($($item)*) }; }
+macro_rules! nested { ($($item:item)*) => { wrapper! { $($item)* } }; }
+macro_rules! mixed { ($name:ident, $item:item) => { $item }; }
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let definitions = rust_rules_item_macro_definitions(tree.root_node(), source)
+            .into_iter()
+            .map(|definition| (definition.name, definition.passthrough))
+            .collect::<HashMap<_, _>>();
+
+        for name in ["replay", "feature", "base", "delegated"] {
+            assert_eq!(definitions.get(name), Some(&true), "{name}");
+        }
+        for name in [
+            "attributed_nested",
+            "dropped",
+            "stringified",
+            "nested",
+            "mixed",
+        ] {
+            assert_eq!(definitions.get(name), Some(&false), "{name}");
+        }
+    }
+
+    #[test]
+    fn declaration_expansion_uses_the_latest_visible_same_name_macro() {
+        let source = r#"
+macro_rules! wrapper { ($($item:item)*) => { $($item)* }; }
+wrapper! { macro_rules! Before { () => {} } }
+macro_rules! wrapper { (drop $name:ident) => {}; }
+wrapper! { macro_rules! Phantom { () => {} } }
+mod inline_scope {
+    macro_rules! wrapper { ($($item:item)*) => { $($item)* }; }
+    wrapper! { macro_rules! InlineGenerated { () => {} } }
+}
+wrapper! { macro_rules! OutsidePhantom { () => {} } }
+other::wrapper! { macro_rules! QualifiedPhantom { () => {} } }
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "src/lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+        let macros = parsed
+            .top_level_declarations
+            .iter()
+            .chain(parsed.children.values().flatten())
+            .filter(|unit| unit.is_macro())
+            .map(|unit| unit.identifier())
+            .collect::<HashSet<_>>();
+
+        for expected in ["Before", "InlineGenerated"] {
+            assert!(macros.contains(expected), "missing {expected}: {macros:?}");
+        }
+        for phantom in ["Phantom", "OutsidePhantom", "QualifiedPhantom"] {
+            assert!(
+                !macros.contains(phantom),
+                "unexpected {phantom}: {macros:?}"
+            );
         }
     }
 }

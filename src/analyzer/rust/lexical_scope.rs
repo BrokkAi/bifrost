@@ -95,6 +95,34 @@ pub(crate) fn visible_import_binder_at(source: &str, reference_byte: usize) -> I
     visible_import_binder_in_tree(tree.root_node(), source, reference_byte)
 }
 
+pub(crate) fn visible_import_binders_at(source: &str, reference_byte: usize) -> Vec<ImportBinder> {
+    let Some(tree) = parse_rust_tree(source) else {
+        return Vec::new();
+    };
+    visible_import_binders_in_tree(tree.root_node(), source, reference_byte)
+}
+
+fn visible_import_binders_in_tree(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> Vec<ImportBinder> {
+    let mut imports = Vec::new();
+    collect_visible_use_statements(root, reference_byte, &mut imports);
+    let mut by_scope: HashMap<(usize, usize), ImportBinder> = HashMap::default();
+    for node in imports {
+        let scope =
+            enclosing_visibility_scope_range(node).unwrap_or((root.start_byte(), root.end_byte()));
+        let binder = by_scope.entry(scope).or_default();
+        for import in rust_imports_from_use_declaration(node, source) {
+            insert_rust_import_binding(binder, &import);
+        }
+    }
+    let mut binders: Vec<_> = by_scope.into_iter().collect();
+    binders.sort_by_key(|((start, end), _)| (end.saturating_sub(*start), *start));
+    binders.into_iter().map(|(_, binder)| binder).collect()
+}
+
 pub(crate) fn visible_import_binder_in_tree(
     root: Node<'_>,
     source: &str,
@@ -500,7 +528,13 @@ fn collect_visible_local_items(
         for node in scope.named_children(&mut cursor) {
             if matches!(
                 node.kind(),
-                "struct_item" | "enum_item" | "trait_item" | "type_item" | "function_item"
+                "struct_item"
+                    | "enum_item"
+                    | "trait_item"
+                    | "type_item"
+                    | "function_item"
+                    | "const_item"
+                    | "static_item"
             ) {
                 collect_local_item_name(node, source, out);
             }
@@ -549,6 +583,7 @@ fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> b
     let mut stack = vec![pattern];
     while let Some(node) = stack.pop() {
         match node.kind() {
+            "scoped_identifier" | "scoped_type_identifier" => {}
             "identifier" | "shorthand_field_identifier" => {
                 if node.id() == target.id() {
                     return true;
@@ -654,6 +689,7 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         match node.kind() {
+            "scoped_identifier" | "scoped_type_identifier" => {}
             "identifier" => {
                 let text = node_text(node, source).trim();
                 if !text.is_empty() {

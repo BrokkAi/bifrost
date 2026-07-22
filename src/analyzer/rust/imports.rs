@@ -6,7 +6,7 @@ use tree_sitter::Node;
 use super::RustAnalyzer;
 use super::declarations::{rust_node_text, rust_package_name};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RustVisibility {
     Private,
     Public,
@@ -163,6 +163,7 @@ fn simple_segment(node: Node<'_>, source: &str) -> Option<String> {
 
 pub(crate) struct RustFocusedUsePath<'tree> {
     pub(crate) full_path: String,
+    pub(crate) segments: Vec<String>,
     pub(crate) root: Node<'tree>,
 }
 
@@ -217,19 +218,19 @@ pub(crate) fn rust_focused_use_path<'tree>(
 
     path_nodes.reverse();
     let root = rust_use_path_root(*path_nodes.first()?);
-    let mut full_path = String::new();
+    let mut segments = Vec::new();
     let path_node_count = path_nodes.len();
     for node in path_nodes {
         if node.kind() == "self" && path_node_count > 1 {
             continue;
         }
-        let part = rust_use_path_text(node, source)?;
-        if !full_path.is_empty() {
-            full_path.push_str("::");
-        }
-        full_path.push_str(&part);
+        segments.extend(rust_use_path_segments(node, source));
     }
-    (!full_path.is_empty()).then_some(RustFocusedUsePath { full_path, root })
+    (!segments.is_empty()).then(|| RustFocusedUsePath {
+        full_path: segments.join("::"),
+        segments,
+        root,
+    })
 }
 
 fn node_contains(container: Node<'_>, node: Node<'_>) -> bool {
@@ -484,7 +485,7 @@ pub(super) fn rust_item_visibility(node: Node<'_>, source: &str) -> RustVisibili
         .unwrap_or(RustVisibility::Private)
 }
 
-fn rust_visibility_from_modifier(node: Node<'_>, source: &str) -> RustVisibility {
+pub(super) fn rust_visibility_from_modifier(node: Node<'_>, source: &str) -> RustVisibility {
     if node.kind() == "crate" {
         return RustVisibility::Crate;
     }
@@ -510,33 +511,6 @@ fn rust_visibility_from_modifier(node: Node<'_>, source: &str) -> RustVisibility
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
-}
-
-fn rust_use_path_text(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "crate" | "identifier" | "metavariable" | "self" | "super" => {
-            let text = rust_node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        "scoped_identifier" => {
-            let path = node
-                .child_by_field_name("path")
-                .and_then(|child| rust_use_path_text(child, source));
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|child| rust_use_path_text(child, source))?;
-            Some(join_rust_path(path.as_deref(), &name))
-        }
-        _ => None,
-    }
-}
-
-fn join_rust_path(prefix: Option<&str>, path: &str) -> String {
-    match prefix {
-        Some(prefix) if !prefix.is_empty() && !path.is_empty() => format!("{prefix}::{path}"),
-        Some(prefix) if !prefix.is_empty() => prefix.to_string(),
-        _ => path.to_string(),
-    }
 }
 
 fn rust_import_info(
