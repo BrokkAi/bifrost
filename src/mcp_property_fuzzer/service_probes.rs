@@ -284,6 +284,9 @@ pub struct ProbeSummary {
     /// package/module declaration, whose "path" is a convention rather than
     /// a per-file contract.
     pub skipped_module_summary_element: usize,
+    /// Summary probes skipped for empty files (e.g. 0-byte `__init__.py`):
+    /// an all-empty response is a valid result there, not a refusal.
+    pub skipped_empty_file_summaries: usize,
     /// I2 probes skipped because the sampled symbol is a module unit, whose
     /// name is its file, not a selector-resolvable symbol.
     pub symbols_excluded_module_spelling: usize,
@@ -779,7 +782,17 @@ fn generate_probes(
         for &index in &service_symbols {
             let symbol = &input.symbols[index];
             let file = &input.files[symbol.file_index];
-            if seen_files.insert(file.path.clone()) {
+            // Empty files (e.g. 0-byte `__init__.py` package markers) have
+            // nothing to summarize; an all-empty response is a valid result,
+            // not a refusal (the celery/freqtrade I5 false fires).
+            let empty_file = file
+                .text
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty());
+            if empty_file {
+                summary.skipped_empty_file_summaries += 1;
+            }
+            if seen_files.insert(file.path.clone()) && !empty_file {
                 probes.push(ProbeRecord {
                     id: format!("i3:get_summaries:{}", file.path),
                     tool: "get_summaries",
@@ -1912,16 +1925,21 @@ pub fn check_i3a(
             // an ambiguity answer is consistent when it offers the listed
             // file's own `path#symbol` selector, because the listing itself
             // supplies the disambiguating path (an agent following the
-            // summary resolves in one guided re-call). The violation is
-            // resolvability from the listing context: a hard not_found, or
-            // matches that exclude the listed path (the bfg shape, where the
-            // emitted spelling maps to no exact declaration at all).
+            // summary resolves in one guided re-call). It is also consistent
+            // when the ambiguity offers the listed name itself — the element
+            // resolves by name (laravel's identical types/ stub twins).
+            // The violation is resolvability from the listing context: a hard
+            // not_found, or matches that offer only *other* names — never the
+            // listed one (the bfg shape: `LFS.Pointer` offered only
+            // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
             let own_selector = format!("{element_path}#");
             let resolvable_from_listing = array_field(structured, "ambiguous")
                 .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
                 .flatten()
                 .filter_map(Value::as_str)
-                .any(|candidate| candidate.starts_with(&own_selector));
+                .any(|candidate| {
+                    candidate.starts_with(&own_selector) || candidate == record.symbol_fq
+                });
             if !resolvable_from_listing {
                 sink.record(violation(
                     InvariantKind::I3,

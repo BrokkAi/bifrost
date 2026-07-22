@@ -1326,3 +1326,67 @@ fn ts_module_units_are_excluded_from_spelling_probes() {
     );
     assert!(report.violations.is_empty(), "{:?}", report.violations);
 }
+
+// A 0-byte `__init__.py` yields an all-empty (valid) summaries response;
+// probing it must not fire I5's empty-refusal (the celery/freqtrade shape).
+#[test]
+fn empty_init_files_are_skipped_for_summary_probes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("examples/pkg/__init__.py", "")
+        .file("examples/pkg/core.py", "def core():\n    return 1\n")
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("py"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    let summary = report.probe_summary.as_ref().expect("probe summary");
+    assert!(
+        summary.skipped_empty_file_summaries > 0,
+        "empty file should be skipped: {summary:?}"
+    );
+    assert!(
+        !report
+            .violations
+            .iter()
+            .any(|violation| violation.shape == "empty-failure-hint"),
+        "empty-file summary is not a refusal: {:?}",
+        report.violations
+    );
+}
+
+// The laravel types/-stub twin shape: the listed name itself is offered as
+// an ambiguity selector (resolves to an identical twin), so the element is
+// resolvable from its listing context — unlike the bfg shape, where only
+// alternative names are offered and the listed one never resolves.
+#[test]
+fn i3a_silent_when_ambiguity_offers_the_listed_name_itself() {
+    let mut probe = record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "types/Support/LazyCollection.php".to_string(),
+        },
+        json!({
+            "ambiguous": [{
+                "target": "Users",
+                "matches": ["Illuminate.Tests.Auth.PasswordBrokerName.Users", "Users"]
+            }],
+            "not_found": [],
+            "sources": []
+        }),
+    );
+    probe.symbol_fq = "Users".to_string();
+    let records = vec![probe];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}
