@@ -211,6 +211,19 @@ where
     pub(crate) fn edge_count(&self) -> usize {
         self.outgoing.len()
     }
+
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>() as u64)
+            .saturating_add(
+                (self.nodes.len() as u64).saturating_mul(std::mem::size_of::<K>() as u64),
+            )
+            .saturating_add(
+                (self.index_by_node.capacity() as u64)
+                    .saturating_mul((std::mem::size_of::<(K, u32)>() + 1) as u64),
+            )
+            .saturating_add(self.outgoing.estimated_bytes())
+            .saturating_add(self.incoming.estimated_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +266,6 @@ mod tests {
         assert_eq!(graph.outgoing(0), [1, 2]);
         assert_eq!(graph.incoming(1), [0, 2]);
         assert_eq!(graph.node_id(&"c"), Some(2));
+        assert!(graph.estimated_bytes() > 0);
     }
 }

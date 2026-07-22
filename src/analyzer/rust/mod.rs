@@ -528,6 +528,12 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        self.inner.snapshot_derived_layer_cache()
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }

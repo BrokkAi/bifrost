@@ -1354,6 +1354,10 @@ pub struct TreeSitterAnalyzer<A> {
     /// Complete immutable postings for this exact analyzer generation.
     /// Ordinary clones share the owner; updates and overlays replace it.
     structural_index_cache: Arc<crate::analyzer::structural::index::SnapshotStructuralIndexCache>,
+    /// Complete immutable typed relations for this exact analyzer snapshot.
+    /// Ordinary clones share the owner; updates and overlays replace it.
+    derived_layer_cache:
+        Arc<crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache>,
     semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
     store_context: AnalyzerStoreContext,
     /// Per-request persisted read model. Live OIDs are validated once and
@@ -1392,6 +1396,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             state: Arc::clone(&self.state),
             structural_cache: Arc::clone(&self.structural_cache),
             structural_index_cache: Arc::clone(&self.structural_index_cache),
+            derived_layer_cache: Arc::clone(&self.derived_layer_cache),
             semantic_cache: self.semantic_cache.clone(),
             store_context: self.store_context.clone(),
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
@@ -1431,6 +1436,11 @@ impl<A> TreeSitterAnalyzer<A> {
         snapshot.project = project;
         snapshot.structural_index_cache = Arc::new(
             crate::analyzer::structural::index::SnapshotStructuralIndexCache::new(
+                self.config.memo_cache_budget_bytes() / 8,
+            ),
+        );
+        snapshot.derived_layer_cache = Arc::new(
+            crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::new(
                 self.config.memo_cache_budget_bytes() / 8,
             ),
         );
@@ -1558,6 +1568,7 @@ where
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
         let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
+        let derived_layer_cache = Arc::new(Self::build_derived_layer_cache(&config));
         let semantic_cache = crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
             config.memo_cache_budget_bytes() / 8,
         );
@@ -1568,6 +1579,7 @@ where
             state,
             structural_cache,
             structural_index_cache,
+            derived_layer_cache,
             semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
@@ -1628,6 +1640,20 @@ where
         &self,
     ) -> &crate::analyzer::structural::index::SnapshotStructuralIndexCache {
         &self.structural_index_cache
+    }
+
+    fn build_derived_layer_cache(
+        config: &AnalyzerConfig,
+    ) -> crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache {
+        crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::new(
+            config.memo_cache_budget_bytes() / 8,
+        )
+    }
+
+    pub(crate) fn derived_layer_cache(
+        &self,
+    ) -> &crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache {
+        &self.derived_layer_cache
     }
 
     pub(crate) fn materialize_semantics_with_lowerer(
@@ -1737,6 +1763,7 @@ where
             FileStateCache::new(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
         let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
+        let derived_layer_cache = Arc::new(Self::build_derived_layer_cache(&config));
         Self {
             project,
             adapter,
@@ -1744,6 +1771,7 @@ where
             state: Arc::new(state),
             structural_cache,
             structural_index_cache,
+            derived_layer_cache,
             semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
@@ -5662,6 +5690,12 @@ where
         } else {
             Vec::new()
         }
+    }
+
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        Some(self.derived_layer_cache())
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {

@@ -366,6 +366,15 @@ pub trait IAnalyzer: Send + Sync + Any {
         Vec::new()
     }
 
+    /// Snapshot-owned immutable derived query layers. Concrete analyzers keep
+    /// the default when they cannot bind a complete snapshot lifecycle.
+    #[doc(hidden)]
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        None
+    }
+
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
         if query.is_empty() {
             return Vec::new();

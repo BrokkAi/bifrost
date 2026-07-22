@@ -184,6 +184,17 @@ def _code_query_profile_payload() -> dict:
                     "replayed_files": 1,
                 },
             },
+            {
+                "layer": "direct_import_topology",
+                "metrics": {
+                    "kind": "complete_value",
+                    "lookups": 1,
+                    "hits": 1,
+                    "build_files": 3,
+                    "build_edges": 2,
+                    "retained_bytes": 256,
+                },
+            },
         ],
         "access_path": {
             "selected": "posting:kind+name",
@@ -354,6 +365,13 @@ class CodeQueryModelTest(unittest.TestCase):
             response.cache_layers[1].metrics,
             CodeQueryStructuralFactsCacheCounters,
         )
+        self.assertEqual(
+            response.cache_layers[2].layer,
+            CodeQueryCacheLayerKind.DIRECT_IMPORT_TOPOLOGY,
+        )
+        self.assertEqual(response.cache_layers[2].metrics.build_files, 3)
+        self.assertEqual(response.cache_layers[2].metrics.build_edges, 2)
+        self.assertEqual(response.cache_layers[2].metrics.retained_bytes, 256)
         self.assertEqual(response.scheduling.bounded_dispatch.worker_limit, 4)
         self.assertEqual(
             response.scheduling.bounded_dispatch.extra["future_scheduler_fact"], 9
@@ -814,7 +832,11 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIsInstance(profile.result.results[0], CodeQueryMatch)
         self.assertEqual(profile.explain.parsed_query.execution_mode, "profile")
         self.assertGreaterEqual(len(profile.operators), 2)
-        self.assertEqual(len(profile.cache_layers), 8)
+        self.assertEqual(len(profile.cache_layers), 9)
+        self.assertEqual(
+            profile.cache_layers[-1].layer,
+            CodeQueryCacheLayerKind.DIRECT_IMPORT_TOPOLOGY,
+        )
         self.assertGreaterEqual(profile.scheduling.peak_concurrency, 1)
 
     def test_query_code_builds_typed_set_plans_and_parses_branch_paths(self) -> None:

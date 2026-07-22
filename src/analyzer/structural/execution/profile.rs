@@ -316,6 +316,14 @@ pub(crate) struct QueryCacheLayerProfile {
     pub(crate) complete_builds: u64,
     pub(crate) incomplete_builds: u64,
     pub(crate) unknown_outcomes: u64,
+    pub(crate) cancelled: u64,
+    pub(crate) unavailable: u64,
+    pub(crate) over_budget: u64,
+    pub(crate) fallbacks: u64,
+    pub(crate) build_files: u64,
+    pub(crate) build_edges: u64,
+    pub(crate) build_ns: u64,
+    pub(crate) retained_bytes: u64,
     /// Cached payload items made available to the consumer before
     /// relation-specific filtering and projection. This can exceed emitted
     /// rows; `relation_expansions` records post-filter expansions separately.
@@ -410,6 +418,14 @@ impl QueryCacheLayerProfile {
                 .incomplete_builds
                 .saturating_add(other.incomplete_builds),
             unknown_outcomes: self.unknown_outcomes.saturating_add(other.unknown_outcomes),
+            cancelled: self.cancelled.saturating_add(other.cancelled),
+            unavailable: self.unavailable.saturating_add(other.unavailable),
+            over_budget: self.over_budget.saturating_add(other.over_budget),
+            fallbacks: self.fallbacks.saturating_add(other.fallbacks),
+            build_files: self.build_files.saturating_add(other.build_files),
+            build_edges: self.build_edges.saturating_add(other.build_edges),
+            build_ns: self.build_ns.saturating_add(other.build_ns),
+            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
             replayed_items: self.replayed_items.saturating_add(other.replayed_items),
         }
     }
@@ -458,6 +474,14 @@ impl QueryCacheLayerProfile {
             unknown_outcomes: self
                 .unknown_outcomes
                 .saturating_sub(earlier.unknown_outcomes),
+            cancelled: self.cancelled.saturating_sub(earlier.cancelled),
+            unavailable: self.unavailable.saturating_sub(earlier.unavailable),
+            over_budget: self.over_budget.saturating_sub(earlier.over_budget),
+            fallbacks: self.fallbacks.saturating_sub(earlier.fallbacks),
+            build_files: self.build_files.saturating_sub(earlier.build_files),
+            build_edges: self.build_edges.saturating_sub(earlier.build_edges),
+            build_ns: self.build_ns.saturating_sub(earlier.build_ns),
+            retained_bytes: self.retained_bytes.saturating_sub(earlier.retained_bytes),
             replayed_items: self.replayed_items.saturating_sub(earlier.replayed_items),
         }
     }
@@ -475,6 +499,7 @@ pub(crate) struct QueryCacheProfile {
     pub(crate) outgoing_call: QueryCacheLayerProfile,
     pub(crate) import_forward: QueryCacheLayerProfile,
     pub(crate) import_reverse: QueryCacheLayerProfile,
+    pub(crate) direct_import_topology: QueryCacheLayerProfile,
 }
 
 impl QueryCacheProfile {
@@ -494,6 +519,9 @@ impl QueryCacheProfile {
             outgoing_call: self.outgoing_call.saturating_add(other.outgoing_call),
             import_forward: self.import_forward.saturating_add(other.import_forward),
             import_reverse: self.import_reverse.saturating_add(other.import_reverse),
+            direct_import_topology: self
+                .direct_import_topology
+                .saturating_add(other.direct_import_topology),
         }
     }
 
@@ -513,6 +541,9 @@ impl QueryCacheProfile {
             outgoing_call: self.outgoing_call.saturating_sub(earlier.outgoing_call),
             import_forward: self.import_forward.saturating_sub(earlier.import_forward),
             import_reverse: self.import_reverse.saturating_sub(earlier.import_reverse),
+            direct_import_topology: self
+                .direct_import_topology
+                .saturating_sub(earlier.direct_import_topology),
         }
     }
 }
@@ -779,6 +810,9 @@ pub enum CodeQueryProfileCacheLayer {
     ImportReverse {
         metrics: CodeQueryProfileCacheCounters,
     },
+    DirectImportTopology {
+        metrics: CodeQueryProfileCacheCounters,
+    },
 }
 
 impl CodeQueryProfileCacheLayer {
@@ -810,6 +844,11 @@ impl CodeQueryProfileCacheLayer {
             Self::ImportReverse {
                 metrics: CodeQueryProfileCacheCounters::from_internal(profile.import_reverse),
             },
+            Self::DirectImportTopology {
+                metrics: CodeQueryProfileCacheCounters::from_internal(
+                    profile.direct_import_topology,
+                ),
+            },
         ]
     }
 }
@@ -828,6 +867,14 @@ pub struct CodeQueryProfileCacheCounters {
     pub complete_builds: u64,
     pub incomplete_builds: u64,
     pub unknown_outcomes: u64,
+    pub cancelled: u64,
+    pub unavailable: u64,
+    pub over_budget: u64,
+    pub fallbacks: u64,
+    pub build_files: u64,
+    pub build_edges: u64,
+    pub build_ns: u64,
+    pub retained_bytes: u64,
     pub replayed_items: u64,
 }
 
@@ -846,6 +893,14 @@ impl CodeQueryProfileCacheCounters {
             complete_builds: counters.complete_builds,
             incomplete_builds: counters.incomplete_builds,
             unknown_outcomes: counters.unknown_outcomes,
+            cancelled: counters.cancelled,
+            unavailable: counters.unavailable,
+            over_budget: counters.over_budget,
+            fallbacks: counters.fallbacks,
+            build_files: counters.build_files,
+            build_edges: counters.build_edges,
+            build_ns: counters.build_ns,
+            retained_bytes: counters.retained_bytes,
             replayed_items: counters.replayed_items,
         }
     }
@@ -1132,6 +1187,17 @@ mod public_contract_tests {
             replayed_files: 2,
             ..QuerySeedStructuralFactsCacheProfile::default()
         };
+        profile.cache.direct_import_topology = QueryCacheLayerProfile {
+            lookups: 1,
+            misses: 1,
+            builds: 1,
+            complete_builds: 1,
+            build_files: 2,
+            build_edges: 1,
+            build_ns: 44,
+            retained_bytes: 256,
+            ..QueryCacheLayerProfile::default()
+        };
         profile.record_scheduler_run(SchedulerRunProfile {
             worker_limit: 2,
             workers_spawned: 2,
@@ -1236,6 +1302,7 @@ mod public_contract_tests {
                 "outgoing_call",
                 "import_forward",
                 "import_reverse",
+                "direct_import_topology",
             ]
         );
         assert_eq!(
@@ -1255,6 +1322,14 @@ mod public_contract_tests {
                     "complete_builds": 0,
                     "incomplete_builds": 0,
                     "unknown_outcomes": 0,
+                    "cancelled": 0,
+                    "unavailable": 0,
+                    "over_budget": 0,
+                    "fallbacks": 0,
+                    "build_files": 0,
+                    "build_edges": 0,
+                    "build_ns": 0,
+                    "retained_bytes": 0,
                     "replayed_items": 3
                 }
             })
@@ -1262,6 +1337,35 @@ mod public_contract_tests {
         assert_eq!(
             value["cache_layers"][1]["metrics"]["kind"],
             "structural_facts"
+        );
+        assert_eq!(
+            value["cache_layers"][8],
+            json!({
+                "layer": "direct_import_topology",
+                "metrics": {
+                    "kind": "complete_value",
+                    "lookups": 1,
+                    "hits": 0,
+                    "misses": 1,
+                    "builds": 1,
+                    "waits": 0,
+                    "wait_ns": 0,
+                    "complete_hits": 0,
+                    "incomplete_hits": 0,
+                    "complete_builds": 1,
+                    "incomplete_builds": 0,
+                    "unknown_outcomes": 0,
+                    "cancelled": 0,
+                    "unavailable": 0,
+                    "over_budget": 0,
+                    "fallbacks": 0,
+                    "build_files": 2,
+                    "build_edges": 1,
+                    "build_ns": 44,
+                    "retained_bytes": 256,
+                    "replayed_items": 0
+                }
+            })
         );
         assert_eq!(
             value["access_path"],

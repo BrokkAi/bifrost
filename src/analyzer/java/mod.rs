@@ -459,6 +459,12 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        self.inner.snapshot_derived_layer_cache()
+    }
+
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
         self.inner.get_all_declarations()
     }

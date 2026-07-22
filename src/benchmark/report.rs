@@ -78,6 +78,8 @@ pub struct QueryCodeProfileMetrics {
     pub import_files_resolved: u64,
     pub import_edges_resolved: u64,
     pub facts_cache: QueryCodeFactsCacheMetrics,
+    #[serde(default)]
+    pub direct_import_topology: QueryCodeDerivedLayerMetrics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_path: Option<QueryCodeAccessPathMetrics>,
 }
@@ -91,6 +93,30 @@ pub struct QueryCodeFactsCacheMetrics {
     pub unavailable: u64,
     pub unknown_outcomes: u64,
     pub replayed_files: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeDerivedLayerMetrics {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub builds: u64,
+    pub waits: u64,
+    pub wait_ns: u64,
+    pub complete_hits: u64,
+    pub incomplete_hits: u64,
+    pub complete_builds: u64,
+    pub incomplete_builds: u64,
+    pub unknown_outcomes: u64,
+    pub cancelled: u64,
+    pub unavailable: u64,
+    pub over_budget: u64,
+    pub fallbacks: u64,
+    pub replayed_items: u64,
+    pub build_files: u64,
+    pub build_edges: u64,
+    pub build_ns: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

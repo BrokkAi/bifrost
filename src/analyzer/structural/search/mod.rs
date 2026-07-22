@@ -6,6 +6,11 @@
 //! `limit` matches with captures, enclosing symbols, and capability
 //! diagnostics.
 
+use super::execution::derived::{
+    DerivedLayer, DerivedLayerAcquisition, DerivedLayerBuildMetrics, DerivedLayerLifecycle,
+    DerivedLayerRequest, DirectImportTopology, DirectImportTopologyLimits,
+    RequestLocalDirectImportGraph, build_direct_import_topology,
+};
 use super::execution::plan::{
     CodeQueryExplain, LogicalQueryOperator, LogicalQueryPlan, PhysicalQueryNodeId,
     PhysicalQueryOperator, PhysicalQueryPlan,
@@ -57,7 +62,6 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
-use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
@@ -534,101 +538,6 @@ impl PipelineRenderCache {
     }
 }
 
-#[derive(Debug, Default)]
-struct DirectImportGraph {
-    forward: HashMap<ProjectFile, Vec<ProjectFile>>,
-    compact: Option<CompactDirectedGraph<ProjectFile>>,
-    unsupported: HashSet<ProjectFile>,
-    all_files: Vec<ProjectFile>,
-    analyzed: HashSet<ProjectFile>,
-    resolved_files: usize,
-    resolved_edges: usize,
-    complete: bool,
-}
-
-impl DirectImportGraph {
-    fn new(analyzer: &dyn IAnalyzer) -> Self {
-        let mut all_files: Vec<_> = analyzer.analyzed_files().into_iter().collect();
-        all_files.sort_by_key(rel_path_string);
-        let analyzed = all_files.iter().cloned().collect();
-        Self {
-            all_files,
-            analyzed,
-            ..Self::default()
-        }
-    }
-
-    fn freeze(&mut self) {
-        if self.compact.is_some() {
-            return;
-        }
-        let nodes = self.all_files.clone();
-        let index_by_file: HashMap<_, _> = nodes
-            .iter()
-            .enumerate()
-            .map(|(index, file)| (file.clone(), index as u32))
-            .collect();
-        let mut edges = Vec::with_capacity(self.resolved_edges);
-        for (source, targets) in &self.forward {
-            let Some(source) = index_by_file.get(source).copied() else {
-                continue;
-            };
-            edges.extend(targets.iter().filter_map(|target| {
-                index_by_file
-                    .get(target)
-                    .copied()
-                    .map(|target| (source, target))
-            }));
-        }
-        self.compact = Some(CompactDirectedGraph::from_indexed_nodes(
-            nodes,
-            index_by_file,
-            edges,
-        ));
-    }
-
-    fn imports_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
-        if let Some(compact) = &self.compact {
-            return compact
-                .node_id(file)
-                .into_iter()
-                .flat_map(|source| compact.outgoing(source))
-                .map(|target| compact.nodes()[*target as usize].clone())
-                .collect();
-        }
-        self.forward.get(file).cloned().unwrap_or_default()
-    }
-
-    fn importers_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
-        let Some(compact) = &self.compact else {
-            return Vec::new();
-        };
-        compact
-            .node_id(file)
-            .into_iter()
-            .flat_map(|target| compact.incoming(target))
-            .map(|source| compact.nodes()[*source as usize].clone())
-            .collect()
-    }
-
-    fn importer_count(&self, file: &ProjectFile) -> usize {
-        let Some(compact) = &self.compact else {
-            return 0;
-        };
-        compact
-            .node_id(file)
-            .map_or(0, |target| compact.incoming(target).len())
-    }
-
-    fn forward_relation_complete(&self, files: &[ProjectFile]) -> bool {
-        files.iter().all(|file| self.forward.contains_key(file))
-    }
-
-    fn reverse_relation_complete(&self) -> bool {
-        self.complete && self.unsupported.is_empty()
-    }
-}
-
 /// Run `query` across every language provider the analyzer exposes.
 pub fn execute(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResult {
     execute_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
@@ -975,7 +884,9 @@ struct QueryExecutionState<'a> {
     indexed_declarations: IndexedDeclarations,
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
-    import_graph: Option<DirectImportGraph>,
+    import_graph: Option<RequestLocalDirectImportGraph>,
+    direct_import_layer: Option<Arc<DerivedLayer>>,
+    direct_import_layer_generation: Option<u64>,
     cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
     observed_structural_indexes: Option<Arc<Mutex<HashSet<usize>>>>,
@@ -983,6 +894,37 @@ struct QueryExecutionState<'a> {
     access_failure: Option<String>,
     parallel_seed_budget: Option<FairSeedBudgetLease>,
     scheduler_workers: usize,
+}
+
+#[derive(Clone, Copy)]
+enum DirectImportAccess<'a> {
+    RequestLocal(&'a RequestLocalDirectImportGraph),
+    Snapshot(&'a DirectImportTopology),
+}
+
+impl DirectImportAccess<'_> {
+    fn imports_of(&self, file: &ProjectFile) -> Option<Vec<ProjectFile>> {
+        match self {
+            Self::RequestLocal(graph) => {
+                graph.supports_source(file).then(|| graph.imports_of(file))
+            }
+            Self::Snapshot(topology) => topology.imports_of(file),
+        }
+    }
+
+    fn importers_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        match self {
+            Self::RequestLocal(graph) => graph.importers_of(file),
+            Self::Snapshot(topology) => topology.importers_of(file).unwrap_or_default(),
+        }
+    }
+
+    fn unsupported_languages(&self) -> Vec<Language> {
+        match self {
+            Self::RequestLocal(graph) => graph.unsupported_languages(),
+            Self::Snapshot(_) => Vec::new(),
+        }
+    }
 }
 
 struct PlanExecution {
@@ -1308,6 +1250,8 @@ fn execute_internal_with_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         import_graph: None,
+        direct_import_layer: None,
+        direct_import_layer_generation: None,
         cache_profile: capture_profile.then(QueryCacheProfile::default),
         profile: capture_profile
             .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
@@ -2300,6 +2244,7 @@ fn execute_plan(
                 let mut instrumentation = profiling.then(QueryStepInstrumentation::default);
                 let mut stepped = apply_plan_step(
                     step,
+                    physical_node.derived_layer_request(),
                     *final_in_authored_suffix,
                     child.rows,
                     state,
@@ -2655,6 +2600,8 @@ fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     import_graph: None,
+                    direct_import_layer: None,
+                    direct_import_layer_generation: None,
                     cache_profile: profiling.then(QueryCacheProfile::default),
                     profile: profiling
                         .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
@@ -2681,6 +2628,8 @@ fn execute_parallel_seed_union(
                 );
                 lease.finish(branch_state.budget);
                 debug_assert!(branch_state.import_graph.is_none());
+                debug_assert!(branch_state.direct_import_layer.is_none());
+                debug_assert!(branch_state.direct_import_layer_generation.is_none());
                 debug_assert!(branch_state.reference_cache.inbound.is_empty());
                 debug_assert!(branch_state.reference_cache.outbound.is_empty());
                 debug_assert!(branch_state.call_cache.incoming.is_empty());
@@ -3739,9 +3688,247 @@ fn push_seed_provider_omission(
     });
 }
 
+fn acquire_direct_import_layer(
+    state: &mut QueryExecutionState<'_>,
+    request: DerivedLayerRequest,
+    limits: CodeQueryExecutionLimits,
+    build_if_missing: bool,
+) -> Option<DerivedLayerLifecycle> {
+    let Some(cache) = state.analyzer.snapshot_derived_layer_cache() else {
+        if let Some(profile) = &mut state.cache_profile {
+            let topology = &mut profile.direct_import_topology;
+            topology.lookups = topology.lookups.saturating_add(1);
+            topology.misses = topology.misses.saturating_add(1);
+            topology.unavailable = topology.unavailable.saturating_add(1);
+            topology.fallbacks = topology.fallbacks.saturating_add(1);
+        }
+        if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+            state
+                .access_failure
+                .get_or_insert_with(|| "analyzer has no snapshot derived-layer cache".to_string());
+        }
+        return None;
+    };
+    let uncancelled = CancellationToken::default();
+    let cancellation = state.cancellation.unwrap_or(&uncancelled);
+    let source_generation = state.analyzer.project().analysis_generation();
+    if state
+        .direct_import_layer_generation
+        .is_some_and(|generation| generation != source_generation)
+    {
+        state.direct_import_layer = None;
+        state.direct_import_layer_generation = None;
+    }
+    let ready = cache.get_ready(request, source_generation, cancellation);
+    let acquisition = match ready {
+        Some(layer) if state.analyzer.project().analysis_generation() == source_generation => {
+            DerivedLayerAcquisition::Ready {
+                layer,
+                lifecycle: DerivedLayerLifecycle::Hit,
+                wait: Default::default(),
+                build: DerivedLayerBuildMetrics::default(),
+            }
+        }
+        Some(_) => DerivedLayerAcquisition::Unavailable {
+            reason: "derived-layer source generation changed before reuse".to_string(),
+            over_budget: false,
+            wait: Default::default(),
+            build: DerivedLayerBuildMetrics::default(),
+        },
+        None if !build_if_missing => {
+            if let Some(profile) = &mut state.cache_profile {
+                let topology = &mut profile.direct_import_topology;
+                topology.lookups = topology.lookups.saturating_add(1);
+                topology.misses = topology.misses.saturating_add(1);
+                topology.fallbacks = topology.fallbacks.saturating_add(1);
+            }
+            return None;
+        }
+        None => cache.acquire(
+            request,
+            source_generation,
+            cancellation,
+            || {
+                build_direct_import_topology(
+                    state.analyzer,
+                    cancellation,
+                    DirectImportTopologyLimits {
+                        max_files: limits.max_scanned_files,
+                        max_edges: limits.max_pipeline_rows,
+                        max_retained_bytes: cache.max_retained_bytes(),
+                    },
+                )
+            },
+            || state.analyzer.project().analysis_generation() == source_generation,
+        ),
+    };
+
+    let (wait, build) = match &acquisition {
+        DerivedLayerAcquisition::Ready { wait, build, .. }
+        | DerivedLayerAcquisition::Cancelled { wait, build }
+        | DerivedLayerAcquisition::Unavailable { wait, build, .. } => (*wait, *build),
+    };
+    state.budget.import_files_resolved = state
+        .budget
+        .import_files_resolved
+        .saturating_add(usize::try_from(build.resolved_files).unwrap_or(usize::MAX));
+    state.budget.import_edges_resolved = state
+        .budget
+        .import_edges_resolved
+        .saturating_add(usize::try_from(build.resolved_edges).unwrap_or(usize::MAX));
+    if let Some(profile) = &mut state.cache_profile {
+        let topology = &mut profile.direct_import_topology;
+        topology.lookups = topology.lookups.saturating_add(1);
+        topology.waits = topology.waits.saturating_add(wait.waits);
+        topology.wait_ns = topology.wait_ns.saturating_add(wait.wait_ns);
+        topology.build_files = topology.build_files.saturating_add(build.resolved_files);
+        topology.build_edges = topology.build_edges.saturating_add(build.resolved_edges);
+        topology.build_ns = topology.build_ns.saturating_add(build.elapsed_ns);
+    }
+
+    match acquisition {
+        DerivedLayerAcquisition::Ready { lifecycle, .. }
+            if state.analyzer.project().analysis_generation() != source_generation =>
+        {
+            if let Some(profile) = &mut state.cache_profile {
+                let topology = &mut profile.direct_import_topology;
+                topology.misses = topology.misses.saturating_add(1);
+                topology.unavailable = topology.unavailable.saturating_add(1);
+                topology.fallbacks = topology.fallbacks.saturating_add(1);
+                topology.builds = topology
+                    .builds
+                    .saturating_add(u64::from(lifecycle == DerivedLayerLifecycle::Built));
+            }
+            if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+                state.access_failure.get_or_insert_with(|| {
+                    "derived-layer source generation changed before selection".to_string()
+                });
+            }
+            state.direct_import_layer = None;
+            state.direct_import_layer_generation = None;
+            None
+        }
+        DerivedLayerAcquisition::Ready {
+            layer, lifecycle, ..
+        } => {
+            if let Some(profile) = &mut state.cache_profile {
+                let topology = &mut profile.direct_import_topology;
+                match lifecycle {
+                    DerivedLayerLifecycle::Hit => {
+                        topology.hits = topology.hits.saturating_add(1);
+                        topology.complete_hits = topology.complete_hits.saturating_add(1);
+                        topology.replayed_items = topology.replayed_items.saturating_add(
+                            u64::try_from(layer.direct_import_topology().resolved_edges())
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
+                    DerivedLayerLifecycle::Built => {
+                        topology.misses = topology.misses.saturating_add(1);
+                        topology.builds = topology.builds.saturating_add(1);
+                        topology.complete_builds = topology.complete_builds.saturating_add(1);
+                    }
+                }
+                let first_observation =
+                    state
+                        .observed_structural_indexes
+                        .as_ref()
+                        .is_some_and(|observed| {
+                            observed
+                                .lock()
+                                .expect("observed snapshot values lock poisoned")
+                                .insert(Arc::as_ptr(&layer) as usize)
+                        });
+                if first_observation {
+                    topology.retained_bytes = topology
+                        .retained_bytes
+                        .saturating_add(layer.direct_import_topology().retained_bytes());
+                }
+            }
+            state.direct_import_layer = Some(layer);
+            state.direct_import_layer_generation = Some(source_generation);
+            Some(lifecycle)
+        }
+        DerivedLayerAcquisition::Cancelled { .. } => {
+            if let Some(profile) = &mut state.cache_profile {
+                let topology = &mut profile.direct_import_topology;
+                topology.misses = topology.misses.saturating_add(1);
+                topology.cancelled = topology.cancelled.saturating_add(1);
+                topology.fallbacks = topology.fallbacks.saturating_add(1);
+                if build.elapsed_ns > 0 {
+                    topology.builds = topology.builds.saturating_add(1);
+                }
+            }
+            if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+                state.access_failure.get_or_insert_with(|| {
+                    "direct import topology acquisition cancelled".to_string()
+                });
+            }
+            None
+        }
+        DerivedLayerAcquisition::Unavailable {
+            reason,
+            over_budget,
+            ..
+        } => {
+            if let Some(profile) = &mut state.cache_profile {
+                let topology = &mut profile.direct_import_topology;
+                topology.misses = topology.misses.saturating_add(1);
+                topology.unavailable = topology.unavailable.saturating_add(1);
+                topology.over_budget = topology.over_budget.saturating_add(u64::from(over_budget));
+                topology.fallbacks = topology.fallbacks.saturating_add(1);
+                if build.elapsed_ns > 0 {
+                    topology.builds = topology.builds.saturating_add(1);
+                }
+            }
+            if build_if_missing && state.access_mode == StructuralAccessMode::IndexedRequired {
+                state.access_failure.get_or_insert(reason);
+            }
+            None
+        }
+    }
+}
+
+fn discard_stale_direct_import_layer(state: &mut QueryExecutionState<'_>, required: bool) {
+    let Some(layer_generation) = state.direct_import_layer_generation else {
+        return;
+    };
+    if state.analyzer.project().analysis_generation() == layer_generation {
+        return;
+    }
+    state.direct_import_layer = None;
+    state.direct_import_layer_generation = None;
+    if let Some(profile) = &mut state.cache_profile {
+        let topology = &mut profile.direct_import_topology;
+        topology.unavailable = topology.unavailable.saturating_add(1);
+        topology.fallbacks = topology.fallbacks.saturating_add(1);
+    }
+    if required && state.access_mode == StructuralAccessMode::IndexedRequired {
+        state
+            .access_failure
+            .get_or_insert_with(|| "direct import topology became stale before use".to_string());
+    }
+}
+
+fn record_direct_import_fallback(
+    state: &mut QueryExecutionState<'_>,
+    reason: &str,
+    required: bool,
+) {
+    if let Some(profile) = &mut state.cache_profile {
+        profile.direct_import_topology.fallbacks =
+            profile.direct_import_topology.fallbacks.saturating_add(1);
+    }
+    if required && state.access_mode == StructuralAccessMode::IndexedRequired {
+        state
+            .access_failure
+            .get_or_insert_with(|| reason.to_string());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_plan_step(
     step: &QueryStep,
+    derived_layer_request: Option<DerivedLayerRequest>,
     final_in_authored_suffix: bool,
     rows: Vec<PipelineRow>,
     state: &mut QueryExecutionState<'_>,
@@ -3762,71 +3949,49 @@ fn apply_plan_step(
             pipeline_halted: false,
         };
     }
+    let mut use_snapshot_imports = false;
+    let mut snapshot_lifecycle = None;
     if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
-        let graph = state
-            .import_graph
-            .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
-        let graph_exhausted = if step == &QueryStep::ImportersOf {
-            let cache_observation = state
-                .cache_profile
-                .as_ref()
-                .map(|_| (graph.complete, graph.reverse_relation_complete()));
-            if let (Some(profile), Some((cache_hit, cache_complete))) =
-                (&mut state.cache_profile, cache_observation)
-            {
-                if cache_hit {
-                    let replayed_edges = rows
-                        .iter()
-                        .filter_map(|row| match &row.value {
-                            PipelineValue::File(file) => Some(graph.importer_count(file)),
-                            PipelineValue::StructuralMatch(_)
-                            | PipelineValue::Declaration(_)
-                            | PipelineValue::ReferenceSite(_)
-                            | PipelineValue::CallSite(_)
-                            | PipelineValue::ExpressionSite(_)
-                            | PipelineValue::ReceiverAnalysis(_) => None,
-                        })
-                        .sum();
-                    profile
-                        .import_reverse
-                        .record_hit(Some(cache_complete), replayed_edges);
-                } else {
-                    profile.import_reverse.record_miss();
-                }
+        if state.access_mode != StructuralAccessMode::ScanOnly {
+            let request = derived_layer_request
+                .unwrap_or_else(DerivedLayerRequest::complete_direct_import_topology);
+            let build_if_missing = derived_layer_request.is_some();
+            snapshot_lifecycle =
+                acquire_direct_import_layer(state, request, limits, build_if_missing);
+        }
+        discard_stale_direct_import_layer(state, derived_layer_request.is_some());
+        if let Some(topology) = state
+            .direct_import_layer
+            .as_deref()
+            .map(DerivedLayer::direct_import_topology)
+        {
+            let within_request_budget = topology.resolved_files() <= limits.max_scanned_files
+                && topology.resolved_edges() <= limits.max_pipeline_rows;
+            let relation_complete =
+                step == &QueryStep::ImportsOf || topology.reverse_relation_complete();
+            use_snapshot_imports = within_request_budget && relation_complete;
+            if !use_snapshot_imports {
+                record_direct_import_fallback(
+                    state,
+                    "complete direct import topology cannot satisfy this request",
+                    derived_layer_request.is_some(),
+                );
             }
-            let import_work_before = state
-                .cache_profile
-                .as_ref()
-                .map(|_| (graph.resolved_files, graph.resolved_edges));
-            let exhausted = ensure_complete_import_graph(
-                state.analyzer,
-                graph,
-                limits.max_scanned_files,
-                limits.max_pipeline_rows,
-            );
-            if let Some((resolved_files_before, resolved_edges_before)) = import_work_before {
-                state.budget.import_files_resolved = state
-                    .budget
-                    .import_files_resolved
-                    .saturating_add(graph.resolved_files.saturating_sub(resolved_files_before));
-                state.budget.import_edges_resolved = state
-                    .budget
-                    .import_edges_resolved
-                    .saturating_add(graph.resolved_edges.saturating_sub(resolved_edges_before));
-            }
-            if cache_observation.is_some_and(|(cache_hit, _)| !cache_hit)
-                && let Some(profile) = &mut state.cache_profile
-            {
-                profile
-                    .import_reverse
-                    .record_build(Some(!exhausted && graph.reverse_relation_complete()));
-            }
-            exhausted
-        } else {
-            let mut frontier = rows
+        }
+
+        if use_snapshot_imports {
+            let topology = state
+                .direct_import_layer
+                .as_deref()
+                .expect("snapshot import layer was selected")
+                .direct_import_topology();
+            let replayed_edges = rows
                 .iter()
                 .filter_map(|row| match &row.value {
-                    PipelineValue::File(file) => Some(file.clone()),
+                    PipelineValue::File(file) if step == &QueryStep::ImportersOf => {
+                        topology.importer_count(file)
+                    }
+                    PipelineValue::File(file) => topology.imports_of(file).map(|edges| edges.len()),
                     PipelineValue::StructuralMatch(_)
                     | PipelineValue::Declaration(_)
                     | PipelineValue::ReferenceSite(_)
@@ -3834,65 +3999,147 @@ fn apply_plan_step(
                     | PipelineValue::ExpressionSite(_)
                     | PipelineValue::ReceiverAnalysis(_) => None,
                 })
-                .collect::<Vec<_>>();
-            frontier.sort_by_key(rel_path_string);
-            frontier.dedup();
-            let cache_observation = state.cache_profile.as_ref().map(|_| {
-                let cache_hit = frontier.iter().all(|file| {
-                    graph.forward.contains_key(file) || graph.unsupported.contains(file)
-                });
-                let cache_complete = cache_hit && graph.forward_relation_complete(&frontier);
-                let replayed_edges = frontier
-                    .iter()
-                    .filter_map(|file| graph.forward.get(file))
-                    .map(Vec::len)
-                    .sum();
-                (cache_hit, cache_complete, replayed_edges)
-            });
-            if let (Some(profile), Some((cache_hit, cache_complete, replayed_edges))) =
-                (&mut state.cache_profile, cache_observation)
-            {
-                if cache_hit {
-                    profile
-                        .import_forward
-                        .record_hit(Some(cache_complete), replayed_edges);
+                .sum();
+            if let Some(profile) = &mut state.cache_profile {
+                let relation = if step == &QueryStep::ImportersOf {
+                    &mut profile.import_reverse
                 } else {
-                    profile.import_forward.record_miss();
+                    &mut profile.import_forward
+                };
+                if snapshot_lifecycle == Some(DerivedLayerLifecycle::Built) {
+                    relation.record_miss();
+                    relation.record_build(Some(true));
+                } else {
+                    relation.record_hit(Some(true), replayed_edges);
                 }
             }
-            let import_work_before = state
-                .cache_profile
-                .as_ref()
-                .map(|_| (graph.resolved_files, graph.resolved_edges));
-            let exhausted = ensure_forward_import_edges(
-                state.analyzer,
-                graph,
-                &frontier,
-                limits.max_scanned_files,
-                limits.max_pipeline_rows,
-            );
-            if let Some((resolved_files_before, resolved_edges_before)) = import_work_before {
+        } else {
+            let graph = state
+                .import_graph
+                .get_or_insert_with(|| RequestLocalDirectImportGraph::new(state.analyzer));
+            let graph_exhausted = if step == &QueryStep::ImportersOf {
+                let cache_observation = state
+                    .cache_profile
+                    .as_ref()
+                    .map(|_| (graph.is_complete(), graph.reverse_relation_complete()));
+                if let (Some(profile), Some((cache_hit, cache_complete))) =
+                    (&mut state.cache_profile, cache_observation)
+                {
+                    if cache_hit {
+                        let replayed_edges = rows
+                            .iter()
+                            .filter_map(|row| match &row.value {
+                                PipelineValue::File(file) => Some(graph.importer_count(file)),
+                                PipelineValue::StructuralMatch(_)
+                                | PipelineValue::Declaration(_)
+                                | PipelineValue::ReferenceSite(_)
+                                | PipelineValue::CallSite(_)
+                                | PipelineValue::ExpressionSite(_)
+                                | PipelineValue::ReceiverAnalysis(_) => None,
+                            })
+                            .sum();
+                        profile
+                            .import_reverse
+                            .record_hit(Some(cache_complete), replayed_edges);
+                    } else {
+                        profile.import_reverse.record_miss();
+                    }
+                }
+                let resolved_files_before = graph.resolved_files();
+                let resolved_edges_before = graph.resolved_edges();
+                let exhausted = graph.ensure_complete(
+                    state.analyzer,
+                    limits.max_scanned_files,
+                    limits.max_pipeline_rows,
+                    state.cancellation,
+                );
                 state.budget.import_files_resolved = state
                     .budget
                     .import_files_resolved
-                    .saturating_add(graph.resolved_files.saturating_sub(resolved_files_before));
+                    .saturating_add(graph.resolved_files().saturating_sub(resolved_files_before));
                 state.budget.import_edges_resolved = state
                     .budget
                     .import_edges_resolved
-                    .saturating_add(graph.resolved_edges.saturating_sub(resolved_edges_before));
-            }
-            if cache_observation.is_some_and(|(cache_hit, _, _)| !cache_hit)
-                && let Some(profile) = &mut state.cache_profile
+                    .saturating_add(graph.resolved_edges().saturating_sub(resolved_edges_before));
+                if cache_observation.is_some_and(|(cache_hit, _)| !cache_hit)
+                    && let Some(profile) = &mut state.cache_profile
+                {
+                    profile
+                        .import_reverse
+                        .record_build(Some(!exhausted && graph.reverse_relation_complete()));
+                }
+                exhausted
+            } else {
+                let mut frontier = rows
+                    .iter()
+                    .filter_map(|row| match &row.value {
+                        PipelineValue::File(file) => Some(file.clone()),
+                        PipelineValue::StructuralMatch(_)
+                        | PipelineValue::Declaration(_)
+                        | PipelineValue::ReferenceSite(_)
+                        | PipelineValue::CallSite(_)
+                        | PipelineValue::ExpressionSite(_)
+                        | PipelineValue::ReceiverAnalysis(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                frontier.sort_by_key(rel_path_string);
+                frontier.dedup();
+                let cache_observation = state.cache_profile.as_ref().map(|_| {
+                    let cache_hit = frontier.iter().all(|file| graph.has_cached_forward(file));
+                    let cache_complete = cache_hit && graph.forward_relation_complete(&frontier);
+                    let replayed_edges = frontier
+                        .iter()
+                        .map(|file| graph.cached_forward_edge_count(file))
+                        .sum();
+                    (cache_hit, cache_complete, replayed_edges)
+                });
+                if let (Some(profile), Some((cache_hit, cache_complete, replayed_edges))) =
+                    (&mut state.cache_profile, cache_observation)
+                {
+                    if cache_hit {
+                        profile
+                            .import_forward
+                            .record_hit(Some(cache_complete), replayed_edges);
+                    } else {
+                        profile.import_forward.record_miss();
+                    }
+                }
+                let resolved_files_before = graph.resolved_files();
+                let resolved_edges_before = graph.resolved_edges();
+                let exhausted = graph.ensure_forward(
+                    state.analyzer,
+                    &frontier,
+                    limits.max_scanned_files,
+                    limits.max_pipeline_rows,
+                    state.cancellation,
+                );
+                state.budget.import_files_resolved = state
+                    .budget
+                    .import_files_resolved
+                    .saturating_add(graph.resolved_files().saturating_sub(resolved_files_before));
+                state.budget.import_edges_resolved = state
+                    .budget
+                    .import_edges_resolved
+                    .saturating_add(graph.resolved_edges().saturating_sub(resolved_edges_before));
+                if cache_observation.is_some_and(|(cache_hit, _, _)| !cache_hit)
+                    && let Some(profile) = &mut state.cache_profile
+                {
+                    profile.import_forward.record_build(Some(
+                        !exhausted && graph.forward_relation_complete(&frontier),
+                    ));
+                }
+                exhausted
+            };
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
             {
-                profile.import_forward.record_build(Some(
-                    !exhausted && graph.forward_relation_complete(&frontier),
-                ));
+                return cancelled_plan_execution();
             }
-            exhausted
-        };
-        if graph_exhausted {
-            truncated = true;
-            push_import_graph_budget_diagnostic(diagnostics, graph);
+            if graph_exhausted {
+                truncated = true;
+                push_import_graph_budget_diagnostic(diagnostics, graph);
+            }
         }
     }
     let max_step_outputs = if final_in_authored_suffix {
@@ -3900,12 +4147,24 @@ fn apply_plan_step(
     } else {
         limits.max_pipeline_rows
     };
+    let import_access = if use_snapshot_imports {
+        state
+            .direct_import_layer
+            .as_deref()
+            .map(DerivedLayer::direct_import_topology)
+            .map(DirectImportAccess::Snapshot)
+    } else {
+        state
+            .import_graph
+            .as_ref()
+            .map(DirectImportAccess::RequestLocal)
+    };
     let (mut rows, exhausted, step_truncated) = apply_pipeline_step(
         state.analyzer,
         state.workspace,
         step,
         rows,
-        state.import_graph.as_ref(),
+        import_access,
         Some(&mut state.indexed_declarations),
         &mut state.reference_cache,
         &mut state.call_cache,
@@ -4165,107 +4424,13 @@ fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>) {
     });
 }
 
-fn ensure_complete_import_graph(
-    analyzer: &dyn IAnalyzer,
-    graph: &mut DirectImportGraph,
-    max_files: usize,
-    max_edges: usize,
-) -> bool {
-    if graph.complete {
-        graph.freeze();
-        return false;
-    }
-    let files = graph.all_files.clone();
-    let exhausted = ensure_forward_import_edges(analyzer, graph, &files, max_files, max_edges);
-    if !exhausted {
-        graph.complete = true;
-    }
-    graph.freeze();
-    exhausted
-}
-
-fn ensure_forward_import_edges(
-    analyzer: &dyn IAnalyzer,
-    graph: &mut DirectImportGraph,
-    files: &[ProjectFile],
-    max_files: usize,
-    max_edges: usize,
-) -> bool {
-    let mut pending = files
-        .iter()
-        .filter(|file| !graph.forward.contains_key(*file) && !graph.unsupported.contains(*file))
-        .cloned()
-        .collect::<Vec<_>>();
-    pending.sort_by_key(rel_path_string);
-    pending.dedup();
-    if pending.is_empty() {
-        return false;
-    }
-
-    let available_files = max_files.saturating_sub(graph.resolved_files);
-    let mut exhausted = pending.len() > available_files;
-    if pending.len() > available_files {
-        pending.truncate(available_files);
-    }
-
-    let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-    for file in pending {
-        if analyzer.import_analysis_provider_for_file(&file).is_some() {
-            groups
-                .entry(crate::analyzer::common::language_for_file(&file))
-                .or_default()
-                .push(file);
-        } else {
-            graph.resolved_files += 1;
-            graph.unsupported.insert(file);
-            graph.compact = None;
-        }
-    }
-
-    for files in groups.values_mut() {
-        files.sort_by_key(rel_path_string);
-        let Some(provider) = files
-            .first()
-            .and_then(|file| analyzer.import_analysis_provider_for_file(file))
-        else {
-            continue;
-        };
-        let bulk_infos = provider.import_infos_for_files(files);
-        for file in files.iter() {
-            let imports = bulk_infos
-                .as_ref()
-                .and_then(|infos| infos.get(file))
-                .cloned()
-                .unwrap_or_else(|| provider.import_info_of(file));
-            let mut targets =
-                crate::analyzer::resolve_imported_files_from_infos(provider, file, &imports)
-                    .into_iter()
-                    .filter(|target| graph.analyzed.contains(target))
-                    .collect::<Vec<_>>();
-            targets.sort_by_key(rel_path_string);
-            targets.dedup();
-
-            let available_edges = max_edges.saturating_sub(graph.resolved_edges);
-            if targets.len() > available_edges {
-                exhausted = true;
-                continue;
-            }
-            graph.resolved_files += 1;
-            graph.resolved_edges += targets.len();
-            graph.forward.insert(file.clone(), targets);
-            graph.compact = None;
-        }
-    }
-    exhausted
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_pipeline_step(
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
     step: &QueryStep,
     rows: Vec<PipelineRow>,
-    import_graph: Option<&DirectImportGraph>,
+    import_graph: Option<DirectImportAccess<'_>>,
     indexed_declarations: Option<&mut IndexedDeclarations>,
     reference_cache: &mut ReferenceTraversalCache,
     call_cache: &mut CallTraversalCache,
@@ -4413,16 +4578,17 @@ fn apply_pipeline_step(
             }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
-                if graph.unsupported.contains(file) {
-                    unsupported_languages.insert(crate::analyzer::common::language_for_file(file));
-                    Vec::new()
-                } else {
-                    graph
-                        .imports_of(file)
+                match graph.imports_of(file) {
+                    Some(imports) => imports
                         .into_iter()
                         .map(PipelineValue::File)
                         .map(pipeline_expansion)
-                        .collect()
+                        .collect(),
+                    None => {
+                        unsupported_languages
+                            .insert(crate::analyzer::common::language_for_file(file));
+                        Vec::new()
+                    }
                 }
             }
             (PipelineValue::File(file), QueryStep::ImportersOf) => import_graph
@@ -4737,12 +4903,7 @@ fn apply_pipeline_step(
     if step == &QueryStep::ImportersOf
         && let Some(graph) = import_graph
     {
-        unsupported_languages.extend(
-            graph
-                .unsupported
-                .iter()
-                .map(crate::analyzer::common::language_for_file),
-        );
+        unsupported_languages.extend(graph.unsupported_languages());
     }
 
     for language in unsupported_languages {
@@ -6511,7 +6672,7 @@ fn push_pipeline_budget_diagnostic(
 
 fn push_import_graph_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-    graph: &DirectImportGraph,
+    graph: &RequestLocalDirectImportGraph,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
@@ -6520,7 +6681,7 @@ fn push_import_graph_budget_diagnostic(
         language: "workspace",
         message: format!(
             "query_code import graph budget exhausted after resolving {} files and {} direct edges; import traversal results are partial",
-            graph.resolved_files, graph.resolved_edges
+            graph.resolved_files(), graph.resolved_edges()
         ),
     });
 }

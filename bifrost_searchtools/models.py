@@ -1077,6 +1077,14 @@ class CodeQueryProfileCacheCounters:
     complete_builds: int = 0
     incomplete_builds: int = 0
     unknown_outcomes: int = 0
+    cancelled: int = 0
+    unavailable: int = 0
+    over_budget: int = 0
+    fallbacks: int = 0
+    build_files: int = 0
+    build_edges: int = 0
+    build_ns: int = 0
+    retained_bytes: int = 0
     replayed_items: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -1094,6 +1102,14 @@ class CodeQueryProfileCacheCounters:
             "complete_builds",
             "incomplete_builds",
             "unknown_outcomes",
+            "cancelled",
+            "unavailable",
+            "over_budget",
+            "fallbacks",
+            "build_files",
+            "build_edges",
+            "build_ns",
+            "retained_bytes",
             "replayed_items",
         }
         return cls(
@@ -1149,6 +1165,7 @@ class CodeQueryCacheLayerKind(StrEnum):
     OUTGOING_CALL = "outgoing_call"
     IMPORT_FORWARD = "import_forward"
     IMPORT_REVERSE = "import_reverse"
+    DIRECT_IMPORT_TOPOLOGY = "direct_import_topology"
 
 
 @dataclass(frozen=True)

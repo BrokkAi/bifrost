@@ -234,6 +234,8 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 #[derive(Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
+    derived_layer_cache:
+        Arc<crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache>,
     global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
     global_usage_definition_index_build_count: Arc<AtomicUsize>,
     global_usage_definition_index_build_lock: Arc<Mutex<()>>,
@@ -245,6 +247,7 @@ impl Clone for MultiAnalyzer {
     fn clone(&self) -> Self {
         Self {
             delegates: self.delegates.clone(),
+            derived_layer_cache: Arc::clone(&self.derived_layer_cache),
             global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
             global_usage_definition_index_build_count: Arc::clone(
                 &self.global_usage_definition_index_build_count,
@@ -262,6 +265,10 @@ impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
         Self {
             delegates,
+            derived_layer_cache: Arc::new(
+                crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::default(
+                ),
+            ),
             global_usage_definition_index: Arc::new(OnceLock::new()),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
@@ -290,6 +297,10 @@ impl MultiAnalyzer {
                     (*language, delegate.clone_with_project(Arc::clone(&project)))
                 })
                 .collect(),
+            derived_layer_cache: Arc::new(
+                crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::default(
+                ),
+            ),
             global_usage_definition_index: Arc::new(OnceLock::new()),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
@@ -1042,6 +1053,12 @@ impl IAnalyzer for MultiAnalyzer {
             .values()
             .flat_map(|delegate| delegate.analyzer().structural_search_providers())
             .collect()
+    }
+
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        Some(&self.derived_layer_cache)
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

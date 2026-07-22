@@ -22,6 +22,8 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 07:42Z) Captured a correctness-clean local pre-index report for all 12 query cases at .cache/issue920-preindex-output/run-20260722T073755Z.json.
 - [x] (2026-07-22 09:55Z) Completed Milestone 2 implementation and its three-specialist guided review; fixed construction peak-memory, finalization/selection cancellation, duplicate retained-byte accounting, scoped-versus-admitted telemetry, narrow-scope build cost, live-overlay freshness, and cold-ratio findings.
 - [x] (2026-07-22 10:16Z) Captured paired clean-commit Dapper scan-only and Auto reports at commit 4c480b6d; the workspace query reduced warm median from 107.4 ms to 26.0 ms, examined facts from 49,181 to 27, and retained 1,979,756 bytes (16.2% of normalized-facts bytes).
+- [x] (2026-07-22 11:04Z) Implemented the measured direct-import topology, snapshot ownership/lifecycle telemetry, typed differential/lifecycle tests, and Ky/Express importer benchmark cases; captured paired scan-only/Auto evidence on both pinned repositories.
+- [x] (2026-07-22 11:32Z) Ran the Milestone 3 five-perspective guided review. It confirmed eager first-use Auto admission, duplicated failed-build fallback work, incomplete MultiAnalyzer generation identity, fixed-budget ownership, construction-memory, live-overlay replay, parser strictness, and cleanup findings; review fixes remain in progress.
 - [ ] Complete Milestone 3 using the measured promotion criteria, run focused tests, run guided review, fix confirmed findings, update this plan, and commit.
 - [ ] Perform the post-milestone architectural cleanup and centralize snapshot-cache, access-path, and profile-accounting logic.
 - [ ] Run cargo fmt --check, all-target/all-feature Clippy, and the complete nlp,python feature-enabled test gate.
@@ -65,6 +67,15 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: `scoped_fact_nodes` cannot be counted on a scan-only path without materializing files that exact source anchors excluded. The profile now reports zero when that total is unavailable and separately records `admitted_fact_nodes`, the compatibility-budget denominator available on both scan and indexed paths.
   Evidence: the Dapper scan admitted 49,181 facts after source filtering while the complete indexed scope contained 85,325 facts.
+
+- Observation: The benchmark session intentionally strips the server's internal `BIFROST_QUERY_CODE_ACCESS_MODE`; scan-only benchmark evidence must use the runner contract `BIFROST_BENCHMARK_QUERY_CODE_ACCESS=scan_only`.
+  Evidence: the first Ky report under `.cache/issue920-ky-derived-scan` was not scan-only and is invalid; `.cache/issue920-ky-derived-scan-v2/run-20260722T110052Z.json` records the valid scan reference.
+
+- Observation: Express's importer workload meets every conservative derived-layer gate, while Ky demonstrates why the absolute latency arm matters. Express improved warm median by 10.792 ms (66.2%), retained 7,093 bytes, and kept first/warm at 9.10x. Ky improved 52.3% but only 5.69 ms, so it does not independently justify promotion.
+  Evidence: `.cache/issue920-express-derived-{scan,auto}` and `.cache/issue920-ky-derived-{scan-v2,auto}` reports.
+
+- Observation: The complete direct-import topology is tiny relative to the already-persisted structural facts but should remain snapshot-local. Express retained 7,093 bytes versus 2,259,214 serialized structural-facts payload bytes (0.31%); no restart-benefit or serialization/invalidation evidence exists for a second persisted layer.
+  Evidence: `.cache/issue920/express-js/.brokk/bifrost_cache.db` read-only payload census and the paired Express reports.
 
 ## Decision Log
 
@@ -132,6 +143,18 @@ The behavior is visible in three ways. The benchmark report contains one stable 
   Rationale: Reuse is observable runner state and cannot honestly be inferred from CodeQuery syntax.
   Date/Author: 2026-07-22 / Codex.
 
+- Decision: Promote only `DirectImportTopology` as a snapshot-local derived relation. Express's `try-render-importers` case reduced warm median from 16.306 ms to 5.514 ms, eliminated warm import resolution, retained 7,093 bytes, and held first/warm to 9.10x; Ky corroborated the reuse shape but not the stricter 10 ms absolute latency arm.
+  Rationale: Express meets the 50% physical-work, stricter 20%-or-10-ms latency, 25% retained-memory, and 10x cold/warm gates on the same pinned checkout and machine.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Keep owner/member, hierarchy, reference, and call relations request-local. Their current payloads include proof tier, ambiguity, site or call kind, source range, typed endpoints, and partial/unsupported state that a bare dense graph cannot reproduce; no retained-byte or cross-request benchmark passed the promotion gate.
+  Rationale: Promotion must preserve the complete public typed payload and exactness state, not only endpoint connectivity. These relations are also more shape-specific and less consistently reused than import topology.
+  Date/Author: 2026-07-22 / Codex.
+
+- Decision: Keep both structural postings and direct-import topology memory-only for issue #920.
+  Rationale: Neither layer has demonstrated the required process-restart benefit, smaller serialized representation, and complete durable invalidation key. Existing structural facts remain the sole persisted substrate.
+  Date/Author: 2026-07-22 / Codex.
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The checked-in manifest now has 12 correctness-checked query cases across all ten pinned languages and all six workload classes. Each case gets a fresh MCP process, a separately reported first request, two warmups, ten measured requests, full-result stability checking, warm median/p95, and structured work/cache metrics. Failed correctness checks expose no timing samples. Query benchmark code is isolated from the generic runner, the MCP transport has a hard response deadline, and the scheduled job has a hard timeout.
@@ -141,6 +164,8 @@ The local pre-index report passed all cases. First/warm median milliseconds were
 Milestone 2 is implementation- and guided-review-complete. The posting index retains dense `(file_id, fact_id)` rows for kind, name, selective kind/name, exact callee/module role values, kwarg keywords, and compact source-trigram filters; facts and sources remain in their existing caches. Construction preflights fixed allocations, enforces a conservative peak estimate, polls cancellation through source, fact, finalization, census, and selection loops, and publishes only under an unchanged source generation. Forced scan/index tests cover every structural language, RQL/JSON equivalence, nested captures/negation, file/source/fact/pipeline/result cutoffs, update/update_all, add/delete, clones, and mutable overlays. The complete LSP suite remains green.
 
 The clean-commit Dapper pair at `4c480b6d3707d4b380423026ecd0bb8caf6aa9c2` satisfies the Milestone 2 promotion gates. For `workspace-exact-sql-mapper-class`, scan-only first/warm median/p95 was 217.6/107.4/245.1 ms and Auto was 208.9/26.0/26.8 ms, a 4.13x warm-median improvement with an 8.04x first-to-warm ratio. Indexed warm execution reduced candidate/examined facts from 49,181 to 27, materialized facts from 49,181 to 24,269, and inspected source bytes from 1,159,390 to 917,649. The transition warmup built over 157 files and 85,325 facts in 210.9 ms; the retained index was 1,979,756 bytes versus 12,215,566 normalized-facts bytes, or 16.2%. Both paths returned the same 27 results without truncation or diagnostics.
+
+Milestone 3's measured implementation is complete and its guided-review corrections are in progress. `DirectImportTopology` retains compact outgoing/incoming file IDs plus explicit source-support bits, is owned by an analyzer snapshot, and preserves scan-only values, proof/provenance, order, diagnostics, and truncation in typed differential tests. Owner/member, hierarchy, reference, and call relations remain request-local because their exact public payload cannot be reconstructed from endpoint rows alone and no independent promotion evidence exists.
 
 At each milestone, append the observed behavior, tests, benchmark figures, retained-memory decision, and any remaining gap here. At completion, compare the final Ubuntu benchmark artifact and differential-test evidence against every acceptance criterion rather than summarizing only the code diff.
 
@@ -477,6 +502,43 @@ Milestone 2 clean local benchmark pair:
     transition build = 157 files; 85,325 facts; 12,215,566 normalized-facts bytes; 210.9 ms; no wait/cancel/fallback
     warm index lifecycle = 1 ready lookup; 1 lookup; 1 hit; no miss/build/wait/cancel/fallback
     retained posting bytes = 1,979,756, or 16.2% of normalized-facts bytes
+
+Milestone 3 local typed benchmark pairs (dirty implementation tree, local Apple arm64 development build):
+
+    Ky repository = sindresorhus/ky pinned by benchmark/targets.toml
+    case = ky-class-importers; result cardinality = 1; truncated = false; diagnostics = []
+    valid scan report = .cache/issue920-ky-derived-scan-v2/run-20260722T110052Z.json
+    auto report = .cache/issue920-ky-derived-auto/run-20260722T110001Z.json
+    scan first/median/p95 = 46.993/10.875/21.531 ms
+    auto first/median/p95 = 37.628/5.184/5.577 ms; warm improvement = 52.3% and 5.691 ms; first/median = 7.26x
+    scan warm import work = 52 files / 111 edges; auto warm import work = 0 / 0
+    topology build = 52 files / 111 edges / 3.987 ms; retained = 2,876 bytes
+    invalid report not to cite = .cache/issue920-ky-derived-scan/run-20260722T105936Z.json
+
+    Express repository = expressjs/express pinned by benchmark/targets.toml
+    case = try-render-importers; result cardinality = 1; truncated = false; diagnostics = []
+    scan report = .cache/issue920-express-derived-scan/run-20260722T110324Z.json
+    auto report = .cache/issue920-express-derived-auto/run-20260722T110359Z.json
+    scan first/median/p95 = 68.769/16.306/23.886 ms
+    auto first/median/p95 = 50.173/5.514/5.806 ms; warm improvement = 66.2% and 10.792 ms; first/median = 9.10x
+    scan first and warm import work = 141 files / 92 edges; auto warm import work = 0 / 0
+    topology build = 141 files / 92 edges / 11.089 ms; retained = 7,093 bytes
+    persisted structural-facts payload census = 2,259,214 bytes; topology/payload = 0.31%
+
+Milestone 3 focused validation before guided-review fixes:
+
+    cargo test analyzer::structural::execution --lib
+    # 21 pass, 2 intentionally ignored
+    cargo test --test code_query_pipelines --test code_query_public_api
+    # 73 + 5 pass
+    cargo test --test benchmark_manifest --test benchmark_compare --test benchmark_workflow_policy --test bifrost_benchmark_cli --test bifrost_benchmark_run
+    # 9 + 9 + 2 + 3 + 9 pass
+    BIFROST_CACHE_DIR=<fresh temporary directory> scripts/test_python.sh
+    # 56 pass
+    cargo clippy --all-targets --all-features -- -D warnings
+    # pass
+    BIFROST_CODE_QUERY_BENCH_SMALL_FILES=2 BIFROST_CODE_QUERY_BENCH_LARGE_FILES=3 BIFROST_CODE_QUERY_BENCH_ITERATIONS=1 cargo test --lib code_query_execution_profile_measurement -- --ignored --nocapture
+    # 1 pass after updating the cold-versus-warm snapshot lifecycle contract
 
 ## Interfaces and Dependencies
 

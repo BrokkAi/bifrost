@@ -5,7 +5,8 @@ use crate::benchmark::mcp_iteration::{
 use crate::benchmark::mcp_session::McpSession;
 use crate::benchmark::report::{
     QueryCodeAccessPathMetrics, QueryCodeAccessPathTermMetrics, QueryCodeBenchmarkMetrics,
-    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, ScenarioReport, ScenarioTransport,
+    QueryCodeDerivedLayerMetrics, QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics,
+    ScenarioReport, ScenarioTransport,
 };
 use crate::benchmark::runner::BenchmarkProfile;
 use crate::benchmark::{
@@ -255,6 +256,31 @@ struct FactsCacheWire {
     replayed_files: u64,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DerivedLayerCacheWire {
+    lookups: u64,
+    hits: u64,
+    misses: u64,
+    builds: u64,
+    waits: u64,
+    wait_ns: u64,
+    complete_hits: u64,
+    incomplete_hits: u64,
+    complete_builds: u64,
+    incomplete_builds: u64,
+    unknown_outcomes: u64,
+    cancelled: u64,
+    unavailable: u64,
+    over_budget: u64,
+    fallbacks: u64,
+    replayed_items: u64,
+    build_files: u64,
+    build_edges: u64,
+    build_ns: u64,
+    retained_bytes: u64,
+}
+
 fn parse_profile(
     case: &QueryCodeBenchmarkCase,
     tool_result: &Value,
@@ -312,6 +338,19 @@ fn parse_profile(
                 case.id
             )
         })?;
+    let topology = profile
+        .cache_layers
+        .iter()
+        .find(|layer| layer.layer == "direct_import_topology")
+        .map(|layer| serde_json::from_value::<DerivedLayerCacheWire>(layer.metrics.clone()))
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "query_code case `{}` returned invalid direct_import_topology metrics: {error}",
+                case.id
+            )
+        })?
+        .unwrap_or_default();
 
     Ok((
         profile.result,
@@ -336,6 +375,28 @@ fn parse_profile(
                 unavailable: facts.unavailable,
                 unknown_outcomes: facts.unknown_outcomes,
                 replayed_files: facts.replayed_files,
+            },
+            direct_import_topology: QueryCodeDerivedLayerMetrics {
+                lookups: topology.lookups,
+                hits: topology.hits,
+                misses: topology.misses,
+                builds: topology.builds,
+                waits: topology.waits,
+                wait_ns: topology.wait_ns,
+                complete_hits: topology.complete_hits,
+                incomplete_hits: topology.incomplete_hits,
+                complete_builds: topology.complete_builds,
+                incomplete_builds: topology.incomplete_builds,
+                unknown_outcomes: topology.unknown_outcomes,
+                cancelled: topology.cancelled,
+                unavailable: topology.unavailable,
+                over_budget: topology.over_budget,
+                fallbacks: topology.fallbacks,
+                replayed_items: topology.replayed_items,
+                build_files: topology.build_files,
+                build_edges: topology.build_edges,
+                build_ns: topology.build_ns,
+                retained_bytes: topology.retained_bytes,
             },
             access_path: Some(parse_access_path(&profile.access_path)?),
         },
@@ -575,8 +636,44 @@ fn aggregate_metrics(
             }),
             replayed_files: median_counter(observations, |value| value.facts_cache.replayed_files),
         },
+        direct_import_topology: aggregate_derived_layer_metrics(observations),
         access_path: aggregate_access_path_metrics(observations)?,
     })
+}
+
+fn aggregate_derived_layer_metrics(
+    observations: &[QueryCodeProfileMetrics],
+) -> QueryCodeDerivedLayerMetrics {
+    let counter = |select: fn(&QueryCodeDerivedLayerMetrics) -> u64| {
+        median_u64(
+            observations
+                .iter()
+                .map(|value| select(&value.direct_import_topology))
+                .collect(),
+        )
+    };
+    QueryCodeDerivedLayerMetrics {
+        lookups: counter(|value| value.lookups),
+        hits: counter(|value| value.hits),
+        misses: counter(|value| value.misses),
+        builds: counter(|value| value.builds),
+        waits: counter(|value| value.waits),
+        wait_ns: counter(|value| value.wait_ns),
+        complete_hits: counter(|value| value.complete_hits),
+        incomplete_hits: counter(|value| value.incomplete_hits),
+        complete_builds: counter(|value| value.complete_builds),
+        incomplete_builds: counter(|value| value.incomplete_builds),
+        unknown_outcomes: counter(|value| value.unknown_outcomes),
+        cancelled: counter(|value| value.cancelled),
+        unavailable: counter(|value| value.unavailable),
+        over_budget: counter(|value| value.over_budget),
+        fallbacks: counter(|value| value.fallbacks),
+        replayed_items: counter(|value| value.replayed_items),
+        build_files: counter(|value| value.build_files),
+        build_edges: counter(|value| value.build_edges),
+        build_ns: counter(|value| value.build_ns),
+        retained_bytes: counter(|value| value.retained_bytes),
+    }
 }
 
 fn aggregate_access_path_metrics(
@@ -698,6 +795,10 @@ mod tests {
         assert_eq!(metrics.total_ns, 11);
         assert_eq!(metrics.scanned_files, 2);
         assert_eq!(metrics.facts_cache.extractions, 2);
+        assert_eq!(metrics.direct_import_topology.lookups, 1);
+        assert_eq!(metrics.direct_import_topology.hits, 1);
+        assert_eq!(metrics.direct_import_topology.replayed_items, 2);
+        assert_eq!(metrics.direct_import_topology.retained_bytes, 512);
         assert_eq!(
             metrics
                 .access_path
@@ -778,19 +879,32 @@ mod tests {
                     "import_files_resolved": 0,
                     "import_edges_resolved": 0
                 },
-                "cache_layers": [{
-                    "layer": "seed_structural_facts",
-                    "metrics": {
-                        "kind": "structural_facts",
-                        "lookups": 2,
-                        "memory_hits": 0,
-                        "persisted_hydrations": 0,
-                        "extractions": 2,
-                        "unavailable": 0,
-                        "unknown_outcomes": 0,
-                        "replayed_files": 2
+                "cache_layers": [
+                    {
+                        "layer": "seed_structural_facts",
+                        "metrics": {
+                            "kind": "structural_facts",
+                            "lookups": 2,
+                            "memory_hits": 0,
+                            "persisted_hydrations": 0,
+                            "extractions": 2,
+                            "unavailable": 0,
+                            "unknown_outcomes": 0,
+                            "replayed_files": 2
+                        }
+                    },
+                    {
+                        "layer": "direct_import_topology",
+                        "metrics": {
+                            "kind": "complete_value",
+                            "lookups": 1,
+                            "hits": 1,
+                            "complete_hits": 1,
+                            "replayed_items": 2,
+                            "retained_bytes": 512
+                        }
                     }
-                }],
+                ],
                 "access_path": {
                     "selected": "posting:kind+name",
                     "representation_version": 1,

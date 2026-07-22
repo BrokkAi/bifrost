@@ -166,6 +166,396 @@ fn run_class_query(
     .expect("class query")
 }
 
+fn import_query(
+    analyzer: &dyn IAnalyzer,
+    language: &str,
+    path: &str,
+    name: &str,
+    step: &str,
+    limits: CodeQueryExecutionLimits,
+    access_mode: StructuralAccessMode,
+) -> DetailedCodeQueryResult {
+    let query = CodeQuery::from_json(&json!({
+        "languages": [language],
+        "where": [path],
+        "match": { "kind": "class", "name": name },
+        "steps": [{ "op": "file_of" }, { "op": step }],
+        "result_detail": "full",
+        "limit": 100
+    }))
+    .expect("import query");
+    execute_code_query_with_access_mode(analyzer, &query, limits, access_mode, true)
+        .expect("import query execution")
+}
+
+#[test]
+fn snapshot_import_topology_matches_request_local_and_reuses_across_requests() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "bench/Target.java")
+        .write("package bench; public class Target {}\n")
+        .expect("write target");
+    for name in ["First", "Second"] {
+        ProjectFile::new(root.clone(), format!("bench/{name}.java"))
+            .write(format!(
+                "package bench; import bench.Target; public class {name} {{}}\n"
+            ))
+            .expect("write importer");
+    }
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+    let limits = CodeQueryExecutionLimits::default();
+
+    let scan = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::ScanOnly,
+    );
+    let built = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(
+        serde_json::to_value(&built.result).expect("snapshot result"),
+        serde_json::to_value(&scan.result).expect("request-local result")
+    );
+    let built_profile = built.profile.expect("build profile");
+    assert_eq!(built_profile.cache.direct_import_topology.lookups, 1);
+    assert_eq!(built_profile.cache.direct_import_topology.misses, 1);
+    assert_eq!(built_profile.cache.direct_import_topology.builds, 1);
+    assert_eq!(
+        built_profile.cache.direct_import_topology.complete_builds,
+        1
+    );
+    assert_eq!(built_profile.cache.direct_import_topology.build_files, 3);
+    assert_eq!(built_profile.cache.direct_import_topology.build_edges, 2);
+    assert!(built_profile.cache.direct_import_topology.build_ns > 0);
+    assert!(built_profile.cache.direct_import_topology.retained_bytes > 0);
+    assert_eq!(built_profile.work.import_files_resolved, 3);
+    assert_eq!(built_profile.work.import_edges_resolved, 2);
+
+    let reused = import_query(
+        &analyzer,
+        "java",
+        "bench/Target.java",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(
+        serde_json::to_value(&reused.result).expect("reused result"),
+        serde_json::to_value(&scan.result).expect("request-local result")
+    );
+    let reused_profile = reused.profile.expect("reuse profile");
+    assert_eq!(reused_profile.cache.direct_import_topology.lookups, 1);
+    assert_eq!(reused_profile.cache.direct_import_topology.hits, 1);
+    assert_eq!(reused_profile.cache.direct_import_topology.complete_hits, 1);
+    assert_eq!(reused_profile.cache.direct_import_topology.builds, 0);
+    assert_eq!(reused_profile.work.import_files_resolved, 0);
+    assert_eq!(reused_profile.work.import_edges_resolved, 0);
+
+    let forward_scan = import_query(
+        &analyzer,
+        "java",
+        "bench/First.java",
+        "First",
+        "imports_of",
+        limits,
+        StructuralAccessMode::ScanOnly,
+    );
+    let forward_reused = import_query(
+        &analyzer,
+        "java",
+        "bench/First.java",
+        "First",
+        "imports_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(
+        serde_json::to_value(&forward_reused.result).expect("snapshot forward result"),
+        serde_json::to_value(&forward_scan.result).expect("request-local forward result")
+    );
+    let forward_profile = forward_reused.profile.expect("forward profile");
+    assert_eq!(forward_profile.cache.direct_import_topology.hits, 1);
+    assert_eq!(forward_profile.cache.import_forward.complete_hits, 1);
+}
+
+#[test]
+fn snapshot_import_topology_resets_on_update_and_mutable_overlay_generation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let consumer = ProjectFile::new(root.clone(), "bench/Consumer.java");
+    ProjectFile::new(root.clone(), "bench/Before.java")
+        .write("package bench; public class Before {}\n")
+        .expect("write before");
+    ProjectFile::new(root.clone(), "bench/After.java")
+        .write("package bench; public class After {}\n")
+        .expect("write after");
+    consumer
+        .write("package bench; import bench.Before; public class Consumer {}\n")
+        .expect("write consumer");
+    let project: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root.clone(), Language::Java));
+    let analyzer = JavaAnalyzer::new(Arc::clone(&project));
+    let limits = CodeQueryExecutionLimits::default();
+
+    let before = import_query(
+        &analyzer,
+        "java",
+        "bench/Before.java",
+        "Before",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(before.result.results.len(), 1);
+    assert_eq!(
+        before
+            .profile
+            .expect("initial profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1
+    );
+    let cloned = analyzer.clone();
+    assert_eq!(
+        import_query(
+            &cloned,
+            "java",
+            "bench/Before.java",
+            "Before",
+            "importers_of",
+            limits,
+            StructuralAccessMode::IndexedRequired,
+        )
+        .profile
+        .expect("clone profile")
+        .cache
+        .direct_import_topology
+        .hits,
+        1
+    );
+
+    consumer
+        .write("package bench; import bench.After; public class Consumer {}\n")
+        .expect("update consumer");
+    let updated = analyzer.update(&BTreeSet::from([consumer.clone()]));
+    let after = import_query(
+        &updated,
+        "java",
+        "bench/After.java",
+        "After",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(after.result.results.len(), 1);
+    assert_eq!(
+        after
+            .profile
+            .expect("updated profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1
+    );
+    assert!(
+        import_query(
+            &updated,
+            "java",
+            "bench/Before.java",
+            "Before",
+            "importers_of",
+            limits,
+            StructuralAccessMode::IndexedRequired,
+        )
+        .result
+        .results
+        .is_empty()
+    );
+
+    consumer
+        .write("package bench; import bench.Before; public class Consumer {}\n")
+        .expect("restore disk consumer");
+    let overlay = Arc::new(OverlayProject::new(project));
+    let overlay_analyzer =
+        JavaAnalyzer::new(Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>);
+    assert_eq!(
+        import_query(
+            &overlay_analyzer,
+            "java",
+            "bench/Before.java",
+            "Before",
+            "importers_of",
+            limits,
+            StructuralAccessMode::IndexedRequired,
+        )
+        .result
+        .results
+        .len(),
+        1
+    );
+    assert!(overlay.set(
+        consumer.abs_path(),
+        "package bench; import bench.After; public class Consumer {}\n".to_string()
+    ));
+    let overlay_after = import_query(
+        &overlay_analyzer,
+        "java",
+        "bench/After.java",
+        "After",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(overlay_after.result.results.len(), 1);
+    assert_eq!(
+        overlay_after
+            .profile
+            .expect("revised overlay profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1,
+        "the revised overlay generation must not hit the old topology"
+    );
+    assert!(
+        import_query(
+            &overlay_analyzer,
+            "java",
+            "bench/Before.java",
+            "Before",
+            "importers_of",
+            limits,
+            StructuralAccessMode::IndexedRequired,
+        )
+        .result
+        .results
+        .is_empty()
+    );
+}
+
+#[test]
+fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "target.ts")
+        .write("export class Target {}\n")
+        .expect("write TypeScript target");
+    ProjectFile::new(root.clone(), "consumer.ts")
+        .write("import { Target } from './target'; export class Consumer extends Target {}\n")
+        .expect("write TypeScript consumer");
+    ProjectFile::new(root.clone(), "Extra.java")
+        .write("public class Extra {}\n")
+        .expect("write Java source");
+    let project: Arc<dyn crate::analyzer::Project> = Arc::new(TestProject::with_languages(
+        root,
+        BTreeSet::from([Language::Java, Language::TypeScript]),
+    ));
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let limits = CodeQueryExecutionLimits::default();
+
+    let built = import_query(
+        workspace.analyzer(),
+        "typescript",
+        "target.ts",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(built.result.results.len(), 1);
+    assert_eq!(
+        built
+            .profile
+            .expect("multi build profile")
+            .cache
+            .direct_import_topology
+            .builds,
+        1
+    );
+    let cloned = workspace.clone();
+    let reused = import_query(
+        cloned.analyzer(),
+        "typescript",
+        "target.ts",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::IndexedRequired,
+    );
+    assert_eq!(reused.result.results.len(), 1);
+    assert_eq!(
+        reused
+            .profile
+            .expect("multi reuse profile")
+            .cache
+            .direct_import_topology
+            .hits,
+        1
+    );
+}
+
+#[test]
+fn auto_import_topology_budget_fallback_matches_request_local_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "a.rb")
+        .write("require_relative 'b'\ndef from_a; end\n")
+        .expect("write a");
+    ProjectFile::new(root.clone(), "b.rb")
+        .write("require_relative 'c'\ndef from_b; end\n")
+        .expect("write b");
+    ProjectFile::new(root.clone(), "c.rb")
+        .write("class Target; end\n")
+        .expect("write c");
+    let analyzer = RubyAnalyzer::from_project(TestProject::new(root, Language::Ruby));
+    let limits = CodeQueryExecutionLimits {
+        max_scanned_files: 1,
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    let scan = import_query(
+        &analyzer,
+        "ruby",
+        "c.rb",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::ScanOnly,
+    );
+    let automatic = import_query(
+        &analyzer,
+        "ruby",
+        "c.rb",
+        "Target",
+        "importers_of",
+        limits,
+        StructuralAccessMode::Auto,
+    );
+    assert_eq!(
+        serde_json::to_value(&automatic.result).expect("automatic result"),
+        serde_json::to_value(&scan.result).expect("request-local result")
+    );
+    let profile = automatic.profile.expect("fallback profile");
+    assert_eq!(profile.cache.direct_import_topology.lookups, 1);
+    assert_eq!(profile.cache.direct_import_topology.unavailable, 1);
+    assert_eq!(profile.cache.direct_import_topology.over_budget, 1);
+    assert_eq!(profile.cache.direct_import_topology.fallbacks, 1);
+    assert_eq!(profile.cache.direct_import_topology.complete_builds, 0);
+}
+
 #[test]
 fn snapshot_index_reuses_clones_and_resets_updates_and_overlays() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -918,7 +1308,10 @@ fn typed_diagnostic_producers_cover_budget_output_and_cancellation() {
     let budget = CodeQueryExecutionBudget::default();
     push_budget_diagnostic(&mut diagnostics, &budget);
     push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
-    push_import_graph_budget_diagnostic(&mut diagnostics, &DirectImportGraph::default());
+    push_import_graph_budget_diagnostic(
+        &mut diagnostics,
+        &RequestLocalDirectImportGraph::default(),
+    );
     push_truncation_diagnostic(&mut diagnostics, &budget, 1);
     push_broad_query_diagnostic(&mut diagnostics, &budget);
 
@@ -2463,6 +2856,12 @@ fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
     assert_eq!(profile.cache.import_reverse.hits, 1);
     assert_eq!(profile.cache.import_reverse.incomplete_hits, 1);
     assert_eq!(profile.cache.import_reverse.complete_hits, 0);
+    assert_eq!(profile.cache.direct_import_topology.lookups, 4);
+    assert_eq!(profile.cache.direct_import_topology.misses, 3);
+    assert_eq!(profile.cache.direct_import_topology.hits, 1);
+    assert_eq!(profile.cache.direct_import_topology.builds, 1);
+    assert_eq!(profile.cache.direct_import_topology.complete_builds, 1);
+    assert_eq!(profile.cache.direct_import_topology.fallbacks, 4);
     assert_eq!(
         profile
             .operators
@@ -2605,6 +3004,14 @@ fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
     assert_eq!(profile.cache.import_reverse.hits, 1);
     assert_eq!(profile.cache.import_reverse.complete_hits, 1);
     assert!(profile.cache.import_reverse.replayed_items > 0);
+    assert_eq!(profile.cache.direct_import_topology.lookups, 2);
+    assert_eq!(profile.cache.direct_import_topology.misses, 1);
+    assert_eq!(profile.cache.direct_import_topology.hits, 1);
+    assert_eq!(profile.cache.direct_import_topology.builds, 1);
+    assert_eq!(profile.cache.direct_import_topology.complete_builds, 1);
+    assert_eq!(profile.cache.direct_import_topology.build_files, 4);
+    assert_eq!(profile.cache.direct_import_topology.build_edges, 4);
+    assert!(profile.cache.direct_import_topology.retained_bytes > 0);
     let import_steps = profile
         .operators
         .iter()

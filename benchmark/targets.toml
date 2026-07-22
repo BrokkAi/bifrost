@@ -156,6 +156,7 @@ definition_queries = [
 ]
 query_code_queries = [
   { id = "exact-try-render-function", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["javascript"],"where":["lib/application.js"],"match":{"kind":"function","name":"tryRender"},"limit":100}', required_paths = ["lib/application.js"], expected_witness_json = '{"result_type":"structural_match","path":"lib/application.js","kind":"function","enclosing_symbol":"tryRender"}', min_results = 1, max_results = 1 },
+  { id = "try-render-importers", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["javascript"],"where":["lib/application.js"],"match":{"kind":"function","name":"tryRender"},"steps":[{"op":"file_of"},{"op":"importers_of"}],"limit":1000}', required_paths = ["lib/application.js", "lib/express.js"], expected_witness_json = '{"result_type":"file","path":"lib/express.js","provenance":[{"seed":{"path":"lib/application.js","kind":"function","start_line":625,"end_line":631},"steps":[{"op":"file_of","result":{"result_type":"file","path":"lib/application.js"}},{"op":"importers_of","result":{"result_type":"file","path":"lib/express.js"}}]}]}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
@@ -189,6 +190,7 @@ definition_queries = [
 ]
 query_code_queries = [
   { id = "ky-class-file", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["typescript"],"where":["source/core/Ky.ts"],"match":{"kind":"class","name":"Ky"},"steps":[{"op":"file_of"}],"limit":100}', required_paths = ["source/core/Ky.ts"], expected_witness_json = '{"result_type":"file","path":"source/core/Ky.ts","provenance":[{"seed":{"path":"source/core/Ky.ts","kind":"class","start_line":142,"end_line":1042},"steps":[{"op":"file_of","result":{"result_type":"file","path":"source/core/Ky.ts"}}]}]}', min_results = 1, max_results = 1 },
+  { id = "ky-class-importers", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["typescript"],"where":["source/core/Ky.ts"],"match":{"kind":"class","name":"Ky"},"steps":[{"op":"file_of"},{"op":"importers_of"}],"limit":1000}', required_paths = ["source/core/Ky.ts", "source/index.ts"], expected_witness_json = '{"result_type":"file","path":"source/index.ts","provenance":[{"seed":{"path":"source/core/Ky.ts","kind":"class","start_line":142,"end_line":1042},"steps":[{"op":"file_of","result":{"result_type":"file","path":"source/core/Ky.ts"}},{"op":"importers_of","result":{"result_type":"file","path":"source/index.ts"}}]}]}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]

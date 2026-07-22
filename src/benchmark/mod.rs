@@ -16,7 +16,7 @@ pub use manifest::{
 pub use report::{
     BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
     EnvironmentVarianceReport, QueryCodeAccessPathMetrics, QueryCodeBenchmarkMetrics,
-    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, ScenarioCompareOutcome,
-    ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+    QueryCodeDerivedLayerMetrics, QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics,
+    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
 };
 pub use runner::{BenchmarkProfile, RunRequest, run_benchmark};

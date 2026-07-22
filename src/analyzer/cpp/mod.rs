@@ -532,6 +532,12 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        self.inner.snapshot_derived_layer_cache()
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }

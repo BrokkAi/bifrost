@@ -1406,6 +1406,12 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_derived_layer_cache(
+        &self,
+    ) -> Option<&crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache> {
+        self.inner.snapshot_derived_layer_cache()
+    }
+
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
