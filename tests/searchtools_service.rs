@@ -214,20 +214,54 @@ class Sample {
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
 
-    let value = service
-        .call_tool_value(
-            "query_code",
-            serde_json::json!({
-                "match": { "kind": "call", "callee": { "name": "run" } },
-                "steps": [{ "op": "receiver_targets" }]
-            }),
-        )
-        .expect("Java receiver query");
+    let query = serde_json::json!({
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [{ "op": "receiver_targets" }]
+    });
+    let assert_exact_receiver = |payload: &Value| {
+        assert_eq!(
+            payload["results"].as_array().map(Vec::len),
+            Some(1),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["results"][0]["result_type"], "receiver_analysis",
+            "{payload}"
+        );
+        assert_eq!(payload["results"][0]["outcome"], "precise", "{payload}");
+        assert_eq!(
+            payload["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
+            "{payload}"
+        );
+        assert!(
+            payload["results"][0]["values"][0]["type_declaration"]["fq_name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("Service")),
+            "{payload}"
+        );
+    };
 
-    assert_eq!(
-        value["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
-        "payload: {value}"
-    );
+    let ordinary = service
+        .call_tool_value("query_code", query.clone())
+        .expect("Java receiver query");
+    assert_exact_receiver(&ordinary);
+
+    let mut profile_query = query.clone();
+    profile_query["execution_mode"] = serde_json::json!("profile");
+    let profile = service
+        .call_tool_value("query_code", profile_query)
+        .expect("profiled Java receiver query");
+    assert_eq!(profile["format"], "bifrost_code_query_profile/v1");
+    assert_eq!(profile["result"], ordinary, "{profile}");
+    assert_exact_receiver(&profile["result"]);
+
+    let mut explain_query = query;
+    explain_query["execution_mode"] = serde_json::json!("explain");
+    let explain = service
+        .call_tool_value("query_code", explain_query)
+        .expect("explained Java receiver query");
+    assert_eq!(explain["format"], "bifrost_code_query_explain/v1");
+    assert!(explain.get("results").is_none(), "{explain}");
 }
 
 #[test]

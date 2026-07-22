@@ -128,6 +128,91 @@ enum SemanticReceiverGate {
     },
 }
 
+impl SemanticReceiverGate {
+    fn work(&self) -> ReceiverAnalysisWork {
+        match self {
+            Self::Available { work, .. }
+            | Self::Unavailable { work }
+            | Self::Exceeded { work, .. } => *work,
+        }
+    }
+
+    fn exceeded_limit(&self) -> Option<ReceiverBudgetLimit> {
+        match self {
+            Self::Exceeded { limit, .. } => Some(*limit),
+            Self::Available { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// One receiver-query budget shared by setup, the neutral semantic gate, and
+/// the compatibility provider. Setup consumes the same scope capacity as the
+/// two analysis phases even though it remains separately visible in reports.
+#[derive(Debug, Clone, Copy)]
+struct ReceiverWorkLedger {
+    budget: ReceiverAnalysisBudget,
+    work: ReceiverAnalysisWork,
+}
+
+impl ReceiverWorkLedger {
+    fn new(budget: ReceiverAnalysisBudget) -> Self {
+        Self {
+            budget,
+            work: ReceiverAnalysisWork::default(),
+        }
+    }
+
+    fn remaining_budget(&self) -> ReceiverAnalysisBudget {
+        ReceiverAnalysisBudget {
+            max_scope_nodes: self
+                .budget
+                .max_scope_nodes
+                .saturating_sub(self.work.setup_nodes.saturating_add(self.work.scope_nodes)),
+            max_summary_expansions: self
+                .budget
+                .max_summary_expansions
+                .saturating_sub(self.work.summary_expansions),
+            ..self.budget
+        }
+    }
+
+    fn charge_setup(&mut self, nodes: usize) -> Result<(), ReceiverBudgetLimit> {
+        let remaining = self.remaining_budget().max_scope_nodes;
+        self.work.setup_nodes = self.work.setup_nodes.saturating_add(nodes.min(remaining));
+        if nodes > remaining {
+            Err(ReceiverBudgetLimit::ScopeNodes)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn charge_analysis(&mut self, work: ReceiverAnalysisWork) -> Result<(), ReceiverBudgetLimit> {
+        debug_assert_eq!(work.setup_nodes, 0);
+        let remaining = self.remaining_budget();
+        let scope_exceeded = work.scope_nodes > remaining.max_scope_nodes;
+        let summaries_exceeded = work.summary_expansions > remaining.max_summary_expansions;
+        self.work.scope_nodes = self
+            .work
+            .scope_nodes
+            .saturating_add(work.scope_nodes.min(remaining.max_scope_nodes));
+        self.work.summary_expansions = self.work.summary_expansions.saturating_add(
+            work.summary_expansions
+                .min(remaining.max_summary_expansions),
+        );
+        if scope_exceeded {
+            Err(ReceiverBudgetLimit::ScopeNodes)
+        } else if summaries_exceeded {
+            Err(ReceiverBudgetLimit::SummaryExpansions)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn work(&self) -> ReceiverAnalysisWork {
+        self.work
+    }
+}
+
 impl<'a> ReceiverQueryService<'a> {
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
@@ -195,7 +280,7 @@ impl<'a> ReceiverQueryService<'a> {
                 None,
             ));
         };
-        let mut setup_nodes = 0;
+        let mut ledger = ReceiverWorkLedger::new(budget);
         if !self.prepared_files.borrow().contains_key(file) {
             let Some(tree) = parse_js_ts_tree(file, &source, language) else {
                 return Ok(unsupported_report(
@@ -212,19 +297,27 @@ impl<'a> ReceiverQueryService<'a> {
                 tree.root_node(),
                 &source,
                 cancellation,
-                budget.max_scope_nodes,
+                ledger.remaining_budget().max_scope_nodes,
             ) {
                 JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => (index, visited),
                 JsTsReceiverSyntaxIndexBuild::ExceededScope { visited } => {
+                    let _ = ledger.charge_setup(visited);
                     return Ok(setup_budget_report(
-                        operation, file, language, range, &source, visited,
+                        operation,
+                        file,
+                        language,
+                        range,
+                        &source,
+                        ledger.work(),
                     ));
                 }
                 JsTsReceiverSyntaxIndexBuild::Cancelled => {
                     return Err(ReceiverQueryError::Cancelled);
                 }
             };
-            setup_nodes = visited;
+            ledger
+                .charge_setup(visited)
+                .expect("completed setup traversal fits its supplied receiver budget");
             self.prepared_files.borrow_mut().insert(
                 file.clone(),
                 PreparedReceiverFile {
@@ -235,10 +328,6 @@ impl<'a> ReceiverQueryService<'a> {
                 },
             );
         }
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: budget.max_scope_nodes.saturating_sub(setup_nodes),
-            ..budget
-        };
         let prepared_files = self.prepared_files.borrow();
         let prepared = prepared_files
             .get(file)
@@ -256,7 +345,7 @@ impl<'a> ReceiverQueryService<'a> {
                 "receiver_input_range_unavailable",
                 Some(source),
             );
-            report.work.setup_nodes = setup_nodes;
+            report.work = ledger.work();
             return Ok(report);
         };
         self.definitions.set_language(language);
@@ -276,13 +365,30 @@ impl<'a> ReceiverQueryService<'a> {
                 let gate = self.semantic_receiver_gate(
                     file,
                     node_range(input_node),
-                    budget,
+                    ledger.remaining_budget(),
                     cancellation,
                 )?;
-                let analysis = provider.resolve_receiver_node_report(input_node, budget);
-                apply_semantic_gate(
+                if let Some(limit) = charge_semantic_gate(&mut ledger, &gate) {
+                    return Ok(budget_report(
+                        operation,
+                        site(
+                            file,
+                            language,
+                            node_range(input_node),
+                            source,
+                            input_node.kind(),
+                            None,
+                        ),
+                        ledger.work(),
+                        limit,
+                    ));
+                }
+                let analysis =
+                    provider.resolve_receiver_node_report(input_node, ledger.remaining_budget());
+                finalize_legacy_report(
                     values_report(operation, file, language, input_node, source, analysis),
                     gate,
+                    &mut ledger,
                 )
             }
             ReceiverQueryOperation::ReceiverTargets => {
@@ -300,27 +406,43 @@ impl<'a> ReceiverQueryService<'a> {
                                 "receiver_site_without_receiver",
                                 Some(source),
                             );
-                            report.work.setup_nodes = setup_nodes;
+                            report.work = ledger.work();
                             return Ok(report);
                         };
                         receiver
                     }
                 };
-                let gate =
-                    self.semantic_receiver_gate(file, node_range(receiver), budget, cancellation)?;
-                let analysis = provider.resolve_receiver_node_report(receiver, budget);
-                apply_semantic_gate(
+                let gate = self.semantic_receiver_gate(
+                    file,
+                    node_range(receiver),
+                    ledger.remaining_budget(),
+                    cancellation,
+                )?;
+                if let Some(limit) = charge_semantic_gate(&mut ledger, &gate) {
+                    return Ok(budget_report(
+                        operation,
+                        site(
+                            file,
+                            language,
+                            node_range(receiver),
+                            source,
+                            receiver.kind(),
+                            None,
+                        ),
+                        ledger.work(),
+                        limit,
+                    ));
+                }
+                let analysis =
+                    provider.resolve_receiver_node_report(receiver, ledger.remaining_budget());
+                finalize_legacy_report(
                     values_report(operation, file, language, receiver, source, analysis),
                     gate,
+                    &mut ledger,
                 )
             }
             ReceiverQueryOperation::MemberTargets => {
-                let Some(member_report) = provider.resolve_member_targets_at_site(
-                    input_node,
-                    None,
-                    input_node.start_byte(),
-                    budget,
-                ) else {
+                let Some(member_expression) = member_expression_at_site(input_node) else {
                     let mut report = unsupported_report(
                         operation,
                         file,
@@ -329,9 +451,73 @@ impl<'a> ReceiverQueryService<'a> {
                         "member_target_site_unsupported",
                         Some(source),
                     );
-                    report.work.setup_nodes = setup_nodes;
+                    report.work = ledger.work();
                     return Ok(report);
                 };
+                let Some(property) = member_expression.child_by_field_name("property") else {
+                    let mut report = unsupported_report(
+                        operation,
+                        file,
+                        language,
+                        range,
+                        "member_target_site_unsupported",
+                        Some(source),
+                    );
+                    report.work = ledger.work();
+                    return Ok(report);
+                };
+                let Some(receiver) = member_expression.child_by_field_name("object") else {
+                    let mut report = unsupported_report(
+                        operation,
+                        file,
+                        language,
+                        range,
+                        "member_target_site_unsupported",
+                        Some(source),
+                    );
+                    report.work = ledger.work();
+                    return Ok(report);
+                };
+                let member_name = source
+                    .get(property.start_byte()..property.end_byte())
+                    .unwrap_or_default();
+                if member_name.is_empty() {
+                    let mut report = unsupported_report(
+                        operation,
+                        file,
+                        language,
+                        range,
+                        "member_target_site_unsupported",
+                        Some(source),
+                    );
+                    report.work = ledger.work();
+                    return Ok(report);
+                }
+                let gate_site = site(
+                    file,
+                    language,
+                    node_range(receiver),
+                    source,
+                    "receiver",
+                    Some(member_name.to_string()),
+                );
+                let gate = self.semantic_receiver_gate(
+                    file,
+                    node_range(receiver),
+                    ledger.remaining_budget(),
+                    cancellation,
+                )?;
+                if let Some(limit) = charge_semantic_gate(&mut ledger, &gate) {
+                    return Ok(budget_report(operation, gate_site, ledger.work(), limit));
+                }
+                let member_report = provider
+                    .resolve_member_targets_at_site(
+                        input_node,
+                        Some(member_name),
+                        input_node.start_byte(),
+                        ledger.remaining_budget(),
+                    )
+                    .expect("validated member expression remains supported by its provider");
                 let site = site(
                     file,
                     language,
@@ -340,13 +526,7 @@ impl<'a> ReceiverQueryService<'a> {
                     "receiver",
                     Some(member_report.member_name),
                 );
-                let gate = self.semantic_receiver_gate(
-                    file,
-                    member_report.receiver_range,
-                    budget,
-                    cancellation,
-                )?;
-                apply_semantic_gate(
+                finalize_legacy_report(
                     ReceiverQueryReport {
                         operation,
                         site,
@@ -357,12 +537,11 @@ impl<'a> ReceiverQueryService<'a> {
                         candidates_truncated: member_report.analysis.candidates_truncated,
                     },
                     gate,
+                    &mut ledger,
                 )
             }
         };
         check_cancelled(cancellation)?;
-        let mut report = report;
-        report.work.setup_nodes = setup_nodes;
         Ok(report)
     }
 
@@ -381,7 +560,15 @@ impl<'a> ReceiverQueryService<'a> {
             });
         };
         let cancellation = cancellation.cloned().unwrap_or_default();
-        let mut semantic = ReceiverSemanticBridge::new(budget);
+        let mut semantic = match ReceiverSemanticBridge::new(budget) {
+            Ok(semantic) => semantic,
+            Err(limit) => {
+                return Ok(SemanticReceiverGate::Exceeded {
+                    work: ReceiverAnalysisWork::default(),
+                    limit,
+                });
+            }
+        };
         let outcome = semantic
             .oracle(workspace)
             .pointees_at_source(
@@ -442,7 +629,7 @@ impl<'a> ReceiverQueryService<'a> {
             ));
         };
 
-        let mut setup_nodes = 0;
+        let mut ledger = ReceiverWorkLedger::new(budget);
         if !self.prepared_java_files.borrow().contains_key(file) {
             let Some(tree) = parse_tree_for_language(file, Language::Java, &source) else {
                 return Ok(unsupported_report(
@@ -454,26 +641,30 @@ impl<'a> ReceiverQueryService<'a> {
                     Some(&source),
                 ));
             };
-            setup_nodes = match walk_named_tree_preorder_bounded(
+            let setup_nodes = match walk_named_tree_preorder_bounded(
                 tree.root_node(),
                 true,
-                budget.max_scope_nodes,
+                ledger.remaining_budget().max_scope_nodes,
                 cancellation,
                 |_| {},
             ) {
                 BoundedNamedTreeWalk::Complete { visited } => visited,
                 BoundedNamedTreeWalk::Exceeded { visited } => {
+                    let _ = ledger.charge_setup(visited);
                     return Ok(setup_budget_report(
                         operation,
                         file,
                         Language::Java,
                         range,
                         &source,
-                        visited,
+                        ledger.work(),
                     ));
                 }
                 BoundedNamedTreeWalk::Cancelled => return Err(ReceiverQueryError::Cancelled),
             };
+            ledger
+                .charge_setup(setup_nodes)
+                .expect("completed setup traversal fits its supplied receiver budget");
             self.java_class_ranges
                 .borrow_mut()
                 .insert(file.clone(), ClassRangeIndex::build(self.analyzer, file));
@@ -481,10 +672,6 @@ impl<'a> ReceiverQueryService<'a> {
                 .borrow_mut()
                 .insert(file.clone(), PreparedJavaReceiverFile { source, tree });
         }
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: budget.max_scope_nodes.saturating_sub(setup_nodes),
-            ..budget
-        };
 
         let prepared_files = self.prepared_java_files.borrow();
         let prepared = prepared_files
@@ -503,7 +690,7 @@ impl<'a> ReceiverQueryService<'a> {
                 "receiver_input_range_unavailable",
                 Some(&prepared.source),
             );
-            report.work.setup_nodes = setup_nodes;
+            report.work = ledger.work();
             return Ok(report);
         };
         let query_node = match operation {
@@ -520,7 +707,7 @@ impl<'a> ReceiverQueryService<'a> {
                         "receiver_site_without_receiver",
                         Some(&prepared.source),
                     );
-                    report.work.setup_nodes = setup_nodes;
+                    report.work = ledger.work();
                     return Ok(report);
                 };
                 receiver
@@ -537,50 +724,54 @@ impl<'a> ReceiverQueryService<'a> {
                 .get(member.start_byte()..member.end_byte())
                 .map(str::to_string)
         });
-        let semantic = self.semantic_receiver_gate(file, query_range, budget, cancellation)?;
-        let (points_to, mut work, mut candidates_truncated) = match semantic {
+        let semantic = self.semantic_receiver_gate(
+            file,
+            query_range,
+            ledger.remaining_budget(),
+            cancellation,
+        )?;
+        if let Some(limit) = charge_semantic_gate(&mut ledger, &semantic) {
+            return Ok(budget_report(
+                operation,
+                site(
+                    file,
+                    Language::Java,
+                    query_range,
+                    &prepared.source,
+                    query_node.kind(),
+                    member_name,
+                ),
+                ledger.work(),
+                limit,
+            ));
+        }
+        let (points_to, mut candidates_truncated) = match semantic {
             SemanticReceiverGate::Available {
-                work,
                 points_to: Some(points_to),
                 truncated,
-            } => (points_to, work, truncated),
-            SemanticReceiverGate::Available {
-                work,
-                points_to: None,
                 ..
+            } => (points_to, truncated),
+            SemanticReceiverGate::Available {
+                points_to: None, ..
             }
-            | SemanticReceiverGate::Unavailable { work } => {
+            | SemanticReceiverGate::Unavailable { .. } => {
                 let mut report =
                     java_unknown_report(operation, file, query_node, &prepared.source, member_name);
-                report.work = work;
-                report.work.setup_nodes = setup_nodes;
+                report.work = ledger.work();
                 return Ok(report);
             }
-            SemanticReceiverGate::Exceeded { mut work, limit } => {
-                work.setup_nodes = setup_nodes;
-                return Ok(budget_report(
-                    operation,
-                    site(
-                        file,
-                        Language::Java,
-                        node_range(query_node),
-                        &prepared.source,
-                        query_node.kind(),
-                        member_name,
-                    ),
-                    work,
-                    limit,
-                ));
+            SemanticReceiverGate::Exceeded { .. } => {
+                unreachable!("semantic gate budget exits before compatibility analysis")
             }
         };
 
         self.definitions.set_language(Language::Java);
-        work.setup_nodes = setup_nodes;
+        let compatibility_budget = ledger.remaining_budget();
         if operation == ReceiverQueryOperation::MemberTargets {
             let Some(member_node) = member_node else {
                 let mut report =
                     java_unknown_report(operation, file, query_node, &prepared.source, member_name);
-                report.work = work;
+                report.work = ledger.work();
                 return Ok(report);
             };
             let Some(outcome) = java_definition_at(
@@ -593,10 +784,11 @@ impl<'a> ReceiverQueryService<'a> {
             ) else {
                 let mut report =
                     java_unknown_report(operation, file, query_node, &prepared.source, member_name);
-                report.work = work;
+                report.work = ledger.work();
                 return Ok(report);
             };
-            let (outcome, truncated) = java_definition_outcome(outcome, budget.max_targets);
+            let (outcome, truncated) =
+                java_definition_outcome(outcome, compatibility_budget.max_targets);
             candidates_truncated |= truncated;
             return Ok(ReceiverQueryReport {
                 operation,
@@ -609,7 +801,7 @@ impl<'a> ReceiverQueryService<'a> {
                     member_name,
                 ),
                 analysis: ReceiverQueryAnalysis::MemberTargets(outcome),
-                work,
+                work: ledger.work(),
                 candidates_truncated,
             });
         }
@@ -651,7 +843,7 @@ impl<'a> ReceiverQueryService<'a> {
             .iter()
             .map(|ty| ty.definitions.len())
             .sum::<usize>()
-            > budget.max_targets;
+            > compatibility_budget.max_targets;
 
         let analysis = match operation {
             ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
@@ -675,7 +867,7 @@ impl<'a> ReceiverQueryService<'a> {
                         &prepared.tree,
                         query_node,
                     ),
-                    budget.max_targets,
+                    compatibility_budget.max_targets,
                 );
                 candidates_truncated |= truncated;
                 ReceiverQueryAnalysis::Values(java_type_outcome(type_outcome.status, values))
@@ -696,7 +888,7 @@ impl<'a> ReceiverQueryService<'a> {
                 member_name,
             ),
             analysis,
-            work,
+            work: ledger.work(),
             candidates_truncated,
         })
     }
@@ -707,40 +899,53 @@ impl<'a> ReceiverQueryService<'a> {
     }
 }
 
+fn charge_semantic_gate(
+    ledger: &mut ReceiverWorkLedger,
+    gate: &SemanticReceiverGate,
+) -> Option<ReceiverBudgetLimit> {
+    ledger
+        .charge_analysis(gate.work())
+        .err()
+        .or_else(|| gate.exceeded_limit())
+}
+
+fn finalize_legacy_report(
+    report: ReceiverQueryReport,
+    gate: SemanticReceiverGate,
+    ledger: &mut ReceiverWorkLedger,
+) -> ReceiverQueryReport {
+    let compatibility_limit = ledger.charge_analysis(report.work).err();
+    let mut report = apply_semantic_gate(report, gate);
+    if let Some(limit) = compatibility_limit {
+        neutral_exceeded(&mut report.analysis, limit);
+    }
+    report.work = ledger.work();
+    report
+}
+
 fn apply_semantic_gate(
     mut report: ReceiverQueryReport,
     gate: SemanticReceiverGate,
 ) -> ReceiverQueryReport {
-    let gate_work = match gate {
+    match gate {
         SemanticReceiverGate::Available {
-            work,
             points_to,
             truncated,
+            ..
         } => {
             if let Some(points_to) = points_to {
                 let removed = retain_neutral_backed_values(&mut report.analysis, &points_to);
                 report.candidates_truncated |= removed;
             }
             report.candidates_truncated |= truncated;
-            work
         }
-        SemanticReceiverGate::Unavailable { work } => {
+        SemanticReceiverGate::Unavailable { .. } => {
             neutral_unknown(&mut report.analysis);
-            work
         }
-        SemanticReceiverGate::Exceeded { work, limit } => {
+        SemanticReceiverGate::Exceeded { limit, .. } => {
             neutral_exceeded(&mut report.analysis, limit);
-            work
         }
-    };
-    report.work.scope_nodes = report
-        .work
-        .scope_nodes
-        .saturating_add(gate_work.scope_nodes);
-    report.work.summary_expansions = report
-        .work
-        .summary_expansions
-        .saturating_add(gate_work.summary_expansions);
+    }
     report
 }
 
@@ -869,42 +1074,64 @@ fn replace_with_neutral_exceeded<T>(
     }
 }
 
+#[derive(Debug)]
 struct ReceiverSemanticBridge {
     budget: SemanticBudget,
     oracle_limits: OracleLimits,
 }
 
 impl ReceiverSemanticBridge {
-    fn new(receiver: ReceiverAnalysisBudget) -> Self {
-        let scope = receiver.max_scope_nodes.max(1);
-        let summaries = receiver.max_summary_expansions.max(1);
+    const SCOPE_DIMENSIONS: usize = 11;
+    const SUMMARY_DIMENSIONS: usize = 3;
+
+    fn new(receiver: ReceiverAnalysisBudget) -> Result<Self, ReceiverBudgetLimit> {
+        if receiver.max_scope_nodes < Self::SCOPE_DIMENSIONS {
+            return Err(ReceiverBudgetLimit::ScopeNodes);
+        }
+        if receiver.max_summary_expansions < Self::SUMMARY_DIMENSIONS {
+            return Err(ReceiverBudgetLimit::SummaryExpansions);
+        }
+
+        let scope = receiver.max_scope_nodes;
+        let summaries = receiver.max_summary_expansions;
         let targets = receiver.max_targets.max(1);
         // Oracle limits are positive by contract. Source projections always
         // start with an empty OracleCallContext, so this representational
         // minimum does not retain a call frame when receiver context depth is
         // explicitly zero.
         let context = receiver.context_depth.max(1);
-        let traversal = scope
-            .saturating_mul(context.saturating_add(1))
-            .saturating_add(summaries.saturating_mul(targets))
-            .max(1);
         let text = scope.saturating_mul(1_024).max(1);
+        let [
+            procedures,
+            blocks,
+            program_points,
+            values,
+            allocations,
+            source_mappings,
+            evidence,
+            gaps,
+            events,
+            control_edges,
+            nested_entries,
+        ] = partition_receiver_limit::<{ Self::SCOPE_DIMENSIONS }>(scope);
+        let [call_sites, memory_locations, captures] =
+            partition_receiver_limit::<{ Self::SUMMARY_DIMENSIONS }>(summaries);
         let budget = SemanticBudget::new(SemanticWork {
             source_bytes: text,
-            procedures: scope,
-            blocks: scope,
-            program_points: scope,
-            values: scope,
-            allocations: scope,
-            call_sites: summaries,
-            memory_locations: summaries,
-            captures: summaries,
-            source_mappings: scope,
-            evidence: scope,
-            gaps: scope,
-            events: traversal,
-            control_edges: traversal,
-            nested_entries: traversal,
+            procedures,
+            blocks,
+            program_points,
+            values,
+            allocations,
+            call_sites,
+            memory_locations,
+            captures,
+            source_mappings,
+            evidence,
+            gaps,
+            events,
+            control_edges,
+            nested_entries,
             owned_text_bytes: text,
         })
         .expect("receiver semantic budget is positive");
@@ -921,10 +1148,10 @@ impl ReceiverSemanticBridge {
             ..defaults
         })
         .expect("receiver oracle limits are positive");
-        Self {
+        Ok(Self {
             budget,
             oracle_limits,
-        }
+        })
     }
 
     fn oracle<'workspace>(
@@ -944,8 +1171,7 @@ impl ReceiverSemanticBridge {
             summary_expansions: work
                 .call_sites
                 .saturating_add(work.memory_locations)
-                .saturating_add(work.captures)
-                .saturating_add(work.nested_entries),
+                .saturating_add(work.captures),
             scope_nodes: work
                 .procedures
                 .saturating_add(work.blocks)
@@ -956,7 +1182,8 @@ impl ReceiverSemanticBridge {
                 .saturating_add(work.evidence)
                 .saturating_add(work.gaps)
                 .saturating_add(work.events)
-                .saturating_add(work.control_edges),
+                .saturating_add(work.control_edges)
+                .saturating_add(work.nested_entries),
         }
     }
 
@@ -964,8 +1191,7 @@ impl ReceiverSemanticBridge {
         match exceeded.dimension() {
             SemanticBudgetDimension::CallSites
             | SemanticBudgetDimension::MemoryLocations
-            | SemanticBudgetDimension::Captures
-            | SemanticBudgetDimension::NestedEntries => ReceiverBudgetLimit::SummaryExpansions,
+            | SemanticBudgetDimension::Captures => ReceiverBudgetLimit::SummaryExpansions,
             SemanticBudgetDimension::SourceBytes
             | SemanticBudgetDimension::Procedures
             | SemanticBudgetDimension::Blocks
@@ -977,9 +1203,18 @@ impl ReceiverSemanticBridge {
             | SemanticBudgetDimension::Gaps
             | SemanticBudgetDimension::Events
             | SemanticBudgetDimension::ControlEdges
+            | SemanticBudgetDimension::NestedEntries
             | SemanticBudgetDimension::OwnedTextBytes => ReceiverBudgetLimit::ScopeNodes,
         }
     }
+}
+
+fn partition_receiver_limit<const DIMENSIONS: usize>(total: usize) -> [usize; DIMENSIONS] {
+    debug_assert!(DIMENSIONS > 0);
+    debug_assert!(total >= DIMENSIONS);
+    let quotient = total / DIMENSIONS;
+    let remainder = total % DIMENSIONS;
+    std::array::from_fn(|index| quotient + usize::from(index < remainder))
 }
 
 fn java_receiver_values(
@@ -1430,15 +1665,12 @@ fn setup_budget_report(
     language: Language,
     range: Range,
     source: &str,
-    setup_nodes: usize,
+    work: ReceiverAnalysisWork,
 ) -> ReceiverQueryReport {
     budget_report(
         operation,
         site(file, language, range, source, "setup", None),
-        ReceiverAnalysisWork {
-            setup_nodes,
-            ..ReceiverAnalysisWork::default()
-        },
+        work,
         ReceiverBudgetLimit::ScopeNodes,
     )
 }
@@ -1631,6 +1863,119 @@ export function caller() {
     }
 
     #[test]
+    fn workspace_semantic_gate_and_compatibility_provider_share_one_budget() {
+        let mut source = String::from(
+            "class Service { run() {} }\nexport function caller() {\n  const service = new Service();\n",
+        );
+        for index in 0..32 {
+            source.push_str(&format!("  const local{index} = {index};\n"));
+        }
+        source.push_str("  service.run();\n}\n");
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+        file.write(&source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::TypeScript)),
+            AnalyzerConfig::default(),
+        );
+        let range = marker_range(&source, "service.run");
+        let workspace_service = ReceiverQueryService::from_workspace(&workspace);
+        let warm = workspace_service
+            .analyze(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("warm workspace receiver query");
+        assert!(matches!(
+            warm.analysis,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(_))
+        ));
+
+        let gate = workspace_service
+            .semantic_receiver_gate(
+                &file,
+                warm.site.range,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("isolated semantic gate");
+        assert!(gate.exceeded_limit().is_none());
+        let gate_work = gate.work();
+
+        let compatibility_service = ReceiverQueryService::new(workspace.analyzer());
+        let _ = compatibility_service
+            .analyze(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("prepare compatibility receiver query");
+        let compatibility = compatibility_service
+            .analyze(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("measure compatibility receiver query");
+        assert_eq!(compatibility.work.setup_nodes, 0);
+        assert!(gate_work.scope_nodes > 0 && compatibility.work.scope_nodes > 0);
+
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: gate_work
+                .scope_nodes
+                .max(compatibility.work.scope_nodes)
+                .max(ReceiverSemanticBridge::SCOPE_DIMENSIONS),
+            max_summary_expansions: gate_work
+                .summary_expansions
+                .max(compatibility.work.summary_expansions)
+                .max(ReceiverSemanticBridge::SUMMARY_DIMENSIONS),
+            ..ReceiverAnalysisBudget::default()
+        };
+        assert!(
+            gate_work
+                .scope_nodes
+                .saturating_add(compatibility.work.scope_nodes)
+                > budget.max_scope_nodes,
+            "fixture must require more combined work than either phase alone"
+        );
+
+        let bounded = workspace_service
+            .analyze(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                budget,
+                None,
+            )
+            .expect("aggregate-bounded workspace receiver query");
+        assert!(
+            bounded
+                .work
+                .setup_nodes
+                .saturating_add(bounded.work.scope_nodes)
+                <= budget.max_scope_nodes
+        );
+        assert!(bounded.work.summary_expansions <= budget.max_summary_expansions);
+        assert!(matches!(
+            bounded.analysis,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::ExceededBudget { .. })
+        ));
+    }
+
+    #[test]
     fn unsupported_language_returns_an_explicit_row() {
         let source = "value = object.member\n";
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1708,11 +2053,14 @@ class Sample {
         assert!(first.work.setup_nodes > 0);
         assert_eq!(second.work.setup_nodes, 0);
         for report in [&first, &second] {
-            assert!(matches!(
-                report.analysis,
-                ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(ref targets))
-                    if targets.len() == 1
-            ));
+            assert!(
+                matches!(
+                    report.analysis,
+                    ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(ref targets))
+                        if targets.len() == 1
+                ),
+                "unexpected Java member-target report: {report:#?}"
+            );
         }
 
         let capped = service
@@ -1752,7 +2100,14 @@ class Sample {
                 limit: "scope_nodes"
             })
         ));
-        assert_eq!(bounded.work.setup_nodes, 2);
+        assert_eq!(bounded.work.setup_nodes, 1);
+        assert!(
+            bounded
+                .work
+                .setup_nodes
+                .saturating_add(bounded.work.scope_nodes)
+                <= ReceiverAnalysisBudget::tiny().max_scope_nodes
+        );
 
         let cancellation = CancellationToken::default();
         cancellation.cancel();
@@ -1804,13 +2159,16 @@ class Right {
             )
             .expect("nested current-receiver query");
 
-        assert!(matches!(
-            report.analysis,
-            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(ref values))
-                if matches!(values.as_slice(), [ReceiverValue::CurrentReceiver(owner)]
-                    if owner.fq_name().contains("Left.Worker")
-                        && !owner.fq_name().contains("Right.Worker"))
-        ));
+        assert!(
+            matches!(
+                report.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(ref values))
+                    if matches!(values.as_slice(), [ReceiverValue::CurrentReceiver(owner)]
+                        if owner.fq_name().contains("Left.Worker")
+                            && !owner.fq_name().contains("Right.Worker"))
+            ),
+            "unexpected nested receiver report: {report:#?}"
+        );
     }
 
     #[test]
@@ -1843,13 +2201,16 @@ export function caller() {
                 limit: "scope_nodes"
             })
         ));
-        assert_eq!(report.work.setup_nodes, 2);
+        assert_eq!(report.work.setup_nodes, 1);
         assert!(
             report
                 .work
                 .setup_nodes
                 .saturating_add(report.work.scope_nodes)
-                > ReceiverAnalysisBudget::tiny().max_scope_nodes
+                <= ReceiverAnalysisBudget::tiny().max_scope_nodes
+        );
+        assert!(
+            report.work.summary_expansions <= ReceiverAnalysisBudget::tiny().max_summary_expansions
         );
 
         let cancellation = CancellationToken::default();
@@ -1872,14 +2233,19 @@ export function caller() {
         let bridge = ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
             context_depth: 2,
             max_targets: 3,
-            max_summary_expansions: 5,
-            max_scope_nodes: 7,
-        });
+            max_summary_expansions: 9,
+            max_scope_nodes: 17,
+        })
+        .expect("aggregate semantic budget");
         let semantic = bridge.budget.limits();
-        assert_eq!(semantic.procedures, 7);
-        assert_eq!(semantic.call_sites, 5);
-        assert_eq!(semantic.source_bytes, 7 * 1_024);
-        assert_eq!(semantic.nested_entries, 7 * 3 + 5 * 3);
+        assert_eq!(semantic.procedures, 2);
+        assert_eq!(semantic.control_edges, 1);
+        assert_eq!(semantic.nested_entries, 1);
+        assert_eq!(semantic.call_sites, 3);
+        assert_eq!(semantic.source_bytes, 17 * 1_024);
+        let aggregate_limits = ReceiverSemanticBridge::receiver_work(semantic);
+        assert_eq!(aggregate_limits.scope_nodes, 17);
+        assert_eq!(aggregate_limits.summary_expansions, 9);
 
         let oracle = bridge.oracle_limits.values();
         assert_eq!(oracle.dispatch_targets, 3);
@@ -1887,14 +2253,32 @@ export function caller() {
         assert_eq!(oracle.alias_breadth, 3);
         assert_eq!(oracle.source_observations, 3);
         assert_eq!(oracle.call_context_depth, 2);
-        assert_eq!(oracle.summary_depth, 5);
-        assert_eq!(oracle.call_binding_entries, 5);
+        assert_eq!(oracle.summary_depth, 9);
+        assert_eq!(oracle.call_binding_entries, 9);
 
         let zero_context = ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
             context_depth: 0,
             ..ReceiverAnalysisBudget::default()
-        });
+        })
+        .expect("zero-context receiver budget");
         assert_eq!(zero_context.oracle_limits.call_context_depth(), 1);
+
+        assert_eq!(
+            ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
+                max_scope_nodes: ReceiverSemanticBridge::SCOPE_DIMENSIONS - 1,
+                ..ReceiverAnalysisBudget::default()
+            })
+            .unwrap_err(),
+            ReceiverBudgetLimit::ScopeNodes
+        );
+        assert_eq!(
+            ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
+                max_summary_expansions: ReceiverSemanticBridge::SUMMARY_DIMENSIONS - 1,
+                ..ReceiverAnalysisBudget::default()
+            })
+            .unwrap_err(),
+            ReceiverBudgetLimit::SummaryExpansions
+        );
     }
 
     #[test]
@@ -1918,8 +2302,8 @@ export function caller() {
             owned_text_bytes: usize::MAX,
         });
         assert_eq!(translated.setup_nodes, 0);
-        assert_eq!(translated.summary_expansions, 4);
-        assert_eq!(translated.scope_nodes, 10);
+        assert_eq!(translated.summary_expansions, 3);
+        assert_eq!(translated.scope_nodes, 11);
 
         let budget = SemanticBudget::uniform(1).unwrap();
         let summary = budget
@@ -1940,6 +2324,16 @@ export function caller() {
             .unwrap_err();
         assert_eq!(
             ReceiverSemanticBridge::receiver_limit(scope),
+            ReceiverBudgetLimit::ScopeNodes
+        );
+        let nested_scope = budget
+            .check(SemanticWork {
+                nested_entries: 2,
+                ..SemanticWork::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            ReceiverSemanticBridge::receiver_limit(nested_scope),
             ReceiverBudgetLimit::ScopeNodes
         );
     }

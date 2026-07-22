@@ -2125,6 +2125,33 @@ fn source_points_to_projection_is_pre_cancellable_and_budget_staged() {
         materialization_work,
         "failed projection work must not be committed to the caller budget"
     );
+
+    let mut limits = SemanticBudget::default().limits();
+    limits.nested_entries = materialization_work.nested_entries + 1;
+    let mut nested_entry_budget = SemanticBudget::new(limits).unwrap();
+    let outcome = oracle
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut nested_entry_budget, &cancellation),
+        )
+        .expect("candidate traversal exhaustion is a semantic outcome");
+    assert!(matches!(
+        outcome,
+        SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work,
+        } if exceeded.dimension() == SemanticBudgetDimension::NestedEntries
+            && exceeded.limit() == materialization_work.nested_entries + 1
+            && exceeded.attempted() == materialization_work.nested_entries + 2
+            && work.nested_entries == materialization_work.nested_entries + 2
+    ));
+    assert_eq!(
+        nested_entry_budget.used(),
+        materialization_work,
+        "failed candidate traversal work must remain staged"
+    );
 }
 
 #[test]

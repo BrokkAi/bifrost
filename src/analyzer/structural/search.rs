@@ -5276,12 +5276,11 @@ fn receiver_analysis_expansions(
             .max_pipeline_rows
             .saturating_sub(budget.pipeline_rows);
         let base = receiver_budget_override.unwrap_or_default();
-        let receiver_budget = ReceiverAnalysisBudget {
-            context_depth: base.context_depth,
-            max_targets: base.max_targets.min(remaining_rows.saturating_sub(1)),
-            max_summary_expansions: base.max_summary_expansions.min(remaining_facts),
-            max_scope_nodes: base.max_scope_nodes.min(remaining_facts),
-        };
+        let receiver_budget = receiver_budget_for_remaining_work(
+            base,
+            remaining_facts,
+            remaining_rows.saturating_sub(1),
+        );
         let report =
             match service.analyze(operation, file, range, input, receiver_budget, cancellation) {
                 Ok(report) => report,
@@ -5380,6 +5379,40 @@ fn receiver_analysis_expansions(
         });
     }
     expansions
+}
+
+fn receiver_budget_for_remaining_work(
+    base: ReceiverAnalysisBudget,
+    remaining_facts: usize,
+    remaining_targets: usize,
+) -> ReceiverAnalysisBudget {
+    let desired_scope = base.max_scope_nodes.min(remaining_facts);
+    let desired_summaries = base.max_summary_expansions.min(remaining_facts);
+    if desired_scope.saturating_add(desired_summaries) <= remaining_facts {
+        return ReceiverAnalysisBudget {
+            context_depth: base.context_depth,
+            max_targets: base.max_targets.min(remaining_targets),
+            max_summary_expansions: desired_summaries,
+            max_scope_nodes: desired_scope,
+        };
+    }
+
+    // CodeQuery has one fact-node budget, while receiver analysis exposes
+    // separate scope and summary caps. Reserve up to one quarter for summary
+    // expansion, then give scope traversal the remainder; this prevents the
+    // two dimensions from each spending the same scalar remainder in full.
+    let summary_reserve = desired_summaries.min(remaining_facts / 4);
+    let max_scope_nodes = desired_scope.min(remaining_facts - summary_reserve);
+    let unallocated = remaining_facts - summary_reserve - max_scope_nodes;
+    let max_summary_expansions =
+        summary_reserve.saturating_add((desired_summaries - summary_reserve).min(unallocated));
+    debug_assert!(max_scope_nodes.saturating_add(max_summary_expansions) <= remaining_facts);
+    ReceiverAnalysisBudget {
+        context_depth: base.context_depth,
+        max_targets: base.max_targets.min(remaining_targets),
+        max_summary_expansions,
+        max_scope_nodes,
+    }
 }
 
 fn receiver_candidate_count(report: &ReceiverQueryReport) -> usize {
@@ -10981,6 +11014,31 @@ export function invoke(service: Service) { service.run(); }
         assert!(partial.result.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
         }));
+    }
+
+    #[test]
+    fn receiver_budget_projects_one_remaining_fact_cap_across_all_work() {
+        let base = ReceiverAnalysisBudget::default();
+        let bounded = receiver_budget_for_remaining_work(base, 100, usize::MAX);
+        assert_eq!(bounded.max_scope_nodes, 75);
+        assert_eq!(bounded.max_summary_expansions, 25);
+        assert_eq!(
+            bounded
+                .max_scope_nodes
+                .saturating_add(bounded.max_summary_expansions),
+            100
+        );
+
+        let tiny = receiver_budget_for_remaining_work(base, 1, 1);
+        assert!(
+            tiny.max_scope_nodes
+                .saturating_add(tiny.max_summary_expansions)
+                <= 1
+        );
+        assert_eq!(tiny.max_targets, 1);
+
+        let ample = receiver_budget_for_remaining_work(base, usize::MAX, usize::MAX);
+        assert_eq!(ample, base);
     }
 
     #[test]

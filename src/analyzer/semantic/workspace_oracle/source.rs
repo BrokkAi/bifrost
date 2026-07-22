@@ -299,22 +299,15 @@ fn source_value_observations(
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<(Vec<ValueAtPoint>, bool), Interruption> {
-    let candidates = source_value_candidates(artifact, range, staged, cancellation)?;
-    let mut observations = Vec::with_capacity(candidates.len().min(limit));
-    let mut group_start = 0;
-    while group_start < candidates.len() {
+    let candidate_groups = source_value_candidates(artifact, range, staged, cancellation)?;
+    let mut observations = Vec::new();
+    for group in candidate_groups {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
-        let procedure = candidates[group_start].value.procedure().clone();
-        let mut group_end = group_start + 1;
-        while group_end < candidates.len() && candidates[group_end].value.procedure() == &procedure
-        {
-            group_end += 1;
-        }
         if project_procedure_observations(
-            &procedure,
-            &candidates[group_start..group_end],
+            &group.procedure,
+            &group.candidates,
             range,
             limit,
             &mut observations,
@@ -323,7 +316,6 @@ fn source_value_observations(
         )? {
             return Ok((observations, true));
         }
-        group_start = group_end;
     }
     Ok((observations, false))
 }
@@ -334,14 +326,20 @@ struct SourceValueCandidate {
     span: SourceSpan,
 }
 
+#[derive(Debug)]
+struct ProcedureSourceCandidates {
+    procedure: crate::analyzer::semantic::ProcedureHandle,
+    candidates: Vec<SourceValueCandidate>,
+}
+
 fn source_value_candidates(
     artifact: &Arc<SemanticArtifact>,
     range: Range,
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
-) -> Result<Vec<SourceValueCandidate>, Interruption> {
+) -> Result<Vec<ProcedureSourceCandidates>, Interruption> {
     let mut best_value_width = None;
-    let mut candidates = Vec::new();
+    let mut groups = Vec::new();
     for procedure in artifact.procedures() {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
@@ -353,6 +351,7 @@ fn source_value_candidates(
         let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
             continue;
         };
+        let mut candidates = Vec::new();
         for value in procedure.values() {
             if cancellation.is_cancelled() {
                 return Err(Interruption::Cancelled);
@@ -375,6 +374,7 @@ fn source_value_candidates(
             }
             if best_value_width.is_none_or(|best| width < best) {
                 best_value_width = Some(width);
+                groups.clear();
                 candidates.clear();
             }
             let Some(value_handle) = procedure_handle.value_handle(value.id) else {
@@ -389,8 +389,14 @@ fn source_value_candidates(
                 span,
             });
         }
+        if !candidates.is_empty() {
+            groups.push(ProcedureSourceCandidates {
+                procedure: procedure_handle,
+                candidates,
+            });
+        }
     }
-    Ok(candidates)
+    Ok(groups)
 }
 
 #[derive(Debug, Default)]
@@ -457,14 +463,17 @@ fn project_procedure_observations(
 
     let mut fallback_candidates = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        staged.charge(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
         if !candidates_by_span
             .get(&candidate.span)
             .is_some_and(|span| span.has_exact_point)
         {
-            staged.charge(SemanticWork {
-                nested_entries: 1,
-                ..SemanticWork::default()
-            })?;
             fallback_candidates.push(index);
         }
     }
@@ -537,6 +546,10 @@ fn append_observations(
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
+        staged.charge(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
         let Ok(observation) = ValueAtPoint::new(
             candidates[*index].value.clone(),
             point.clone(),
@@ -548,10 +561,6 @@ fn append_observations(
         if observations.len() == limit {
             return Ok(true);
         }
-        staged.charge(SemanticWork {
-            nested_entries: 1,
-            ..SemanticWork::default()
-        })?;
         observations.push(observation);
     }
     Ok(false)

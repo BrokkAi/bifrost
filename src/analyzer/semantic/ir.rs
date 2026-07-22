@@ -908,7 +908,6 @@ impl SemanticGapImpacts {
     const RETURN_TRANSFER: Self = Self::VALUE.with(SemanticGapImpact::ReturnTransfer);
     const CONTROL_FLOW: Self = Self::MEMORY.with(SemanticGapImpact::ReturnTransfer);
     const CALL_EVALUATION: Self = Self::CONTROL_FLOW.with(SemanticGapImpact::CallEvaluation);
-    const CALL: Self = Self::CALL_EVALUATION.with(SemanticGapImpact::DispatchCoverage);
 
     pub const fn single(impact: SemanticGapImpact) -> Self {
         Self(impact.bit())
@@ -957,7 +956,7 @@ impl SemanticGapImpacts {
             | SemanticCapability::Captures => Self::MEMORY,
             SemanticCapability::Calls
             | SemanticCapability::CallableReferences
-            | SemanticCapability::ConcurrentSpawn => Self::CALL,
+            | SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
             SemanticCapability::DynamicDispatch => {
                 Self::single(SemanticGapImpact::DispatchCoverage)
             }
@@ -4916,13 +4915,18 @@ mod tests {
             ),
             SemanticGapImpacts::CONTROL_FLOW,
         );
-        assert_eq!(
-            SemanticGapImpacts::for_gap(
-                SemanticCapability::Calls,
+        for capability in [
+            SemanticCapability::Calls,
+            SemanticCapability::CallableReferences,
+            SemanticCapability::ConcurrentSpawn,
+        ] {
+            let impacts = SemanticGapImpacts::for_gap(
+                capability,
                 SemanticGapSubject::CallSite(CallSiteId::new(0)),
-            ),
-            SemanticGapImpacts::CALL,
-        );
+            );
+            assert_eq!(impacts, SemanticGapImpacts::CALL_EVALUATION);
+            assert!(!impacts.contains(SemanticGapImpact::DispatchCoverage));
+        }
         let assignment =
             SemanticGapImpacts::for_gap(SemanticCapability::Assignments, SemanticGapSubject::Point);
         assert!(assignment.contains(SemanticGapImpact::ValueFlow));
@@ -5891,10 +5895,7 @@ mod tests {
                 SemanticGapImpact::ValueFlow,
             ),
             (SemanticCapability::Captures, SemanticGapImpact::ValueFlow),
-            (
-                SemanticCapability::Calls,
-                SemanticGapImpact::DispatchCoverage,
-            ),
+            (SemanticCapability::Calls, SemanticGapImpact::CallEvaluation),
             (
                 SemanticCapability::NormalCallContinuation,
                 SemanticGapImpact::CallEvaluation,
