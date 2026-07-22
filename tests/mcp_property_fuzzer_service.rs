@@ -1045,6 +1045,35 @@ fn i1c_silent_when_single_line_block_sits_mid_line() {
     assert_eq!(summary.i1c_source_text_checks, 1);
 }
 
+// Go embedded-field blocks deliberately re-insert the `type` keyword: the
+// returned text may add that prefix over the file's own field text (the
+// go-ethereum `type Request     any` shape).
+#[test]
+fn i1c_silent_when_go_embedded_field_reinserts_the_type_keyword() {
+    let input = I1Input {
+        files: vec![I1File {
+            path: "beacon/light/request/types.go".to_string(),
+            text: Some("package request\n\ntype Container struct {\n\tRequest     any\n\tOther       int\n}\n".to_string()),
+            parse_errors: Some(vec![]),
+        }],
+        symbols: vec![],
+    };
+    let records = vec![record(
+        "i1c",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "request.Request".to_string(),
+        },
+        json!({"sources": [{"label": "beacon/light/request.Request", "path": "beacon/light/request/types.go", "start_line": 4, "end_line": 4, "text": "type Request     any"}]}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i1c(&refs(&records), &input, "go", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(summary.i1c_source_text_checks, 1);
+}
+
 // The bfg InvocableBFG.processFor shape: the reported range's last line is
 // blank and the returned text faithfully carries it. The comparison must not
 // lose that trailing blank line to a join/re-split round trip.

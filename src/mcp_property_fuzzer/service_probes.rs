@@ -1491,7 +1491,14 @@ fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
         return false;
     }
     if expected.len() == 1 {
-        return expected[0].contains(text_lines[0]);
+        let line = text_lines[0];
+        // Go embedded-field blocks deliberately re-insert the `type`
+        // keyword, rendering the field as a type declaration over the
+        // file's own field text.
+        return expected[0].contains(line)
+            || line
+                .strip_prefix("type ")
+                .is_some_and(|stripped| expected[0].contains(stripped));
     }
     let last = expected.len() - 1;
     expected[0].ends_with(text_lines[0])
