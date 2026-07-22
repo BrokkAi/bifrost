@@ -12,7 +12,7 @@ mod common;
 
 use brokk_bifrost::mcp_property_fuzzer::service_probes::{
     ProbeKind, ProbeOutcome, ProbeRecord, ProbeSummary, check_i1c, check_i2, check_i3a, check_i3b,
-    check_i3c, check_i4, check_i5, check_render_mode_drift, disputed_name,
+    check_i3c, check_i4, check_i5, check_render_mode_drift, disputed_name, minimize_batch,
 };
 use brokk_bifrost::mcp_property_fuzzer::{
     FuzzerConfig, I1File, I1Input, InvariantKind, Violation, run_invariants_with_service,
@@ -34,6 +34,7 @@ fn record(id: &str, tool: &'static str, kind: ProbeKind, structured: Value) -> P
             rendered_text: None,
             mode_b_structured: None,
         }),
+        elapsed_ms: None,
     }
 }
 
@@ -71,6 +72,7 @@ fn fuzzer_config(language: &str) -> FuzzerConfig {
         max_service_symbols: 1_000,
         max_scan_probes: 100,
         symbol_filter: None,
+        path_filter: None,
         seed: 0,
     }
 }
@@ -245,6 +247,35 @@ fn i2_silent_when_batch_entry_matches_its_own_references_single() {
     let mut summary = ProbeSummary::default();
     check_i2(&refs(&records), "scala", &mut sink, &mut summary);
     assert!(sink.into_sorted_vec().is_empty());
+}
+
+#[test]
+fn minimize_batch_drops_only_entries_irrelevant_to_reproduction() {
+    let references = vec![json!("a"), json!("b"), json!("c"), json!("d")];
+    // The failure reproduces exactly while "b" is present in the batch.
+    let shrunk = minimize_batch(&references, |candidate| {
+        candidate.iter().any(|entry| entry == "b")
+    });
+    assert_eq!(shrunk, vec![json!("b")]);
+}
+
+#[test]
+fn minimize_batch_keeps_every_entry_when_all_are_load_bearing() {
+    let references = vec![json!("a"), json!("b"), json!("c")];
+    // The failure reproduces only with the full batch: nothing can drop.
+    let shrunk = minimize_batch(&references, |candidate| candidate.len() == 3);
+    assert_eq!(shrunk, references);
+}
+
+#[test]
+fn minimize_batch_keeps_a_two_entry_minimum_for_pair_dependent_failures() {
+    let references = vec![json!("a"), json!("b"), json!("c")];
+    // The failure needs "a" and "c" together; "b" is noise, and shrinking
+    // below the reproducing pair must stop even though "a" alone fails too.
+    let shrunk = minimize_batch(&references, |candidate| {
+        candidate.iter().any(|entry| entry == "a") && candidate.iter().any(|entry| entry == "c")
+    });
+    assert_eq!(shrunk, vec![json!("a"), json!("c")]);
 }
 
 // Scala class/companion pairs share a user-level name but are distinct
@@ -895,6 +926,9 @@ fn service_invariants_silent_on_healthy_scala_fixture() {
         workspace.analyzer(),
         &fuzzer_config("scala"),
         None,
+        // Exercise the parallel probe path even in tests: outcomes land in
+        // fixed slots, so parallelism must not change findings.
+        4,
     )
     .expect("run invariants");
     let summary = report.probe_summary.as_ref().expect("probe summary");

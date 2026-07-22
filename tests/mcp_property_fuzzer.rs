@@ -8,7 +8,8 @@
 mod common;
 
 use brokk_bifrost::mcp_property_fuzzer::{
-    FuzzerConfig, I1File, I1Input, InvariantKind, SymbolFacts, check_i1, run_invariants,
+    FuzzerConfig, I1File, I1Input, InvariantKind, SymbolFacts, check_i1, rerun::rerun_configs,
+    run_invariants,
 };
 use brokk_bifrost::{AnalyzerConfig, CodeUnitType, ParseError, ParseErrorKind, Range};
 use common::InlineTestProject;
@@ -293,6 +294,7 @@ fn fuzzer_config(language: &str) -> FuzzerConfig {
         max_service_symbols: 1_000,
         max_scan_probes: 100,
         symbol_filter: None,
+        path_filter: None,
         seed: 0,
     }
 }
@@ -722,3 +724,128 @@ class PublicJob @Inject() (jobSrv: JobSrv) extends PublicData with JobRenderer {
     .build
 }
 "#;
+
+// ---------------------------------------------------------------------------
+// `--rerun` config reconstruction (`src/mcp_property_fuzzer/rerun.rs`)
+// ---------------------------------------------------------------------------
+
+fn rerun_record(violations: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "repository",
+        "status": "completed",
+        "report": {
+            "config": {
+                "corpus_language": "scala",
+                "invariants": ["I1", "I2", "I3", "I4", "I5"],
+                "max_symbols": 5000,
+                "max_service_symbols": 200,
+                "max_scan_probes": 40,
+                "seed": 7
+            },
+            "violations": violations
+        }
+    })
+}
+
+fn rerun_violation(signature: &str, invariant: &str, symbol: &str) -> serde_json::Value {
+    serde_json::json!({
+        "signature": signature,
+        "invariant": invariant,
+        "tool": "get_symbol_sources",
+        "shape": "test",
+        "language": "scala",
+        "symbol": symbol,
+        "path": "src/Foo.scala",
+        "evidence": {},
+        "exemplars": [symbol],
+        "occurrences": 1
+    })
+}
+
+#[test]
+fn rerun_configs_narrow_each_violation_to_its_exemplar_symbol() {
+    let record = rerun_record(serde_json::json!([
+        rerun_violation("(I2, scala, get_symbol_sources, sig-a)", "I2", "a.b.Foo"),
+        rerun_violation("(I1, scala, index, sig-b)", "I1", "a.b.Bar")
+    ]));
+    let configs = rerun_configs(&record, None).expect("rerun configs");
+    assert_eq!(configs.len(), 2, "{configs:?}");
+    assert_eq!(configs[0].0, "(I2, scala, get_symbol_sources, sig-a)");
+    assert_eq!(configs[0].1.symbol_filter.as_deref(), Some("a.b.Foo"));
+    assert_eq!(configs[1].0, "(I1, scala, index, sig-b)");
+    assert_eq!(configs[1].1.symbol_filter.as_deref(), Some("a.b.Bar"));
+    // The recorded base config carries through unchanged apart from the filter.
+    assert_eq!(configs[0].1.corpus_language, "scala");
+    assert_eq!(configs[0].1.seed, 7);
+    assert_eq!(configs[0].1.max_symbols, 5000);
+}
+
+#[test]
+fn rerun_configs_keep_the_base_config_for_i5_and_symbol_less_violations() {
+    let record = rerun_record(serde_json::json!([
+        rerun_violation("(I5, scala, search_symbols, sig-c)", "I5", "a.b.Baz"),
+        rerun_violation("(I1, scala, index, sig-d)", "I1", "")
+    ]));
+    let configs = rerun_configs(&record, None).expect("rerun configs");
+    assert_eq!(configs.len(), 2, "{configs:?}");
+    assert_eq!(
+        configs[0].1.symbol_filter, None,
+        "I5 derives from the sample"
+    );
+    assert_eq!(configs[1].1.symbol_filter, None, "no symbol to filter by");
+}
+
+#[test]
+fn rerun_configs_filter_signatures_by_substring() {
+    let record = rerun_record(serde_json::json!([
+        rerun_violation(
+            "(I2, scala, get_definitions_by_reference, batch-outcome-differs)",
+            "I2",
+            "a.b.Foo"
+        ),
+        rerun_violation("(I3, scala, get_symbol_sources, sig-b)", "I3", "a.b.Bar")
+    ]));
+    let configs = rerun_configs(&record, Some("batch-outcome")).expect("rerun configs");
+    assert_eq!(configs.len(), 1, "{configs:?}");
+    assert_eq!(configs[0].1.symbol_filter.as_deref(), Some("a.b.Foo"));
+
+    let err = rerun_configs(&record, Some("no-such-signature")).expect_err("no match");
+    assert!(err.contains("--signature"), "{err}");
+}
+
+#[test]
+fn rerun_configs_reject_a_record_without_violations() {
+    let record = rerun_record(serde_json::json!([]));
+    let err = rerun_configs(&record, None).expect_err("empty violations");
+    assert!(err.contains("no violations"), "{err}");
+}
+
+#[test]
+fn rerun_configs_target_summaries_listed_signatures_by_file_not_symbol() {
+    // The exemplar "symbol" of a summaries-listed violation is an element
+    // name from the summaries response, which usually is not a sampled
+    // workspace symbol; filtering by it empties the probe set. The file is
+    // the reproduction scope.
+    let record = rerun_record(serde_json::json!([
+        rerun_violation(
+            "(I3, scala, get_symbol_sources, summaries-listed-symbol-path-mismatch)",
+            "I3",
+            "org.apache.spark.util.Utils"
+        ),
+        rerun_violation(
+            "(I3, scala, get_symbol_sources, summaries-listed-symbol-unresolvable)",
+            "I3",
+            "com.example.Phantom"
+        )
+    ]));
+    let configs = rerun_configs(&record, None).expect("rerun configs");
+    assert_eq!(configs.len(), 2, "{configs:?}");
+    for (_, config) in &configs {
+        assert_eq!(config.symbol_filter, None, "no symbol filter");
+        assert_eq!(
+            config.path_filter.as_deref(),
+            Some("src/Foo.scala"),
+            "file-scoped rerun"
+        );
+    }
+}

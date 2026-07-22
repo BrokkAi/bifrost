@@ -43,6 +43,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Instant;
 
 /// Defaults for the service-probe volume knobs in [`FuzzerConfig`]; smaller
 /// than the index-walk cap because tool calls cost more than index walks.
@@ -256,6 +260,9 @@ pub struct ProbeSummary {
     pub summary_probes: usize,
     pub scan_probes: usize,
     pub negative_probes: usize,
+    /// I2 batch-asymmetry violations reduced to a minimal reproducing
+    /// reference set before being recorded.
+    pub shrunk_violations: usize,
     pub follow_up_probes: usize,
     pub calls_executed: usize,
     pub calls_errored: usize,
@@ -288,6 +295,10 @@ pub struct ProbeRecord {
     pub symbol_path: String,
     pub kind: ProbeKind,
     pub outcome: Option<ProbeOutcome>,
+    /// Wall time of this probe's tool call(s), mode B included when it ran;
+    /// recorded so the dump shows the per-call latency distribution (tail
+    /// analysis for campaign tuning), not used by any checker.
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,12 +363,13 @@ pub fn run_service_invariants(
     config: &FuzzerConfig,
     summary: &mut ProbeSummary,
     probe_dump: Option<&Path>,
+    probe_parallelism: usize,
 ) -> Result<Vec<Violation>, String> {
     let language = config.corpus_language.as_str();
     let mut probes = generate_probes(input, invalid, config, summary);
-    execute_probes(service, &mut probes, summary);
+    execute_probes(service, &mut probes, summary, probe_parallelism);
     let mut follow_ups = derive_follow_ups(&probes, config, summary);
-    execute_probes(service, &mut follow_ups, summary);
+    execute_probes(service, &mut follow_ups, summary, probe_parallelism);
     let records: Vec<&ProbeRecord> = probes.iter().chain(follow_ups.iter()).collect();
     if let Some(path) = probe_dump {
         dump_probe_records(&records, path)?;
@@ -382,7 +394,122 @@ pub fn run_service_invariants(
     if config.invariants.contains(&InvariantKind::I5) {
         check_i5(&records, language, &mut sink, summary);
     }
-    Ok(sink.into_sorted_vec())
+    let mut violations = sink.into_sorted_vec();
+    if config.invariants.contains(&InvariantKind::I2) {
+        shrink_violations(service, &mut violations, summary);
+    }
+    Ok(violations)
+}
+
+// ---------------------------------------------------------------------------
+// Shrinking (M3)
+// ---------------------------------------------------------------------------
+
+/// Minimize each shrinkable violation's recorded arguments to the smallest
+/// batch still failing, re-executing against the live service. Only
+/// `get_definitions_by_reference` batch arguments are shrinkable today: every
+/// other probe family is generated single-entry, and reference contexts are
+/// single source lines by construction (nothing shorter still names the
+/// token).
+fn shrink_violations(
+    service: &SearchToolsService,
+    violations: &mut [Violation],
+    summary: &mut ProbeSummary,
+) {
+    for violation in violations.iter_mut() {
+        if violation.tool != "get_definitions_by_reference"
+            || violation.shape != "batch-outcome-differs-from-single"
+        {
+            continue;
+        }
+        let Some(references) = violation
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("references"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        if references.len() < 2 {
+            continue;
+        }
+        let original = references.len();
+        let minimized = minimize_batch(references, |candidate| {
+            batch_asymmetry_reproduces(service, candidate)
+        });
+        if minimized.len() < original {
+            summary.shrunk_violations += 1;
+            violation.evidence["shrink"] = json!({ "original_references": original });
+            violation.arguments = Some(json!({ "references": minimized }));
+        }
+    }
+}
+
+/// Greedy delta-minimization: drop one entry at a time while the failure
+/// still reproduces. Order-preserving and deterministic; the closure decides
+/// whether a candidate batch still exhibits the violation.
+pub fn minimize_batch(
+    references: &[Value],
+    mut reproduces: impl FnMut(&[Value]) -> bool,
+) -> Vec<Value> {
+    let mut current: Vec<Value> = references.to_vec();
+    let mut index = 0;
+    while current.len() > 1 && index < current.len() {
+        let mut candidate = current.clone();
+        candidate.remove(index);
+        if reproduces(&candidate) {
+            current = candidate;
+        } else {
+            index += 1;
+        }
+    }
+    current
+}
+
+/// Reproduction test for `batch-outcome-differs-from-single`: re-execute the
+/// candidate batch and each entry's single call; the violation reproduces
+/// when any entry's batched status still differs from its single-call status.
+/// Unavailable outcomes (transport errors, short result lists) disqualify the
+/// candidate rather than fabricating divergence.
+fn batch_asymmetry_reproduces(service: &SearchToolsService, references: &[Value]) -> bool {
+    let batch = call_tool(
+        service,
+        "get_definitions_by_reference",
+        &json!({ "references": references }),
+        true,
+    );
+    let Some(batch_structured) = structured_of(batch) else {
+        return false;
+    };
+    let batched_statuses: Vec<String> = array_field(&batch_structured, "results")
+        .filter_map(|result| {
+            result
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    if batched_statuses.len() != references.len() {
+        return false;
+    }
+    references
+        .iter()
+        .zip(batched_statuses.iter())
+        .any(|(reference, batched_status)| {
+            let single = call_tool(
+                service,
+                "get_definitions_by_reference",
+                &json!({ "references": [reference] }),
+                true,
+            );
+            let single_status = structured_of(single).and_then(|structured| {
+                array_field(&structured, "results")
+                    .next()
+                    .and_then(|result| result.get("status").and_then(Value::as_str))
+                    .map(str::to_string)
+            });
+            matches!(single_status, Some(status) if status != *batched_status)
+        })
 }
 
 /// Structured-payload cap per dumped record: small payloads stay verbatim so
@@ -460,6 +587,7 @@ pub fn dump_probe_records(records: &[&ProbeRecord], path: &Path) -> Result<(), S
             "symbol_fq": record.symbol_fq,
             "symbol_path": record.symbol_path,
             "outcome": outcome,
+            "elapsed_ms": record.elapsed_ms,
             "structured": structured,
             "mode_b_structured": mode_b,
             "error": error,
@@ -513,6 +641,13 @@ fn generate_probes(
         {
             continue;
         }
+        if let Some(filter) = &config.path_filter
+            && !input.files[symbol.file_index]
+                .path
+                .contains(filter.as_str())
+        {
+            continue;
+        }
         service_symbols.push(index);
         if service_symbols.len() >= config.max_service_symbols {
             break;
@@ -538,6 +673,7 @@ fn generate_probes(
                         spelling: spelling.clone(),
                     },
                     outcome: None,
+                    elapsed_ms: None,
                 });
                 summary.selector_probes += 1;
             }
@@ -558,6 +694,7 @@ fn generate_probes(
                             spelling: spelling.clone(),
                         },
                         outcome: None,
+                        elapsed_ms: None,
                     });
                     summary.definition_probes += 1;
                 }
@@ -588,6 +725,7 @@ fn generate_probes(
                 symbol_path: path.to_string(),
                 kind: ProbeKind::DefinitionBatch { spellings: pair },
                 outcome: None,
+                elapsed_ms: None,
             });
             batched += 1;
         }
@@ -608,6 +746,7 @@ fn generate_probes(
                     symbol_path: file.path.clone(),
                     kind: ProbeKind::SummaryFile,
                     outcome: None,
+                    elapsed_ms: None,
                 });
                 summary.summary_probes += 1;
             }
@@ -625,6 +764,7 @@ fn generate_probes(
                     expected_display_fq: symbol.display_fq.clone(),
                 },
                 outcome: None,
+                elapsed_ms: None,
             });
             summary.scan_probes += 1;
         }
@@ -725,6 +865,7 @@ fn negative_probes(input: &I1Input, service_symbols: &[usize], language: &str) -
                 shape: "keyword-prefixed-selector",
             },
             outcome: None,
+            elapsed_ms: None,
         });
     }
 
@@ -746,6 +887,7 @@ fn negative_probes(input: &I1Input, service_symbols: &[usize], language: &str) -
                 shape: "redundant-init-suffix",
             },
             outcome: None,
+            elapsed_ms: None,
         });
     }
 
@@ -762,6 +904,7 @@ fn negative_probes(input: &I1Input, service_symbols: &[usize], language: &str) -
                 shape: "path-passed-as-symbol",
             },
             outcome: None,
+            elapsed_ms: None,
         });
     }
     probes
@@ -771,32 +914,88 @@ fn negative_probes(input: &I1Input, service_symbols: &[usize], language: &str) -
 // Execution
 // ---------------------------------------------------------------------------
 
+/// Probe calls execute concurrently across `probe_parallelism` workers.
+/// Generation order and record slots are fixed before execution starts, and
+/// workers send outcomes back through a channel to be applied to their
+/// pre-assigned slots on the calling thread, so the dump and every downstream
+/// checker see byte-identical input regardless of scheduling. The service is
+/// the same shared `SearchToolsService` the MCP server fields concurrent
+/// requests against (`RwLock`/`Mutex` throughout); checker-relevant counters
+/// are commutative additions, so no finding depends on execution order.
 fn execute_probes(
     service: &SearchToolsService,
     probes: &mut [ProbeRecord],
     summary: &mut ProbeSummary,
+    probe_parallelism: usize,
 ) {
-    for probe in probes.iter_mut() {
-        if probe.outcome.is_some() {
-            continue;
+    // Owned work items: workers never borrow the probe slice, which keeps the
+    // borrow story trivial and lets the calling thread apply results.
+    let work: Vec<(usize, &'static str, Value, bool)> = probes
+        .iter()
+        .enumerate()
+        .filter(|(_, probe)| probe.outcome.is_none())
+        .map(|(index, probe)| {
+            (
+                index,
+                probe.tool,
+                probe.arguments.clone(),
+                // Scans are the expensive calls; they run single-mode.
+                !matches!(probe.kind, ProbeKind::Scan { .. }),
+            )
+        })
+        .collect();
+    if work.is_empty() {
+        return;
+    }
+    let worker_count = probe_parallelism.min(work.len()).max(1);
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel::<(usize, ProbeOutcome, bool, u64)>();
+    let results: Vec<(usize, ProbeOutcome, bool, u64)> = thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let next = &next;
+            let sender = sender.clone();
+            let work = &work;
+            scope.spawn(move || {
+                loop {
+                    let claim = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((index, tool, arguments, run_mode_b)) = work.get(claim) else {
+                        break;
+                    };
+                    let started = Instant::now();
+                    let mut outcome = call_tool(service, tool, arguments, true);
+                    let compared_modes =
+                        *run_mode_b && matches!(outcome, ProbeOutcome::Structured { .. });
+                    if compared_modes
+                        && let ProbeOutcome::Structured {
+                            mode_b_structured, ..
+                        } = &mut outcome
+                    {
+                        *mode_b_structured =
+                            structured_of(call_tool(service, tool, arguments, false));
+                    }
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    if sender
+                        .send((*index, outcome, compared_modes, elapsed_ms))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
         }
-        // Scans are the expensive calls; they run single-mode.
-        let run_mode_b = !matches!(probe.kind, ProbeKind::Scan { .. });
-        let mut outcome = call_tool(service, probe.tool, &probe.arguments, true);
-        if run_mode_b
-            && let ProbeOutcome::Structured {
-                mode_b_structured, ..
-            } = &mut outcome
-        {
+        drop(sender);
+        receiver.iter().collect()
+    });
+    for (index, outcome, compared_modes, elapsed_ms) in results {
+        if compared_modes {
             summary.render_mode_comparisons += 1;
-            *mode_b_structured =
-                structured_of(call_tool(service, probe.tool, &probe.arguments, false));
         }
         if matches!(outcome, ProbeOutcome::Error(_)) {
             summary.calls_errored += 1;
         }
         summary.calls_executed += 1;
-        probe.outcome = Some(outcome);
+        probes[index].elapsed_ms = Some(elapsed_ms);
+        probes[index].outcome = Some(outcome);
     }
 }
 
@@ -881,6 +1080,7 @@ fn derive_follow_ups(
                                     element_path: path.to_string(),
                                 },
                                 outcome: None,
+                                elapsed_ms: None,
                             });
                             taken += 1;
                         }
@@ -918,6 +1118,7 @@ fn derive_follow_ups(
                                     expected_path: definition_path.to_string(),
                                 },
                                 outcome: None,
+                                elapsed_ms: None,
                             });
                         }
                     }
@@ -945,6 +1146,7 @@ fn derive_follow_ups(
                         origin_tool: probe.tool,
                     },
                     outcome: None,
+                    elapsed_ms: None,
                 });
             }
         }

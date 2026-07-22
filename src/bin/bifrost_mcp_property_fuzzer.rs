@@ -7,11 +7,20 @@
 //!       --clones-root /path/to/clones --repo owner__name \
 //!       --invariants I1 --out ledger.jsonl
 //!
-//! Current scope: `--repo` selection (repeatable), I1 as an index walk plus
-//! I1(c)/I2–I5 through an in-process `SearchToolsService` (both render modes),
-//! JSONL ledger with FIRD-style resume. Corpus-wide selection, concurrency,
-//! shrinking, and `--rerun` arrive in M3.
+//!     bifrost_mcp_property_fuzzer \
+//!       --clones-root /path/to/clones --commits-root /path/to/sft-tools-commits \
+//!       --top 5 --repo-jobs 2 --cache-mode ephemeral --out ledger.jsonl
+//!
+//! Selection is either explicit (`--repo`, repeatable) or corpus-wide:
+//! `--commits-root` + `--top N` rank every corpus repository per language via
+//! `scripts/mcp-fuzzer-repo-rank.py` (task count first, scan-record count as
+//! tiebreaker) and audit the top N usable clones per requested language.
+//! Repositories run through a bounded worker pool (`--repo-jobs`), every
+//! completed record supports FIRD-style resume, and `--rerun LINE` re-executes
+//! the failing slice of a ledger record to confirm a violation still
+//! reproduces.
 
+use brokk_bifrost::mcp_property_fuzzer::rerun::rerun_configs;
 use brokk_bifrost::mcp_property_fuzzer::service_probes::{
     DEFAULT_MAX_SCAN_PROBES, DEFAULT_MAX_SERVICE_SYMBOLS,
 };
@@ -21,15 +30,17 @@ use brokk_bifrost::mcp_property_fuzzer::{
 use brokk_bifrost::searchtools_service::SearchToolsService;
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project};
 use git2::{Repository, StatusOptions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Instant;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -39,6 +50,12 @@ const CORPUS_LANGUAGES: [&str; 11] = [
 
 const DEFAULT_MAX_SYMBOLS: usize = 5_000;
 const DEFAULT_PARALLELISM: usize = 8;
+/// Repositories audited concurrently in corpus mode. Kept low: each worker
+/// already fans out over `--jobs` analyzer threads and clones can be large.
+const DEFAULT_REPO_JOBS: usize = 2;
+/// brokkbench checkout the rank helper imports `tasks.py` from; overridable
+/// with `BROKK_BENCH_DIR` for other machines and for tests.
+const DEFAULT_BROKK_BENCH_DIR: &str = "/home/jonathan/Projects/brokkbench";
 
 fn main() -> ExitCode {
     match run() {
@@ -108,10 +125,15 @@ struct FuzzerArgs {
     max_service_symbols: usize,
     max_scan_probes: usize,
     symbol_filter: Option<String>,
+    path_filter: Option<String>,
     dump_probes: Option<PathBuf>,
     seed: u64,
     parallelism: usize,
     cache_mode: CacheMode,
+    top: Option<usize>,
+    repo_jobs: usize,
+    rerun: Option<usize>,
+    signature: Option<String>,
     strict: bool,
     force: bool,
     dry_run: bool,
@@ -128,10 +150,15 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
     let mut max_service_symbols = DEFAULT_MAX_SERVICE_SYMBOLS;
     let mut max_scan_probes = DEFAULT_MAX_SCAN_PROBES;
     let mut symbol_filter = None;
+    let mut path_filter = None;
     let mut dump_probes = None;
     let mut seed = 0_u64;
     let mut parallelism = DEFAULT_PARALLELISM;
     let mut cache_mode = CacheMode::Persisted;
+    let mut top = None;
+    let mut repo_jobs = DEFAULT_REPO_JOBS;
+    let mut rerun = None;
+    let mut signature = None;
     let mut strict = false;
     let mut force = false;
     let mut dry_run = false;
@@ -179,6 +206,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
             "--symbol-filter" => {
                 symbol_filter = Some(take_value(args, &mut index, "--symbol-filter")?)
             }
+            "--path-filter" => path_filter = Some(take_value(args, &mut index, "--path-filter")?),
             "--dump-probes" => {
                 dump_probes = Some(PathBuf::from(take_value(
                     args,
@@ -196,6 +224,10 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
             "--cache-mode" => {
                 cache_mode = CacheMode::parse(&take_value(args, &mut index, "--cache-mode")?)?
             }
+            "--top" => top = Some(take_positive_usize(args, &mut index, "--top")?),
+            "--repo-jobs" => repo_jobs = take_positive_usize(args, &mut index, "--repo-jobs")?,
+            "--rerun" => rerun = Some(take_positive_usize(args, &mut index, "--rerun")?),
+            "--signature" => signature = Some(take_value(args, &mut index, "--signature")?),
             "--strict" => strict = true,
             "--force" => force = true,
             "--dry-run" => dry_run = true,
@@ -203,11 +235,29 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
         }
         index += 1;
     }
-    if repos.is_empty() {
-        return Err(
-            "--repo is required (corpus-wide selection arrives with M3; repeat --repo to audit several clones)"
-                .to_string(),
-        );
+    let rerun_mode = rerun.is_some();
+    if signature.is_some() && !rerun_mode {
+        return Err("--signature only applies together with --rerun".to_string());
+    }
+    if rerun_mode {
+        if !repos.is_empty() || top.is_some() || commits_root.is_some() || dry_run {
+            return Err(
+                "--rerun cannot be combined with --repo, --top, --commits-root, or --dry-run"
+                    .to_string(),
+            );
+        }
+    } else if repos.is_empty() {
+        if commits_root.is_none() {
+            return Err(
+                "--commits-root is required to rank the corpus when no --repo is given".to_string(),
+            );
+        }
+        if top.is_none() {
+            return Err(
+                "--top N is required to size the corpus selection when no --repo is given"
+                    .to_string(),
+            );
+        }
     }
     if !dry_run && out.is_none() {
         return Err("--out is required unless --dry-run is used".to_string());
@@ -231,10 +281,15 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
         max_service_symbols,
         max_scan_probes,
         symbol_filter,
+        path_filter,
         dump_probes,
         seed,
         parallelism,
         cache_mode,
+        top,
+        repo_jobs,
+        rerun,
+        signature,
         strict,
         force,
         dry_run,
@@ -289,10 +344,25 @@ struct SelectedRepository {
     root: PathBuf,
 }
 
+/// One ranked corpus repository as emitted by
+/// `scripts/mcp-fuzzer-repo-rank.py`; ordering already encodes priority
+/// (task count, then scan-record count, then slug).
+#[derive(Debug, Deserialize)]
+struct RankedRepo {
+    slug: String,
+    sft_count: u64,
+    scan_records: u64,
+    rank_key: String,
+}
+
 /// Resolve each `--repo` slug to a validated clone and its corpus language.
 /// The language comes from the single `--language` flag when exactly one is
 /// given, otherwise from `<commits-root>/<language>/<slug>.jsonl` membership,
 /// falling back to `unknown` when no commits root is available.
+///
+/// With no `--repo`, corpus mode ranks every repository of each requested
+/// language (all 11 by default) through `scripts/mcp-fuzzer-repo-rank.py` and
+/// takes the top `--top N` usable clones per language.
 fn select_repositories(args: &FuzzerArgs) -> Result<Vec<SelectedRepository>, String> {
     let clones_root = args.clones_root.canonicalize().map_err(|err| {
         format!(
@@ -300,6 +370,25 @@ fn select_repositories(args: &FuzzerArgs) -> Result<Vec<SelectedRepository>, Str
             args.clones_root.display()
         )
     })?;
+    if args.repos.is_empty() {
+        let commits_root = args
+            .commits_root
+            .as_ref()
+            .expect("corpus mode requires --commits-root (validated by parse_args)");
+        let languages: Vec<String> = if args.languages.is_empty() {
+            CORPUS_LANGUAGES.iter().map(ToString::to_string).collect()
+        } else {
+            args.languages.clone()
+        };
+        let ranking = corpus_ranking(commits_root, &languages)?;
+        return Ok(ranked_selection(
+            &ranking,
+            &clones_root,
+            &languages,
+            args.top
+                .expect("corpus mode requires --top (validated by parse_args)"),
+        ));
+    }
     let mut selected = Vec::new();
     for slug in &args.repos {
         let root = validate_clone(&clones_root.join(slug))?;
@@ -317,6 +406,97 @@ fn select_repositories(args: &FuzzerArgs) -> Result<Vec<SelectedRepository>, Str
         });
     }
     Ok(selected)
+}
+
+/// Interpreter for the rank helper: the brokkbench venv when present (system
+/// python can be too old for `tasks.py`), otherwise `python3` from PATH.
+fn rank_interpreter() -> PathBuf {
+    let bench_dir = env::var_os("BROKK_BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_BROKK_BENCH_DIR));
+    let venv_python = bench_dir.join(".venv").join("bin").join("python3");
+    if venv_python.is_file() {
+        venv_python
+    } else {
+        PathBuf::from("python3")
+    }
+}
+
+/// Run `scripts/mcp-fuzzer-repo-rank.py` and parse its JSON ranking. All
+/// corpus-metadata access stays behind `tasks.py` (its "Thou Shalt Not Read
+/// Tasks Manually" policy); the Rust runner never parses it directly.
+fn corpus_ranking(
+    commits_root: &Path,
+    languages: &[String],
+) -> Result<HashMap<String, Vec<RankedRepo>>, String> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("mcp-fuzzer-repo-rank.py");
+    let output = Command::new(rank_interpreter())
+        .arg(&script)
+        .arg("--commits-root")
+        .arg(commits_root)
+        .arg("--languages")
+        .arg(languages.join(","))
+        .output()
+        .map_err(|err| format!("failed to run `{}`: {err}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{}` failed: {}",
+            script.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid ranking JSON from `{}`: {err}", script.display()))
+}
+
+/// Take the top `top` usable clones per language in ranked order. Missing or
+/// broken clones are skipped with a warning rather than failing the campaign:
+/// the corpus is partially checked out by design, and the ledger records what
+/// actually ran.
+fn ranked_selection(
+    ranking: &HashMap<String, Vec<RankedRepo>>,
+    clones_root: &Path,
+    languages: &[String],
+    top: usize,
+) -> Vec<SelectedRepository> {
+    let mut selected = Vec::new();
+    for language in languages {
+        let Some(ranked) = ranking.get(language) else {
+            eprintln!("warning: no corpus ranking for language `{language}`; skipping it");
+            continue;
+        };
+        let mut taken = 0;
+        for entry in ranked {
+            if taken >= top {
+                break;
+            }
+            match validate_clone(&clones_root.join(&entry.slug)) {
+                Ok(root) => {
+                    eprintln!(
+                        "select {language} {} (sft_count={}, scan_records={}, rank_key={})",
+                        entry.slug, entry.sft_count, entry.scan_records, entry.rank_key
+                    );
+                    selected.push(SelectedRepository {
+                        language: language.clone(),
+                        slug: entry.slug.clone(),
+                        root,
+                    });
+                    taken += 1;
+                }
+                Err(reason) => {
+                    eprintln!("warning: skip {language} {}: {reason}", entry.slug);
+                }
+            }
+        }
+        if taken < top {
+            eprintln!(
+                "warning: language `{language}` yielded only {taken} usable clone(s) (wanted top {top})"
+            );
+        }
+    }
+    selected
 }
 
 fn repository_language(args: &FuzzerArgs, slug: &str) -> Result<String, String> {
@@ -423,7 +603,23 @@ enum RepositoryResult {
     EngineError { message: String },
 }
 
+/// A repository run prepared on the main thread (config, fingerprint, resume
+/// check) and waiting in the worker queue.
+#[derive(Debug)]
+struct PreparedRun {
+    position: usize,
+    total: usize,
+    repo: SelectedRepository,
+    config: FuzzerConfig,
+    fingerprint: String,
+    metadata: RepositoryMetadata,
+    dump_path: Option<PathBuf>,
+}
+
 fn execute(args: &FuzzerArgs) -> Result<bool, String> {
+    if let Some(line_number) = args.rerun {
+        return execute_rerun(args, line_number);
+    }
     let selected = select_repositories(args)?;
     if args.dry_run {
         for repo in &selected {
@@ -432,14 +628,14 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let bifrost_metadata = repository_metadata(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let bifrost_metadata = Arc::new(repository_metadata(Path::new(env!("CARGO_MANIFEST_DIR")))?);
     let completed = if args.force {
         HashSet::new()
     } else {
         completed_runs(&args.out)?
     };
-    let mut strict_failure = false;
     let total = selected.len();
+    let mut prepared = Vec::new();
     for (position, repo) in selected.into_iter().enumerate() {
         let config = FuzzerConfig {
             corpus_language: repo.language.clone(),
@@ -448,6 +644,7 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             max_service_symbols: args.max_service_symbols,
             max_scan_probes: args.max_scan_probes,
             symbol_filter: args.symbol_filter.clone(),
+            path_filter: args.path_filter.clone(),
             seed: args.seed,
         };
         let fingerprint = run_fingerprint(&config)?;
@@ -469,15 +666,6 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             );
             continue;
         }
-        eprintln!(
-            "[{}/{}] run {} {} ({})",
-            position + 1,
-            total,
-            repo.language,
-            repo.slug,
-            repo.root.display()
-        );
-        let started = Instant::now();
         // With several repos selected the dump path is suffixed per slug so
         // later repos never overwrite earlier ones.
         let dump_path = args.dump_probes.as_ref().map(|path| {
@@ -493,65 +681,251 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
                 path.clone()
             }
         });
-        let result = run_engine(
-            &repo.root,
-            &config,
-            args.parallelism,
-            args.cache_mode,
-            dump_path.as_deref(),
-        );
-        let record = RepositoryRecord {
-            schema_version: SCHEMA_VERSION,
-            record_type: "repository",
-            bifrost_version: env!("CARGO_PKG_VERSION"),
-            bifrost_head: bifrost_metadata.head.clone(),
-            bifrost_dirty: bifrost_metadata.dirty,
-            corpus_language: repo.language.clone(),
-            analyzer_language: analyzer_language(&repo.language),
-            repo_slug: repo.slug.clone(),
-            repo_head: metadata.head.clone(),
-            repo_dirty: metadata.dirty,
-            cache_mode: args.cache_mode.as_str(),
-            run_fingerprint: fingerprint,
-            elapsed_seconds: started.elapsed().as_secs_f64(),
-            result: match result {
-                Ok(report) => RepositoryResult::Completed {
-                    report: Box::new(report),
-                },
-                Err(message) => RepositoryResult::EngineError { message },
-            },
-        };
-        append_record(&args.out, &record)?;
-        match &record.result {
-            RepositoryResult::Completed { report } => {
-                eprintln!(
-                    "[{}/{}] done {} {}: violations={} ({} distinct signature(s)) elapsed={:.1}s",
-                    position + 1,
-                    total,
-                    repo.language,
-                    repo.slug,
-                    report.violation_count(),
-                    report.violations.len(),
-                    record.elapsed_seconds
-                );
-                if args.strict && report.has_actionable_findings() {
-                    strict_failure = true;
+        prepared.push(PreparedRun {
+            position,
+            total,
+            repo,
+            config,
+            fingerprint,
+            metadata,
+            dump_path,
+        });
+    }
+    if prepared.is_empty() {
+        return Ok(false);
+    }
+
+    // Worker pool mirroring FIRD's corpus runner: bounded `--repo-jobs`
+    // workers pop prepared runs, the main thread appends records serially so
+    // the ledger is never written concurrently.
+    let worker_count = args.repo_jobs.min(prepared.len()).max(1);
+    eprintln!(
+        "run-corpus repositories={} repo_jobs={} jobs_per_repo={}",
+        prepared.len(),
+        worker_count,
+        args.parallelism
+    );
+    let queue = Arc::new(Mutex::new(VecDeque::from(prepared)));
+    let (sender, receiver) = mpsc::channel::<RepositoryRecord>();
+    let parallelism = args.parallelism;
+    let cache_mode = args.cache_mode;
+    let strict = args.strict;
+    let mut strict_failure = false;
+    thread::scope(|scope| -> Result<(), String> {
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let sender = sender.clone();
+            let bifrost_metadata = Arc::clone(&bifrost_metadata);
+            scope.spawn(move || {
+                loop {
+                    let Some(run) = queue
+                        .lock()
+                        .expect("corpus queue lock poisoned")
+                        .pop_front()
+                    else {
+                        break;
+                    };
+                    let record = execute_run(run, &bifrost_metadata, parallelism, cache_mode);
+                    if sender.send(record).is_err() {
+                        return;
+                    }
                 }
-            }
-            RepositoryResult::EngineError { message } => {
-                eprintln!(
-                    "[{}/{}] failed {} {}: {} elapsed={:.1}s",
-                    position + 1,
-                    total,
-                    repo.language,
-                    repo.slug,
-                    message,
-                    record.elapsed_seconds
-                );
+            });
+        }
+        drop(sender);
+        for record in receiver {
+            append_record(&args.out, &record)?;
+            if strict
+                && matches!(
+                    &record.result,
+                    RepositoryResult::Completed { report } if report.has_actionable_findings()
+                )
+            {
+                strict_failure = true;
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(strict_failure)
+}
+
+fn execute_run(
+    run: PreparedRun,
+    bifrost_metadata: &RepositoryMetadata,
+    parallelism: usize,
+    cache_mode: CacheMode,
+) -> RepositoryRecord {
+    let PreparedRun {
+        position,
+        total,
+        repo,
+        config,
+        fingerprint,
+        metadata,
+        dump_path,
+    } = run;
+    eprintln!(
+        "[{}/{}] run {} {} ({})",
+        position + 1,
+        total,
+        repo.language,
+        repo.slug,
+        repo.root.display()
+    );
+    let started = Instant::now();
+    let result = run_engine(
+        &repo.root,
+        &config,
+        parallelism,
+        cache_mode,
+        dump_path.as_deref(),
+    );
+    let record = RepositoryRecord {
+        schema_version: SCHEMA_VERSION,
+        record_type: "repository",
+        bifrost_version: env!("CARGO_PKG_VERSION"),
+        bifrost_head: bifrost_metadata.head.clone(),
+        bifrost_dirty: bifrost_metadata.dirty,
+        corpus_language: repo.language.clone(),
+        analyzer_language: analyzer_language(&repo.language),
+        repo_slug: repo.slug.clone(),
+        repo_head: metadata.head.clone(),
+        repo_dirty: metadata.dirty,
+        cache_mode: cache_mode.as_str(),
+        run_fingerprint: fingerprint,
+        elapsed_seconds: started.elapsed().as_secs_f64(),
+        result: match result {
+            Ok(report) => RepositoryResult::Completed {
+                report: Box::new(report),
+            },
+            Err(message) => RepositoryResult::EngineError { message },
+        },
+    };
+    match &record.result {
+        RepositoryResult::Completed { report } => {
+            eprintln!(
+                "[{}/{}] done {} {}: violations={} ({} distinct signature(s)) elapsed={:.1}s",
+                position + 1,
+                total,
+                repo.language,
+                repo.slug,
+                report.violation_count(),
+                report.violations.len(),
+                record.elapsed_seconds
+            );
+        }
+        RepositoryResult::EngineError { message } => {
+            eprintln!(
+                "[{}/{}] failed {} {}: {} elapsed={:.1}s",
+                position + 1,
+                total,
+                repo.language,
+                repo.slug,
+                message,
+                record.elapsed_seconds
+            );
+        }
+    }
+    record
+}
+
+/// Re-execute the failing slice of one ledger record (`--rerun LINE`): every
+/// recorded violation (optionally narrowed by `--signature`) gets its own
+/// run narrowed to the exemplar symbol, and the rerun reports which recorded
+/// signatures still reproduce. Returns `true` when any went MISSING so the
+/// process exits 2 — a disappeared violation is worth noticing, whether it
+/// was fixed or was flaky.
+fn execute_rerun(args: &FuzzerArgs, line_number: usize) -> Result<bool, String> {
+    let record = read_record_line(&args.out, line_number)?;
+    if record.get("record_type").and_then(Value::as_str) != Some("repository")
+        || record.get("status").and_then(Value::as_str) != Some("completed")
+    {
+        return Err(format!(
+            "ledger `{}` line {line_number} is not a completed repository record",
+            args.out.display()
+        ));
+    }
+    let slug = record
+        .get("repo_slug")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("ledger line {line_number} has no `repo_slug`"))?
+        .to_string();
+    let language = record
+        .get("corpus_language")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let recorded_head = record
+        .get("repo_head")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let cache_mode = record
+        .get("cache_mode")
+        .and_then(Value::as_str)
+        .map(CacheMode::parse)
+        .transpose()?
+        .unwrap_or(CacheMode::Persisted);
+    let clones_root = args.clones_root.canonicalize().map_err(|err| {
+        format!(
+            "failed to canonicalize clones root `{}`: {err}",
+            args.clones_root.display()
+        )
+    })?;
+    let root = validate_clone(&clones_root.join(&slug))?;
+    let metadata = repository_metadata(&root)?;
+    if metadata.head != recorded_head {
+        eprintln!(
+            "warning: {slug} HEAD drifted since the recorded run (ledger {recorded_head}, now {}); reproduction is not guaranteed",
+            metadata.head
+        );
+    }
+    let configs = rerun_configs(&record, args.signature.as_deref())?;
+    println!(
+        "rerun {} {}: {} violation(s) from {} line {}",
+        language,
+        slug,
+        configs.len(),
+        args.out.display(),
+        line_number
+    );
+    let mut missing = 0;
+    for (signature, config) in configs {
+        let report = run_engine(&root, &config, args.parallelism, cache_mode, None)?;
+        if report
+            .violations
+            .iter()
+            .any(|violation| violation.signature == signature)
+        {
+            println!("reproduced {signature}");
+        } else {
+            println!("MISSING {signature}");
+            missing += 1;
+        }
+    }
+    Ok(missing > 0)
+}
+
+/// Read the 1-based line `line_number` from the ledger and parse it as JSON.
+fn read_record_line(path: &Path, line_number: usize) -> Result<Value, String> {
+    let file = File::open(path)
+        .map_err(|err| format!("failed to read ledger `{}`: {err}", path.display()))?;
+    let line = BufReader::new(file)
+        .lines()
+        .nth(line_number - 1)
+        .ok_or_else(|| format!("ledger `{}` has no line {line_number}", path.display()))?
+        .map_err(|err| {
+            format!(
+                "failed to read ledger `{}` line {line_number}: {err}",
+                path.display()
+            )
+        })?;
+    serde_json::from_str(&line).map_err(|err| {
+        format!(
+            "ledger `{}` line {line_number} is not valid JSON: {err}",
+            path.display()
+        )
+    })
 }
 
 fn run_engine(
@@ -589,7 +963,13 @@ fn run_engine(
         started.elapsed().as_secs_f64()
     );
     let workspace = service.analyzer_snapshot()?;
-    let report = run_invariants_with_service(&service, workspace.analyzer(), config, probe_dump)?;
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        config,
+        probe_dump,
+        parallelism,
+    )?;
     let probe_calls = report
         .probe_summary
         .as_ref()
@@ -743,14 +1123,22 @@ fn append_record(path: &Path, record: &RepositoryRecord) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage: bifrost_mcp_property_fuzzer --clones-root PATH --repo SLUG [--repo SLUG...] --out PATH [options]"
+        "Usage: bifrost_mcp_property_fuzzer --clones-root PATH (--repo SLUG [--repo SLUG...] | --commits-root PATH --top N) --out PATH [options]"
+    );
+    println!(
+        "       bifrost_mcp_property_fuzzer --clones-root PATH --out PATH --rerun LINE [--signature TEXT]"
     );
     println!("  --clones-root PATH     Directory containing corpus clones named owner__repo");
     println!(
-        "  --commits-root PATH    Corpus metadata (sft-tools-commits); used to infer repo language"
+        "  --commits-root PATH    Corpus metadata (sft-tools-commits); ranks repos and infers languages"
     );
-    println!("  --repo SLUG            Corpus clone to audit; repeatable");
-    println!("  --language LANG        Corpus language filter/inference hint; repeatable");
+    println!("  --repo SLUG            Corpus clone to audit; repeatable; omit for corpus mode");
+    println!(
+        "  --top N                Corpus mode: audit the top N task-count-ranked clones per language"
+    );
+    println!(
+        "  --language LANG        Corpus language filter/inference hint; repeatable (default: all 11 in corpus mode)"
+    );
     println!(
         "  --invariants LIST      Comma-separated invariants to check (default: I1,I2,I3,I4,I5)"
     );
@@ -768,6 +1156,9 @@ fn print_help() {
         "  --symbol-filter TEXT   Restrict service probes to symbols whose fq name contains TEXT"
     );
     println!(
+        "  --path-filter TEXT     Restrict service probes to symbols whose declaring file path contains TEXT"
+    );
+    println!(
         "  --dump-probes PATH     Write every executed probe (arguments + outcomes) as JSONL for triage"
     );
     println!("  --seed N               Deterministic sampling seed (default: 0)");
@@ -775,7 +1166,16 @@ fn print_help() {
         "  --jobs N               Analyzer workers per repository (default: {DEFAULT_PARALLELISM})"
     );
     println!(
+        "  --repo-jobs N          Repositories audited concurrently (default: {DEFAULT_REPO_JOBS})"
+    );
+    println!(
         "  --cache-mode MODE      persisted for warm/resumable campaigns (default); ephemeral for one-off smoke runs"
+    );
+    println!(
+        "  --rerun LINE           Re-execute every violation recorded at ledger line LINE and report reproduction"
+    );
+    println!(
+        "  --signature TEXT       With --rerun: only violations whose signature contains TEXT"
     );
     println!("  --dry-run              Print the selected repositories without auditing");
     println!("  --strict               Exit 2 when any violation is found");

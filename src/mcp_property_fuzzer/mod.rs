@@ -44,6 +44,7 @@
 //! runs over fresh clones — and any `--cache-mode ephemeral` run — are always
 //! cold, so the check is fully live there.
 
+pub mod rerun;
 pub mod service_probes;
 
 use crate::analyzer::common::{display_identifier_for_target, display_symbol_for_target};
@@ -130,6 +131,12 @@ pub struct FuzzerConfig {
     /// fq name contains it (used by acceptance runs and `--rerun`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub symbol_filter: Option<String>,
+    /// Optional substring filter restricting service probes to symbols whose
+    /// declaring file path contains it. File-scoped probe families (the
+    /// `get_summaries` chain behind I3a) reproduce through the file, not the
+    /// symbol, so `--rerun` targets those signatures via this filter.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub path_filter: Option<String>,
     pub seed: u64,
 }
 
@@ -345,6 +352,7 @@ pub fn run_invariants_with_service(
     analyzer: &dyn IAnalyzer,
     config: &FuzzerConfig,
     probe_dump: Option<&std::path::Path>,
+    probe_parallelism: usize,
 ) -> Result<FuzzerReport, String> {
     let mut i1_summary = I1Summary::default();
     let input = collect_i1_input(analyzer, config.max_symbols, config.seed, &mut i1_summary);
@@ -376,6 +384,7 @@ pub fn run_invariants_with_service(
             config,
             &mut summary,
             probe_dump,
+            probe_parallelism,
         )?);
         violations.sort_by(|left, right| {
             left.signature
