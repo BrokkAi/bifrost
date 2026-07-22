@@ -46,6 +46,7 @@ fn main() {
             "tree_sitter_scala_external_scanner_deserialize",
             "brokk_bifrost_tree_sitter_scala_external_scanner_deserialize",
         ),
+        ("token_name", "brokk_bifrost_tree_sitter_scala_token_name"),
     ] {
         build.define(upstream, Some(private));
     }
