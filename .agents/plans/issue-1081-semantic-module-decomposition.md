@@ -16,7 +16,7 @@ The semantic intermediate representation and its workspace-backed oracles alread
 - [x] (2026-07-22 17:10Z) Decomposed the language-neutral oracle contracts behind the existing `oracle.rs` facade and preserved the full exported type set.
 - [x] (2026-07-22 17:10Z) Decomposed the semantic IR model, artifact, validation, and tests behind the existing `ir.rs` facade and preserved the full exported type set.
 - [x] (2026-07-22 17:10Z) Moved workspace dispatch implementation and its unit tests into `workspace_oracle/dispatch.rs` while retaining the shared root facade and ICFG helper paths.
-- [ ] Run unchanged contract tests, formatting, full-feature Clippy, and a parallel specialist review; address every confirmed finding.
+- [x] (2026-07-22 17:27Z) Ran the unchanged contract tests, formatting, all-target/all-feature checking and Clippy, exact scope checks, and five parallel specialist review lenses; no code findings remained.
 
 ## Surprises & Discoveries
 
@@ -31,6 +31,12 @@ The semantic intermediate representation and its workspace-backed oracles alread
 
 - Observation: ICFG production code imports `exact_source_for_procedure` and `semantic_locator_work`, while its unit tests also import callable-identity, candidate-retention, and scoped-gap helpers from the workspace-oracle root.
   Evidence: the first integrated compile resolved the imports in `src/analyzer/semantic/icfg.rs`; the facade now preserves the production paths and gates the three test-only re-exports with `#[cfg(test)]`.
+
+- Observation: the four acceptance suites compile with the Python feature, but their test executables cannot link on this macOS host when PyO3's `extension-module` feature is enabled because the executable has unresolved `_Py*` symbols.
+  Evidence: the isolated `cargo test --features nlp,python` run reached the link step and failed only on undefined Python symbols; the helper removed its managed target. This is the repository's previously documented macOS PyO3 test-link limitation, not a refactor compile error. The same unchanged suites passed with `--features nlp`, while all Python-feature Rust code passed all-target checking and Clippy.
+
+- Observation: the shell initially resolved `cargo` and `rustc` from `/Users/dave/.local/bin` but `cargo-clippy` from Homebrew, whose LLVM patch versions are incompatible for isolated compilation.
+  Evidence: the first isolated Clippy run reported E0514 with LLVM 22.1.2 versus 22.1.6 metadata. Rerunning with `/opt/homebrew/bin/cargo`, `/opt/homebrew/bin/rustc`, and the matching Homebrew Clippy completed cleanly with warnings denied.
 
 ## Decision Log
 
@@ -56,7 +62,11 @@ The semantic intermediate representation and its workspace-backed oracles alread
 
 ## Outcomes & Retrospective
 
-Implementation is not yet complete. At completion this section will record the final file topology, unchanged-test evidence, review findings, and any remaining work.
+Issue #1081 is complete as a topology-only refactor. `oracle.rs`, `ir.rs`, and `workspace_oracle.rs` are now 27-, 17-, and 55-line facades. Oracle contracts live in focused `call`, `dispatch`, `error`, `heap`, `limits`, `model`, `relation`, `traits`, and `value_flow` children. IR model, validation, immutable artifact, and tests have separate homes. Workspace dispatch implementation and tests now live together under the unchanged shared workspace-oracle facade.
+
+The public oracle and IR type sets match `4037def8` exactly, all existing consumers compile with all features, and the four acceptance test files are byte-for-byte unchanged. Their 90 tests pass with `--features nlp` (25 ICFG, 11 IR, 41 oracle, and 13 value-language tests). Formatting, exact diff checks, and all-target/all-feature Clippy with warnings denied pass. The only incomplete literal form of the requested test command is the known macOS PyO3 executable-link limitation described above; Python-feature compilation remains covered by both `cargo check` and Clippy.
+
+Five independent review lenses found no security, duplication, intent, operational, or architecture findings. In particular, reviewers verified private one-way facades, scoped identity, relation-arena ownership, candidate sealing, ordering, coverage/proof composition, finite-limit guards, work budgets, and cancellation precedence. No follow-up code changes were required after review.
 
 ## Context and Orientation
 
@@ -102,7 +112,7 @@ Run the repository's formatting and lint acceptance gates:
     cargo fmt --all -- --check
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
 
-The expected result for each command is exit status zero. Contract-test counts may evolve, but no test source in those four files is to change as part of this issue.
+The expected result for each command is exit status zero. Contract-test counts may evolve, but no test source in those four files is to change as part of this issue. On the current macOS host, the Python-feature test executables have the known PyO3 link limitation documented above; use the `nlp` result plus the all-feature check and Clippy gates as the local evidence boundary.
 
 ## Validation and Acceptance
 
@@ -135,6 +145,35 @@ Integrated compile evidence after the three moves:
 
 The exported top-level `pub struct`, `pub enum`, `pub trait`, and `pub type` name sets in both `oracle` and `ir` match commit `4037def8` exactly.
 
+Final validation evidence:
+
+    cargo fmt --all -- --check
+    # passed
+
+    cargo check --all-targets --all-features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.43s
+
+    scripts/with-isolated-cargo-target.sh cargo test --features nlp \
+      --test semantic_ir_contract \
+      --test semantic_oracle_contract \
+      --test semantic_value_language_contract \
+      --test icfg_contract
+    # 90 passed; 0 failed
+
+    RUSTC=/opt/homebrew/bin/rustc scripts/with-isolated-cargo-target.sh \
+      /opt/homebrew/bin/cargo clippy --all-targets --all-features -- -D warnings
+    # passed; managed target removed
+
+    git diff --quiet 4037def8..HEAD -- \
+      tests/semantic_ir_contract.rs \
+      tests/semantic_oracle_contract.rs \
+      tests/semantic_value_language_contract.rs \
+      tests/icfg_contract.rs
+    # exit 0
+
+    git diff --check 4037def8..HEAD
+    # passed
+
 ## Interfaces and Dependencies
 
 At completion, these facade paths remain valid and unchanged:
@@ -149,3 +188,5 @@ The child modules are implementation details and remain private. Public type nam
 Revision note (2026-07-22 16:56Z): Initial self-contained plan created after live issue, branch, dependency, and history inspection. The oracle layout adds explicit foundational contract modules to satisfy the issue's one-direction dependency constraint.
 
 Revision note (2026-07-22 17:10Z): Recorded completion of all three module moves, the implicit IR-test imports and ICFG helper consumers found by the integrated compile, and the successful all-target/all-feature check.
+
+Revision note (2026-07-22 17:27Z): Closed validation and review with exact test, formatting, Clippy, API-parity, and unchanged-source evidence; documented the known macOS PyO3 link boundary and the corrected local toolchain selection.
