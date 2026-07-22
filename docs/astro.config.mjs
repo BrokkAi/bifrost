@@ -84,6 +84,7 @@ export default defineConfig({
           items: [
             { label: 'MCP Server', slug: 'mcp' },
             { label: 'Agent Instructions', slug: 'agents' },
+            { label: 'Pi', slug: 'pi' },
             { label: 'Codex', slug: 'codex' },
             { label: 'Claude Code', slug: 'claude-code' },
             { label: 'Cursor', slug: 'cursor' },
