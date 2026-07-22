@@ -31,6 +31,25 @@ threshold-crossing improvements and one remaining threshold-crossing regression;
 this promotion registers the broad analyzer-performance improvements as the new
 comparison point without changing the regression detector.
 
+The July 15 blessed Ubuntu baseline (`run-20260715T120808Z.json`, Bifrost commit
+`e3860e0b5d50e8b82bb963569d4c5a170b9d977c`) had zero scenario failures across
+the same 10 repositories and 76 scenarios. It was checked in by commit
+`0d12e86f982c734d8caf446e42990b02fec0b997`; the originating Actions run was not
+recorded in the repository.
+
+The issue #920 query-regression baseline is promoted from the successful full
+manual benchmark run on July 22, 2026 (`run-20260722T204647Z.json` from Actions
+run 29955662059, Bifrost commit
+`bc98c29da12ced428b0b4952709ebbeb20a4ff5a`). The report had zero scenario
+failures across the same 10 repositories and 92 scenarios, including all 16 new
+`query_code` cases with stable result cardinalities and no query diagnostics.
+The artifact also passes strict comparison against itself, including the
+first-to-warm retention invariant. Comparison with the July 15 baseline reported
+four improvements and four existing-scenario timing regressions. This promotion
+deliberately establishes the reviewed post-#920 floor so subsequent strict runs
+exercise the new query correctness, cache-path, and timing contracts instead of
+treating all 16 cases as absent from the baseline.
+
 It is not written automatically. Promote it deliberately:
 
 1. Run the benchmark workflow or a local `bifrost_benchmark run`.
