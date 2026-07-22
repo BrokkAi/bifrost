@@ -24,6 +24,14 @@ on:
         required: false
         default: false
         type: boolean
+      query_code_access:
+        description: 'Temporary #920 QueryCode access selector'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - scan_only
       post_to_slack:
         description: 'Post results to Slack; disable for exploratory runs'
         required: false
@@ -45,6 +53,7 @@ jobs:
       SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
       BENCHMARK_REPO: ${{ inputs.repo || '' }}
       BENCHMARK_MAX_FILES: ${{ inputs.max_files || '' }}
+      BIFROST_BENCHMARK_QUERY_CODE_ACCESS: ${{ inputs.query_code_access || 'auto' }}
 
     steps:
       - uses: actions/checkout@v5
