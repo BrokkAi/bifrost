@@ -19,11 +19,10 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
-    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex, build_direct_descendant_index_from_candidates,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -232,7 +231,7 @@ pub struct ScalaAnalyzer {
     package_namespaces: Arc<OnceLock<Vec<String>>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    lazy_hierarchy_index: Arc<OnceLock<hierarchy::ScalaLazyHierarchyIndex>>,
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
@@ -365,7 +364,7 @@ impl ScalaAnalyzer {
             importable_declarations_by_package: Arc::new(OnceLock::new()),
             package_namespaces: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            lazy_hierarchy_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
             full_usage_edges: build_weighted_cache(memo_budget / 8, weight_scala_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),

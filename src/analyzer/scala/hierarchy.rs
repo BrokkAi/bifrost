@@ -29,18 +29,107 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.direct_descendant_index
-            .get_or_init(|| self.build_direct_descendant_index())
-            .descendants(code_unit)
+        self.lazy_hierarchy_index
+            .get_or_init(|| self.build_lazy_hierarchy_index())
+            .direct_descendants(self, code_unit)
+    }
+}
+
+/// Candidate-scoped Scala descendant lookup.
+///
+/// Building the whole-workspace descendant graph eagerly (issue #908) resolved
+/// every class's ancestors up front, which is `O(N)` per class because each
+/// `ScalaNameResolver` rebuilds the enclosing package's binding table — an
+/// `O(N^2)` build that blocked the first inverse-member query for minutes on
+/// large workspaces. Instead we do a single cheap global pass that records only
+/// the parser-derived *simple names* each class spells as a direct supertype
+/// (no resolution), then resolve ancestors on demand for just the classes whose
+/// spelled supertype could name a queried owner. The per-class resolution is
+/// memoized in the analyzer's `direct_ancestors` cache, so a transitive
+/// descendant walk pays for the subtree it actually touches, not the workspace.
+pub(crate) struct ScalaLazyHierarchyIndex {
+    /// Bulk-projected hierarchy context per class (imports + supertype paths),
+    /// captured without point-hydrating any file so ancestor resolution never
+    /// re-reads a file state.
+    contexts: HashMap<CodeUnit, ScalaHierarchyOwnerContext>,
+    /// Shared project-types snapshot used by every ancestor resolution.
+    types: Arc<ScalaProjectTypes>,
+    /// Same-fq-name candidate identities, used to reconcile a resolved ancestor
+    /// to the concrete declaration identity a descendant query is keyed on
+    /// (mirrors `build_direct_descendant_index_from_candidates`).
+    types_by_fq_name: HashMap<String, Vec<CodeUnit>>,
+    /// Classes indexed by each simple supertype name they spell. A class can
+    /// only be a descendant of `owner` if it spells `owner`'s simple name, so
+    /// this prunes ancestor resolution to the relevant candidates.
+    candidates_by_supertype_simple: HashMap<String, Vec<CodeUnit>>,
+}
+
+impl ScalaLazyHierarchyIndex {
+    fn direct_descendants(&self, scala: &ScalaAnalyzer, owner: &CodeUnit) -> HashSet<CodeUnit> {
+        if !owner.is_class() {
+            return HashSet::default();
+        }
+        let simple = crate::analyzer::scala::scala_simple_type_name(owner);
+        let Some(candidates) = self.candidates_by_supertype_simple.get(&simple) else {
+            return HashSet::default();
+        };
+        let mut descendants = HashSet::default();
+        for candidate in candidates {
+            let ancestors = self.ancestors_of(scala, candidate);
+            if ancestors
+                .iter()
+                .any(|ancestor| self.reconcile_ancestor(ancestor, candidate) == *owner)
+            {
+                descendants.insert(candidate.clone());
+            }
+        }
+        descendants
+    }
+
+    /// Resolve a candidate's direct ancestors, reading through the analyzer's
+    /// shared `direct_ancestors` cache so repeated subtree walks and later
+    /// `get_direct_ancestors` queries never re-resolve or point-hydrate.
+    fn ancestors_of(&self, scala: &ScalaAnalyzer, candidate: &CodeUnit) -> Arc<Vec<CodeUnit>> {
+        if let Some(cached) = scala.direct_ancestors.get(candidate) {
+            return cached;
+        }
+        let ancestors = self
+            .contexts
+            .get(candidate)
+            .map(|context| {
+                scala.resolve_direct_ancestor_units_with_context(candidate, &self.types, context)
+            })
+            .unwrap_or_default();
+        let ancestors = Arc::new(ancestors);
+        scala
+            .direct_ancestors
+            .insert(candidate.clone(), Arc::clone(&ancestors));
+        ancestors
+    }
+
+    /// Map a resolved ancestor to the concrete same-source declaration identity
+    /// when the fq-name is uniquely sourced, matching the identity contract of
+    /// the eager `DirectDescendantIndex` edge construction.
+    fn reconcile_ancestor(&self, ancestor: &CodeUnit, candidate: &CodeUnit) -> CodeUnit {
+        self.types_by_fq_name
+            .get(&ancestor.fq_name())
+            .and_then(|same_name| {
+                let mut same_source = same_name
+                    .iter()
+                    .filter(|unit| unit.source() == candidate.source());
+                let exact = same_source.next()?;
+                same_source.next().is_none().then(|| exact.clone())
+            })
+            .unwrap_or_else(|| ancestor.clone())
     }
 }
 
 impl ScalaAnalyzer {
-    fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
-        let _scope = crate::profiling::scope("ScalaAnalyzer::build_direct_descendant_index");
+    fn build_lazy_hierarchy_index(&self) -> ScalaLazyHierarchyIndex {
+        let _scope = crate::profiling::scope("ScalaAnalyzer::build_lazy_hierarchy_index");
         let file_states = self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit);
         let mut candidates = Vec::new();
-        let mut contexts = HashMap::default();
+        let mut contexts: HashMap<CodeUnit, ScalaHierarchyOwnerContext> = HashMap::default();
         let mut seen = HashSet::default();
         for state in file_states.values() {
             for candidate in state
@@ -57,26 +146,60 @@ impl ScalaAnalyzer {
                 }
             }
         }
-
         let types = self.project_types_from_file_states(file_states);
-        let mut ancestors_by_owner = HashMap::default();
+
+        // Cheap global pass: group same-fq-name identities and index each class
+        // by the simple names it spells as direct supertypes. No resolution.
+        let mut types_by_fq_name: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for candidate in &candidates {
-            let ancestors = contexts
-                .get(candidate)
-                .map(|context| {
-                    self.resolve_direct_ancestor_units_with_context(candidate, &types, context)
-                })
-                .unwrap_or_default();
-            self.direct_ancestors
-                .insert(candidate.clone(), Arc::new(ancestors.clone()));
-            ancestors_by_owner.insert(candidate.clone(), ancestors);
+            types_by_fq_name
+                .entry(candidate.fq_name())
+                .or_default()
+                .push(candidate.clone());
         }
-        build_direct_descendant_index_from_candidates(candidates, |candidate| {
-            ancestors_by_owner
-                .get(candidate)
-                .cloned()
-                .unwrap_or_default()
-        })
+        let mut candidates_by_supertype_simple: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for (candidate, context) in &contexts {
+            let mut keys: HashSet<String> = HashSet::default();
+            for path in &context.supertype_lookup_paths {
+                let Some(leaf) = path.segments().last() else {
+                    continue;
+                };
+                // The spelled leaf is the query key for a directly-named owner.
+                keys.insert(leaf.clone());
+                // An `import a.b.Real as Leaf` renames the spelled leaf, so the
+                // owner's real simple name differs from what is spelled. Index
+                // the candidate under the import target's simple name too, so a
+                // descendant query keyed on the real name still finds it.
+                for import in &context.imports {
+                    if import.is_wildcard {
+                        continue;
+                    }
+                    if import.identifier.as_deref() != Some(leaf.as_str()) {
+                        continue;
+                    }
+                    if let Some(real) = scala_import_path(import)
+                        .as_deref()
+                        .and_then(|path| path.rsplit('.').next())
+                        .filter(|real| *real != leaf.as_str())
+                    {
+                        keys.insert(real.to_string());
+                    }
+                }
+            }
+            for key in keys {
+                candidates_by_supertype_simple
+                    .entry(key)
+                    .or_default()
+                    .push(candidate.clone());
+            }
+        }
+
+        ScalaLazyHierarchyIndex {
+            contexts,
+            types,
+            types_by_fq_name,
+            candidates_by_supertype_simple,
+        }
     }
 
     #[allow(dead_code)]
@@ -430,5 +553,137 @@ trait External
                 && relation.to.fq_name() == "app.Logged"
                 && relation.kind == TypeRelationKind::NominalInheritance
         }));
+    }
+
+    /// Reference implementation of the pre-#908 eager whole-workspace descendant
+    /// index: resolve every class's ancestors up front and materialize the full
+    /// ancestor→descendant graph. Kept test-only to prove the lazy path is
+    /// semantically identical.
+    fn eager_reference_descendants(
+        analyzer: &ScalaAnalyzer,
+    ) -> crate::analyzer::DirectDescendantIndex {
+        use crate::hash::{HashMap, HashSet};
+        let file_states = analyzer.bulk_file_states(
+            analyzer.analyzed_files(),
+            crate::analyzer::BulkFileStateSource::Omit,
+        );
+        let mut candidates = Vec::new();
+        let mut contexts: HashMap<CodeUnit, ScalaHierarchyOwnerContext> = HashMap::default();
+        let mut seen = HashSet::default();
+        for state in file_states.values() {
+            for candidate in state
+                .definition_lookup_units
+                .iter()
+                .chain(&state.declarations)
+                .filter(|candidate| candidate.is_class())
+            {
+                if seen.insert(candidate.clone()) {
+                    candidates.push(candidate.clone());
+                }
+                if let Some(context) = hierarchy_owner_context_from_state(state, candidate) {
+                    contexts.insert(candidate.clone(), context);
+                }
+            }
+        }
+        let types = analyzer.project_types_from_file_states(file_states);
+        let mut ancestors_by_owner: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
+        for candidate in &candidates {
+            let ancestors = contexts
+                .get(candidate)
+                .map(|context| {
+                    analyzer.resolve_direct_ancestor_units_with_context(candidate, &types, context)
+                })
+                .unwrap_or_default();
+            ancestors_by_owner.insert(candidate.clone(), ancestors);
+        }
+        crate::analyzer::capabilities::build_direct_descendant_index_from_candidates(
+            candidates,
+            |candidate| {
+                ancestors_by_owner
+                    .get(candidate)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )
+    }
+
+    fn sorted_fq_names(units: &crate::hash::HashSet<CodeUnit>) -> Vec<String> {
+        let mut names: Vec<String> = units.iter().map(CodeUnit::fq_name).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn scala_lazy_descendants_match_eager_reference_index() {
+        // Tricky shapes: cross-file inheritance, type/package aliases, wildcard
+        // imports, companion objects, and a multi-level chain.
+        let files: &[(&str, &str)] = &[
+            (
+                "lib/Types.scala",
+                "package lib\nclass Base\ntrait Runnable\n",
+            ),
+            (
+                "root/api/Types.scala",
+                "package root.api\nclass PackageBase\n",
+            ),
+            (
+                "alias/Children.scala",
+                "package alias\nimport lib.Base as Parent\nimport lib.Runnable\nimport root.{api => classic}\nclass First extends Parent with Runnable\nclass Second extends Parent\nclass Third extends Parent\nclass PackageAliasChild extends classic.PackageBase\n",
+            ),
+            (
+                "wild/Child.scala",
+                "package wild\nimport lib._\nclass WildcardChild extends Base with Runnable\n",
+            ),
+            (
+                "same/Types.scala",
+                "package same\nclass Peer\nclass SamePackageChild extends Peer\n",
+            ),
+            (
+                "companion/Types.scala",
+                "package companion\nclass Foo\nobject Foo { trait Base }\nclass Child extends Foo.Base\nobject Bases { trait StableBase }\nimport Bases.*\nclass StableWildcardChild extends StableBase\n",
+            ),
+            (
+                "chain/Chain.scala",
+                "package chain\nclass A\nclass B extends A\nclass C extends B\nclass D extends C\n",
+            ),
+            (
+                "aliastype/Alias.scala",
+                "package aliastype\nimport lib.Base\ntype Renamed = Base\nclass ViaTypeAlias extends Renamed\n",
+            ),
+        ];
+
+        // One analyzer so both paths key on the same declaration identities;
+        // the eager reference builds its own standalone index and does not touch
+        // the lazy `get_direct_descendants` path or its cache priming.
+        let (_fixture, analyzer) = analyzer_with_files(files);
+        let eager = eager_reference_descendants(&analyzer);
+
+        let all_classes: Vec<CodeUnit> = analyzer
+            .all_declarations()
+            .filter(CodeUnit::is_class)
+            .collect();
+        assert!(
+            all_classes.len() >= 15,
+            "fixture should exercise many classes"
+        );
+
+        let mut agreements = 0usize;
+        for unit in &all_classes {
+            let lazy = sorted_fq_names(&analyzer.get_direct_descendants(unit));
+            let reference = sorted_fq_names(&eager.descendants(unit));
+            assert_eq!(
+                lazy,
+                reference,
+                "descendant mismatch for {}",
+                unit.fq_name()
+            );
+            if !lazy.is_empty() {
+                agreements += 1;
+            }
+        }
+        assert!(
+            agreements >= 5,
+            "differential must cover several non-empty descendant sets, saw {agreements}"
+        );
     }
 }
