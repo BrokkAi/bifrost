@@ -88,6 +88,20 @@ discovered, run:
 opencode debug skill
 ```
 
+OpenCode also scans the global `~/.agents/skills/` root. Avoid keeping different
+versions of the same Bifrost skill in both the project and global roots:
+same-named global copies can be selected instead of the project copies. Check
+the `location` reported for all three Bifrost skills and keep one intended
+scope current. To use global skills instead, install or refresh that scope:
+
+```bash
+bifrost --root /absolute/path/to/project \
+  --install-skills --target global --mode copy
+```
+
+If the installer reports local changes, review them before deciding whether to
+replace them with `--force`.
+
 Installing skills does not start Bifrost or expose analyzer tools by itself.
 Keep the MCP configuration above enabled when you want OpenCode to call
 Bifrost.
