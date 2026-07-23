@@ -2299,12 +2299,14 @@ class Host {
             [this.key] = this;
             instanceDirect = this;
             instanceArrow = () => this;
+            parameterArrow = (value) => value;
             static staticDirect = this;
             static staticArrow = () => this;
             [(() => this.key)()]() {}
             static {
                 const staticBlockDirect = this;
                 const staticBlockArrow = () => this;
+                const staticBlockHelper = (value) => value;
             }
         }
         return Nested;
@@ -2421,12 +2423,51 @@ class Host {
         assert!(static_block.properties().is_static);
         assert_eq!(receiver_flow_count(static_block), 1);
         assert_receiver_capture(static_block);
+        assert!(
+            static_block
+                .values()
+                .iter()
+                .all(|value| !matches!(value.kind, SemanticValueKind::Parameter { .. })),
+            "{path} static-block initializer must not absorb nested lambda parameters"
+        );
         assert!(!initializer("instanceDirect = this").properties().is_static);
         assert!(
             initializer("static staticDirect = this")
                 .properties()
                 .is_static
         );
+
+        let parameter_initializer = initializer("parameterArrow = (value) => value");
+        assert!(
+            parameter_initializer
+                .values()
+                .iter()
+                .all(|value| !matches!(value.kind, SemanticValueKind::Parameter { .. })),
+            "{path} field initializer must not absorb nested lambda parameters"
+        );
+        let parameter_lambdas = procedures
+            .iter()
+            .filter(|procedure| {
+                procedure.kind() == ProcedureKind::Lambda
+                    && procedure_source(procedure).contains("(value) => value")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameter_lambdas.len(),
+            2,
+            "{path} should materialize field and static-block helper lambdas"
+        );
+        for lambda in parameter_lambdas {
+            let parameters = lambda
+                .values()
+                .iter()
+                .filter(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+                .count();
+            assert_eq!(
+                parameters, 1,
+                "{path} lambda should retain its own parameter"
+            );
+        }
 
         let outer = procedure_named(&graph, "makeNested", ProcedureKind::Method);
         let outer_receiver = outer

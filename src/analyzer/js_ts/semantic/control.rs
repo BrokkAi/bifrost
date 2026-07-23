@@ -1262,10 +1262,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
-        let expressions = class_definition_expressions(node, self.session.cancellation()).map_err(
+        let evaluation = class_definition_expressions(node, self.session.cancellation()).map_err(
             |LoweringCancelled| TsLoweringError::Cancelled(Box::new(builder.prospective_work())),
         )?;
-        self.schedule_expressions(builder, entry, &expressions, next, scope, stack)
+        if evaluation.has_decorators {
+            return self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unsupported,
+                "class and member decorator evaluation order is not yet lowered",
+            );
+        }
+        self.schedule_expressions(builder, entry, &evaluation.expressions, next, scope, stack)
     }
 
     #[allow(clippy::too_many_arguments)]

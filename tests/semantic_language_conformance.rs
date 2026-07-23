@@ -6889,6 +6889,40 @@ fn javascript_typescript_class_field_initializers_are_source_backed() {
 }
 
 #[test]
+fn typescript_unsupported_parameter_decorators_do_not_publish_nested_callables() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "typescript/decorators.ts",
+            r#"
+                declare function decorate(value: unknown): ParameterDecorator;
+
+                class Decorated {
+                    method(@decorate(() => this) value: string): string {
+                        return value;
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "typescript/decorators.ts");
+
+    assert!(
+        graph
+            .artifact()
+            .procedures()
+            .iter()
+            .all(|procedure| procedure.kind() != ProcedureKind::Lambda),
+        "unsupported parameter decorators must not publish misleading nested callable semantics"
+    );
+    let method = procedure_named(&graph, "method", ProcedureKind::Method);
+    assert!(
+        method.captures().is_empty(),
+        "the decorated method must not capture a decorator arrow through its own receiver"
+    );
+}
+
+#[test]
 fn csharp_branches_loops_and_nested_callables_are_separate() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

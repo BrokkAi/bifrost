@@ -2155,7 +2155,7 @@ fn typescript_for_in_initializer_and_destructuring_gaps_are_point_scoped() {
 }
 
 #[test]
-fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
+fn typescript_for_await_yield_and_unsupported_control_stop_at_typed_boundaries() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
             "src/boundaries.ts",
@@ -2226,10 +2226,8 @@ fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
                 .effect("invoke"),
         )
         .bind(
-            "unknown_gap",
-            PointSelector::new("class Local {}")
-                .procedure("unknownControl")
-                .effect("gap"),
+            "class_definition",
+            PointSelector::new("class Local {}").procedure("unknownControl"),
         )
         .bind(
             "unknown_after",
@@ -2252,13 +2250,13 @@ fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
                 .effect("invoke"),
         );
 
-    for terminal in ["for_await_gap", "yield_gap", "unknown_gap", "logical_gap"] {
+    for terminal in ["for_await_gap", "yield_gap", "logical_gap"] {
         graph.assert_successors(terminal, &[]);
     }
     graph.assert_unreachable("for_await_gap", "for_await_use");
     graph.assert_unreachable("for_await_gap", "iterate_after");
     graph.assert_unreachable("yield_gap", "values_after");
-    graph.assert_unreachable("unknown_gap", "unknown_after");
+    graph.assert_reachable("class_definition", "unknown_after");
     graph.assert_unreachable("logical_gap", "logical_after");
 
     let capabilities = [
@@ -2274,6 +2272,68 @@ fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
                 .any(|gap| gap.capability == capability && gap.kind == SemanticGapKind::Unsupported)
         }));
     }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn typescript_implements_is_type_only_and_decorators_remain_explicitly_unsupported() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/class_boundaries.ts",
+            r#"
+                interface Marker {}
+                declare function decorate(): ClassDecorator;
+                declare function after(): void;
+
+                function implemented(): void {
+                    class Local implements Marker {}
+                    after();
+                }
+
+                function decorated(): void {
+                    @decorate()
+                    class Local {}
+                    after();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/class_boundaries.ts");
+    graph
+        .bind(
+            "implements_class",
+            PointSelector::new("class Local implements Marker {}").procedure("implemented"),
+        )
+        .bind(
+            "implements_after",
+            PointSelector::new("after()")
+                .occurrence(1)
+                .procedure("implemented")
+                .effect("invoke"),
+        )
+        .bind(
+            "decorator_gap",
+            PointSelector::new("class Local {}")
+                .procedure("decorated")
+                .effect("gap"),
+        )
+        .bind(
+            "decorator_after",
+            PointSelector::new("after()")
+                .occurrence(2)
+                .procedure("decorated")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("implements_class", "implements_after");
+    graph.assert_successors("decorator_gap", &[]);
+    graph.assert_unreachable("decorator_gap", "decorator_after");
+    graph.assert_point_gap(
+        "decorator_gap",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
     graph.assert_adjacency_symmetric();
 }
 

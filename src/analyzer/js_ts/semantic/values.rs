@@ -93,13 +93,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         properties: ProcedureProperties,
     ) -> Result<(), TsLoweringError> {
         let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots(
-            self.prepared.dialect().language(),
-            self.prepared.tree().root_node(),
-            self.prepared.source(),
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout = if procedure_kind == ProcedureKind::Initializer {
+            Default::default()
+        } else {
+            formal_parameter_slots(
+                self.prepared.dialect().language(),
+                self.prepared.tree().root_node(),
+                self.prepared.source(),
+                &declaration_range,
+            )
+            .unwrap_or_default()
+        };
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             let node = callable

@@ -16,7 +16,7 @@ After this change, semantic artifacts for JavaScript, JSX, TypeScript, and TSX w
 - [x] (2026-07-23 08:16+02:00) Created this self-contained ExecPlan.
 - [x] (2026-07-23 08:23+02:00) Milestone 1: materialized initialized fields, split class-member child ownership and declaration paths, and passed focused JS/JSX/TS/TSX conformance plus the pre-existing class-field-arrow regression.
 - [x] (2026-07-23 08:33+02:00) Milestone 2: published instance/static initializer receivers, lowered initializer expressions without return effects, modeled heritage/computed-name class evaluation, bumped adapter fingerprints, and passed focused receiver/CFG/cancellation/deep-control tests.
-- [ ] Milestone 3: run complete validation, conduct specialist review, address findings, and record the final outcome.
+- [x] (2026-07-23 09:27+02:00) Milestone 3: passed the complete semantic and all-feature Rust gates, addressed every confirmed specialist-review finding, reran strict Clippy, and recorded the final outcome.
 
 ## Surprises & Discoveries
 
@@ -31,6 +31,18 @@ After this change, semantic artifacts for JavaScript, JSX, TypeScript, and TSX w
 
 - Observation: once fields became procedures, the existing class-field-arrow selector matched both the initializer entry and nested lambda entry.
   Evidence: the focused pre-existing regression reported both `type:Worker::initializer:run` and `type:Worker::initializer:run::lambda:run`; selecting the complete lambda declaration path preserves the original assertion without hiding the new boundary.
+
+- Observation: class declarations were previously used as an example of terminal unknown control syntax in a broad CFG boundary test.
+  Evidence: after structured class-definition lowering, the full `semantic_cfg_contract` binary correctly showed `class Local {}` reaching its following call. The test now reserves terminal assertions for genuinely unsupported control constructs and separately proves the class continuation.
+
+- Observation: TypeScript class heritage and member syntax mix runtime and erased forms under common grammar containers.
+  Evidence: specialist review found that an implements-only clause, overload/abstract/declare computed members, and decorators could otherwise be misclassified as runtime expressions. Structured kind/modifier checks now exclude erased forms, while decorators publish a terminal `NormalControlFlow` unsupported gap.
+
+- Observation: initializer input discovery cannot safely scan the whole field or static-block range for formal parameters.
+  Evidence: the shared formal-parameter helper deliberately finds nested parameter owners within a range, which could duplicate a nested arrow's parameters onto its initializer. Initializers now skip formal-parameter layout entirely and emit only their owned receiver.
+
+- Observation: the macOS toolchain paths mixed rustup Cargo/rustc with Homebrew rustdoc even though both reported Rust 1.96.0.
+  Evidence: the first doc-test phase rejected compatible-looking artifacts with `E0514`; pinning `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` first in `PATH` made the isolated doc phase and final monolithic all-feature run pass. The sandboxed full run also hit the repository's three known process-I/O permission tests, while the unrestricted run passed them.
 
 ## Decision Log
 
@@ -50,11 +62,21 @@ After this change, semantic artifacts for JavaScript, JSX, TypeScript, and TSX w
   Rationale: field values, method bodies, and static blocks have their own procedures. Type-only heritage and decorators are outside this issue. Using the existing iterative expression scheduler preserves source order, budgets, cancellation, and stack safety.
   Date/Author: 2026-07-23 / Codex
 
+- Decision: treat decorators as an explicit conservative boundary rather than partially lowering them.
+  Rationale: class, member, and parameter decorator ordering is outside this issue, but silently continuing would under-approximate calls and exceptions. Decorated class definitions now publish a terminal point-scoped unsupported normal-control gap, and decorator subtrees do not publish misleading nested procedure or receiver-capture facts.
+  Date/Author: 2026-07-23 / Codex
+
+- Decision: restrict class-definition computed-name evaluation to runtime members and give initializers no formal-parameter layout.
+  Rationale: TypeScript `implements`, overload signatures, abstract/declare members, and nested callable parameters are not inputs executed or owned by the initializer procedure. Structured grammar kinds, modifier tokens, and procedure kind provide exact boundaries without source parsing.
+  Date/Author: 2026-07-23 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 publishes initialized fields as source-backed initializer procedures in all four JS/TS parser flavors. Named and static identities, anonymous computed-field ordinals, and exact value-versus-computed-name arrow parenting are covered by `javascript_typescript_class_field_initializers_are_source_backed`. The pre-existing `javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed` test was tightened to select the nested lambda by its complete declaration path now that the field initializer is itself executable.
 
 Milestone 2 makes every initializer receiver-owning, including static fields and blocks, while preserving the old non-static method/function policy. `javascript_typescript_class_initializers_own_receivers` proves direct receiver flow and immediate-parent arrow captures for instance fields, static fields, static blocks, heritage, and computed names in both languages. `typescript_class_definition_and_initializer_execution_stay_separate` proves source-ordered outer evaluation, isolated field/method/static-block call sites, deterministic rendering, no manufactured return rows, and explicit deferred-scheduling gaps. The new AST collection is cancellation-polled, and the existing deep-control and nested-type boundary regressions remain green.
+
+Milestone 3 hardened the implementation through five read-only specialist reviews covering security, duplication, issue intent, DevOps/CI, and architecture. Confirmed findings led to one shared child-ownership predicate, streaming cancellation-aware member collection, exact exclusion of implements/type-only members, conservative decorator boundaries and enumeration suppression, and receiver-only initializer inputs. The final focused binaries passed 132 semantic-language conformance tests, 41 CFG contract tests, and 14 value-language contract tests. Strict `cargo clippy --all-targets --all-features -- -D warnings` passed through the isolated-target helper. The final monolithic `cargo test --features nlp,python -- --test-threads=1` passed under the consistently pinned rustup toolchain: 1,703 library tests passed with 5 ignored, every binary and integration target passed, and rustdoc passed with zero doctests. Formatting and `git diff --check` are clean.
 
 ## Context and Orientation
 
@@ -111,7 +133,7 @@ Final validation:
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
     git diff --check
 
-The focused commands must report the named tests as passed. The complete commands must finish with no failed tests, no formatting changes, no diff errors, and no Clippy warnings.
+The focused commands must report the named tests as passed. The complete commands must finish with no failed tests, no formatting changes, no diff errors, and no Clippy warnings. On this macOS host, commands that invoke rustdoc must put `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` first in `PATH`; all-feature tests additionally need the repository's established PyO3 dynamic-lookup `RUSTFLAGS`.
 
 ## Validation and Acceptance
 
@@ -147,4 +169,4 @@ The only durable identity changes are:
     JAVASCRIPT_ADAPTER_VERSION = b"javascript-value-semantics-v7"
     TYPESCRIPT_ADAPTER_VERSION = b"typescript-value-semantics-v8"
 
-Revision note (2026-07-23): Created the initial self-contained implementation plan after confirming the current decomposed lowerer layout and synchronizing the issue branch with `origin/master`. Updated after Milestone 1 to record discovery/identity behavior and focused validation. Updated after Milestone 2 with receiver, CFG, cancellation, deterministic-render, and adjacent-regression evidence.
+Revision note (2026-07-23): Created the initial self-contained implementation plan after confirming the current decomposed lowerer layout and synchronizing the issue branch with `origin/master`. Updated after Milestone 1 to record discovery/identity behavior and focused validation. Updated after Milestone 2 with receiver, CFG, cancellation, deterministic-render, and adjacent-regression evidence. Finalized after Milestone 3 with specialist-review fixes, complete validation evidence, and the toolchain/sandbox observations needed to reproduce the gates.

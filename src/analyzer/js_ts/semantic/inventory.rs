@@ -173,6 +173,10 @@ pub(super) fn enumerate_procedures<'tree>(
             procedure_context = Some((id, procedure_path));
         }
 
+        if node.kind() == "decorator" {
+            continue;
+        }
+
         let mut cursor = node.walk();
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children.into_iter().rev() {
