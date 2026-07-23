@@ -15,7 +15,7 @@ After this change, Bifrost will parse valid Scala calls such as `simulation.run(
 - [x] (2026-07-23 07:05Z) Ported upstream PR #551 coherently, documented the third vendored patch, regenerated with CLI 0.25.9 twice with identical hashes, and added empty-lambda, self-type, enum, and extension parser controls.
 - [x] (2026-07-23 07:34Z) Added a minimized Chisel-shaped fixture that fails with the published parser, plus analyzer, SearchTools, I1 property-fuzzer, and pre-#1068 persisted-cache epoch regressions.
 - [x] (2026-07-23 07:42Z) Replayed Chisel `e639b4f6`: `VCSSpec` now spans lines 16–234, all three expected fields are indexed, and summaries retain the later classes and `BackendSpec`.
-- [ ] Run focused and repository-wide validation, review the final diff, and record outcomes.
+- [x] (2026-07-23 08:07Z) Passed focused #1068/#1016/#1073 tests, formatting, package verification, and all-feature clippy; the all-feature suite passed 1,700 tests with only three sandbox-denied process tests, all seven of whose module tests passed outside the sandbox. Reviewed the final diff with no further code findings.
 
 ## Surprises & Discoveries
 
@@ -57,7 +57,11 @@ After this change, Bifrost will parse valid Scala calls such as `simulation.run(
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. The desired end state is a source-controlled parser derived from v0.25.1 plus the documented #1016, #1073, and upstream #551 changes, with a clear path to remove the private parser once an official release contains all required behavior.
+Issue #1068 is repaired on the existing vendored v0.25.1 base by applying the complete upstream #551 grammar change alongside the existing #1016 and #1073 patches. The generated artifacts are deterministic, the parser keeps empty lambdas structured without stealing self types, the compact fixture proves the published parser still truncates while Bifrost does not, and the epoch bump invalidates stale parsed blobs.
+
+The exact Chisel replay is restored end to end: `VCSSpec` spans lines 16–234, its three expected fields are independently indexed, and every later class remains present in summaries. Package verification reports 8,357,323 compressed bytes against a 10,000,000-byte budget. Formatting and all-feature clippy pass. The feature-enabled full suite reached 1,700 passing and 5 ignored tests; its only three failures were sandbox `Operation not permitted` results in `benchmark::mcp_session`, and the complete seven-test module passed when rerun outside the sandbox.
+
+The private parser remains necessary because upstream 0.26.0 predates #551. Removal is intentionally deferred until a published release contains all required fixes and passes the committed coexistence controls.
 
 ## Context and Orientation
 
