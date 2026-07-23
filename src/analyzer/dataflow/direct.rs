@@ -2,7 +2,10 @@
 
 use crate::analyzer::semantic::IcfgNodeId;
 
-use super::{DataflowEdge, DataflowOutput, DataflowSeed, DistributiveDataflowProblem};
+use super::{
+    BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowSeed,
+    DistributiveDataflowProblem,
+};
 
 /// The sole fact in [`DirectFlowProblem`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,14 +33,6 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
 
     fn zero_fact(&self) -> Self::Fact {
         DirectFact
-    }
-
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        for node in self.seed_nodes.iter().copied() {
-            if !out.emit(DataflowSeed::new(node, DirectFact)) {
-                break;
-            }
-        }
     }
 
     // `DirectFact` is the distinguished zero fact, which the kernel preserves.
@@ -79,5 +74,15 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for DirectFlowProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for node in self.seed_nodes.iter().copied() {
+            if !out.emit(DataflowSeed::new(node, DirectFact)) {
+                break;
+            }
+        }
     }
 }

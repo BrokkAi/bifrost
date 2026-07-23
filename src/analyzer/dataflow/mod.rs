@@ -21,7 +21,8 @@ pub use budget::{
 pub use direct::{DirectFact, DirectFlowProblem};
 pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput};
 pub use problem::{
-    DataflowEdge, DataflowOutput, DataflowSeed, DistributiveDataflowProblem, FactId,
+    BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowSeed,
+    DistributiveDataflowProblem, FactId,
 };
 pub use quality::{PathQuality, PathQualityFrontier};
 pub use result::{DataflowCoverage, DataflowResult, ReachedFact, SolverTermination};

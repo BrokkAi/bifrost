@@ -3,7 +3,10 @@
 use std::hash::Hash;
 
 use crate::analyzer::dense_id::define_dense_id;
-use crate::analyzer::semantic::{IcfgEdge, IcfgEdgeId, IcfgNodeId, IcfgNodeKey, IcfgSnapshot};
+use crate::analyzer::semantic::{
+    CallSiteHandle, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
+    ProgramPointHandle, ProofStatus,
+};
 
 define_dense_id! {
     /// A run-local dense identifier for one client fact.
@@ -34,30 +37,55 @@ impl<F> DataflowSeed<F> {
 
 /// Kernel-controlled output for seeds and transfer facts.
 ///
-/// [`DataflowOutput::emit`] returns `false` when cancellation or a work limit
-/// asks the callback to stop. The kernel will not retain additional rows even
-/// if a callback ignores that signal, but clients must return cooperatively to
-/// keep their own CPU work bounded.
+/// The kernel deduplicates rows into a request-bounded callback buffer before
+/// canonicalizing them and atomically checking their semantic publication
+/// charge. [`DataflowOutput::emit`] returns `false` when cancellation or that
+/// row cap asks the callback to stop. The kernel will not retain additional
+/// rows even if a callback ignores the signal, but clients must return
+/// cooperatively to keep their own CPU work bounded.
 pub trait DataflowOutput<T> {
     /// Emit one row, returning whether the callback may continue.
     #[must_use]
     fn emit(&mut self, value: T) -> bool;
 }
 
-/// Borrowed topology for one transfer-function evaluation.
+/// Procedure-local semantic edge for one transfer-function evaluation.
 ///
-/// The source and target keys expose the already context-expanded ICFG nodes;
-/// clients must not construct or maintain a second call stack.
+/// The descriptor deliberately omits snapshot-local IDs and expanded call
+/// contexts. A bounded-snapshot runner and a later summary runner can
+/// therefore invoke the same transfer relation without making client
+/// semantics depend on one materialized call stack.
 #[derive(Debug, Clone, Copy)]
 pub struct DataflowEdge<'graph> {
-    edge_id: IcfgEdgeId,
-    edge: &'graph IcfgEdge,
-    source: &'graph IcfgNodeKey,
-    target: &'graph IcfgNodeKey,
+    kind: IcfgEdgeKind,
+    origin: Option<&'graph CallSiteHandle>,
+    source: &'graph ProgramPointHandle,
+    target: &'graph ProgramPointHandle,
+    proof: &'graph ProofStatus,
+    completeness: &'graph EvidenceCompleteness,
 }
 
 impl<'graph> DataflowEdge<'graph> {
-    /// Resolve one edge and both endpoint keys from the same snapshot.
+    pub const fn new(
+        kind: IcfgEdgeKind,
+        origin: Option<&'graph CallSiteHandle>,
+        source: &'graph ProgramPointHandle,
+        target: &'graph ProgramPointHandle,
+        proof: &'graph ProofStatus,
+        completeness: &'graph EvidenceCompleteness,
+    ) -> Self {
+        Self {
+            kind,
+            origin,
+            source,
+            target,
+            proof,
+            completeness,
+        }
+    }
+
+    /// Resolve one semantic edge and both procedure-local endpoint handles
+    /// from the same bounded snapshot.
     ///
     /// Returning a descriptor only after all three rows resolve prevents
     /// callers from pairing an edge with nodes from a different snapshot.
@@ -65,41 +93,42 @@ impl<'graph> DataflowEdge<'graph> {
         let edge = snapshot.edge(edge_id)?;
         let source = snapshot.node(edge.source)?;
         let target = snapshot.node(edge.target)?;
-        Some(Self::new(edge_id, edge, source, target))
+        Some(Self::new(
+            edge.kind,
+            edge.origin.as_ref(),
+            source.point(),
+            target.point(),
+            &edge.proof,
+            &edge.completeness,
+        ))
     }
 
-    pub(crate) const fn new(
-        edge_id: IcfgEdgeId,
-        edge: &'graph IcfgEdge,
-        source: &'graph IcfgNodeKey,
-        target: &'graph IcfgNodeKey,
-    ) -> Self {
-        Self {
-            edge_id,
-            edge,
-            source,
-            target,
-        }
+    pub const fn kind(self) -> IcfgEdgeKind {
+        self.kind
     }
 
-    pub const fn edge_id(self) -> IcfgEdgeId {
-        self.edge_id
+    pub const fn origin(self) -> Option<&'graph CallSiteHandle> {
+        self.origin
     }
 
-    pub const fn edge(self) -> &'graph IcfgEdge {
-        self.edge
-    }
-
-    pub const fn source(self) -> &'graph IcfgNodeKey {
+    pub const fn source(self) -> &'graph ProgramPointHandle {
         self.source
     }
 
-    pub const fn target(self) -> &'graph IcfgNodeKey {
+    pub const fn target(self) -> &'graph ProgramPointHandle {
         self.target
+    }
+
+    pub const fn proof(self) -> &'graph ProofStatus {
+        self.proof
+    }
+
+    pub const fn completeness(self) -> &'graph EvidenceCompleteness {
+        self.completeness
     }
 }
 
-/// A finite, union-distributive may-data-flow problem.
+/// A finite, union-distributive may-data-flow transfer relation.
 ///
 /// Each callback maps one input fact independently to zero or more output
 /// facts. Because clients cannot inspect or replace the whole reached set,
@@ -119,13 +148,6 @@ pub trait DistributiveDataflowProblem {
     /// Transfer callbacks still receive this fact and may generate additional
     /// facts from it. They do not need to return the zero fact themselves.
     fn zero_fact(&self) -> Self::Fact;
-
-    /// Append every explicit, context-specific seed for this run.
-    ///
-    /// Seed production, like transfer evaluation, must be finite, repeatable,
-    /// and cooperatively returning. The kernel deduplicates and preflights
-    /// retained rows before allowing its callback buffer to grow.
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>);
 
     /// Transfer over an ordinary intraprocedural edge.
     ///
@@ -175,4 +197,20 @@ pub trait DistributiveDataflowProblem {
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     );
+}
+
+/// Snapshot-specific seeds paired with a reusable transfer relation.
+///
+/// Only this bounded runner consumes dense, context-expanded `IcfgNodeId`
+/// seeds. Keeping them out of [`DistributiveDataflowProblem`] allows later
+/// procedure-summary backends to reuse transfer callbacks with their own
+/// entry and incoming-call contracts.
+pub trait BoundedSnapshotDataflowProblem: DistributiveDataflowProblem {
+    /// Append every explicit, context-specific seed for this snapshot run.
+    ///
+    /// Seed production, like transfer evaluation, must be finite, repeatable,
+    /// and cooperatively returning. The kernel bounds the unique seed buffer
+    /// by the remaining callback-row budget, then canonicalizes the complete
+    /// retained relation before charging facts and exact zero-inclusive states.
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>);
 }

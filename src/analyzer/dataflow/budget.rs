@@ -13,10 +13,11 @@ define_work_dimensions! {
     /// Work performed or limits applied by one bounded data-flow solve.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SolverWork;
-    all: pub(crate) [4];
+    all: pub(crate) [5];
     InternedFacts => interned_facts = 100_000,
     ReachedStates => reached_states = 1_000_000,
     FlowEvaluations => flow_evaluations = 4_000_000,
+    CallbackRows => callback_rows = 4_000_000,
     PropagatedOutputs => propagated_outputs = 4_000_000,
 }
 
@@ -66,11 +67,14 @@ impl fmt::Display for SolverBudgetExceeded {
 
 impl Error for SolverBudgetExceeded {}
 
-/// Four-dimensional request-local work budget.
+/// Five-dimensional request-local work budget.
 ///
-/// Callback sinks preflight their canonical retained rows against these same
-/// limits before allocating. Problem implementations must still stop emitting
-/// when requested and return cooperatively to bound their own CPU work.
+/// `callback_rows` is the single deterministic cap for each unique seed or
+/// transfer relation collected from clients. If a complete relation fits that
+/// cap, the kernel sorts it and atomically checks the exact fact, state,
+/// callback-row, and propagated-output charge. Problem implementations must
+/// still stop emitting when requested and return cooperatively to bound their
+/// own CPU work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverBudget {
     ledger: BudgetLedger<SolverWork>,
@@ -153,6 +157,7 @@ mod tests {
             interned_facts: 2,
             reached_states: 10,
             flow_evaluations: 10,
+            callback_rows: 10,
             propagated_outputs: 10,
         });
         budget

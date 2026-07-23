@@ -5,8 +5,9 @@ mod dataflow_fixtures;
 use std::collections::BTreeSet;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowError, DataflowOutput, DataflowRequest, DataflowResult, DataflowSeed,
-    DirectFlowProblem, DistributiveDataflowProblem, IcfgSolveInput, SolverBudget, solve,
+    BoundedSnapshotDataflowProblem, DataflowEdge, DataflowError, DataflowOutput, DataflowRequest,
+    DataflowResult, DataflowSeed, DirectFlowProblem, DistributiveDataflowProblem, IcfgSolveInput,
+    SolverBudget, SolverBudgetDimension, SolverWork, solve,
 };
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, ControlEdgeKind, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
@@ -54,17 +55,13 @@ impl DistributiveDataflowProblem for MarkerProblem {
         MarkerFact::Zero
     }
 
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        let _ = out.emit(DataflowSeed::new(self.seed, MarkerFact::Seed));
-    }
-
     fn normal_flow(
         &self,
         edge: DataflowEdge<'_>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
-        let marker = match edge.edge().kind {
+        let marker = match edge.kind() {
             IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Cleanup) => MarkerFact::CleanupNormal,
             _ => MarkerFact::Normal,
         };
@@ -86,7 +83,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
-        let marker = match edge.edge().kind {
+        let marker = match edge.kind() {
             IcfgEdgeKind::NormalReturn => MarkerFact::NormalReturn,
             IcfgEdgeKind::ExceptionalReturn => MarkerFact::ExceptionalReturn,
             kind => panic!("return callback received {kind:?}"),
@@ -100,7 +97,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
-        let marker = match edge.edge().kind {
+        let marker = match edge.kind() {
             IcfgEdgeKind::CallToNormalContinuation => MarkerFact::CallToNormalReturn,
             IcfgEdgeKind::CallToExceptionalContinuation => MarkerFact::CallToExceptionalReturn,
             kind => panic!("call-to-return callback received {kind:?}"),
@@ -114,13 +111,19 @@ impl DistributiveDataflowProblem for MarkerProblem {
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
-        let marker = match edge.edge().kind {
+        let marker = match edge.kind() {
             IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Cleanup) => {
                 MarkerFact::CleanupExceptional
             }
             _ => MarkerFact::Exceptional,
         };
         Self::emit(fact, marker, out);
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for MarkerProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, MarkerFact::Seed));
     }
 }
 
@@ -139,10 +142,6 @@ impl DistributiveDataflowProblem for KillProblem {
 
     fn zero_fact(&self) -> Self::Fact {
         KillFact::Zero
-    }
-
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        let _ = out.emit(DataflowSeed::new(self.seed, KillFact::Live));
     }
 
     fn normal_flow(
@@ -183,6 +182,12 @@ impl DistributiveDataflowProblem for KillProblem {
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for KillProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, KillFact::Live));
     }
 }
 
@@ -220,14 +225,6 @@ impl DistributiveDataflowProblem for PermutedProblem {
         PermutedFact::Zero
     }
 
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        for seed in self.seeds.iter().copied() {
-            if !out.emit(seed) {
-                break;
-            }
-        }
-    }
-
     fn normal_flow(
         &self,
         _edge: DataflowEdge<'_>,
@@ -274,9 +271,19 @@ impl DistributiveDataflowProblem for PermutedProblem {
     }
 }
 
+impl BoundedSnapshotDataflowProblem for PermutedProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for seed in self.seeds.iter().copied() {
+            if !out.emit(seed) {
+                break;
+            }
+        }
+    }
+}
+
 fn solve_default<P>(input: IcfgSolveInput<'_>, problem: &P) -> DataflowResult<P::Fact>
 where
-    P: DistributiveDataflowProblem,
+    P: BoundedSnapshotDataflowProblem,
 {
     let cancellation = CancellationToken::default();
     let mut budget = SolverBudget::default();
@@ -306,7 +313,7 @@ where
 
 fn assert_matches_reference<P>(graph: &IcfgGraph, problem: &P) -> DataflowResult<P::Fact>
 where
-    P: DistributiveDataflowProblem,
+    P: BoundedSnapshotDataflowProblem,
     P::Fact: std::fmt::Debug,
 {
     let optimized = solve_default(graph.solve_input(), problem);
@@ -508,6 +515,51 @@ fn seed_and_transfer_output_permutations_have_identical_results() {
         *reference_solve(graph.snapshot(), &forward)
             .expect("reference solve")
             .reached()
+    );
+}
+
+#[test]
+fn constrained_output_permutations_report_the_same_budget_dimension() {
+    let graph = rust_choose_icfg();
+    let root = graph.node("root");
+    let forward = PermutedProblem {
+        seeds: vec![DataflowSeed::new(root, PermutedFact::Zero)],
+        reverse_outputs: false,
+    };
+    let reverse = PermutedProblem {
+        seeds: forward.seeds.clone(),
+        reverse_outputs: true,
+    };
+    // Zero is already interned while Alpha and Beta are new. A streaming
+    // multidimensional preflight would therefore report different dimensions
+    // depending on which end of this relation arrives first.
+    let limits = SolverWork {
+        interned_facts: 2,
+        propagated_outputs: 1,
+        ..SolverWork::uniform(usize::MAX)
+    };
+
+    let solve_constrained = |problem: &PermutedProblem| {
+        let cancellation = CancellationToken::default();
+        let mut budget = SolverBudget::new(limits);
+        solve(
+            graph.solve_input(),
+            problem,
+            &mut DataflowRequest::new(&mut budget, &cancellation),
+        )
+        .expect("budget exhaustion is a normal partial result")
+    };
+    let forward_result = solve_constrained(&forward);
+    let reverse_result = solve_constrained(&reverse);
+
+    assert_eq!(forward_result, reverse_result);
+    let exceeded = forward_result
+        .termination()
+        .budget_exceeded()
+        .expect("the canonical relation must exceed the remaining fact slot");
+    assert_eq!(
+        (exceeded.dimension(), exceeded.limit(), exceeded.attempted(),),
+        (SolverBudgetDimension::InternedFacts, 2, 3)
     );
 }
 

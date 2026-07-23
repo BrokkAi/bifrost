@@ -62,7 +62,7 @@ pub struct IcfgSolveInput<'graph> {
 }
 
 impl<'graph> IcfgSolveInput<'graph> {
-    pub const fn new(snapshot: &'graph IcfgSnapshot, status: IcfgInputStatus) -> Self {
+    const fn new(snapshot: &'graph IcfgSnapshot, status: IcfgInputStatus) -> Self {
         Self { snapshot, status }
     }
 

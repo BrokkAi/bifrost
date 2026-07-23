@@ -11,7 +11,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowOutput, DataflowSeed, DistributiveDataflowProblem,
+    BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowSeed,
+    DistributiveDataflowProblem,
 };
 use brokk_bifrost::analyzer::semantic::{
     ControlEdgeKind, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
@@ -66,7 +67,7 @@ pub fn reference_solve<P>(
     problem: &P,
 ) -> Result<ReferenceDataflowResult<P::Fact>, ReferenceDataflowError>
 where
-    P: DistributiveDataflowProblem,
+    P: BoundedSnapshotDataflowProblem,
 {
     let mut seeds = Vec::<DataflowSeed<P::Fact>>::new();
     problem.seeds(&mut VecOutput(&mut seeds));
@@ -111,11 +112,7 @@ where
                     }
                     outputs.sort_unstable();
                     outputs.dedup();
-                    additions.extend(
-                        outputs
-                            .into_iter()
-                            .map(|output| (descriptor.edge().target, output)),
-                    );
+                    additions.extend(outputs.into_iter().map(|output| (edge.target, output)));
                 }
             }
         }

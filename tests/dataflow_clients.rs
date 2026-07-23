@@ -6,9 +6,10 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowError, DataflowOutput, DataflowRequest, DataflowResult, DataflowSeed,
-    DirectFact, DirectFlowProblem, DistributiveDataflowProblem, IcfgInputStatus, IcfgSolveInput,
-    SolverBudget, SolverBudgetDimension, SolverTermination, SolverWork, solve,
+    BoundedSnapshotDataflowProblem, DataflowEdge, DataflowError, DataflowOutput, DataflowRequest,
+    DataflowResult, DataflowSeed, DirectFact, DirectFlowProblem, DistributiveDataflowProblem,
+    IcfgInputStatus, IcfgSolveInput, SolverBudget, SolverBudgetDimension, SolverTermination,
+    SolverWork, solve,
 };
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, IcfgLimitKind, IcfgNodeId, IcfgSnapshot, IcfgSnapshotLimits, SemanticBudget,
@@ -53,10 +54,6 @@ impl DistributiveDataflowProblem for GeneratingProblem {
         GeneratingFact::Seed
     }
 
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        let _ = out.emit(DataflowSeed::new(self.seed, GeneratingFact::Seed));
-    }
-
     fn normal_flow(
         &self,
         _edge: DataflowEdge<'_>,
@@ -100,6 +97,12 @@ impl DistributiveDataflowProblem for GeneratingProblem {
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         Self::transfer(fact, out);
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for GeneratingProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, GeneratingFact::Seed));
     }
 }
 
@@ -122,10 +125,6 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
         GeneratingFact::Seed
     }
 
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        let _ = out.emit(DataflowSeed::new(self.seed, GeneratingFact::Seed));
-    }
-
     fn normal_flow(
         &self,
         _edge: DataflowEdge<'_>,
@@ -169,6 +168,12 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         self.transfer(out);
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for CancelOnTransferProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, GeneratingFact::Seed));
     }
 }
 
@@ -184,13 +189,6 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
         0
     }
 
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        for fact in 1..=10 {
-            self.attempts.set(self.attempts.get() + 1);
-            let _ = out.emit(DataflowSeed::new(self.seed, fact));
-        }
-    }
-
     fn normal_flow(
         &self,
         _edge: DataflowEdge<'_>,
@@ -229,6 +227,15 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for SeedBurstProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for fact in 1..=10 {
+            self.attempts.set(self.attempts.get() + 1);
+            let _ = out.emit(DataflowSeed::new(self.seed, fact));
+        }
     }
 }
 
@@ -258,10 +265,6 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
         0
     }
 
-    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
-        let _ = out.emit(DataflowSeed::new(self.seed, 0));
-    }
-
     fn normal_flow(
         &self,
         _edge: DataflowEdge<'_>,
@@ -308,6 +311,12 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
     }
 }
 
+impl BoundedSnapshotDataflowProblem for TransferBurstProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, 0));
+    }
+}
+
 fn solve_direct(input: IcfgSolveInput<'_>, seed: IcfgNodeId) -> DataflowResult<DirectFact> {
     let problem = DirectFlowProblem::new([seed]);
     let cancellation = CancellationToken::default();
@@ -318,6 +327,46 @@ fn solve_direct(input: IcfgSolveInput<'_>, seed: IcfgNodeId) -> DataflowResult<D
         &mut DataflowRequest::new(&mut budget, &cancellation),
     )
     .expect("valid direct-flow fixture")
+}
+
+fn outcome_with_status(
+    snapshot: &IcfgSnapshot,
+    status: IcfgInputStatus,
+) -> SemanticOutcome<IcfgSnapshot> {
+    let snapshot = snapshot.clone();
+    let work = SemanticWork::default();
+    match status {
+        IcfgInputStatus::Complete => SemanticOutcome::Complete {
+            value: snapshot,
+            work,
+        },
+        IcfgInputStatus::Ambiguous => SemanticOutcome::Ambiguous {
+            candidates: snapshot,
+            work,
+        },
+        IcfgInputStatus::Unknown => SemanticOutcome::Unknown {
+            partial: Some(snapshot),
+            work,
+        },
+        IcfgInputStatus::Unsupported { capability } => SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(snapshot),
+            work,
+        },
+        IcfgInputStatus::Unproven => SemanticOutcome::Unproven {
+            partial: snapshot,
+            work,
+        },
+        IcfgInputStatus::ExceededBudget { exceeded } => SemanticOutcome::ExceededBudget {
+            partial: Some(snapshot),
+            exceeded,
+            work,
+        },
+        IcfgInputStatus::Cancelled => SemanticOutcome::Cancelled {
+            partial: Some(snapshot),
+            work,
+        },
+    }
 }
 
 fn result_nodes<Fact>(result: &DataflowResult<Fact>) -> BTreeSet<IcfgNodeId> {
@@ -351,6 +400,7 @@ fn budget_with_limit(dimension: SolverBudgetDimension, limit: usize) -> SolverBu
         SolverBudgetDimension::InternedFacts => limits.interned_facts = limit,
         SolverBudgetDimension::ReachedStates => limits.reached_states = limit,
         SolverBudgetDimension::FlowEvaluations => limits.flow_evaluations = limit,
+        SolverBudgetDimension::CallbackRows => limits.callback_rows = limit,
         SolverBudgetDimension::PropagatedOutputs => limits.propagated_outputs = limit,
     }
     SolverBudget::new(limits)
@@ -561,7 +611,10 @@ fn completeness_keeps_input_edge_and_boundary_uncertainty_separate() {
         IcfgInputStatus::Unproven,
         IcfgInputStatus::Cancelled,
     ] {
-        let result = solve_direct(IcfgSolveInput::new(complete_graph.snapshot(), status), root);
+        let outcome = outcome_with_status(complete_graph.snapshot(), status);
+        let input =
+            IcfgSolveInput::from_outcome(&outcome).expect("retained snapshot is traversable");
+        let result = solve_direct(input, root);
         assert_eq!(result.coverage().input_status(), status);
         assert_eq!(result.termination(), SolverTermination::FixedPoint);
         assert!(!result.is_complete(), "{status:?} input became complete");
@@ -604,10 +657,7 @@ fn completeness_keeps_input_edge_and_boundary_uncertainty_separate() {
             .effect("entry"),
         CallContextSelector::root(),
     );
-    let partial_result = solve_direct(
-        IcfgSolveInput::new(partial_graph.snapshot(), IcfgInputStatus::Complete),
-        partial_graph.node("root"),
-    );
+    let partial_result = solve_direct(partial_graph.solve_input(), partial_graph.node("root"));
     assert!(
         !partial_result.coverage().partial_edges().is_empty()
             || !partial_result.coverage().unproven_edges().is_empty(),
@@ -684,9 +734,10 @@ fn each_budget_dimension_stops_atomically_before_output_publication() {
 
     for (dimension, limit, attempted) in [
         (SolverBudgetDimension::InternedFacts, 1, 2),
-        (SolverBudgetDimension::ReachedStates, 1, 2),
+        (SolverBudgetDimension::ReachedStates, 1, 3),
         (SolverBudgetDimension::FlowEvaluations, 0, 1),
-        (SolverBudgetDimension::PropagatedOutputs, 0, 1),
+        (SolverBudgetDimension::CallbackRows, 1, 2),
+        (SolverBudgetDimension::PropagatedOutputs, 0, 2),
     ] {
         let cancellation = CancellationToken::default();
         let mut budget = budget_with_limit(dimension, limit);
@@ -723,7 +774,7 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
         attempts: Cell::new(0),
     };
     let cancellation = CancellationToken::default();
-    let mut seed_budget = budget_with_limit(SolverBudgetDimension::InternedFacts, 1);
+    let mut seed_budget = budget_with_limit(SolverBudgetDimension::CallbackRows, 4);
     let seed_result = solve(
         graph.solve_input(),
         &seed_problem,
@@ -740,19 +791,47 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
             seed_exceeded.limit(),
             seed_exceeded.attempted(),
         ),
-        (SolverBudgetDimension::InternedFacts, 1, 2)
+        (SolverBudgetDimension::CallbackRows, 4, 5)
     );
     assert_eq!(seed_problem.attempts.get(), 10);
     assert!(seed_result.facts().is_empty());
     assert!(seed_result.reached().is_empty());
     assert_eq!(seed_budget.used(), SolverWork::default());
 
+    let seed_fact_problem = SeedBurstProblem {
+        seed: root,
+        attempts: Cell::new(0),
+    };
+    let mut seed_fact_budget = budget_with_limit(SolverBudgetDimension::InternedFacts, 1);
+    let seed_fact_result = solve(
+        graph.solve_input(),
+        &seed_fact_problem,
+        &mut DataflowRequest::new(&mut seed_fact_budget, &cancellation),
+    )
+    .expect("seed fact exhaustion is a normal result");
+    let seed_fact_exceeded = seed_fact_result
+        .termination()
+        .budget_exceeded()
+        .expect("canonical seed publication must stop");
+    assert_eq!(
+        (
+            seed_fact_exceeded.dimension(),
+            seed_fact_exceeded.limit(),
+            seed_fact_exceeded.attempted(),
+        ),
+        (SolverBudgetDimension::InternedFacts, 1, 11)
+    );
+    assert_eq!(seed_fact_problem.attempts.get(), 10);
+    assert!(seed_fact_result.facts().is_empty());
+    assert!(seed_fact_result.reached().is_empty());
+    assert_eq!(seed_fact_budget.used(), SolverWork::default());
+
     let transfer_problem = TransferBurstProblem {
         seed: root,
         attempts: Cell::new(0),
         cancel_on_stop: None,
     };
-    let mut transfer_budget = budget_with_limit(SolverBudgetDimension::PropagatedOutputs, 3);
+    let mut transfer_budget = budget_with_limit(SolverBudgetDimension::CallbackRows, 4);
     let transfer_result = solve(
         graph.solve_input(),
         &transfer_problem,
@@ -769,7 +848,7 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
             transfer_exceeded.limit(),
             transfer_exceeded.attempted(),
         ),
-        (SolverBudgetDimension::PropagatedOutputs, 3, 4)
+        (SolverBudgetDimension::CallbackRows, 4, 5)
     );
     assert_eq!(transfer_problem.attempts.get(), 10);
     assert_eq!(transfer_result.facts(), &[0]);
@@ -798,7 +877,7 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
             cross_dimension_exceeded.limit(),
             cross_dimension_exceeded.attempted(),
         ),
-        (SolverBudgetDimension::InternedFacts, 1, 2)
+        (SolverBudgetDimension::InternedFacts, 1, 11)
     );
     assert_eq!(cross_dimension_problem.attempts.get(), 10);
     assert_eq!(cross_dimension_result.facts(), &[0]);
@@ -817,7 +896,7 @@ fn cancellation_after_sink_exhaustion_takes_precedence() {
         attempts: Cell::new(0),
         cancel_on_stop: Some(cancellation.clone()),
     };
-    let mut budget = budget_with_limit(SolverBudgetDimension::PropagatedOutputs, 3);
+    let mut budget = budget_with_limit(SolverBudgetDimension::CallbackRows, 4);
     let result = solve(
         graph.solve_input(),
         &problem,

@@ -9,10 +9,10 @@ use crate::analyzer::semantic::{
 use crate::hash::{HashMap, HashSet};
 
 use super::{
-    DataflowCoverage, DataflowEdge, DataflowError, DataflowOutput, DataflowRequest, DataflowResult,
-    DataflowSeed, DistributiveDataflowProblem, FactId, IcfgSolveInput, PathQuality,
-    PathQualityFrontier, ReachedFact, SolverBudget, SolverBudgetExceeded, SolverTermination,
-    SolverWork,
+    BoundedSnapshotDataflowProblem, DataflowCoverage, DataflowEdge, DataflowError, DataflowOutput,
+    DataflowRequest, DataflowResult, DataflowSeed, DistributiveDataflowProblem, FactId,
+    IcfgSolveInput, PathQuality, PathQualityFrontier, ReachedFact, SolverBudget,
+    SolverBudgetExceeded, SolverTermination, SolverWork,
 };
 
 const ZERO_FACT_ID: FactId = FactId::new(0);
@@ -31,10 +31,7 @@ struct QueuedState {
 
 struct BoundedSeedOutputs<'graph, 'request, Fact> {
     snapshot: &'graph IcfgSnapshot,
-    zero_fact: Fact,
     values: HashSet<DataflowSeed<Fact>>,
-    prospective_facts: HashSet<Fact>,
-    prospective_states: HashSet<DataflowSeed<Fact>>,
     budget: &'request SolverBudget,
     cancellation: &'request crate::analyzer::semantic::CancellationToken,
     invalid_node: Option<IcfgNodeId>,
@@ -47,18 +44,12 @@ where
 {
     fn new(
         snapshot: &'graph IcfgSnapshot,
-        zero_fact: Fact,
         budget: &'request SolverBudget,
         cancellation: &'request crate::analyzer::semantic::CancellationToken,
     ) -> Self {
-        let mut prospective_facts = HashSet::default();
-        prospective_facts.insert(zero_fact);
         Self {
             snapshot,
-            zero_fact,
             values: HashSet::default(),
-            prospective_facts,
-            prospective_states: HashSet::default(),
             budget,
             cancellation,
             invalid_node: None,
@@ -104,66 +95,40 @@ where
             return true;
         }
 
-        let zero_state = DataflowSeed::new(seed.node, self.zero_fact);
-        let additional_states = usize::from(!self.prospective_states.contains(&seed))
-            + usize::from(zero_state != seed && !self.prospective_states.contains(&zero_state));
-        let prospective_work = SolverWork {
-            interned_facts: self
-                .prospective_facts
-                .len()
-                .saturating_add(usize::from(!self.prospective_facts.contains(&seed.fact))),
-            reached_states: self
-                .prospective_states
-                .len()
-                .saturating_add(additional_states),
+        let callback_rows = self.values.len().saturating_add(1);
+        if let Err(exceeded) = self.budget.check(SolverWork {
+            callback_rows,
             ..SolverWork::uniform(0)
-        };
-        if let Err(exceeded) = self.budget.check(prospective_work) {
+        }) {
             self.exceeded = Some(exceeded);
             return false;
         }
 
         self.values.insert(seed);
-        self.prospective_facts.insert(seed.fact);
-        self.prospective_states.insert(seed);
-        self.prospective_states.insert(zero_state);
         true
     }
 }
 
-struct BoundedFactOutputs<'state, 'request, Fact> {
+struct BoundedFactOutputs<'request, Fact> {
     values: &'request mut HashSet<Fact>,
-    fact_ids: &'state HashMap<Fact, FactId>,
-    reached: &'state HashMap<ExplodedState, PathQualityFrontier>,
-    target: IcfgNodeId,
     budget: &'request SolverBudget,
     cancellation: &'request crate::analyzer::semantic::CancellationToken,
-    new_facts: usize,
-    new_reached_states: usize,
     exceeded: Option<SolverBudgetExceeded>,
 }
 
-impl<'state, 'request, Fact> BoundedFactOutputs<'state, 'request, Fact>
+impl<'request, Fact> BoundedFactOutputs<'request, Fact>
 where
     Fact: Copy + Eq + std::hash::Hash,
 {
     fn new(
         values: &'request mut HashSet<Fact>,
-        fact_ids: &'state HashMap<Fact, FactId>,
-        reached: &'state HashMap<ExplodedState, PathQualityFrontier>,
-        target: IcfgNodeId,
         budget: &'request SolverBudget,
         cancellation: &'request crate::analyzer::semantic::CancellationToken,
     ) -> Self {
         Self {
             values,
-            fact_ids,
-            reached,
-            target,
             budget,
             cancellation,
-            new_facts: 0,
-            new_reached_states: 0,
             exceeded: None,
         }
     }
@@ -173,7 +138,7 @@ where
     }
 }
 
-impl<Fact> DataflowOutput<Fact> for BoundedFactOutputs<'_, '_, Fact>
+impl<Fact> DataflowOutput<Fact> for BoundedFactOutputs<'_, Fact>
 where
     Fact: Copy + Eq + std::hash::Hash,
 {
@@ -185,30 +150,16 @@ where
             return true;
         }
 
-        let existing_fact = self.fact_ids.get(&value).copied();
-        let adds_fact = existing_fact.is_none();
-        let adds_state = existing_fact.is_none_or(|fact| {
-            !self.reached.contains_key(&ExplodedState {
-                node: self.target,
-                fact,
-            })
-        });
-        let prospective_work = SolverWork {
-            interned_facts: self.new_facts.saturating_add(usize::from(adds_fact)),
-            reached_states: self
-                .new_reached_states
-                .saturating_add(usize::from(adds_state)),
-            propagated_outputs: self.values.len().saturating_add(1),
+        let callback_rows = self.values.len().saturating_add(1);
+        if let Err(exceeded) = self.budget.check(SolverWork {
+            callback_rows,
             ..SolverWork::uniform(0)
-        };
-        if let Err(exceeded) = self.budget.check(prospective_work) {
+        }) {
             self.exceeded = Some(exceeded);
             return false;
         }
 
         self.values.insert(value);
-        self.new_facts = prospective_work.interned_facts;
-        self.new_reached_states = prospective_work.reached_states;
         true
     }
 }
@@ -245,7 +196,7 @@ where
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, DataflowError>
     where
-        P: DistributiveDataflowProblem<Fact = Fact>,
+        P: BoundedSnapshotDataflowProblem<Fact = Fact>,
     {
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
@@ -253,12 +204,8 @@ where
 
         let zero_fact = problem.zero_fact();
         let (invalid_node, sink_exceeded, emitted_seeds) = {
-            let mut seed_outputs = BoundedSeedOutputs::new(
-                self.snapshot,
-                zero_fact,
-                request.budget,
-                request.cancellation,
-            );
+            let mut seed_outputs =
+                BoundedSeedOutputs::new(self.snapshot, request.budget, request.cancellation);
             problem.seeds(&mut seed_outputs);
             let invalid_node = seed_outputs.invalid_node();
             let exceeded = seed_outputs.exceeded();
@@ -279,6 +226,7 @@ where
         }
         let mut seeds = emitted_seeds.into_iter().collect::<Vec<_>>();
         seeds.sort_unstable();
+        let seed_rows = seeds.len();
 
         let mut staged_facts = vec![zero_fact];
         let mut staged_fact_ids = HashMap::default();
@@ -312,6 +260,7 @@ where
         let charge = SolverWork {
             interned_facts: staged_facts.len(),
             reached_states: staged_states.len(),
+            callback_rows: seed_rows,
             ..SolverWork::default()
         };
         let staged_budget = match request.budget.staged_charge(charge) {
@@ -387,9 +336,6 @@ where
                 let sink_exceeded = {
                     let mut outputs = BoundedFactOutputs::new(
                         &mut emitted_outputs,
-                        &self.fact_ids,
-                        &self.reached,
-                        edge.target,
                         request.budget,
                         request.cancellation,
                     );
@@ -467,6 +413,7 @@ where
         let charge = SolverWork {
             interned_facts: staged_facts.len(),
             reached_states: new_reached_states,
+            callback_rows: propagated_outputs,
             propagated_outputs,
             ..SolverWork::default()
         };
@@ -540,7 +487,7 @@ pub fn solve<P>(
     request: &mut DataflowRequest<'_>,
 ) -> Result<DataflowResult<P::Fact>, DataflowError>
 where
-    P: DistributiveDataflowProblem,
+    P: BoundedSnapshotDataflowProblem,
 {
     let initial_work = request.budget.used();
     let mut state = TabulationState::new(input.snapshot());
@@ -562,7 +509,7 @@ fn apply_transfer<P>(
 ) where
     P: DistributiveDataflowProblem,
 {
-    match edge.edge().kind {
+    match edge.kind() {
         IcfgEdgeKind::Intraprocedural(
             ControlEdgeKind::Exceptional | ControlEdgeKind::AsyncExceptional,
         ) => problem.exceptional_flow(edge, fact, out),
