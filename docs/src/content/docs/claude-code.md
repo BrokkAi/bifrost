@@ -39,6 +39,12 @@ BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 
 Start a fresh Claude Code session after installing the plugin so the MCP server configuration is loaded at startup.
 
+Before testing query behavior, apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+the `/mcp` tool event and structured result for a known workspace declaration,
+verify its project-relative source path, and reject ordinary file-reading
+fallbacks or paths under the installed plugin.
+
 ## Can My Agent Run RQL?
 
 Confirm that `query_code` appears in `/mcp` for the fresh session. Then ask Claude to call it once with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then ask Claude to call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.

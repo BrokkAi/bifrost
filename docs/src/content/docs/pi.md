@@ -49,6 +49,11 @@ Start Pi in the repository you want to analyze, then ask it to call
 rather than a README so the result proves that Bifrost ran instead of ordinary
 file reading.
 
+Apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+the `bifrost_` tool event and structured result, verify the result belongs to
+Pi's active workspace, and reject paths under the installed package.
+
 To confirm structural-query access, ask Pi to call `bifrost_query_code` with
 the inline canonical JSON fields:
 

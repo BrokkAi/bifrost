@@ -45,6 +45,12 @@ Use a smoke prompt that proves Cursor called Bifrost instead of just reading fil
 Use the Bifrost MCP get_summaries tool on src/analyzer/usages. Summarize the package structure in five bullets and explicitly name the MCP tool result you used.
 ```
 
+Apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+Cursor's Bifrost tool event and structured result, verify the result belongs to
+the active workspace, and reject ordinary file-reading fallbacks or paths under
+the installed plugin.
+
 The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can load plugin skills, but it has not proven reliable for plugin-provided MCP servers. Treat the desktop Customize/MCP flow as the MCP validation path.
 
 ## Can My Agent Run RQL?

@@ -107,6 +107,11 @@ A successful smoke shows the `bifrost-code-reading` skill being loaded and a
 ask about `README.md` or documentation files; those can pass through ordinary
 file reading without proving that the analyzer-backed MCP server ran.
 
+Apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+the Bifrost tool event and structured result for a known workspace declaration,
+verify its project-relative source path, and reject file-reading fallbacks.
+
 ## Can My Agent Run RQL?
 
 The configuration above uses `symbol|extended`, so a fresh OpenCode session

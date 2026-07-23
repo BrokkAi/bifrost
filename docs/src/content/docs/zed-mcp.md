@@ -107,6 +107,12 @@ that:
 Avoid prompts that only ask about `README.md` or docs files; those can pass
 through ordinary file reading without proving the MCP server ran.
 
+Apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+Zed's Bifrost tool event and structured result for a known workspace
+declaration, verify its project-relative source path, and reject paths under the
+configured binary's install directory or another repository.
+
 ## Can My Agent Run RQL?
 
 The configuration above uses `symbol|extended`. In a new Agent thread, confirm that the Bifrost tool list includes `query_code`, then call it with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
