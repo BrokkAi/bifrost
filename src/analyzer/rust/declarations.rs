@@ -447,6 +447,9 @@ fn visit_rust_macro_invocation_definitions(
     let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
         return;
     };
+    if rust_builtin_macro_does_not_replay_item_arguments(invoked_macro) {
+        return;
+    }
     // Use the structured macro-rules knowledge we have. If this file defines the
     // invoked macro and proves it does NOT replay its item input faithfully, the
     // braces do not expand to the items inside, so indexing them would be a lie
@@ -880,6 +883,25 @@ fn rust_item_repetition_replays_parameters(
             "metavariable" => item_parameters.contains_key(rust_node_text(child, source).trim()),
             _ => false,
         })
+}
+
+fn rust_builtin_macro_does_not_replay_item_arguments(name: &str) -> bool {
+    matches!(
+        name,
+        "cfg"
+            | "column"
+            | "compile_error"
+            | "concat"
+            | "env"
+            | "file"
+            | "include"
+            | "include_bytes"
+            | "include_str"
+            | "line"
+            | "module_path"
+            | "option_env"
+            | "stringify"
+    )
 }
 
 fn rust_latest_visible_rules_item_macro(
@@ -1610,6 +1632,33 @@ macro_rules! mixed { ($name:ident, $item:item) => { $item }; }
         ] {
             assert_eq!(definitions.get(name), Some(&false), "{name}");
         }
+    }
+
+    #[test]
+    fn built_in_token_macros_are_not_item_passthroughs() {
+        for name in [
+            "cfg",
+            "column",
+            "compile_error",
+            "concat",
+            "env",
+            "file",
+            "include",
+            "include_bytes",
+            "include_str",
+            "line",
+            "module_path",
+            "option_env",
+            "stringify",
+        ] {
+            assert!(
+                rust_builtin_macro_does_not_replay_item_arguments(name),
+                "{name}"
+            );
+        }
+        assert!(!rust_builtin_macro_does_not_replay_item_arguments(
+            "external_cfg_items"
+        ));
     }
 
     #[test]
