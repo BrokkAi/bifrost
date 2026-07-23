@@ -11,7 +11,26 @@ Install the Bifrost Amp skills from GitHub:
 amp skill add BrokkAi/bifrost/plugins/bifrost-agent/amp-skills --global --overwrite
 ```
 
-Bifrost must be available on `PATH` for the skill's MCP server to start. For local testing, install Bifrost with Cargo or use an absolute binary path in your local skill copy.
+Keep `--overwrite` when upgrading an existing installation so Amp replaces an
+older skill bundle. The bundle pins its supported Bifrost release—currently
+v0.8.9—and its launcher automatically prepares that exact binary in a managed
+cache when necessary. Bifrost does not need to be preinstalled on `PATH`.
+
+Confirm that Amp resolves the global skill, then run the launcher's readiness
+check from the path reported by `amp skill info`:
+
+```bash
+amp skill info bifrost-code-intelligence
+node /absolute/path/from-skill-info/bin/bifrost-launcher.mjs doctor
+```
+
+For the current bundle, the readiness output should include `status=ready` and
+`required=0.8.9`. If the binary has not been prepared yet, replace `doctor`
+with `prepare`, then run `doctor` again.
+
+For local development, set `BIFROST_BINARY_PATH` to an absolute path to a
+matching-version binary. Using a `bifrost` executable from `PATH` is opt-in:
+set `BIFROST_LAUNCHER_ALLOW_PATH=1`.
 
 ## Validate the Setup
 
