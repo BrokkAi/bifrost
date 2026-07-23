@@ -2,7 +2,7 @@ use crate::analyzer::{ImportInfo, StructuredImportScope};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
-use super::scala_type_lookup_segments;
+use super::{scala_nested_type_candidates, scala_type_lookup_segments};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ScalaWildcardOwnerKind {
@@ -86,9 +86,20 @@ pub(crate) fn resolve_scala_explicit_import_tier(
 /// exposed by an earlier package wildcard (`core.*; Annotations.*`) or stable
 /// singleton wildcard. Direct lexical/package paths take precedence over such
 /// chained paths. Multiple owners at the selected tier are kept as ambiguity.
+///
+/// `enclosing_owner_fq_names` maps an import declaration's start byte to the
+/// fqns of its lexically enclosing object/class/trait scopes (innermost
+/// first, as produced by `scala::scala_enclosing_template_owner_fq_names`).
+/// A relative wildcard base (`import Registry._` nested in a template)
+/// resolves against those enclosing scopes before the package, so its
+/// owner-qualified spellings are tried first. Callers without analyzer
+/// access to compute that chain (e.g. the type-hierarchy-only resolver,
+/// which never sees a live `ScalaAnalyzer`) pass `|_| Vec::new()` and keep
+/// today's package-only behavior.
 pub(crate) fn resolve_scala_wildcard_import_environment(
     imports: &[ImportInfo],
     package_prefixes: &[String],
+    mut enclosing_owner_fq_names: impl FnMut(usize) -> Vec<String>,
     mut owner_facts: impl FnMut(&str) -> ScalaWildcardOwnerFacts,
 ) -> ScalaWildcardImportEnvironment {
     let mut environment = ScalaWildcardImportEnvironment::default();
@@ -101,17 +112,36 @@ pub(crate) fn resolve_scala_wildcard_import_environment(
             continue;
         };
 
-        let import_prefixes = import
-            .path
-            .as_ref()
-            .map(|path| path.lexical_prefixes.as_slice())
-            .filter(|prefixes| !prefixes.is_empty())
-            .unwrap_or(package_prefixes);
         let mut selected = Vec::new();
-        for candidate in scala_import_path_candidates(&path, import_prefixes) {
-            selected = owners_for_candidate(import_index, candidate, &mut owner_facts);
-            if !selected.is_empty() {
-                break;
+        if let Some(structured_path) = import.path.as_ref() {
+            let owners = enclosing_owner_fq_names(structured_path.declaration_start_byte);
+            'owner: for owner in &owners {
+                let owner_candidates = scala_nested_type_candidates(
+                    owner.trim_end_matches('$').to_string(),
+                    &structured_path.segments,
+                    true,
+                );
+                for candidate in owner_candidates {
+                    selected = owners_for_candidate(import_index, candidate, &mut owner_facts);
+                    if !selected.is_empty() {
+                        break 'owner;
+                    }
+                }
+            }
+        }
+
+        if selected.is_empty() {
+            let import_prefixes = import
+                .path
+                .as_ref()
+                .map(|path| path.lexical_prefixes.as_slice())
+                .filter(|prefixes| !prefixes.is_empty())
+                .unwrap_or(package_prefixes);
+            for candidate in scala_import_path_candidates(&path, import_prefixes) {
+                selected = owners_for_candidate(import_index, candidate, &mut owner_facts);
+                if !selected.is_empty() {
+                    break;
+                }
             }
         }
 

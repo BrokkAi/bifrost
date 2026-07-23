@@ -24857,3 +24857,267 @@ fn rust_super_import_unbraced_resolves_call() {
         "{value}"
     );
 }
+
+/// Regression test for #1085 (the live failure in the issue's signature
+/// family): a relative wildcard import resolving against an *enclosing*
+/// object/class/trait scope, not just the file's package. Before the fix,
+/// `import Registry._` inside `object Status` only tried package-qualified
+/// spellings (`Registry`, `org.http4s.Registry`) for the import token, missed
+/// the true enclosing-template-qualified fqn `org.http4s.Status$.Registry$`,
+/// and reported a dishonest `unresolvable_import_boundary` even though
+/// `Registry` is indexed as a nested sibling declaration.
+#[test]
+fn scala_relative_wildcard_import_resolves_to_enclosing_sibling_object() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nobject Status {\n  import Registry._\n  def f: Int = 1\n\n  private object Registry {\n    val X: Int = 1\n  }\n}\n",
+        )
+        .build();
+
+    let line = "  import Registry._";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "Registry")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Status$.Registry$",
+        "{value}"
+    );
+    let rendered = value.to_string();
+    assert!(
+        !rendered.contains("not indexed in this workspace"),
+        "boundary claim must not fire: {rendered}"
+    );
+}
+
+/// The enclosing-owner walk must climb through every nesting level (not just
+/// the innermost one) to reach a sibling declared several scopes up.
+#[test]
+fn scala_relative_wildcard_import_resolves_through_nested_enclosing_scopes() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nobject Outer {\n  object Status {\n    object Inner {\n      import Registry._\n      def f: Int = 1\n    }\n\n    private object Registry {\n      val X: Int = 1\n    }\n  }\n}\n",
+        )
+        .build();
+
+    let line = "      import Registry._";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":6,"column":{}}}]}}"#,
+            column_of(line, "Registry")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Outer$.Status$.Registry$",
+        "{value}"
+    );
+}
+
+/// Multi-segment relative imports must qualify the first segment against the
+/// enclosing owner and keep the remaining segments relative, for a click on
+/// either the terminal segment or a mid-path segment.
+#[test]
+fn scala_multi_segment_relative_wildcard_import_resolves_nested_object() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nobject Status {\n  import Registry.Sub._\n  def f: Int = 1\n\n  private object Registry {\n    object Sub {\n      val X: Int = 1\n    }\n  }\n}\n",
+        )
+        .build();
+
+    let line = "  import Registry.Sub._";
+    let value_sub = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "Sub")
+        ),
+    );
+    let result_sub = &value_sub["results"][0];
+    assert_eq!(result_sub["status"], "resolved", "{value_sub}");
+    assert_eq!(
+        result_sub["definitions"][0]["fqn"], "org.http4s.Status$.Registry$.Sub$",
+        "{value_sub}"
+    );
+
+    let value_registry = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "Registry")
+        ),
+    );
+    let result_registry = &value_registry["results"][0];
+    assert_eq!(result_registry["status"], "resolved", "{value_registry}");
+    assert_eq!(
+        result_registry["definitions"][0]["fqn"], "org.http4s.Status$.Registry$",
+        "{value_registry}"
+    );
+}
+
+/// A genuinely unindexed wildcard import (nothing in the workspace could ever
+/// supply its declaration, matching indexed or enclosing-owner-qualified)
+/// must still report the honest boundary diagnostic; the enclosing-owner fix
+/// must not suppress real boundary cases.
+#[test]
+fn scala_unindexed_wildcard_import_still_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nimport cats.syntax.all._\n\nobject Status {\n  def f: Int = 1\n}\n",
+        )
+        .build();
+
+    let line = "import cats.syntax.all._";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "all")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+/// A package-level relative import (no enclosing object/class/trait scope at
+/// all) must keep resolving exactly as it did before this fix: the new
+/// enclosing-owner candidates are strictly additive and produce an empty
+/// owner list at file scope, leaving the existing package-based resolution
+/// untouched.
+#[test]
+fn scala_package_level_relative_wildcard_import_still_resolves() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nimport Registry._\n\nobject Status {\n  def f: Int = 1\n}\n",
+        )
+        .file(
+            "src/Registry.scala",
+            "package org.http4s\n\nobject Registry {\n  val X: Int = 1\n}\n",
+        )
+        .build();
+
+    let line = "import Registry._";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "Registry")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Registry$",
+        "{value}"
+    );
+}
+
+/// The usage-side shape of the same #1085 root cause: a *reference* to a
+/// name reached through a wildcard import whose base is itself qualified by
+/// an enclosing object/class/trait scope, not just the package. Before this
+/// fix, `X` fell through every wildcard-candidate builder (each of which
+/// only ever qualified the import base against the file's package) and hit
+/// `scala_import_boundary_for_name`'s dishonest "appears to cross a Scala
+/// import boundary" diagnostic.
+#[test]
+fn scala_wildcard_imported_member_from_enclosing_sibling_object_resolves() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nobject Status {\n  import Registry._\n  def f: Int = X.y\n\n  private object Registry {\n    object X {\n      val y: Int = 1\n    }\n  }\n}\n",
+        )
+        .build();
+
+    let line = "  def f: Int = X.y";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":5,"column":{}}}]}}"#,
+            column_of(line, "X")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Status$.Registry$.X$",
+        "{value}"
+    );
+    let rendered = value.to_string();
+    assert!(
+        !rendered.contains("cross a Scala import boundary"),
+        "boundary claim must not fire: {rendered}"
+    );
+}
+
+/// The enclosing-owner walk on the usage side must also climb multiple
+/// nesting levels, mirroring the import-token-click coverage above.
+#[test]
+fn scala_wildcard_imported_member_resolves_through_nested_enclosing_scopes() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nobject Outer {\n  object Status {\n    object Inner {\n      import Registry._\n      def f: Int = X.y\n    }\n\n    private object Registry {\n      object X {\n        val y: Int = 1\n      }\n    }\n  }\n}\n",
+        )
+        .build();
+
+    let line = "      def f: Int = X.y";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":7,"column":{}}}]}}"#,
+            column_of(line, "X")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Outer$.Status$.Registry$.X$",
+        "{value}"
+    );
+}
+
+/// No-regression: a usage reached only through a genuinely unindexed
+/// wildcard import must still fail to resolve (not falsely succeed) once
+/// enclosing-owner qualification is added to every wildcard-candidate
+/// builder.
+#[test]
+fn scala_wildcard_imported_member_from_unindexed_import_still_fails_honestly() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Status.scala",
+            "package org.http4s\n\nobject Status {\n  import cats.syntax.all._\n  def f: Int = SomeUnindexedName.y\n}\n",
+        )
+        .build();
+
+    let line = "  def f: Int = SomeUnindexedName.y";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Status.scala","line":4,"column":{}}}]}}"#,
+            column_of(line, "SomeUnindexedName")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+}

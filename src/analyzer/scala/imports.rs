@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tree_sitter::Node;
 
-use super::ScalaAnalyzer;
 use super::wildcard_imports::{
     ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
     ScalaWildcardImportOwner, ScalaWildcardOwnerFacts, ScalaWildcardOwnerKind,
     resolve_scala_explicit_import_tier, resolve_scala_wildcard_import_environment,
     scala_import_path,
 };
+use super::{ScalaAnalyzer, scala_enclosing_template_owner_fq_names};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ScalaExportSelector {
@@ -148,9 +148,14 @@ impl ScalaAnalyzer {
         {
             package_prefixes.push(package.to_string());
         }
-        resolve_scala_wildcard_import_environment(imports, &package_prefixes, |candidate| {
-            self.wildcard_owner_facts(candidate)
-        })
+        resolve_scala_wildcard_import_environment(
+            imports,
+            &package_prefixes,
+            |declaration_start_byte| {
+                scala_enclosing_template_owner_fq_names(self, self, file, declaration_start_byte)
+            },
+            |candidate| self.wildcard_owner_facts(candidate),
+        )
     }
 
     fn importable_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {

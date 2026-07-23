@@ -5460,8 +5460,16 @@ impl NameResolver {
             );
         }
 
-        let wildcard_environment =
-            resolve_scala_wildcard_import_environment(imports, &package_prefixes, |candidate| {
+        // `for_type_hierarchy_file` never sees a live `ScalaAnalyzer` (it
+        // resolves purely from precomputed `ProjectTypes`/imports), so it
+        // cannot walk the enclosing-owner chain the way the other resolver
+        // construction paths below do; pass an empty chain and keep today's
+        // package-only wildcard qualification here.
+        let wildcard_environment = resolve_scala_wildcard_import_environment(
+            imports,
+            &package_prefixes,
+            |_declaration_start_byte| Vec::new(),
+            |candidate| {
                 let normalized = scala_normalized_fq_name(candidate);
                 let mut objects = types
                     .index
@@ -5473,7 +5481,8 @@ impl NameResolver {
                     package: types.index.package_exists(candidate),
                     stable_singleton,
                 }
-            });
+            },
+        );
         if !wildcard_environment.ambiguous {
             for owner in &wildcard_environment.owners {
                 if owner.is_singleton() {
@@ -5715,9 +5724,19 @@ impl NameResolver {
             }
         }
 
+        // This whole-workspace resolver is constructed in a batch,
+        // bulk-projected path that must not point-hydrate a file's full
+        // declarations per wildcard import (see
+        // `scala_descendant_index_batches_file_hierarchy_facts_and_preserves_visibility`).
+        // `scala_enclosing_template_owner_fq_names` calls `ClassRangeIndex::build`,
+        // which does exactly that hydration, so this resolver keeps today's
+        // package-only wildcard qualification; only the request-scoped,
+        // single-file resolvers (`usages::get_definition::scala` and
+        // `scala::imports`) get the enclosing-owner enhancement.
         let wildcard_environment = resolve_scala_wildcard_import_environment(
             imports,
             active_package_prefixes,
+            |_declaration_start_byte| Vec::new(),
             |candidate| ScalaWildcardOwnerFacts {
                 package: types.index.package_exists(candidate),
                 stable_singleton: types
@@ -5784,9 +5803,11 @@ impl NameResolver {
             // ambiguous earlier wildcard must not erase a later, independent
             // wildcard import; it only contributes no bindings of its own.
             for import in imports.iter().filter(|import| import.is_wildcard) {
+                // Same batch/no-hydration constraint as above.
                 let environment = resolve_scala_wildcard_import_environment(
                     std::slice::from_ref(import),
                     active_package_prefixes,
+                    |_declaration_start_byte| Vec::new(),
                     |candidate| ScalaWildcardOwnerFacts {
                         package: types.index.package_exists(candidate),
                         stable_singleton: types
