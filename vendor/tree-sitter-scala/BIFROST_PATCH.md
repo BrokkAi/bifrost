@@ -5,7 +5,7 @@ release `v0.25.1`, commit
 `a067c39163b62b19e76cea17476f3188da8c9e51`. The upstream MIT license
 remains in `LICENSE`.
 
-Bifrost carries two declarative grammar fixes that are not available together
+Bifrost carries three declarative grammar fixes that are not available together
 in a published crate:
 
 1. Issue #1073 declares a generalized-LR conflict between
@@ -19,6 +19,16 @@ in a published crate:
    class constructor. Upstream generated-parser commit
    `a68000002745b94eec61cef741efe7cede4ff465` is the immutable reference for
    that fix.
+3. Issue #1068 applies upstream pull request
+   `tree-sitter-scala#551`, merged as
+   `88a12d30bd14edfab6d4552af22f6d3a5f5000e9`. It permits empty block-lambda
+   bodies such as `{ _ => }` without consuming their enclosing class body,
+   while preserving self-type-only template bodies and supporting enum self
+   types and modifiers.
+
+The private build can be removed once an official upstream release contains
+all three fixes and passes these regressions. The latest published release,
+`v0.26.0`, predates the issue #1068 fix.
 
 The generated files under `src/` were produced from the checked-in
 `grammar.js` with `tree-sitter-cli 0.25.9`.
@@ -29,6 +39,7 @@ To regenerate, work from this directory and run:
 
 Then run the focused acceptance tests from the repository root:
 
+    cargo test --lib analyzer::scala::language::tests
     cargo test --test scala_extension_soft_keyword_test
     cargo test --test scala_analyzer_test issue_1016_scala_annotated_constructor_whitespace_forms_keep_parameters_and_bodies
     cargo test --test mcp_property_fuzzer issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture

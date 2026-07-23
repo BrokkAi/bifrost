@@ -189,10 +189,19 @@ module.exports = grammar({
 
     enum_body: $ =>
       choice(
-        prec.left(PREC.control, seq(":", $._indent, $._enum_block, $._outdent)),
+        prec.left(
+          PREC.control,
+          seq(
+            ":",
+            $._indent,
+            optional($.self_type),
+            $._enum_block,
+            $._outdent,
+          ),
+        ),
         seq(
           "{",
-          // TODO: self type
+          optional($.self_type),
           optional($._enum_block),
           "}",
         ),
@@ -201,6 +210,7 @@ module.exports = grammar({
     enum_case_definitions: $ =>
       seq(
         repeat($.annotation),
+        optional($.modifiers),
         "case",
         choice(commaSep1($.simple_enum_case), $.full_enum_case),
       ),
@@ -437,7 +447,12 @@ module.exports = grammar({
     _indented_template_body: $ =>
       prec.left(
         PREC.control,
-        seq(":", $._indent, optional($.self_type), $._block, $._outdent),
+        seq(
+          ":",
+          $._indent,
+          choice(seq(optional($.self_type), $._block), $.self_type),
+          $._outdent,
+        ),
       ),
 
     _braced_template_body: $ =>
@@ -450,7 +465,8 @@ module.exports = grammar({
         ),
       ),
 
-    _braced_template_body1: $ => seq(optional($.self_type), $._block),
+    _braced_template_body1: $ =>
+      choice(seq(optional($.self_type), $._block), $.self_type),
     _braced_template_body2: $ =>
       seq(
         choice(
@@ -1281,7 +1297,7 @@ module.exports = grammar({
             choice($.bindings, $.wildcard, $._single_lambda_param),
           ),
           choice("=>", "?=>"),
-          $._block,
+          optional($._block),
         ),
       ),
 

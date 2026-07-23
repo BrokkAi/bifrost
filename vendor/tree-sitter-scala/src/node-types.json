@@ -2212,6 +2212,10 @@
         {
           "type": "expression",
           "named": true
+        },
+        {
+          "type": "self_type",
+          "named": true
         }
       ]
     }
@@ -2230,6 +2234,10 @@
         },
         {
           "type": "full_enum_case",
+          "named": true
+        },
+        {
+          "type": "modifiers",
           "named": true
         },
         {
