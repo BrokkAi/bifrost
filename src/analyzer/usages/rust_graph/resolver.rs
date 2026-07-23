@@ -1,7 +1,7 @@
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{
-    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
+    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, Range, RustAnalyzer,
     RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -16,6 +16,14 @@ use tree_sitter::Node;
 pub(crate) trait RustDefinitionProvider {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
     fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
+
+    fn is_bounded(&self) -> bool {
+        false
+    }
+
+    fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
+        analyzer.ranges(unit)
+    }
 
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
         self.fqn(&format!("{owner_fqn}.{name}"))

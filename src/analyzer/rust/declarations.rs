@@ -1,6 +1,8 @@
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::usages::{ImportBinder, ImportKind};
-use crate::analyzer::{CodeUnit, ParameterMetadata, ProjectFile, Range, SignatureMetadata};
+use crate::analyzer::{
+    CodeUnit, DispatchExtensibility, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
+};
 use crate::hash::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::{Node, Tree};
@@ -1320,12 +1322,16 @@ fn visit_rust_field(
     if in_test_region {
         parsed.mark_test_region(&code_unit);
     }
-    parsed.add_signature(
+    parsed.add_signature_with_metadata(
         code_unit.clone(),
-        rust_node_text(node, source)
-            .trim()
-            .trim_end_matches(',')
-            .to_string(),
+        SignatureMetadata::new(
+            rust_node_text(node, source)
+                .trim()
+                .trim_end_matches(',')
+                .to_string(),
+            Vec::new(),
+        )
+        .with_dispatch_extensibility(DispatchExtensibility::Closed),
     );
     Some(code_unit)
 }
@@ -1678,12 +1684,13 @@ fn enclosing_rust_impl_item(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let dispatch = rust_callable_dispatch_extensibility(node);
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(dispatch);
     };
     let parameter_text = rust_node_text(parameters_node, source).trim();
     let Some(parameters_start) = signature.find(parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(dispatch);
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -1702,7 +1709,26 @@ fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> S
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    SignatureMetadata::new(signature, parameters).with_dispatch_extensibility(dispatch)
+}
+
+fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        match candidate.kind() {
+            "trait_item" => return DispatchExtensibility::Open,
+            "impl_item" => {
+                return if candidate.child_by_field_name("trait").is_some() {
+                    DispatchExtensibility::Open
+                } else {
+                    DispatchExtensibility::Closed
+                };
+            }
+            "function_item" | "closure_expression" | "source_file" => break,
+            _ => parent = candidate.parent(),
+        }
+    }
+    DispatchExtensibility::Closed
 }
 
 fn rust_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {

@@ -6,17 +6,21 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
+use crate::analyzer::semantic::lowering::formal_multiplicity;
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{ProjectFile, RustAnalyzer};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"rust-cfg-v2";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v3";
 
 impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
 
@@ -97,6 +101,12 @@ fn rust_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::DeferredExecution,
@@ -117,6 +127,7 @@ struct ProcedureSpec<'tree> {
     kind: ProcedureKind,
     properties: ProcedureProperties,
     has_parameter_bindings: bool,
+    callable: Node<'tree>,
 }
 
 enum ProcedureEnumeration<'tree> {
@@ -216,6 +227,7 @@ fn enumerate_procedures<'tree>(
                 kind,
                 properties,
                 has_parameter_bindings: callable_has_parameter_bindings(frame.node),
+                callable: frame.node,
             });
             let callable_path = push_declaration_path(&mut declaration_paths, child_path, segment);
             callable_body_scope = Some((body.id(), id, callable_path));
@@ -350,9 +362,32 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
+            dispatch_extensibility: rust_callable_dispatch_extensibility(node),
             ..ProcedureProperties::default()
         },
     ))
+}
+
+fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {
+    if node.kind() != "function_item" {
+        return DispatchExtensibility::Closed;
+    }
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        match candidate.kind() {
+            "trait_item" => return DispatchExtensibility::Open,
+            "impl_item" => {
+                return if candidate.child_by_field_name("trait").is_some() {
+                    DispatchExtensibility::Open
+                } else {
+                    DispatchExtensibility::Closed
+                };
+            }
+            "function_item" | "closure_expression" | "source_file" => break,
+            _ => parent = candidate.parent(),
+        }
+    }
+    DispatchExtensibility::Closed
 }
 
 fn has_impl_or_trait_parent(mut node: Node<'_>) -> bool {
@@ -442,7 +477,20 @@ enum Work<'tree> {
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    receiver: Option<ValueId>,
     next_cleanup_region: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
 }
 
 fn lower_procedure<'tree>(
@@ -481,8 +529,14 @@ fn lower_procedure<'tree>(
     let mut context = LoweringContext {
         source: prepared.source(),
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
         next_cleanup_region: usize::from(spec.has_parameter_bindings),
     };
+    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
 
     if spec.has_parameter_bindings {
         context.add_drop_omission_gaps(
@@ -519,26 +573,45 @@ fn lower_procedure<'tree>(
     }
 
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
-    let body_returns_value =
-        spec.body.kind() != "block" || block_tail_expression(spec.body).is_some();
-    let body_next = if body_returns_value {
+    let return_source = if spec.body.kind() == "block" {
+        block_tail_expression(spec.body)
+    } else {
+        Some(spec.body)
+    };
+    let body_next = if let Some(return_source) = return_source {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let source = context.expression_value(
+            &mut builder,
+            return_source,
+            expression_value_kind(return_source),
+        )?;
         let return_value =
             context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: return_value,
+            },
+        )?;
+        if !rust_expression_has_direct_value_evidence(return_source) {
+            context.add_gap(
+                &mut builder,
+                implicit_return,
+                SemanticGapSubject::Value(return_value),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "tail-expression result transfer requires value refinement",
+            )?;
+        }
         context.append_effect(
             &mut builder,
             implicit_return,
             SemanticEffect::ProcedureReturn {
                 value: Some(return_value),
             },
-        )?;
-        context.add_gap(
-            &mut builder,
-            implicit_return,
-            SemanticGapSubject::Value(return_value),
-            SemanticCapability::Values,
-            SemanticGapKind::Unknown,
-            "tail-expression result transfer into the procedure return value is not represented",
         )?;
         context.edge(
             &mut builder,
@@ -611,6 +684,197 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), RustLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Rust,
+            callable,
+            self.source,
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RustLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let node = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let metadata = self.value_mapping(builder, node)?;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| RustLoweringError::Invalid("too many parameters".into()))?;
+                value
+            };
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+        if let Some(receiver) = self.receiver {
+            self.parameters.insert("self".into(), receiver);
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), RustLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RustLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node.id() != body.id() && is_rust_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "let_declaration"
+                && let Some(pattern) = node.child_by_field_name("pattern")
+                && let Some(name) = identity_binding_identifier(pattern)
+                && let Some(text) = node_text(self.source, name)
+                && let Some((scope_start, scope_end)) = rust_local_scope(node)
+            {
+                let metadata = self.value_mapping(builder, name)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals
+                    .entry(text.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: name.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| {
+                (
+                    binding.scope_end - binding.scope_start,
+                    std::cmp::Reverse(binding.declaration_start),
+                )
+            })
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .find(|binding| binding.declaration_start == declaration_start)
+            .map(|binding| binding.value)
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RustLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RustLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), RustLoweringError> {
+        let Some(name) = node_text(self.source, node) else {
+            return Ok(());
+        };
+        let (source, kind) = if node.kind() == "self" {
+            (self.receiver, ValueFlowKind::Receiver)
+        } else if node.kind() == "identifier" {
+            if let Some(local) = self.local_at(name, node.start_byte()) {
+                (Some(local), ValueFlowKind::Local)
+            } else {
+                (self.parameters.get(name).copied(), ValueFlowKind::Parameter)
+            }
+        } else {
+            (None, ValueFlowKind::Local)
+        };
+        if let Some(source) = source
+            && source != target
+        {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -957,6 +1221,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return self.edge(builder, entry, next);
         };
         let binding = self.point(builder, node, Vec::new())?;
+        if let Some(pattern) = node.child_by_field_name("pattern") {
+            if let Some(name) = identity_binding_identifier(pattern) {
+                let name_text = node_text(self.source, name).ok_or_else(|| {
+                    RustLoweringError::Invalid("Rust binding has an invalid name range".into())
+                })?;
+                let target = self
+                    .local_declaration_value(name_text, name.start_byte())
+                    .ok_or_else(|| {
+                        RustLoweringError::Invalid(
+                            "Rust local declaration was not preindexed".into(),
+                        )
+                    })?;
+                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                self.append_effect(
+                    builder,
+                    binding,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    binding,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target,
+                    },
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    binding,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::LocalFlow,
+                    SemanticGapKind::Unsupported,
+                    "destructuring and by-reference Rust let patterns are not lowered as identity-preserving local flow",
+                )?;
+            }
+        }
         if let Some(alternative) = alternative {
             let success = self.point(builder, node, Vec::new())?;
             let alternative_entry = self.point(builder, alternative, Vec::new())?;
@@ -1015,6 +1320,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustLoweringError> {
         match node.kind() {
             "call_expression" => self.call_expression(builder, node, entry, next, scope, stack),
+            "struct_expression" => self.struct_expression(builder, node, entry, next, scope, stack),
+            "assignment_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "parenthesized_expression" | "reference_expression" => {
+                let value = first_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                self.transparent_expression(builder, node, value, entry, next, scope, stack)
+            }
+            "type_cast_expression" => {
+                let value = required_field(node, "value")?;
+                self.conversion_expression(builder, node, value, entry, next, scope, stack)
+            }
             "closure_expression" | "async_block" | "gen_block" => {
                 self.callable_expression(builder, node, entry, next)
             }
@@ -1112,13 +1429,196 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
-            kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
+            kind if is_runtime_leaf(kind) => {
+                let value = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.emit_lexical_input_flow(builder, node, entry, value)?;
+                self.edge(builder, entry, next)
+            }
             kind if is_runtime_container(kind) => {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             _ => self.unhandled_control_syntax(builder, node, entry),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn struct_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.session
+            .add_allocation(builder, terminal, result, AllocationKind::Object)?;
+        self.edge(builder, terminal, next)?;
+        let children = runtime_expression_children(node);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        if left.kind() == "identifier" {
+            let name = node_text(self.source, left).ok_or_else(|| {
+                RustLoweringError::Invalid("Rust assignment has an invalid target range".into())
+            })?;
+            let target = self
+                .local_at(name, left.start_byte())
+                .or_else(|| self.parameters.get(name).copied());
+            if let Some(target) = target {
+                let value = self.expression_value(builder, right, expression_value_kind(right))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: if self.local_at(name, left.start_byte()).is_some() {
+                            ValueFlowKind::Local
+                        } else {
+                            ValueFlowKind::Parameter
+                        },
+                        source: value,
+                        target,
+                    },
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unknown,
+                    "assignment target does not name a represented Rust local or parameter",
+                )?;
+            }
+            self.add_drop_omission_gaps(builder, terminal, "assignment may replace a live value")?;
+            self.edge(builder, terminal, next)?;
+            stack.push(Work::Expression {
+                node: right,
+                entry,
+                next: EdgeTarget::normal(terminal),
+                scope,
+            });
+            return Ok(());
+        }
+
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Assignments,
+            SemanticGapKind::Unsupported,
+            "field, index, dereferenced, and destructuring Rust assignment targets are not yet lowered into memory flow",
+        )?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "Rust place assignment may invoke custom DerefMut, IndexMut, or Drop behavior",
+        )?;
+        self.add_drop_omission_gaps(builder, terminal, "assignment may replace a live value")?;
+        self.edge(builder, terminal, next)?;
+        let children = runtime_expression_children(node);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transparent_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        value: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let source = self.expression_value(builder, value, expression_value_kind(value))?;
+        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        self.edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conversion_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        value: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Value(target),
+            SemanticCapability::Values,
+            SemanticGapKind::Unsupported,
+            "Rust cast result identity is not propagated across conversion semantics",
+        )?;
+        self.edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1608,6 +2108,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let value = value_node
             .map(|_| self.value(builder, terminal, SemanticValueKind::Return))
             .transpose()?;
+        if let (Some(value_node), Some(value)) = (value_node, value) {
+            let source =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    target: value,
+                },
+            )?;
+        }
         self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
         self.abrupt(builder, terminal, scope, CompletionKind::Return, None)?;
         if let Some(value_node) = value_node {
@@ -1955,13 +2468,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let function = required_field(node, "function")?;
+        let callable_anchor = rust_callable_anchor(function);
+        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
         let receiver_node = rust_call_receiver(function);
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
             .transpose()?;
         let callable_kind = if receiver.is_some() {
             CallableReferenceKind::BoundMethod
@@ -1988,7 +2504,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let arguments = call_arguments(node);
         let argument_values = arguments
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(|argument| {
+                self.expression_value(builder, *argument, expression_value_kind(*argument))
+                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -1996,7 +2515,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: argument_values.into_iter().map(Into::into).collect(),
+                arguments: argument_values.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2016,6 +2535,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        if function.kind() == "generic_function" {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "generic Rust call applicability depends on unresolved type arguments and bounds",
+            )?;
+        }
         if receiver_node.is_some() {
             self.add_gap(
                 builder,
@@ -2083,6 +2612,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticCapability::CallableReferences,
             SemanticGapKind::Unknown,
             "closure target and captured environment require location-first callable refinement",
+        )?;
+        self.add_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::Captures,
+            SemanticGapKind::Unknown,
+            "closure capture identities and capture modes require lexical capture refinement",
         )?;
         if matches!(node.kind(), "async_block" | "gen_block")
             || (node.kind() == "closure_expression" && direct_child_kind(node, "async"))
@@ -2327,6 +2864,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, RustLoweringError> {
+        let range = node.byte_range();
+        let occurrence = self.session.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(RustLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, RustLoweringError> {
         self.session.metadata(point)
     }
@@ -2410,11 +2959,90 @@ fn unwrap_generic_function(mut function: Node<'_>) -> Node<'_> {
     function
 }
 
+fn rust_callable_anchor(function: Node<'_>) -> Node<'_> {
+    let function = unwrap_generic_function(function);
+    match function.kind() {
+        "field_expression" => function.child_by_field_name("field").unwrap_or(function),
+        "scoped_identifier" | "scoped_type_identifier" => {
+            function.child_by_field_name("name").unwrap_or(function)
+        }
+        _ => function,
+    }
+}
+
 fn rust_call_receiver(function: Node<'_>) -> Option<Node<'_>> {
     let function = unwrap_generic_function(function);
     (function.kind() == "field_expression")
         .then(|| function.child_by_field_name("value"))
         .flatten()
+}
+
+fn identity_binding_identifier(mut pattern: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match pattern.kind() {
+            "identifier" => return Some(pattern),
+            "mut_pattern" | "captured_pattern" => {
+                let children = named_children(pattern);
+                if children.len() != 1 {
+                    return None;
+                }
+                pattern = children[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn rust_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if matches!(
+            candidate.kind(),
+            "block" | "closure_expression" | "function_item" | "async_block" | "gen_block"
+        ) {
+            return Some((candidate.start_byte(), candidate.end_byte()));
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+fn is_rust_nested_execution_boundary(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_item" | "closure_expression" | "async_block" | "gen_block"
+    )
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "closure_expression" | "async_block" | "gen_block" => SemanticValueKind::Callable,
+        kind if kind.ends_with("_literal")
+            || matches!(kind, "true" | "false" | "unit_expression") =>
+        {
+            SemanticValueKind::Constant
+        }
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "call_expression"
+            | "struct_expression"
+            | "parenthesized_expression"
+            | "reference_expression"
+    ) || is_runtime_leaf(node.kind())
 }
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
