@@ -283,13 +283,19 @@ fn traced_gap_affects_value(
                     "semantic gap has a stale call site",
                 ))
             })?;
-            let fixed_field_matches = call.callee == value
-                || call.receiver == Some(value)
-                || call.result == Some(value)
-                || call.thrown == Some(value);
-            if fixed_field_matches {
+            // A call-site gap can weaken values produced by the call without
+            // weakening caller-side values that were evaluated before it.
+            // Adapters attach CallEvaluation explicitly when the callee,
+            // receiver, or argument evaluation is itself incomplete.
+            if call.result == Some(value) || call.thrown == Some(value) {
                 true
-            } else {
+            } else if gap
+                .impacts
+                .contains(SemanticGapImpact::CallEvaluation)
+            {
+                if call.callee == value || call.receiver == Some(value) {
+                    return Ok(true);
+                }
                 let mut argument_matches = false;
                 for argument in &call.arguments {
                     if cancellation.is_cancelled() {
@@ -309,6 +315,8 @@ fn traced_gap_affects_value(
                     }
                 }
                 argument_matches
+            } else {
+                false
             }
         }
     })

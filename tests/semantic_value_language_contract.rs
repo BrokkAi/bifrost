@@ -2767,17 +2767,20 @@ fn logical_assignment_arrow_without_parent_binding_retains_an_explicit_capture_g
 }
 
 #[test]
-fn traced_call_gap_keeps_a_dependent_heap_value_open() {
+fn traced_call_gap_opens_outputs_without_weakening_evaluated_inputs() {
     const SOURCE: &str = r#"
 class Sample {
-    consume(_value: Sample) {}
-    forward(input: Sample): Sample { this.consume(input); return input; }
+    consume(value: Sample): Sample { return value; }
+    forward(input: Sample): Sample {
+        const result = consume(input);
+        return result;
+    }
 }
 "#;
     let project = InlineTestProject::new().file("forward.ts", SOURCE).build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let graph = SemanticGraph::materialize(&project, &analyzer, "forward.ts");
-    let call = call_named(&graph, SOURCE, "forward", "this.consume(input)");
+    let call = call_named(&graph, SOURCE, "forward", "consume(input)");
     let call_row = call
         .procedure()
         .semantics()
@@ -2818,11 +2821,33 @@ class Sample {
             &query,
             &mut SemanticRequest::new(&mut budget, &cancellation),
         )
-        .expect("call-dependent parameter points-to query");
+        .expect("evaluated call argument points-to query");
     assert_eq!(
         available(&outcome).objects().coverage(),
+        CandidateCoverage::Exhaustive,
+        "a call-output gap must not weaken an already evaluated argument"
+    );
+
+    let result = call_row.result.expect("sample call result");
+    let result_query = ValueAtPoint::new(
+        call.procedure().value_handle(result).unwrap(),
+        call.procedure().point_handle(continuation).unwrap(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let mut budget = SemanticBudget::default();
+    let result_outcome = analyzer
+        .semantic_oracle_provider()
+        .pointees(
+            &result_query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("call result points-to query");
+    assert_eq!(
+        available(&result_outcome).objects().coverage(),
         CandidateCoverage::Open,
-        "a call gap reached by the parameter trace must keep the heap result open"
+        "the same call gap must keep the call-produced result open"
     );
 }
 
