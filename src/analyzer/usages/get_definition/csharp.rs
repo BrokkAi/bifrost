@@ -1302,6 +1302,14 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
     {
         return false;
     }
+    if parent.kind() == "variable_declarator" {
+        // Only the declarator's own name is a declaration site; the
+        // initializer value is an ordinary reference and must reach the
+        // enclosing-class member lookup (CsvHelper's
+        // `var i = delimiterPosition` drew a dishonest using-boundary
+        // claim for a field declared in the same class).
+        return parent.child_by_field_name("name") != Some(node);
+    }
     !matches!(
         parent.kind(),
         "class_declaration"
@@ -1314,7 +1322,6 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "constructor_declaration"
             | "property_declaration"
             | "parameter"
-            | "variable_declarator"
             | "using_directive"
     )
 }

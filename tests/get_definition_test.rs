@@ -3276,6 +3276,30 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+// A bare field reference inside a method must resolve through the enclosing
+// class's members, not fall through to the type path and claim a using
+// boundary for a field declared in the same class (tier-3 CsvHelper:
+// `delimiterPosition`/`newLinePosition` in CsvParser).
+#[test]
+fn csharp_private_field_reference_resolves_via_enclosing_class() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/CsvParser.cs",
+            "using Xunit;\n\nnamespace Ns {\n    public class CsvParser {\n        private int delimiterPosition = 1;\n        public void Read() {\n            for (var i = delimiterPosition; i < 10; i++) { }\n        }\n    }\n}\n",
+        )
+        .build();
+    let value = lookup_reference(
+        project.root(),
+        r#"{"references":[{"path":"src/CsvParser.cs","symbol":"CsvParser","context":"            for (var i = delimiterPosition; i < 10; i++) { }","target":"delimiterPosition"}]}"#,
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Ns.CsvParser.delimiterPosition",
+        "{value}"
+    );
+}
+
 #[test]
 fn csharp_dotted_type_lookup_does_not_import_child_namespace() {
     let project = InlineTestProject::with_language(Language::CSharp)
