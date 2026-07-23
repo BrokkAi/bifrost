@@ -441,14 +441,6 @@ struct Derived : PCM::Base {
 }
 
 #[test]
-#[ignore = "issue #939 forward half is fixed (see the active forward-only regression above); \
-the inverse scan_usages_by_reference half still fails identically for the *absolute*-qualified \
-control shape (see \
-issue_939_control_cpp_absolute_qualified_base_member_call_forward_resolution), proving the \
-remaining gap is a general bare-inherited-member-call attribution limitation in \
-cpp_graph/inverted.rs's resolve_declaring_member_owner (usage-graph side), not something in \
-get_definition or specific to relative qualification. Un-ignore once that usage-graph gap is \
-fixed."]
 fn issue_939_cpp_relative_qualified_base_member_call_resolves_forward_and_inverse() {
     let source = r#"namespace Outer {
 namespace PCM {
@@ -545,4 +537,121 @@ struct Derived : Outer::PCM::Base {
     eprintln!("issue_939 control (absolute-qualified base) forward result: {value}");
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
+}
+
+/// Collect every proven-hit snippet from a `scan_usages_by_reference` result for `symbol`.
+fn issue_939_usage_snippets(root: &std::path::Path, symbol: &str) -> Vec<String> {
+    let scan = scan_usages_by_reference(root, &json!({"symbols": [symbol], "include_tests": true}));
+    let mut snippets = Vec::new();
+    if let Some(files) = scan["results"][0]["files"].as_array() {
+        for file in files {
+            if let Some(hits) = file["hits"].as_array() {
+                for hit in hits {
+                    if let Some(snippet) = hit["snippet"].as_str() {
+                        snippets.push(snippet.to_string());
+                    }
+                }
+            }
+        }
+    }
+    snippets
+}
+
+/// #939 inverse, negative discipline: a bare `value()` call inside `Unrelated` (which does NOT
+/// inherit from `Base` and declares its own same-named `value`) must NOT be attributed to
+/// `Base::value`. Only the genuinely-inherited call site in `Derived` may resolve to `Base::value`.
+#[test]
+fn issue_939_cpp_bare_inherited_call_does_not_attribute_unrelated_same_named_member() {
+    let source = r#"namespace app {
+struct Base {
+    int value() const { return 1; }
+};
+struct Derived : Base {
+    int run() const { return value(); } // derived-inherited-call
+};
+struct Unrelated {
+    int value() const { return 2; }
+    int other() const { return value(); } // unrelated-noninherited-call
+};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("bases.cpp", source)
+        .build();
+
+    let snippets = issue_939_usage_snippets(project.root(), "app.Base.value");
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("derived-inherited-call")),
+        "expected the inherited call in Derived to attribute to Base::value: {snippets:#?}"
+    );
+    assert!(
+        !snippets
+            .iter()
+            .any(|snippet| snippet.contains("unrelated-noninherited-call")),
+        "a bare call to an unrelated class's same-named member must NOT attribute to \
+         Base::value: {snippets:#?}"
+    );
+}
+
+/// #939 inverse, deeper chain: a bare inherited call must walk the full base chain, resolving
+/// `value()` in `Derived : Middle : Base` to the grandparent `Base::value`.
+#[test]
+fn issue_939_cpp_bare_inherited_call_resolves_through_grandparent_base() {
+    let source = r#"namespace app {
+struct Base {
+    int value() const { return 1; }
+};
+struct Middle : Base {};
+struct Derived : Middle {
+    int run() const { return value(); } // grandparent-inherited-call
+};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("bases.cpp", source)
+        .build();
+
+    let snippets = issue_939_usage_snippets(project.root(), "app.Base.value");
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("grandparent-inherited-call")),
+        "expected the grandparent-inherited call to attribute to Base::value: {snippets:#?}"
+    );
+}
+
+/// #939 inverse parity: an explicit `this->value()` call to an inherited base member attributes
+/// to `Base::value` exactly like the bare `value()` form. Both are genuine external usages of the
+/// inherited base member, not same-type self calls.
+#[test]
+fn issue_939_cpp_explicit_this_inherited_call_matches_bare_call_attribution() {
+    let source = r#"namespace app {
+struct Base {
+    int value() const { return 1; }
+};
+struct Derived : Base {
+    int bare() const { return value(); }        // derived-bare-inherited-call
+    int viaThis() const { return this->value(); } // derived-this-inherited-call
+};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("bases.cpp", source)
+        .build();
+
+    let snippets = issue_939_usage_snippets(project.root(), "app.Base.value");
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("derived-bare-inherited-call")),
+        "bare inherited call must attribute to Base::value: {snippets:#?}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("derived-this-inherited-call")),
+        "explicit this-> inherited call must attribute to Base::value with parity: {snippets:#?}"
+    );
 }
