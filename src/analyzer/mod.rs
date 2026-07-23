@@ -100,8 +100,8 @@ pub use model::{
     ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
     MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
     Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
-    StructuredImportScope, SummaryFileProjection, TestAssertionSmell, TestAssertionWeights,
-    metrics_from_declarations,
+    StructuredImportPathKind, StructuredImportScope, SummaryFileProjection, TestAssertionSmell,
+    TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,

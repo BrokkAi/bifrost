@@ -1104,6 +1104,10 @@ pub struct MaintainabilitySizeSmell {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredImportPath {
     pub segments: Vec<String>,
+    /// Parser-derived import form. This lets consumers distinguish
+    /// `import pkg.mod` from `from pkg import mod` without reparsing text.
+    #[serde(default)]
+    pub kind: Option<StructuredImportPathKind>,
     /// Lexical namespace/package prefixes at the import declaration, ordered
     /// from outermost to innermost and derived by the language parser.
     #[serde(default)]
@@ -1115,6 +1119,12 @@ pub struct StructuredImportPath {
     /// Start byte of the import declaration, used for source-order visibility.
     #[serde(default)]
     pub declaration_start_byte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StructuredImportPathKind {
+    Namespace,
+    ImportFrom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

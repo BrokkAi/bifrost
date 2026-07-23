@@ -293,7 +293,8 @@ cfg_not_rt! {
     );
 }
 
-// Negatives: expression-position macros and non-item token trees index nothing.
+// Negatives: expression-position macros, non-item token trees, and compiler
+// builtins that consume rather than replay item tokens index nothing.
 #[test]
 fn rust_expression_and_non_item_macros_index_nothing() {
     // - `matches!`/`println!` inside a fn body are expression position: never
@@ -311,12 +312,16 @@ fn rust_expression_and_non_item_macros_index_nothing() {
 println!("fn fake_top() {{}}");
 
 numbers! { 1, 2, 3 }
+
+stringify! {
+    pub fn stringified_phantom() {}
+}
 "#;
     let project = InlineTestProject::with_language(Language::Rust)
         .file("lib.rs", lib)
         .build();
 
-    for phantom in ["fake_expr", "fake_top", "numbers"] {
+    for phantom in ["fake_expr", "fake_top", "numbers", "stringified_phantom"] {
         assert!(
             !search(&project, phantom)
                 .iter()

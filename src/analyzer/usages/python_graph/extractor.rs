@@ -2,7 +2,7 @@ use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
-use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::model::{ImportKind, UsageHit};
 use crate::analyzer::usages::python_graph::hits::{
     record_hit, record_import_hit, record_unproven_hit,
 };
@@ -197,6 +197,7 @@ pub(super) fn scan_files_for_seeds(
             target_member: target_member.as_deref(),
             target_owner: target_owner.clone(),
             target_is_module: target.is_module(),
+            target_source: target.source(),
             seeds,
             edges: &edges,
             target_self_file,
@@ -252,6 +253,7 @@ pub(super) struct ScanCtx<'a> {
     target_member: Option<&'a str>,
     target_owner: Option<CodeUnit>,
     target_is_module: bool,
+    target_source: &'a ProjectFile,
     seeds: &'a BTreeSet<(ProjectFile, String)>,
     edges: &'a [ImportEdge],
     target_self_file: bool,
@@ -738,8 +740,13 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
     }
 
+    let object_binds_target = if ctx.target_is_module {
+        imported_root_targets_module(ctx, object, node)
+    } else {
+        ctx.binds_target(object_text, node)
+    };
     if object.kind() == "identifier"
-        && ctx.binds_target(object_text, node)
+        && object_binds_target
         && (ctx.target_is_module
             || (ctx.target_member.is_none()
                 && !ctx.edges.iter().any(|edge| {
@@ -747,6 +754,12 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 })))
     {
         record_hit(object, ctx);
+    }
+
+    if ctx.target_is_module
+        && let Some(module_qualifier) = module_attribute_target_hit(node, ctx)
+    {
+        record_hit(module_qualifier, ctx);
     }
 
     // A bare member name used as the *object* of an attribute access in the
@@ -778,8 +791,9 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let namespace_match = ctx.edges.iter().any(|edge| {
         matches!(edge.kind, ImportEdgeKind::Namespace)
-            && (edge.local_name == object_text
-                || object_text.ends_with(&format!(".{}", edge.local_name)))
+            && namespace_edge_matches_object(ctx.analyzer, edge, object_text)
+            && leftmost_identifier(node)
+                .is_none_or(|root| !import_root_shadowed(ctx, slice(root, ctx.source), root, node))
             && ctx
                 .seeds
                 .contains(&(edge.target_file.clone(), attribute_text.to_string()))
@@ -789,22 +803,92 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn namespace_edge_matches_object(
+    analyzer: &dyn IAnalyzer,
+    edge: &ImportEdge,
+    object_text: &str,
+) -> bool {
+    if edge.local_name == object_text {
+        return true;
+    }
+    let Some(suffix) = object_text.strip_prefix(&edge.local_name) else {
+        return false;
+    };
+    if !suffix.starts_with('.') {
+        return false;
+    }
+    analyzer
+        .declarations(&edge.target_file)
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .is_some_and(|module| module.fq_name() == object_text)
+}
+
+fn imported_root_targets_module(ctx: &ScanCtx<'_>, root: Node<'_>, reference: Node<'_>) -> bool {
+    let Some(module_fqn) = imported_module_binding_fqn(ctx, root, reference) else {
+        return false;
+    };
+    ctx.py
+        .usage_resolve_module_files(ctx.file, &module_fqn)
+        .into_iter()
+        .any(|resolved_file| &resolved_file == ctx.target_source)
+}
+
+fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
+    let (root, attributes) = attribute_chain(node)?;
+    if attributes.is_empty() {
+        return None;
+    }
+    let mut module_fqn = imported_module_binding_fqn(ctx, root, node)?;
+    for attribute in attributes {
+        let segment = slice(attribute, ctx.source);
+        if segment.is_empty() {
+            return None;
+        }
+        if module_fqn.ends_with('.') {
+            module_fqn.push_str(segment);
+        } else {
+            module_fqn.push('.');
+            module_fqn.push_str(segment);
+        }
+        let resolved = ctx.py.usage_resolve_module_files(ctx.file, &module_fqn);
+        if resolved.is_empty() {
+            return None;
+        }
+        if resolved
+            .iter()
+            .any(|resolved_file| resolved_file == ctx.target_source)
+        {
+            return Some(attribute);
+        }
+    }
+    None
+}
+
 fn call_result_matches_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let Some(target_owner) = ctx.target_owner.as_ref() else {
         return false;
     };
-    call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, call)
-        .into_iter()
-        .any(|class| {
-            &class == target_owner
-                || ctx
-                    .analyzer
-                    .type_hierarchy_provider()
-                    .map(|provider| provider.get_ancestors(&class))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .any(|ancestor| &ancestor == target_owner)
-        })
+    let scope_facts = ctx.scope_facts_for_node(call);
+    call_result_types(
+        ctx.analyzer,
+        ctx.py,
+        ctx.file,
+        ctx.source,
+        call,
+        scope_facts,
+    )
+    .into_iter()
+    .any(|class| {
+        &class == target_owner
+            || ctx
+                .analyzer
+                .type_hierarchy_provider()
+                .map(|provider| provider.get_ancestors(&class))
+                .unwrap_or_default()
+                .into_iter()
+                .any(|ancestor| &ancestor == target_owner)
+    })
 }
 
 pub(in crate::analyzer::usages) fn call_result_types(
@@ -813,6 +897,7 @@ pub(in crate::analyzer::usages) fn call_result_types(
     file: &ProjectFile,
     source: &str,
     call: Node<'_>,
+    scope_facts: Option<&LocalBindingsSnapshot<String>>,
 ) -> Vec<CodeUnit> {
     let Some(function) = call.child_by_field_name("function") else {
         return Vec::new();
@@ -821,33 +906,16 @@ pub(in crate::analyzer::usages) fn call_result_types(
     if !constructed.is_empty() {
         return constructed;
     }
-    let callable_fqn = match function.kind() {
-        "identifier" => {
-            let local = slice(function, source);
-            let binder = py.import_binder_of(file);
-            match binder.bindings.get(local) {
-                Some(binding)
-                    if binding.kind == crate::analyzer::usages::model::ImportKind::Named =>
-                {
-                    binding
-                        .imported_name
-                        .as_ref()
-                        .map(|imported| format!("{}.{}", binding.module_specifier, imported))
-                }
-                _ => analyzer
-                    .declarations(file)
-                    .into_iter()
-                    .find(|unit| unit.is_function() && unit.identifier() == local)
-                    .map(|unit| unit.fq_name()),
-            }
-        }
-        _ => None,
-    };
-    let Some(callable_fqn) = callable_fqn else {
+    let callable_fqns = resolve_callable_fqns(analyzer, py, file, source, function, scope_facts);
+    if callable_fqns.is_empty() {
         return Vec::new();
-    };
-    let callables =
-        py.resolve_fqn_candidates(&callable_fqn, |name| analyzer.definitions(name).collect());
+    }
+    let callables = callable_fqns
+        .into_iter()
+        .flat_map(|callable_fqn| {
+            py.resolve_fqn_candidates(&callable_fqn, |name| analyzer.definitions(name).collect())
+        })
+        .collect::<Vec<_>>();
     let mut classes = Vec::new();
     for callable in callables.into_iter().filter(CodeUnit::is_function) {
         let Some(raw_type) = callable_return_type_name(analyzer, &callable) else {
@@ -861,6 +929,241 @@ pub(in crate::analyzer::usages) fn call_result_types(
     classes.sort();
     classes.dedup();
     classes
+}
+
+fn resolve_callable_fqns(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    scope_facts: Option<&LocalBindingsSnapshot<String>>,
+) -> Vec<String> {
+    match function.kind() {
+        "identifier" => {
+            resolve_identifier_callable_fqns(analyzer, py, file, source, function, scope_facts)
+        }
+        "attribute" => {
+            resolve_attribute_callable_fqns(analyzer, py, file, source, function, scope_facts)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn resolve_identifier_callable_fqns(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    scope_facts: Option<&LocalBindingsSnapshot<String>>,
+) -> Vec<String> {
+    let local = slice(function, source);
+    if local.is_empty() || scope_facts.is_some_and(|facts| facts.is_shadowed(local)) {
+        return Vec::new();
+    }
+    let binder = py.import_binder_of(file);
+    match binder.bindings.get(local) {
+        Some(binding) if binding.kind == crate::analyzer::usages::model::ImportKind::Named => {
+            binding
+                .imported_name
+                .as_ref()
+                .map(|imported| vec![format!("{}.{}", binding.module_specifier, imported)])
+                .unwrap_or_default()
+        }
+        _ => analyzer
+            .declarations(file)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == local)
+            .map(|unit| vec![unit.fq_name()])
+            .unwrap_or_default(),
+    }
+}
+
+fn resolve_attribute_callable_fqns(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    scope_facts: Option<&LocalBindingsSnapshot<String>>,
+) -> Vec<String> {
+    let Some(receiver) = function.child_by_field_name("object") else {
+        return Vec::new();
+    };
+    let Some(method) = function.child_by_field_name("attribute") else {
+        return Vec::new();
+    };
+    let method = slice(method, source);
+    if method.is_empty() {
+        return Vec::new();
+    }
+    let mut fqns = attribute_receiver_classes(analyzer, py, file, source, receiver, scope_facts)
+        .into_iter()
+        .map(|class| format!("{}.{}", class.fq_name(), method))
+        .collect::<Vec<_>>();
+    fqns.sort();
+    fqns.dedup();
+    fqns
+}
+
+fn attribute_receiver_classes(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    receiver: Node<'_>,
+    scope_facts: Option<&LocalBindingsSnapshot<String>>,
+) -> Vec<CodeUnit> {
+    let mut classes = match receiver.kind() {
+        "identifier" => {
+            identifier_receiver_classes(analyzer, py, file, source, receiver, scope_facts)
+        }
+        "attribute" => {
+            if let Some(root) = leftmost_identifier(receiver)
+                && scope_facts.is_some_and(|facts| facts.is_shadowed(slice(root, source)))
+            {
+                Vec::new()
+            } else {
+                resolve_constructor_types(analyzer, py, file, source, receiver)
+            }
+        }
+        _ => Vec::new(),
+    };
+    classes.sort();
+    classes.dedup();
+    classes
+}
+
+fn identifier_receiver_classes(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    receiver: Node<'_>,
+    scope_facts: Option<&LocalBindingsSnapshot<String>>,
+) -> Vec<CodeUnit> {
+    let ident = slice(receiver, source);
+    if ident.is_empty() {
+        return Vec::new();
+    }
+    if matches!(ident, "self" | "cls")
+        && let Some(class) = enclosing_class_for_node(analyzer, file, receiver)
+    {
+        return vec![class];
+    }
+    if let Some(facts) = scope_facts {
+        if let Some(raw_type) = facts
+            .resolution_for(ident)
+            .as_precise()
+            .and_then(|targets| targets.iter().next())
+            && let Some(class) = resolve_receiver_type(analyzer, py, file, raw_type, false)
+        {
+            return vec![class];
+        }
+        if facts.is_shadowed(ident) {
+            return Vec::new();
+        }
+    }
+    resolve_receiver_type(analyzer, py, file, ident, false)
+        .into_iter()
+        .collect()
+}
+
+fn enclosing_class_for_node(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let enclosing = analyzer.enclosing_code_unit(file, &range)?;
+    if enclosing.is_class() {
+        return Some(enclosing);
+    }
+    target_owner_code_unit(analyzer, &enclosing)
+}
+
+fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
+    let mut attributes = Vec::new();
+    let mut current = node;
+    loop {
+        if current.kind() != "attribute" {
+            return None;
+        }
+        attributes.push(current.child_by_field_name("attribute")?);
+        current = current.child_by_field_name("object")?;
+        if current.kind() == "identifier" {
+            attributes.reverse();
+            return Some((current, attributes));
+        }
+    }
+}
+
+fn imported_module_binding_fqn(
+    ctx: &ScanCtx<'_>,
+    root: Node<'_>,
+    reference: Node<'_>,
+) -> Option<String> {
+    let root_text = slice(root, ctx.source);
+    if root_text.is_empty() {
+        return None;
+    }
+    if import_root_shadowed(ctx, root_text, root, reference) {
+        return None;
+    }
+    let binder = ctx.py.import_binder_of(ctx.file);
+    let binding = binder.bindings.get(root_text)?;
+    match binding.kind {
+        ImportKind::Namespace => Some(binding.module_specifier.clone()),
+        ImportKind::Named => {
+            let imported = binding.imported_name.as_ref()?;
+            let candidate = if binding.module_specifier.ends_with('.') {
+                format!("{}{}", binding.module_specifier, imported)
+            } else {
+                format!("{}.{}", binding.module_specifier, imported)
+            };
+            (!ctx
+                .py
+                .usage_resolve_module_files(ctx.file, &candidate)
+                .is_empty())
+            .then_some(candidate)
+        }
+        _ => None,
+    }
+}
+
+fn import_root_shadowed(
+    ctx: &ScanCtx<'_>,
+    root_text: &str,
+    root: Node<'_>,
+    reference: Node<'_>,
+) -> bool {
+    ctx.scope_facts_for_node(root)
+        .or_else(|| ctx.scope_facts_for_node(reference))
+        .is_some_and(|facts| facts.is_shadowed(root_text))
+        || enclosing_parameters_shadow(root_text, reference, ctx.source)
+}
+
+fn enclosing_parameters_shadow(root_text: &str, reference: Node<'_>, source: &str) -> bool {
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda") {
+            let Some(parameters) = parent.child_by_field_name("parameters") else {
+                return false;
+            };
+            let mut cursor = parameters.walk();
+            return parameters.named_children(&mut cursor).any(|parameter| {
+                parameter_symbol(parameter, source).as_deref() == Some(root_text)
+            });
+        }
+        current = parent;
+    }
+    false
 }
 
 fn member_receiver_match_is_unproven(

@@ -447,6 +447,13 @@ fn visit_rust_macro_invocation_definitions(
     let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
         return;
     };
+    // `stringify!` is a compiler builtin whose contract is to consume arbitrary
+    // tokens and emit one string literal. Its input can therefore be a perfectly
+    // valid item stream even though none of those items survive expansion. This
+    // is structured Rust macro semantics, not an inferred user-macro policy.
+    if invoked_macro == "stringify" {
+        return;
+    }
     // Use the structured macro-rules knowledge we have. If this file defines the
     // invoked macro and proves it does NOT replay its item input faithfully, the
     // braces do not expand to the items inside, so indexing them would be a lie

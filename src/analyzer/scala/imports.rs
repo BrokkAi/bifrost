@@ -443,6 +443,7 @@ pub(crate) fn scala_import_infos_from_node_with_prefixes(
         alias: None,
         path: Some(StructuredImportPath {
             segments: base_path,
+            kind: None,
             lexical_prefixes: lexical_prefixes.to_vec(),
             lexical_scopes,
             declaration_start_byte: node.start_byte(),
@@ -550,6 +551,7 @@ fn scala_import_selector_info(
             alias: None,
             path: Some(StructuredImportPath {
                 segments: base_path.to_vec(),
+                kind: None,
                 lexical_prefixes: lexical_prefixes.to_vec(),
                 lexical_scopes: lexical_scopes.to_vec(),
                 declaration_start_byte,
@@ -583,6 +585,7 @@ fn scala_import_selector_info(
         alias,
         path: Some(StructuredImportPath {
             segments: path,
+            kind: None,
             lexical_prefixes: lexical_prefixes.to_vec(),
             lexical_scopes: lexical_scopes.to_vec(),
             declaration_start_byte,

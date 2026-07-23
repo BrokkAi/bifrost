@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::analyzer::StructuredImportPathKind;
 use brokk_bifrost::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer,
     TestProject, TypeHierarchyProvider,
@@ -243,6 +244,160 @@ fn python_imported_code_units_prefer_later_reexport_over_local_binding() {
             .iter()
             .all(|unit| unit.fq_name() != "example.build_service"),
         "{imports:?}"
+    );
+}
+
+#[test]
+fn python_import_info_preserves_structured_grouped_and_relative_imports() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/consumer.py",
+            r#"from ..shared import (
+    helper,  # keep comment out of the binding
+    tool as local_tool,
+)
+import pkg.submodule as sub
+from pkg import *
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let file = project.file("pkg/consumer.py");
+
+    let imports = analyzer.import_info_of(&file);
+    assert_eq!(4, imports.len(), "{imports:#?}");
+
+    assert_eq!(
+        imports[0].path.as_ref().map(|path| path.kind),
+        Some(Some(StructuredImportPathKind::ImportFrom))
+    );
+    assert_eq!(
+        imports[0]
+            .path
+            .as_ref()
+            .map(|path| path.segments.clone())
+            .unwrap_or_default(),
+        vec!["..shared".to_string(), "helper".to_string()]
+    );
+    assert_eq!(imports[0].identifier.as_deref(), Some("helper"));
+    assert_eq!(imports[0].raw_snippet, "from ..shared import helper");
+    assert_eq!(
+        imports[0]
+            .path
+            .as_ref()
+            .and_then(|path| path.segments.first())
+            .map(String::as_str),
+        Some("..shared")
+    );
+
+    assert_eq!(
+        imports[1]
+            .path
+            .as_ref()
+            .map(|path| path.segments.clone())
+            .unwrap_or_default(),
+        vec!["..shared".to_string(), "tool".to_string()]
+    );
+    assert_eq!(imports[1].identifier.as_deref(), Some("local_tool"));
+    assert_eq!(imports[1].alias.as_deref(), Some("local_tool"));
+    assert_eq!(
+        imports[1].raw_snippet,
+        "from ..shared import tool as local_tool"
+    );
+    assert_eq!(
+        imports[1]
+            .path
+            .as_ref()
+            .and_then(|path| path.segments.first())
+            .map(String::as_str),
+        Some("..shared")
+    );
+
+    assert_eq!(
+        imports[2].path.as_ref().map(|path| path.kind),
+        Some(Some(StructuredImportPathKind::Namespace))
+    );
+    assert_eq!(
+        imports[2]
+            .path
+            .as_ref()
+            .map(|path| path.segments.clone())
+            .unwrap_or_default(),
+        vec!["pkg".to_string(), "submodule".to_string()]
+    );
+    assert_eq!(imports[2].identifier.as_deref(), Some("sub"));
+    assert_eq!(imports[2].alias.as_deref(), Some("sub"));
+
+    assert!(imports[3].is_wildcard);
+    assert_eq!(
+        imports[3]
+            .path
+            .as_ref()
+            .map(|path| path.segments.clone())
+            .unwrap_or_default(),
+        vec!["pkg".to_string()]
+    );
+}
+
+#[test]
+fn python_grouped_import_comment_does_not_break_import_resolution() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/ops.py", "class ConvLayer:\n    pass\n")
+        .file(
+            "pkg/consumer.py",
+            r#"from .ops import (  # type: ignore
+    ConvLayer,
+)
+
+def build() -> ConvLayer:
+    return ConvLayer()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let file = project.file("pkg/consumer.py");
+
+    let imported = analyzer.imported_code_units_of(&file);
+    assert!(
+        imported
+            .iter()
+            .any(|unit| unit.fq_name() == "pkg.ops.ConvLayer"),
+        "{imported:#?}"
+    );
+}
+
+#[test]
+fn python_unaliased_dotted_import_binds_root_namespace_package() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "")
+        .file("pkg/submodule.py", "class Service:\n    pass\n")
+        .file(
+            "consumer.py",
+            "import pkg.submodule\n\ndef build() -> pkg.submodule.Service:\n    return pkg.submodule.Service()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let file = project.file("consumer.py");
+
+    let imported = analyzer.imported_code_units_of(&file);
+    assert!(
+        imported.iter().any(|unit| unit.fq_name() == "pkg"),
+        "{imported:#?}"
+    );
+
+    let imports = analyzer.import_info_of(&file);
+    let dotted = imports
+        .iter()
+        .find(|import| import.raw_snippet == "import pkg.submodule")
+        .unwrap_or_else(|| panic!("missing dotted import: {imports:#?}"));
+    assert_eq!(dotted.identifier.as_deref(), Some("pkg"));
+    assert_eq!(
+        dotted
+            .path
+            .as_ref()
+            .map(|path| path.segments.clone())
+            .unwrap_or_default(),
+        vec!["pkg".to_string(), "submodule".to_string()]
     );
 }
 

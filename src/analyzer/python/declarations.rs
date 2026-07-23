@@ -1,4 +1,4 @@
-use super::imports::parse_python_import_infos;
+use super::imports::python_import_infos_from_node;
 use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
 use super::*;
 use crate::analyzer::ParameterMetadata;
@@ -445,8 +445,7 @@ impl<'a> PythonVisitor<'a> {
     }
 
     fn visit_import_statement(&mut self, node: Node<'_>) {
-        let raw = py_node_text(node, self.source).trim();
-        for info in parse_python_import_infos(raw) {
+        for info in python_import_infos_from_node(node, self.source) {
             self.parsed.import_statements.push(info.raw_snippet.clone());
             self.parsed.imports.push(info);
         }

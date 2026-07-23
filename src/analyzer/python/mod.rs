@@ -39,7 +39,7 @@ use declarations::{
     python_module_name,
 };
 use imports::{
-    PythonImportDetails, parse_python_import_details, parse_python_import_infos,
+    PythonImportDetails, python_import_details, python_import_infos_from_node,
     resolve_python_relative_module,
 };
 use tests::detect_python_test_assertion_smells;
@@ -130,7 +130,7 @@ impl PythonAnalyzer {
         identifiers.into_iter().collect()
     }
 
-    fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
+    pub(crate) fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
         if let Some(units) = self.inner.forward_path_module_fqn(module_fq) {
             return units.into_iter().find(|code_unit| code_unit.is_module());
         }
@@ -272,8 +272,9 @@ impl PythonAnalyzer {
             if node.kind() != "import_from_statement" {
                 continue;
             }
-            let raw = py_node_text(node, source).trim();
-            self.record_reexport_event(file, raw, node.start_byte(), events, index);
+            for info in python_import_infos_from_node(node, source) {
+                self.record_single_reexport_event(file, &info, events, index);
+            }
         }
     }
 
@@ -285,28 +286,14 @@ impl PythonAnalyzer {
         index: &mut ExportIndex,
     ) {
         for import in imports {
-            self.record_reexport_event(file, &import.raw_snippet, usize::MAX, events, index);
-        }
-    }
-
-    fn record_reexport_event(
-        &self,
-        file: &ProjectFile,
-        raw: &str,
-        start_byte: usize,
-        events: &mut Vec<(usize, String, ExportEntry)>,
-        index: &mut ExportIndex,
-    ) {
-        for info in parse_python_import_infos(raw) {
-            self.record_single_reexport_event(file, &info.raw_snippet, start_byte, events, index);
+            self.record_single_reexport_event(file, import, events, index);
         }
     }
 
     fn record_single_reexport_event(
         &self,
         file: &ProjectFile,
-        raw: &str,
-        start_byte: usize,
+        import: &ImportInfo,
         events: &mut Vec<(usize, String, ExportEntry)>,
         index: &mut ExportIndex,
     ) {
@@ -315,10 +302,15 @@ impl PythonAnalyzer {
             name,
             alias,
             wildcard,
-        }) = parse_python_import_details(raw)
+        }) = python_import_details(import)
         else {
             return;
         };
+        let start_byte = import
+            .path
+            .as_ref()
+            .map(|path| path.declaration_start_byte)
+            .unwrap_or(usize::MAX);
         let resolved_module = if module.starts_with('.') {
             resolve_python_relative_module(file, &module)
         } else {
@@ -369,22 +361,20 @@ impl PythonAnalyzer {
         let mut binder = ImportBinder::empty();
 
         for import in imports {
-            let Some(details) = parse_python_import_details(&import.raw_snippet) else {
+            let Some(details) = python_import_details(import) else {
                 continue;
             };
             match details {
                 PythonImportDetails::Import { module, alias } => {
-                    let local_name = alias.unwrap_or_else(|| {
-                        module
-                            .split('.')
-                            .next_back()
-                            .unwrap_or(module.as_str())
-                            .to_string()
-                    });
+                    let local_name =
+                        imports::python_namespace_binding_name(import, alias.as_deref(), &module);
+                    let module_specifier =
+                        imports::python_namespace_binding_module(import, alias.as_deref(), &module);
                     binder.bindings.insert(
                         local_name,
                         ImportBinding {
-                            module_specifier: module,
+                            module_specifier,
+                            namespace_imported_module: Some(module),
                             kind: ImportKind::Namespace,
                             imported_name: None,
                         },
@@ -414,6 +404,7 @@ impl PythonAnalyzer {
                             local_name,
                             ImportBinding {
                                 module_specifier: module_candidate,
+                                namespace_imported_module: None,
                                 kind: ImportKind::Namespace,
                                 imported_name: None,
                             },
@@ -424,6 +415,7 @@ impl PythonAnalyzer {
                         local_name,
                         ImportBinding {
                             module_specifier: resolved_module,
+                            namespace_imported_module: None,
                             kind: ImportKind::Named,
                             imported_name: Some(name),
                         },

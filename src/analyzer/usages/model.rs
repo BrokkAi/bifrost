@@ -483,6 +483,10 @@ pub enum ImportKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ImportBinding {
     pub module_specifier: String,
+    /// Full module loaded by a namespace import when the locally bound module
+    /// differs from it. Python's `import pkg.child` binds `pkg` while loading
+    /// `pkg.child`; aliased namespace imports bind the full module directly.
+    pub namespace_imported_module: Option<String>,
     pub kind: ImportKind,
     pub imported_name: Option<String>,
 }

@@ -498,6 +498,7 @@ fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut I
             binding.local_name,
             ImportBinding {
                 module_specifier: binding.module_specifier,
+                namespace_imported_module: None,
                 kind,
                 imported_name,
             },
@@ -534,6 +535,7 @@ fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinde
                             local,
                             ImportBinding {
                                 module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
                                 kind: ImportKind::Default,
                                 imported_name: None,
                             },
@@ -553,6 +555,7 @@ fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinde
                             local,
                             ImportBinding {
                                 module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
                                 kind: ImportKind::Namespace,
                                 imported_name: None,
                             },
@@ -582,6 +585,7 @@ fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinde
                             local_name,
                             ImportBinding {
                                 module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
                                 kind: ImportKind::Named,
                                 imported_name,
                             },

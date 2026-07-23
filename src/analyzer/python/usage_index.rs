@@ -362,7 +362,11 @@ fn build_importer_reverse(
             continue;
         };
         for (local_name, binding) in &binder.bindings {
-            for target_file in resolve_module(module_index, file, &binding.module_specifier) {
+            let imported_module = binding
+                .namespace_imported_module
+                .as_deref()
+                .unwrap_or(&binding.module_specifier);
+            for target_file in resolve_module(module_index, file, imported_module) {
                 // A glob `from m import *` binds every export of the target file
                 // as a named edge, mirroring the graph it replaces.
                 if matches!(binding.kind, ImportKind::Glob) {

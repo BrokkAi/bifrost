@@ -1,85 +1,98 @@
-use brokk_bifrost::{ImportAnalysisProvider, ImportInfo, ProjectFile, PythonAnalyzer, TestProject};
+mod common;
 
-fn analyzer_for_temp_root(root: &std::path::Path) -> PythonAnalyzer {
-    PythonAnalyzer::from_project(TestProject::new(root, brokk_bifrost::Language::Python))
+use brokk_bifrost::analyzer::{StructuredImportPath, StructuredImportPathKind};
+use brokk_bifrost::{ImportAnalysisProvider, ImportInfo, Language, PythonAnalyzer};
+use common::InlineTestProject;
+
+fn import_info(
+    raw_snippet: &str,
+    identifier: Option<&str>,
+    path: &[&str],
+    kind: StructuredImportPathKind,
+) -> ImportInfo {
+    ImportInfo {
+        raw_snippet: raw_snippet.to_string(),
+        is_wildcard: false,
+        identifier: identifier.map(str::to_string),
+        alias: None,
+        path: Some(StructuredImportPath {
+            segments: path.iter().map(|segment| (*segment).to_string()).collect(),
+            kind: Some(kind),
+            lexical_prefixes: Vec::new(),
+            lexical_scopes: Vec::new(),
+            declaration_start_byte: 0,
+        }),
+    }
 }
 
 #[test]
 fn test_could_import_file_relative_parent_import() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let source = ProjectFile::new(root.to_path_buf(), "pkg/sub/module.py");
-    source.write("from .. import utils").unwrap();
-    let target = ProjectFile::new(root.to_path_buf(), "pkg/utils.py");
-    target.write("def some_fn(): pass").unwrap();
-
-    let analyzer = analyzer_for_temp_root(root);
-    let import = ImportInfo {
-        raw_snippet: "from .. import utils".to_string(),
-        is_wildcard: false,
-        identifier: Some("utils".to_string()),
-        alias: None,
-        path: None,
-    };
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/sub/module.py", "from .. import utils")
+        .file("pkg/utils.py", "def some_fn(): pass")
+        .build();
+    let source = project.file("pkg/sub/module.py");
+    let target = project.file("pkg/utils.py");
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let import = import_info(
+        "from .. import utils",
+        Some("utils"),
+        &["..", "utils"],
+        StructuredImportPathKind::ImportFrom,
+    );
     assert!(analyzer.could_import_file(&source, &[import], &target));
 }
 
 #[test]
 fn test_could_import_file_relative_parent_module_import() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let source = ProjectFile::new(root.to_path_buf(), "pkg/sub/module.py");
-    source.write("from ..other import something").unwrap();
-    let target = ProjectFile::new(root.to_path_buf(), "pkg/other.py");
-    target.write("something = 1").unwrap();
-
-    let analyzer = analyzer_for_temp_root(root);
-    let import = ImportInfo {
-        raw_snippet: "from ..other import something".to_string(),
-        is_wildcard: false,
-        identifier: Some("something".to_string()),
-        alias: None,
-        path: None,
-    };
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/sub/module.py", "from ..other import something")
+        .file("pkg/other.py", "something = 1")
+        .build();
+    let source = project.file("pkg/sub/module.py");
+    let target = project.file("pkg/other.py");
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let import = import_info(
+        "from ..other import something",
+        Some("something"),
+        &["..other", "something"],
+        StructuredImportPathKind::ImportFrom,
+    );
     assert!(analyzer.could_import_file(&source, &[import], &target));
 }
 
 #[test]
 fn test_could_import_file_invalid_relative_import_conservative_return() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let source = ProjectFile::new(root.to_path_buf(), "pkg/module.py");
-    source.write("from ... import utils").unwrap();
-    let target = ProjectFile::new(root.to_path_buf(), "some_other.py");
-    target.write("").unwrap();
-
-    let analyzer = analyzer_for_temp_root(root);
-    let import = ImportInfo {
-        raw_snippet: "from ... import utils".to_string(),
-        is_wildcard: false,
-        identifier: Some("utils".to_string()),
-        alias: None,
-        path: None,
-    };
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/module.py", "from ... import utils")
+        .file("some_other.py", "")
+        .build();
+    let source = project.file("pkg/module.py");
+    let target = project.file("some_other.py");
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let import = import_info(
+        "from ... import utils",
+        Some("utils"),
+        &["...", "utils"],
+        StructuredImportPathKind::ImportFrom,
+    );
     assert!(analyzer.could_import_file(&source, &[import], &target));
 }
 
 #[test]
 fn test_could_import_file_negative_match() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    let source = ProjectFile::new(root.to_path_buf(), "pkg/module.py");
-    source.write("import unrelated").unwrap();
-    let target = ProjectFile::new(root.to_path_buf(), "pkg/target.py");
-    target.write("").unwrap();
-
-    let analyzer = analyzer_for_temp_root(root);
-    let import = ImportInfo {
-        raw_snippet: "import unrelated".to_string(),
-        is_wildcard: false,
-        identifier: Some("unrelated".to_string()),
-        alias: None,
-        path: None,
-    };
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/module.py", "import unrelated")
+        .file("pkg/target.py", "")
+        .build();
+    let source = project.file("pkg/module.py");
+    let target = project.file("pkg/target.py");
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let import = import_info(
+        "import unrelated",
+        Some("unrelated"),
+        &["unrelated"],
+        StructuredImportPathKind::Namespace,
+    );
     assert!(!analyzer.could_import_file(&source, &[import], &target));
 }

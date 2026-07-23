@@ -975,6 +975,7 @@ fn import_binder_of(
                     "*".to_string(),
                     ImportBinding {
                         module_specifier: path,
+                        namespace_imported_module: None,
                         kind: ImportKind::Glob,
                         imported_name: None,
                     },
@@ -1007,6 +1008,7 @@ fn import_binder_of(
                         local,
                         ImportBinding {
                             module_specifier: path.clone(),
+                            namespace_imported_module: None,
                             kind: ImportKind::Namespace,
                             imported_name: None,
                         },

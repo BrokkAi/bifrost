@@ -92,6 +92,14 @@ fn call_result_receiver_resolves_member_usage() {
 }
 
 #[test]
+fn shadowed_bare_factory_does_not_resolve_member_usage() {
+    assert_no_python_member_hit(
+        "class Foo:\n    bar: int\n\ndef build() -> Foo:\n    return Foo()\n",
+        "from service import build\n\ndef read(build):\n    return build().bar\n",
+    );
+}
+
+#[test]
 fn imported_alias_annotation_resolves_receiver_member_usage() {
     assert_single_python_member_hit(
         "class Foo:\n    bar: int\n",
@@ -520,6 +528,145 @@ class DynamicConfig:
 }
 
 #[test]
+fn classmethod_attribute_callee_return_resolves_member_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "config.py",
+            r#"
+class RTDETRConfig:
+    input_size: int
+
+    @classmethod
+    def from_name(cls, name: str) -> "RTDETRConfig":
+        return cls()
+"#,
+        )
+        .file(
+            "consumer.py",
+            "from config import RTDETRConfig as Alias\n\nsize = Alias.from_name(\"r18\").input_size\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "config.RTDETRConfig.input_size");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve classmethod attribute-callee return usage");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(
+        hit.snippet.contains("Alias.from_name(\"r18\").input_size"),
+        "{hit:#?}"
+    );
+}
+
+#[test]
+fn classmethod_attribute_callee_return_does_not_match_unknown_factory_return() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "config.py",
+            r#"
+class RTDETRConfig:
+    input_size: int
+
+    @classmethod
+    def from_name(cls, name: str):
+        return cls()
+"#,
+        )
+        .file(
+            "consumer.py",
+            "from config import RTDETRConfig\n\nsize = RTDETRConfig.from_name(\"r18\").input_size\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "config.RTDETRConfig.input_size");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for unknown factory returns");
+
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+#[test]
+fn classmethod_attribute_callee_return_does_not_match_different_owner() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "config.py",
+            r#"
+class RTDETRConfig:
+    input_size: int
+
+class OtherConfig:
+    input_size: int
+
+    @classmethod
+    def from_name(cls, name: str) -> "OtherConfig":
+        return cls()
+"#,
+        )
+        .file(
+            "consumer.py",
+            "from config import OtherConfig\n\nsize = OtherConfig.from_name(\"r18\").input_size\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "config.RTDETRConfig.input_size");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for different-owner factory returns");
+
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+#[test]
+fn shadowed_class_name_does_not_match_attribute_callee_return_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "config.py",
+            r#"
+class RTDETRConfig:
+    input_size: int
+
+    @classmethod
+    def from_name(cls, name: str) -> "RTDETRConfig":
+        return cls()
+
+class OtherConfig:
+    @classmethod
+    def from_name(cls, name: str) -> "OtherConfig":
+        return cls()
+"#,
+        )
+        .file(
+            "consumer.py",
+            "from config import RTDETRConfig, OtherConfig\n\n\
+def shadow():\n    RTDETRConfig = OtherConfig\n    return RTDETRConfig.from_name(\"r18\").input_size\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "config.RTDETRConfig.input_size");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for shadowed class-name receivers");
+
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+#[test]
 fn relative_import_resolves_export_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -873,6 +1020,77 @@ def shadow(expression):
     let hit = hits.iter().next().expect("one module qualifier hit");
     assert_eq!(hit.file, project.file("consumer.py"));
     assert!(hit.snippet.contains("expression.Expression()"), "{hit:#?}");
+}
+
+#[test]
+fn imported_package_submodule_qualifier_reports_module_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/image.py", "VALUE = 1\n")
+        .file("pkg/__init__.py", "from . import image\n")
+        .file("consumer.py", "import pkg as K\n\nvalue = K.image.VALUE\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.image");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the intermediate package qualifier");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one module qualifier hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("K.image.VALUE"), "{hit:#?}");
+}
+
+#[test]
+fn from_imported_submodule_qualifier_reports_module_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("api/v2/metrics_pb2.py", "VALUE = 1\n")
+        .file("api/v2/__init__.py", "from . import metrics_pb2\n")
+        .file("api/__init__.py", "from . import v2\n")
+        .file(
+            "consumer.py",
+            "from api import v2\n\nvalue = v2.metrics_pb2.VALUE\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "api.v2.metrics_pb2");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the imported submodule qualifier");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one module qualifier hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("v2.metrics_pb2.VALUE"), "{hit:#?}");
+}
+
+#[test]
+fn shadowed_root_does_not_report_imported_submodule_qualifier_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/image.py", "VALUE = 1\n")
+        .file("pkg/__init__.py", "from . import image\n")
+        .file(
+            "consumer.py",
+            "import pkg as K\n\n\
+def shadow(K):\n    return K.image.VALUE\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.image");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for a shadowed imported submodule qualifier");
+
+    assert!(hits.is_empty(), "{hits:#?}");
 }
 
 #[test]

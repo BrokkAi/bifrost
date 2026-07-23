@@ -57,7 +57,8 @@ pub(super) fn resolve_python(
                 site.range.start_byte,
                 source,
             );
-            if !object_shadowed && let Some(module) = ctx.namespace_module_for_object(object_text) {
+            if !object_shadowed && let Some(module) = ctx.namespace_module_for_node(object, source)
+            {
                 return python_fqn_outcome(
                     py,
                     support,
@@ -126,12 +127,18 @@ pub(super) fn resolve_python(
                 if !candidates.is_empty() {
                     return candidates_outcome(candidates);
                 }
+                if let Some(module) = ctx.namespace.get(text) {
+                    return python_module_outcome(py, support, module, text);
+                }
                 return no_definition(
                     "no_indexed_definition",
                     format!("`{text}` is bound locally but has no indexed Python definition"),
                 );
             }
-            if let Some(fqn) = ctx.named.get(text).or_else(|| ctx.namespace.get(text)) {
+            if let Some(module) = ctx.namespace.get(text) {
+                return python_module_outcome(py, support, module, text);
+            }
+            if let Some(fqn) = ctx.named.get(text) {
                 return python_fqn_outcome(py, support, fqn, text);
             }
             if let Some(candidates) = ctx.same_file.get(text)
@@ -258,8 +265,12 @@ fn python_visible_module_binding_candidates(
                 }
             }
             ModuleBindingEventKind::ImportModule(module) => {
-                candidates
-                    .extend(py.resolve_fqn_candidates(module, |candidate| support.fqn(candidate)));
+                let bound_module = context
+                    .namespace
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(module);
+                candidates.extend(py.resolve_module_code_unit(bound_module));
             }
             ModuleBindingEventKind::Other => {
                 if let Some(local) = context.same_file.get(name) {
@@ -444,14 +455,28 @@ impl PythonDefinitionContext {
         }
     }
 
-    fn namespace_module_for_object(&self, object: &str) -> Option<&str> {
-        if let Some(module) = self.namespace.get(object) {
-            return Some(module.as_str());
+    fn namespace_module_for_node(&self, object: Node<'_>, source: &str) -> Option<String> {
+        let mut attributes = Vec::new();
+        let mut current = object;
+        while current.kind() == "attribute" {
+            let attribute = current.child_by_field_name("attribute")?;
+            let text = python_slice(attribute, source);
+            if text.is_empty() {
+                return None;
+            }
+            attributes.push(text);
+            current = current.child_by_field_name("object")?;
         }
-        self.namespace
-            .values()
-            .find(|module| module.as_str() == object)
-            .map(String::as_str)
+        if current.kind() != "identifier" {
+            return None;
+        }
+        let root = python_slice(current, source);
+        let mut module = self.namespace.get(root)?.clone();
+        for attribute in attributes.into_iter().rev() {
+            module.push('.');
+            module.push_str(attribute);
+        }
+        Some(module)
     }
 
     fn receiver_type_for_object(
@@ -669,6 +694,26 @@ fn python_fqn_outcome(
     no_definition(
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed Python definition was found"),
+    )
+}
+
+fn python_module_outcome(
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    module_fq: &str,
+    raw: &str,
+) -> DefinitionLookupOutcome {
+    if let Some(module) = py.resolve_module_code_unit(module_fq) {
+        return candidates_outcome(vec![module]);
+    }
+    if python_crosses_unindexed_boundary(support, module_fq) {
+        return boundary(format!(
+            "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{raw}` resolved to module `{module_fq}`, but no indexed Python module was found"),
     )
 }
 

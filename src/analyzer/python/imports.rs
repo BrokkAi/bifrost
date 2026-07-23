@@ -1,7 +1,8 @@
 use super::*;
-use crate::analyzer::ImportInfo;
+use crate::analyzer::{ImportInfo, StructuredImportPath, StructuredImportPathKind};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use tree_sitter::Node;
 
 impl PythonAnalyzer {
     pub(super) fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
@@ -19,17 +20,13 @@ impl PythonAnalyzer {
         file: &ProjectFile,
         import: &ImportInfo,
     ) -> Vec<(String, CodeUnit)> {
-        if let Some(details) = parse_python_import_details(&import.raw_snippet) {
+        if let Some(details) = python_import_details(import) {
             match details {
                 PythonImportDetails::Import { module, alias } => {
-                    if let Some(module_code_unit) = self.resolve_module_code_unit(&module) {
-                        let binding = alias.unwrap_or_else(|| {
-                            module
-                                .split('.')
-                                .next_back()
-                                .unwrap_or(module.as_str())
-                                .to_string()
-                        });
+                    let binding = python_namespace_binding_name(import, alias.as_deref(), &module);
+                    let bound_module =
+                        python_namespace_binding_module(import, alias.as_deref(), &module);
+                    if let Some(module_code_unit) = self.resolve_module_code_unit(&bound_module) {
                         return vec![(binding, module_code_unit)];
                     }
                 }
@@ -339,9 +336,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         let mut used_wildcards = HashSet::default();
         for ident in &unresolved {
             for wildcard in &wildcard_imports {
-                let Some(package_name) =
-                    extract_package_from_python_wildcard(&wildcard.raw_snippet)
-                else {
+                let Some(package_name) = extract_package_from_python_wildcard(wildcard) else {
                     continue;
                 };
 
@@ -374,7 +369,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         target: &ProjectFile,
     ) -> bool {
         for import in imports {
-            let Some(details) = parse_python_import_details(&import.raw_snippet) else {
+            let Some(details) = python_import_details(import) else {
                 continue;
             };
             match details {
@@ -406,8 +401,8 @@ impl ImportAnalysisProvider for PythonAnalyzer {
     }
 }
 
-pub(super) fn extract_package_from_python_wildcard(raw: &str) -> Option<String> {
-    let details = parse_python_import_details(raw)?;
+pub(super) fn extract_package_from_python_wildcard(import: &ImportInfo) -> Option<String> {
+    let details = python_import_details(import)?;
     match details {
         PythonImportDetails::FromImport {
             module, wildcard, ..
@@ -430,108 +425,250 @@ pub(super) enum PythonImportDetails {
     },
 }
 
-pub(super) fn parse_python_import_infos(raw: &str) -> Vec<ImportInfo> {
+pub(super) fn python_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    match node.kind() {
+        "import_statement" => python_namespace_import_infos(node, source),
+        "import_from_statement" => python_from_import_infos(node, source),
+        _ => Vec::new(),
+    }
+}
+
+pub(super) fn python_import_details(import: &ImportInfo) -> Option<PythonImportDetails> {
+    let path = import.path.as_ref()?;
+    match path.kind? {
+        StructuredImportPathKind::Namespace => Some(PythonImportDetails::Import {
+            module: join_python_import_segments(&path.segments),
+            alias: import.alias.clone(),
+        }),
+        StructuredImportPathKind::ImportFrom => {
+            let (name, module_segments) = if import.is_wildcard {
+                ("*".to_string(), path.segments.as_slice())
+            } else {
+                let (name, module_segments) = path.segments.split_last()?;
+                (name.clone(), module_segments)
+            };
+            Some(PythonImportDetails::FromImport {
+                module: join_python_import_segments(module_segments),
+                name,
+                alias: import.alias.clone(),
+                wildcard: import.is_wildcard,
+            })
+        }
+    }
+}
+
+fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
     let mut infos = Vec::new();
-    if let Some(body) = raw.strip_prefix("import ") {
-        for part in split_top_level_commas(body) {
-            let (module, alias) = split_alias(&part);
-            infos.push(ImportInfo {
-                raw_snippet: if let Some(alias) = &alias {
-                    format!("import {module} as {alias}")
-                } else {
-                    format!("import {module}")
-                },
-                is_wildcard: false,
-                identifier: Some(alias.clone().unwrap_or_else(|| {
-                    module
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(module.as_str())
-                        .to_string()
-                })),
-                alias,
-                path: None,
-            });
-        }
-    } else if let Some((module, names)) = raw
-        .strip_prefix("from ")
-        .and_then(|tail| tail.split_once(" import "))
-    {
-        if names.trim() == "*" {
-            infos.push(ImportInfo {
-                raw_snippet: format!("from {module} import *"),
-                is_wildcard: true,
-                identifier: None,
-                alias: None,
-                path: None,
-            });
+    let mut cursor = node.walk();
+    for imported in node.children_by_field_name("name", &mut cursor) {
+        let (module_node, alias) = if imported.kind() == "aliased_import" {
+            let Some(name) = imported.child_by_field_name("name") else {
+                continue;
+            };
+            let alias = imported
+                .child_by_field_name("alias")
+                .map(|alias| py_node_text(alias, source).trim().to_string())
+                .filter(|alias| !alias.is_empty());
+            (name, alias)
         } else {
-            for part in split_top_level_commas(names) {
-                let (name, alias) = split_alias(&part);
-                infos.push(ImportInfo {
-                    raw_snippet: if let Some(alias) = &alias {
-                        format!("from {module} import {name} as {alias}")
-                    } else {
-                        format!("from {module} import {name}")
-                    },
-                    is_wildcard: false,
-                    identifier: Some(alias.clone().unwrap_or_else(|| name.clone())),
-                    alias,
-                    path: None,
-                });
-            }
+            (imported, None)
+        };
+        let segments = python_path_segments(module_node, source);
+        if segments.is_empty() {
+            continue;
         }
+        let module = join_python_import_segments(&segments);
+        let identifier = alias.clone().or_else(|| segments.first().cloned());
+        infos.push(ImportInfo {
+            raw_snippet: if let Some(alias) = &alias {
+                format!("import {module} as {alias}")
+            } else {
+                format!("import {module}")
+            },
+            is_wildcard: false,
+            identifier,
+            alias,
+            path: Some(StructuredImportPath {
+                segments,
+                kind: Some(StructuredImportPathKind::Namespace),
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: node.start_byte(),
+            }),
+        });
     }
     infos
 }
 
-pub(super) fn parse_python_import_details(raw: &str) -> Option<PythonImportDetails> {
-    if let Some(body) = raw.strip_prefix("import ") {
-        let part = split_top_level_commas(body).into_iter().next()?;
-        let (module, alias) = split_alias(&part);
-        return Some(PythonImportDetails::Import { module, alias });
+fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    let Some(module_node) = node.child_by_field_name("module_name") else {
+        return Vec::new();
+    };
+    let module_segments = python_module_segments(module_node, source);
+    if module_segments.is_empty() {
+        return Vec::new();
     }
-    let (module, names) = raw.strip_prefix("from ")?.split_once(" import ")?;
-    if names.trim() == "*" {
-        return Some(PythonImportDetails::FromImport {
-            module: module.to_string(),
-            name: "*".to_string(),
+
+    let mut infos = Vec::new();
+    let has_wildcard_import = {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|child| child.kind() == "wildcard_import")
+    };
+    let mut cursor = node.walk();
+    let imported_names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
+    if has_wildcard_import {
+        let module = join_python_import_segments(&module_segments);
+        infos.push(ImportInfo {
+            raw_snippet: format!("from {module} import *"),
+            is_wildcard: true,
+            identifier: None,
             alias: None,
-            wildcard: true,
+            path: Some(StructuredImportPath {
+                segments: module_segments,
+                kind: Some(StructuredImportPathKind::ImportFrom),
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: node.start_byte(),
+            }),
+        });
+        return infos;
+    }
+    if imported_names.is_empty() {
+        return infos;
+    }
+
+    for imported in imported_names {
+        let (name_node, alias) = if imported.kind() == "aliased_import" {
+            let Some(name) = imported.child_by_field_name("name") else {
+                continue;
+            };
+            let alias = imported
+                .child_by_field_name("alias")
+                .map(|alias| py_node_text(alias, source).trim().to_string())
+                .filter(|alias| !alias.is_empty());
+            (name, alias)
+        } else {
+            (imported, None)
+        };
+        let name_segments = python_path_segments(name_node, source);
+        if name_segments.is_empty() {
+            continue;
+        }
+        let imported_name = join_python_import_segments(&name_segments);
+        let mut segments = module_segments.clone();
+        segments.extend(name_segments);
+        let module = join_python_import_segments(&module_segments);
+        infos.push(ImportInfo {
+            raw_snippet: if let Some(alias) = &alias {
+                format!("from {module} import {imported_name} as {alias}")
+            } else {
+                format!("from {module} import {imported_name}")
+            },
+            is_wildcard: false,
+            identifier: Some(alias.clone().unwrap_or_else(|| imported_name.clone())),
+            alias,
+            path: Some(StructuredImportPath {
+                segments,
+                kind: Some(StructuredImportPathKind::ImportFrom),
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: node.start_byte(),
+            }),
         });
     }
-    let part = split_top_level_commas(names).into_iter().next()?;
-    let (name, alias) = split_alias(&part);
-    Some(PythonImportDetails::FromImport {
-        module: module.to_string(),
-        name,
-        alias,
-        wildcard: false,
-    })
+    infos
 }
 
-fn split_top_level_commas(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(normalize_python_import_part)
-        .filter(|part| !part.is_empty())
-        .collect()
+fn python_module_segments(module: Node<'_>, source: &str) -> Vec<String> {
+    if module.kind() == "relative_import" {
+        let mut cursor = module.walk();
+        let mut prefix = String::new();
+        let mut path_node = None;
+        for child in module.named_children(&mut cursor) {
+            match child.kind() {
+                "import_prefix" if prefix.is_empty() => {
+                    prefix = py_node_text(child, source).trim().to_string();
+                }
+                "dotted_name" if path_node.is_none() => {
+                    path_node = Some(child);
+                }
+                _ => {}
+            }
+        }
+        let mut segments = path_node
+            .map(|path| python_path_segments(path, source))
+            .unwrap_or_default();
+        if !prefix.is_empty() {
+            if let Some(first) = segments.first_mut() {
+                first.insert_str(0, &prefix);
+            } else {
+                segments.push(prefix);
+            }
+        }
+        return segments;
+    }
+    python_path_segments(module, source)
 }
 
-fn normalize_python_import_part(input: &str) -> String {
-    input
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim()
-        .to_string()
+fn python_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    match node.kind() {
+        "identifier" => vec![py_node_text(node, source).trim().to_string()],
+        "dotted_name" => {
+            let mut segments = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                segments.extend(python_path_segments(child, source));
+            }
+            segments
+        }
+        _ => {
+            let mut segments = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                segments.extend(python_path_segments(child, source));
+            }
+            segments
+        }
+    }
 }
 
-fn split_alias(input: &str) -> (String, Option<String>) {
-    input
-        .rsplit_once(" as ")
-        .map(|(name, alias)| (name.trim().to_string(), Some(alias.trim().to_string())))
-        .unwrap_or_else(|| (input.trim().to_string(), None))
+fn join_python_import_segments(segments: &[String]) -> String {
+    let Some((first, rest)) = segments.split_first() else {
+        return String::new();
+    };
+    if first.starts_with('.') && !rest.is_empty() {
+        format!("{first}.{}", rest.join("."))
+    } else {
+        segments.join(".")
+    }
+}
+
+pub(super) fn python_namespace_binding_name(
+    import: &ImportInfo,
+    alias: Option<&str>,
+    module: &str,
+) -> String {
+    import
+        .identifier
+        .clone()
+        .or_else(|| alias.map(str::to_string))
+        .unwrap_or_else(|| module.to_string())
+}
+
+pub(super) fn python_namespace_binding_module(
+    import: &ImportInfo,
+    alias: Option<&str>,
+    module: &str,
+) -> String {
+    if alias.is_some() {
+        return module.to_string();
+    }
+    import
+        .path
+        .as_ref()
+        .and_then(|path| path.segments.first().cloned())
+        .unwrap_or_else(|| module.to_string())
 }
 
 pub(super) fn resolve_python_relative_module(

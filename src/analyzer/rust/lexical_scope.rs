@@ -30,6 +30,7 @@ pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &Imp
             format!("*:{module_specifier}"),
             ImportBinding {
                 module_specifier,
+                namespace_imported_module: None,
                 kind: ImportKind::Glob,
                 imported_name: None,
             },
@@ -82,6 +83,7 @@ pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &Imp
         local_name,
         ImportBinding {
             module_specifier,
+            namespace_imported_module: None,
             kind,
             imported_name,
         },

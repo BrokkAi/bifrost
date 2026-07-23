@@ -1895,6 +1895,175 @@ def validate_exchange(ex_has):
 }
 
 #[test]
+fn get_definitions_by_reference_resolves_python_dotted_module_alias_to_exact_module() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("cirq_google/__init__.py", "")
+        .file(
+            "cirq_google/engine/__init__.py",
+            "from .engine import Engine\n",
+        )
+        .file("cirq_google/engine/engine.py", "class Engine:\n    pass\n")
+        .file(
+            "app.py",
+            r#"import cirq_google.engine.engine as engine_base
+
+def use_alias():
+    return engine_base.Engine
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "app.use_alias",
+                    "context": "    return engine_base.Engine",
+                    "target": "engine_base"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!(
+        1,
+        result["definitions"].as_array().unwrap().len(),
+        "{value}"
+    );
+    assert_eq!(
+        "cirq_google.engine.engine", result["definitions"][0]["fqn"],
+        "{value}"
+    );
+    assert_eq!(
+        "cirq_google/engine/engine.py", result["definitions"][0]["path"],
+        "{value}"
+    );
+}
+
+#[test]
+fn get_definitions_by_reference_resolves_unaliased_python_dotted_module_member() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "")
+        .file("pkg/service.py", "class Service:\n    pass\n")
+        .file(
+            "app.py",
+            "import pkg.service\n\ndef use():\n    return pkg.service.Service\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "app.use",
+                    "context": "    return pkg.service.Service",
+                    "target": "Service"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!("pkg.service.Service", result["definitions"][0]["fqn"]);
+    assert_eq!("pkg/service.py", result["definitions"][0]["path"]);
+}
+
+#[test]
+fn get_definitions_by_reference_reports_shadowed_python_module_alias_as_local_binding() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("cirq_google/__init__.py", "")
+        .file("cirq_google/engine/__init__.py", "")
+        .file("cirq_google/engine/engine.py", "class Engine:\n    pass\n")
+        .file(
+            "app.py",
+            r#"import cirq_google.engine.engine as engine_base
+
+def use_alias():
+    engine_base = object()
+    return engine_base.Engine
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "app.use_alias",
+                    "context": "    return engine_base.Engine",
+                    "target": "engine_base"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!("no_definition", result["status"], "{value}");
+    assert_eq!(
+        "local_variable_reference", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+}
+
+#[test]
+fn get_definitions_by_reference_reports_boundary_for_unindexed_python_module_alias() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"import external.pkg.mod as engine_base
+
+def use_alias():
+    return engine_base.Builder
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            &serde_json::json!({
+                "references": [{
+                    "symbol": "app.use_alias",
+                    "context": "    return engine_base.Builder",
+                    "target": "engine_base"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = only_result(&value);
+
+    assert_eq!("unresolvable_import_boundary", result["status"], "{value}");
+    assert_eq!(
+        "unresolvable_import_boundary", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
+    assert!(
+        result["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("external.pkg.mod")),
+        "{value}"
+    );
+}
+
+#[test]
 fn get_definitions_by_reference_resolves_cpp_overload_by_argument_type() {
     let temp = TempDir::new().unwrap();
     fs::write(

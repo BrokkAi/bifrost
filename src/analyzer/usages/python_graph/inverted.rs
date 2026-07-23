@@ -374,7 +374,7 @@ fn handle_attribute<'a>(
         return;
     }
     if object.kind() == "call" && ctx.targets_by_terminal.contains_key(attribute_text) {
-        for class in call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, object) {
+        for class in call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, object, facts) {
             let direct = format!("{}.{attribute_text}", class.fq_name());
             if ctx.targets.contains(&direct) {
                 ctx.record(direct, attribute);
