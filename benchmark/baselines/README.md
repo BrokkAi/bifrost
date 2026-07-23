@@ -57,18 +57,19 @@ exercise the new query correctness, cache-path, and timing contracts instead of
 treating all 16 cases as absent from the baseline.
 
 The July 23 post-sync issue #920 refresh is promoted from the exact-branch
-artifact `run-20260723T005928Z.json` from Actions run 29970021643 at Bifrost
-commit `180e7b5dd4eb83d9a0936caa4aa3d56e617003b2`. All 92 scenarios succeeded,
+artifact `run-20260723T011914Z.json` from Actions run 29970897733 at Bifrost
+commit `47737aaed504a938fbedad6d6a4e0b2d27ce8f56`. All 92 scenarios succeeded,
 including all 16 `query_code` cases, and the workflow reported no regression
 against the prior blessed baseline. The artifact has no threshold crossings in
-either comparison direction against exact-head run 29968367834 and passes strict
+either comparison direction against exact-head run 29970021643 and passes strict
 comparison against itself. Run 29966995969 was rejected because its broadly
 faster runner produced 30 threshold crossings when a representative replay was
 compared against it; blessing that sample would have manufactured regressions
 across unrelated languages. This refresh includes the Rust analysis-epoch fix,
-the Scala relative-import changes, and the O(1) lazy-LRU/SearchTools cache work
-from current master, so future comparisons use the current persisted-store and
-cache contracts.
+the Scala relative-import changes, the O(1) lazy-LRU/SearchTools cache work, and
+the known inert built-in macro suppression from current master, so future
+comparisons use the current persisted-store, cache, and Rust declaration
+contracts.
 
 It is not written automatically. Promote it deliberately:
 
