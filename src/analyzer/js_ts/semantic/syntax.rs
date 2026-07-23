@@ -25,6 +25,16 @@ struct EnclosingBinding {
 }
 
 pub(super) fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    if matches!(node.kind(), "field_definition" | "public_field_definition") {
+        let name = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"))?;
+        if name.kind() == "computed_property_name" {
+            return None;
+        }
+        return nonempty_node_text(source, name).map(Box::<str>::from);
+    }
+
     if let Some(name) = node
         .child_by_field_name("name")
         .and_then(|name| nonempty_node_text(source, name))
@@ -129,31 +139,51 @@ pub(super) fn callable_shape<'tree>(
     Node<'tree>,
     ProcedureProperties,
 )> {
-    let (kind, segment_kind, generator) = match node.kind() {
+    let (kind, segment_kind, body, generator, is_static) = match node.kind() {
         "function_declaration" | "function_expression" => (
             ProcedureKind::Function,
             DeclarationSegmentKind::Function,
+            node.child_by_field_name("body")?,
+            false,
             false,
         ),
         "generator_function_declaration" | "generator_function" => (
             ProcedureKind::Function,
             DeclarationSegmentKind::Function,
+            node.child_by_field_name("body")?,
             true,
+            false,
         ),
-        "arrow_function" => (ProcedureKind::Lambda, DeclarationSegmentKind::Lambda, false),
+        "arrow_function" => (
+            ProcedureKind::Lambda,
+            DeclarationSegmentKind::Lambda,
+            node.child_by_field_name("body")?,
+            false,
+            false,
+        ),
         "method_definition" => (
             ProcedureKind::Method,
             DeclarationSegmentKind::Method,
+            node.child_by_field_name("body")?,
             has_child_kind(node, "*"),
+            has_child_kind(node, "static") || has_child_kind(node, "static get"),
         ),
         "class_static_block" => (
             ProcedureKind::Initializer,
             DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("body")?,
             false,
+            true,
+        ),
+        "field_definition" | "public_field_definition" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("value")?,
+            false,
+            has_child_kind(node, "static"),
         ),
         _ => return None,
     };
-    let body = node.child_by_field_name("body")?;
     let mut cursor = node.walk();
     let is_async = node
         .children(&mut cursor)
@@ -165,9 +195,7 @@ pub(super) fn callable_shape<'tree>(
         ProcedureProperties {
             is_async,
             is_generator: generator,
-            is_static: node.kind() == "class_static_block"
-                || (node.kind() == "method_definition"
-                    && (has_child_kind(node, "static") || has_child_kind(node, "static get"))),
+            is_static,
             is_synthetic: false,
             invocation: if generator {
                 ProcedureInvocationKind::Deferred
@@ -177,6 +205,14 @@ pub(super) fn callable_shape<'tree>(
             ..ProcedureProperties::default()
         },
     ))
+}
+
+pub(super) fn callable_child_belongs_to_procedure(callable: Node<'_>, child: Node<'_>) -> bool {
+    match callable.kind() {
+        "field_definition" | "public_field_definition" => field_matches(callable, "value", child),
+        "method_definition" => !field_matches(callable, "name", child),
+        _ => true,
+    }
 }
 
 pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {

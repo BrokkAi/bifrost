@@ -100,7 +100,7 @@ pub(super) fn enumerate_procedures<'tree>(
             lexical_parent,
             declaration_path,
         } = frame;
-        let mut child_path = declaration_path;
+        let mut outer_path = declaration_path;
         if let Some(segment_kind) = declaration_container_kind(node) {
             let name = declaration_container_name(prepared.source(), node);
             let sibling_ordinal = next_sibling_ordinal(
@@ -113,10 +113,10 @@ pub(super) fn enumerate_procedures<'tree>(
             let segment =
                 declaration_segment(segment_kind, name.as_deref(), anchor, sibling_ordinal)
                     .map_err(SemanticProviderError::invalid_identity)?;
-            child_path = push_declaration_path(&mut declaration_paths, declaration_path, segment);
+            outer_path = push_declaration_path(&mut declaration_paths, declaration_path, segment);
         }
 
-        let mut child_parent = lexical_parent;
+        let mut procedure_context = None;
         if let Some((mut kind, mut segment_kind, body, properties)) = callable_shape(node) {
             let id = ProcedureId::try_from_index(specs.len())
                 .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
@@ -126,12 +126,12 @@ pub(super) fn enumerate_procedures<'tree>(
                 segment_kind = DeclarationSegmentKind::Constructor;
             }
             let sibling_ordinal =
-                next_sibling_ordinal(&mut siblings, child_path, segment_kind, name.as_deref());
+                next_sibling_ordinal(&mut siblings, outer_path, segment_kind, name.as_deref());
             let anchor = source_anchor(node, 0).map_err(SemanticProviderError::invalid_identity)?;
             let segment =
                 declaration_segment(segment_kind, name.as_deref(), anchor, sibling_ordinal)
                     .map_err(SemanticProviderError::invalid_identity)?;
-            let mut segments = collect_declaration_path(&declaration_paths, child_path);
+            let mut segments = collect_declaration_path(&declaration_paths, outer_path);
             segments.push(segment.clone());
             let declaration = DeclarationLocator::new(segments)
                 .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
@@ -169,13 +169,21 @@ pub(super) fn enumerate_procedures<'tree>(
                 callable: node,
                 captures_receiver,
             });
-            child_parent = Some(id);
-            child_path = push_declaration_path(&mut declaration_paths, child_path, segment);
+            let procedure_path = push_declaration_path(&mut declaration_paths, outer_path, segment);
+            procedure_context = Some((id, procedure_path));
         }
 
         let mut cursor = node.walk();
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children.into_iter().rev() {
+            let (child_parent, child_path) = match procedure_context {
+                Some((procedure, procedure_path))
+                    if callable_child_belongs_to_procedure(node, child) =>
+                {
+                    (Some(procedure), procedure_path)
+                }
+                _ => (lexical_parent, outer_path),
+            };
             stack.push(ProcedureEnumerationFrame {
                 node: child,
                 lexical_parent: child_parent,

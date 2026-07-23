@@ -6620,7 +6620,9 @@ fn javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed() {
         )
         .bind(
             "field_arrow_entry",
-            PointSelector::new("() =>").procedure("run").effect("entry"),
+            PointSelector::new("() =>")
+                .procedure("src/features.js::type:Worker::initializer:run::lambda:run")
+                .effect("entry"),
         );
 
     graph.assert_point_gap(
@@ -6716,6 +6718,174 @@ fn javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed() {
                 segment.kind() == DeclarationSegmentKind::Type && segment.name() == Some("Worker")
             })
     );
+}
+
+#[test]
+fn javascript_typescript_class_field_initializers_are_source_backed() {
+    const SOURCE: &str = r#"
+        function outer() {
+            class Fields {
+                named = () => this;
+                static shared = () => this;
+                [(() => "computed")()] = () => this;
+                [(() => "direct")()] = this;
+                declared;
+            }
+        }
+    "#;
+
+    let project = InlineTestProject::new()
+        .file("javascript/fields.js", SOURCE)
+        .file("javascript/fields.jsx", SOURCE)
+        .file("typescript/fields.ts", SOURCE)
+        .file("typescript/fields.tsx", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut baseline = None;
+
+    for path in [
+        "javascript/fields.js",
+        "javascript/fields.jsx",
+        "typescript/fields.ts",
+        "typescript/fields.tsx",
+    ] {
+        let graph = SemanticGraph::materialize(&project, &analyzer, path);
+        let procedures = graph.artifact().procedures();
+        let outer = procedure_named(&graph, "outer", ProcedureKind::Function);
+        let initializers = procedures
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Initializer)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initializers.len(),
+            4,
+            "{path} should publish one initializer for each field value and none for `declared`"
+        );
+
+        let named_initializer = initializers
+            .iter()
+            .copied()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("named")
+            })
+            .unwrap_or_else(|| panic!("{path} should retain the named field identity"));
+        assert!(!named_initializer.properties().is_static);
+        let static_initializer = initializers
+            .iter()
+            .copied()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("shared")
+            })
+            .unwrap_or_else(|| panic!("{path} should retain the static field identity"));
+        assert!(static_initializer.properties().is_static);
+
+        let mut anonymous_ordinals = initializers
+            .iter()
+            .filter_map(|procedure| {
+                let segment = procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .expect("initializer declaration must have a final segment");
+                segment
+                    .name()
+                    .is_none()
+                    .then_some(segment.sibling_ordinal())
+            })
+            .collect::<Vec<_>>();
+        anonymous_ordinals.sort_unstable();
+        assert_eq!(anonymous_ordinals, [0, 1]);
+
+        for initializer in &initializers {
+            assert_eq!(initializer.lexical_parent(), Some(outer.id()));
+            assert!(
+                initializer
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .iter()
+                    .any(|segment| {
+                        segment.kind() == DeclarationSegmentKind::Type
+                            && segment.name() == Some("Fields")
+                    }),
+                "{path} initializer should remain nested under the class declaration"
+            );
+        }
+
+        let procedure_source = |procedure: &ProcedureSemantics| {
+            let span = procedure.locator().anchor().span();
+            SOURCE
+                .get(span.start_byte() as usize..span.end_byte() as usize)
+                .expect("procedure locator must remain inside the shared fixture")
+        };
+        let lambdas = procedures
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Lambda)
+            .collect::<Vec<_>>();
+        assert_eq!(lambdas.len(), 5);
+        for lambda in &lambdas {
+            let source = procedure_source(lambda);
+            if source.contains("\"computed\"") || source.contains("\"direct\"") {
+                assert_eq!(
+                    lambda.lexical_parent(),
+                    Some(outer.id()),
+                    "{path} computed field names execute in the outer class-definition context"
+                );
+            } else {
+                assert_eq!(source, "() => this");
+                assert!(
+                    initializers
+                        .iter()
+                        .any(|initializer| Some(initializer.id()) == lambda.lexical_parent()),
+                    "{path} field-value arrows should be owned by their initializer procedure"
+                );
+            }
+        }
+
+        let projection = procedures
+            .iter()
+            .map(|procedure| {
+                let final_segment = procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .expect("procedure declaration must have a final segment");
+                (
+                    procedure.kind(),
+                    final_segment.name().map(str::to_owned),
+                    final_segment.sibling_ordinal(),
+                    procedure.properties().is_static,
+                    procedure
+                        .lexical_parent()
+                        .and_then(|parent| procedures.get(parent.index()))
+                        .map(ProcedureSemantics::kind),
+                    procedure_source(procedure).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(baseline) = &baseline {
+            assert_eq!(
+                &projection, baseline,
+                "{path} should preserve JS/JSX/TS/TSX procedure identity parity"
+            );
+        } else {
+            baseline = Some(projection);
+        }
+    }
 }
 
 #[test]
