@@ -29,6 +29,11 @@ Use the bifrost-code-intelligence skill. Call the Bifrost get_summaries tool on 
 
 Use a source directory or source file for validation. Avoid a prompt that only asks about `README.md`, because that can pass through ordinary file reading without proving the MCP server ran.
 
+Apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+the Bifrost tool event and structured result for a known workspace declaration,
+verify its project-relative source path, and reject file-reading fallbacks.
+
 ## Can My Agent Run RQL?
 
 The installed `bifrost-code-intelligence` skill starts MCP with `symbol|extended`, but its tools remain hidden until Amp loads that skill. After loading it, confirm that `query_code` is available. Ask Amp to call `query_code` with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. Then check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))` and call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.

@@ -360,7 +360,7 @@ fn handle_response(
             last_error = Some("root entry is missing a string uri".to_string());
             continue;
         };
-        let path = match file_uri_to_path(uri) {
+        let path = match client_root_to_path(uri) {
             Ok(path) => path,
             Err(error) => {
                 last_error = Some(error);
@@ -400,6 +400,15 @@ fn handle_response(
         eprintln!("bifrost: no usable MCP workspace root: {error}");
     }
     connection.finish_roots_response()
+}
+
+fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
+    let native_path = PathBuf::from(root);
+    if native_path.is_absolute() {
+        return Ok(native_path);
+    }
+
+    file_uri_to_path(root)
 }
 
 fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
@@ -1605,6 +1614,23 @@ mod uri_tests {
             .join("workspace with spaces");
         let uri = url::Url::from_file_path(&path).expect("file URI");
         assert_eq!(file_uri_to_path(uri.as_str()).unwrap(), path);
+    }
+
+    #[test]
+    fn absolute_native_workspace_root_is_accepted() {
+        let path = std::env::current_dir()
+            .expect("current directory")
+            .join("workspace with spaces");
+        assert_eq!(
+            client_root_to_path(path.to_str().expect("native path")).unwrap(),
+            path
+        );
+    }
+
+    #[test]
+    fn relative_native_workspace_root_is_rejected() {
+        let error = client_root_to_path("workspace").unwrap_err();
+        assert!(error.contains("invalid root URI `workspace`"), "{error}");
     }
 
     #[test]

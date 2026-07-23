@@ -12,11 +12,15 @@ as a custom stdio context server in `settings.json`.
 
 ## Configure MCP
 
-Build or install Bifrost first:
+Build or install Bifrost first. To install the release verified with this setup
+explicitly:
 
 ```bash
-cargo install brokk-bifrost --locked --force
+cargo install brokk-bifrost --version 0.8.9 --locked --force
+bifrost --version
 ```
+
+The version check should print `bifrost 0.8.9`.
 
 For local development, build this checkout and use an absolute path to the
 debug binary:
@@ -50,9 +54,51 @@ the Bifrost agent package, including `search_symbols`, `get_summaries`,
 Use a smaller or larger MCP toolset only when the host should see a different
 surface. See [MCP Server](/mcp/) for the available toolsets.
 
-Open Zed's Agent settings and confirm the Model Context Protocol section lists
-the Bifrost server with its tool count. If the server is disabled, enable it
-there before starting a new Agent thread.
+Open **Settings → AI → MCP Servers** and confirm that Bifrost's indicator is
+green and its tooltip says **Server is active**. If the server is disabled,
+enable it there.
+
+## Enable Bifrost in an Agent Profile
+
+An active MCP server is not automatically callable from every Zed Agent
+profile. The profile selected for a thread controls which MCP tools that thread
+can use. A server can therefore be running correctly while the agent reports
+that `search_symbols` or `query_code` is unavailable.
+
+Run `agent: manage profiles` from the command palette, create or configure a
+profile, and enable the Bifrost tools you want under its MCP tools. For a
+focused code-intelligence profile, the corresponding `settings.json` shape is:
+
+```json
+{
+  "agent": {
+    "profiles": {
+      "bifrost": {
+        "name": "Bifrost",
+        "enable_all_context_servers": false,
+        "context_servers": {
+          "bifrost": {
+            "tools": {
+              "search_symbols": true,
+              "get_summaries": true,
+              "query_code": true
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The profile's `bifrost` key must match the name used under the top-level
+`context_servers` configuration. Start a new Zed Agent thread and select this
+profile. Existing threads retain the tool surface with which they were
+created.
+
+Zed asks for confirmation before MCP calls by default. Approve the first
+Bifrost call when prompted, or configure Zed's tool permissions if you want a
+different approval policy.
 
 ## Add Skills
 
@@ -99,13 +145,20 @@ it cannot access Bifrost tools and falls back to reading files directly, check
 that:
 
 - the `context_servers` entry is present in the active Zed settings file,
-- the server is enabled in Agent settings,
+- the server is active under **Settings → AI → MCP Servers**,
+- the selected Agent profile enables the requested Bifrost tool,
 - the command path points at an existing Bifrost binary,
 - `--root` points at the project you want analyzed, and
-- the thread was created after the server was added or enabled.
+- the thread was created after the server and profile were configured.
 
 Avoid prompts that only ask about `README.md` or docs files; those can pass
 through ordinary file reading without proving the MCP server ran.
+
+Apply the shared
+[host-integration evidence contract](/mcp/#validate-host-integration): retain
+Zed's Bifrost tool event and structured result for a known workspace
+declaration, verify its project-relative source path, and reject paths under the
+configured binary's install directory or another repository.
 
 ## Can My Agent Run RQL?
 

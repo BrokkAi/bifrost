@@ -2333,6 +2333,13 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "class PluginOnly {}\n",
     )
     .expect("write plugin fixture");
+    let relative_workspace = plugin_dir.path().join("workspace");
+    fs::create_dir(&relative_workspace).expect("create relative workspace fixture");
+    fs::write(
+        relative_workspace.join("RelativeWorkspace.java"),
+        "class RelativeWorkspace {}\n",
+    )
+    .expect("write relative workspace fixture");
     let workspace = TempDir::new().expect("workspace");
     fs::write(
         workspace.path().join("ClientWorkspace.java"),
@@ -2362,7 +2369,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
             "params": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": { "roots": { "listChanged": true } },
-                "clientInfo": { "name": "codex-mcp-client", "version": "0.145.0" }
+                "clientInfo": { "name": "cursor-vscode", "version": "3.12.30" }
             }
         }),
     );
@@ -2400,15 +2407,53 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         current_roots_request["method"], "roots/list",
         "{current_roots_request}"
     );
-    let workspace_uri = url::Url::from_directory_path(workspace.path())
-        .expect("workspace file URI")
-        .to_string();
     write_line(
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
             "id": current_roots_request["id"],
-            "result": { "roots": [{ "uri": workspace_uri, "name": "fixture" }] }
+            "result": { "roots": [{ "uri": "workspace", "name": "relative" }] }
+        }),
+    );
+    let rejected_relative_root = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["RelativeWorkspace"] }
+            }
+        }),
+    );
+    assert!(
+        rejected_relative_root["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "a relative client root must never resolve against process cwd: {rejected_relative_root}"
+    );
+
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let workspace_roots_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        workspace_roots_request["method"], "roots/list",
+        "{workspace_roots_request}"
+    );
+    // Cursor 3.12.30 advertises standard MCP roots but returns its workspace as
+    // a native absolute path rather than a file URI.
+    let workspace_root = workspace.path().display().to_string();
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": workspace_roots_request["id"],
+            "result": { "roots": [{ "uri": workspace_root, "name": "fixture" }] }
         }),
     );
 

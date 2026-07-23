@@ -88,6 +88,38 @@ For JSON-based MCP hosts, configure Bifrost as a stdio server:
 
 Use an absolute binary path if `bifrost` is not on the host's `PATH`. Replace `/path/to/project` with the project root syntax supported by your host, or with an absolute project path.
 
+## Validate Host Integration
+
+Treat installation, tool discovery, workspace binding, and individual toolsets
+as separate checks. A plugin listed as installed does not prove that the current
+agent session loaded its MCP server, and a prompt answered through ordinary file
+reading does not prove that Bifrost ran.
+
+After installing or changing Bifrost or its MCP configuration, restart or
+reload the host as its integration page requires, then open a new agent session.
+Run these checks in order:
+
+1. Confirm the host lists the expected Bifrost server and that the active
+   session or Agent profile exposes the expected tool schemas.
+2. Call a Bifrost symbol tool for a declaration known to exist only in the
+   active workspace. Forbid shell search and direct file reading in the smoke
+   prompt.
+3. Verify that the MCP result contains the expected project-relative source
+   path. Reject results under an installed plugin, binary, or launcher cache.
+4. Confirm `query_code` is advertised before testing inline JSON or a saved RQL
+   file.
+
+Keep the exact host tool event or structured MCP result as evidence. A model's
+summary without the underlying tool result is not enough to distinguish an MCP
+call from a fallback. If the symbol call reaches Bifrost but reports an unbound
+workspace, inspect the host's explicit root, standard MCP roots, or negotiated
+workspace metadata before testing query behavior.
+
+The host-specific pages define how to restart, inspect, or discover tools in
+Codex, Claude Code, Cursor, OpenCode, Zed Agent, Amp, and other supported
+clients. Use this shared evidence contract without copying one host's lifecycle
+or tool-discovery mechanism into another.
+
 ## Validate Query Access
 
 After adding or changing MCP configuration, start a fresh agent session. First confirm that the host's advertised Bifrost tools include `query_code`; a successful `get_summaries` call proves symbol navigation, but does not prove query access.

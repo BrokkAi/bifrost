@@ -25,5 +25,6 @@
     "./agents/issue-planner.md",
     "./agents/security-reviewer.md",
     "./agents/senior-dev-reviewer.md"
-  ]
+  ],
+  "mcpServers": "./mcp.json"
 }

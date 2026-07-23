@@ -146,8 +146,8 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(
   cursorManifest.mcpServers,
-  undefined,
-  `${cursorManifestPath} should let Cursor discover root mcp.json automatically`,
+  "./mcp.json",
+  `${cursorManifestPath} should select Cursor's host-specific MCP config`,
 );
 fs.accessSync("plugins/bifrost-agent/assets/icon.png", fsConstants.R_OK);
 
@@ -172,8 +172,8 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(
   cursorMcpConfig.mcpServers?.bifrost?.command,
-  "./bin/bifrost-launcher.mjs",
-  `${cursorMcpPath} should launch the package-local Bifrost launcher`,
+  "${CURSOR_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
+  `${cursorMcpPath} should resolve the launcher from Cursor's installed plugin directory`,
 );
 assert.deepStrictEqual(
   cursorMcpConfig.mcpServers?.bifrost?.type,
@@ -181,14 +181,19 @@ assert.deepStrictEqual(
   `${cursorMcpPath} should use Cursor's documented stdio MCP type`,
 );
 assert.deepStrictEqual(
+  cursorMcpConfig.mcpServers?.bifrost?.cwd,
+  undefined,
+  `${cursorMcpPath} should not infer a workspace from Cursor's process directory`,
+);
+assert.deepStrictEqual(
   mcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
   ["--mcp", "symbol|extended"],
   `${mcpPath} should use the default Bifrost MCP toolset`,
 );
 assert.deepStrictEqual(
-  cursorMcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
+  cursorMcpConfig.mcpServers?.bifrost?.args,
   ["--mcp", "symbol|extended"],
-  `${cursorMcpPath} should use the default Bifrost MCP toolset`,
+  `${cursorMcpPath} should start rootless with the default Bifrost MCP toolset`,
 );
 const sharedMcpServer = mcpConfig.mcpServers?.bifrost;
 const cursorMcpServer = cursorMcpConfig.mcpServers?.bifrost;

@@ -26,10 +26,14 @@ roots. On a rootless connection without advertised roots, it offers the
 `codex/sandbox-state-meta` extension; current Codex uses that capability to
 supply the active task. Bifrost never treats the installed plugin directory as
 the analyzer workspace.
-Claude Code and Codex read this server entry from `.mcp.json`; Cursor reads the
-same entry from root `mcp.json`, using Cursor's documented `type: "stdio"`
-field. Amp uses a different direct server-map shape for `mcp.json` and
-`--mcp-config`, so the generated Amp bundle lives under
+Claude Code and Codex read this server entry from `.mcp.json`. Cursor's plugin
+manifest explicitly selects root `mcp.json`, which uses Cursor's documented
+`type: "stdio"` and `${CURSOR_PLUGIN_ROOT}` placeholder. The Cursor entry starts
+Bifrost rootless. Builds containing the post-0.8.9 Cursor compatibility fix
+accept both standard `file:` root URIs and Cursor's native absolute-path form
+while keeping MCP roots authoritative; the published 0.8.9 binary requires an
+explicit fixed-project root. Amp uses a different direct server-map shape for
+`mcp.json` and `--mcp-config`, so the generated Amp bundle lives under
 `plugins/bifrost-agent/amp-skills`.
 
 Binary resolution order is:
@@ -347,27 +351,41 @@ cargo build --bin bifrost
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" cursor .
 ```
 
-In Cursor, open **Customize**, then use **Manage -> Add Marketplace -> Import
-from Disk** and select the repository root. Cursor should read
-`.cursor-plugin/marketplace.json`, find the `bifrost` plugin at
-`plugins/bifrost-agent`, and offer it for installation. If testing the package
-directory directly instead of the repository marketplace, select
-`plugins/bifrost-agent`.
+In the dedicated **Cursor Agents** window, open **Customize -> Plugins**, choose
+**Add -> From Local Repo**, and select the repository root. Cursor reads
+`.cursor-plugin/marketplace.json`, finds the `bifrost` plugin at
+`plugins/bifrost-agent`, and offers it for installation. Do not select
+`plugins/bifrost-agent` directly: **From Local Repo** expects the repository
+marketplace manifest.
 
-After installing, enable the Bifrost MCP server for the workspace from the
-plugin's **MCPs** section in Customize. Cursor does not load installed MCP
-servers into chat until they are enabled, and already-open agent chats may need
-a fresh chat before newly enabled MCP tools appear. Then ask Cursor Agent to
-call a lightweight analyzer operation such as `get_summaries` or
-`search_symbols` against files in the active workspace. Use a source directory
-or file, not `README.md`, so the smoke cannot pass through ordinary file
-reading. For example:
+In the tested Cursor build, this route resolved plugin contents from the remote
+default branch, not from the selected feature-branch commit or dirty worktree.
+Use it only for a snapshot already reachable from that default branch. A local
+Rust binary can still be tested through `BIFROST_BINARY_PATH`; fully quit Cursor
+before running the command above so the new app process inherits the override.
+
+After installing, open **Customize -> MCPs** in the Cursor Agents window,
+enable Bifrost, verify that it connects, and start a fresh agent. Then use a
+strict prompt that proves the result came through Bifrost instead of ordinary
+file or shell search:
 
 ```text
-Use the Bifrost MCP get_summaries tool on src/analyzer/usages. Summarize the
-package structure in five bullets and explicitly name the MCP tool result you
-used.
+Use only the installed Bifrost plugin MCP tools. First confirm query_code is in
+the callable Bifrost MCP surface. Then call the Bifrost search_symbols MCP tool
+with patterns ["reconcile_codex_sandbox_workspace"]. Do not use Shell,
+terminal, rg, codebase search, file reading, or the bifrost CLI. Report the
+exact MCP result, especially the returned path.
 ```
+
+The published 0.8.9 binary does not accept Cursor's native-path `roots/list`
+response. For a fixed-project 0.8.9 smoke, fully quit Cursor and start it from
+the intended project with
+`BIFROST_WORKSPACE_ROOT="$(pwd)" cursor .`. The override is authoritative and
+must be changed when switching projects.
+
+Cursor Agents 3.12.30 may return the base repository as its MCP root while an
+agent runs in a separate worktree. In that mode, verify a branch-only symbol or
+file instead of accepting a relative path that exists in both checkouts.
 
 The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can
 load plugin skills, but it has not proven reliable for plugin-provided MCP
