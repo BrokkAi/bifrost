@@ -720,3 +720,58 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
     assert!(!failure.complete);
     assert_eq!(Some("no_graph_seed"), failure.reason_kind.as_deref());
 }
+
+/// #1100: `excluded_test_files` decides membership from paths alone instead of
+/// hydrating every file's FileState. This pins the equivalence argument: the
+/// path-only predicate must produce exactly the set the full classification
+/// would exclude (Test and TestSupport are both excluded and both require
+/// `test_like`; Production/Ambiguous are never test_like), across fixtures
+/// covering all classification shapes.
+#[test]
+fn excluded_test_files_path_predicate_matches_full_classification() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path();
+    for (path, content) in [
+        ("src/prod.ts", "export function prod() { return 1; }\n"),
+        (
+            "tests/spec.test.ts",
+            "import { prod } from '../src/prod';\ntest('t', () => { prod(); });\n",
+        ),
+        (
+            "tests/helper.ts",
+            "import { prod } from '../src/prod';\nexport const h = prod();\n",
+        ),
+        (
+            "src/thing.test.ts",
+            "import { prod } from './prod';\ntest('u', () => { prod(); });\n",
+        ),
+        ("src/other.ts", "export const o = 2;\n"),
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+    }
+    let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
+    let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
+
+    let by_path = super::scan_usages::excluded_test_files(&analyzer, false).expect("excluded set");
+    let by_classification: crate::hash::HashSet<ProjectFile> = analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            matches!(
+                super::scan_usages::classify_resolved_test_file(&analyzer, file).kind,
+                super::scan_usages::TestFileKind::Test
+                    | super::scan_usages::TestFileKind::TestSupport
+            )
+        })
+        .collect();
+    assert_eq!(
+        *by_path, by_classification,
+        "path-only exclusion must equal full-classification exclusion"
+    );
+    assert!(
+        !by_path.is_empty(),
+        "fixture must actually produce excluded files or the equivalence is vacuous"
+    );
+}

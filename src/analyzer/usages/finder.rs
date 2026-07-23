@@ -156,6 +156,7 @@ impl UsageFinder {
         }
 
         let target = &overloads[0];
+        let _cand_scope = crate::profiling::scope("usages::candidate_discovery");
         let mut candidates = HashSet::default();
         for overload in overloads {
             let routed = match explicit_provider {
@@ -210,12 +211,14 @@ impl UsageFinder {
         let candidate_files_sample =
             candidate_files_truncated.then(|| candidate_files_sample(&all_candidates, &candidates));
 
+        drop(_cand_scope);
         let mut graph_failure = None;
         let scan_scope = UsageScanScope::with_cancellation(
             &candidates,
             self.authoritative_scope,
             &self.cancellation,
         );
+        let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
         let result = match graph_find_usages(
             language_for_target(target),
             analyzer,

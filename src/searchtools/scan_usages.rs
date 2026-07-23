@@ -386,17 +386,34 @@ pub(super) fn excluded_test_files(
     if include_tests {
         return None;
     }
+    // A file is excluded from a non-test scan exactly when its classification is
+    // `Test` or `TestSupport`. Both kinds require — and are fully determined by —
+    // the path-based `test_like` predicate in `classify_resolved_test_file`: a
+    // `Test` file is `test_like && contains_test_code`, a `TestSupport` file is
+    // `test_like && !contains_test_code`, and every non-`test_like` file lands in
+    // `Production`/`Ambiguous`. So membership here is decided purely by path
+    // convention; the `contains_test_code` signal only splits `Test` from
+    // `TestSupport`, and both are excluded. Deciding it from paths avoids
+    // hydrating every workspace file's `FileState` (a full store read + decode of
+    // all declarations) solely to read a boolean that cannot change the set — the
+    // dominant per-call cost of a scan on a large workspace.
     let set: HashSet<ProjectFile> = analyzer
         .analyzed_files()
         .into_iter()
-        .filter(|file| {
-            matches!(
-                classify_resolved_test_file(analyzer, file).kind,
-                TestFileKind::Test | TestFileKind::TestSupport
-            )
-        })
+        .filter(is_test_like_path)
         .collect();
     Some(Arc::new(set))
+}
+
+/// Path-only mirror of `classify_resolved_test_file`'s `test_like` branch: a
+/// file rooted under a test directory or carrying a test filename convention.
+/// This is the exact membership predicate for [`excluded_test_files`]; keep the
+/// two in lockstep if the classification's `test_like` rule ever changes.
+fn is_test_like_path(file: &ProjectFile) -> bool {
+    let path = rel_path_string(file);
+    let language = language_for_file(file);
+    test_paths::path_test_verdict(&path) == test_paths::PathTestVerdict::TestRoot
+        || test_paths::has_test_filename_convention(&path, language)
 }
 
 /// Build a [`UsageFinder`] whose file filter drops the excluded test files and
