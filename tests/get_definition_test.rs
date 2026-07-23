@@ -16793,6 +16793,176 @@ fn csharp_static_using_resolves_short_target_in_enclosing_namespace() {
     );
 }
 
+// The canonical usagebench `csharp-parity-extension-method-call` shape: `Handle`
+// and `Tag` are both extension methods on `Handler`, and `Tag` is invoked both on
+// a direct receiver (`handler.Tag()`) and on the return of an extension call
+// (`handler.Handle("Ada").Tag()`). The chained form regressed to
+// `unsupported_csharp_receiver` because invocation-return typing only looked up
+// the invoked name (`Handle`) as an ordinary member, never as an extension.
+#[test]
+fn csharp_chained_extension_method_call_resolves_forward() {
+    let handlers = "namespace Demo {\n    public sealed class Handler {\n    }\n    public static class HandlerExtensions {\n        public static Handler Handle(this Handler handler, string name) => handler;\n        public static string Tag(this Handler handler) => \"tag\";\n    }\n}\n";
+    let consumers = "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var direct = handler.Tag();\n            var chained = handler.Handle(\"Ada\").Tag();\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Handlers.cs", handlers)
+        .file("src/Consumers.cs", consumers)
+        .build();
+
+    let direct = consumers.find("handler.Tag()").expect("direct call") + "handler.".len();
+    let chained = consumers
+        .find("handler.Handle(\"Ada\").Tag()")
+        .expect("chained call")
+        + "handler.Handle(\"Ada\").".len();
+    for (label, offset) in [("direct", direct), ("chained", chained)] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/Consumers.cs", consumers, offset),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{label} extension call should resolve: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], "Demo.HandlerExtensions.Tag",
+            "{label} extension call should resolve to the extension method: {value}"
+        );
+    }
+
+    // The same chained site resolved by symbol reference.
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "Run",
+                "context": "var chained = handler.Handle(\"Ada\").Tag();",
+                "target": "Tag"
+            }]
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        value["results"][0]["status"], "resolved",
+        "chained extension call should resolve by reference: {value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.HandlerExtensions.Tag",
+        "chained extension call should resolve to the extension method by reference: {value}"
+    );
+}
+
+// A three-link chain `a.Handle(..).Wrap().Tag()` where every intermediate call is
+// itself an extension returning a concrete type; typing recurses through each link.
+#[test]
+fn csharp_deep_chained_extension_calls_resolve_forward() {
+    let handlers = "namespace Demo {\n    public sealed class Handler {\n    }\n    public sealed class Wrapper {\n    }\n    public static class HandlerExtensions {\n        public static Handler Handle(this Handler handler, string name) => handler;\n        public static Wrapper Wrap(this Handler handler) => new Wrapper();\n        public static string Tag(this Wrapper wrapper) => \"tag\";\n    }\n}\n";
+    let consumers = "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var deep = handler.Handle(\"Ada\").Wrap().Tag();\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Handlers.cs", handlers)
+        .file("src/Consumers.cs", consumers)
+        .build();
+
+    let offset = consumers
+        .find("handler.Handle(\"Ada\").Wrap().Tag()")
+        .expect("deep chain")
+        + "handler.Handle(\"Ada\").Wrap().".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Consumers.cs", consumers, offset),
+    );
+    assert_eq!(
+        value["results"][0]["status"], "resolved",
+        "deep chained extension call should resolve: {value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.HandlerExtensions.Tag",
+        "deep chained extension call should resolve to the Wrapper extension: {value}"
+    );
+}
+
+// Negatives for the chained-extension receiver typing: an instance method on the
+// return type must win over a same-named extension; an extension whose `this`
+// type is incompatible with the receiver must not match; an untyped sub-receiver
+// must yield the honest unresolved diagnostic rather than a borrowed extension.
+#[test]
+fn csharp_chained_extension_receiver_typing_negatives() {
+    // (1) instance method on the return type wins over a same-named extension.
+    let instance_wins = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            "namespace Demo {\n    public sealed class Handler {\n        public string Tag() => \"instance\";\n    }\n    public static class HandlerExtensions {\n        public static Handler Handle(this Handler handler, string name) => handler;\n        public static string Tag(this Handler handler) => \"extension\";\n    }\n}\n",
+        )
+        .file(
+            "src/Consumers.cs",
+            "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var chained = handler.Handle(\"Ada\").Tag();\n        }\n    }\n}\n",
+        )
+        .build();
+    let consumers = "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var chained = handler.Handle(\"Ada\").Tag();\n        }\n    }\n}\n";
+    let offset = consumers
+        .find("handler.Handle(\"Ada\").Tag()")
+        .expect("chained call")
+        + "handler.Handle(\"Ada\").".len();
+    let value = lookup(
+        instance_wins.root(),
+        &location_reference("src/Consumers.cs", consumers, offset),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Demo.Handler.Tag",
+        "an instance method on the return type must win over the extension: {value}"
+    );
+
+    // (2) an extension whose `this` type is not the receiver type must not match.
+    let incompatible = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            "namespace Demo {\n    public sealed class Handler {\n    }\n    public sealed class Other {\n    }\n    public static class HandlerExtensions {\n        public static Handler Handle(this Handler handler, string name) => handler;\n        public static string Tag(this Other other) => \"tag\";\n    }\n}\n",
+        )
+        .file(
+            "src/Consumers.cs",
+            "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var chained = handler.Handle(\"Ada\").Tag();\n        }\n    }\n}\n",
+        )
+        .build();
+    let value = lookup(
+        incompatible.root(),
+        &location_reference("src/Consumers.cs", consumers, offset),
+    );
+    assert_eq!(
+        value["results"][0]["status"], "no_definition",
+        "an extension for an incompatible receiver type must not match: {value}"
+    );
+
+    // (3) an untyped sub-receiver must not borrow a visible extension owner.
+    let untyped = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            "namespace Demo {\n    public sealed class Handler {\n    }\n    public static class HandlerExtensions {\n        public static Handler Handle(this Handler handler, string name) => handler;\n        public static string Tag(this Handler handler) => \"tag\";\n    }\n}\n",
+        )
+        .file(
+            "src/Consumers.cs",
+            "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var chained = mystery.Handle(\"Ada\").Tag();\n        }\n    }\n}\n",
+        )
+        .build();
+    let untyped_consumers = "using Demo;\nnamespace App {\n    public sealed class Consumer {\n        public void Run(Handler handler) {\n            var chained = mystery.Handle(\"Ada\").Tag();\n        }\n    }\n}\n";
+    let untyped_offset = untyped_consumers
+        .find("mystery.Handle(\"Ada\").Tag()")
+        .expect("untyped chained call")
+        + "mystery.Handle(\"Ada\").".len();
+    let value = lookup(
+        untyped.root(),
+        &location_reference("src/Consumers.cs", untyped_consumers, untyped_offset),
+    );
+    assert_ne!(
+        value["results"][0]["status"], "resolved",
+        "an untyped sub-receiver must not borrow a visible extension owner: {value}"
+    );
+    assert!(
+        value["results"][0]["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an untyped sub-receiver must not produce a definition: {value}"
+    );
+}
+
 #[test]
 fn csharp_global_static_using_applies_across_files() {
     let project = InlineTestProject::with_language(Language::CSharp)

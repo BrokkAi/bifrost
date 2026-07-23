@@ -709,29 +709,92 @@ fn method_return_type_fq_name_for_arity_inner(
         if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
             return None;
         }
-        let metadata = csharp.signature_metadata(&unit);
-        if let Some(substituted) = (!metadata.is_empty())
-            .then_some(metadata.as_slice())
-            .and_then(|metadata| {
-                substituted_method_type_parameter(metadata, explicit_type_arguments)
-            })
-        {
-            return Some(substituted);
-        }
-        let declared_type = metadata
-            .iter()
-            .find_map(|metadata| metadata.return_type_text().map(str::to_string))
-            .or_else(|| method_return_type(csharp, &unit))?;
-        let declaring_owner = csharp.parent_of(&unit).unwrap_or_else(|| owner.clone());
-        resolve_member_type_fq_name(
-            csharp,
-            unit.source(),
-            &declaring_owner,
-            &declared_type,
-            usage,
-        )
+        callable_return_type_fq_name(csharp, &unit, owner, explicit_type_arguments, usage)
     })
     .collect::<Vec<_>>();
+    resolved.sort();
+    resolved.dedup();
+    (resolved.len() == 1).then(|| resolved.remove(0))
+}
+
+/// Resolve a callable's declared return type to a fully-qualified type name,
+/// applying explicit type-argument substitution when the return is a bare method
+/// type parameter. `owner_fallback` supplies the declaring owner only when the
+/// unit's own parent is unavailable. Shared between ordinary member return typing
+/// and extension-method return typing so both derive the return FQN identically.
+fn callable_return_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    unit: &CodeUnit,
+    owner_fallback: &CodeUnit,
+    explicit_type_arguments: Option<&[String]>,
+    usage: bool,
+) -> Option<String> {
+    let metadata = csharp.signature_metadata(unit);
+    if let Some(substituted) = (!metadata.is_empty())
+        .then_some(metadata.as_slice())
+        .and_then(|metadata| substituted_method_type_parameter(metadata, explicit_type_arguments))
+    {
+        return Some(substituted);
+    }
+    let declared_type = metadata
+        .iter()
+        .find_map(|metadata| metadata.return_type_text().map(str::to_string))
+        .or_else(|| method_return_type(csharp, unit))?;
+    let declaring_owner = csharp
+        .parent_of(unit)
+        .unwrap_or_else(|| owner_fallback.clone());
+    resolve_member_type_fq_name(
+        csharp,
+        unit.source(),
+        &declaring_owner,
+        &declared_type,
+        usage,
+    )
+}
+
+/// Type an invocation whose callee is an extension method by that extension's
+/// declared return type. Mirrors `method_return_type_fq_name_for_arity` for the
+/// case the invoked name is not an ordinary member of the receiver type but a
+/// visible extension method — the piece that lets chained receivers such as
+/// `handler.Handle("Ada").Tag()` be typed when `Handle` is itself an extension.
+/// Reuses the shared extension-candidate matcher (so the same visibility scoping
+/// and `this`-parameter compatibility gate apply) and the shared return-type
+/// derivation. Returns a type FQN only when the matching extensions agree on one.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    source: &str,
+    site: Node<'_>,
+    receiver_type_names: &[String],
+    method: &str,
+    call_arity: Option<usize>,
+    explicit_generic_arity: Option<usize>,
+    explicit_type_arguments: Option<&[String]>,
+    usage: bool,
+) -> Option<String> {
+    if receiver_type_names.is_empty() {
+        return None;
+    }
+    let candidates = visible_extension_method_candidates_inner(
+        csharp,
+        analyzer,
+        source,
+        site,
+        receiver_type_names,
+        method,
+        call_arity,
+        explicit_generic_arity,
+        false,
+        usage,
+    );
+    let mut resolved = candidates
+        .into_iter()
+        .filter(|unit| unit.is_function())
+        .filter_map(|unit| {
+            callable_return_type_fq_name(csharp, &unit, &unit, explicit_type_arguments, usage)
+        })
+        .collect::<Vec<_>>();
     resolved.sort();
     resolved.dedup();
     (resolved.len() == 1).then(|| resolved.remove(0))

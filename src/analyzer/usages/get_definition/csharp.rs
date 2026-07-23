@@ -1585,6 +1585,18 @@ fn csharp_nearest_member_type_units(
 /// Type an `invocation_expression` receiver by the callee's declared return
 /// type: resolve the invoked method's owner(s), then resolve the return type of
 /// `owner.Method` (walking the type hierarchy) to a type CodeUnit.
+/// The resolved callee of an `invocation_expression`: the receiver type owners the
+/// invoked name is looked up on, the name itself, its generic arity/type arguments,
+/// and — when the callee has a receiver — the name node that seeds extension-method
+/// visibility scoping if the name turns out to be an extension.
+struct CSharpInvocationCallee<'a> {
+    owners: Vec<CodeUnit>,
+    method: &'a str,
+    explicit_generic_arity: Option<usize>,
+    explicit_type_arguments: Option<Vec<String>>,
+    extension_site: Option<Node<'a>>,
+}
+
 fn csharp_invocation_return_type_units(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
@@ -1597,12 +1609,7 @@ fn csharp_invocation_return_type_units(
     let Some(function) = invocation.child_by_field_name("function") else {
         return Vec::new();
     };
-    let (owners, method, explicit_generic_arity, explicit_type_arguments): (
-        Vec<CodeUnit>,
-        &str,
-        Option<usize>,
-        Option<Vec<String>>,
-    ) = match function.kind() {
+    let callee = match function.kind() {
         // `obj.Method()` — type the sub-receiver, look up `Method` on it.
         "member_access_expression" | "conditional_access_expression" => {
             let (sub_receiver, name_node) = match function.kind() {
@@ -1641,19 +1648,28 @@ fn csharp_invocation_return_type_units(
                 root,
                 sub_receiver,
             );
-            (
+            CSharpInvocationCallee {
                 owners,
-                csharp_node_text(name.identifier, source),
-                name.explicit_generic_arity,
-                type_arguments,
-            )
+                method: csharp_node_text(name.identifier, source),
+                explicit_generic_arity: name.explicit_generic_arity,
+                explicit_type_arguments: type_arguments,
+                // The name node seeds extension-method visibility scoping when the
+                // callee turns out to be an extension rather than an ordinary member.
+                extension_site: Some(name.identifier),
+            }
         }
         // `Method()` — an unqualified call resolves against the enclosing class.
         "identifier" => {
             let owners = csharp_enclosing_class(analyzer, file, function.start_byte())
                 .into_iter()
                 .collect();
-            (owners, csharp_node_text(function, source), None, None)
+            CSharpInvocationCallee {
+                owners,
+                method: csharp_node_text(function, source),
+                explicit_generic_arity: None,
+                explicit_type_arguments: None,
+                extension_site: None,
+            }
         }
         "generic_name" => {
             let Some(name) = csharp_member_name(function) else {
@@ -1669,26 +1685,35 @@ fn csharp_invocation_return_type_units(
             let owners = csharp_enclosing_class(analyzer, file, function.start_byte())
                 .into_iter()
                 .collect();
-            (
+            CSharpInvocationCallee {
                 owners,
-                csharp_node_text(name.identifier, source),
-                name.explicit_generic_arity,
-                type_arguments,
-            )
+                method: csharp_node_text(name.identifier, source),
+                explicit_generic_arity: name.explicit_generic_arity,
+                explicit_type_arguments: type_arguments,
+                extension_site: None,
+            }
         }
         _ => return Vec::new(),
     };
+    let CSharpInvocationCallee {
+        owners,
+        method,
+        explicit_generic_arity,
+        explicit_type_arguments,
+        extension_site,
+    } = callee;
     if owners.is_empty() || method.is_empty() {
         return Vec::new();
     }
 
+    let receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
     let mut return_type_units = Vec::new();
     let value_arity = csharp_argument_count(invocation, source);
-    for owner in owners {
+    for owner in &owners {
         if let Some(type_fqn) = csharp_method_return_type_fq_name_for_arity(
             csharp,
             file,
-            &owner,
+            owner,
             method,
             Some(value_arity),
             explicit_generic_arity,
@@ -1696,6 +1721,28 @@ fn csharp_invocation_return_type_units(
         ) {
             return_type_units.extend(definitions.fqn(&type_fqn));
         }
+    }
+    // The invoked name was not an ordinary member of the receiver type; the callee
+    // may itself be an extension method (`handler.Handle("Ada")` where `Handle` is
+    // `this Handler`). Type the invocation by that extension's declared return type
+    // so a chained extension call on the result (`…​.Tag()`) can still resolve. Uses
+    // the shared extension matcher + return-type derivation — no duplicated typing.
+    if return_type_units.is_empty()
+        && let Some(site) = extension_site
+        && let Some(type_fqn) = csharp_extension_invocation_return_type_fq_name(
+            csharp,
+            analyzer,
+            source,
+            site,
+            &receiver_type_names,
+            method,
+            Some(value_arity),
+            explicit_generic_arity,
+            explicit_type_arguments.as_deref(),
+            false,
+        )
+    {
+        return_type_units.extend(definitions.fqn(&type_fqn));
     }
     sort_units(&mut return_type_units);
     return_type_units.dedup();
