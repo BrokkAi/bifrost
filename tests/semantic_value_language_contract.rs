@@ -16,7 +16,10 @@ use brokk_bifrost::analyzer::semantic::{
     ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason, WorkspaceSemanticOracle,
 };
 
-use common::{InlineTestProject, semantic_graph::SemanticGraph};
+use common::{
+    InlineTestProject,
+    semantic_graph::{SemanticGraph, mapped_source, procedure_source},
+};
 
 fn procedure_named<'artifact>(
     graph: &'artifact SemanticGraph,
@@ -56,22 +59,6 @@ fn available<T>(outcome: &SemanticOutcome<T>) -> &T {
     outcome
         .available_value()
         .expect("source-backed oracle outcome must retain its partial value")
-}
-
-fn mapped_source<'source>(
-    procedure: &ProcedureSemantics,
-    source: &'source str,
-    mapping: brokk_bifrost::analyzer::semantic::SourceMappingId,
-) -> &'source str {
-    let span = procedure
-        .source_mapping(mapping)
-        .expect("semantic row must retain a source mapping")
-        .locator
-        .anchor()
-        .span();
-    source
-        .get(span.start_byte() as usize..span.end_byte() as usize)
-        .expect("semantic source span must index the fixture")
 }
 
 fn assert_value_contract(
@@ -2322,18 +2309,12 @@ class Host {
     for path in ["initializers/receivers.js", "initializers/receivers.ts"] {
         let graph = SemanticGraph::materialize(&project, &analyzer, path);
         let procedures = graph.artifact().procedures();
-        let procedure_source = |procedure: &ProcedureSemantics| {
-            let span = procedure.locator().anchor().span();
-            SOURCE
-                .get(span.start_byte() as usize..span.end_byte() as usize)
-                .expect("procedure locator must remain inside the shared fixture")
-        };
         let initializer = |source_fragment: &str| {
             procedures
                 .iter()
                 .find(|procedure| {
                     procedure.kind() == ProcedureKind::Initializer
-                        && procedure_source(procedure).contains(source_fragment)
+                        && procedure_source(procedure, SOURCE).contains(source_fragment)
                 })
                 .unwrap_or_else(|| panic!("{path} missing initializer for {source_fragment:?}"))
         };
@@ -2449,7 +2430,7 @@ class Host {
             .iter()
             .filter(|procedure| {
                 procedure.kind() == ProcedureKind::Lambda
-                    && procedure_source(procedure).contains("(value) => value")
+                    && procedure_source(procedure, SOURCE).contains("(value) => value")
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2509,7 +2490,7 @@ class Host {
             .expect("computed method-name arrow procedure");
         assert_eq!(computed_name_lambda.lexical_parent(), Some(outer.id()));
         assert!(
-            procedure_source(computed_name_lambda).contains("() => this.key"),
+            procedure_source(computed_name_lambda, SOURCE).contains("() => this.key"),
             "{path} computed-name arrow must stay in the surrounding class-definition context"
         );
     }

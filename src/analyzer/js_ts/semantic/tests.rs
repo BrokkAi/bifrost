@@ -1,5 +1,5 @@
 use super::syntax::{
-    body_contains_free_this, callable_child_belongs_to_procedure, class_definition_expressions,
+    body_contains_free_this, callable_field_belongs_to_procedure, class_definition_expressions,
 };
 use super::*;
 
@@ -155,9 +155,8 @@ fn method_decorators_stay_in_the_class_definition_context() {
         },
     );
     let method = method.expect("method definition");
-    let decorator = method
-        .child_by_field_name("decorator")
-        .expect("method decorator");
-
-    assert!(!callable_child_belongs_to_procedure(method, decorator));
+    assert!(!callable_field_belongs_to_procedure(
+        method.kind(),
+        Some("decorator")
+    ));
 }

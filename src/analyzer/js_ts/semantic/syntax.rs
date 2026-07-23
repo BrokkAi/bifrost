@@ -112,29 +112,17 @@ fn assignment_binding(source: &str, left: Node<'_>) -> Option<EnclosingBinding> 
 }
 
 fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    child_belongs_to_field(parent, field, child)
-}
-
-fn child_belongs_to_field(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    let mut cursor = parent.walk();
     parent
-        .children(&mut cursor)
-        .enumerate()
-        .any(|(index, candidate)| {
-            candidate.id() == child.id()
-                && parent
-                    .field_name_for_child(index as u32)
-                    .is_some_and(|name| name == field)
-        })
+        .child_by_field_name(field)
+        .is_some_and(|candidate| candidate.id() == child.id())
 }
 
 fn has_children_in_field(parent: Node<'_>, field: &str) -> bool {
     let mut cursor = parent.walk();
-    parent.children(&mut cursor).enumerate().any(|(index, _)| {
-        parent
-            .field_name_for_child(index as u32)
-            .is_some_and(|name| name == field)
-    })
+    parent
+        .children_by_field_name(field, &mut cursor)
+        .next()
+        .is_some()
 }
 
 fn simple_binding_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -227,13 +215,13 @@ pub(super) fn callable_shape<'tree>(
     ))
 }
 
-pub(super) fn callable_child_belongs_to_procedure(callable: Node<'_>, child: Node<'_>) -> bool {
-    match callable.kind() {
-        "field_definition" | "public_field_definition" => field_matches(callable, "value", child),
-        "method_definition" => {
-            !field_matches(callable, "name", child)
-                && !child_belongs_to_field(callable, "decorator", child)
-        }
+pub(super) fn callable_field_belongs_to_procedure(
+    callable_kind: &str,
+    field: Option<&str>,
+) -> bool {
+    match callable_kind {
+        "field_definition" | "public_field_definition" => field == Some("value"),
+        "method_definition" => !matches!(field, Some("name" | "decorator")),
         _ => true,
     }
 }
@@ -265,7 +253,16 @@ pub(super) fn class_definition_expressions<'tree>(
                     }
                     match heritage.kind() {
                         "extends_clause" => {
-                            expressions.extend(children_by_field_name(heritage, "value"));
+                            let mut extends_cursor = heritage.walk();
+                            for (index, value) in heritage.children(&mut extends_cursor).enumerate()
+                            {
+                                if cancellation.is_cancelled() {
+                                    return Err(LoweringCancelled);
+                                }
+                                if heritage.field_name_for_child(index as u32) == Some("value") {
+                                    expressions.push(value);
+                                }
+                            }
                         }
                         "implements_clause" => {}
                         _ => expressions.push(heritage),
@@ -556,10 +553,12 @@ pub(super) fn is_js_ts_nested_execution_boundary(node: Node<'_>, traversal_root:
         return true;
     }
     node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "method_definition" | "field_definition" | "public_field_definition"
-        ) && callable_child_belongs_to_procedure(parent, node)
+        let belongs_to_procedure = match parent.kind() {
+            "field_definition" | "public_field_definition" => field_matches(parent, "value", node),
+            "method_definition" => !field_matches(parent, "name", node),
+            _ => false,
+        };
+        belongs_to_procedure
             && !(parent.kind() == "method_definition"
                 && node.id() == traversal_root.id()
                 && field_matches(parent, "body", node))

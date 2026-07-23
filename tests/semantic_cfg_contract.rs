@@ -5,7 +5,10 @@ use brokk_bifrost::{AnalyzerConfig, Language, ProjectFile};
 
 use common::{
     InlineTestProject,
-    semantic_graph::{PointSelector, SemanticGraph, TopologyRenderLimits, edge as expected_edge},
+    semantic_graph::{
+        PointSelector, SemanticGraph, TopologyRenderLimits, edge as expected_edge, mapped_source,
+        procedure_source,
+    },
 };
 
 const SOURCE: SourceMappingId = SourceMappingId::new(0);
@@ -98,32 +101,6 @@ fn anchor(offset: u32, width: u32) -> SourceAnchor {
 
 fn event(effect: SemanticEffect) -> SemanticEvent {
     SemanticEvent::new(effect, SOURCE, EVIDENCE)
-}
-
-fn mapped_cfg_source<'source>(
-    procedure: &ProcedureSemantics,
-    source: &'source str,
-    mapping: SourceMappingId,
-) -> &'source str {
-    let span = procedure
-        .source_mapping(mapping)
-        .expect("semantic row must retain a source mapping")
-        .locator
-        .anchor()
-        .span();
-    source
-        .get(span.start_byte() as usize..span.end_byte() as usize)
-        .expect("semantic source span must index the fixture")
-}
-
-fn cfg_procedure_source<'source>(
-    procedure: &ProcedureSemantics,
-    source: &'source str,
-) -> &'source str {
-    let span = procedure.locator().anchor().span();
-    source
-        .get(span.start_byte() as usize..span.end_byte() as usize)
-        .expect("procedure locator must index the fixture")
 }
 
 fn edge(
@@ -1576,7 +1553,7 @@ function build(): void {
         procedure
             .call_sites()
             .iter()
-            .map(|call| mapped_cfg_source(procedure, SOURCE, call.source).to_owned())
+            .map(|call| mapped_source(procedure, SOURCE, call.source).to_owned())
             .collect::<Vec<_>>()
     };
     assert_eq!(
@@ -1593,17 +1570,17 @@ function build(): void {
     let field_initializer = initializers
         .iter()
         .copied()
-        .find(|procedure| cfg_procedure_source(procedure, SOURCE).contains("fieldValue()"))
+        .find(|procedure| procedure_source(procedure, SOURCE).contains("fieldValue()"))
         .expect("computed field initializer");
     let static_initializer = initializers
         .iter()
         .copied()
-        .find(|procedure| cfg_procedure_source(procedure, SOURCE).contains("staticValue()"))
+        .find(|procedure| procedure_source(procedure, SOURCE).contains("staticValue()"))
         .expect("static field initializer");
     let static_block = initializers
         .iter()
         .copied()
-        .find(|procedure| cfg_procedure_source(procedure, SOURCE).contains("staticBody()"))
+        .find(|procedure| procedure_source(procedure, SOURCE).contains("staticBody()"))
         .expect("static block initializer");
     assert_eq!(call_sources(field_initializer), ["fieldValue()"]);
     assert_eq!(call_sources(static_initializer), ["staticValue()"]);
@@ -1613,7 +1590,7 @@ function build(): void {
         .iter()
         .find(|procedure| {
             procedure.kind() == ProcedureKind::Method
-                && cfg_procedure_source(procedure, SOURCE).contains("methodBody()")
+                && procedure_source(procedure, SOURCE).contains("methodBody()")
         })
         .expect("computed method procedure");
     assert_eq!(call_sources(computed_method), ["methodBody()"]);

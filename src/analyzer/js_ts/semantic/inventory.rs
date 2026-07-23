@@ -178,11 +178,16 @@ pub(super) fn enumerate_procedures<'tree>(
         }
 
         let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
+        let children = node
+            .children(&mut cursor)
+            .enumerate()
+            .filter(|(_, child)| child.is_named())
+            .map(|(index, child)| (child, node.field_name_for_child(index as u32)))
+            .collect::<Vec<_>>();
+        for (child, field) in children.into_iter().rev() {
             let (child_parent, child_path) = match procedure_context {
                 Some((procedure, procedure_path))
-                    if callable_child_belongs_to_procedure(node, child) =>
+                    if callable_field_belongs_to_procedure(node.kind(), field) =>
                 {
                     (Some(procedure), procedure_path)
                 }

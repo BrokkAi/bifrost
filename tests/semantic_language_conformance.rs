@@ -14,6 +14,7 @@ use common::{
     semantic_graph::{
         CallContextSelector, ExpectedIcfgBoundary, ExpectedIcfgBoundaryKind, IcfgGraph,
         IcfgOutcomeKind, PointSelector, SemanticGraph, edge as cfg_edge, icfg_edge,
+        procedure_source,
     },
 };
 
@@ -6825,19 +6826,13 @@ fn javascript_typescript_class_field_initializers_are_source_backed() {
             );
         }
 
-        let procedure_source = |procedure: &ProcedureSemantics| {
-            let span = procedure.locator().anchor().span();
-            SOURCE
-                .get(span.start_byte() as usize..span.end_byte() as usize)
-                .expect("procedure locator must remain inside the shared fixture")
-        };
         let lambdas = procedures
             .iter()
             .filter(|procedure| procedure.kind() == ProcedureKind::Lambda)
             .collect::<Vec<_>>();
         assert_eq!(lambdas.len(), 5);
         for lambda in &lambdas {
-            let source = procedure_source(lambda);
+            let source = procedure_source(lambda, SOURCE);
             if source.contains("\"computed\"") || source.contains("\"direct\"") {
                 assert_eq!(
                     lambda.lexical_parent(),
@@ -6873,7 +6868,7 @@ fn javascript_typescript_class_field_initializers_are_source_backed() {
                         .lexical_parent()
                         .and_then(|parent| procedures.get(parent.index()))
                         .map(ProcedureSemantics::kind),
-                    procedure_source(procedure).to_owned(),
+                    procedure_source(procedure, SOURCE).to_owned(),
                 )
             })
             .collect::<Vec<_>>();

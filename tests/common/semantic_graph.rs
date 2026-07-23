@@ -124,6 +124,35 @@ pub const fn edge(endpoint: &str, kind: ControlEdgeKind) -> ExpectedEdge<'_> {
     ExpectedEdge::new(endpoint, kind)
 }
 
+/// Return the exact fixture source represented by one semantic source mapping.
+pub fn mapped_source<'source>(
+    procedure: &ProcedureSemantics,
+    source: &'source str,
+    mapping: SourceMappingId,
+) -> &'source str {
+    let span = procedure
+        .source_mapping(mapping)
+        .expect("semantic row must retain a source mapping")
+        .locator
+        .anchor()
+        .span();
+    source_for_span(source, span)
+}
+
+/// Return the exact fixture source represented by a procedure locator.
+pub fn procedure_source<'source>(
+    procedure: &ProcedureSemantics,
+    source: &'source str,
+) -> &'source str {
+    source_for_span(source, procedure.locator().anchor().span())
+}
+
+fn source_for_span(source: &str, span: SourceSpan) -> &str {
+    source
+        .get(span.start_byte() as usize..span.end_byte() as usize)
+        .expect("semantic source span must index the fixture")
+}
+
 /// A call-context selector expressed only in readable call-site aliases.
 ///
 /// Aliases are ordered from the root caller toward the current callee. The
