@@ -349,7 +349,7 @@ fn i2_silent_when_class_and_companion_diverge_at_the_location_stage() {
 #[test]
 fn i2_fires_when_one_declarations_spellings_drift_at_the_location_stage() {
     let records = vec![
-        defs_spelling(0, "Foo", "ctx", "t", "invalid_location"),
+        defs_spelling(0, "Foo", "ctx", "t", "resolved"),
         defs_spelling(1, "a.b.Foo", "ctx", "t", "no_definition"),
     ];
     let mut sink = Default::default();
@@ -358,6 +358,34 @@ fn i2_fires_when_one_declarations_spellings_drift_at_the_location_stage() {
     let violations = sink.into_sorted_vec();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert_eq!(violations[0].shape, "spelling-status-drift");
+}
+
+// invalid_location is qualification divergence surfacing at the location
+// stage (a bare selector too weak to anchor the reference), exempt like
+// Ambiguous/NotFound — not a verdict to compare (open62541 shape).
+#[test]
+fn i2_silent_when_bare_spelling_reports_invalid_location_where_qualified_resolves() {
+    let records = vec![
+        defs_spelling(0, "setConditionField", "ctx", "t", "invalid_location"),
+        defs_spelling(
+            1,
+            "UA_AlarmConditionsDriver.setConditionField",
+            "ctx",
+            "t",
+            "resolved",
+        ),
+        defs_spelling(
+            2,
+            "include/open62541/driver/alarms_conditions.h#setConditionField",
+            "ctx",
+            "t",
+            "resolved",
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "cpp", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
 }
 
 // Location verdicts legitimately differ across *different* reference sites:

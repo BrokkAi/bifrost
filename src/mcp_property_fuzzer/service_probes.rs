@@ -1815,6 +1815,14 @@ pub fn check_i2(
                 let SpellingOutcome::Resolved { status, .. } = outcome else {
                     continue;
                 };
+                // invalid_location is qualification divergence surfacing at
+                // the location stage, not a verdict: a bare selector too weak
+                // to anchor the reference reports target-not-found where a
+                // qualified spelling resolves (open62541's struct-member
+                // function pointers). Exempt it like Ambiguous/NotFound.
+                if status == "invalid_location" {
+                    continue;
+                }
                 let ProbeKind::Spelling { spelling, .. } = &record.kind else {
                     continue;
                 };
