@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, resolved call edges and direct call-site inputs, direct project import edges, indexed type hierarchies, declaration ownership, and bounded JavaScript/TypeScript receiver provenance. It does not infer override families, resolve general aliases, or perform control-flow, taint, or general data-flow analysis.
+Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, resolved call edges and direct call-site inputs, direct project import edges, indexed type hierarchies, declaration ownership, and bounded receiver provenance in Java, JavaScript, and TypeScript. It does not infer override families, resolve general aliases, or perform control-flow, taint, or general data-flow analysis.
 
 ## Minimal Query
 
@@ -227,7 +227,7 @@ Call traversal is direct by default. `callers` and `callees` accept a positive f
 
 The three receiver steps return a tagged `receiver_analysis` row for every input, including unknown and unsupported cases. Each row includes `analysis_kind`, input path/language/range/text/kind, and `outcome`. `receiver_targets` and `points_to` use recursive `values`; `member_targets` uses exact `CodeQueryDeclaration` values under `member_targets`. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
 
-Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Languages other than JavaScript and TypeScript return explicit `unsupported` rows plus capability diagnostics rather than empty results. Receiver-analysis rows are terminal except for `file_of`.
+Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Languages other than Java, JavaScript, and TypeScript return explicit `unsupported` rows plus capability diagnostics rather than empty results. Receiver-analysis rows are terminal except for `file_of`.
 
 An optional `capture` is valid only when the preceding domain is a structural match. It must be between 1 and 128 bytes and name a positive capture declared by the structural query; every unique bound range is analyzed. Without a capture, `points_to` analyzes the match or the normalized `right` side of assignment/binding shapes, `receiver_targets` extracts the call `receiver` or field-access `object`, and `member_targets` extracts the receiver plus terminal member. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for exact JSON/RQL/output triples.
 

@@ -241,9 +241,9 @@ query_step_ops! {
     CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
     CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
     CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
-    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site -> receiver_analysis", description: "Analyze the bounded JS/TS receiver value at each input site." }
-    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site -> receiver_analysis", description: "Analyze the bounded JS/TS value provenance of each input expression." }
-    MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact JS/TS member declarations through bounded receiver facts." }
+    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site -> receiver_analysis", description: "Analyze the bounded Java, JavaScript, or TypeScript receiver value at each input site." }
+    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site -> receiver_analysis", description: "Analyze bounded Java, JavaScript, or TypeScript value provenance for each input expression." }
+    MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact Java, JavaScript, or TypeScript member declarations through bounded receiver facts." }
 }
 
 macro_rules! rql_forms {
@@ -552,21 +552,21 @@ rql_forms! {
         class: Wrapper,
         shape: Query,
         signature: "(receiver-targets [:capture name] query)",
-        description: "Analyze bounded JS/TS receiver values at structural or semantic source sites.",
+        description: "Analyze bounded Java, JavaScript, or TypeScript receiver values at structural or semantic source sites.",
     }
     PointsTo {
         labels: ["points-to", "points_to"],
         class: Wrapper,
         shape: Query,
         signature: "(points-to [:capture name] query)",
-        description: "Analyze bounded JS/TS value and allocation provenance.",
+        description: "Analyze bounded Java, JavaScript, or TypeScript value and allocation provenance.",
     }
     MemberTargets {
         labels: ["member-targets", "member_targets"],
         class: Wrapper,
         shape: Query,
         signature: "(member-targets [:capture name] query)",
-        description: "Resolve exact JS/TS member declarations through the analyzed receiver.",
+        description: "Resolve exact Java, JavaScript, or TypeScript member declarations through the analyzed receiver.",
     }
     Name {
         labels: ["name"],

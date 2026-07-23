@@ -35,7 +35,7 @@ An empty `results` array is only a zero-result inside the query's actual workspa
 | `proof: "unproven"` reference/call edge | “This is a structured possible target.” | “This call definitely targets…” |
 | Importer-file result | “This file directly imports the target file.” | “This file calls or uses the target member.” |
 | `provenance_truncated: true` | “The result has additional derivation paths that were not retained.” | “These are all paths to the result.” |
-| `receiver_analysis` with `precise` | “The bounded JS/TS receiver provider returned this exact candidate set for the input.” | “Whole-program analysis proves this is the only runtime value.” |
+| `receiver_analysis` with `precise` | “The bounded receiver analysis returned this exact candidate set for the input.” | “Whole-program analysis proves this is the only runtime value.” |
 | `receiver_analysis` with `ambiguous` | “The bounded analysis retained these possible candidates.” | “Each candidate is independently precise.” |
 | `receiver_analysis` with `unknown`, `unsupported`, or `exceeded_budget` | “Bifrost could not establish candidates for this input for the reported reason/limit.” | “There are no targets.” |
 | Complete policy run with zero findings | “This policy retained no findings in its recorded analyzer and dependency scope.” | “The issue cannot occur.” |
