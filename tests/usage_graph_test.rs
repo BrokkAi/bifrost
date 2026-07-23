@@ -398,3 +398,98 @@ class Consumer:
         value["edges"]
     );
 }
+
+#[test]
+fn python_namespace_import_chains_resolve_deep_members_and_shadowing() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+import kornia as K
+
+def via_alias():
+    K.color.rgb_to_bgr()
+
+def via_deep():
+    K.core.ops.eye_like()
+
+def via_classmethod():
+    K.feature.DISK.from_pretrained()
+
+def shadowed(K):
+    K.feature.DISK.from_pretrained()
+"#,
+        )
+        .file(
+            "kornia/__init__.py",
+            r#"
+from . import color, core, feature
+"#,
+        )
+        .file(
+            "kornia/color.py",
+            r#"
+def rgb_to_bgr():
+    pass
+"#,
+        )
+        .file(
+            "kornia/core/__init__.py",
+            r#"
+from . import ops
+"#,
+        )
+        .file(
+            "kornia/core/ops.py",
+            r#"
+def eye_like():
+    pass
+"#,
+        )
+        .file(
+            "kornia/feature.py",
+            r#"
+class DISK:
+    @classmethod
+    def from_pretrained(cls):
+        return cls()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.via_alias", "kornia.color.rgb_to_bgr"),
+        "namespace alias chain should resolve nested module member: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.via_deep", "kornia.core.ops.eye_like"),
+        "deep namespace chain should resolve exact function target: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.via_classmethod", "kornia.feature.DISK"),
+        "inner class attribute in a deep namespace chain should record the class target: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "app.via_classmethod",
+            "kornia.feature.DISK.from_pretrained"
+        ),
+        "deep namespace chain should resolve the final classmethod target: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.shadowed", "kornia.feature.DISK")
+            && !has_edge(
+                &value,
+                "app.shadowed",
+                "kornia.feature.DISK.from_pretrained"
+            ),
+        "a shadowed namespace-import root must not resolve through the import binding: {}",
+        value["edges"]
+    );
+}

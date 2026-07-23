@@ -193,6 +193,7 @@ pub(super) fn scan_files_for_seeds(
             source: source_str,
             line_starts: &line_starts,
             analyzer,
+            target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
             target_owner: target_owner.clone(),
@@ -249,6 +250,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
+    target: &'a CodeUnit,
     target_short: &'a str,
     target_member: Option<&'a str>,
     target_owner: Option<CodeUnit>,
@@ -789,39 +791,59 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         record_hit(attribute, ctx);
     }
 
-    let namespace_match = ctx.edges.iter().any(|edge| {
-        matches!(edge.kind, ImportEdgeKind::Namespace)
-            && namespace_edge_matches_object(ctx.analyzer, edge, object_text)
-            && leftmost_identifier(node)
-                .is_none_or(|root| !import_root_shadowed(ctx, slice(root, ctx.source), root, node))
-            && ctx
-                .seeds
-                .contains(&(edge.target_file.clone(), attribute_text.to_string()))
-    });
-    if ctx.target_member.is_none() && namespace_match {
-        record_hit(attribute, ctx);
+    if let Some(namespace_target) = namespace_attribute_target_hit(node, ctx) {
+        record_hit(namespace_target, ctx);
     }
 }
 
-fn namespace_edge_matches_object(
-    analyzer: &dyn IAnalyzer,
-    edge: &ImportEdge,
-    object_text: &str,
-) -> bool {
-    if edge.local_name == object_text {
-        return true;
+/// Resolve a top-level symbol written through a namespace import and any number
+/// of intermediate modules (`K.feature.DISK`, `pkg.core.ops.eye_like`).
+///
+/// The written path is assembled only from tree-sitter's `attribute` fields.
+/// The analyzer's canonical export resolver then proves that the whole path
+/// names the exact physical target, so re-export aliases remain supported
+/// without comparing rendered source paths or broadening same-name candidates.
+fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
+    if ctx.target_member.is_some() {
+        return None;
     }
-    let Some(suffix) = object_text.strip_prefix(&edge.local_name) else {
-        return false;
-    };
-    if !suffix.starts_with('.') {
-        return false;
+    let (root, attributes) = attribute_chain(node)?;
+    let terminal = *attributes.last()?;
+    let terminal_name = slice(terminal, ctx.source);
+    if terminal_name.is_empty()
+        || !ctx
+            .seeds
+            .iter()
+            .any(|(_, seed_name)| seed_name == terminal_name)
+    {
+        return None;
     }
-    analyzer
-        .declarations(&edge.target_file)
+
+    let root_name = slice(root, ctx.source);
+    if root_name.is_empty() || import_root_shadowed(ctx, root_name, root, node) {
+        return None;
+    }
+    let binder = ctx.py.import_binder_of(ctx.file);
+    let binding = binder.bindings.get(root_name)?;
+    if binding.kind != ImportKind::Namespace {
+        return None;
+    }
+    let mut written_fqn = binding.module_specifier.clone();
+    for attribute in attributes {
+        let segment = slice(attribute, ctx.source);
+        if segment.is_empty() {
+            return None;
+        }
+        written_fqn.push('.');
+        written_fqn.push_str(segment);
+    }
+    ctx.py
+        .resolve_fqn_candidates(&written_fqn, |name| {
+            ctx.analyzer.definitions(name).collect()
+        })
         .into_iter()
-        .find(CodeUnit::is_module)
-        .is_some_and(|module| module.fq_name() == object_text)
+        .any(|candidate| &candidate == ctx.target)
+        .then_some(terminal)
 }
 
 fn imported_root_targets_module(ctx: &ScanCtx<'_>, root: Node<'_>, reference: Node<'_>) -> bool {
@@ -1701,6 +1723,7 @@ fn collect_scope_facts_with_factory_returns(
         };
         let facts = collect_scope_facts_from_source(
             &declaration_source,
+            ScopeFactTraversal::Class,
             true,
             Some(declaration.short_name()),
             factory_return_types,
@@ -1725,6 +1748,7 @@ fn collect_scope_facts_with_factory_returns(
             .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
             &declaration_source,
+            ScopeFactTraversal::Function,
             false,
             owner,
             factory_return_types,
@@ -1745,8 +1769,13 @@ fn collect_scope_facts_with_factory_returns(
         let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
-        let facts =
-            collect_scope_facts_from_source(&declaration_source, false, None, factory_return_types);
+        let facts = collect_scope_facts_from_source(
+            &declaration_source,
+            ScopeFactTraversal::Module,
+            false,
+            None,
+            factory_return_types,
+        );
         scope_facts.insert(declaration.clone(), facts);
     }
     scope_facts
@@ -1776,11 +1805,12 @@ fn declaration_source_slices<'a>(
 
 fn collect_scope_facts_from_source(
     source: &str,
+    traversal: ScopeFactTraversal,
     allow_self_receivers: bool,
     current_class: Option<&str>,
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
-    let events = collect_scope_fact_events(source);
+    let events = collect_scope_fact_events(source, traversal);
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
     for event in &events {
         if let ScopeFactEvent::Parameter { symbol, .. } = event
@@ -1929,7 +1959,14 @@ enum AssignmentRhs {
     Unknown,
 }
 
-fn collect_scope_fact_events(source: &str) -> Vec<ScopeFactEvent> {
+#[derive(Clone, Copy)]
+enum ScopeFactTraversal {
+    Module,
+    Function,
+    Class,
+}
+
+fn collect_scope_fact_events(source: &str, traversal: ScopeFactTraversal) -> Vec<ScopeFactEvent> {
     if source.trim().is_empty() {
         return Vec::new();
     }
@@ -1946,17 +1983,43 @@ fn collect_scope_fact_events(source: &str) -> Vec<ScopeFactEvent> {
     };
 
     let mut events = Vec::new();
-    collect_scope_fact_events_from_node(tree.root_node(), source, &mut events);
+    collect_scope_fact_events_from_node(tree.root_node(), source, traversal, &mut events);
     events
 }
 
 fn collect_scope_fact_events_from_node(
     root: Node<'_>,
     source: &str,
+    traversal: ScopeFactTraversal,
     events: &mut Vec<ScopeFactEvent>,
 ) {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, false)];
+    while let Some((node, inside_function)) = stack.pop() {
+        let next_inside_function = match traversal {
+            ScopeFactTraversal::Module => {
+                if matches!(
+                    node.kind(),
+                    "function_definition" | "class_definition" | "lambda"
+                ) {
+                    continue;
+                }
+                false
+            }
+            ScopeFactTraversal::Function => match node.kind() {
+                "function_definition" if inside_function => continue,
+                "function_definition" => true,
+                "class_definition" | "lambda" => continue,
+                _ => inside_function,
+            },
+            ScopeFactTraversal::Class => inside_function,
+        };
+        if matches!(traversal, ScopeFactTraversal::Function) && !next_inside_function {
+            let mut cursor = node.walk();
+            let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            children.reverse();
+            stack.extend(children.into_iter().map(|child| (child, false)));
+            continue;
+        }
         match node.kind() {
             "parameters" => collect_parameter_events(node, source, events),
             "assignment" => collect_assignment_events(node, source, events),
@@ -1966,7 +2029,11 @@ fn collect_scope_fact_events_from_node(
         let mut cursor = node.walk();
         let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         children.reverse();
-        stack.extend(children);
+        stack.extend(
+            children
+                .into_iter()
+                .map(|child| (child, next_inside_function)),
+        );
     }
 }
 

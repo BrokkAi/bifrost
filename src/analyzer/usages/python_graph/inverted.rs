@@ -390,33 +390,44 @@ fn handle_attribute<'a>(
             }
         }
     }
-    // `module.symbol` where the object is a namespace import: the callee is the
-    // module prefix plus the accessed attribute. A local of the same name as the
-    // module shadows the import.
-    if !is_shadowed(scopes, object_text)
-        && let Some(binding) = ctx.namespace.get(object_text)
-    {
-        let module = binding.module.clone();
-        let workspace_module = binding.workspace_module;
-        if ctx.targets.contains(&module) {
-            ctx.record(module.clone(), object);
-        }
-        let direct = format!("{module}.{attribute_text}");
-        if ctx.targets.contains(&direct) {
-            ctx.record(direct, attribute);
+    // `module.symbol` or a deeper `module.ns.symbol` chain rooted at a
+    // namespace import. Walk the attribute structure from the leftmost imported
+    // root so deep chains stay exact without source-text splitting.
+    if let Some((root, attributes)) = attribute_chain(node) {
+        let root_text = slice(root, ctx.source);
+        if !root_text.is_empty()
+            && !is_shadowed(scopes, root_text)
+            && let Some(binding) = ctx.namespace.get(root_text)
+        {
+            let mut direct = binding.module.clone();
+            let workspace_module = binding.workspace_module;
+            if object.kind() == "identifier" && ctx.targets.contains(&direct) {
+                ctx.record(direct.clone(), object);
+            }
+            for member in attributes {
+                let member_text = slice(member, ctx.source);
+                if member_text.is_empty() {
+                    return;
+                }
+                direct.push('.');
+                direct.push_str(member_text);
+            }
+            if ctx.targets.contains(&direct) {
+                ctx.record(direct, attribute);
+                return;
+            }
+            // A re-export alias can change the terminal name (`proto.module` may
+            // canonically resolve to `proto.modules.define_module`), so terminal-name
+            // filtering is not sound here. Namespace imports are already a narrow,
+            // structured subset of attributes; resolve their workspace candidates
+            // and let `record` retain only requested targets.
+            if workspace_module {
+                for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
+                    ctx.record(resolved.clone(), attribute);
+                }
+            }
             return;
         }
-        // A re-export alias can change the terminal name (`proto.module` may
-        // canonically resolve to `proto.modules.define_module`), so terminal-name
-        // filtering is not sound here. Namespace imports are already a narrow,
-        // structured subset of attributes; resolve their workspace candidates
-        // and let `record` retain only requested targets.
-        if workspace_module {
-            for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
-                ctx.record(resolved.clone(), attribute);
-            }
-        }
-        return;
     }
 
     // `recv.method` where recv is a typed local/parameter: resolve to the
@@ -510,6 +521,22 @@ fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
             "identifier" => return Some(node),
             "attribute" => node = node.child_by_field_name("object")?,
             _ => return None,
+        }
+    }
+}
+
+fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
+    let mut attributes = Vec::new();
+    let mut current = node;
+    loop {
+        if current.kind() != "attribute" {
+            return None;
+        }
+        attributes.push(current.child_by_field_name("attribute")?);
+        current = current.child_by_field_name("object")?;
+        if current.kind() == "identifier" {
+            attributes.reverse();
+            return Some((current, attributes));
         }
     }
 }
