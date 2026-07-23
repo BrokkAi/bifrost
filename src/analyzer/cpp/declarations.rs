@@ -115,6 +115,22 @@ struct RecoveredExportedClass<'tree> {
     body: Option<Node<'tree>>,
     raw_supertypes: Option<Vec<String>>,
     uses_initializer_body: bool,
+    /// Present only for the fragmented multiple-base export shape (issue #938).
+    /// Carries the true class-body byte region -- the members tree-sitter scattered
+    /// out of the recovered node -- so they can be reparsed and re-owned as members
+    /// rather than lost inside the truncated `initializer_list` stand-in.
+    fragmented_body: Option<FragmentedExportBody>,
+}
+
+/// The recovered class-body geometry for a fragmented multiple-base export class.
+/// `[reparse_start, reparse_end)` is the interior between the class braces, kept
+/// verbatim for a padded reparse (issue #941 machinery) so every recovered member
+/// keeps its exact original byte/line position. `class_range` is the full class
+/// navigation range spanning to the displaced closing brace.
+struct FragmentedExportBody {
+    reparse_start: usize,
+    reparse_end: usize,
+    class_range: Range,
 }
 
 fn recover_exported_class_declaration<'tree>(
@@ -151,6 +167,7 @@ fn recover_exported_class_declaration<'tree>(
         raw_supertypes: matches!(class_node.kind(), "class_specifier" | "struct_specifier")
             .then(|| extract_cpp_supertypes(class_node, source)),
         uses_initializer_body: false,
+        fragmented_body: None,
     })
 }
 
@@ -236,7 +253,72 @@ fn recover_malformed_exported_multiple_base_class<'tree>(
         body: Some(body),
         raw_supertypes: Some(raw_supertypes),
         uses_initializer_body: true,
+        fragmented_body: fragmented_export_body_region(node, body, source),
     })
+}
+
+/// Locate the true class-body region for a fragmented multiple-base export class.
+///
+/// `node` is the outer `declaration`; `body` is the `initializer_list` tree-sitter
+/// emits in place of the real class body. Tree-sitter reduces that body in one of
+/// two shapes, both of which lose the members from the recovered node:
+///
+/// * Complete inline body (one-liner / empty class): the `initializer_list` carries
+///   a real closing brace and holds the whole body text inline. The interior between
+///   the braces reparses to the members directly.
+/// * Truncated body (the QGIS/Chromium shape): the `initializer_list` ends at the
+///   first member with a zero-width MISSING `}`; every later member -- and the real
+///   closing `}` (a lone-`}` `ERROR`) -- scatters to the declaration's following
+///   siblings. The interior runs from the opening brace to that displaced `}`.
+///
+/// Returns the interior byte range to reparse plus the full class navigation range.
+fn fragmented_export_body_region(
+    node: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+) -> Option<FragmentedExportBody> {
+    let reparse_start = body.start_byte() + 1;
+    let close = direct_close_brace(body)?;
+    if close.end_byte() > close.start_byte() {
+        return Some(FragmentedExportBody {
+            reparse_start,
+            reparse_end: close.start_byte(),
+            class_range: cpp_declaration_range(node),
+        });
+    }
+    // The closing brace was displaced past the recovered node. A balanced nested
+    // class keeps its own braces, so the first lone-`}` sibling is this class's.
+    let mut sibling = node.next_named_sibling();
+    let displaced_close = loop {
+        let current = sibling?;
+        if cpp_is_stray_close_brace(current, source) {
+            break current;
+        }
+        sibling = current.next_named_sibling();
+    };
+    Some(FragmentedExportBody {
+        reparse_start,
+        reparse_end: displaced_close.start_byte(),
+        class_range: Range {
+            start_byte: node.start_byte(),
+            end_byte: displaced_close.end_byte(),
+            start_line: node.start_position().row + 1,
+            end_line: displaced_close.end_position().row + 1,
+        },
+    })
+}
+
+/// The direct `}` child of a node, real or MISSING (a MISSING brace is zero-width).
+fn direct_close_brace(node: Node<'_>) -> Option<Node<'_>> {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .find(|child| !child.is_named() && child.kind() == "}")
+}
+
+/// A displaced lone closing brace: the class close that the fragmented multiple-base
+/// mis-parse split off past the recovered declaration as a bare `}` `ERROR`.
+fn cpp_is_stray_close_brace(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "ERROR" && node_text(node, source).trim() == "}"
 }
 
 fn displaced_exported_class_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -626,6 +708,15 @@ pub(super) struct CppVisitor<'a> {
     pub(super) source: &'a str,
     pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
     pub(super) recovered_class_sibling_scopes: HashMap<usize, ScopeInfo>,
+    /// Byte regions whose contents were re-owned by a fragmented export-class
+    /// recovery (#938): the scattered members between the fragmented
+    /// declaration and its displaced closing brace are indexed as members of
+    /// the recovered class by the region reparse, so the ordinary sibling walk
+    /// must not ALSO index them as top-level declarations (that double-indexing
+    /// made a scattered nested class ambiguous between `Inner` and
+    /// `Widget$Inner`). Regions are rare (one per fragmented recovery), so a
+    /// linear scan at visit time is fine.
+    pub(super) consumed_fragment_regions: Vec<(usize, usize)>,
 }
 
 impl<'a> CppVisitor<'a> {
@@ -637,28 +728,82 @@ impl<'a> CppVisitor<'a> {
         class_unit: Option<CodeUnit>,
         template_signature: Option<String>,
     ) {
-        let mut stack = vec![CppWork::Container(CppContainer {
-            node,
-            scope: ScopeInfo {
-                package_name: package_name.to_string(),
-                module,
-                class_unit,
-                template_signature,
-                template_metadata: None,
-                declarations_are_fields: false,
-                recovered_specialization_member_scope: false,
-            },
-        })];
+        let scope = ScopeInfo {
+            package_name: package_name.to_string(),
+            module,
+            class_unit,
+            template_signature,
+            template_metadata: None,
+            declarations_are_fields: false,
+            recovered_specialization_member_scope: false,
+        };
+        self.run_container_work(node, scope);
+    }
+
+    /// Whether a work node lies entirely inside a byte region consumed by a
+    /// fragmented export-class recovery (#938); such nodes were already indexed
+    /// as members of the recovered class by the region reparse.
+    fn node_is_inside_consumed_fragment(&self, node: Node<'_>) -> bool {
+        self.consumed_fragment_regions
+            .iter()
+            .any(|&(start, end)| node.start_byte() >= start && node.end_byte() <= end)
+    }
+
+    /// Drive the container work loop from an explicit seed scope to completion. The
+    /// loop is self-contained so a locally-owned reparsed tree (issue #938/#941)
+    /// stays alive for the whole traversal.
+    fn run_container_work<'tree>(&mut self, node: Node<'tree>, scope: ScopeInfo) {
+        let mut stack = vec![CppWork::Container(CppContainer { node, scope })];
         while let Some(work) = stack.pop() {
             match work {
                 CppWork::Container(container) => {
                     push_cpp_child_work(container.node, container.scope, &mut stack);
                 }
                 CppWork::Node(work) => {
+                    if self.node_is_inside_consumed_fragment(work.node) {
+                        continue;
+                    }
                     self.visit_node(work.node, &work.scope, &mut stack);
                 }
             }
         }
+    }
+
+    /// Reparse the fragmented multiple-base export class body (issue #938) and index
+    /// its contents as members of `class_unit`. The interior is reparsed in a padded
+    /// copy (issue #941's `cpp_reparse_region_items`) so every member keeps its exact
+    /// original byte/line position; the reparse is admitted only when it is entirely
+    /// member-shaped, so a well-formed body is the sole thing re-owned this way.
+    fn visit_fragmented_export_class_members(
+        &mut self,
+        fragmented: &FragmentedExportBody,
+        class_unit: CodeUnit,
+        scope: &ScopeInfo,
+    ) {
+        if fragmented.reparse_start >= fragmented.reparse_end {
+            return;
+        }
+        let Some((_padded, tree)) = cpp_reparse_region_items(
+            self.source,
+            fragmented.reparse_start,
+            fragmented.reparse_end,
+        ) else {
+            return;
+        };
+        let root = tree.root_node();
+        if !cpp_reparsed_members_are_indexable(root, self.source) {
+            return;
+        }
+        let member_scope = ScopeInfo {
+            package_name: scope.package_name.clone(),
+            module: scope.module.clone(),
+            class_unit: Some(class_unit),
+            template_signature: scope.template_signature.clone(),
+            template_metadata: None,
+            declarations_are_fields: true,
+            recovered_specialization_member_scope: false,
+        };
+        self.run_container_work(root, member_scope);
     }
 
     fn visit_node<'tree>(
@@ -1201,6 +1346,37 @@ impl<'a> CppVisitor<'a> {
         }
 
         if let Some(recovered) = recover_exported_class_declaration(node, self.source) {
+            if let Some(fragmented) = recovered.fragmented_body {
+                // Issue #938: the members tree-sitter scattered out of the fragmented
+                // multiple-base export node are reparsed from their true body region
+                // and re-owned as members of the recovered class, with an explicit
+                // navigation range spanning to the displaced closing brace.
+                let code_unit = self.visit_named_class_like_shape(
+                    recovered.declaration_node,
+                    recovered.name,
+                    None,
+                    true,
+                    Some(fragmented.class_range),
+                    recovered.raw_supertypes,
+                    scope,
+                    stack,
+                );
+                let consumed_region = (
+                    recovered.declaration_node.end_byte(),
+                    fragmented.class_range.end_byte,
+                );
+                self.visit_fragmented_export_class_members(&fragmented, code_unit, scope);
+                // Everything between the fragmented declaration and its displaced
+                // closing brace now belongs to the recovered class; keep the
+                // ordinary walk from re-indexing those scattered siblings at top
+                // level. Registered AFTER the member reparse above because the
+                // padded reparse's nodes deliberately carry their original byte
+                // offsets (inside this very region) and must not be suppressed;
+                // the outer tree's sibling work items are visited later, so the
+                // ordering still shields them.
+                self.consumed_fragment_regions.push(consumed_region);
+                return;
+            }
             let uses_initializer_body = recovered.uses_initializer_body;
             let definition_body_present = recovered.body.is_some();
             self.visit_named_class_like_shape(
@@ -3401,6 +3577,35 @@ fn cpp_reparsed_items_are_indexable(root: Node<'_>, source: &str) -> bool {
         }
     }
     saw_item
+}
+
+/// Robustness gate for a reparsed fragmented multiple-base export class body
+/// (issue #938). Adapts `cpp_reparsed_items_are_indexable` to the member-shaped
+/// kinds a class body produces when reparsed at translation-unit scope: the
+/// access-specifier label preceding the first member surfaces as a
+/// `labeled_statement` wrapping that member, and members surface as
+/// `declaration`/`field_declaration`/`function_definition`/nested type specifiers.
+/// Statement or expression soup surfaces as other top-level kinds and is rejected,
+/// so only a genuinely member-shaped body is ever re-owned as members; anything
+/// ambiguous falls back to indexing the class alone.
+fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    let mut saw_member = false;
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "comment" => {}
+            "labeled_statement" => saw_member = true,
+            "function_definition" => {
+                if child.has_error() && cpp_sentinel_macro_region(child, source).is_none() {
+                    return false;
+                }
+                saw_member = true;
+            }
+            kind if cpp_is_indexable_item_kind(kind) => saw_member = true,
+            _ => return false,
+        }
+    }
+    saw_member
 }
 
 fn cpp_is_indexable_item_kind(kind: &str) -> bool {

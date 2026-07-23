@@ -298,7 +298,6 @@ void use_block() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "issue #938 is live; un-ignore when the fix lands"]
 fn issue_938_cpp_fragmented_multi_base_export_class_recovers_class_and_late_member_owner() {
     let source = r#"#define CORE_EXPORT
 namespace core {

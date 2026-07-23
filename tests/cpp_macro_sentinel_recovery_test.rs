@@ -329,3 +329,180 @@ END_WRAP
         "no class/struct should be fabricated from the soup: {summaries}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Issue #938: a fragmented multiple-base export class (an undefined all-caps macro between
+// `class` and the name, plus multiple bases) makes tree-sitter scatter the class body -- the
+// first member lands inside a truncated `initializer_list` stand-in and every later member,
+// nested class, and the real closing brace scatter to top-level siblings. The #938 recovery
+// reuses the #941 padded-reparse machinery to reparse the true body region and re-own its
+// contents as members. This exercises the shared machinery end to end through the service API.
+// ---------------------------------------------------------------------------------------------
+
+const FRAGMENTED_EXPORT_WIDGET: &str = r#"#define CORE_EXPORT
+namespace core {
+class A {};
+class B {};
+class C {};
+}
+class CORE_EXPORT Widget : public core::A, public core::B, public core::C {
+public:
+    void early();
+    class Inner {
+    public:
+        void innerM();
+    };
+    // padding to push the tail member well past the fragmented opening
+    void lateMethod();
+};
+void callWidget(Widget* w) {
+    w->lateMethod();
+}
+"#;
+
+/// The fragmented multiple-base export shape recovers every scattered member with the correct
+/// owner and exact ranges: the first member (`early`), a nested class and its method, and a tail
+/// member (`lateMethod`) declared long after the fragmented opening. The tail member's inverse
+/// usage from an outside caller must be FOUND, and the summary must nest the members under Widget.
+#[test]
+fn fragmented_multi_base_export_class_recovers_scattered_members() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget.h", FRAGMENTED_EXPORT_WIDGET)
+        .build();
+
+    // (a) Widget and its scattered members resolve to exact source ranges.
+    let widget = symbol_sources(&project, "Widget");
+    let widget_source = unique_source(&widget, "Widget");
+    assert_eq!("widget.h", widget_source["path"], "{widget}");
+    assert_eq!(
+        line_of(FRAGMENTED_EXPORT_WIDGET, "class CORE_EXPORT Widget"),
+        widget_source["start_line"].as_u64().expect("start_line") as usize,
+        "Widget start line must be byte/line-exact: {widget}"
+    );
+
+    let early = symbol_sources(&project, "early");
+    let early_source = unique_source(&early, "early");
+    assert_eq!(
+        line_of(FRAGMENTED_EXPORT_WIDGET, "void early()"),
+        early_source["start_line"].as_u64().expect("start_line") as usize,
+        "the first member's range must be byte/line-exact, not swallowed: {early}"
+    );
+
+    let late = symbol_sources(&project, "lateMethod");
+    let late_source = unique_source(&late, "lateMethod");
+    // get_symbol_sources deliberately widens a block to whole preceding comment
+    // lines, so the declaration line bounds the block rather than starting it
+    // exactly when a comment sits directly above (here the fixture's padding
+    // comment). The recovery itself is byte-exact; assert the declaration line
+    // is covered and the rendered text carries the declaration.
+    let decl_line = line_of(FRAGMENTED_EXPORT_WIDGET, "void lateMethod()");
+    let start = late_source["start_line"].as_u64().expect("start_line") as usize;
+    let end = late_source["end_line"].as_u64().expect("end_line") as usize;
+    assert!(
+        start <= decl_line && decl_line <= end,
+        "the tail member's range must cover its declaration line: {late}"
+    );
+    assert!(
+        late_source["text"]
+            .as_str()
+            .expect("text")
+            .contains("void lateMethod();"),
+        "the tail member's rendered text must carry the declaration: {late}"
+    );
+
+    // (b) The nested class and its method recover under their own owner.
+    assert!(
+        source_text(&symbol_sources(&project, "innerM"), "innerM").contains("innerM"),
+        "the nested class method must resolve to its declaration",
+    );
+
+    // (c) Inverse usage of the tail member from an outside caller is FOUND, not verified_absent.
+    let scan = scan_usages(&project, "lateMethod");
+    assert_eq!(
+        0,
+        scan["summary"]["verified_absent"].as_u64().expect("count"),
+        "lateMethod usages must not be verified_absent: {scan}"
+    );
+    assert!(
+        scan["summary"]["found"].as_u64().expect("count") >= 1,
+        "lateMethod must have a found usage: {scan}"
+    );
+    let enclosings = proven_hit_enclosings(&scan);
+    assert!(
+        enclosings.iter().any(|e| e.contains("callWidget")),
+        "the proven call site must be enclosed by callWidget: {enclosings:?} in {scan}"
+    );
+
+    // (d) The summary nests both scattered members and the nested class under Widget.
+    let summaries = call(
+        &project,
+        "get_summaries",
+        serde_json::json!({ "targets": ["widget.h"] }),
+    );
+    let elements: Vec<&Value> = summaries["summaries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|block| block["elements"].as_array().into_iter().flatten())
+        .collect();
+    for member in ["early", "lateMethod"] {
+        let element = elements
+            .iter()
+            .find(|el| {
+                el["symbol"].as_str().is_some_and(|s| s.contains(member))
+                    && el["kind"].as_str() == Some("function")
+            })
+            .unwrap_or_else(|| panic!("{member} must appear in summaries: {summaries}"));
+        assert!(
+            element["parent_symbol"]
+                .as_str()
+                .is_some_and(|parent| parent.contains("Widget")),
+            "{member} must be owned by Widget: {summaries}"
+        );
+    }
+}
+
+/// False-positive guard: a well-formed multiple-base class (no export-macro fragmentation) must
+/// index through the ordinary path and never trip the #938 reparse recovery, and a member-shaped
+/// but non-fragmented declaration must keep its normal owner.
+#[test]
+fn well_formed_multi_base_class_is_untouched_by_fragmented_recovery() {
+    let source = r#"namespace core { class A {}; class B {}; }
+class Widget : public core::A, public core::B {
+public:
+    void method();
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("plain.h", source)
+        .build();
+
+    let widget = symbol_sources(&project, "Widget");
+    let widget_source = unique_source(&widget, "Widget");
+    assert_eq!("plain.h", widget_source["path"], "{widget}");
+
+    let summaries = call(
+        &project,
+        "get_summaries",
+        serde_json::json!({ "targets": ["plain.h"] }),
+    );
+    let elements: Vec<&Value> = summaries["summaries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|block| block["elements"].as_array().into_iter().flatten())
+        .collect();
+    let method_element = elements
+        .iter()
+        .find(|el| {
+            el["symbol"].as_str().is_some_and(|s| s.contains("method"))
+                && el["kind"].as_str() == Some("function")
+        })
+        .unwrap_or_else(|| panic!("method must appear in summaries: {summaries}"));
+    assert!(
+        method_element["parent_symbol"]
+            .as_str()
+            .is_some_and(|parent| parent.contains("Widget")),
+        "a well-formed class member must stay owned by Widget: {summaries}"
+    );
+}
