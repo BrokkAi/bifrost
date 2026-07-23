@@ -977,6 +977,76 @@ def run():
 }
 
 #[test]
+fn nested_namespace_module_reexport_resolves_canonical_function_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from . import color\n")
+        .file("pkg/color/__init__.py", "from .rgb import rgb_to_bgr\n")
+        .file(
+            "pkg/color/rgb.py",
+            "def rgb_to_bgr(image):\n    return image\n",
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg as K
+
+def run(image):
+    return K.color.rgb_to_bgr(image)
+
+def shadow(K, image):
+    return K.color.rgb_to_bgr(image)
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.color.rgb.rgb_to_bgr");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve a symbol through a nested namespace module");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one unshadowed namespace hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(
+        hit.snippet.contains("K.color.rgb_to_bgr(image)"),
+        "{hit:#?}"
+    );
+}
+
+#[test]
+fn nested_namespace_direct_module_resolves_function_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "")
+        .file("pkg/core/__init__.py", "")
+        .file(
+            "pkg/core/ops.py",
+            "def eye_like(size, value):\n    return value\n",
+        )
+        .file(
+            "consumer.py",
+            "import pkg\n\nvalue = pkg.core.ops.eye_like(4, object())\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.core.ops.eye_like");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve a direct symbol through nested modules");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
 fn imported_module_target_reports_qualifier_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -1068,6 +1138,34 @@ fn from_imported_submodule_qualifier_reports_module_usage() {
     let hit = hits.iter().next().expect("one module qualifier hit");
     assert_eq!(hit.file, project.file("consumer.py"));
     assert!(hit.snippet.contains("v2.metrics_pb2.VALUE"), "{hit:#?}");
+}
+
+#[test]
+fn from_imported_direct_submodule_decorator_reports_module_qualifier_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/linalg/__init__.py", "")
+        .file("pkg/protocols/__init__.py", "")
+        .file(
+            "pkg/value/__init__.py",
+            "def decorate(cls):\n    return cls\n",
+        )
+        .file("pkg/__init__.py", "from pkg import value\n")
+        .file(
+            "pkg/consumer.py",
+            "from pkg import linalg, protocols, value\n\n@value.decorate\nclass Example:\n    def method(self, value):\n        return value\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.value");
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+        .into_either()
+        .expect("public usage lookup should retain a directly imported module qualifier");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one module qualifier hit");
+    assert_eq!(hit.file, project.file("pkg/consumer.py"));
+    assert!(hit.snippet.contains("@value.decorate"), "{hit:#?}");
 }
 
 #[test]

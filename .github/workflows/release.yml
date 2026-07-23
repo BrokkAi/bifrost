@@ -11,6 +11,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 env:
   BIN_NAME: bifrost
   ANDROID_API: '21'
@@ -74,12 +77,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download Rust notice report
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: rust-third-party-licenses
           path: licenses
@@ -102,7 +106,7 @@ jobs:
       - name: Set up Android NDK
         if: matrix.target == 'aarch64-linux-android'
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
         with:
           ndk-version: r27d
           add-to-path: false
@@ -120,11 +124,6 @@ jobs:
             echo "RANLIB_aarch64_linux_android=${toolchain_bin}/llvm-ranlib"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain_bin}/aarch64-linux-android${api}-clang"
           } >> "$GITHUB_ENV"
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Build
         if: matrix.target != 'universal-apple-darwin'
@@ -167,7 +166,7 @@ jobs:
           "$hash  $stage.zip" | Out-File -Encoding ascii "dist/$stage.zip.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.target }}
           path: |
@@ -184,17 +183,19 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
@@ -225,7 +226,7 @@ jobs:
           tar -C "$package_root" -czf "dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz" bifrost-agent
 
       - name: Upload staged agent plugin
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: bifrost-agent-package
           path: dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz
@@ -239,23 +240,25 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Download built Linux binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: ${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu
           path: ${{ runner.temp }}/bifrost-linux-release
 
       - name: Download staged agent plugin
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: bifrost-agent-package
           path: ${{ runner.temp }}/bifrost-agent-prepublish
@@ -298,18 +301,19 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           name: ${{ needs.release-context.outputs.tag }}
@@ -327,22 +331,22 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: plugins/bifrost-agent/package-lock.json
+          package-manager-cache: false
 
       - name: Install Pi package dependencies
         run: npm ci
@@ -372,7 +376,7 @@ jobs:
         working-directory: plugins/bifrost-agent
 
       - name: Upload Pi package artifact to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           files: dist/brokk-bifrost-agent-*.tgz
@@ -385,22 +389,22 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
+          package-manager-cache: false
 
       - name: Install extension dependencies
         run: npm ci
@@ -432,7 +436,7 @@ jobs:
         working-directory: editors/vscode
 
       - name: Upload editor artifact to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           files: dist/*.vsix
@@ -453,17 +457,19 @@ jobs:
       contents: read
     steps:
       - name: Checkout release scripts
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Download staged agent plugin
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: bifrost-agent-package
           path: ${{ runner.temp }}/bifrost-agent-release
@@ -489,18 +495,19 @@ jobs:
       contents: write
     steps:
       - name: Checkout release scripts
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ needs.release-context.outputs.tag }}
 
       - name: Download validated agent plugin
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: bifrost-agent-package
           path: dist
 
       - name: Upload agent plugin to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           files: dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz
@@ -525,14 +532,16 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout master
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: master
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Confirm master is the released version
         env:
@@ -540,7 +549,7 @@ jobs:
         run: node scripts/release-version.mjs check --tag "$RELEASE_TAG"
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
@@ -579,6 +588,8 @@ jobs:
           done < <(git diff --name-only)
 
       - name: Commit generated metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           if git diff --quiet; then
@@ -591,4 +602,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: sync release metadata for ${{ needs.release-context.outputs.tag }}"
+          gh auth setup-git
           git push origin HEAD:master
