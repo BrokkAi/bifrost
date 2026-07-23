@@ -25,8 +25,7 @@ const binaryPath = options.binaryPath
   : null;
 await assertEmptyCache(cacheDir);
 
-const launcher = path.join(pluginDir, "bin", "bifrost-launcher.mjs");
-await fs.access(launcher);
+const launcher = await resolveClaudePluginLauncher(pluginDir);
 
 const launcherEnv = {
   ...process.env,
@@ -36,7 +35,7 @@ const launcherEnv = {
   BIFROST_LAUNCHER_CACHE_DIR: cacheDir,
 };
 
-await prepare(launcher, pluginDir, launcherEnv, binaryPath ? "explicit" : "installed");
+await prepare(launcher, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
 await withDisposableSmokeWorkspace((workspace) =>
   assertCodexSandboxWorkspaceBinding(launcher, pluginDir, workspace, launcherEnv)
 );
@@ -45,7 +44,8 @@ await withDisposableSmokeWorkspace((workspace) =>
 );
 await assertNoPluginWorkspaceCache(pluginDir);
 console.log(
-  `Packaged agent plugin passed the recorded Codex ${recordedCodexVersion} handshake replay and MCP roots smoke.`
+  `Packaged agent plugin passed Claude launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
+  "handshake replay, and the MCP roots smoke."
 );
 
 function validateRecordedCodexHandshake(fixture) {
@@ -101,6 +101,34 @@ async function requiredFile(value, name) {
     throw new Error(`--${name} must be a file: ${file}`);
   }
   return file;
+}
+
+async function resolveClaudePluginLauncher(pluginRoot) {
+  const manifestPath = path.join(pluginRoot, ".claude-plugin", "plugin.json");
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  assert.equal(
+    typeof manifest.mcpServers,
+    "string",
+    `${manifestPath} must select a host-specific MCP config`
+  );
+  const mcpConfigPath = path.resolve(pluginRoot, manifest.mcpServers);
+  const mcpConfig = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+  const server = mcpConfig.mcpServers?.bifrost;
+  assert.ok(server, `${mcpConfigPath} must define the bifrost MCP server`);
+  assert.equal(
+    server.command,
+    "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
+    `${mcpConfigPath} must resolve bundled files through CLAUDE_PLUGIN_ROOT`
+  );
+  assert.equal(
+    server.cwd,
+    undefined,
+    `${mcpConfigPath} must not depend on the Claude Code project working directory`
+  );
+  const command = server.command.replaceAll("${CLAUDE_PLUGIN_ROOT}", pluginRoot);
+  assert.equal(path.isAbsolute(command), true, `${mcpConfigPath} did not resolve an absolute launcher path`);
+  await fs.access(command);
+  return command;
 }
 
 async function assertEmptyCache(directory) {

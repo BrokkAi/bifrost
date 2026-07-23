@@ -26,5 +26,5 @@
     "./agents/security-reviewer.md",
     "./agents/senior-dev-reviewer.md"
   ],
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./claude-mcp.json"
 }

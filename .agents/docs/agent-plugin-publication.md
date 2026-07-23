@@ -18,22 +18,24 @@ manifest versions aligned with `Cargo.toml` and keep the stable plugin `name` as
 `brokk` for Claude/Codex. Cursor uses the Cursor-facing plugin name `bifrost`.
 Use `Bifrost by Brokk` for UI-facing display text.
 
-The Claude/Codex MCP configuration lives at `plugins/bifrost-agent/.mcp.json`.
-Cursor uses the same server shape in `plugins/bifrost-agent/mcp.json`, with
-Cursor's documented `type: "stdio"` field, because Cursor's plugin loader
-detects root `mcp.json` directly. Amp does not use either of those wrapper
-shapes: Amp `mcp.json` / `--mcp-config` expects a direct server-name map. The
-Amp package is generated under `plugins/bifrost-agent/amp-skills` from the
-canonical Bifrost code-intelligence skills.
+Codex uses `plugins/bifrost-agent/.mcp.json`, where `cwd: "."` makes its
+package-relative launcher command resolve from the installed plugin. Claude
+Code uses the host-specific `plugins/bifrost-agent/claude-mcp.json`, selected
+by its plugin manifest, because Claude resolves ordinary relative MCP commands
+from the project directory. The Claude entry uses `${CLAUDE_PLUGIN_ROOT}` and
+does not set `cwd`. Cursor uses `plugins/bifrost-agent/mcp.json`, with Cursor's
+documented `type: "stdio"` field and `${CURSOR_PLUGIN_ROOT}`. Amp does not use
+any of those wrapper shapes: Amp `mcp.json` / `--mcp-config` expects a direct
+server-name map. The Amp package is generated under
+`plugins/bifrost-agent/amp-skills` from the canonical Bifrost
+code-intelligence skills.
 
 ```json
 {
   "mcpServers": {
     "bifrost": {
-      "command": "./bin/bifrost-launcher.mjs",
-      "args": ["--mcp", "symbol|extended"],
-      "startup_timeout_sec": 180,
-      "tool_timeout_sec": 300
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
+      "args": ["--mcp", "symbol|extended"]
     }
   }
 }
@@ -68,21 +70,25 @@ GitHub release download. A compatible `bifrost` on `PATH` is used only when
 `BIFROST_LAUNCHER_ALLOW_PATH=1` is set explicitly. Set
 `BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable downloads.
 
-The 180-second startup budget covers the launcher's bounded 60-second download,
-60-second extraction, and 10-second version probe, plus startup margin. Keep the
-Claude/Codex and Cursor values identical and above the minimum exported by the
-canonical launcher. The package-local `doctor [--json]` command does not
+The 180-second Codex/Cursor startup budget covers the launcher's bounded
+60-second download, 60-second extraction, and 10-second version probe, plus
+startup margin. Keep those two host values identical and above the minimum
+exported by the canonical launcher. Claude Code does not consume those
+host-specific timeout fields; use its `MCP_TIMEOUT` environment setting or run
+the launcher `prepare [--json]` command before startup when a cold install may
+exceed the host default. The package-local `doctor [--json]` command does not
 modify the cache or download assets, but it does execute the selected binary's
 `--version` probe and therefore assumes trusted candidate locations.
 `prepare [--json]` resolves or installs the exact pinned release without
-starting MCP. Run `prepare` before host startup when a host does not support a
-configurable MCP startup timeout, then start a fresh task.
+starting MCP.
 
-The launcher resolves the workspace root from `BIFROST_WORKSPACE_ROOT`, then a
-host-provided `--root` or `--workspace-root`, then the host session working
-directory. It always starts Bifrost with explicit `--root <resolved-root>`. The
-default plugin toolset is `symbol|extended`, not `searchtools`, so the local
-plugin exposes analyzer navigation and related discovery tools without the
+The launcher resolves the workspace root from `BIFROST_WORKSPACE_ROOT` or a
+host-provided `--root` / `--workspace-root`. Without an explicit root, it
+starts Bifrost unbound so the MCP client can supply its approved workspace
+through `roots/list` or the Codex sandbox metadata extension; it does not infer
+analyzer scope from the host process working directory. The default plugin
+toolset is `symbol|extended`, not `searchtools`, so the local plugin exposes
+analyzer navigation and related discovery tools without the
 `activate_workspace` or raw text-file tools.
 
 The plugin manifests also point at `plugins/bifrost-agent/skills` and declare
@@ -269,8 +275,8 @@ claude plugin validate .
   `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
   `skills/`, `agents/`, and `assets/icon.png`.
 - Package the Claude Code Agent Plugin from `plugins/bifrost-agent` with
-  `.claude-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
-  `skills/`, `agents/`, and `assets/icon.png`.
+  `.claude-plugin/plugin.json`, `claude-mcp.json`, `bifrost-release.json`,
+  `bin/`, `skills/`, `agents/`, and `assets/icon.png`.
 - Package the Cursor Plugin from `plugins/bifrost-agent` with
   `.cursor-plugin/plugin.json`, `mcp.json`, `bifrost-release.json`, `bin/`,
   `skills/`, `agents/`, and `assets/icon.png`; submit through Cursor's manual
@@ -278,7 +284,7 @@ claude plugin validate .
 - Generate and package the Amp skill collection from
   `plugins/bifrost-agent/amp-skills` after running
   `node scripts/generate-amp-skill-bundle.mjs`. Use Amp's direct server-map
-  config, not the Claude/Codex `.mcp.json` wrapper or Cursor root `mcp.json`.
+  config, not the Claude, Codex, or Cursor host-plugin wrappers.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --root <resolved-root> --mcp "symbol|extended"`.
 - Validate a cold package cache with `doctor`, `prepare`, a second successful

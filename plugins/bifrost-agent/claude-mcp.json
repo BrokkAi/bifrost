@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
+      "args": [
+        "--mcp",
+        "symbol|extended"
+      ]
+    }
+  }
+}

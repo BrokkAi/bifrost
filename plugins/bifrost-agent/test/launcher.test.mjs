@@ -422,6 +422,44 @@ printf '%s\\n' "$@" > "${recordPath}"
   assert.equal(command.startsWith(repoRoot), true);
 });
 
+test("Claude MCP manifest resolves the launcher from the installed plugin outside the workspace", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const workspace = path.join(temp, "workspace");
+  const recordPath = path.join(temp, "args.txt");
+  const stubBinary = path.join(temp, "bifrost-stub");
+  const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
+  await fsp.mkdir(workspace);
+  await writeExecutableFixture(stubBinary, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "bifrost ${metadata.binaryVersion}"
+  exit 0
+fi
+printf '%s\\n' "$@" > "${recordPath}"
+`);
+
+  const mcpConfig = JSON.parse(await fsp.readFile(path.join(packageDir, "claude-mcp.json"), "utf8"));
+  const server = mcpConfig.mcpServers.bifrost;
+  const command = server.command.replace("${CLAUDE_PLUGIN_ROOT}", packageDir);
+  await execFileAsync(command, server.args, {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      BIFROST_BINARY_PATH: stubBinary,
+      BIFROST_LAUNCHER_AUTO_INSTALL: "0"
+    }
+  });
+
+  assert.deepEqual(
+    (await fsp.readFile(recordPath, "utf8")).trim().split(/\r?\n/),
+    ["--mcp", "symbol|extended"]
+  );
+  assert.equal(path.isAbsolute(command), true);
+  assert.equal(command.startsWith(packageDir), true);
+});
+
 test("resolves an explicit reusable launch without allowing env root override", async () => {
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
   const workspace = path.join(temp, "workspace");

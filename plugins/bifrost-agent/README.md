@@ -18,7 +18,10 @@ Cursor's Customize UI. The public marketplace namespace is `bifrost`, so
 Claude/Codex marketplace installs read as `brokk@bifrost` where the host exposes
 namespace-qualified install names.
 
-The plugin starts `./bin/bifrost-launcher.mjs --mcp "symbol|extended"`.
+Claude Code starts
+`${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs --mcp "symbol|extended"` from
+the host-specific `claude-mcp.json`. Codex starts the same launcher through its
+package-relative `.mcp.json`.
 The launcher uses `BIFROST_WORKSPACE_ROOT` when set, then a host-provided
 `--root` or `--workspace-root`. Without either explicit override, Bifrost
 starts unbound and requests the host's approved workspace through standard MCP
@@ -26,10 +29,12 @@ roots. On a rootless connection without advertised roots, it offers the
 `codex/sandbox-state-meta` extension; current Codex uses that capability to
 supply the active task. Bifrost never treats the installed plugin directory as
 the analyzer workspace.
-Claude Code and Codex read this server entry from `.mcp.json`. Cursor's plugin
-manifest explicitly selects root `mcp.json`, which uses Cursor's documented
-`type: "stdio"` and `${CURSOR_PLUGIN_ROOT}` placeholder. The Cursor entry starts
-Bifrost rootless. Builds containing the post-0.8.9 Cursor compatibility fix
+Claude Code uses `${CLAUDE_PLUGIN_ROOT}` because its MCP commands otherwise
+resolve relative to the project directory, not the installed plugin. Codex
+retains the package-relative `.mcp.json`. Cursor's plugin manifest explicitly
+selects root `mcp.json`, which uses Cursor's documented `type: "stdio"` and
+`${CURSOR_PLUGIN_ROOT}` placeholder. Both host-specific entries start Bifrost
+rootless. Builds containing the post-0.8.9 Cursor compatibility fix
 accept both standard `file:` root URIs and Cursor's native absolute-path form
 while keeping MCP roots authoritative; the published 0.8.9 binary requires an
 explicit fixed-project root. Amp uses a different direct server-map shape for
