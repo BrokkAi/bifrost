@@ -604,13 +604,27 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
     // arity — the query side already strips it
     // (query_symbol_interpretations), so aliases must offer the
     // arity-free form too or generic types are unaddressable (#1063).
+    // Strip from *every* variant, not just the primary: a nested generic
+    // member (`Ns.Outer$Inner`1.Method`) displays as
+    // `Ns.Outer.Inner.Method`, so the arity-free dollar-split form must
+    // exist too (xunit/MudBlazor tier-3 more-specific-fails).
     if language == Language::CSharp {
-        let normalized: Vec<_> = primary
+        let arity_free: Vec<Vec<String>> = variants
             .iter()
-            .map(|segment| strip_csharp_generic_arity(segment).to_string())
+            .map(|variant| {
+                variant
+                    .iter()
+                    .map(|segment| strip_csharp_generic_arity(segment).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|normalized| {
+                !normalized.is_empty() && normalized.iter().all(|segment| !segment.is_empty())
+            })
             .collect();
-        if normalized != primary && normalized.iter().all(|segment| !segment.is_empty()) {
-            variants.push(normalized);
+        for normalized in arity_free {
+            if !variants.contains(&normalized) {
+                variants.push(normalized);
+            }
         }
     }
 
@@ -851,4 +865,35 @@ fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csharp_generic_member_alias_includes_arity_free_form() {
+        let variants = symbol_path_variants(Language::CSharp, "Ns.Top`1.Go");
+        assert!(
+            variants
+                .iter()
+                .any(|v| v == &vec!["Ns".to_string(), "Top".to_string(), "Go".to_string()]),
+            "arity-free member variant must be offered: {variants:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_nested_generic_member_alias_includes_dollar_split_arity_free_form() {
+        let variants = symbol_path_variants(Language::CSharp, "Ns.Outer$Inner`1.Method");
+        assert!(
+            variants.iter().any(|v| v
+                == &vec![
+                    "Ns".to_string(),
+                    "Outer".to_string(),
+                    "Inner".to_string(),
+                    "Method".to_string()
+                ]),
+            "nested arity-free member variant must be offered: {variants:?}"
+        );
+    }
 }
