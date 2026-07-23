@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use brokk_bifrost::WorkspaceAnalyzer;
+use brokk_bifrost::analyzer::dataflow::{IcfgInputStatus, IcfgSolveInput};
 use brokk_bifrost::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, CancellationToken, ControlContinuation, ControlEdgeKind,
     DeferredInvocationKind, DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind,
@@ -1124,6 +1125,38 @@ pub struct IcfgGraph {
 }
 
 impl IcfgGraph {
+    /// Return the immutable snapshot retained by this source-backed fixture.
+    pub const fn snapshot(&self) -> &IcfgSnapshot {
+        &self.snapshot
+    }
+
+    /// Pair this fixture with the exact payload-free provider status it kept.
+    ///
+    /// Unsupported and budget-exhausted outcomes carry typed payloads that
+    /// `IcfgOutcomeKind` intentionally does not retain; tests for those cases
+    /// should construct input directly from the original provider outcome.
+    pub fn solve_input(&self) -> IcfgSolveInput<'_> {
+        let status = match self.outcome {
+            IcfgOutcomeKind::Complete => IcfgInputStatus::Complete,
+            IcfgOutcomeKind::Ambiguous => IcfgInputStatus::Ambiguous,
+            IcfgOutcomeKind::Unknown => IcfgInputStatus::Unknown,
+            IcfgOutcomeKind::Unproven => IcfgInputStatus::Unproven,
+            IcfgOutcomeKind::Cancelled => IcfgInputStatus::Cancelled,
+            IcfgOutcomeKind::Unsupported | IcfgOutcomeKind::ExceededBudget => {
+                panic!(
+                    "{:?} ICFG fixture discarded a required status payload",
+                    self.outcome
+                )
+            }
+        };
+        IcfgSolveInput::new(&self.snapshot, status)
+    }
+
+    /// Resolve a previously bound readable alias to its snapshot-local node.
+    pub fn node(&self, alias: &str) -> IcfgNodeId {
+        self.bound_node(alias)
+    }
+
     pub fn materialize(
         project: &BuiltInlineTestProject,
         analyzer: &WorkspaceAnalyzer,

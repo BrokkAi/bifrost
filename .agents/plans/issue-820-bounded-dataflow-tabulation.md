@@ -19,7 +19,7 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - [x] (2026-07-23 12:15Z) Froze the bounded first-child scope and created this issue-specific ExecPlan.
 - [x] (2026-07-23 14:46Z) Implemented the public problem, input, budget, outcome, and direct-flow contracts under `src/analyzer/dataflow/`.
 - [x] (2026-07-23 14:46Z) Implemented deterministic iterative propagation and path/input completeness accounting; `cargo check --lib` passes.
-- [ ] Add the independent repeated-scan reference and behavior-focused direct/differential tests.
+- [x] (2026-07-23 15:10Z) Added the independent repeated-scan reference and behavior-focused direct/differential tests; the two new integration binaries pass 20 tests in total, including 12 dataflow cases and their shared harness tests.
 - [ ] Run formatting, focused tests, strict all-target/all-feature Clippy, and the feature-enabled regression suite.
 - [ ] Run specialist review, resolve findings, and record final outcomes and validation evidence.
 
@@ -48,6 +48,9 @@ This first child deliberately stops before reusable procedure summaries, recursi
 
 - Observation: solver budgets cannot preempt arbitrary work performed inside a client callback that has not returned.
   Evidence: seeds and transfer outputs enter client-owned `Vec` callbacks before the kernel can sort, deduplicate, charge, or observe cancellation. This first-party slice therefore documents finite, repeatable, cooperatively returning callbacks; its four dimensions atomically bound work admitted by the kernel, not hostile client execution. A bounded output-sink contract remains a possible later hardening if untrusted clients are introduced.
+
+- Observation: current source-backed ICFG adapters do not expose a stable unproven-complete edge topology for an end-to-end incomparable-path-frontier fixture.
+  Evidence: local edges are proven-complete; currently unproven dispatch edges also carry partial completeness; return gaps downgrade both axes; and C++ virtual open-world uncertainty is retained as a separate boundary rather than an unproven edge. The frontier and edge-conjunction algebra therefore have focused unit regressions, while solver-level frontier requeue remains a later test when a contract-backed topology exists. No synthetic production snapshot constructor was added only for testing.
 
 ## Decision Log
 
@@ -89,7 +92,7 @@ This first child deliberately stops before reusable procedure summaries, recursi
 
 ## Outcomes & Retrospective
 
-The additive production module now compiles. It contains the finite unary problem contract, run-local deterministic fact interning, explicit input and path quality, four-dimensional atomic budgeting, cancellation checkpoints, direct-flow client, and a FIFO worklist over every current ICFG edge family. Behavior-focused and differential fixture validation is in progress. The scope boundary remains unchanged: this child establishes context-respecting propagation over a bounded ICFG, not the epic's later summary-driven recursion or reusable procedure-summary claims.
+The additive production module and its independent reference suite now pass focused validation. The implementation contains the finite unary problem contract, run-local deterministic fact interning, explicit input and nondominated path quality, four-dimensional atomic budgeting, cancellation checkpoints, direct-flow client, and a FIFO worklist over every current ICFG edge family. Tests prove exact normal/exceptional return and bypass routing, cleanup classification, nonzero fact killing with zero preservation, deterministic seed/output permutations, all four atomic budget stops, synchronous callback cancellation, provider-outcome status retention, recursive boundaries, ordinary reachability parity, and worklist/reference equality. Repository-wide lint and feature-enabled regression gates remain in progress. The scope boundary remains unchanged: this child establishes context-respecting propagation over a bounded ICFG, not the epic's later summary-driven recursion or reusable procedure-summary claims.
 
 ## Context and Orientation
 

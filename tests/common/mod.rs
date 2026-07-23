@@ -1,3 +1,4 @@
+pub mod dataflow_reference;
 mod inline_project;
 pub mod lsp_click;
 pub mod lsp_client;
