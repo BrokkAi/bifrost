@@ -8,6 +8,7 @@ use std::sync::{LazyLock, Mutex};
 static LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const ISSUE_1016_JOBCTRL: &str = include_str!("fixtures/scala-issue-1016/JobCtrl.scala");
+const ISSUE_1068_VCSSPEC: &str = include_str!("fixtures/scala-issue-1068/VCSSpec.scala");
 
 fn scala_class_end_byte(language: tree_sitter::Language, source: &str, name: &str) -> usize {
     let mut parser = tree_sitter::Parser::new();
@@ -749,6 +750,48 @@ class JobSrv {
             })),
         "{reference_result}"
     );
+}
+
+#[test]
+fn issue_1068_scala_empty_lambda_supports_complete_symbol_source() {
+    let published_end = scala_class_end_byte(
+        tree_sitter_scala::LANGUAGE.into(),
+        ISSUE_1068_VCSSPEC,
+        "VCSSpec",
+    );
+    assert!(
+        published_end
+            < ISSUE_1068_VCSSPEC
+                .find("def after")
+                .expect("following method"),
+        "the published-parser control unexpectedly retained the full class"
+    );
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("svsimTests/VCSSpec.scala", ISSUE_1068_VCSSPEC)
+        .build();
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["svsimTests.VCSSpec"]}"#,
+    );
+
+    assert_eq!(
+        result["sources"].as_array().map(Vec::len),
+        Some(1),
+        "{result}"
+    );
+    assert_eq!(
+        result["not_found"].as_array().map(Vec::len),
+        Some(0),
+        "{result}"
+    );
+    let source = result["sources"][0]["text"]
+        .as_str()
+        .expect("VCSSpec source");
+    assert!(source.contains("simulation.run("), "{source}");
+    assert!(source.contains("def after(): Int"), "{source}");
+    assert!(!source.contains("class FollowingSpec"), "{source}");
 }
 
 #[test]

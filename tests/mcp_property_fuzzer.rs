@@ -17,6 +17,7 @@ use common::InlineTestProject;
 /// Verbatim `cortex/connector/.../controllers/v0/JobCtrl.scala` from
 /// TheHive-Project/TheHive @ d390a031 (AGPL-3.0), as reported in issue #1016.
 const ISSUE_1016_JOBCTRL: &str = include_str!("fixtures/scala-issue-1016/JobCtrl.scala");
+const ISSUE_1068_VCSSPEC: &str = include_str!("fixtures/scala-issue-1068/VCSSpec.scala");
 
 fn range(text: &str, needle: &str, end: Option<&str>) -> Range {
     let start_byte = text.find(needle).expect("needle present");
@@ -645,6 +646,29 @@ fn issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture() {
             .as_ref()
             .map(|unit| unit.fq_name()),
         Some("org.thp.thehive.connector.cortex.controllers.v0.JobCtrl".to_string())
+    );
+}
+
+#[test]
+fn issue_1068_i1_accepts_empty_lambda_scala_fixture() {
+    let project = InlineTestProject::new()
+        .file("src/VCSSpec.scala", ISSUE_1068_VCSSPEC)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let report =
+        run_invariants(workspace.analyzer(), &fuzzer_config("scala")).expect("run invariants");
+    assert!(
+        report.violations.is_empty(),
+        "{}",
+        serde_json::to_string_pretty(&report.violations).expect("violations json")
+    );
+
+    let analyzer = workspace.analyzer();
+    assert!(
+        !analyzer
+            .get_definitions("svsimTests.VCSSpec.after")
+            .is_empty(),
+        "method after the empty lambda must remain indexed"
     );
 }
 

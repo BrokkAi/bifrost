@@ -12,8 +12,9 @@ After this change, Bifrost will parse valid Scala calls such as `simulation.run(
 - [x] (2026-07-23 06:19Z) Confirmed that GitHub and crates.io still publish only `tree-sitter-scala` 0.26.0 from 2026-04-18, while the required upstream fix merged later as PR #551 / commit `88a12d30bd14edfab6d4552af22f6d3a5f5000e9`.
 - [x] (2026-07-23 06:19Z) Reproduced current behavior against the exact Chisel commit: the raw parser emits an `ERROR` at bytes `410..22749`, `get_symbol_sources` returns only `class VCSSpec extends BackendSpec`, and `search_symbols` reports no fields from the file.
 - [x] (2026-07-23 06:19Z) Regenerated upstream PR #551 in a temporary checkout with `tree-sitter-cli` 0.25.9 and proved that the exact Chisel file then parses with `root_has_error=false`.
-- [ ] Port the coherent upstream grammar patch, regenerate Bifrost's pinned parser, document provenance, and add parser-shape controls.
-- [ ] Add analyzer, SearchTools, property-fuzzer, and persisted-cache regressions, then replay the exact Chisel witness.
+- [x] (2026-07-23 07:05Z) Ported upstream PR #551 coherently, documented the third vendored patch, regenerated with CLI 0.25.9 twice with identical hashes, and added empty-lambda, self-type, enum, and extension parser controls.
+- [x] (2026-07-23 07:34Z) Added a minimized Chisel-shaped fixture that fails with the published parser, plus analyzer, SearchTools, I1 property-fuzzer, and pre-#1068 persisted-cache epoch regressions.
+- [x] (2026-07-23 07:42Z) Replayed Chisel `e639b4f6`: `VCSSpec` now spans lines 16–234, all three expected fields are indexed, and summaries retain the later classes and `BackendSpec`.
 - [ ] Run focused and repository-wide validation, review the final diff, and record outcomes.
 
 ## Surprises & Discoveries
@@ -30,6 +31,12 @@ After this change, Bifrost will parse valid Scala calls such as `simulation.run(
 - Observation: The connected Bifrost MCP server is unavailable in this task session.
   Evidence: Tool discovery exposes no Bifrost analyzer calls in this turn. The checked-out `target/debug/bifrost` one-shot CLI remains available and reproduced the public SearchTools failure directly.
 
+- Observation: A bare empty lambda is insufficient as a public regression witness.
+  Evidence: The published 0.25.1 parser accepts a small `simulation.run() { _ => }` class. The truncation is reproduced by Chisel's nested matcher/spec/call shape; the minimized fixture retains that shape and proves the published parser ends `VCSSpec` before its sentinel method.
+
+- Observation: The repaired parser restores the complete exact Chisel symbol surface.
+  Evidence: Source-restricted one-shot tools at Chisel `e639b4f6` return `VCSSpec` at lines 16–234, fields `finishRe`, `backend`, and `compilationSettings` at lines 18, 21, and 27, and later top-level declarations beginning with `CustomVerilatorBackend` at line 239.
+
 ## Decision Log
 
 - Decision: Keep the current v0.25.1 vendored base and port upstream PR #551 rather than waiting for a release or updating to an unreleased master snapshot.
@@ -44,8 +51,8 @@ After this change, Bifrost will parse valid Scala calls such as `simulation.run(
   Rationale: The repository guidance favors `InlineTestProject` for small test projects, while the exact 680-line upstream file is still valuable as an end-to-end acceptance replay without permanently duplicating an external corpus.
   Date/Author: 2026-07-23 / Codex
 
-- Decision: Do not rebase the issue branch onto the newer `origin/master`.
-  Rationale: Repository policy prohibits rebasing without an explicit request, and the intervening commits do not overlap this work.
+- Decision: Rebase the issue branch onto `origin/master` after the grammar milestone.
+  Rationale: The user explicitly authorized the rebase. Committing the grammar milestone first provided a clean boundary, and the rebase completed without conflicts.
   Date/Author: 2026-07-23 / Codex
 
 ## Outcomes & Retrospective

@@ -6311,25 +6311,24 @@ mod tests {
     }
 
     #[test]
-    fn scala_contextual_extension_parser_epoch_invalidates_prior_parsed_blobs() {
-        // This is the Scala epoch published by 0.8.8 before `extension` became
-        // a contextual soft identifier. That grammar change altered parse-table
-        // behavior without changing the ABI, node-kind names, or field names
-        // covered by the automatic grammar fingerprint.
-        const PRE_CONTEXTUAL_EXTENSION_EPOCH: &str =
-            "47bfc278e012ccd40fae653b0709bdc20c9979303719d20f36922f13ee0d7a88";
+    fn scala_empty_lambda_parser_epoch_invalidates_prior_parsed_blobs() {
+        // This is the Scala epoch immediately before issue #1068's parser-table
+        // change. The change does not add an ABI, node-kind, or field name, so
+        // the manual vendored-parser salt must invalidate old parsed blobs.
+        const PRE_EMPTY_LAMBDA_EPOCH: &str =
+            "68da221d12ed704b76c78dfe72b57f6eca7064aaa95ca39af8bcdcca1c2d1a29";
 
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
             temp.path(),
-            "Enrichments.scala",
-            "trait Enrichments { implicit class Rich(value: String) { def extension = value } }\n",
+            "VCSSpec.scala",
+            "class VCSSpec { def run(): Unit = simulation.run() { _ => }; def after = 1 }\n",
         );
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
         let prior_generation = store
-            .ensure_language_epoch_value("scala", PRE_CONTEXTUAL_EXTENSION_EPOCH)
+            .ensure_language_epoch_value("scala", PRE_EMPTY_LAMBDA_EPOCH)
             .unwrap();
         store
             .write_parsed_blob_at_generation(
@@ -6343,7 +6342,10 @@ mod tests {
         assert!(store.contains_parsed_blob(oid, "scala").unwrap());
 
         let current_generation = store
-            .ensure_language_epoch(Language::Scala, &tree_sitter_scala::LANGUAGE.into())
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
             .unwrap();
 
         assert_ne!(current_generation, prior_generation);

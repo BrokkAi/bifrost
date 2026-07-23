@@ -334,6 +334,29 @@ fn issue_1016_scala_annotated_constructor_whitespace_forms_keep_parameters_and_b
 }
 
 #[test]
+fn issue_1068_empty_lambda_keeps_following_class_members() {
+    let source = include_str!("fixtures/scala-issue-1068/VCSSpec.scala");
+    let project = inline_scala_project(&[("svsimTests/VCSSpec.scala", source)]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+
+    let class = definition(&analyzer, "svsimTests.VCSSpec");
+    let after = definition(&analyzer, "svsimTests.VCSSpec.after");
+    let following = definition(&analyzer, "svsimTests.FollowingSpec");
+    let class_source = analyzer.get_source(&class, false).expect("VCSSpec source");
+
+    assert!(class_source.contains("simulation.run("));
+    assert!(class_source.contains("def after(): Int"));
+    assert_eq!(
+        analyzer.parent_of(&after).as_ref().map(CodeUnit::fq_name),
+        Some("svsimTests.VCSSpec".to_string())
+    );
+    assert!(
+        analyzer.parent_of(&following).is_none(),
+        "following declaration must remain top-level"
+    );
+}
+
+#[test]
 fn test_simple_constructor_in_class_definition() {
     let project = inline_scala_project(&[(
         "ai/brokk/Foo.scala",
