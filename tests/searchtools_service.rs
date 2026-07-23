@@ -160,6 +160,73 @@ fn watcher_reported_change_is_applied_by_next_call() {
     assert!(payload.contains("second"), "payload: {payload}");
 }
 
+/// M3 regression: `UpdateStrategy::Manual` sessions have no watcher and no
+/// implicit staleness revalidation (`snapshot_for_query` always takes the
+/// read-only fast path for them) — the *only* way they observe a change is
+/// the explicit `update_paths` tool, which drives the same
+/// `WorkspaceAnalyzer::update` -> `resolve_live_oids` ->
+/// `LivePathMap::refresh` write path the watcher uses. M3 memoizes
+/// `LiveSnapshot` stat-validation on `LivePathMap`'s generation counter, so
+/// this proves that generation bump (and the fresh, unvalidated `PathState`s
+/// it produces) still reaches a Manual session's next read after an explicit
+/// update, exactly as before this milestone.
+#[test]
+fn manual_service_sees_change_after_explicit_update_paths() {
+    let temp = TempDir::new().unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    {
+        let mut config = repo.config().unwrap();
+        config.set_str("user.email", "t@example.com").unwrap();
+        config.set_str("user.name", "T").unwrap();
+    }
+    let file_path = temp.path().join("Watched.java");
+    fs::write(&file_path, "public class Watched { void first() {} }\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("Watched.java")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = Signature::now("T", "t@example.com").unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+        .unwrap();
+
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf()).unwrap();
+
+    let baseline = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(baseline.contains("first"), "payload: {baseline}");
+    assert!(!baseline.contains("second"), "payload: {baseline}");
+
+    fs::write(
+        &file_path,
+        "public class Watched { void first() {} void second() {} }\n",
+    )
+    .unwrap();
+
+    // Without an explicit update, a Manual session must NOT observe the
+    // out-of-band edit (no watcher, no implicit revalidation for this path).
+    let still_stale = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(
+        !still_stale.contains("second"),
+        "a Manual session must not implicitly observe out-of-band changes: {still_stale}"
+    );
+
+    service
+        .call_tool_json("update_paths", r#"{"paths":["Watched.java"]}"#)
+        .unwrap();
+
+    let refreshed = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(
+        refreshed.contains("second"),
+        "explicit update_paths must make the change visible: {refreshed}"
+    );
+}
+
 /// Concurrency smoke for M2: many threads issue read-only calls against one
 /// service while a file change lands on disk mid-stream. Every call must
 /// succeed (the read-first peek must never deadlock or error against a
