@@ -5,7 +5,10 @@ use brokk_bifrost::{AnalyzerConfig, Language, ProjectFile};
 
 use common::{
     InlineTestProject,
-    semantic_graph::{PointSelector, SemanticGraph, TopologyRenderLimits, edge as expected_edge},
+    semantic_graph::{
+        PointSelector, SemanticGraph, TopologyRenderLimits, edge as expected_edge, mapped_source,
+        procedure_source,
+    },
 };
 
 const SOURCE: SourceMappingId = SourceMappingId::new(0);
@@ -1441,6 +1444,199 @@ fn typescript_class_static_blocks_are_deferred_initializer_procedures() {
 }
 
 #[test]
+fn typescript_class_definition_and_initializer_execution_stay_separate() {
+    const SOURCE: &str = r#"
+function build(): void {
+    class Nested extends heritage() {
+        [firstKey()] = fieldValue();
+        static staticField = staticValue();
+        [secondKey()]() {
+            methodBody();
+        }
+        static {
+            staticBody();
+        }
+    }
+    after();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/class-execution.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/class-execution.ts");
+    let repeat = SemanticGraph::materialize(&project, &analyzer, "src/class-execution.ts");
+    assert_eq!(
+        graph.render_topology(),
+        repeat.render_topology(),
+        "class-definition and initializer topology should render deterministically"
+    );
+
+    graph
+        .bind(
+            "build_entry",
+            PointSelector::new("function build")
+                .procedure("build")
+                .effect("entry"),
+        )
+        .bind(
+            "heritage",
+            PointSelector::new("heritage()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "first_key",
+            PointSelector::new("firstKey()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "second_key",
+            PointSelector::new("secondKey()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "after",
+            PointSelector::new("after()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "field_initializer_entry",
+            PointSelector::new("[firstKey()] = fieldValue()").effect("entry"),
+        )
+        .bind(
+            "field_value",
+            PointSelector::new("fieldValue()").effect("invoke"),
+        )
+        .bind(
+            "field_initializer_exit",
+            PointSelector::new("[firstKey()] = fieldValue()").effect("normal_exit"),
+        )
+        .bind(
+            "static_value",
+            PointSelector::new("staticValue()").effect("invoke"),
+        )
+        .bind(
+            "method_body",
+            PointSelector::new("methodBody()").effect("invoke"),
+        )
+        .bind(
+            "static_body",
+            PointSelector::new("staticBody()").effect("invoke"),
+        );
+
+    graph.assert_reachable("build_entry", "heritage");
+    graph.assert_reachable("heritage", "first_key");
+    graph.assert_reachable("first_key", "second_key");
+    graph.assert_reachable("second_key", "after");
+    graph.assert_reachable("field_initializer_entry", "field_value");
+    graph.assert_reachable("field_value", "field_initializer_exit");
+
+    let procedures = graph.artifact().procedures();
+    let build = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Function
+                && procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("build")
+        })
+        .expect("build procedure");
+    let call_sources = |procedure: &ProcedureSemantics| {
+        procedure
+            .call_sites()
+            .iter()
+            .map(|call| mapped_source(procedure, SOURCE, call.source).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        call_sources(build),
+        ["heritage()", "firstKey()", "secondKey()", "after()"],
+        "outer class evaluation must exclude field values, method bodies, and static blocks"
+    );
+
+    let initializers = procedures
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Initializer)
+        .collect::<Vec<_>>();
+    assert_eq!(initializers.len(), 3);
+    let field_initializer = initializers
+        .iter()
+        .copied()
+        .find(|procedure| procedure_source(procedure, SOURCE).contains("fieldValue()"))
+        .expect("computed field initializer");
+    let static_initializer = initializers
+        .iter()
+        .copied()
+        .find(|procedure| procedure_source(procedure, SOURCE).contains("staticValue()"))
+        .expect("static field initializer");
+    let static_block = initializers
+        .iter()
+        .copied()
+        .find(|procedure| procedure_source(procedure, SOURCE).contains("staticBody()"))
+        .expect("static block initializer");
+    assert_eq!(call_sources(field_initializer), ["fieldValue()"]);
+    assert_eq!(call_sources(static_initializer), ["staticValue()"]);
+    assert_eq!(call_sources(static_block), ["staticBody()"]);
+
+    let computed_method = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Method
+                && procedure_source(procedure, SOURCE).contains("methodBody()")
+        })
+        .expect("computed method procedure");
+    assert_eq!(call_sources(computed_method), ["methodBody()"]);
+
+    for initializer in initializers {
+        assert!(
+            initializer
+                .values()
+                .iter()
+                .all(|value| value.kind != SemanticValueKind::Return),
+            "initializer expressions must not manufacture return values"
+        );
+        assert!(
+            initializer
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| {
+                    !matches!(
+                        event.effect,
+                        SemanticEffect::ProcedureReturn { .. }
+                            | SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Return,
+                                ..
+                            }
+                    )
+                }),
+            "initializer expressions must complete normally without return effects"
+        );
+        assert!(initializer.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Procedure
+                && gap.capability == SemanticCapability::DeferredExecution
+                && gap.kind == SemanticGapKind::Unsupported
+        }));
+    }
+    assert!(
+        field_initializer.gaps().iter().any(|gap| {
+            gap.detail
+                .contains("class field initializer scheduling during construction")
+        }),
+        "field initializer must surface the remaining scheduling gap"
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
 fn typescript_compound_abrupt_tails_and_dead_control_stay_disconnected() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -1936,7 +2132,7 @@ fn typescript_for_in_initializer_and_destructuring_gaps_are_point_scoped() {
 }
 
 #[test]
-fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
+fn typescript_for_await_yield_and_unsupported_control_stop_at_typed_boundaries() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
             "src/boundaries.ts",
@@ -2007,10 +2203,8 @@ fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
                 .effect("invoke"),
         )
         .bind(
-            "unknown_gap",
-            PointSelector::new("class Local {}")
-                .procedure("unknownControl")
-                .effect("gap"),
+            "class_definition",
+            PointSelector::new("class Local {}").procedure("unknownControl"),
         )
         .bind(
             "unknown_after",
@@ -2033,13 +2227,13 @@ fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
                 .effect("invoke"),
         );
 
-    for terminal in ["for_await_gap", "yield_gap", "unknown_gap", "logical_gap"] {
+    for terminal in ["for_await_gap", "yield_gap", "logical_gap"] {
         graph.assert_successors(terminal, &[]);
     }
     graph.assert_unreachable("for_await_gap", "for_await_use");
     graph.assert_unreachable("for_await_gap", "iterate_after");
     graph.assert_unreachable("yield_gap", "values_after");
-    graph.assert_unreachable("unknown_gap", "unknown_after");
+    graph.assert_reachable("class_definition", "unknown_after");
     graph.assert_unreachable("logical_gap", "logical_after");
 
     let capabilities = [
@@ -2055,6 +2249,68 @@ fn typescript_for_await_yield_and_unknown_control_stop_at_typed_boundaries() {
                 .any(|gap| gap.capability == capability && gap.kind == SemanticGapKind::Unsupported)
         }));
     }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn typescript_implements_is_type_only_and_decorators_remain_explicitly_unsupported() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/class_boundaries.ts",
+            r#"
+                interface Marker {}
+                declare function decorate(): ClassDecorator;
+                declare function after(): void;
+
+                function implemented(): void {
+                    class Local implements Marker {}
+                    after();
+                }
+
+                function decorated(): void {
+                    @decorate()
+                    class Local {}
+                    after();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/class_boundaries.ts");
+    graph
+        .bind(
+            "implements_class",
+            PointSelector::new("class Local implements Marker {}").procedure("implemented"),
+        )
+        .bind(
+            "implements_after",
+            PointSelector::new("after()")
+                .occurrence(1)
+                .procedure("implemented")
+                .effect("invoke"),
+        )
+        .bind(
+            "decorator_gap",
+            PointSelector::new("class Local {}")
+                .procedure("decorated")
+                .effect("gap"),
+        )
+        .bind(
+            "decorator_after",
+            PointSelector::new("after()")
+                .occurrence(2)
+                .procedure("decorated")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("implements_class", "implements_after");
+    graph.assert_successors("decorator_gap", &[]);
+    graph.assert_unreachable("decorator_gap", "decorator_after");
+    graph.assert_point_gap(
+        "decorator_gap",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
     graph.assert_adjacency_symmetric();
 }
 

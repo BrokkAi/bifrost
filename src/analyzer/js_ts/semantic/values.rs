@@ -93,13 +93,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         properties: ProcedureProperties,
     ) -> Result<(), TsLoweringError> {
         let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots(
-            self.prepared.dialect().language(),
-            self.prepared.tree().root_node(),
-            self.prepared.source(),
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout = if procedure_kind == ProcedureKind::Initializer {
+            Default::default()
+        } else {
+            formal_parameter_slots(
+                self.prepared.dialect().language(),
+                self.prepared.tree().root_node(),
+                self.prepared.source(),
+                &declaration_range,
+            )
+            .unwrap_or_default()
+        };
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             let node = callable
@@ -135,13 +139,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
 
-        if self.receiver.is_none()
-            && !properties.is_static
-            && matches!(
-                procedure_kind,
-                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Function
-            )
-        {
+        if self.receiver.is_none() && procedure_owns_receiver(procedure_kind, properties) {
             let metadata = self.value_mapping(builder, callable)?;
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,

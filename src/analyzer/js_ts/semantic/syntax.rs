@@ -25,6 +25,16 @@ struct EnclosingBinding {
 }
 
 pub(super) fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    if matches!(node.kind(), "field_definition" | "public_field_definition") {
+        let name = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"))?;
+        if name.kind() == "computed_property_name" {
+            return None;
+        }
+        return nonempty_node_text(source, name).map(Box::<str>::from);
+    }
+
     if let Some(name) = node
         .child_by_field_name("name")
         .and_then(|name| nonempty_node_text(source, name))
@@ -107,6 +117,14 @@ fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
         .is_some_and(|candidate| candidate.id() == child.id())
 }
 
+fn has_children_in_field(parent: Node<'_>, field: &str) -> bool {
+    let mut cursor = parent.walk();
+    parent
+        .children_by_field_name(field, &mut cursor)
+        .next()
+        .is_some()
+}
+
 fn simple_binding_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     matches!(
         node.kind(),
@@ -129,31 +147,51 @@ pub(super) fn callable_shape<'tree>(
     Node<'tree>,
     ProcedureProperties,
 )> {
-    let (kind, segment_kind, generator) = match node.kind() {
+    let (kind, segment_kind, body, generator, is_static) = match node.kind() {
         "function_declaration" | "function_expression" => (
             ProcedureKind::Function,
             DeclarationSegmentKind::Function,
+            node.child_by_field_name("body")?,
+            false,
             false,
         ),
         "generator_function_declaration" | "generator_function" => (
             ProcedureKind::Function,
             DeclarationSegmentKind::Function,
+            node.child_by_field_name("body")?,
             true,
+            false,
         ),
-        "arrow_function" => (ProcedureKind::Lambda, DeclarationSegmentKind::Lambda, false),
+        "arrow_function" => (
+            ProcedureKind::Lambda,
+            DeclarationSegmentKind::Lambda,
+            node.child_by_field_name("body")?,
+            false,
+            false,
+        ),
         "method_definition" => (
             ProcedureKind::Method,
             DeclarationSegmentKind::Method,
+            node.child_by_field_name("body")?,
             has_child_kind(node, "*"),
+            has_child_kind(node, "static") || has_child_kind(node, "static get"),
         ),
         "class_static_block" => (
             ProcedureKind::Initializer,
             DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("body")?,
             false,
+            true,
+        ),
+        "field_definition" | "public_field_definition" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("value")?,
+            false,
+            has_child_kind(node, "static"),
         ),
         _ => return None,
     };
-    let body = node.child_by_field_name("body")?;
     let mut cursor = node.walk();
     let is_async = node
         .children(&mut cursor)
@@ -165,9 +203,7 @@ pub(super) fn callable_shape<'tree>(
         ProcedureProperties {
             is_async,
             is_generator: generator,
-            is_static: node.kind() == "class_static_block"
-                || (node.kind() == "method_definition"
-                    && (has_child_kind(node, "static") || has_child_kind(node, "static get"))),
+            is_static,
             is_synthetic: false,
             invocation: if generator {
                 ProcedureInvocationKind::Deferred
@@ -177,6 +213,125 @@ pub(super) fn callable_shape<'tree>(
             ..ProcedureProperties::default()
         },
     ))
+}
+
+pub(super) fn callable_field_belongs_to_procedure(
+    callable_kind: &str,
+    field: Option<&str>,
+) -> bool {
+    match callable_kind {
+        "field_definition" | "public_field_definition" => field == Some("value"),
+        "method_definition" => !matches!(field, Some("name" | "decorator")),
+        _ => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ClassDefinitionEvaluation<'tree> {
+    pub(super) expressions: Vec<Node<'tree>>,
+    pub(super) has_decorators: bool,
+}
+
+pub(super) fn class_definition_expressions<'tree>(
+    class: Node<'tree>,
+    cancellation: &CancellationToken,
+) -> Result<ClassDefinitionEvaluation<'tree>, LoweringCancelled> {
+    let mut expressions = Vec::new();
+    let mut has_decorators = false;
+    let mut cursor = class.walk();
+    for child in class.named_children(&mut cursor) {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        match child.kind() {
+            "decorator" => has_decorators = true,
+            "class_heritage" => {
+                let mut heritage_cursor = child.walk();
+                for heritage in child.named_children(&mut heritage_cursor) {
+                    if cancellation.is_cancelled() {
+                        return Err(LoweringCancelled);
+                    }
+                    match heritage.kind() {
+                        "extends_clause" => {
+                            let mut extends_cursor = heritage.walk();
+                            for (index, value) in heritage.children(&mut extends_cursor).enumerate()
+                            {
+                                if cancellation.is_cancelled() {
+                                    return Err(LoweringCancelled);
+                                }
+                                if heritage.field_name_for_child(index as u32) == Some("value") {
+                                    expressions.push(value);
+                                }
+                            }
+                        }
+                        "implements_clause" => {}
+                        _ => expressions.push(heritage),
+                    }
+                }
+            }
+            "class_body" => {
+                let mut body_cursor = child.walk();
+                for member in child.named_children(&mut body_cursor) {
+                    if cancellation.is_cancelled() {
+                        return Err(LoweringCancelled);
+                    }
+                    if member.kind() == "decorator" {
+                        has_decorators = true;
+                    } else {
+                        has_decorators |= member_has_decorators(member, cancellation)?;
+                        if let Some(name) = runtime_computed_member_name(member) {
+                            expressions.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(ClassDefinitionEvaluation {
+        expressions,
+        has_decorators,
+    })
+}
+
+fn member_has_decorators(
+    member: Node<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, LoweringCancelled> {
+    if has_children_in_field(member, "decorator") {
+        return Ok(true);
+    }
+    let Some(parameters) = member.child_by_field_name("parameters") else {
+        return Ok(false);
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        if has_children_in_field(parameter, "decorator") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn runtime_computed_member_name(member: Node<'_>) -> Option<Node<'_>> {
+    let executes_at_runtime = match member.kind() {
+        "method_definition" | "field_definition" => true,
+        "public_field_definition" => {
+            !has_child_kind(member, "abstract") && !has_child_kind(member, "declare")
+        }
+        _ => false,
+    };
+    executes_at_runtime
+        .then(|| {
+            member
+                .child_by_field_name("name")
+                .or_else(|| member.child_by_field_name("property"))
+        })
+        .flatten()
+        .filter(|name| name.kind() == "computed_property_name")
 }
 
 pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -398,13 +553,15 @@ pub(super) fn is_js_ts_nested_execution_boundary(node: Node<'_>, traversal_root:
         return true;
     }
     node.parent().is_some_and(|parent| {
-        (parent.kind() == "method_definition"
-            && !(node.id() == traversal_root.id() && field_matches(parent, "body", node))
-            && !field_matches(parent, "name", node))
-            || (matches!(
-                parent.kind(),
-                "field_definition" | "public_field_definition"
-            ) && field_matches(parent, "value", node))
+        let belongs_to_procedure = match parent.kind() {
+            "field_definition" | "public_field_definition" => field_matches(parent, "value", node),
+            "method_definition" => !field_matches(parent, "name", node),
+            _ => false,
+        };
+        belongs_to_procedure
+            && !(parent.kind() == "method_definition"
+                && node.id() == traversal_root.id()
+                && field_matches(parent, "body", node))
     })
 }
 

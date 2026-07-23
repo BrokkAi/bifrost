@@ -16,7 +16,10 @@ use brokk_bifrost::analyzer::semantic::{
     ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason, WorkspaceSemanticOracle,
 };
 
-use common::{InlineTestProject, semantic_graph::SemanticGraph};
+use common::{
+    InlineTestProject,
+    semantic_graph::{SemanticGraph, mapped_source, procedure_source},
+};
 
 fn procedure_named<'artifact>(
     graph: &'artifact SemanticGraph,
@@ -56,22 +59,6 @@ fn available<T>(outcome: &SemanticOutcome<T>) -> &T {
     outcome
         .available_value()
         .expect("source-backed oracle outcome must retain its partial value")
-}
-
-fn mapped_source<'source>(
-    procedure: &ProcedureSemantics,
-    source: &'source str,
-    mapping: brokk_bifrost::analyzer::semantic::SourceMappingId,
-) -> &'source str {
-    let span = procedure
-        .source_mapping(mapping)
-        .expect("semantic row must retain a source mapping")
-        .locator
-        .anchor()
-        .span();
-    source
-        .get(span.start_byte() as usize..span.end_byte() as usize)
-        .expect("semantic source span must index the fixture")
 }
 
 fn assert_value_contract(
@@ -2285,6 +2272,228 @@ class Capture {
 
     assert_nested_receiver_capture_relay(&typescript);
     assert_nested_receiver_capture_relay(&java);
+}
+
+#[test]
+fn javascript_typescript_class_initializers_own_receivers() {
+    const SOURCE: &str = r#"
+class Host {
+    Base = class {};
+    key = "member";
+
+    makeNested() {
+        class Nested extends this.Base {
+            [this.key] = this;
+            instanceDirect = this;
+            instanceArrow = () => this;
+            parameterArrow = (value) => value;
+            static staticDirect = this;
+            static staticArrow = () => this;
+            [(() => this.key)()]() {}
+            static {
+                const staticBlockDirect = this;
+                const staticBlockArrow = () => this;
+                const staticBlockHelper = (value) => value;
+            }
+        }
+        return Nested;
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("initializers/receivers.js", SOURCE)
+        .file("initializers/receivers.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for path in ["initializers/receivers.js", "initializers/receivers.ts"] {
+        let graph = SemanticGraph::materialize(&project, &analyzer, path);
+        let procedures = graph.artifact().procedures();
+        let initializer = |source_fragment: &str| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure.kind() == ProcedureKind::Initializer
+                        && procedure_source(procedure, SOURCE).contains(source_fragment)
+                })
+                .unwrap_or_else(|| panic!("{path} missing initializer for {source_fragment:?}"))
+        };
+        let receiver = |procedure: &ProcedureSemantics| {
+            procedure
+                .values()
+                .iter()
+                .find(|value| value.kind == SemanticValueKind::Receiver)
+                .map(|value| value.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{path} initializer {:?} should own a receiver",
+                        procedure.locator().declaration()
+                    )
+                })
+        };
+        let receiver_flow_count = |procedure: &ProcedureSemantics| {
+            let receiver = receiver(procedure);
+            procedure
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Receiver,
+                            source,
+                            ..
+                        } if source == receiver
+                    )
+                })
+                .count()
+        };
+        let assert_receiver_capture = |procedure: &ProcedureSemantics| {
+            let receiver = receiver(procedure);
+            let capture = procedure.captures().first().unwrap_or_else(|| {
+                panic!(
+                    "{path} initializer {:?} should bind its arrow receiver",
+                    procedure.locator().declaration()
+                )
+            });
+            assert_eq!(procedure.captures().len(), 1);
+            assert_eq!(capture.captured, CaptureSource::Value(receiver));
+            let lambda = graph
+                .artifact()
+                .procedure(capture.target)
+                .expect("initializer capture target should be materialized");
+            assert_eq!(lambda.kind(), ProcedureKind::Lambda);
+            assert_eq!(lambda.lexical_parent(), Some(procedure.id()));
+            assert!(matches!(
+                lambda
+                    .memory_location(capture.destination)
+                    .expect("lambda receiver capture slot")
+                    .kind,
+                MemoryLocationKind::Capture { lexical_parent }
+                    if lexical_parent == procedure.id()
+            ));
+            assert!(
+                !lambda.gaps().iter().any(|gap| {
+                    gap.subject == SemanticGapSubject::MemoryLocation(capture.destination)
+                        && gap.capability == SemanticCapability::Captures
+                }),
+                "{path} initializer-owned receiver capture should remain exact"
+            );
+        };
+
+        for source_fragment in [
+            "[this.key] = this",
+            "instanceDirect = this",
+            "static staticDirect = this",
+        ] {
+            assert_eq!(
+                receiver_flow_count(initializer(source_fragment)),
+                1,
+                "{path} direct field `this` should flow only from the initializer receiver"
+            );
+        }
+        for source_fragment in [
+            "instanceArrow = () => this",
+            "static staticArrow = () => this",
+        ] {
+            assert_receiver_capture(initializer(source_fragment));
+        }
+
+        let static_block = initializer("const staticBlockDirect = this");
+        assert!(static_block.properties().is_static);
+        assert_eq!(receiver_flow_count(static_block), 1);
+        assert_receiver_capture(static_block);
+        assert!(
+            static_block
+                .values()
+                .iter()
+                .all(|value| !matches!(value.kind, SemanticValueKind::Parameter { .. })),
+            "{path} static-block initializer must not absorb nested lambda parameters"
+        );
+        assert!(!initializer("instanceDirect = this").properties().is_static);
+        assert!(
+            initializer("static staticDirect = this")
+                .properties()
+                .is_static
+        );
+
+        let parameter_initializer = initializer("parameterArrow = (value) => value");
+        assert!(
+            parameter_initializer
+                .values()
+                .iter()
+                .all(|value| !matches!(value.kind, SemanticValueKind::Parameter { .. })),
+            "{path} field initializer must not absorb nested lambda parameters"
+        );
+        let parameter_lambdas = procedures
+            .iter()
+            .filter(|procedure| {
+                procedure.kind() == ProcedureKind::Lambda
+                    && procedure_source(procedure, SOURCE).contains("(value) => value")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameter_lambdas.len(),
+            2,
+            "{path} should materialize field and static-block helper lambdas"
+        );
+        for lambda in parameter_lambdas {
+            let parameters = lambda
+                .values()
+                .iter()
+                .filter(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+                .count();
+            assert_eq!(
+                parameters, 1,
+                "{path} lambda should retain its own parameter"
+            );
+        }
+
+        let outer = procedure_named(&graph, "makeNested", ProcedureKind::Method);
+        let outer_receiver = outer
+            .values()
+            .iter()
+            .find(|value| value.kind == SemanticValueKind::Receiver)
+            .expect("outer instance method receiver");
+        let outer_receiver_flows = outer
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Receiver,
+                        source,
+                        ..
+                    } if source == outer_receiver.id
+                )
+            })
+            .count();
+        assert_eq!(
+            outer_receiver_flows, 2,
+            "{path} outer method should evaluate only heritage and the direct computed field name"
+        );
+        let computed_name_capture = outer
+            .captures()
+            .first()
+            .expect("computed method-name arrow should capture the outer receiver");
+        assert_eq!(outer.captures().len(), 1);
+        assert_eq!(
+            computed_name_capture.captured,
+            CaptureSource::Value(outer_receiver.id)
+        );
+        let computed_name_lambda = graph
+            .artifact()
+            .procedure(computed_name_capture.target)
+            .expect("computed method-name arrow procedure");
+        assert_eq!(computed_name_lambda.lexical_parent(), Some(outer.id()));
+        assert!(
+            procedure_source(computed_name_lambda, SOURCE).contains("() => this.key"),
+            "{path} computed-name arrow must stay in the surrounding class-definition context"
+        );
+    }
 }
 
 #[test]
