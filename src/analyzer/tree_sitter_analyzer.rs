@@ -29,12 +29,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 128;
+// `FileState` holds the full parsed source (`source: String`) plus every
+// declaration-shaped collection derived from it (imports, signatures,
+// supertypes, ranges, children, ...) keyed by `CodeUnit`. For a typical
+// source file (a few KB to tens of KB of text, tens to low hundreds of
+// declarations) that's conservatively ~50-100 KB per entry once the
+// per-CodeUnit maps are counted; large files run higher. This cache is
+// shared across all concurrent calls behind one `Arc<Mutex<..>>>`, so its
+// capacity is a single shared budget, not per-call: at 1024 entries the
+// worst-case footprint is on the order of ~50-100 MB, which is an
+// acceptable trade against the O(n) `VecDeque::retain` this cache used to
+// pay on every touch under that same shared lock.
+const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
 // A broad usage traversal may visit more files than the small cross-request
 // cache holds. Retain hydrated states for one request, then release them.
 const QUERY_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
 const QUERY_PREPARED_SYNTAX_CACHE_CAPACITY: usize = 1_024;
-const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 32;
+// `SummaryFileProjection` is much lighter than `FileState`: no source text,
+// just the declaration/signature/range/children maps used to render
+// `get_summaries`. Call it a few KB per entry; 128 entries is a small,
+// bounded addition (well under 1 MB) in exchange for a much higher hit rate
+// under concurrent summary requests than the previous cap of 32.
+const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 128;
 const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -694,11 +710,33 @@ struct ResolvedPreparedSource {
     snapshot: ProjectSourceSnapshot,
 }
 
+/// A bound on how far `order` (see below) is allowed to grow past `capacity`
+/// before we pay for a compaction pass. Lazy deletion means every `touch`
+/// leaves a stale duplicate behind instead of scanning to remove it, so
+/// without this bound a cache whose keys are re-touched far more often than
+/// new keys are inserted (the common case: a handful of hot files touched on
+/// every call) would grow `order` unboundedly even though `entries` stays at
+/// `capacity`. Compacting at a small multiple of `capacity` keeps the
+/// amortized cost of `touch`/`insert` O(1) while capping `order`'s memory at
+/// O(capacity).
+const CACHE_ORDER_COMPACT_FACTOR: usize = 4;
+
 #[derive(Debug)]
 struct BoundedFileCache<T> {
     capacity: usize,
-    entries: HashMap<FileStateCacheKey, Arc<T>>,
-    order: VecDeque<FileStateCacheKey>,
+    /// Value plus the `stamp` of the most recent `order` entry that refers to
+    /// it. Only the `order` entry whose stamp matches this one is "live";
+    /// any earlier entries for the same key are stale leftovers from prior
+    /// touches (see `touch`).
+    entries: HashMap<FileStateCacheKey, (Arc<T>, u64)>,
+    /// Touch history, oldest first. A key may appear multiple times: every
+    /// `get`/`insert` touch pushes a fresh `(key, stamp)` pair rather than
+    /// scanning to relocate an existing one (that scan was the O(n)
+    /// `VecDeque::retain` this type replaced). Eviction pops from the front
+    /// and discards entries whose stamp no longer matches `entries`, so the
+    /// first pop that *does* match is the true least-recently-used survivor.
+    order: VecDeque<(FileStateCacheKey, u64)>,
+    next_stamp: u64,
 }
 
 type FileStateCache = BoundedFileCache<FileState>;
@@ -833,11 +871,17 @@ impl<T> BoundedFileCache<T> {
             capacity,
             entries: HashMap::default(),
             order: VecDeque::new(),
+            next_stamp: 0,
         }
     }
 
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn get(&mut self, key: &FileStateCacheKey) -> Option<Arc<T>> {
-        let state = Arc::clone(self.entries.get(key)?);
+        let state = Arc::clone(&self.entries.get(key)?.0);
         self.touch(key);
         Some(state)
     }
@@ -846,24 +890,59 @@ impl<T> BoundedFileCache<T> {
         if self.capacity == 0 {
             return;
         }
-        if self.entries.insert(key.clone(), value).is_some() {
-            self.touch(&key);
-            return;
+        let stamp = self.next_stamp;
+        self.next_stamp += 1;
+        let is_new_key = self.entries.insert(key.clone(), (value, stamp)).is_none();
+        self.order.push_back((key, stamp));
+        if is_new_key {
+            while self.entries.len() > self.capacity {
+                self.evict_one();
+            }
         }
-        self.order.push_back(key.clone());
-        while self.entries.len() > self.capacity {
-            let Some(evicted) = self.order.pop_front() else {
-                break;
-            };
-            if self.entries.remove(&evicted).is_some() {
-                break;
+        self.maybe_compact();
+    }
+
+    /// O(1) touch: record a fresh, newest-timestamped entry in `order`
+    /// without scanning to remove the key's previous occurrence. Stale
+    /// duplicates are discarded lazily, either by `evict_one` (which skips
+    /// them) or `maybe_compact` (which filters them out in bulk).
+    fn touch(&mut self, key: &FileStateCacheKey) {
+        let stamp = self.next_stamp;
+        self.next_stamp += 1;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.1 = stamp;
+        }
+        self.order.push_back((key.clone(), stamp));
+        self.maybe_compact();
+    }
+
+    /// Pop from the front of `order` until we find (and remove) a genuine
+    /// LRU victim: an entry whose stamp still matches what `entries` holds.
+    /// Earlier pops that don't match are stale duplicates left behind by
+    /// `touch` and are simply dropped.
+    fn evict_one(&mut self) {
+        while let Some((key, stamp)) = self.order.pop_front() {
+            let is_live = matches!(self.entries.get(&key), Some((_, current)) if *current == stamp);
+            if is_live {
+                self.entries.remove(&key);
+                return;
             }
         }
     }
 
-    fn touch(&mut self, key: &FileStateCacheKey) {
-        self.order.retain(|existing| existing != key);
-        self.order.push_back(key.clone());
+    /// Bulk-drop stale `order` duplicates once they outnumber `entries` by
+    /// more than `CACHE_ORDER_COMPACT_FACTOR`, so long-lived caches whose
+    /// keys are touched far more often than evicted don't grow `order`
+    /// without bound. Filtering keeps at most one (the live) entry per key.
+    fn maybe_compact(&mut self) {
+        let threshold = self.capacity.saturating_mul(CACHE_ORDER_COMPACT_FACTOR);
+        if self.order.len() <= threshold.max(CACHE_ORDER_COMPACT_FACTOR) {
+            return;
+        }
+        let entries = &self.entries;
+        self.order.retain(
+            |(key, stamp)| matches!(entries.get(key), Some((_, current)) if current == stamp),
+        );
     }
 }
 
@@ -4441,7 +4520,11 @@ where
             .into_iter()
             .filter(|unit| unit.identifier() == identifier)
             .collect();
-        matches.extend(self.dirty_units_matching(false, |unit| unit.identifier() == identifier));
+        // `true`: dirty (edited-but-not-yet-persisted) file state must offer
+        // the same membership as the widened SQL query above, or unsaved
+        // edits to a definition-lookup-only unit would regress to invisible
+        // while its persisted counterpart resolves.
+        matches.extend(self.dirty_units_matching(true, |unit| unit.identifier() == identifier));
         matches.extend(
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
                 unit.identifier() == identifier
@@ -5940,6 +6023,88 @@ mod tests {
     use git2::{ObjectType, Oid};
     use std::path::{Path, PathBuf};
     use std::sync::{Barrier, Condvar, RwLock};
+
+    fn cache_key(name: &str) -> FileStateCacheKey {
+        FileStateCacheKey {
+            oid: Oid::zero(),
+            rel_path: PathBuf::from(name),
+        }
+    }
+
+    #[test]
+    fn bounded_file_cache_respects_capacity_under_interleaved_touches() {
+        let mut cache: BoundedFileCache<u32> = BoundedFileCache::new(2);
+        cache.insert(cache_key("a"), Arc::new(1));
+        cache.insert(cache_key("b"), Arc::new(2));
+        // Interleave touches (get) with a fresh insert; capacity must never
+        // be exceeded no matter how many stale `order` duplicates a touch
+        // leaves behind.
+        assert!(cache.get(&cache_key("a")).is_some());
+        assert!(cache.get(&cache_key("a")).is_some());
+        assert!(cache.get(&cache_key("b")).is_some());
+        cache.insert(cache_key("c"), Arc::new(3));
+        assert_eq!(cache.len(), 2, "capacity must be respected after eviction");
+    }
+
+    #[test]
+    fn bounded_file_cache_most_recently_used_survives_eviction() {
+        let mut cache: BoundedFileCache<u32> = BoundedFileCache::new(2);
+        cache.insert(cache_key("a"), Arc::new(1));
+        cache.insert(cache_key("b"), Arc::new(2));
+        // Touch "a" so "b" becomes the least-recently-used entry.
+        assert!(cache.get(&cache_key("a")).is_some());
+        cache.insert(cache_key("c"), Arc::new(3));
+        assert!(
+            cache.get(&cache_key("a")).is_some(),
+            "recently touched entry must survive eviction"
+        );
+        assert!(
+            cache.get(&cache_key("c")).is_some(),
+            "newly inserted entry must survive eviction"
+        );
+        assert!(
+            cache.get(&cache_key("b")).is_none(),
+            "least-recently-used entry must be evicted"
+        );
+    }
+
+    #[test]
+    fn bounded_file_cache_duplicate_touches_do_not_inflate_entry_count() {
+        let mut cache: BoundedFileCache<u32> = BoundedFileCache::new(3);
+        cache.insert(cache_key("a"), Arc::new(1));
+        for _ in 0..50 {
+            assert!(cache.get(&cache_key("a")).is_some());
+        }
+        assert_eq!(
+            cache.len(),
+            1,
+            "repeated touches of one key must not create extra entries"
+        );
+        // Re-inserting the same key (e.g. re-hydrating after a dirty write)
+        // must also not grow the entry count.
+        cache.insert(cache_key("a"), Arc::new(2));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(*cache.get(&cache_key("a")).unwrap(), 2);
+    }
+
+    #[test]
+    fn bounded_file_cache_compacts_stale_order_duplicates() {
+        let mut cache: BoundedFileCache<u32> = BoundedFileCache::new(2);
+        cache.insert(cache_key("a"), Arc::new(1));
+        cache.insert(cache_key("b"), Arc::new(2));
+        // Touch "a" far past the compaction threshold; `order` must not grow
+        // without bound even though `entries` stays fixed at capacity.
+        for _ in 0..(CACHE_ORDER_COMPACT_FACTOR * 10) {
+            assert!(cache.get(&cache_key("a")).is_some());
+        }
+        assert!(
+            cache.order.len()
+                <= cache.capacity * CACHE_ORDER_COMPACT_FACTOR + CACHE_ORDER_COMPACT_FACTOR,
+            "order should be compacted instead of growing unboundedly, got {}",
+            cache.order.len()
+        );
+        assert_eq!(cache.len(), 2);
+    }
 
     #[derive(Clone)]
     struct CountingOverlayProject {
@@ -7507,6 +7672,91 @@ mod tests {
         assert!(
             cache.analyzed_live_files().is_none(),
             "a later analyzer request must validate its own live-file snapshot"
+        );
+    }
+
+    /// Direct analyzers do not own a watcher, so later query contexts must
+    /// revalidate filesystem-backed live paths. The request cache still
+    /// prevents duplicate sweeps within one query context, but an unrelated
+    /// later call must be able to notice an out-of-band disk edit.
+    #[test]
+    fn analyzed_live_files_revalidates_filesystem_paths_across_query_contexts() {
+        // Git-backed on purpose: `resolve_live_oids` only routes through
+        // `LivePathValidation::Filesystem` (the `PathState.stat: Some(_)`
+        // shape M3 memoizes) when `store_context.liveness` resolves a repo
+        // for the project root; a non-git `TestProject` falls back to
+        // treating every live path as an "overlay" with `stat: None`, which
+        // never calls `fs::metadata` in the first place (unrelated to this
+        // milestone) and so would not exercise the memoization at all.
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = crate::gitblob::tests::init_repo(temp.path());
+        std::fs::write(temp.path().join("A.java"), "public class A {}\n").unwrap();
+        crate::gitblob::tests::commit_all(&repo, "init");
+        let root = temp.path().to_path_buf();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+
+        let first = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&first);
+        let files_first = analyzer.analyzed_live_files();
+        analyzer.end_query(&first);
+        assert_eq!(files_first.len(), 1, "files: {files_first:?}");
+
+        // A later direct-analyzer query must still validate the filesystem:
+        // no SearchToolsService watcher is available here to bump the live
+        // path generation after an out-of-band edit.
+        crate::analyzer::store::liveness::reset_stat_call_count_for_test();
+        let second = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&second);
+        let files_second = analyzer.analyzed_live_files();
+        analyzer.end_query(&second);
+        assert_eq!(files_second, files_first);
+        assert!(
+            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
+            "an unrelated direct-analyzer query context must re-stat live filesystem paths"
+        );
+
+        // A real update to the changed file (the watcher/Manual write path's
+        // `resolve_live_oids` -> `live_paths.refresh`) must bump `live_paths`'
+        // generation and stat the changed file to record its new state...
+        std::fs::write(
+            temp.path().join("A.java"),
+            "public class A { void m() {} }\n",
+        )
+        .unwrap();
+        let file = ProjectFile::new(temp.path().to_path_buf(), PathBuf::from("A.java"));
+        crate::analyzer::store::liveness::reset_stat_call_count_for_test();
+        let updated = analyzer.update(&BTreeSet::from([file]));
+        assert!(
+            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
+            "update() must re-stat the changed file before recording its new live oid"
+        );
+
+        // ...the *first* query context to build a `LiveSnapshot` off that new
+        // generation performs its own one-time validation pass over the
+        // (here, single-file) live set and observes the new content...
+        crate::analyzer::store::liveness::reset_stat_call_count_for_test();
+        let third = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        updated.begin_query(&third);
+        let files_third = updated.analyzed_live_files();
+        updated.end_query(&third);
+        assert_eq!(files_third.len(), 1, "files: {files_third:?}");
+        assert!(
+            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
+            "the first LiveSnapshot build for the post-update generation must validate on disk"
+        );
+
+        // ...and every later, unrelated query context against that same
+        // direct analyzer still revalidates the filesystem.
+        crate::analyzer::store::liveness::reset_stat_call_count_for_test();
+        let fourth = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        updated.begin_query(&fourth);
+        let files_fourth = updated.analyzed_live_files();
+        updated.end_query(&fourth);
+        assert_eq!(files_fourth, files_third);
+        assert!(
+            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
+            "a second direct-analyzer query context must re-stat post-update filesystem paths"
         );
     }
 

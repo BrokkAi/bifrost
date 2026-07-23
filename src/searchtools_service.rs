@@ -450,10 +450,10 @@ impl SearchToolsService {
         let root = project.root().to_path_buf();
         let watcher_starter = production_watcher_starter();
         let workspace = if persisted {
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config)
+            WorkspaceAnalyzer::build_persisted_for_service(Arc::clone(&project), config)
                 .map_err(|error| format!("Failed to build persisted workspace: {error}"))?
         } else {
-            WorkspaceAnalyzer::build(Arc::clone(&project), config)
+            WorkspaceAnalyzer::build_for_service(Arc::clone(&project), config)
         };
         let session = assemble_session(
             project,
@@ -1453,17 +1453,61 @@ impl SearchToolsService {
         active_workspace_result(session.snapshot.analyzer().project().root())
     }
 
+    /// Read-first snapshot acquisition: the exclusive session lock is only
+    /// worth taking when the watcher actually has something to apply. Under
+    /// `WatchFiles`, peek `ProjectChangeWatcher::has_pending` while holding
+    /// only a read lock (reached through the session, since the watcher lives
+    /// inside it); if nothing is pending, clone the two `Arc`s under that same
+    /// read lock and return without ever taking the write lock. If something
+    /// is pending, drop the read guard and take the write lock to apply the
+    /// delta as before. A watcher event landing between the peek and the
+    /// read-locked clone is picked up at the next call boundary — the same
+    /// call-boundary consistency the previous always-write-locked code had
+    /// (an event landing right after `apply_watcher_delta` already missed the
+    /// current call). Under `Manual`, the watcher is always `Disabled` and
+    /// this path never mutates the snapshot, so a read lock always suffices.
     fn snapshot_for_query(&self) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
+        // Manual sessions never mutate the snapshot from this path (no
+        // watcher, no implicit updates driven by this call), so a read lock
+        // always suffices — never take the write lock at all.
+        if self.update_strategy == UpdateStrategy::Manual {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            return Ok(WorkspaceQueryScope::new(
+                Arc::clone(&session.snapshot),
+                Arc::clone(&session.document_root),
+            ));
+        }
+
+        {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            if !Self::session_watcher_has_pending(session) {
+                return Ok(WorkspaceQueryScope::new(
+                    Arc::clone(&session.snapshot),
+                    Arc::clone(&session.document_root),
+                ));
+            }
+        }
+
+        // Only reached for `WatchFiles` sessions with a pending delta.
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        match self.update_strategy {
-            UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
-            UpdateStrategy::Manual => {}
-        }
+        Self::apply_watcher_delta(session);
         Ok(WorkspaceQueryScope::new(
             Arc::clone(&session.snapshot),
             Arc::clone(&session.document_root),
         ))
+    }
+
+    /// Whether `session`'s watcher (if active) currently has a delta that a
+    /// call to `apply_watcher_delta` would act on. `Manual` sessions always
+    /// carry `SessionWatcher::Disabled`, so this is `false` for them too.
+    fn session_watcher_has_pending(session: &WorkspaceSession) -> bool {
+        match &session.watcher {
+            SessionWatcher::Disabled => false,
+            SessionWatcher::Active(watcher) => watcher.has_pending(),
+        }
     }
 
     fn handle_get_symbol_sources(
@@ -1480,12 +1524,30 @@ impl SearchToolsService {
             let candidate_files =
                 symbol_source_candidate_files(initial_snapshot.analyzer(), &result);
 
-            let final_snapshot = {
+            // Compute the stale set from a read-locked snapshot; the disk
+            // reads inside `stale_symbol_source_files` happen with no session
+            // lock held at all. Only take the write lock when there is
+            // something to apply.
+            let peek_snapshot = {
+                let guard = self.read_session()?;
+                let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+                Arc::clone(&session.snapshot)
+            };
+            let stale_files = stale_symbol_source_files(peek_snapshot.analyzer(), candidate_files)?;
+
+            let final_snapshot = if stale_files.is_empty() {
+                Arc::clone(initial_snapshot.arc())
+            } else {
                 let mut guard = self.write_session()?;
                 let session = guard.as_mut().ok_or_else(Self::closed_error)?;
                 Self::apply_watcher_delta(session);
+                // Re-validate under the write lock: another thread may have
+                // applied a watcher delta between the read-locked peek above
+                // and now, which can make a file the peek considered stale
+                // fresh again (or vice versa), so recompute against the
+                // now-current session snapshot rather than trusting the peek.
                 let analyzer = session.snapshot.analyzer();
-                let stale_files = stale_symbol_source_files(analyzer, candidate_files)?;
+                let stale_files = stale_symbol_source_files(analyzer, stale_files)?;
                 Self::apply_changed_files(session, stale_files);
                 Arc::clone(&session.snapshot)
             };
@@ -1515,16 +1577,42 @@ impl SearchToolsService {
         })
     }
 
+    /// Same read-first strategy as `snapshot_for_query`, plus the session's
+    /// semantic indexer handle.
     #[cfg(feature = "nlp")]
     fn semantic_snapshot_for_query(
         &self,
     ) -> Result<(WorkspaceQueryScope, Option<Arc<SemanticIndexer>>), SearchToolsServiceError> {
+        if self.update_strategy == UpdateStrategy::Manual {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            return Ok((
+                WorkspaceQueryScope::new(
+                    Arc::clone(&session.snapshot),
+                    Arc::clone(&session.document_root),
+                ),
+                session.semantic.clone(),
+            ));
+        }
+
+        {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            if !Self::session_watcher_has_pending(session) {
+                return Ok((
+                    WorkspaceQueryScope::new(
+                        Arc::clone(&session.snapshot),
+                        Arc::clone(&session.document_root),
+                    ),
+                    session.semantic.clone(),
+                ));
+            }
+        }
+
+        // Only reached for `WatchFiles` sessions with a pending delta.
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        match self.update_strategy {
-            UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
-            UpdateStrategy::Manual => {}
-        }
+        Self::apply_watcher_delta(session);
         Ok((
             WorkspaceQueryScope::new(
                 Arc::clone(&session.snapshot),
@@ -1909,9 +1997,11 @@ fn build_persisted_workspace(
     root: PathBuf,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
-    let workspace =
-        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    let workspace = WorkspaceAnalyzer::build_persisted_for_service(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+    )
+    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
     Ok((project, workspace))
 }
 
@@ -1925,7 +2015,7 @@ fn build_persisted_workspace_at(
     db_path: &Path,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
-    let workspace = WorkspaceAnalyzer::build_persisted_at(
+    let workspace = WorkspaceAnalyzer::build_persisted_at_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
         db_path,
@@ -1938,7 +2028,8 @@ fn build_transient_workspace(
     root: PathBuf,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
-    let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+    let workspace =
+        WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
 }
 

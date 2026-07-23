@@ -450,6 +450,7 @@ struct GoDefinitionContext {
 
 #[derive(Clone)]
 pub(super) struct ScalaDefinitionContext {
+    pub(super) file: ProjectFile,
     pub(super) package: Arc<str>,
     pub(super) imports: Arc<Vec<ImportInfo>>,
 }
@@ -590,6 +591,7 @@ impl<'a> DefinitionBatchContext<'a> {
         self.scala_contexts
             .entry(file.clone())
             .or_insert_with(|| ScalaDefinitionContext {
+                file: file.clone(),
                 package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
                 imports: Arc::new(scala.import_info_of(file)),
             })

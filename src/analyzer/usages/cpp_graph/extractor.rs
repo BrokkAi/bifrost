@@ -1779,6 +1779,16 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_hit(function_terminal_node(function), ctx);
         }
         MethodReceiverTargetResolution::NonTarget | MethodReceiverTargetResolution::Ambiguous => {}
+        // A bare `m()` whose name resolves through the enclosing class's base hierarchy to
+        // the target member declared on a base is a genuine external usage of that inherited
+        // base member (e.g. `Derived::run` calling inherited `Base::value`), so it is an
+        // ordinary Reference hit -- not a same-type self call. Checked before the self-owner
+        // arm because `same_owner_context` also accepts this inherited case.
+        MethodReceiverTargetResolution::Missing
+            if inherited_target_owner_context(function, ctx) =>
+        {
+            push_hit(function_terminal_node(function), ctx);
+        }
         MethodReceiverTargetResolution::Missing if same_owner_context(function, ctx) => {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
@@ -2297,7 +2307,12 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let unscoped_enum_match = ctx.spec.enum_owner_kind == EnumOwnerKind::Unscoped
         && ctx.visibility.is_visible(ctx.file, &ctx.spec.target);
     let owner_context = structured_owner_context_resolution(node, ctx);
-    if matches!(owner_context, StructuredOwnerContextResolution::Target) || unscoped_enum_match {
+    if matches!(
+        owner_context,
+        StructuredOwnerContextResolution::SelfTarget
+            | StructuredOwnerContextResolution::InheritedTarget
+    ) || unscoped_enum_match
+    {
         push_hit(node, ctx);
     } else if let Some(target_owner) = (ctx.spec.enum_owner_kind == EnumOwnerKind::Scoped)
         .then_some(ctx.spec.owner.as_ref())
@@ -2328,7 +2343,8 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         }
                     }
                     match owner_context {
-                        StructuredOwnerContextResolution::Target
+                        StructuredOwnerContextResolution::SelfTarget
+                        | StructuredOwnerContextResolution::InheritedTarget
                         | StructuredOwnerContextResolution::NonTarget => return,
                         StructuredOwnerContextResolution::Ambiguous => {
                             push_unproven_hit(node, ctx);
@@ -4148,7 +4164,18 @@ fn resolve_type_components_lexically_at_inner(
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     matches!(
         structured_owner_context_resolution(node, ctx),
-        StructuredOwnerContextResolution::Target
+        StructuredOwnerContextResolution::SelfTarget
+            | StructuredOwnerContextResolution::InheritedTarget
+    )
+}
+
+/// A bare/`this->` member call whose name resolves, through the enclosing class's base
+/// hierarchy, to the target member declared on a base (the target owner). This is a
+/// genuine external usage of the inherited base member rather than a same-type self call.
+fn inherited_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    matches!(
+        structured_owner_context_resolution(node, ctx),
+        StructuredOwnerContextResolution::InheritedTarget
     )
 }
 
@@ -4316,7 +4343,14 @@ mod effective_using_scale_tests {
 
 #[derive(Clone, Copy)]
 enum StructuredOwnerContextResolution {
-    Target,
+    /// The enclosing class is itself the target owner: a bare/`this->` call here is a
+    /// genuine same-type self call (the SelfReceiver policy from #1014-B applies).
+    SelfTarget,
+    /// The enclosing class does not declare the member but inherits it from a base that
+    /// is the target owner. A bare/`this->` call to that inherited member is a genuine
+    /// external usage OF the base member (e.g. `Derived` calling inherited `Base::value`),
+    /// not a self call, so it is attributed as an ordinary Reference.
+    InheritedTarget,
     NonTarget,
     Ambiguous,
     Missing,
@@ -4333,14 +4367,16 @@ fn structured_owner_context_resolution(
         return StructuredOwnerContextResolution::Missing;
     };
     if receiver_owner_matches_target(&enclosing_owner, target_owner, ctx) {
-        return StructuredOwnerContextResolution::Target;
+        return StructuredOwnerContextResolution::SelfTarget;
     }
+    // The enclosing class is not the target owner, so any match reached by walking its
+    // base hierarchy is an inherited-member usage of the base, not a self call.
     let member_owner = cached_declaring_member_owner(&enclosing_owner, ctx);
     match member_owner {
         EnclosingMemberOwnerResolution::Owner(owner)
             if receiver_owner_matches_target(&owner, target_owner, ctx) =>
         {
-            StructuredOwnerContextResolution::Target
+            StructuredOwnerContextResolution::InheritedTarget
         }
         EnclosingMemberOwnerResolution::Owner(_) => StructuredOwnerContextResolution::NonTarget,
         EnclosingMemberOwnerResolution::Ambiguous => StructuredOwnerContextResolution::Ambiguous,

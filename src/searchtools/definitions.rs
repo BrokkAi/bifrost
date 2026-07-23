@@ -76,16 +76,19 @@ pub(super) fn resolve_definition_context_query(
         let Some(range) = primary_range(analyzer, &unit) else {
             continue;
         };
-        let source = match unit.source().read_to_string() {
-            Ok(source) => source,
-            Err(err) => {
+        // `range` above is derived from the analyzer's own declaration data,
+        // so the analyzed snapshot (not a fresh disk read) is the source
+        // whose byte offsets it actually corresponds to.
+        let source = match analyzer.indexed_source(unit.source()) {
+            Some(source) => source,
+            None => {
                 return DefinitionByReferenceLookupResult {
                     query,
                     status: "not_found".to_string(),
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
                         kind: "read_failed".to_string(),
-                        message: format!("failed to read source file: {err}"),
+                        message: "failed to read source file: not indexed by analyzer".to_string(),
                     }],
                 };
             }

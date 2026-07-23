@@ -38,6 +38,11 @@ static GIT_STATUS_RENAMED: AtomicUsize = AtomicUsize::new(0);
 static GIT_STATUS_COPIED: AtomicUsize = AtomicUsize::new(0);
 static GIT_NATIVE_RENAME_CANDIDATES: AtomicUsize = AtomicUsize::new(0);
 static GIT_FIND_SIMILAR_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Counts `git rev-list` subprocess spawns across the process lifetime (not reset by
+/// `reset_git_counters`, unlike the per-call diff counters above). Exists so tests and manual
+/// measurement can confirm the HEAD-keyed cache is actually skipping the subprocess on repeat
+/// calls with an unchanged HEAD, rather than only inferring it from wall-clock time.
+static GIT_REV_LIST_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 
 fn reset_git_counters() {
     GIT_COMMITS_SCANNED.store(0, Ordering::Relaxed);
@@ -355,9 +360,14 @@ pub(crate) fn most_important_project_files(
         return Vec::new();
     };
     let candidate_set: HashSet<_> = candidates.iter().cloned().collect();
+    // Peel HEAD to a tree once for the whole call instead of per candidate: a full scan of an
+    // untracked candidate set previously re-resolved `HEAD` and re-peeled to a tree once per file.
+    let Some(head_tree) = repo.head_tree() else {
+        return Vec::new();
+    };
     if !candidate_set
         .iter()
-        .any(|file| repo.is_tracked_in_head(file))
+        .any(|file| repo.is_tracked_in_tree(file, &head_tree))
     {
         return Vec::new();
     }
@@ -932,9 +942,14 @@ fn related_files_by_git(
     }) else {
         return Ok(Vec::new());
     };
+    // Peel HEAD to a tree once for the whole call rather than once per seed (see the matching
+    // comment in `most_important_project_files`).
+    let Some(head_tree) = repo.head_tree() else {
+        return Ok(Vec::new());
+    };
     if !seed_weights
         .keys()
-        .any(|seed| repo.is_tracked_in_head(seed))
+        .any(|seed| repo.is_tracked_in_tree(seed, &head_tree))
     {
         return Ok(Vec::new());
     }
@@ -1066,6 +1081,22 @@ struct RepoCommitChangeCache {
     commits: Cache<Oid, Arc<CommitChange>>,
     fill_lock: Mutex<()>,
     fill_commits_scanned: AtomicUsize,
+    /// The ordered recent-commit OID list (topo-order, first-parent, as produced by
+    /// `git rev-list -n <limit> HEAD`), keyed by the peeled HEAD commit OID it was computed for.
+    /// A cheap libgit2 HEAD-peel (no subprocess) on each call is compared against this key; on a
+    /// match the `git rev-list` spawn is skipped entirely. A new commit moves HEAD to a new OID,
+    /// which misses the cached key and forces a refill, so the list can never be observed stale.
+    recent_oids: Mutex<Option<CachedRecentOids>>,
+    /// Counts rev-list refills performed FOR THIS CACHE, so tests can assert cache-hit
+    /// behavior deterministically under parallel test execution (the process-global
+    /// GIT_REV_LIST_SPAWNS counter is shared across concurrently-running tests and is
+    /// observability-only).
+    recent_oid_fills: AtomicUsize,
+}
+
+struct CachedRecentOids {
+    head: Oid,
+    oids: Arc<Vec<Oid>>,
 }
 
 impl RepoCommitChangeCache {
@@ -1074,6 +1105,8 @@ impl RepoCommitChangeCache {
             commits: Cache::builder().max_capacity(max_entries.max(1)).build(),
             fill_lock: Mutex::new(()),
             fill_commits_scanned: AtomicUsize::new(0),
+            recent_oids: Mutex::new(None),
+            recent_oid_fills: AtomicUsize::new(0),
         }
     }
 }
@@ -1107,6 +1140,24 @@ fn clear_repo_commit_change_cache_for_root(repo_root: &Path) {
     caches.remove(repo_root);
 }
 
+/// Discovered repo root cache, keyed by the caller-supplied (uncanonicalized) workspace root.
+/// `Repository::discover`'s upward directory walk plus the workdir canonicalize only need to run
+/// once per workspace; after that we just `Repository::open` the known path each call, which is
+/// cheap (`git2::Repository` is not `Sync`, so we cannot cache the `Repository` handle itself
+/// across calls/threads, only the path it lives at).
+fn repo_root_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+#[cfg(test)]
+fn clear_repo_root_cache_for_project(project_root: &Path) {
+    repo_root_cache()
+        .lock()
+        .expect("repo root cache mutex")
+        .remove(project_root);
+}
+
 impl GitProjectContext {
     fn discover(project_root: &Path) -> Option<Self> {
         // Keep the caller's project_root as-given so ProjectFiles we build from
@@ -1115,11 +1166,41 @@ impl GitProjectContext {
         // macOS temp dirs come in via /var -> /private/var symlinks.
         let project_root = project_root.to_path_buf();
         let canonical_project = project_root.canonicalize().ok()?;
+
+        let cached_repo_root = repo_root_cache()
+            .lock()
+            .expect("repo root cache mutex")
+            .get(&project_root)
+            .cloned();
+        if let Some(cached_repo_root) = cached_repo_root
+            && canonical_project.starts_with(&cached_repo_root)
+            && let Ok(repo) = Repository::open(&cached_repo_root)
+        {
+            let repo_prefix = canonical_project
+                .strip_prefix(&cached_repo_root)
+                .ok()?
+                .to_path_buf();
+            return Some(Self {
+                repo,
+                repo_root: cached_repo_root,
+                project_root,
+                repo_prefix,
+            });
+        }
+        // Cached path missing, out of scope for this project root, or no longer opens as a repo
+        // (e.g. `.git` was removed or replaced): fall through to a fresh discover below, which
+        // will also refresh the cache entry.
+
         let repo = Repository::discover(&canonical_project).ok()?;
         let repo_root = repo.workdir()?.canonicalize().ok()?;
         if !canonical_project.starts_with(&repo_root) {
             return None;
         }
+
+        repo_root_cache()
+            .lock()
+            .expect("repo root cache mutex")
+            .insert(project_root.clone(), repo_root.clone());
 
         let repo_prefix = canonical_project
             .strip_prefix(&repo_root)
@@ -1133,14 +1214,30 @@ impl GitProjectContext {
         })
     }
 
-    fn is_tracked_in_head(&self, file: &ProjectFile) -> bool {
+    /// Peel HEAD to its tree once per call. Callers that need to test several candidates for
+    /// HEAD-tracked status should hoist this once and reuse it (`is_tracked_in_tree`) rather than
+    /// re-resolving `HEAD` and re-peeling per candidate.
+    ///
+    /// We intentionally stop at this per-call hoist rather than also caching a cross-call
+    /// tracked-path set keyed by HEAD OID: callers only ever need the first tracked match
+    /// (`Iterator::any`), so the expensive case — no candidate is tracked — still only pays one
+    /// HEAD peel plus one `Tree::get_path` (bounded by path depth, not repo size) per candidate;
+    /// a full recursive tree walk to materialize every tracked path up front would spend more
+    /// work than it saves and would hold an unbounded-by-repo-size path set in memory for
+    /// large repos.
+    fn head_tree(&self) -> Option<git2::Tree<'_>> {
+        self.repo.head().ok()?.peel_to_tree().ok()
+    }
+
+    fn is_tracked_in_tree(&self, file: &ProjectFile, tree: &git2::Tree<'_>) -> bool {
         let repo_rel = self.project_rel_to_repo_rel(file.rel_path());
-        self.repo
-            .head()
-            .ok()
-            .and_then(|head| head.peel_to_tree().ok())
-            .and_then(|tree| tree.get_path(&repo_rel).ok())
-            .is_some()
+        tree.get_path(&repo_rel).is_ok()
+    }
+
+    /// The commit OID HEAD currently resolves to, via libgit2 (no subprocess). `None` for an
+    /// unborn HEAD (no commits yet); detached HEAD peels the same as an attached branch.
+    fn head_commit_oid(&self) -> Option<Oid> {
+        self.repo.head().ok()?.peel_to_commit().ok().map(|c| c.id())
     }
 
     fn recent_commit_changes(&self, limit: usize) -> Result<Vec<CommitChange>, String> {
@@ -1153,7 +1250,7 @@ impl GitProjectContext {
         limit: usize,
         cache: &RepoCommitChangeCache,
     ) -> Result<Vec<CommitChange>, String> {
-        let ordered_oids = self.recent_commit_oids(limit)?;
+        let ordered_oids = self.recent_commit_oids_cached(limit, cache)?;
         if ordered_oids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1168,7 +1265,43 @@ impl GitProjectContext {
         self.run_git_log_command(limit, None)
     }
 
+    /// Returns the ordered recent-commit OID list, reusing the cache entry keyed by the current
+    /// peeled HEAD OID when it matches and already covers at least `limit` commits. On a HEAD
+    /// change (new commit, checkout, reset, …) or a first/insufficient cache entry, this refills
+    /// via `recent_commit_oids` (the `git rev-list` subprocess) and replaces the cached entry.
+    fn recent_commit_oids_cached(
+        &self,
+        limit: usize,
+        cache: &RepoCommitChangeCache,
+    ) -> Result<Vec<Oid>, String> {
+        let Some(head_oid) = self.head_commit_oid() else {
+            // Unborn HEAD (or otherwise unresolvable): no stable key to cache against. Fall back
+            // to the direct, uncached path, which preserves today's error behavior (git itself
+            // fails to resolve "HEAD" for an unborn branch).
+            return self.recent_commit_oids(limit);
+        };
+
+        {
+            let guard = cache.recent_oids.lock().expect("recent oids mutex");
+            if let Some(cached) = guard.as_ref()
+                && cached.head == head_oid
+                && cached.oids.len() >= limit
+            {
+                return Ok(cached.oids[..limit].to_vec());
+            }
+        }
+
+        cache.recent_oid_fills.fetch_add(1, Ordering::Relaxed);
+        let refilled = Arc::new(self.recent_commit_oids(limit)?);
+        *cache.recent_oids.lock().expect("recent oids mutex") = Some(CachedRecentOids {
+            head: head_oid,
+            oids: Arc::clone(&refilled),
+        });
+        Ok((*refilled).clone())
+    }
+
     fn recent_commit_oids(&self, limit: usize) -> Result<Vec<Oid>, String> {
+        GIT_REV_LIST_SPAWNS.fetch_add(1, Ordering::Relaxed);
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.repo_root)
@@ -1628,9 +1761,10 @@ mod weight_benchmark;
 mod tests {
     use super::{
         DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
-        UsageReferenceWeights, clear_repo_commit_change_cache_for_root, commit_age_weight,
+        UsageReferenceWeights, clear_repo_commit_change_cache_for_root,
+        clear_repo_root_cache_for_project, commit_age_weight, most_important_project_files,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
-        repo_commit_change_cache, weighted_page_rank,
+        repo_commit_change_cache, repo_root_cache, weighted_page_rank,
     };
     use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
@@ -2708,6 +2842,207 @@ mod tests {
             "benchmark_repeat_calls_with_cached_git_history cold_28={:.3}s warm_28={:.3}s",
             cold_elapsed.as_secs_f64(),
             warm_elapsed.as_secs_f64()
+        );
+    }
+
+    /// M5 ranking-identity regression: repeating the same call against an unchanged HEAD must
+    /// reuse the HEAD-keyed commit-OID cache and repo-root cache added in M5, and produce the
+    /// exact same ranking. A regression here would mean the cache is returning a different (or
+    /// stale/truncated) commit window than a fresh, uncached run would.
+    #[test]
+    fn ranking_output_identical_across_repeated_calls_with_warm_git_caches() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "public class Seed { }");
+        write_file(root, "Target.java", "public class Target { }");
+        write_file(root, "Helper.java", "public class Helper { }");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(
+            &repo,
+            "initial",
+            &["Seed.java", "Target.java", "Helper.java"],
+            &[],
+            1,
+        );
+        commit_paths_at(&repo, "seed+target", &["Seed.java", "Target.java"], &[], 2);
+        commit_paths_at(&repo, "seed+helper", &["Seed.java", "Helper.java"], &[], 3);
+
+        let analyzer = java_analyzer(root);
+        let seeds = [(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)];
+
+        clear_repo_commit_change_cache_for_root(root);
+        clear_repo_root_cache_for_project(root);
+
+        // First call: cold. Populates both the repo-root cache and the HEAD-keyed commit-OID
+        // cache (plus the pre-existing per-commit change cache).
+        let first = most_relevant_project_files_with_half_life(
+            &analyzer,
+            &seeds,
+            5,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+        );
+        // Second call: warm. HEAD has not moved, so this must hit every M5 cache.
+        let second = most_relevant_project_files_with_half_life(
+            &analyzer,
+            &seeds,
+            5,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+        );
+
+        assert!(
+            !first.is_empty(),
+            "fixture should produce a non-empty ranking"
+        );
+        assert_eq!(
+            first, second,
+            "cached and re-cached rankings must be identical"
+        );
+    }
+
+    /// M5 invalidation proof: a new commit moves HEAD to a new OID, which must miss the cached
+    /// key and force a refill, so the next call reflects the new commit rather than serving a
+    /// stale cached commit-OID list.
+    #[test]
+    fn most_important_files_reflect_commit_added_after_first_call() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let seed = write_file(root, "Seed.java", "class Seed {}");
+        let target = write_file(root, "Target.java", "class Target {}");
+        let other = write_file(root, "Other.java", "class Other {}");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "seed+target", &["Seed.java", "Target.java"], &[], 1);
+
+        let analyzer = java_analyzer(root);
+        let candidates = vec![seed.clone(), target.clone(), other.clone()];
+
+        clear_repo_commit_change_cache_for_root(root);
+        clear_repo_root_cache_for_project(root);
+
+        let before = most_important_project_files(&analyzer, &candidates, 3);
+        assert!(
+            before.contains(&seed) && before.contains(&target),
+            "files touched by the only commit so far should rank"
+        );
+        assert!(
+            !before.contains(&other),
+            "Other.java has not been committed yet and must not appear"
+        );
+
+        // HEAD moves: a brand new commit touches the previously-untouched file. If the OID
+        // cache were stale, this call would still see only the first commit.
+        fs::write(
+            root.join("Other.java"),
+            "class Other { int value() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths_at(&repo, "other only", &["Other.java"], &[], 2);
+
+        let after = most_important_project_files(&analyzer, &candidates, 3);
+        assert!(
+            after.contains(&other),
+            "the new commit must be visible on the very next call: {after:?}"
+        );
+        assert_ne!(before, after);
+    }
+
+    /// M5 unit test: `recent_commit_oids_cached` must reuse the cached list (and avoid spawning
+    /// `git rev-list` again) when HEAD is unchanged, while still matching what an uncached call
+    /// would return.
+    #[test]
+    fn recent_commit_oids_cached_matches_uncached_and_skips_second_spawn() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "File.java", "class File {}");
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "initial", &["File.java"], &[], 1);
+        for index in 0..4 {
+            fs::write(
+                root.join("File.java"),
+                format!("class File {{ int v{index}() {{ return {index}; }} }}"),
+            )
+            .unwrap();
+            commit_paths_at(
+                &repo,
+                &format!("change {index}"),
+                &["File.java"],
+                &[],
+                index + 2,
+            );
+        }
+
+        let context = git_context(root);
+        let uncached = context.recent_commit_oids(3).unwrap();
+
+        let cache = RepoCommitChangeCache::new(64);
+        let cached_first = context.recent_commit_oids_cached(3, &cache).unwrap();
+        assert_eq!(1, cache.recent_oid_fills.load(Ordering::Relaxed));
+        assert_eq!(uncached, cached_first);
+
+        // HEAD unchanged: the second call must reuse the cached list without spawning again.
+        let cached_second = context.recent_commit_oids_cached(3, &cache).unwrap();
+        assert_eq!(1, cache.recent_oid_fills.load(Ordering::Relaxed));
+        assert_eq!(cached_first, cached_second);
+
+        // A smaller limit is served from the same cached entry (a prefix slice), still with no
+        // extra spawn.
+        let cached_smaller = context.recent_commit_oids_cached(2, &cache).unwrap();
+        assert_eq!(1, cache.recent_oid_fills.load(Ordering::Relaxed));
+        assert_eq!(&cached_first[..2], cached_smaller.as_slice());
+
+        // A larger limit than what is cached forces exactly one more refill.
+        let cached_larger = context.recent_commit_oids_cached(5, &cache).unwrap();
+        assert_eq!(2, cache.recent_oid_fills.load(Ordering::Relaxed));
+        assert_eq!(5, cached_larger.len());
+    }
+
+    /// M5 unit test for the discover repo-root cache's fallback path: a poisoned/stale cache
+    /// entry must not be trusted blind. `discover` must detect the failed `Repository::open`,
+    /// fall back to a fresh `Repository::discover`, and refresh the cache entry so subsequent
+    /// calls take the fast path against the corrected root.
+    #[test]
+    fn discover_recovers_when_cached_repo_root_is_invalid() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "File.java", "class File {}");
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "initial", &["File.java"], &[], 1);
+
+        clear_repo_root_cache_for_project(root);
+        repo_root_cache().lock().unwrap().insert(
+            root.to_path_buf(),
+            Path::new("/nonexistent/bifrost-relevance-test-path").to_path_buf(),
+        );
+
+        let context = GitProjectContext::discover(root)
+            .expect("fallback discover should still find the real repo");
+        assert_eq!(context.repo_root, root.canonicalize().unwrap());
+
+        let cached_after = repo_root_cache().lock().unwrap().get(root).cloned();
+        assert_eq!(
+            cached_after,
+            Some(root.canonicalize().unwrap()),
+            "the fallback path must refresh the cache to the corrected root"
+        );
+    }
+
+    /// A workspace with no `.git` anywhere in its ancestry keeps returning `None`, whether or not
+    /// a stale path cache entry is present; the fallback discover must not fabricate a repo.
+    #[test]
+    fn discover_returns_none_when_no_repo_exists_even_with_stale_cache_entry() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "File.java", "class File {}");
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "initial", &["File.java"], &[], 1);
+        clear_repo_root_cache_for_project(root);
+        assert!(GitProjectContext::discover(root).is_some());
+
+        fs::remove_dir_all(root.join(".git")).unwrap();
+        assert!(
+            GitProjectContext::discover(root).is_none(),
+            "cached-path open failure must fall back to a fresh discover, not a stale success"
         );
     }
 }

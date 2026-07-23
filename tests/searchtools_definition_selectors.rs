@@ -2691,3 +2691,331 @@ fn arrow_const_named_input_indexes_and_resolves() {
         "Input must produce sources or ambiguity: {rendered}"
     );
 }
+
+// #1087: `resolution_from_matches` dedups candidates into a `BTreeMap<fq_name,
+// CodeUnit>` (one first-inserted representative per fq, see `insert_match`).
+// The `len == 1` branch re-expands that single fq bucket back out to every
+// declaration sharing it via `matching_definitions`, but the `len > 1`
+// ("ambiguous") branch used to skip that step and emit
+// `matches.into_values().collect()` directly -- so once a THIRD, differently
+// fq'd sibling pushed the map past one entry, every other same-fq bucket
+// silently collapsed to its single representative.
+//
+// Here `Input` is declared as a top-level arrow-function const in two files
+// (both fq `"Input"`, package empty) plus a top-level, *exported*,
+// *non-function* `const Input = {...}` object literal in a third file. JS/TS
+// indexes an exported top-level object literal with "surface shape" twice:
+// once as a module-scoped `Field` whose short_name (and therefore fq) is
+// file-scoped -- e.g. `hook/UseFormMethods.tsx.Input`, mirroring the real
+// `UseFormMethods.tsx`/`forwardRefToPassRefProp.tsx` siblings from the
+// upstream react-hook-form repro -- and once more as a plain-named "surface"
+// `Field` that itself shares fq `"Input"` with the two function
+// declarations. That gives two fq buckets: `"Input"` (3 declarations: both
+// functions plus the surface field) and the file-scoped one (1 declaration),
+// and the second bucket is what pushes `matches.len()` to 2 and selects the
+// buggy branch. Before the fix, the `"Input"` bucket collapsed from 3
+// declarations down to whichever was first-inserted, silently dropping the
+// other two; after the fix all four declarations across both buckets must be
+// listed.
+#[test]
+fn bare_name_ambiguity_expands_every_same_fq_declaration_once_a_distinct_fq_sibling_exists() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "examples/V6/customMaskedInputWithController.tsx",
+            "const Input = (props) => {\n  const { onChange, ...restProps } = props;\n  return <input {...restProps} onChange={onChange} />;\n};\n\nexport { Input };\n",
+        )
+        .file(
+            "examples/V7/anotherMaskedInput.tsx",
+            "const Input = (props) => {\n  return <input {...props} />;\n};\n\nexport { Input };\n",
+        )
+        .file(
+            "hook/UseFormMethods.tsx",
+            "export const Input = {\n  displayName: 'Input',\n};\n",
+        )
+        .build();
+
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Input"]}"#);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!("Input", result["ambiguous"][0]["target"], "{result}");
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert_eq!(
+        4,
+        matches.len(),
+        "expected all four declarations (two same-fq functions, the same-fq \
+         surface field, and the distinct-fq file-scoped field), got: {result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V6/customMaskedInputWithController.tsx")),
+        "missing first same-fq declaration: {result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V7/anotherMaskedInput.tsx")),
+        "missing second same-fq declaration: {result}"
+    );
+    assert!(
+        matches.iter().any(|m| m == "hook/UseFormMethods.tsx#Input"),
+        "missing same-fq surface field declaration: {result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m == "hook/UseFormMethods.tsx#UseFormMethods.tsx.Input"),
+        "missing distinct-fq file-scoped field declaration: {result}"
+    );
+}
+
+// No-regression companion to the above: with only the two same-fq function
+// declarations (no third, distinct-fq sibling), `resolution_from_matches`
+// takes the `len == 1` branch, which already re-expanded correctly before
+// this fix. Both file-anchored candidates must keep showing up.
+#[test]
+fn bare_name_ambiguity_still_expands_same_fq_declarations_without_a_distinct_fq_sibling() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "examples/V6/customMaskedInputWithController.tsx",
+            "const Input = (props) => {\n  const { onChange, ...restProps } = props;\n  return <input {...restProps} onChange={onChange} />;\n};\n\nexport { Input };\n",
+        )
+        .file(
+            "examples/V7/anotherMaskedInput.tsx",
+            "const Input = (props) => {\n  return <input {...props} />;\n};\n\nexport { Input };\n",
+        )
+        .build();
+
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["Input"]}"#);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+    assert_eq!(2, matches.len(), "{result}");
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V6/customMaskedInputWithController.tsx")),
+        "{result}"
+    );
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.contains("examples/V7/anotherMaskedInput.tsx")),
+        "{result}"
+    );
+}
+
+// No-regression: a uniquely-named symbol must keep resolving cleanly (no
+// over-triggering of ambiguity from the expansion added for #1087).
+#[test]
+fn unique_bare_name_still_resolves_cleanly_after_ambiguity_expansion_fix() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/unique.tsx",
+            "export const OnlyOneOfMe = (props) => {\n  return <input {...props} />;\n};\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["OnlyOneOfMe"]}"#,
+    );
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!("src/unique.tsx", result["sources"][0]["path"], "{result}");
+}
+// #1088: bare identifier resolution must see every unit the fq lookup path
+// already resolves. dayjs's ~130 locale files each declare `formats` nested
+// under a top-level `locale` object; the sibling TypeScript `ILocale.formats`
+// interface member used to win silently with zero ambiguity ever reported,
+// because (a) JavaScript's `IAnalyzer::lookup_candidates_by_identifier` never
+// delegated to the shared identifier-lookup store query at all (every other
+// language wrapper did), and (b) even once wired up, the store query's
+// membership excluded `in_definition_lookup`-only units (JS/TS module-surface
+// duplicate fields) that the fq lookup path already resolves fine.
+//
+// This fixture exercises both: `dv.js`/`en.js` mirror dayjs's unexported
+// `const locale = {...}; export default locale;` shape (only reachable via
+// fix (a)); `alpha.js`/`beta.js` use `export const localeX = {...}`, which
+// additionally registers a definition-lookup-only bare `localeX.formats` twin
+// alongside the real `alpha.js.localeX.formats` declaration (only reachable
+// via fix (b)).
+#[test]
+fn bare_name_ambiguity_surfaces_definition_lookup_only_locale_fields() {
+    let project = InlineTestProject::new()
+        .file(
+            "types/locale/types.d.ts",
+            "declare interface ILocale {\n  name: string\n  formats: Partial<{\n    LT: string\n  }>\n}\nexport default ILocale\n",
+        )
+        .file(
+            "src/locale/dv.js",
+            "import dayjs from 'dayjs'\n\nconst locale = {\n  name: 'dv',\n  formats: {\n    LT: 'HH:mm'\n  }\n}\n\ndayjs.locale(locale, null, true)\n\nexport default locale\n",
+        )
+        .file(
+            "src/locale/en.js",
+            "import dayjs from 'dayjs'\n\nconst locale = {\n  name: 'en',\n  formats: {\n    LT: 'h:mm A'\n  }\n}\n\ndayjs.locale(locale, null, true)\n\nexport default locale\n",
+        )
+        .file(
+            "src/locale/alpha.js",
+            "export const localeAlpha = {\n  name: 'alpha',\n  formats: {\n    LT: 'HH:mm'\n  }\n}\n",
+        )
+        .file(
+            "src/locale/beta.js",
+            "export const localeBeta = {\n  name: 'beta',\n  formats: {\n    LT: 'h:mm A'\n  }\n}\n",
+        )
+        .build();
+
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["formats"]}"#);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!("formats", result["ambiguous"][0]["target"], "{result}");
+    let matches = string_array(&result["ambiguous"][0]["matches"]);
+
+    // The type member, the two unexported locale fields (fix a), and the two
+    // exported locale fields plus their definition-lookup-only bare twins
+    // (fix b): 1 + 2 + 2*2 = 7.
+    assert_eq!(
+        7,
+        matches.len(),
+        "expected the type member, both unexported locale fields, and both \
+         exported locale fields' declaration + definition-lookup-only twin, \
+         got: {result}"
+    );
+    for expected in [
+        "types/locale/types.d.ts#ILocale.formats",
+        "src/locale/dv.js#dv.js.locale.formats",
+        "src/locale/en.js#en.js.locale.formats",
+        "src/locale/alpha.js#alpha.js.localeAlpha.formats",
+        "src/locale/alpha.js#localeAlpha.formats",
+        "src/locale/beta.js#beta.js.localeBeta.formats",
+        "src/locale/beta.js#localeBeta.formats",
+    ] {
+        assert!(
+            matches.iter().any(|m| m == expected),
+            "missing {expected}: {result}"
+        );
+    }
+}
+
+// No-regression companion: the fq spelling of one locale's `formats` field
+// must keep resolving to exactly that field (the #1088 root-cause report's
+// "though the fq spelling resolves fine" half of the asymmetry).
+#[test]
+fn fq_spelling_of_locale_field_still_resolves_uniquely() {
+    let project = InlineTestProject::new()
+        .file(
+            "types/locale/types.d.ts",
+            "declare interface ILocale {\n  name: string\n  formats: Partial<{\n    LT: string\n  }>\n}\nexport default ILocale\n",
+        )
+        .file(
+            "src/locale/dv.js",
+            "import dayjs from 'dayjs'\n\nconst locale = {\n  name: 'dv',\n  formats: {\n    LT: 'HH:mm'\n  }\n}\n\ndayjs.locale(locale, null, true)\n\nexport default locale\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["dv.js.locale.formats"]}"#,
+    );
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+    assert_eq!("src/locale/dv.js", result["sources"][0]["path"], "{result}");
+    assert_eq!(
+        "dv.js.locale.formats", result["sources"][0]["label"],
+        "{result}"
+    );
+}
+
+// #1088: with far more legitimate candidates than a caller can act on (dayjs
+// has ~130), the rendered `matches` list must stay bounded, carry the true
+// total, and hint at how to narrow the query. 30 distinct-fq same-identifier
+// declarations exceed the 25-candidate cap (src/searchtools/mod.rs's
+// `AMBIGUOUS_SYMBOL_MATCH_LIMIT`).
+#[test]
+fn ambiguous_matches_are_capped_with_a_total_count_note() {
+    let mut project = InlineTestProject::new();
+    for index in 0..30 {
+        project = project.file(
+            format!("src/locale/locale{index}.js"),
+            format!(
+                "const locale = {{\n  name: 'locale{index}',\n  formats: {{\n    LT: 'HH:mm'\n  }}\n}}\n\nexport default locale\n"
+            ),
+        );
+    }
+    let project = project.build();
+
+    let result = call_tool(&project, "get_symbol_sources", r#"{"symbols":["formats"]}"#);
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    let matches = result["ambiguous"][0]["matches"].as_array().unwrap();
+    assert_eq!(25, matches.len(), "{result}");
+    assert!(
+        matches.iter().all(|m| m.as_str().unwrap().contains('#')),
+        "every capped candidate must still be a well-formed path# selector: {result}"
+    );
+    let note = string_value(&result["ambiguous"][0]["note"]);
+    assert!(
+        note.contains("30 candidates") && note.contains("showing 25"),
+        "note must carry the true total and the shown count: {note}"
+    );
+    assert!(
+        note.contains("refine with path#name or a qualified spelling"),
+        "note must hint at how to narrow the query: {note}"
+    );
+}
+
+// #397 no-listing-leak guard: widening bare-identifier *resolution* must not
+// leak definition-lookup-only units into declaration *listing* surfaces.
+// `alpha.js`'s exported `export const localeAlpha = {...}` registers both a
+// real declaration (`alpha.js.localeAlpha.formats`, visible everywhere) and a
+// definition-lookup-only bare twin (`localeAlpha.formats`, resolution-only);
+// get_summaries and search_symbols must keep showing only the former.
+#[test]
+fn definition_lookup_only_locale_fields_do_not_leak_into_listings() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/locale/alpha.js",
+            "export const localeAlpha = {\n  name: 'alpha',\n  formats: {\n    LT: 'HH:mm'\n  }\n}\n",
+        )
+        .build();
+
+    let summary = call_tool(
+        &project,
+        "get_summaries",
+        r#"{"targets":["src/locale/alpha.js"]}"#,
+    );
+    let elements: Vec<String> = summary["summaries"][0]["elements"]
+        .as_array()
+        .expect("summary elements")
+        .iter()
+        .map(|element| element["symbol"].as_str().expect("symbol").to_string())
+        .collect();
+    assert!(
+        !elements
+            .iter()
+            .any(|symbol| symbol == "localeAlpha.formats"),
+        "get_summaries must not list the definition-lookup-only bare twin: {summary}"
+    );
+
+    let search = call_tool(&project, "search_symbols", r#"{"patterns":["formats"]}"#);
+    let symbols: Vec<String> = search["files"][0]["fields"]
+        .as_array()
+        .expect("search fields")
+        .iter()
+        .map(|field| field["symbol"].as_str().expect("symbol").to_string())
+        .collect();
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol == "alpha.js.localeAlpha.formats"),
+        "search_symbols must still list the real declaration: {search}"
+    );
+    assert!(
+        !symbols.iter().any(|symbol| symbol == "localeAlpha.formats"),
+        "search_symbols must not list the definition-lookup-only bare twin: {search}"
+    );
+}

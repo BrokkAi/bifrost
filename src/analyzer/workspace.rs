@@ -171,7 +171,13 @@ impl WorkspaceAnalyzer {
 
     pub fn build(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let store_context = crate::analyzer::default_store_context(project.as_ref());
-        Self::build_filtered(project, config, None, store_context, None)
+        Self::build_filtered(project, config, None, store_context, None, true)
+            .expect("failed to initialize in-memory workspace analyzer")
+    }
+
+    pub(crate) fn build_for_service(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        let store_context = crate::analyzer::default_store_context(project.as_ref());
+        Self::build_filtered(project, config, None, store_context, None, false)
             .expect("failed to initialize in-memory workspace analyzer")
     }
 
@@ -181,7 +187,7 @@ impl WorkspaceAnalyzer {
         languages: &BTreeSet<Language>,
     ) -> Self {
         let store_context = crate::analyzer::default_store_context(project.as_ref());
-        Self::build_filtered(project, config, Some(languages), store_context, None)
+        Self::build_filtered(project, config, Some(languages), store_context, None, true)
             .expect("failed to initialize in-memory workspace analyzer")
     }
 
@@ -190,17 +196,25 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
         let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        Self::build_filtered(project, config, None, store_context, None)
+        Self::build_filtered(project, config, None, store_context, None, true)
     }
 
-    pub(crate) fn build_persisted_at(
+    pub(crate) fn build_persisted_for_service(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, StoreError> {
+        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, None, store_context, None, false)
+    }
+
+    pub(crate) fn build_persisted_at_for_service(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         db_path: &Path,
     ) -> Result<Self, StoreError> {
         let store_context =
             crate::analyzer::persistent_store_context_at(project.as_ref(), db_path)?;
-        Self::build_filtered(project, config, None, store_context, None)
+        Self::build_filtered(project, config, None, store_context, None, false)
     }
 
     /// Progress-reporting variant of `build_persisted`.
@@ -219,6 +233,7 @@ impl WorkspaceAnalyzer {
             None,
             store_context,
             Some(Arc::new(progress)),
+            true,
         )
     }
 
@@ -228,6 +243,7 @@ impl WorkspaceAnalyzer {
         requested_languages: Option<&BTreeSet<Language>>,
         store_context: crate::analyzer::AnalyzerStoreContext,
         progress: Option<BuildProgress>,
+        revalidate_filesystem_paths: bool,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         let mut delegates = BTreeMap::new();
@@ -245,8 +261,11 @@ impl WorkspaceAnalyzer {
                 let project = Arc::clone(&project);
                 let cfg = config.clone();
                 let mut store_context = store_context.clone();
-                store_context.live_paths =
-                    Arc::new(crate::analyzer::store::liveness::LivePathMap::default());
+                store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
+                    crate::analyzer::store::liveness::LivePathMap::default()
+                } else {
+                    crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
+                });
                 macro_rules! build_delegate {
                     ($variant:ident, $analyzer:ty) => {
                         AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(

@@ -3,8 +3,9 @@ use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::scala::{
     ScalaExportSelector, ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment,
     ScalaWildcardOwnerFacts, resolve_scala_wildcard_import_environment,
-    scala_enclosing_package_root_candidates, scala_import_path, scala_import_path_candidates,
-    scala_import_visible_at, scala_lexical_scope_path_at, scala_package_prefixes_at,
+    scala_enclosing_package_root_candidates, scala_enclosing_template_owner_fq_names,
+    scala_import_path, scala_import_path_candidates, scala_import_visible_at,
+    scala_lexical_scope_path_at, scala_nested_type_candidates, scala_package_prefixes_at,
     scala_type_lookup_segments,
 };
 use crate::analyzer::usages::scala_graph::local::{
@@ -90,6 +91,7 @@ enum ScalaNameResolution {
 struct ForwardScalaNameResolver<'a> {
     scala: &'a ScalaAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
+    file: ProjectFile,
     package: Arc<str>,
     package_prefixes: Arc<Vec<String>>,
     lexical_scopes: Arc<Vec<StructuredImportScope>>,
@@ -123,6 +125,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
             scala,
             support,
             &ScalaDefinitionContext {
+                file: file.clone(),
                 package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
                 imports: Arc::new(scala.import_info_of(file)),
             },
@@ -137,6 +140,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         Self {
             scala,
             support,
+            file: batch.file.clone(),
             package: Arc::clone(&batch.package),
             package_prefixes: Arc::new(vec![batch.package.to_string()]),
             lexical_scopes: Arc::new(Vec::new()),
@@ -252,6 +256,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     .flat_map(|package| scala_nested_type_candidates(package, &segments, false)),
             );
         }
+        wildcard_candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(&segments));
         let wildcard = self.resolve_candidate_tier(wildcard_candidates, kind);
         if wildcard != ScalaNameResolution::Unresolved {
             return wildcard;
@@ -272,6 +277,48 @@ impl<'a> ForwardScalaNameResolver<'a> {
             }
         }
         ScalaNameResolution::Unresolved
+    }
+
+    /// Owner-qualified spellings of `segments` reached through each visible
+    /// wildcard import's relative base, qualified by that import's own
+    /// lexically enclosing object/class/trait scopes (innermost first).
+    ///
+    /// Mirrors the plain package-qualified tier built inline just above (and
+    /// in `resolve_owner_segments`) — `import_candidate_fq_names(...)`
+    /// flat-mapped through `scala_nested_type_candidates` — but resolves the
+    /// import's relative base against its enclosing template scopes first,
+    /// exactly like the import-token click path
+    /// (`scala_import_reference_outcome`) and the wildcard-imported-member
+    /// usage path (`scala_wildcard_imported_member_outcome`) already do.
+    /// Without this, `object Status { import Registry._; def f = X.y }`
+    /// left the qualified-path root `X` unresolved even though `Registry` is
+    /// indexed as a sibling of `Status`.
+    fn enclosing_owner_qualified_wildcard_candidates(&self, segments: &[String]) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for import in self.visible_imports().filter(|import| import.is_wildcard) {
+            let Some(structured_path) = import.path.as_ref() else {
+                continue;
+            };
+            let owners = scala_enclosing_template_owner_fq_names(
+                self.scala,
+                self.scala,
+                &self.file,
+                structured_path.declaration_start_byte,
+            );
+            for owner_base in
+                scala_owner_qualified_import_candidate_tiers(&owners, &structured_path.segments)
+                    .into_iter()
+                    .flatten()
+            {
+                // `owner_base` names the wildcard-imported singleton itself
+                // (e.g. `org.http4s.Status$.Registry`); `segments` is looked
+                // up *inside* it, so it is used as an owner needing its own
+                // `$` decoration here, exactly like any other owner prefix
+                // fed into `scala_nested_type_candidates`.
+                candidates.extend(scala_nested_type_candidates(owner_base, segments, true));
+            }
+        }
+        candidates
     }
 
     fn resolve_lookup_path(
@@ -324,6 +371,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 );
             }
         }
+        wildcard_candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
         let wildcard = self.resolve_candidate_tier(wildcard_candidates, kind);
         if wildcard != ScalaNameResolution::Unresolved {
             return wildcard;
@@ -606,17 +654,29 @@ impl<'a> ForwardScalaNameResolver<'a> {
 
     fn wildcard_import_environment(&self) -> ScalaWildcardImportEnvironment {
         let imports = self.visible_imports().cloned().collect::<Vec<_>>();
-        resolve_scala_wildcard_import_environment(&imports, &self.package_prefixes, |candidate| {
-            let singleton_fqn = format!("{}$", candidate.trim_end_matches('$'));
-            ScalaWildcardOwnerFacts {
-                package: self.support.package_exists(candidate),
-                stable_singleton: self
-                    .support
-                    .fqn(&singleton_fqn)
-                    .into_iter()
-                    .any(|unit| unit.is_class() && unit.fq_name() == singleton_fqn),
-            }
-        })
+        resolve_scala_wildcard_import_environment(
+            &imports,
+            &self.package_prefixes,
+            |declaration_start_byte| {
+                scala_enclosing_template_owner_fq_names(
+                    self.scala,
+                    self.scala,
+                    &self.file,
+                    declaration_start_byte,
+                )
+            },
+            |candidate| {
+                let singleton_fqn = format!("{}$", candidate.trim_end_matches('$'));
+                ScalaWildcardOwnerFacts {
+                    package: self.support.package_exists(candidate),
+                    stable_singleton: self
+                        .support
+                        .fqn(&singleton_fqn)
+                        .into_iter()
+                        .any(|unit| unit.is_class() && unit.fq_name() == singleton_fqn),
+                }
+            },
+        )
     }
 
     fn resolve_candidate_tier(
@@ -699,6 +759,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
             let qualifier_resolver = Self {
                 scala: self.scala,
                 support: self.support,
+                file: self.file.clone(),
                 package: path
                     .lexical_prefixes
                     .last()
@@ -806,42 +867,6 @@ impl<'a> ForwardScalaNameResolver<'a> {
     }
 }
 
-fn scala_nested_type_candidates(
-    prefix: String,
-    segments: &[String],
-    prefix_is_owner: bool,
-) -> Vec<String> {
-    let mut direct = prefix.clone();
-    for segment in segments {
-        if !direct.is_empty() {
-            direct.push('.');
-        }
-        direct.push_str(segment);
-    }
-    if segments.is_empty() {
-        return vec![direct];
-    }
-
-    let mut singleton_qualified = prefix;
-    if prefix_is_owner {
-        singleton_qualified.push('$');
-    }
-    for (index, segment) in segments.iter().enumerate() {
-        if !singleton_qualified.is_empty() {
-            singleton_qualified.push('.');
-        }
-        singleton_qualified.push_str(segment);
-        if index + 1 < segments.len() {
-            singleton_qualified.push('$');
-        }
-    }
-    if singleton_qualified == direct {
-        vec![direct]
-    } else {
-        vec![direct, singleton_qualified]
-    }
-}
-
 fn scala_forward_simple_name(raw: &str) -> Option<&str> {
     raw.trim()
         .split(['[', '(', '{', '.', ' ', '<'])
@@ -914,6 +939,7 @@ pub(super) fn resolve_scala(
         );
     };
     if let Some(outcome) = scala_import_reference_outcome(
+        analyzer,
         scala,
         context.bounded_support(),
         file,
@@ -1126,7 +1152,9 @@ pub(super) fn resolve_scala(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scala_import_reference_outcome(
+    analyzer: &dyn IAnalyzer,
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -1174,6 +1202,15 @@ fn scala_import_reference_outcome(
         infos = scala_import_infos_from_node(import, source);
     }
     let resolver = ScalaNameResolver::for_file(scala, support, file);
+    // A relative Scala import resolves against its enclosing object/class/trait
+    // scopes before the package (Scala §4.7's "qualified idents"), innermost
+    // scope first. Existing candidate generation here only ever qualified a
+    // relative path against package-level lexical prefixes, so an import like
+    // `object Status { import Registry._ }` never tried the enclosing-template
+    // spelling `Status$.Registry$` even when `Registry` is indexed as a nested
+    // sibling declaration.
+    let enclosing_owners =
+        scala_enclosing_template_owner_fq_names(analyzer, scala, file, import.start_byte());
     let selected_name = node.parent().is_some_and(|parent| {
         matches!(
             parent.kind(),
@@ -1200,21 +1237,22 @@ fn scala_import_reference_outcome(
                 && focus_index + 1 < structured_path.segments.len()
                 && structured_path.segments[focus_index] == scala_node_text(node, source).trim()
             {
-                let prefix = structured_path.segments[..=focus_index].join(".");
+                let prefix_segments = &structured_path.segments[..=focus_index];
+                let prefix = prefix_segments.join(".");
+                for owner_tier in
+                    scala_owner_qualified_import_candidate_tiers(&enclosing_owners, prefix_segments)
+                {
+                    if let Some(indexed) = scala_fqn_probe(support, owner_tier) {
+                        return Some(candidates_outcome(indexed));
+                    }
+                }
                 let lexical_prefixes = if structured_path.lexical_prefixes.is_empty() {
                     resolver.package_prefixes.as_slice()
                 } else {
                     structured_path.lexical_prefixes.as_slice()
                 };
                 for candidate in scala_import_path_candidates(&prefix, lexical_prefixes) {
-                    let mut indexed = support
-                        .fqn(&candidate)
-                        .into_iter()
-                        .chain(support.fqn(&format!("{candidate}$")))
-                        .collect::<Vec<_>>();
-                    sort_units(&mut indexed);
-                    indexed.dedup();
-                    if !indexed.is_empty() {
+                    if let Some(indexed) = scala_fqn_probe(support, vec![candidate.clone()]) {
                         return Some(candidates_outcome(indexed));
                     }
                     if support.package_exists(&candidate) {
@@ -1224,19 +1262,22 @@ fn scala_import_reference_outcome(
                     }
                 }
             }
+            // Enclosing-owner-qualified candidates take precedence over
+            // package-lexical-prefix ones: they mirror the nearer scope Scala
+            // actually binds against first. Unlike the package-based tier
+            // loop below, this check is not gated by `selected_name` — it must
+            // also resolve a plain base-path click such as `Registry` in
+            // `import Registry._`, which is neither a selector nor an alias.
+            for owner_tier in scala_owner_qualified_import_candidate_tiers(
+                &enclosing_owners,
+                &structured_path.segments,
+            ) {
+                if let Some(indexed) = scala_fqn_probe(support, owner_tier) {
+                    return Some(candidates_outcome(indexed));
+                }
+            }
             for tier in resolver.structured_import_type_candidate_tiers(structured_path, &[]) {
-                let mut indexed = tier
-                    .into_iter()
-                    .flat_map(|candidate| {
-                        support
-                            .fqn(&candidate)
-                            .into_iter()
-                            .chain(support.fqn(&format!("{candidate}$")))
-                    })
-                    .collect::<Vec<_>>();
-                sort_units(&mut indexed);
-                indexed.dedup();
-                if !indexed.is_empty() {
+                if let Some(indexed) = scala_fqn_probe(support, tier) {
                     return selected_name.then(|| candidates_outcome(indexed));
                 }
             }
@@ -1261,6 +1302,43 @@ fn scala_import_reference_outcome(
             "`{name}` is part of a Scala import whose declaration is not indexed in this workspace"
         ))
     })
+}
+
+/// Candidate spellings of `segments` qualified by each enclosing owner in
+/// turn (innermost first), reusing `scala_nested_type_candidates` so `$`
+/// companion-object spelling stays in one place rather than being
+/// hand-built here. Each returned tier corresponds to one enclosing owner;
+/// callers probe tiers in order so the nearest enclosing scope wins.
+fn scala_owner_qualified_import_candidate_tiers(
+    owners: &[String],
+    segments: &[String],
+) -> Vec<Vec<String>> {
+    owners
+        .iter()
+        .map(|owner| {
+            scala_nested_type_candidates(owner.trim_end_matches('$').to_string(), segments, true)
+        })
+        .collect()
+}
+
+/// Probe `candidates` (and their trailing-`$` companion-object spellings)
+/// against the workspace's indexed fqns, returning the sorted, deduped hits.
+fn scala_fqn_probe(
+    support: &dyn BoundedDefinitionLookup,
+    candidates: Vec<String>,
+) -> Option<Vec<CodeUnit>> {
+    let mut indexed = candidates
+        .into_iter()
+        .flat_map(|candidate| {
+            support
+                .fqn(&candidate)
+                .into_iter()
+                .chain(support.fqn(&format!("{candidate}$")))
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut indexed);
+    indexed.dedup();
+    (!indexed.is_empty()).then_some(indexed)
 }
 
 /// Return the parser-defined position of a simple import-path segment. Scala's
@@ -4834,12 +4912,43 @@ fn scala_wildcard_imported_member_outcome(
         let Some(path) = scala_import_path(&import) else {
             continue;
         };
-        let import_candidates =
-            scala_wildcard_imported_member_units(ctx.support, &path, &file_package, member)
-                .into_iter()
-                .filter(|unit| !ctx.scala.is_type_alias(unit))
-                .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, false))
-                .collect::<Vec<_>>();
+        // A relative wildcard base (`import Registry._` nested in a
+        // template) resolves against its enclosing object/class/trait scopes
+        // before the package, exactly like the import token itself (see
+        // `scala_import_reference_outcome`). Without this, a member reached
+        // only through such an enclosing-scope-qualified sibling (`Registry`
+        // sitting beside the importing template rather than in the file's
+        // package) was invisible here and fell through to the dishonest
+        // `scala_import_boundary_for_name` diagnostic.
+        let enclosing_owners = import
+            .path
+            .as_ref()
+            .map(|structured_path| {
+                scala_enclosing_template_owner_fq_names(
+                    ctx.analyzer,
+                    ctx.scala,
+                    ctx.file,
+                    structured_path.declaration_start_byte,
+                )
+            })
+            .unwrap_or_default();
+        let segments = import
+            .path
+            .as_ref()
+            .map(|structured_path| structured_path.segments.as_slice())
+            .unwrap_or(&[]);
+        let import_candidates = scala_wildcard_imported_member_units(
+            ctx.support,
+            &path,
+            &file_package,
+            &enclosing_owners,
+            segments,
+            member,
+        )
+        .into_iter()
+        .filter(|unit| !ctx.scala.is_type_alias(unit))
+        .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, false))
+        .collect::<Vec<_>>();
         if !import_candidates.is_empty() {
             contributing_imports += 1;
             candidates.extend(import_candidates);
@@ -4864,6 +4973,8 @@ fn scala_wildcard_imported_member_units(
     support: &dyn BoundedDefinitionLookup,
     path: &str,
     file_package: &str,
+    enclosing_owners: &[String],
+    segments: &[String],
     member: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
@@ -4882,6 +4993,25 @@ fn scala_wildcard_imported_member_units(
                 .into_iter()
                 .filter(|unit| unit.identifier() == member),
         );
+    }
+    if !segments.is_empty() {
+        for tier in scala_owner_qualified_import_candidate_tiers(enclosing_owners, segments) {
+            for candidate in tier {
+                candidates.extend(
+                    support
+                        .fqn(&format!("{candidate}.{member}"))
+                        .into_iter()
+                        .filter(|unit| unit.identifier() == member),
+                );
+                let owner_fqn = format!("{}$", candidate.trim_end_matches('$'));
+                candidates.extend(
+                    support
+                        .fqn_direct_children(&owner_fqn)
+                        .into_iter()
+                        .filter(|unit| unit.identifier() == member),
+                );
+            }
+        }
     }
     sort_units(&mut candidates);
     candidates.dedup();
@@ -6192,19 +6322,42 @@ fn scala_imported_member_shadows_bare_call(
             continue;
         };
         if import.is_wildcard {
-            if scala_wildcard_imported_member_units(support, &path, &file_package, name)
-                .into_iter()
-                .filter(|unit| !scala.is_type_alias(unit))
-                .any(|unit| {
-                    scala_member_unit_applies(
+            let enclosing_owners = import
+                .path
+                .as_ref()
+                .map(|structured_path| {
+                    scala_enclosing_template_owner_fq_names(
                         scala,
-                        &unit,
-                        call_shape,
-                        ScalaCallableSiteRole::Ordinary,
-                        false,
+                        scala,
+                        file,
+                        structured_path.declaration_start_byte,
                     )
                 })
-            {
+                .unwrap_or_default();
+            let segments = import
+                .path
+                .as_ref()
+                .map(|structured_path| structured_path.segments.as_slice())
+                .unwrap_or(&[]);
+            if scala_wildcard_imported_member_units(
+                support,
+                &path,
+                &file_package,
+                &enclosing_owners,
+                segments,
+                name,
+            )
+            .into_iter()
+            .filter(|unit| !scala.is_type_alias(unit))
+            .any(|unit| {
+                scala_member_unit_applies(
+                    scala,
+                    &unit,
+                    call_shape,
+                    ScalaCallableSiteRole::Ordinary,
+                    false,
+                )
+            }) {
                 return true;
             }
             continue;

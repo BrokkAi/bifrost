@@ -554,11 +554,7 @@ pub(super) fn resolve_selectable_definitions(
         ),
         _ => {
             let matches: Vec<String> = groups.into_iter().map(|(selector, _)| selector).collect();
-            SelectableDefinitionResolution::Ambiguous(AmbiguousSymbol {
-                target: input.to_string(),
-                note: ambiguous_symbol_selector_note(&matches),
-                matches,
-            })
+            SelectableDefinitionResolution::Ambiguous(capped_ambiguous_symbol(input, matches))
         }
     }
 }
@@ -567,6 +563,27 @@ pub(super) fn ambiguous_symbol_selector_note(matches: &[String]) -> Option<Strin
     matches.first().map(|example| {
         format!("Ambiguous; re-call with one selector from `matches` (e.g. {example}).")
     })
+}
+
+/// Build an [`AmbiguousSymbol`] from every distinct selector a bare name
+/// resolved to, capping the rendered `matches` list at
+/// [`AMBIGUOUS_SYMBOL_MATCH_LIMIT`]. The note always states the true total so
+/// a truncated response is never mistaken for the complete candidate set.
+pub(super) fn capped_ambiguous_symbol(target: &str, mut matches: Vec<String>) -> AmbiguousSymbol {
+    let total = matches.len();
+    let note = if total > AMBIGUOUS_SYMBOL_MATCH_LIMIT {
+        matches.truncate(AMBIGUOUS_SYMBOL_MATCH_LIMIT);
+        Some(format!(
+            "Ambiguous ({total} candidates, showing {AMBIGUOUS_SYMBOL_MATCH_LIMIT}); refine with path#name or a qualified spelling."
+        ))
+    } else {
+        ambiguous_symbol_selector_note(&matches)
+    };
+    AmbiguousSymbol {
+        target: target.to_string(),
+        matches,
+        note,
+    }
 }
 
 /// Split a definition selector into an optional file anchor and the name to

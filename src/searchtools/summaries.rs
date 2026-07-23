@@ -455,8 +455,11 @@ pub(super) fn skim_files_for_files(
                 .map(str::to_string)
                 .collect();
             let path = rel_path_string(&file);
-            let loc = file
-                .read_to_string()
+            // Line count is rendering metadata alongside `list_symbols`,
+            // which already reads the analyzed snapshot; use the same
+            // snapshot here instead of a fresh disk read for consistency.
+            let loc = analyzer
+                .indexed_source(&file)
                 .map(|content| line_count(&content))
                 .unwrap_or(0);
             SkimFile { path, loc, lines }

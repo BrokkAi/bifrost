@@ -229,6 +229,13 @@ pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
 
 pub const DEFINITION_LOOKUP_MAX_REFERENCES: usize = 100;
 
+/// Bare-name symbol resolution can legitimately surface far more candidates
+/// than a caller can act on (e.g. dayjs's ~130 per-locale `formats` object
+/// literals, #1088). Cap the rendered `AmbiguousSymbol.matches` list so the
+/// response stays a manageable size; the note always carries the true total
+/// so nothing is silently dropped.
+pub(crate) const AMBIGUOUS_SYMBOL_MATCH_LIMIT: usize = 25;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 

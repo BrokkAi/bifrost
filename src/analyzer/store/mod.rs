@@ -181,8 +181,14 @@ AND meta.scala_trait_count = (
 )";
 
 pub struct AnalyzerStore {
+    // Field order is load-bearing for `Drop`: Rust drops struct fields in
+    // declaration order, so the writer `conn` and every pooled reader must be
+    // closed before `_ephemeral` runs and deletes the backing temp file (open
+    // handles block deletion on Windows).
     conn: Mutex<Connection>,
+    readers: ReaderPool,
     db_path: Option<PathBuf>,
+    _ephemeral: Option<EphemeralDb>,
     #[cfg(test)]
     parsed_blob_transaction_starts: AtomicUsize,
     #[cfg(test)]
@@ -193,6 +199,138 @@ pub struct AnalyzerStore {
     replacement_cost_fallback_queries: AtomicUsize,
     #[cfg(test)]
     prepared_generation_lookup_queries: AtomicUsize,
+}
+
+/// A hand-rolled checkout pool of read-only SQLite connections for one store.
+///
+/// The writer connection (`AnalyzerStore::conn`) is untouched by reads; every
+/// pure-SELECT method borrows a reader here instead, so N concurrent tool calls
+/// run their symbol lookups / hydration / search in parallel against WAL
+/// snapshots rather than serializing on the single writer mutex.
+///
+/// Checkout pops an idle reader or lazily opens a fresh one; there is no upper
+/// bound on in-flight readers, so a burst never blocks. Checkin keeps at most
+/// `capacity` idle connections and drops the rest (transient burst readers), so
+/// the steady-state resident pool is bounded by `capacity`.
+///
+/// When `source` is `None` the store has no separate readable file (the
+/// in-memory single-connection fallback); reads then route back through the
+/// writer connection so correctness is preserved at the cost of read
+/// parallelism.
+struct ReaderPool {
+    source: Option<PathBuf>,
+    capacity: usize,
+    idle: Mutex<Vec<Connection>>,
+}
+
+impl ReaderPool {
+    fn new(source: Option<PathBuf>) -> Self {
+        let capacity = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
+        Self {
+            source,
+            capacity,
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn checkin(&self, conn: Connection) {
+        let mut idle = self
+            .idle
+            .lock()
+            .expect("analyzer store reader pool poisoned");
+        if idle.len() < self.capacity {
+            idle.push(conn);
+        }
+        // Otherwise this was a transient burst connection opened above capacity;
+        // let it drop and close.
+    }
+}
+
+/// RAII handle to a checked-out reader (or the writer, in the fallback path).
+/// Derefs to `Connection` so existing read methods — `conn.transaction()`,
+/// helper calls taking `&Connection` — work unchanged. On drop, a pooled reader
+/// is returned to its pool.
+pub(crate) struct ReaderGuard<'a> {
+    inner: ReaderConn<'a>,
+}
+
+enum ReaderConn<'a> {
+    Pooled {
+        pool: &'a ReaderPool,
+        conn: Option<Connection>,
+    },
+    Writer(std::sync::MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReaderGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match &self.inner {
+            ReaderConn::Pooled { conn, .. } => {
+                conn.as_ref().expect("reader guard already returned")
+            }
+            ReaderConn::Writer(guard) => guard,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ReaderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match &mut self.inner {
+            ReaderConn::Pooled { conn, .. } => {
+                conn.as_mut().expect("reader guard already returned")
+            }
+            ReaderConn::Writer(guard) => guard,
+        }
+    }
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        if let ReaderConn::Pooled { pool, conn } = &mut self.inner
+            && let Some(conn) = conn.take()
+        {
+            pool.checkin(conn);
+        }
+    }
+}
+
+/// Owns a delete-on-drop temp-file cache DB backing an ephemeral (non-git)
+/// workspace. All connections are struct-ordered to close before this drops.
+struct EphemeralDb {
+    path: PathBuf,
+}
+
+impl Drop for EphemeralDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(self.path.with_extension("db-shm"));
+    }
+}
+
+fn reader_source_path(conn: &Connection) -> Option<PathBuf> {
+    conn.path()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn unique_temp_db_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    // Deliberately not named `bifrost_cache.db`, so the writer's legacy-cache
+    // cleanup treats it as unrelated and never touches sibling temp files.
+    std::env::temp_dir().join(format!("bifrost-analyzer-{pid}-{nanos}-{counter}.db"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -441,7 +579,7 @@ impl AnalyzerStore {
         exact_fqn: &str,
         normalized_fqn: &str,
     ) -> Result<Vec<(String, PathSymbolRow)>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
@@ -531,11 +669,17 @@ impl AnalyzerStore {
         }
     }
 
-    pub fn open_persistent(db_path: &Path) -> Result<Self> {
-        let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
-        Ok(Self {
+    fn from_parts(
+        conn: Connection,
+        reader_source: Option<PathBuf>,
+        db_path: Option<PathBuf>,
+        ephemeral: Option<EphemeralDb>,
+    ) -> Self {
+        Self {
             conn: Mutex::new(conn),
-            db_path: Some(db_path.to_path_buf()),
+            readers: ReaderPool::new(reader_source),
+            db_path,
+            _ephemeral: ephemeral,
             #[cfg(test)]
             parsed_blob_transaction_starts: AtomicUsize::new(0),
             #[cfg(test)]
@@ -546,27 +690,94 @@ impl AnalyzerStore {
             replacement_cost_fallback_queries: AtomicUsize::new(0),
             #[cfg(test)]
             prepared_generation_lookup_queries: AtomicUsize::new(0),
-        })
+        }
     }
 
+    pub fn open_persistent(db_path: &Path) -> Result<Self> {
+        let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
+        let reader_source = reader_source_path(&conn);
+        Ok(Self::from_parts(
+            conn,
+            reader_source,
+            Some(db_path.to_path_buf()),
+            None,
+        ))
+    }
+
+    /// Ephemeral (non-git) workspace store.
+    ///
+    /// Backed by a delete-on-drop temp *file* rather than `:memory:` so the
+    /// reader pool works uniformly: an `:memory:` DB is private to a single
+    /// connection, which a reader pool could never share. The temp file runs in
+    /// WAL at page-cache speed. `db_path()` still reports `None` and
+    /// `is_in_memory()` still reports `true` — these mark "no persistent
+    /// workspace identity", which is exactly what an ephemeral store is,
+    /// independent of the on-disk backing.
+    ///
+    /// Documented fallback: if the temp-file backing cannot be established on
+    /// this platform, fall back to a single in-memory connection whose reads
+    /// route through the writer (no read parallelism, but correct).
     pub fn open_in_memory() -> Result<Self> {
+        match Self::open_ephemeral_temp_file() {
+            Ok(store) => Ok(store),
+            Err(_) => Self::open_in_memory_single_connection(),
+        }
+    }
+
+    fn open_ephemeral_temp_file() -> Result<Self> {
+        let path = unique_temp_db_path();
+        let conn = crate::cache_db::open_unified_connection(&path).map_err(StoreError::new)?;
+        let Some(resolved) = reader_source_path(&conn) else {
+            return Err(StoreError::new(
+                "ephemeral analyzer cache temp file has no resolvable path",
+            ));
+        };
+        Ok(Self::from_parts(
+            conn,
+            Some(resolved.clone()),
+            None,
+            Some(EphemeralDb { path: resolved }),
+        ))
+    }
+
+    fn open_in_memory_single_connection() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         crate::cache_db::configure_connection(&mut conn).map_err(StoreError::new)?;
         crate::cache_db::migrate(&mut conn).map_err(StoreError::new)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            db_path: None,
-            #[cfg(test)]
-            parsed_blob_transaction_starts: AtomicUsize::new(0),
-            #[cfg(test)]
-            parsed_blob_point_contains_queries: AtomicUsize::new(0),
-            #[cfg(test)]
-            replacement_cost_lookup_queries: AtomicUsize::new(0),
-            #[cfg(test)]
-            replacement_cost_fallback_queries: AtomicUsize::new(0),
-            #[cfg(test)]
-            prepared_generation_lookup_queries: AtomicUsize::new(0),
-        })
+        // `reader_source = None` routes reads back through the writer connection.
+        Ok(Self::from_parts(conn, None, None, None))
+    }
+
+    /// Check out a read-only connection for a pure-SELECT method. Pooled readers
+    /// run concurrently against WAL snapshots; the writer connection is never
+    /// taken by these paths (except in the in-memory single-connection
+    /// fallback, where `source` is `None`).
+    fn read_conn(&self) -> Result<ReaderGuard<'_>> {
+        match self.readers.source.as_deref() {
+            Some(path) => {
+                let pooled = self
+                    .readers
+                    .idle
+                    .lock()
+                    .expect("analyzer store reader pool poisoned")
+                    .pop();
+                let conn = match pooled {
+                    Some(conn) => conn,
+                    None => {
+                        crate::cache_db::open_readonly_connection(path).map_err(StoreError::new)?
+                    }
+                };
+                Ok(ReaderGuard {
+                    inner: ReaderConn::Pooled {
+                        pool: &self.readers,
+                        conn: Some(conn),
+                    },
+                })
+            }
+            None => Ok(ReaderGuard {
+                inner: ReaderConn::Writer(self.conn.lock().expect("analyzer store mutex poisoned")),
+            }),
+        }
     }
 
     pub fn db_path(&self) -> Option<&Path> {
@@ -629,7 +840,7 @@ impl AnalyzerStore {
     }
 
     pub fn missing_blobs(&self, oids: &[Oid], lang: &str) -> Result<Vec<Oid>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare(
             "SELECT 1 FROM blobs
@@ -659,7 +870,7 @@ impl AnalyzerStore {
     }
 
     pub fn missing_blob_keys(&self, entries: &[(Oid, String)]) -> Result<Vec<(Oid, String)>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare(
             "SELECT 1 FROM blobs
@@ -720,7 +931,7 @@ impl AnalyzerStore {
     /// Return the complete parsed keys from `entries` using chunked set queries.
     /// This reads blob metadata only; it does not hydrate file state or source.
     pub fn parsed_blob_keys(&self, entries: &[(Oid, String)]) -> Result<HashSet<(Oid, String)>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let present = parsed_blob_keys_conn(&tx, entries)?;
         tx.commit()?;
@@ -732,7 +943,7 @@ impl AnalyzerStore {
         entries: &[(Oid, String)],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<HashSet<(Oid, String)>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(
             &tx,
@@ -745,7 +956,7 @@ impl AnalyzerStore {
     }
 
     pub fn contains_blob(&self, oid: Oid, lang: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         let exists = conn
             .query_row(
                 "SELECT 1 FROM blobs
@@ -763,7 +974,7 @@ impl AnalyzerStore {
     }
 
     pub fn contains_parsed_blob(&self, oid: Oid, lang: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         contains_parsed_blob_conn(&conn, oid, lang)
     }
 
@@ -776,7 +987,7 @@ impl AnalyzerStore {
         #[cfg(test)]
         self.parsed_blob_point_contains_queries
             .fetch_add(1, Ordering::SeqCst);
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let exists = contains_parsed_blob_conn(&tx, oid, lang)?;
@@ -796,7 +1007,7 @@ impl AnalyzerStore {
                 "invalid structural facts snapshot version {snapshot_version}"
             )));
         }
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let sql = format!(
@@ -981,7 +1192,7 @@ impl AnalyzerStore {
 
     #[cfg(test)]
     pub(crate) fn current_generation(&self, lang: &str) -> Result<GenerationId> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         current_generation_conn(&conn, lang)
     }
 
@@ -1305,7 +1516,7 @@ impl AnalyzerStore {
         file: &ProjectFile,
         source: &str,
     ) -> Result<Option<FileState>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let result = hydrate_file_state_conn(&tx, oid, lang, adapter, file, source)?;
@@ -1325,7 +1536,7 @@ impl AnalyzerStore {
         file: &ProjectFile,
     ) -> Result<Option<SummaryFileProjection>> {
         let _scope = crate::profiling::scope("AnalyzerStore::summary_file_projection");
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let result = summary_file_projection_conn(&tx, oid, lang, adapter, file)?;
@@ -1345,7 +1556,7 @@ impl AnalyzerStore {
         adapter: &A,
         source_by_file: &HashMap<ProjectFile, String>,
     ) -> Result<HashMap<ProjectFile, FileState>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let result = hydrate_file_states_conn(&tx, entries, lang, adapter, source_by_file)?;
         tx.commit()?;
@@ -1367,7 +1578,7 @@ impl AnalyzerStore {
                 .or_default()
                 .push((file.clone(), *oid));
         }
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(
             &tx,
@@ -1393,7 +1604,7 @@ impl AnalyzerStore {
         lang: &str,
         _adapter: &A,
     ) -> Result<HashMap<ProjectFile, Vec<ImportInfo>>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let oids = unique_oid_strings(entries);
         let imports_by_oid = read_import_infos_bulk(&tx, lang, &oids)?;
@@ -1426,7 +1637,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         adapter: &A,
     ) -> Result<HashMap<ProjectFile, ImportFacts>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(
             &tx,
@@ -1469,7 +1680,7 @@ impl AnalyzerStore {
         lang: &str,
         generation: GenerationId,
     ) -> Result<Option<String>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let result =
@@ -1483,7 +1694,7 @@ impl AnalyzerStore {
         lang: &str,
         short_name: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
         candidate_rows_for_languages(&conn, std::iter::once(lang), &sql, &[&short_name])
     }
@@ -1494,7 +1705,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
@@ -1514,7 +1725,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
     ) -> Result<Vec<DefinitionOrderCandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = definition_order_candidate_sql(
@@ -1539,7 +1750,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
     ) -> Result<Vec<DefinitionOrderCandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = definition_order_candidate_sql(
@@ -1556,16 +1767,36 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// Backs `IAnalyzer::lookup_candidates_by_identifier`, the sole bare-name
+    /// resolution path keyed on the terminal identifier. Its membership must
+    /// match `definition_lookup_order_candidate_sql`'s `(in_declarations = 1
+    /// OR in_definition_lookup = 1)`, not the `in_declarations`-only
+    /// membership `declaration_candidate_sql` uses elsewhere: a spelling the
+    /// fq lookup path resolves (which already consults that wider
+    /// membership) must be visible here too, or bare-name ambiguity silently
+    /// drops definition-lookup-only units (e.g. JS/TS object-literal
+    /// properties) that the fq spelling resolves fine (#1088). This widening
+    /// is scoped to resolution only — declaration listings
+    /// (get_all_declarations, search, summaries) still use the unchanged
+    /// `in_declarations`-only surfaces by design (#397).
     pub fn declaration_candidate_rows_by_identifier_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         identifier: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = declaration_candidate_sql("units.lang = ?1 AND units.identifier = ?2");
+        let sql = candidate_rows_sql_with_membership(
+            "units",
+            "FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+            "units.lang = ?1 AND units.identifier = ?2",
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+            "units.blob_oid, units.unit_key",
+        );
         let rows = candidate_rows_for_languages(
             &tx,
             langs.iter().map(String::as_str),
@@ -1583,7 +1814,7 @@ impl AnalyzerStore {
         column: PersistedLookupKey,
         value: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let column = match column {
@@ -1605,7 +1836,7 @@ impl AnalyzerStore {
         normalized: bool,
         identifier: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let owner_column = if normalized {
@@ -1645,7 +1876,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         package: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.content_qualifier = ?2");
@@ -1670,7 +1901,7 @@ impl AnalyzerStore {
         after: Option<(&str, Oid, i64)>,
         limit: usize,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let nested = format!("{package}.");
@@ -1721,7 +1952,7 @@ impl AnalyzerStore {
     }
 
     pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         let sql = declaration_candidate_sql("units.lang = ?1");
         candidate_rows_for_languages(&conn, std::iter::once(lang), &sql, &[])
     }
@@ -1735,7 +1966,7 @@ impl AnalyzerStore {
         lang: &str,
         substring: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         let sql = declaration_candidate_sql(
             "units.lang = ?1 AND (
                instr(lower(units.short_name), lower(?2)) > 0
@@ -1751,7 +1982,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         substring: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql(
@@ -1773,7 +2004,7 @@ impl AnalyzerStore {
     /// Search candidates carry the metadata that `search_symbols` otherwise
     /// obtains by repeatedly hydrating complete file states.
     pub fn search_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<SearchCandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         let sql = format!(
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
@@ -1807,7 +2038,7 @@ impl AnalyzerStore {
         // Regex matching is performed after language-specific FQN hydration.
         // The storage projection intentionally supplies a complete declaration
         // candidate set while avoiding per-candidate file-state hydration.
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
@@ -1819,7 +2050,7 @@ impl AnalyzerStore {
     }
 
     pub fn usage_fact_rows_by_lang(&self, lang: &str) -> Result<Vec<UsageFactRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         usage_fact_rows_by_lang_conn(&conn, lang)
     }
 
@@ -1828,7 +2059,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<UsageFactRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
@@ -1844,7 +2075,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<(Vec<CandidateRow>, Vec<UsageFactRow>)> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let declaration_sql = declaration_candidate_sql("units.lang = ?1");
@@ -1867,7 +2098,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<CandidateRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1");
@@ -1881,7 +2112,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<(CandidateRow, Option<Range>)>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1");
@@ -1908,7 +2139,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         kind: CodeUnitType,
     ) -> Result<Vec<CandidatePrimaryRangeRow>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = format!(
@@ -1949,7 +2180,7 @@ impl AnalyzerStore {
         keys: &[HierarchyStorageKey],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<HashMap<HierarchyStorageKey, PersistedHierarchyFacts>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, keys.iter().map(|key| key.lang.as_str()))?;
         let mut keys_by_lang: HashMap<String, Vec<&HierarchyStorageKey>> = HashMap::default();
@@ -2010,7 +2241,7 @@ impl AnalyzerStore {
         if crate::profiling::enabled() {
             crate::profiling::note(format!("language={lang} oid_count={}", oids.len()));
         }
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let mut out = Vec::new();
         out.extend(definition_lookup_candidate_rows_by_oids_conn(
@@ -2036,7 +2267,7 @@ impl AnalyzerStore {
         for (oid, lang) in entries {
             by_lang.entry(lang.clone()).or_default().push(*oid);
         }
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, by_lang.keys().map(String::as_str))?;
         let mut out = Vec::new();
@@ -2076,7 +2307,7 @@ impl AnalyzerStore {
     }
 
     pub fn blobs_with_structured_imports(&self, lang: &str, oids: &[Oid]) -> Result<HashSet<Oid>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let present = blobs_with_structured_imports_conn(&tx, lang, oids)?;
         tx.commit()?;
@@ -2092,7 +2323,7 @@ impl AnalyzerStore {
         for (oid, lang) in entries {
             by_lang.entry(lang.clone()).or_default().push(*oid);
         }
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, by_lang.keys().map(String::as_str))?;
         let mut out = HashSet::default();
@@ -2108,7 +2339,7 @@ impl AnalyzerStore {
     }
 
     pub fn content_row_count(&self, oid: Oid, lang: &str) -> Result<usize> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let oid = oid.to_string();
         let mut total = 0usize;
@@ -2197,7 +2428,7 @@ impl AnalyzerStore {
     }
 
     pub fn seconds_since_gc(&self) -> Result<Option<i64>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let conn = self.read_conn()?;
         let stored: i64 = conn.query_row(
             "SELECT last_gc_at FROM cache_state WHERE id = 1",
             [],
@@ -3992,15 +4223,36 @@ fn unique_oid_strings(entries: &[(ProjectFile, Oid)]) -> Vec<String> {
     out
 }
 
-fn chunk_params(lang: &str, chunk: &[String]) -> Vec<String> {
-    let mut params = Vec::with_capacity(chunk.len() + 1);
-    params.push(lang.to_string());
-    params.extend(chunk.iter().cloned());
+/// Fixed arities the variable-length `IN (…)` chunk queries are padded up to.
+/// Every `chunks(900)` bulk reader lands on one of these four SQL shapes
+/// instead of up to 900 distinct ones, so `prepare_cached` (64 slots) actually
+/// caches them. `900` is the top because the callers chunk at 900.
+const IN_CHUNK_ARITY_LADDER: [usize; 4] = [16, 64, 256, 900];
+
+fn padded_in_arity(len: usize) -> usize {
+    IN_CHUNK_ARITY_LADDER
+        .iter()
+        .copied()
+        .find(|&arity| arity >= len)
+        .unwrap_or(IN_CHUNK_ARITY_LADDER[IN_CHUNK_ARITY_LADDER.len() - 1])
+}
+
+/// Parameters for a chunked `IN (…)` query, padded to the next fixed arity with
+/// `NULL`s. `NULL` never matches `IN`, so the padding is semantics-preserving:
+/// `x IN (a, b, NULL)` returns exactly what `x IN (a, b)` returns for the
+/// non-null `blob_oid`s we query.
+fn chunk_params(lang: &str, chunk: &[String]) -> Vec<Option<String>> {
+    let arity = padded_in_arity(chunk.len());
+    let mut params = Vec::with_capacity(arity + 1);
+    params.push(Some(lang.to_string()));
+    params.extend(chunk.iter().cloned().map(Some));
+    params.resize(arity + 1, None);
     params
 }
 
 fn chunk_placeholders(chunk: &[String]) -> String {
-    std::iter::repeat_n("?", chunk.len())
+    let arity = padded_in_arity(chunk.len());
+    std::iter::repeat_n("?", arity)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -4999,7 +5251,7 @@ fn read_unit_rows<A: LanguageAdapter>(
     adapter: &A,
     file: &ProjectFile,
 ) -> Result<Vec<UnitRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT unit_key, kind, short_name, content_qualifier, signature, synthetic,
                 is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
          FROM code_units
@@ -5424,7 +5676,8 @@ fn contains_parsed_blob_conn(conn: &Connection, oid: Oid, lang: &str) -> Result<
          LIMIT 1"
     );
     Ok(conn
-        .query_row(&sql, params![oid.to_string(), lang], |_| Ok(()))
+        .prepare_cached(&sql)?
+        .query_row(params![oid.to_string(), lang], |_| Ok(()))
         .optional()?
         .is_some())
 }
@@ -5444,14 +5697,23 @@ fn stored_blob_cascade_costs_conn(
     const KEYS_PER_QUERY: usize = PersistBatchLimits::PRODUCTION.max_blobs;
     let mut costs = Vec::with_capacity(prepared.len());
     for chunk in prepared.chunks(KEYS_PER_QUERY) {
-        let mut chunk_costs = vec![StoredCascadeCost::Missing; chunk.len()];
-        let sql = stored_blob_cascade_costs_sql(chunk.len());
+        // Pad the `VALUES (ordinal, ?, ?)` list to a fixed arity so this query
+        // collapses to two cached SQL shapes instead of one per chunk length.
+        // The padded rows carry NULL blob_oid/lang, so their LEFT JOINs miss and
+        // they report `Missing`; we size `chunk_costs` to the padded arity, fill
+        // every ordinal, then truncate the padding away — semantics-preserving.
+        let padded = padded_cascade_arity(chunk.len());
+        let mut chunk_costs = vec![StoredCascadeCost::Missing; padded];
+        let sql = stored_blob_cascade_costs_sql(padded);
         on_query();
         let mut statement = conn.prepare_cached(&sql)?;
-        let parameters = chunk
-            .iter()
-            .flat_map(|blob| [blob.oid_text.as_str(), blob.lang.as_str()]);
-        let rows = statement.query_map(params_from_iter(parameters), |row| {
+        let mut parameters: Vec<Option<&str>> = Vec::with_capacity(padded * 2);
+        for blob in chunk {
+            parameters.push(Some(blob.oid_text.as_str()));
+            parameters.push(Some(blob.lang.as_str()));
+        }
+        parameters.resize(padded * 2, None);
+        let rows = statement.query_map(params_from_iter(parameters.iter()), |row| {
             Ok((
                 row.get::<_, usize>(0)?,
                 row.get::<_, bool>(1)?,
@@ -5477,9 +5739,22 @@ fn stored_blob_cascade_costs_conn(
                 (true, true, None) => StoredCascadeCost::Legacy,
             };
         }
+        chunk_costs.truncate(chunk.len());
         costs.extend(chunk_costs);
     }
     Ok(costs)
+}
+
+/// Fixed arities for the cascade-cost `VALUES` query. Capped at
+/// `PersistBatchLimits::PRODUCTION.max_blobs` (the chunk size), which the SQL
+/// builder asserts against.
+fn padded_cascade_arity(len: usize) -> usize {
+    const LADDER: [usize; 2] = [16, PersistBatchLimits::PRODUCTION.max_blobs];
+    LADDER
+        .iter()
+        .copied()
+        .find(|&arity| arity >= len)
+        .unwrap_or(LADDER[LADDER.len() - 1])
 }
 
 fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
@@ -5600,6 +5875,17 @@ fn update_blob_payload_cost_tx(tx: &Transaction<'_>, oid: &str, lang: &str) -> R
     insert_blob_payload_cost_tx(tx, oid, lang, cost.payload_bytes)
 }
 
+/// Fixed arities for the `VALUES (?, ?)` pair lists, capped at the caller's
+/// 400-key chunk size.
+fn padded_pair_arity(len: usize) -> usize {
+    const LADDER: [usize; 4] = [16, 64, 256, 400];
+    LADDER
+        .iter()
+        .copied()
+        .find(|&arity| arity >= len)
+        .unwrap_or(LADDER[LADDER.len() - 1])
+}
+
 fn parsed_blob_keys_conn(
     conn: &Connection,
     entries: &[(Oid, String)],
@@ -5614,7 +5900,12 @@ fn parsed_blob_keys_conn(
     }
     let mut present = set_with_capacity(unique.len());
     for chunk in unique.chunks(KEYS_PER_QUERY) {
-        let values = std::iter::repeat_n("(?, ?)", chunk.len())
+        // Pad the `VALUES (?, ?)` pair list to a fixed arity so this read-path
+        // query lands on a small set of cached SQL shapes. Padded rows carry
+        // NULL blob_oid/lang; the inner JOIN drops them, so the matched-key set
+        // is unchanged.
+        let padded = padded_pair_arity(chunk.len());
+        let values = std::iter::repeat_n("(?, ?)", padded)
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -5625,12 +5916,14 @@ fn parsed_blob_keys_conn(
                ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
              WHERE {PARSED_BLOB_INTEGRITY_CONDITION}"
         );
-        let parameters = chunk
-            .iter()
-            .flat_map(|(oid, lang)| [oid.to_string(), lang.clone()])
-            .collect::<Vec<_>>();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(parameters), |row| {
+        let mut parameters: Vec<Option<String>> = Vec::with_capacity(padded * 2);
+        for (oid, lang) in chunk {
+            parameters.push(Some(oid.to_string()));
+            parameters.push(Some(lang.clone()));
+        }
+        parameters.resize(padded * 2, None);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(parameters.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -5849,6 +6142,122 @@ mod tests {
             .unwrap();
         assert_eq!(store.missing_blobs(&[one, two], "rust").unwrap(), vec![two]);
         assert_eq!(store.missing_blobs(&[one], "python").unwrap(), vec![one]);
+    }
+
+    #[test]
+    fn concurrent_mixed_reads_against_one_warm_persistent_store() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A persistent store exercises the reader pool (`source = Some`): pure
+        // reads run on checked-out read-only connections, not the writer mutex.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("bifrost_cache.db");
+        let store = Arc::new(AnalyzerStore::open_persistent(&db_path).unwrap());
+
+        // Warm the store with one committed Java blob.
+        let file = write_file(
+            temp.path(),
+            "Widget.java",
+            "class Widget { int value; void run() {} }\n",
+        );
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let generation = store
+            .ensure_language_epoch_value("java", "concurrent-smoke-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, state.as_ref())
+            .unwrap();
+
+        let langs = vec!["java".to_string()];
+        let mut generations = HashMap::default();
+        generations.insert("java".to_string(), generation);
+
+        // Single-threaded baseline: the warm reads return the expected rows.
+        let baseline = store
+            .declaration_candidate_rows_by_short_name_for_langs(&langs, &generations, "Widget")
+            .unwrap();
+        assert!(baseline.iter().any(|row| row.short_name == "Widget"));
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Writer thread: persist additional distinct blobs through the single
+        // writer connection while the readers hammer their pooled readers.
+        let writer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            let root = temp.path().to_path_buf();
+            std::thread::spawn(move || {
+                let mut index = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let src = format!("class Extra{index} {{ int f{index}; }}\n");
+                    let extra = write_file(&root, &format!("Extra{index}.java"), &src);
+                    let extra_state = parse_state(&JavaAdapter, &extra);
+                    let extra_oid = oid_for(extra_state.source.as_bytes());
+                    store
+                        .write_parsed_blob_at_generation(
+                            extra_oid,
+                            "java",
+                            generation,
+                            &JavaAdapter,
+                            &extra_state,
+                        )
+                        .unwrap();
+                    index += 1;
+                }
+            })
+        };
+
+        // Reader threads: mixed definitions lookup + hydration + search, each
+        // asserting the warm Widget rows are always visible.
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let langs = langs.clone();
+            let generations = generations.clone();
+            let file = file.clone();
+            readers.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let rows = store
+                        .declaration_candidate_rows_by_short_name_for_langs(
+                            &langs,
+                            &generations,
+                            "Widget",
+                        )
+                        .unwrap();
+                    assert!(rows.iter().any(|row| row.short_name == "Widget"));
+
+                    let hydrated = store
+                        .hydrate_file_states(
+                            &[(file.clone(), oid)],
+                            "java",
+                            &JavaAdapter,
+                            &HashMap::default(),
+                        )
+                        .unwrap();
+                    assert!(hydrated.contains_key(&file));
+
+                    let search = store.search_candidate_rows_by_lang("java").unwrap();
+                    assert!(
+                        search
+                            .iter()
+                            .any(|row| row.candidate.short_name == "Widget")
+                    );
+                }
+            }));
+        }
+
+        for reader in readers {
+            reader.join().expect("reader thread panicked");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread panicked");
+
+        // The concurrently persisted blobs are all visible after the fact.
+        let widgets = store
+            .declaration_candidate_rows_by_short_name_for_langs(&langs, &generations, "Widget")
+            .unwrap();
+        assert!(widgets.iter().any(|row| row.short_name == "Widget"));
     }
 
     #[test]

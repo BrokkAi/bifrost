@@ -13,7 +13,9 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn fixture_root() -> PathBuf {
@@ -113,6 +115,186 @@ fn service_allows_concurrent_read_only_calls() {
         let value = handle.join().unwrap();
         assert!(value.is_object(), "payload: {value}");
     }
+}
+
+/// Regression for M2's read-first `snapshot_for_query`: a change reported by
+/// the production file watcher (not an explicit `update_paths` call) must
+/// still be visible on the very next tool call, exactly as it was when every
+/// call took an exclusive session write lock unconditionally.
+#[test]
+fn watcher_reported_change_is_applied_by_next_call() {
+    let temp = TempDir::new().unwrap();
+    let file_path = temp.path().join("Watched.java");
+    fs::write(&file_path, "public class Watched { void first() {} }\n").unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+
+    let baseline = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(baseline.contains("first"), "payload: {baseline}");
+    assert!(!baseline.contains("second"), "payload: {baseline}");
+
+    fs::write(
+        &file_path,
+        "public class Watched { void first() {} void second() {} }\n",
+    )
+    .unwrap();
+
+    let mut observed = None;
+    for _ in 0..250 {
+        let payload = service
+            .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+            .unwrap();
+        if payload.contains("second") {
+            observed = Some(payload);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let payload = observed.unwrap_or_else(|| {
+        panic!("watcher-reported change to Watched.java was never applied by a later call")
+    });
+    assert!(payload.contains("second"), "payload: {payload}");
+}
+
+/// M3 regression: `UpdateStrategy::Manual` sessions have no watcher and no
+/// implicit staleness revalidation (`snapshot_for_query` always takes the
+/// read-only fast path for them) — the *only* way they observe a change is
+/// the explicit `update_paths` tool, which drives the same
+/// `WorkspaceAnalyzer::update` -> `resolve_live_oids` ->
+/// `LivePathMap::refresh` write path the watcher uses. M3 memoizes
+/// `LiveSnapshot` stat-validation on `LivePathMap`'s generation counter, so
+/// this proves that generation bump (and the fresh, unvalidated `PathState`s
+/// it produces) still reaches a Manual session's next read after an explicit
+/// update, exactly as before this milestone.
+#[test]
+fn manual_service_sees_change_after_explicit_update_paths() {
+    let temp = TempDir::new().unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    {
+        let mut config = repo.config().unwrap();
+        config.set_str("user.email", "t@example.com").unwrap();
+        config.set_str("user.name", "T").unwrap();
+    }
+    let file_path = temp.path().join("Watched.java");
+    fs::write(&file_path, "public class Watched { void first() {} }\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("Watched.java")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = Signature::now("T", "t@example.com").unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+        .unwrap();
+
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf()).unwrap();
+
+    let baseline = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(baseline.contains("first"), "payload: {baseline}");
+    assert!(!baseline.contains("second"), "payload: {baseline}");
+
+    fs::write(
+        &file_path,
+        "public class Watched { void first() {} void second() {} }\n",
+    )
+    .unwrap();
+
+    // Without an explicit update, a Manual session must NOT observe the
+    // out-of-band edit (no watcher, no implicit revalidation for this path).
+    let still_stale = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(
+        !still_stale.contains("second"),
+        "a Manual session must not implicitly observe out-of-band changes: {still_stale}"
+    );
+
+    service
+        .call_tool_json("update_paths", r#"{"paths":["Watched.java"]}"#)
+        .unwrap();
+
+    let refreshed = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(
+        refreshed.contains("second"),
+        "explicit update_paths must make the change visible: {refreshed}"
+    );
+}
+
+/// Concurrency smoke for M2: many threads issue read-only calls against one
+/// service while a file change lands on disk mid-stream. Every call must
+/// succeed (the read-first peek must never deadlock or error against a
+/// concurrently-mutating session), and calls made after the change is
+/// observable must see it.
+#[test]
+fn concurrent_read_only_calls_survive_a_mid_stream_watcher_change() {
+    let temp = TempDir::new().unwrap();
+    let file_path = temp.path().join("Live.java");
+    fs::write(&file_path, "public class Live { void before() {} }\n").unwrap();
+
+    let service = Arc::new(
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let saw_error = Arc::new(AtomicBool::new(false));
+
+    let reader_handles: Vec<_> = (0..8)
+        .map(|_| {
+            let service = Arc::clone(&service);
+            let stop = Arc::clone(&stop);
+            let saw_error = Arc::clone(&saw_error);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if service
+                        .call_tool_json("get_summaries", r#"{"targets":["Live.java"]}"#)
+                        .is_err()
+                    {
+                        saw_error.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Give the reader threads a head start, then land a change mid-stream.
+    thread::sleep(Duration::from_millis(50));
+    fs::write(
+        &file_path,
+        "public class Live { void before() {} void after() {} }\n",
+    )
+    .unwrap();
+
+    let mut observed_after = false;
+    for _ in 0..250 {
+        let payload = service
+            .call_tool_json("get_summaries", r#"{"targets":["Live.java"]}"#)
+            .unwrap();
+        if payload.contains("after") {
+            observed_after = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for handle in reader_handles {
+        handle.join().unwrap();
+    }
+
+    assert!(
+        !saw_error.load(Ordering::Relaxed),
+        "a concurrent read-only call failed while a file change landed mid-stream"
+    );
+    assert!(
+        observed_after,
+        "post-change calls never observed the watcher-applied update"
+    );
 }
 
 #[test]
@@ -6213,7 +6395,7 @@ exports.measure = function() {
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
 
-    for (symbol, expected_line) in [("parse", 7), ("ExportedClass", 8), ("actualValue", 9)] {
+    for (symbol, expected_line) in [("parse", 7), ("actualValue", 9)] {
         let args = serde_json::json!({
             "symbols": [symbol],
             "include_tests": true,
@@ -6231,14 +6413,43 @@ exports.measure = function() {
         );
     }
 
-    let payload = service
-        .call_tool_json(
-            "scan_usages_by_reference",
-            r#"{"symbols":["exportedName"],"include_tests":true,"paths":["exports.js"]}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(only_result(&value)["total_hits"], 0, "payload: {value}");
+    // #1088: `ExportedClass` and `exportedName` each collide with a commonjs
+    // re-export alias sharing their terminal name (`exports.types =
+    // { ExportedClass }` and `exports.alias = { exportedName: actualValue }`
+    // register their own `types.ExportedClass` / `alias.exportedName`
+    // declarations). Bare-name resolution now surfaces that genuine ambiguity
+    // instead of silently picking the class/function declaration, matching
+    // every other bare-name spelling collision this tool already reports.
+    for (symbol, other_selector) in [
+        ("ExportedClass", "exports.js#types.ExportedClass"),
+        ("exportedName", "exports.js#alias.exportedName"),
+    ] {
+        let args = serde_json::json!({
+            "symbols": [symbol],
+            "include_tests": true,
+            "paths": ["exports.js"],
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args.to_string())
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+        assert_eq!(result["status"], "ambiguous", "payload: {value}");
+        let candidates = result["candidate_targets"].as_array().unwrap();
+        assert_eq!(2, candidates.len(), "payload: {value}");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == &format!("exports.js#{symbol}")),
+            "payload: {value}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == other_selector),
+            "payload: {value}"
+        );
+    }
 
     let payload = service
         .call_tool_json(
@@ -8955,4 +9166,124 @@ fn semantic_search_status_reports_disabled_without_indexer() {
         "unexpected error message: {}",
         err.message
     );
+}
+
+// --- M4 handler-path regressions: routing snippet/source-window reads through
+// the analyzer's indexed snapshot instead of a fresh `ProjectFile::read_to_string`
+// disk read. Each test below pins a golden fixture + expected response for one
+// representative handler site category so a future change that regresses the
+// routing (e.g. reverting to a disk read, or reading the wrong file) fails loud.
+
+#[test]
+fn get_definitions_by_reference_resolves_target_from_indexed_snapshot() {
+    // Covers src/searchtools/definitions.rs's `resolve_definition_context_query`,
+    // which locates `query.target` inside the byte range of an already-resolved
+    // unit's source text.
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            "public class Widget {\n    void caller() {\n        target();\n    }\n    void target() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"Widget","context":"target();","target":"target"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+
+    assert_eq!("resolved", result["status"], "payload: {value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions
+                .iter()
+                .any(|definition| definition["fqn"] == "Widget.target")),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_location_ambiguous_reports_exact_candidate_positions() {
+    // Covers `ambiguous_usage_symbol_from_groups`'s `ScanUsagesSurface::Location`
+    // branch (candidate_details), which reads each candidate's declaration name
+    // range out of its own file's source text, and `resolve_scan_usages_target`,
+    // which reads the target file's source to interpret the requested line.
+    // `foo` and `bar` are both 3-byte identifiers on line 2 so their declaration
+    // name ranges tie for narrowest span and neither location-selects the other,
+    // producing a genuine ambiguity with two exact candidate positions.
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            "public class Widget {\n    void foo() {} void bar() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"Widget.java","line":2}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let ambiguous = only_result(&value);
+
+    assert_eq!("ambiguous", ambiguous["status"], "payload: {value}");
+    let details = ambiguous["candidate_details"]
+        .as_array()
+        .expect("candidate_details present for a Location-surface ambiguity");
+    assert_eq!(2, details.len(), "payload: {value}");
+    for detail in details {
+        assert_eq!("Widget.java", detail["path"], "payload: {value}");
+        assert_eq!(2, detail["start_line"], "payload: {value}");
+    }
+    let foo_detail = details
+        .iter()
+        .find(|detail| {
+            detail["target"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("foo")
+        })
+        .unwrap_or_else(|| panic!("no `foo` candidate detail: {value}"));
+    let bar_detail = details
+        .iter()
+        .find(|detail| {
+            detail["target"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bar")
+        })
+        .unwrap_or_else(|| panic!("no `bar` candidate detail: {value}"));
+    assert_eq!(10, foo_detail["scan_usages_by_location_target"]["column"]);
+    assert_eq!(24, bar_detail["scan_usages_by_location_target"]["column"]);
+}
+
+#[test]
+fn list_symbols_reports_loc_from_indexed_snapshot() {
+    // Covers `skim_files_for_files`'s `loc` field (src/searchtools/summaries.rs),
+    // which reports the analyzed file's line count for `list_symbols`.
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            "public class Widget {\n    void foo() {}\n    void bar() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json("list_symbols", r#"{"file_patterns":["Widget.java"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("Widget.java", value["files"][0]["path"], "payload: {value}");
+    assert_eq!(4, value["files"][0]["loc"], "payload: {value}");
 }

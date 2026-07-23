@@ -52,6 +52,90 @@ pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
 }
 
+/// Object/class/trait declarations lexically enclosing a Scala byte
+/// position, innermost first.
+///
+/// A relative Scala import path — and any wildcard-imported member reached
+/// through it — resolves against these enclosing template scopes before the
+/// package (mirroring ordinary qualified-identifier lookup). This walks the
+/// same `ClassRangeIndex` byte-range lookup + `structural_parent_of` chain
+/// that call/type-namespace resolution already uses for "which singleton
+/// owns this site" (see `scala_exact_lexical_singleton_for_call` and
+/// `scala_type_namespace_resolution` in `usages::get_definition::scala`).
+///
+/// Lives here rather than in `usages::get_definition::scala` (where it was
+/// first written, for the import-token click fix) because
+/// `scala::wildcard_imports`'s `resolve_scala_wildcard_import_environment`
+/// needs the identical owner chain for the *usage* side of the same gap
+/// (resolving a member reached through a wildcard import), and
+/// `scala::imports`'s own `wildcard_import_environment` (workspace-wide
+/// import/usage-graph edges) needs it too. `wildcard_imports` is
+/// deliberately analyzer-free and closure-based for testability, so it does
+/// not call this directly; its callers (here, and in `scala::imports`)
+/// compute the owner chain and pass it in via a closure instead.
+pub(crate) fn scala_enclosing_template_owner_fq_names(
+    analyzer: &dyn IAnalyzer,
+    scala: &ScalaAnalyzer,
+    file: &ProjectFile,
+    byte: usize,
+) -> Vec<String> {
+    let mut owners = Vec::new();
+    let mut current =
+        crate::analyzer::usages::inverted_edges::ClassRangeIndex::build(analyzer, file)
+            .enclosing_unit(byte)
+            .cloned();
+    while let Some(owner) = current {
+        current = scala.structural_parent_of(&owner);
+        if owner.is_class() {
+            owners.push(owner.fq_name());
+        }
+    }
+    owners
+}
+
+/// Candidate spellings of `segments` rooted at `prefix`, plus the "$"
+/// companion-object spelling Scala singletons use in fqns.
+///
+/// `prefix_is_owner` distinguishes an owner whose *own* spelling still needs
+/// a trailing `$` inserted (an object/class fqn segment used as a qualifying
+/// prefix) from a prefix that already carries its correct spelling (e.g. a
+/// package name, or another candidate's fqn taken as-is).
+pub(crate) fn scala_nested_type_candidates(
+    prefix: String,
+    segments: &[String],
+    prefix_is_owner: bool,
+) -> Vec<String> {
+    let mut direct = prefix.clone();
+    for segment in segments {
+        if !direct.is_empty() {
+            direct.push('.');
+        }
+        direct.push_str(segment);
+    }
+    if segments.is_empty() {
+        return vec![direct];
+    }
+
+    let mut singleton_qualified = prefix;
+    if prefix_is_owner {
+        singleton_qualified.push('$');
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        if !singleton_qualified.is_empty() {
+            singleton_qualified.push('.');
+        }
+        singleton_qualified.push_str(segment);
+        if index + 1 < segments.len() {
+            singleton_qualified.push('$');
+        }
+    }
+    if singleton_qualified == direct {
+        vec![direct]
+    } else {
+        vec![direct, singleton_qualified]
+    }
+}
+
 pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
     unit.short_name()
         .rsplit('.')

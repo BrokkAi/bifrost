@@ -10,9 +10,40 @@ use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+
+/// Keep this process's opportunistic analyzer-store GC permanently out of the
+/// picture (see `AnalyzerGcCoordinator::schedule`).
+///
+/// A brand-new `cache_state` row starts with `last_gc_at = 0`, so a store's
+/// very first `build_persisted*` call always finds GC "due" (`gc_due_tx`:
+/// `now - 0 >= GC_MIN_INTERVAL_SECS` is trivially true) and spawns a real
+/// background sweep against the *same* SQLite file this test file's `cold`
+/// build just wrote and its `warm` build immediately reopens. Under light
+/// load the sweep finishes microseconds later, long before the warm build
+/// touches the store, so the race is invisible. Under heavy box load
+/// (parallel `cargo build`, an oversubscribed CPU) the sweep can still be
+/// mid-transaction when the warm build's connection opens, and lock
+/// contention on that shared file perturbs the "warm" build/query into doing
+/// structured work — a re-parse, extra candidate hydration — that the
+/// `warm_*` family asserts never happens (issue #1099). GC readiness is not
+/// under test anywhere in this file, so raise the interval once, for the
+/// whole process, instead of threading a guard through every test. The
+/// returned `GcIntervalGuard` wraps a `MutexGuard` (see `GcTuningGuard`) that
+/// is not `Send`, so it cannot live in a `static`; `mem::forget` it instead
+/// to hold the override (and the internal tuning lock) for the rest of the
+/// process, which is safe because nothing else in this binary calls
+/// `set_tuning_for_test`.
+fn disable_opportunistic_gc_for_test() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let guard = brokk_bifrost::analyzer::store::gc::set_min_interval_secs_for_test(i64::MAX);
+        std::mem::forget(guard);
+    });
+}
 
 fn build_persisted(project: Arc<dyn Project>, config: AnalyzerConfig) -> WorkspaceAnalyzer {
+    disable_opportunistic_gc_for_test();
     WorkspaceAnalyzer::build_persisted(project, config).expect("persisted analyzer should build")
 }
 
@@ -24,6 +55,7 @@ fn build_persisted_with_progress<F>(
 where
     F: Fn(BuildProgressEvent) + Send + Sync + 'static,
 {
+    disable_opportunistic_gc_for_test();
     WorkspaceAnalyzer::build_persisted_with_progress(project, config, progress)
         .expect("persisted analyzer should build")
 }

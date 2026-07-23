@@ -157,11 +157,36 @@ struct IndexFingerprint {
     digest: [u8; 32],
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct PathState {
     oid: Oid,
     stat: Option<FileStat>,
+    /// Whether this entry is intrinsically current for the lifetime of the
+    /// `LiveSnapshot`. Overlay entries have no filesystem stat and can be
+    /// trusted until their overlay generation changes. Filesystem entries keep
+    /// this `false` even after snapshot construction: direct analyzers have no
+    /// watcher, so an out-of-band disk edit can stale an otherwise memoized
+    /// snapshot without bumping `LivePathMap`'s generation.
+    validated: bool,
 }
+
+impl PartialEq for PathState {
+    /// Deliberately ignores `validated`: it is build provenance, not part of
+    /// a path's live content, so two states that agree on `oid`/`stat` must
+    /// compare equal regardless of which one (if either) has been through a
+    /// `LiveSnapshot` validation pass. `refresh`/`replace_all` rely on this
+    /// to detect genuine content changes without being fooled into treating
+    /// a validation-flag difference as a change (in practice the two sides
+    /// they compare are always both `false`, since only `PathState::new`
+    /// feeds the source-of-truth maps — but the exclusion is correct either
+    /// way and documents the intent explicitly rather than relying on that
+    /// invariant silently holding).
+    fn eq(&self, other: &Self) -> bool {
+        self.oid == other.oid && self.stat == other.stat
+    }
+}
+
+impl Eq for PathState {}
 
 impl PathState {
     fn new(oid: Oid, validation: LivePathValidation, file: &ProjectFile) -> Option<Self> {
@@ -169,7 +194,11 @@ impl PathState {
             LivePathValidation::Filesystem => Some(FileStat::from_path(&file.abs_path())?),
             LivePathValidation::Overlay => None,
         };
-        Some(Self { oid, stat })
+        Some(Self {
+            oid,
+            stat,
+            validated: false,
+        })
     }
 }
 
@@ -210,8 +239,8 @@ impl LivePathEntry {
     }
 }
 
-#[derive(Default)]
 pub struct LivePathMap {
+    revalidate_filesystem: bool,
     state: Mutex<LivePathMapState>,
 }
 
@@ -227,10 +256,27 @@ struct MemoizedLivePathMapSnapshot {
     snapshot: Arc<LiveSnapshot>,
 }
 
+impl Default for LivePathMap {
+    fn default() -> Self {
+        Self {
+            revalidate_filesystem: true,
+            state: Mutex::new(LivePathMapState::default()),
+        }
+    }
+}
+
 impl LivePathMap {
+    pub fn trust_filesystem_generation() -> Self {
+        Self {
+            revalidate_filesystem: false,
+            state: Mutex::new(LivePathMapState::default()),
+        }
+    }
+
     pub fn fork(&self) -> Self {
         let guard = self.state.lock().expect("live path map mutex poisoned");
         Self {
+            revalidate_filesystem: self.revalidate_filesystem,
             state: Mutex::new(LivePathMapState {
                 generation: guard.generation,
                 paths: guard.paths.clone(),
@@ -293,7 +339,10 @@ impl LivePathMap {
         {
             return Arc::clone(&memoized.snapshot);
         }
-        let snapshot = Arc::new(snapshot_from_path_states(&guard.paths));
+        let snapshot = Arc::new(snapshot_from_path_states(
+            &guard.paths,
+            self.revalidate_filesystem,
+        ));
         guard.snapshot = Some(MemoizedLivePathMapSnapshot {
             generation: guard.generation,
             snapshot: Arc::clone(&snapshot),
@@ -321,6 +370,9 @@ impl LiveSnapshot {
 
     pub fn validated_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
         let state = self.path_to_state.get(file)?;
+        if state.validated {
+            return Some(state.oid);
+        }
         match (&state.stat, FileStat::from_path(&file.abs_path())) {
             (None, _) => Some(state.oid),
             (Some(expected), Some(current)) if &current == expected => Some(state.oid),
@@ -350,6 +402,9 @@ impl LiveSnapshot {
                 stale.push(file.clone());
                 continue;
             };
+            if state.validated {
+                continue;
+            }
             match (&state.stat, FileStat::from_path(&file.abs_path())) {
                 (None, _) => {}
                 (Some(expected), Some(current)) if &current == expected => {}
@@ -386,6 +441,9 @@ fn build_snapshot(
             PathState {
                 oid,
                 stat: Some(stat),
+                // `Liveness::snapshot()` intentionally never promotes to
+                // `true` — see the `validated` field doc.
+                validated: false,
             },
         );
     }
@@ -416,7 +474,10 @@ fn build_snapshot(
     })
 }
 
-fn snapshot_from_path_states(path_to_state: &HashMap<ProjectFile, PathState>) -> LiveSnapshot {
+fn snapshot_from_path_states(
+    path_to_state: &HashMap<ProjectFile, PathState>,
+    revalidate_filesystem: bool,
+) -> LiveSnapshot {
     let mut oid_to_paths: HashMap<Oid, Vec<ProjectFile>> = HashMap::default();
     let mut live_states = HashMap::default();
     for (file, state) in path_to_state {
@@ -431,7 +492,9 @@ fn snapshot_from_path_states(path_to_state: &HashMap<ProjectFile, PathState>) ->
             .entry(state.oid)
             .or_default()
             .push(file.clone());
-        live_states.insert(file.clone(), state.clone());
+        let mut live_state = state.clone();
+        live_state.validated = state.stat.is_none() || !revalidate_filesystem;
+        live_states.insert(file.clone(), live_state);
     }
     LiveSnapshot {
         oid_to_paths,
@@ -450,6 +513,29 @@ fn current_index_fingerprint(repo: &Repository) -> Result<IndexFingerprint> {
     })
 }
 
+// Per-thread `fs::metadata` call counter for the M3 stat-storm regression
+// tests below (and for other test modules driving a real analyzer/session on
+// a single thread, via the `pub(crate)` accessors). Thread-local rather than
+// a single process-wide counter: `cargo test` runs tests concurrently on
+// separate threads, and each test that cares about this count only wants to
+// see the `fs::metadata` calls its own synchronous call chain made, not ones
+// from unrelated tests' threads (or from the production watcher's background
+// thread, which never touches the counting thread).
+#[cfg(test)]
+thread_local! {
+    static STAT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn stat_call_count_for_test() -> usize {
+    STAT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_stat_call_count_for_test() {
+    STAT_CALLS.with(|calls| calls.set(0));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStat {
     len: u64,
@@ -459,6 +545,8 @@ struct FileStat {
 
 impl FileStat {
     fn from_path(path: &Path) -> Option<Self> {
+        #[cfg(test)]
+        STAT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let metadata = std::fs::metadata(path).ok()?;
         if !metadata.is_file() {
             return None;
@@ -659,6 +747,149 @@ mod tests {
 
         std::fs::write(temp.path().join("a.rs"), "fn new_name() {}\n").unwrap();
         assert_eq!(snapshot.validate([&file].into_iter()), vec![file]);
+    }
+
+    #[test]
+    fn filesystem_validated_oid_for_path_rechecks_memoized_snapshots() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(temp.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let file_a = project_file(temp.path(), "a.rs");
+        let file_b = project_file(temp.path(), "b.rs");
+        let oid_a = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+        let oid_b = Oid::hash_object(ObjectType::Blob, b"fn b() {}\n").unwrap();
+
+        reset_stat_call_count_for_test();
+        let map = LivePathMap::default();
+        map.refresh([
+            LivePathEntry::filesystem(file_a.clone(), oid_a),
+            LivePathEntry::filesystem(file_b.clone(), oid_b),
+        ]);
+        let snapshot = map.snapshot();
+        let stats_after_build = stat_call_count_for_test();
+        assert!(
+            stats_after_build > 0,
+            "refreshing the map and building the first snapshot must validate on disk at least once"
+        );
+
+        // Filesystem-backed entries must re-check the path even when the
+        // LiveSnapshot itself is memoized. Direct analyzers do not have a
+        // watcher, so this validation is what prevents a later out-of-band
+        // edit from serving stale rows.
+        for _ in 0..5 {
+            assert_eq!(snapshot.validated_oid_for_path(&file_a), Some(oid_a));
+            assert_eq!(snapshot.validated_oid_for_path(&file_b), Some(oid_b));
+            assert!(snapshot.validate([&file_a, &file_b].into_iter()).is_empty());
+        }
+        assert!(
+            stat_call_count_for_test() > stats_after_build,
+            "filesystem-backed snapshots must keep revalidating memoized entries"
+        );
+
+        // Repeated LivePathMap::snapshot() calls with no mutation between
+        // them must keep returning the same memoized Arc, not rebuild.
+        let stats_before_snapshot_again = stat_call_count_for_test();
+        let snapshot_again = map.snapshot();
+        assert!(Arc::ptr_eq(&snapshot, &snapshot_again));
+        assert_eq!(stat_call_count_for_test(), stats_before_snapshot_again);
+    }
+
+    #[test]
+    fn refresh_bumps_generation_and_forces_revalidation_on_next_snapshot() {
+        // Models the watcher-driven write path: `SearchToolsService::
+        // apply_watcher_delta`/`apply_changed_files` -> analyzer `update()` ->
+        // `resolve_live_oids` -> `LivePathMap::refresh` for exactly the
+        // changed files, which is the existing invalidation plumbing this
+        // milestone's memoization relies on.
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let file_a = project_file(temp.path(), "a.rs");
+        let oid_a = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+
+        reset_stat_call_count_for_test();
+        let map = LivePathMap::default();
+        map.refresh([LivePathEntry::filesystem(file_a.clone(), oid_a)]);
+        let snapshot = map.snapshot();
+        assert_eq!(snapshot.validated_oid_for_path(&file_a), Some(oid_a));
+        let stats_before_change = stat_call_count_for_test();
+
+        // Simulate a watcher-reported edit landing on disk, then the write
+        // path reporting it to `live_paths`.
+        std::fs::write(temp.path().join("a.rs"), "fn a2() {}\n").unwrap();
+        let new_oid_a = Oid::hash_object(ObjectType::Blob, b"fn a2() {}\n").unwrap();
+        map.refresh([LivePathEntry::filesystem(file_a.clone(), new_oid_a)]);
+
+        let new_snapshot = map.snapshot();
+        assert!(
+            !Arc::ptr_eq(&snapshot, &new_snapshot),
+            "a real content change must bump the generation and force a fresh LiveSnapshot"
+        );
+        assert_eq!(
+            new_snapshot.validated_oid_for_path(&file_a),
+            Some(new_oid_a)
+        );
+        assert!(
+            stat_call_count_for_test() > stats_before_change,
+            "the changed path must be re-validated before its new oid is trusted"
+        );
+
+        // The old snapshot Arc may still be held by a concurrent reader, but
+        // filesystem validation must refuse its now-stale path instead of
+        // serving the old oid.
+        assert_eq!(snapshot.validated_oid_for_path(&file_a), None);
+    }
+
+    #[test]
+    fn replace_all_with_unchanged_content_keeps_the_memoized_snapshot() {
+        // Models `UpdateStrategy::Manual`'s explicit `update_files()`/full
+        // rebuild path and `requires_full_refresh`: `replace_all` always
+        // re-stats every path once (that is the full sweep this call
+        // performs), but if nothing on disk actually differs, the map's
+        // generation must not bump and the already-validated snapshot must
+        // keep being served without another rebuild.
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let file_a = project_file(temp.path(), "a.rs");
+        let oid_a = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+
+        let map = LivePathMap::default();
+        map.replace_all([LivePathEntry::filesystem(file_a.clone(), oid_a)]);
+        let snapshot = map.snapshot();
+        assert_eq!(snapshot.validated_oid_for_path(&file_a), Some(oid_a));
+
+        map.replace_all([LivePathEntry::filesystem(file_a.clone(), oid_a)]);
+        let same_snapshot = map.snapshot();
+        assert!(
+            Arc::ptr_eq(&snapshot, &same_snapshot),
+            "a no-op full refresh must not discard the memoized snapshot"
+        );
+    }
+
+    #[test]
+    fn replace_all_with_changed_content_rebuilds_the_snapshot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(temp.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let file_a = project_file(temp.path(), "a.rs");
+        let file_b = project_file(temp.path(), "b.rs");
+        let oid_a = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+        let oid_b = Oid::hash_object(ObjectType::Blob, b"fn b() {}\n").unwrap();
+
+        let map = LivePathMap::default();
+        map.replace_all([LivePathEntry::filesystem(file_a.clone(), oid_a)]);
+        let snapshot = map.snapshot();
+
+        // A full-refresh delta (e.g. `requires_full_refresh`) that now also
+        // reports `b.rs` must clear the old stamps: the new snapshot must be
+        // a distinct instance, and both files must resolve correctly.
+        map.replace_all([
+            LivePathEntry::filesystem(file_a.clone(), oid_a),
+            LivePathEntry::filesystem(file_b.clone(), oid_b),
+        ]);
+        let new_snapshot = map.snapshot();
+        assert!(!Arc::ptr_eq(&snapshot, &new_snapshot));
+        assert_eq!(new_snapshot.validated_oid_for_path(&file_a), Some(oid_a));
+        assert_eq!(new_snapshot.validated_oid_for_path(&file_b), Some(oid_b));
     }
 
     #[test]
