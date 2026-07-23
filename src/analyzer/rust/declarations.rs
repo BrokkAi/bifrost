@@ -456,9 +456,10 @@ fn visit_rust_macro_invocation_definitions(
     // (`Some(false)` -> suppress). Otherwise -- proven faithful (`Some(true)`) or
     // the definition lives in another file and is unknown here (`None`) -- admit
     // ordinary items and let the parse gate below be the arbiter. Macro
-    // definitions require positive passthrough evidence: inert built-ins such
-    // as `stringify!` can contain a syntactically valid `macro_rules!` token
-    // tree without emitting that declaration.
+    // definitions require positive passthrough evidence because an unknown
+    // external macro can accept a syntactically valid `macro_rules!` token tree
+    // without emitting that declaration. Known inert built-ins were suppressed
+    // above before reaching this fallback.
     let locally_proven_passthrough = match rust_latest_visible_rules_item_macro(
         item_macro_definitions,
         invoked_macro,
