@@ -1,11 +1,36 @@
 use super::*;
 use crate::analyzer::GlobalUsageDefinitionIndex;
+use crate::analyzer::SignatureMetadata;
 use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_prefix_exists(&self, prefix: &str) -> bool;
+    fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
+        self.fqn(&format!("{owner_fqn}.{name}"))
+    }
+    fn import_infos(&self, go: &GoAnalyzer, file: &ProjectFile) -> Vec<ImportInfo> {
+        go.import_info_of(file)
+    }
+    fn signature_metadata(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Vec<SignatureMetadata> {
+        analyzer.signature_metadata(unit)
+    }
+    fn raw_supertypes(&self, go: &GoAnalyzer, unit: &CodeUnit) -> Vec<String> {
+        go.raw_supertypes(unit)
+    }
+    fn scope_step(&self) -> bool {
+        true
+    }
+    fn summary_step(&self) -> bool {
+        true
+    }
+    fn session(&self) -> Option<&ResolutionSession> {
+        None
+    }
 
     fn fqn_exists(&self, fqn: &str) -> bool {
         !self.fqn(fqn).is_empty()
@@ -17,10 +42,6 @@ impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
         GlobalUsageDefinitionIndex::fqn(self, fqn)
     }
 
-    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        GlobalUsageDefinitionIndex::fqn_direct_children(self, fqn)
-    }
-
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
         GlobalUsageDefinitionIndex::fqn_prefix_exists(self, prefix)
     }
@@ -28,36 +49,132 @@ impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
 
 pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
     analyzer: &'a GoAnalyzer,
+    session: Option<&'a ResolutionSession>,
 }
 
 impl<'a> AnalyzerGoDefinitionProvider<'a> {
     pub(crate) fn new(analyzer: &'a GoAnalyzer) -> Self {
-        Self { analyzer }
+        Self {
+            analyzer,
+            session: None,
+        }
+    }
+
+    pub(crate) fn bounded(analyzer: &'a GoAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self {
+            analyzer,
+            session: Some(session),
+        }
     }
 }
 
 impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units: Vec<_> = self.analyzer.definitions(fqn).collect();
+        let mut units: Vec<_> = match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.analyzer
+                    .declaration_candidates_by_fqn_limited(fqn, limit, || {
+                        session.observe_cancellation()
+                    })
+            }),
+            None => self.analyzer.definitions(fqn).collect(),
+        };
         sort_units(&mut units);
         units.dedup();
         units
     }
 
-    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut children = Vec::new();
-        for owner in self.fqn(fqn) {
-            children.extend(self.analyzer.direct_children(&owner));
-        }
-        sort_units(&mut children);
-        children.dedup();
-        children
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.session.is_none()
+            && self
+                .analyzer
+                .workspace_path_index()
+                .package_prefix_exists(prefix)
     }
 
-    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
-        self.analyzer
-            .workspace_path_index()
-            .package_prefix_exists(prefix)
+    fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
+        let mut units = match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.analyzer
+                    .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
+                        session.observe_cancellation()
+                    })
+            }),
+            None => self.fqn(&format!("{owner_fqn}.{name}")),
+        };
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn import_infos(&self, go: &GoAnalyzer, file: &ProjectFile) -> Vec<ImportInfo> {
+        match self.session {
+            Some(session) => {
+                session.query_limited_rows(|limit| go.import_info_limited(file, limit))
+            }
+            None => go.import_info_of(file),
+        }
+    }
+
+    fn signature_metadata(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Vec<SignatureMetadata> {
+        match self.session {
+            Some(session) => session
+                .query_limited_rows(|limit| self.analyzer.signature_metadata_limited(unit, limit)),
+            None => analyzer.signature_metadata(unit),
+        }
+    }
+
+    fn raw_supertypes(&self, go: &GoAnalyzer, unit: &CodeUnit) -> Vec<String> {
+        match self.session {
+            Some(session) => {
+                session.query_limited_rows(|limit| go.raw_supertypes_limited(unit, limit))
+            }
+            None => go.raw_supertypes(unit),
+        }
+    }
+
+    fn scope_step(&self) -> bool {
+        self.session.is_none_or(ResolutionSession::scope_step)
+    }
+
+    fn summary_step(&self) -> bool {
+        self.session.is_none_or(ResolutionSession::summary_step)
+    }
+
+    fn session(&self) -> Option<&ResolutionSession> {
+        self.session
+    }
+}
+
+fn go_smallest_named_node_covering<'tree>(
+    support: &dyn GoDefinitionProvider,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !support.scope_step() || node.end_byte() < end || node.start_byte() > start {
+        return None;
+    }
+    loop {
+        let mut cursor = node.walk();
+        let mut containing_child = None;
+        for child in node.named_children(&mut cursor) {
+            if !support.scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing_child = Some(child);
+                break;
+            }
+        }
+        match containing_child {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
     }
 }
 
@@ -78,6 +195,42 @@ pub(super) fn parse_go_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     parser.parse(source, None)
+}
+
+pub(crate) fn resolve_go_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "go_analyzer_unavailable",
+            "Go analyzer is unavailable",
+        ));
+    };
+    let definitions = AnalyzerGoDefinitionProvider::bounded(go, &session);
+    let selector = tree.and_then(|tree| {
+        definitions
+            .scope_step()
+            .then(|| go_selector_descriptor(tree.root_node(), site))
+            .flatten()
+    });
+    let outcome = resolve_go(
+        analyzer,
+        &definitions,
+        file,
+        source,
+        tree,
+        site,
+        selector.as_ref(),
+        None,
+    );
+    session.finish(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -192,7 +345,7 @@ pub(super) fn resolve_go(
         && let Some(qualifier) = selector.base_identifier(source)
     {
         let name = go_node_text(selector.focused_node(), source);
-        let imports = go_import_paths(go, file);
+        let imports = go_import_paths(support, go, file);
         if let Some(import_path) = imports.get(qualifier) {
             if let Some(outcome) =
                 go_package_selector_chain_outcome(support, import_path, source, selector)
@@ -265,7 +418,8 @@ fn go_keyed_composite_label_outcome(
     root: Node<'_>,
     site: &ResolvedReferenceSite,
 ) -> Option<DefinitionLookupOutcome> {
-    let selected = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let selected =
+        go_smallest_named_node_covering(support, root, site.focus_start_byte, site.focus_end_byte)?;
     let keyed = go_keyed_element_containing_key(selected)?;
     let key = keyed.child_by_field_name("key")?;
     let label_node = go_simple_composite_key_identifier(key, selected)?;
@@ -285,7 +439,7 @@ fn go_keyed_composite_label_outcome(
         ));
     };
     let candidates: Vec<_> = support
-        .fqn(&format!("{owner_fqn}.{label}"))
+        .members_for_owner_name(&owner_fqn, label)
         .into_iter()
         .filter(CodeUnit::is_field)
         .collect();
@@ -417,7 +571,8 @@ pub(crate) fn go_type_lookup_resolution(
     root: Node<'_>,
     site: &ResolvedReferenceSite,
 ) -> Option<GoTypeLookupResolution> {
-    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let node =
+        go_smallest_named_node_covering(support, root, site.focus_start_byte, site.focus_end_byte)?;
     if let Some((fqn, member_name)) =
         go_interface_method_owner_type_fqn(support, file, source, node)
     {
@@ -453,13 +608,31 @@ fn go_package_name(file: &ProjectFile, source: &str) -> String {
 }
 
 fn go_import_paths(
+    support: &dyn GoDefinitionProvider,
     go: &crate::analyzer::GoAnalyzer,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
-    go.definition_import_namespaces(file)
-        .0
+    if support.session().is_none() {
+        return go
+            .definition_import_namespaces(file)
+            .0
+            .into_iter()
+            .filter_map(|(local, packages)| {
+                packages.into_iter().next().map(|package| (local, package))
+            })
+            .collect();
+    }
+    support
+        .import_infos(go, file)
         .into_iter()
-        .filter_map(|(local, packages)| packages.into_iter().next().map(|package| (local, package)))
+        .filter_map(|import| {
+            let local = import.alias.clone().or(import.identifier)?;
+            if local == "_" {
+                return None;
+            }
+            let path = extract_go_import_path(&import.raw_snippet)?;
+            Some((local, path))
+        })
         .collect()
 }
 
@@ -501,12 +674,15 @@ fn go_external_dot_import_path(
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
 ) -> Option<String> {
-    go.import_info_of(file).into_iter().find_map(|import| {
-        (import.alias.as_deref() == Some("."))
-            .then(|| extract_go_import_path(&import.raw_snippet))
-            .flatten()
-            .filter(|import_path| !go_import_path_is_workspace(support, import_path))
-    })
+    support
+        .import_infos(go, file)
+        .into_iter()
+        .find_map(|import| {
+            (import.alias.as_deref() == Some("."))
+                .then(|| extract_go_import_path(&import.raw_snippet))
+                .flatten()
+                .filter(|import_path| !go_import_path_is_workspace(support, import_path))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -625,8 +801,11 @@ fn go_receiver_binding_type_fqn(
     name: &str,
     byte: usize,
 ) -> Option<String> {
-    let mut current = smallest_named_node_covering(root, byte, byte)?;
+    let mut current = go_smallest_named_node_covering(support, root, byte, byte)?;
     loop {
+        if !support.scope_step() {
+            return None;
+        }
         if current.kind() == "method_declaration"
             && let Some(receiver) = current.child_by_field_name("receiver")
             && let Some(type_node) = go_parameter_type_for_name(receiver, source, name)
@@ -651,8 +830,11 @@ fn go_local_binding_type_fqn(
     name: &str,
     byte: usize,
 ) -> Option<String> {
-    let mut scope = smallest_named_node_covering(root, byte, byte)?;
+    let mut scope = go_smallest_named_node_covering(support, root, byte, byte)?;
     loop {
+        if !support.scope_step() {
+            return None;
+        }
         if let Some(binding) = go_nearest_binding_in_scope(scope, source, name, byte) {
             return match binding {
                 GoLocalBinding::Type(type_node) => {
@@ -816,16 +998,6 @@ fn go_last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).last()
 }
 
-fn go_type_text_from_composite_value(value: &str) -> Option<&str> {
-    let trimmed = value
-        .trim_start_matches('&')
-        .trim_start_matches('*')
-        .trim_start();
-    let end = trimmed.find(['{', '(']).unwrap_or(trimmed.len());
-    let type_text = trimmed[..end].trim();
-    (!type_text.is_empty()).then_some(type_text)
-}
-
 fn go_value_type_fqn(
     analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
@@ -835,6 +1007,11 @@ fn go_value_type_fqn(
     value_node: Node<'_>,
     byte: usize,
 ) -> Option<String> {
+    if value_node.kind() == "composite_literal"
+        && let Some(type_node) = value_node.child_by_field_name("type")
+    {
+        return go_resolve_type_fqn(analyzer, support, file, source, type_node);
+    }
     if value_node.kind() == "call_expression"
         && let Some(fqn) = go_call_expression_return_type_fqn(
             analyzer, support, file, source, root, value_node, byte,
@@ -869,9 +1046,15 @@ fn go_value_type_text(
             go_identifier_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
                 .and_then(|fqn| go_type_text_from_fqn(&fqn).map(str::to_string))
         }
-        _ => {
-            go_type_text_from_composite_value(go_node_text(value_node, source)).map(str::to_string)
-        }
+        "composite_literal" => value_node
+            .child_by_field_name("type")
+            .map(|type_node| go_node_text(type_node, source).trim().to_string())
+            .filter(|type_text| !type_text.is_empty()),
+        "parenthesized_expression" | "unary_expression" => go_first_named_child(value_node)
+            .and_then(|inner| {
+                go_value_type_text(analyzer, support, file, source, root, inner, byte)
+            }),
+        _ => None,
     }
 }
 
@@ -1061,8 +1244,13 @@ fn go_expression_type_text(
 ) -> Option<String> {
     match expression.kind() {
         "identifier" => {
-            let binding =
-                go_nearest_visible_binding(root, source, go_node_text(expression, source), byte)?;
+            let binding = go_nearest_visible_binding(
+                support,
+                root,
+                source,
+                go_node_text(expression, source),
+                byte,
+            )?;
             match binding {
                 GoLocalBinding::Type(type_node) => {
                     Some(go_node_text(type_node, source).to_string())
@@ -1082,9 +1270,15 @@ fn go_expression_type_text(
         "index_expression" => {
             go_index_expression_type_text(analyzer, support, file, source, root, expression, byte)
         }
-        _ => {
-            go_type_text_from_composite_value(go_node_text(expression, source)).map(str::to_string)
-        }
+        "composite_literal" => expression
+            .child_by_field_name("type")
+            .map(|type_node| go_node_text(type_node, source).trim().to_string())
+            .filter(|type_text| !type_text.is_empty()),
+        "parenthesized_expression" | "unary_expression" => go_first_named_child(expression)
+            .and_then(|inner| {
+                go_expression_type_text(analyzer, support, file, source, root, inner, byte)
+            }),
+        _ => None,
     }
 }
 
@@ -1156,11 +1350,13 @@ fn go_call_expression_return_type_text(
             if qualifier_node.kind() == "identifier" {
                 let qualifier = go_node_text(qualifier_node, source).trim();
                 if let Some(import_path) =
-                    go_import_paths(resolve_analyzer::<GoAnalyzer>(analyzer)?, file).get(qualifier)
+                    go_import_paths(support, resolve_analyzer::<GoAnalyzer>(analyzer)?, file)
+                        .get(qualifier)
                 {
                     let function_name = go_node_text(method_node, source).trim();
                     if let Some(return_type) = go_callable_return_type_text(
                         analyzer,
+                        support,
                         go_package_member_candidates(support, import_path, function_name),
                     ) {
                         return Some(return_type);
@@ -1177,13 +1373,18 @@ fn go_call_expression_return_type_text(
                 byte.min(expression.start_byte()),
             )?;
             let method = go_node_text(method_node, source).trim();
-            go_callable_return_type_text(analyzer, support.fqn(&format!("{owner_fqn}.{method}")))
+            go_callable_return_type_text(
+                analyzer,
+                support,
+                support.members_for_owner_name(&owner_fqn, method),
+            )
         }
         "identifier" => {
             let package = go_package_name(file, source);
             let name = go_node_text(function, source).trim();
             go_callable_return_type_text(
                 analyzer,
+                support,
                 go_package_member_candidates(support, &package, name),
             )
         }
@@ -1213,7 +1414,8 @@ fn go_call_expression_return_type_fqn(
             if qualifier_node.kind() == "identifier" {
                 let qualifier = go_node_text(qualifier_node, source).trim();
                 if let Some(import_path) =
-                    go_import_paths(resolve_analyzer::<GoAnalyzer>(analyzer)?, file).get(qualifier)
+                    go_import_paths(support, resolve_analyzer::<GoAnalyzer>(analyzer)?, file)
+                        .get(qualifier)
                 {
                     let function_name = go_node_text(method_node, source).trim();
                     let candidates =
@@ -1236,7 +1438,7 @@ fn go_call_expression_return_type_fqn(
             go_callable_return_type_fqn(
                 analyzer,
                 support,
-                support.fqn(&format!("{owner_fqn}.{method}")),
+                support.members_for_owner_name(&owner_fqn, method),
             )
         }
         "identifier" => {
@@ -1254,19 +1456,36 @@ fn go_call_expression_return_type_fqn(
 
 fn go_callable_return_type_text(
     analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
     candidates: Vec<CodeUnit>,
 ) -> Option<String> {
-    candidates.into_iter().find_map(|candidate| {
-        for signature in analyzer.signatures(&candidate) {
-            if let Some(return_type) = go_function_return_type_text(&signature) {
-                return Some(return_type.to_string());
-            }
-        }
-        candidate
-            .signature()
-            .and_then(go_function_return_type_text)
-            .map(str::to_string)
-    })
+    let mut return_types =
+        candidates
+            .into_iter()
+            .flat_map(|candidate| {
+                let mut types = support
+                    .signature_metadata(analyzer, &candidate)
+                    .into_iter()
+                    .filter_map(|metadata| metadata.return_type_text().map(str::to_string))
+                    .collect::<Vec<_>>();
+                if types.is_empty() && support.session().is_none() {
+                    types.extend(analyzer.signatures(&candidate).into_iter().filter_map(
+                        |signature| go_function_return_type_text(&signature).map(str::to_string),
+                    ));
+                    if let Some(return_type) = candidate
+                        .signature()
+                        .and_then(go_function_return_type_text)
+                        .map(str::to_string)
+                    {
+                        types.push(return_type);
+                    }
+                }
+                types
+            })
+            .collect::<Vec<_>>();
+    return_types.sort();
+    return_types.dedup();
+    (return_types.len() == 1).then(|| return_types.remove(0))
 }
 
 fn go_callable_return_type_fqn(
@@ -1274,15 +1493,49 @@ fn go_callable_return_type_fqn(
     support: &dyn GoDefinitionProvider,
     candidates: Vec<CodeUnit>,
 ) -> Option<String> {
-    candidates.into_iter().find_map(|candidate| {
-        let signatures = analyzer.signatures(&candidate);
-        let return_type = signatures
-            .iter()
-            .find_map(|signature| go_function_return_type_text(signature))
-            .or_else(|| candidate.signature().and_then(go_function_return_type_text))?;
-        let source = candidate.source().read_to_string().ok()?;
-        go_resolve_type_text_fqn(analyzer, support, candidate.source(), &source, return_type)
-    })
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let mut resolved = Vec::new();
+    for candidate in candidates {
+        if !support.scope_step() {
+            return None;
+        }
+        let return_types =
+            {
+                let mut types = support
+                    .signature_metadata(analyzer, &candidate)
+                    .into_iter()
+                    .filter_map(|metadata| metadata.return_type_text().map(str::to_string))
+                    .collect::<Vec<_>>();
+                if types.is_empty() && support.session().is_none() {
+                    types.extend(analyzer.signatures(&candidate).into_iter().filter_map(
+                        |signature| go_function_return_type_text(&signature).map(str::to_string),
+                    ));
+                    if let Some(return_type) = candidate
+                        .signature()
+                        .and_then(go_function_return_type_text)
+                        .map(str::to_string)
+                    {
+                        types.push(return_type);
+                    }
+                }
+                types
+            };
+        for return_type in return_types {
+            let (qualifier, name) = go_type_name_parts(&return_type)?;
+            let fqn = if let Some(qualifier) = qualifier {
+                let import_path =
+                    go_import_paths(support, go, candidate.source()).remove(qualifier)?;
+                let fqn = format!("{import_path}.{name}");
+                support.fqn_exists(&fqn).then_some(fqn)?
+            } else {
+                go_resolve_type_name_in_package(support, candidate.package_name(), name)?
+            };
+            resolved.push(fqn);
+        }
+    }
+    resolved.sort();
+    resolved.dedup();
+    (resolved.len() == 1).then(|| resolved.remove(0))
 }
 
 fn go_function_return_type_text(signature: &str) -> Option<&str> {
@@ -1321,13 +1574,17 @@ fn go_matching_close_paren(text: &str, open_byte: usize) -> Option<usize> {
 }
 
 fn go_nearest_visible_binding<'tree>(
+    support: &dyn GoDefinitionProvider,
     root: Node<'tree>,
     source: &str,
     name: &str,
     byte: usize,
 ) -> Option<GoLocalBinding<'tree>> {
-    let mut scope = smallest_named_node_covering(root, byte, byte)?;
+    let mut scope = go_smallest_named_node_covering(support, root, byte, byte)?;
     loop {
+        if !support.scope_step() {
+            return None;
+        }
         if let Some(binding) = go_nearest_binding_in_scope(scope, source, name.trim(), byte) {
             return Some(binding);
         }
@@ -1422,7 +1679,7 @@ fn go_indexed_field_type(
 ) -> Option<(ProjectFile, String)> {
     match go_indexed_field_lookup(analyzer, support, owner_fqn, field) {
         GoIndexedMemberLookup::Unique(field_unit) => {
-            go_field_unit_type_text(analyzer, &field_unit, field)
+            go_field_unit_type_text(analyzer, support, &field_unit, field)
                 .map(|type_text| (field_unit.source().clone(), type_text))
         }
         GoIndexedMemberLookup::Missing | GoIndexedMemberLookup::Ambiguous => None,
@@ -1435,9 +1692,42 @@ fn go_indexed_field_lookup(
     owner_fqn: &str,
     field: &str,
 ) -> GoIndexedMemberLookup<CodeUnit> {
-    let direct = |owner_fqn: &str, field: &str| support.fqn(&format!("{owner_fqn}.{field}"));
-    let embedded = |owner_fqn: &str| go_embedded_field_types(analyzer, support, owner_fqn);
-    go_unique_indexed_member_candidate_at_nearest_depth(owner_fqn, field, &direct, &embedded)
+    let mut frontier = vec![owner_fqn.to_string()];
+    let mut seen = HashSet::default();
+    while !frontier.is_empty() {
+        let mut candidates = Vec::new();
+        for owner in &frontier {
+            if !support.scope_step() || !seen.insert(owner.clone()) {
+                continue;
+            }
+            candidates.extend(support.members_for_owner_name(owner, field).into_iter());
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
+        match candidates.len() {
+            0 => {}
+            1 => {
+                return GoIndexedMemberLookup::Unique(
+                    candidates
+                        .pop()
+                        .expect("single Go member candidate was checked"),
+                );
+            }
+            _ => return GoIndexedMemberLookup::Ambiguous,
+        }
+        if !support.summary_step() {
+            return GoIndexedMemberLookup::Missing;
+        }
+        let mut next = Vec::new();
+        for owner in frontier {
+            next.extend(go_embedded_field_types(analyzer, support, &owner));
+        }
+        next.sort();
+        next.dedup();
+        next.retain(|owner| !seen.contains(owner));
+        frontier = next;
+    }
+    GoIndexedMemberLookup::Missing
 }
 
 fn go_embedded_field_types(
@@ -1445,21 +1735,53 @@ fn go_embedded_field_types(
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
 ) -> Vec<String> {
-    support
-        .fqn_direct_children(owner_fqn)
-        .into_iter()
-        .filter_map(|field| {
-            let type_text = go_embedded_field_unit_type_text(analyzer, &field, None)?;
-            go_resolve_go_field_type_fqn(analyzer, support, owner_fqn, field.source(), &type_text)
-        })
-        .collect()
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return Vec::new();
+    };
+    let mut embedded = Vec::new();
+    for owner in support.fqn(owner_fqn) {
+        if !support.scope_step() {
+            return Vec::new();
+        }
+        for type_text in support.raw_supertypes(go, &owner) {
+            if !support.scope_step() {
+                return Vec::new();
+            }
+            if let Some(fqn) = go_resolve_go_field_type_fqn(
+                analyzer,
+                support,
+                owner_fqn,
+                owner.source(),
+                &type_text,
+            ) {
+                embedded.push(fqn);
+            }
+        }
+    }
+    embedded.sort();
+    embedded.dedup();
+    embedded
 }
 
 fn go_field_unit_type_text(
     analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
     field_unit: &CodeUnit,
     field: &str,
 ) -> Option<String> {
+    let mut type_texts = support
+        .signature_metadata(analyzer, field_unit)
+        .into_iter()
+        .filter_map(|metadata| metadata.return_type_text().map(str::to_string))
+        .collect::<Vec<_>>();
+    type_texts.sort();
+    type_texts.dedup();
+    if type_texts.len() == 1 {
+        return type_texts.pop();
+    }
+    if support.session().is_some() {
+        return None;
+    }
     let signature = field_unit
         .signature()
         .map(str::to_string)
@@ -1501,7 +1823,7 @@ fn go_resolve_qualified_type_from_file(
         return None;
     };
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let import_path = go_import_paths(go, file).remove(qualifier)?;
+    let import_path = go_import_paths(support, go, file).remove(qualifier)?;
     let fqn = format!("{import_path}.{name}");
     support.fqn_exists(&fqn).then_some(fqn)
 }

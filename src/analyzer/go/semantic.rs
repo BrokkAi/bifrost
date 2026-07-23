@@ -6,17 +6,20 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CompletionKind, CompletionRequest, CompletionRoute, DriveError, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{GoAnalyzer, ProjectFile};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{GoAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"go-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v2";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -83,7 +86,6 @@ fn go_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalExitBoundary,
         SemanticCapability::BasicBlocks,
         SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
         SemanticCapability::NormalCallContinuation,
         SemanticCapability::ExceptionalCallContinuation,
     ] {
@@ -97,6 +99,13 @@ fn go_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+        SemanticCapability::Captures,
         SemanticCapability::DeferredExecution,
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::NonLocalControl,
@@ -109,6 +118,7 @@ fn go_capabilities() -> SemanticCapabilities {
 #[derive(Clone)]
 struct ProcedureSpec<'tree> {
     id: ProcedureId,
+    callable: Node<'tree>,
     body: Node<'tree>,
     locator: SemanticLocator,
     lexical_parent: Option<ProcedureId>,
@@ -207,6 +217,7 @@ fn enumerate_procedures<'tree>(
             preflight = candidate;
             specs.push(ProcedureSpec {
                 id,
+                callable: frame.node,
                 body,
                 locator,
                 lexical_parent: frame.lexical_parent,
@@ -384,8 +395,30 @@ enum Work<'tree> {
 }
 
 struct LoweringContext<'tree, 'targets> {
-    source: &'tree str,
+    prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    value_types: HashMap<ValueId, GoTypeIdentity>,
+    receiver: Option<ValueId>,
+    return_shape_supported: bool,
+    package_new_shadowed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoTypeIdentity {
+    pointer_depth: usize,
+    name: Box<str>,
 }
 
 fn lower_procedure<'tree>(
@@ -412,9 +445,51 @@ fn lower_procedure<'tree>(
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
-        source: prepared.source(),
+        prepared,
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        value_types: HashMap::default(),
+        receiver: None,
+        return_shape_supported: spec
+            .callable
+            .child_by_field_name("result")
+            .is_some_and(|result| result.kind() != "parameter_list"),
+        package_new_shadowed: go_package_binding_shadows_new(
+            prepared.tree().root_node(),
+            prepared.source(),
+        ) || spec.lexical_parent.is_some()
+            || go_callable_result_shadows_new(spec.callable, prepared.source()),
     };
+    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
+
+    if spec.lexical_parent.is_some() {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "lexical captures by nested Go function literals are not yet modeled",
+        )?;
+    }
+    if spec
+        .callable
+        .child_by_field_name("type_parameters")
+        .is_some()
+        || go_receiver_uses_generic_type(spec.callable)
+    {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Values,
+            SemanticGapKind::Unsupported,
+            "generic Go callable and receiver type substitutions are not yet represented",
+        )?;
+    }
 
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
     let body_work = Work::Statement {
@@ -471,6 +546,391 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Go,
+            callable,
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(GoLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let mapping_node = slot
+                .names
+                .first()
+                .and_then(|slot_name| {
+                    children_by_field_name(declaration, "name")
+                        .into_iter()
+                        .find(|name| node_text(self.prepared.source(), *name) == Some(slot_name))
+                })
+                .unwrap_or(declaration);
+            let metadata = self.value_mapping(builder, mapping_node)?;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    GoLoweringError::Invalid("too many Go formal parameters".into())
+                })?;
+                value
+            };
+            if let Some(type_node) = declaration.child_by_field_name("type")
+                && let Some(identity) = go_type_identity(type_node, self.prepared.source())
+            {
+                self.value_types.insert(value, identity);
+            }
+            for name in slot.names {
+                if name != "_" {
+                    self.parameters.insert(name.into_boxed_str(), value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(GoLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node != body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            match node.kind() {
+                "var_spec" => self.preindex_var_spec(builder, node)?,
+                "short_var_declaration" => self.preindex_short_declaration(builder, node)?,
+                "range_clause" if direct_child_kind(node, ":=") => {
+                    self.preindex_range_declaration(builder, node)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn preindex_var_spec(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        spec: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let names = children_by_field_name(spec, "name");
+        if names.is_empty() {
+            return Ok(());
+        }
+        let values = spec
+            .child_by_field_name("value")
+            .map(expression_sequence)
+            .unwrap_or_default();
+        let declared_type = spec
+            .child_by_field_name("type")
+            .and_then(|node| go_type_identity(node, self.prepared.source()));
+        for (index, name) in names.into_iter().enumerate() {
+            let inferred_type = (declared_type.is_none() && values.len() == 1)
+                .then(|| self.expression_type_identity(values[0], spec.start_byte()))
+                .flatten()
+                .or_else(|| {
+                    (declared_type.is_none() && values.len() > 1)
+                        .then(|| {
+                            values.get(index).and_then(|value| {
+                                self.expression_type_identity(*value, spec.start_byte())
+                            })
+                        })
+                        .flatten()
+                });
+            self.preindex_local(builder, name, spec, declared_type.clone().or(inferred_type))?;
+        }
+        Ok(())
+    }
+
+    fn preindex_short_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(left) = declaration.child_by_field_name("left") else {
+            return Ok(());
+        };
+        let Some(right) = declaration.child_by_field_name("right") else {
+            return Ok(());
+        };
+        let names = expression_sequence(left);
+        let values = expression_sequence(right);
+        for (index, name) in names.into_iter().enumerate() {
+            if name.kind() != "identifier" {
+                continue;
+            }
+            let inferred_type = (names_len_matches_values(left, right))
+                .then(|| {
+                    values.get(index).and_then(|value| {
+                        self.expression_type_identity(*value, declaration.start_byte())
+                    })
+                })
+                .flatten();
+            self.preindex_local(builder, name, declaration, inferred_type)?;
+        }
+        Ok(())
+    }
+
+    fn preindex_range_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(left) = declaration.child_by_field_name("left") else {
+            return Ok(());
+        };
+        for name in expression_sequence(left) {
+            if name.kind() == "identifier" {
+                self.preindex_local(builder, name, declaration, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preindex_local(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        name_node: Node<'tree>,
+        declaration: Node<'tree>,
+        identity: Option<GoTypeIdentity>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), name_node) else {
+            return Ok(());
+        };
+        if name == "_" {
+            return Ok(());
+        }
+        let Some((scope_start, scope_end)) = go_local_scope(declaration) else {
+            return Ok(());
+        };
+        if declaration.kind() == "short_var_declaration"
+            && self
+                .local_in_exact_scope(name, declaration.start_byte(), scope_start, scope_end)
+                .is_some()
+        {
+            return Ok(());
+        }
+        let metadata = self.value_mapping(builder, name_node)?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        if let Some(identity) = identity {
+            self.value_types.insert(value, identity);
+        }
+        self.locals
+            .entry(name.into())
+            .or_default()
+            .push(LocalBinding {
+                declaration_start: name_node.start_byte(),
+                visible_from: declaration.end_byte(),
+                scope_start,
+                scope_end,
+                value,
+            });
+        Ok(())
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| {
+                (
+                    binding.scope_end - binding.scope_start,
+                    std::cmp::Reverse(binding.visible_from),
+                )
+            })
+            .map(|binding| binding.value)
+    }
+
+    fn local_in_exact_scope(
+        &self,
+        name: &str,
+        byte: usize,
+        scope_start: usize,
+        scope_end: usize,
+    ) -> Option<ValueId> {
+        self.locals.get(name)?.iter().find_map(|binding| {
+            (binding.visible_from <= byte
+                && binding.scope_start == scope_start
+                && binding.scope_end == scope_end)
+                .then_some(binding.value)
+        })
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        self.locals.get(name)?.iter().find_map(|binding| {
+            (binding.declaration_start == declaration_start).then_some(binding.value)
+        })
+    }
+
+    fn binding_value(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_at(name, byte)
+            .or_else(|| self.parameters.get(name).copied())
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, GoLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        if let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
+            self.value_types.insert(value, identity);
+        }
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, GoLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn expression_type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
+        match node.kind() {
+            "identifier" => {
+                let name = node_text(self.prepared.source(), node)?;
+                let value = self.binding_value(name, byte)?;
+                self.value_types.get(&value).cloned()
+            }
+            "parenthesized_expression" => first_runtime_named_child(node)
+                .and_then(|child| self.expression_type_identity(child, byte)),
+            "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                let operand = node.child_by_field_name("operand")?;
+                let mut identity = self.expression_type_identity(operand, byte)?;
+                identity.pointer_depth = identity.pointer_depth.checked_add(1)?;
+                Some(identity)
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                let operand = node.child_by_field_name("operand")?;
+                let mut identity = self.expression_type_identity(operand, byte)?;
+                identity.pointer_depth = identity.pointer_depth.checked_sub(1)?;
+                Some(identity)
+            }
+            "composite_literal" => {
+                go_type_identity(node.child_by_field_name("type")?, self.prepared.source())
+            }
+            "call_expression" if self.is_builtin_new_call(node) => {
+                let argument = all_call_arguments(node).into_iter().next()?;
+                let mut identity = go_type_identity(argument, self.prepared.source())?;
+                identity.pointer_depth = identity.pointer_depth.checked_add(1)?;
+                Some(identity)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_builtin_new_call(&self, node: Node<'tree>) -> bool {
+        if node.kind() != "call_expression"
+            || self.package_new_shadowed
+            || all_call_arguments(node).len() != 1
+        {
+            return false;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return false;
+        };
+        if function.kind() != "identifier"
+            || node_text(self.prepared.source(), function) != Some("new")
+            || self.binding_value("new", node.start_byte()).is_some()
+        {
+            return false;
+        }
+        all_call_arguments(node)
+            .into_iter()
+            .next()
+            .is_some_and(|argument| is_go_type_syntax(argument.kind()))
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), GoLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let Some(source) = self.binding_value(name, node.start_byte()) else {
+            return Ok(());
+        };
+        let kind = if Some(source) == self.receiver {
+            ValueFlowKind::Receiver
+        } else if self.local_at(name, node.start_byte()) == Some(source) {
+            ValueFlowKind::Local
+        } else {
+            ValueFlowKind::Parameter
+        };
+        if source != target {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -621,7 +1081,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     CompletionKind::Continue
                 };
                 let label_node = control_label_node(node);
-                let label = label_node.and_then(|label| node_text(self.source, label));
+                let label = label_node.and_then(|label| node_text(self.prepared.source(), label));
                 self.abrupt(builder, entry, scope, completion, label)
             }
             "labeled_statement" => {
@@ -680,11 +1140,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let expressions = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &expressions, next, scope, stack)
             }
-            "var_declaration" => {
-                let initializers = declaration_initializers(node);
-                self.note_deterministic_evaluation_order(builder, entry, node, &initializers)?;
-                self.schedule_expressions(builder, entry, &initializers, next, scope, stack)
-            }
+            "var_declaration" => self.var_declaration(builder, node, entry, next, scope, stack),
             "const_declaration"
             | "type_declaration"
             | "function_declaration"
@@ -711,6 +1167,49 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let value = (!values.is_empty())
             .then(|| self.value(builder, terminal, SemanticValueKind::Return))
             .transpose()?;
+        if let ([source_node], Some(target)) = (values.as_slice(), value) {
+            let source =
+                self.expression_value(builder, *source_node, expression_value_kind(*source_node))?;
+            let identity_preserving =
+                self.return_shape_supported && source_node.kind() != "type_conversion_expression";
+            if identity_preserving {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        target,
+                    },
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::ReturnFlow,
+                    if self.return_shape_supported {
+                        SemanticGapKind::Unknown
+                    } else {
+                        SemanticGapKind::Unsupported
+                    },
+                    if self.return_shape_supported {
+                        "explicit Go return conversion result identity is intentionally not propagated"
+                    } else {
+                        "Go named, tuple, and multi-result return flow is not yet lowered"
+                    },
+                )?;
+            }
+        } else if values.len() > 1 {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ReturnFlow,
+                SemanticGapKind::Unsupported,
+                "Go tuple and multi-result return flow is not yet lowered",
+            )?;
+        }
         self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
         self.abrupt(builder, terminal, scope, CompletionKind::Return, None)?;
         if values.is_empty() {
@@ -739,6 +1238,96 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), GoLoweringError> {
         let evaluations = assignment_evaluation_nodes(node);
         let boundary = self.point(builder, node, Vec::new())?;
+        let operator_is_simple = node.kind() == "short_var_declaration"
+            || node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "=");
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        let left_items = left.map(expression_sequence).unwrap_or_default();
+        let right_items = right.map(expression_sequence).unwrap_or_default();
+        let simple_pair = operator_is_simple
+            && left_items.len() == 1
+            && right_items.len() == 1
+            && left_items[0].kind() == "identifier";
+
+        if simple_pair {
+            let name_node = left_items[0];
+            let source_node = right_items[0];
+            let name = node_text(self.prepared.source(), name_node).ok_or_else(|| {
+                GoLoweringError::Invalid("Go assignment has invalid identifier range".into())
+            })?;
+            if name != "_" {
+                let target = if node.kind() == "short_var_declaration" {
+                    self.local_declaration_value(name, name_node.start_byte())
+                        .or_else(|| self.binding_value(name, node.start_byte()))
+                } else {
+                    self.binding_value(name, node.start_byte())
+                };
+                if let Some(target) = target {
+                    let value = self.expression_value(
+                        builder,
+                        source_node,
+                        expression_value_kind(source_node),
+                    )?;
+                    let identity_preserving = node.kind() == "short_var_declaration"
+                        && self.local_declaration_value(name, name_node.start_byte())
+                            == Some(target)
+                        || self.value_types.get(&target).is_some_and(|target_type| {
+                            self.expression_type_identity(source_node, node.start_byte())
+                                .is_some_and(|source_type| source_type == *target_type)
+                        });
+                    if identity_preserving {
+                        self.append_effect(
+                            builder,
+                            boundary,
+                            SemanticEffect::Assignment { target, value },
+                        )?;
+                        let kind = if Some(target) == self.receiver {
+                            ValueFlowKind::Receiver
+                        } else if self
+                            .local_at(name, node.end_byte())
+                            .is_some_and(|local| local == target)
+                        {
+                            ValueFlowKind::Local
+                        } else {
+                            ValueFlowKind::Parameter
+                        };
+                        self.append_effect(
+                            builder,
+                            boundary,
+                            SemanticEffect::ValueFlow {
+                                kind,
+                                source: value,
+                                target,
+                            },
+                        )?;
+                    } else {
+                        self.add_gap(
+                            builder,
+                            boundary,
+                            SemanticGapSubject::Value(target),
+                            SemanticCapability::Values,
+                            SemanticGapKind::Unknown,
+                            "Go assignment may perform a conversion or lacks a structured identity type",
+                        )?;
+                    }
+                }
+            }
+        } else if !left_items.is_empty() || !right_items.is_empty() {
+            self.add_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                if operator_is_simple {
+                    "Go tuple, multi-result, and multi-target assignment flow is not yet lowered"
+                } else {
+                    "Go compound assignment flow is not yet lowered"
+                },
+            )?;
+        }
         if node.kind() == "assignment_statement"
             && node
                 .child_by_field_name("left")
@@ -767,6 +1356,111 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             builder,
             entry,
             &evaluations,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn var_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let initializers = declaration_initializers(node);
+        if initializers.is_empty() {
+            return self.edge(builder, entry, next);
+        }
+        let boundary = self.point(builder, node, Vec::new())?;
+        let mut lowered_any = false;
+        let mut unsupported = false;
+        for spec in go_var_specs(node) {
+            let names = children_by_field_name(spec, "name");
+            let values = spec
+                .child_by_field_name("value")
+                .map(expression_sequence)
+                .unwrap_or_default();
+            if names.len() != 1 || values.len() != 1 {
+                unsupported |= !values.is_empty();
+                continue;
+            }
+            let name_node = names[0];
+            let value_node = values[0];
+            let Some(name) = node_text(self.prepared.source(), name_node) else {
+                continue;
+            };
+            if name == "_" {
+                continue;
+            }
+            let Some(target) = self.local_declaration_value(name, name_node.start_byte()) else {
+                continue;
+            };
+            let value =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let inferred = spec.child_by_field_name("type").is_none();
+            let identity_preserving = inferred
+                || self.value_types.get(&target).is_some_and(|target_type| {
+                    self.expression_type_identity(value_node, spec.start_byte())
+                        .is_some_and(|source_type| source_type == *target_type)
+                });
+            if identity_preserving {
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: value,
+                        target,
+                    },
+                )?;
+                lowered_any = true;
+            } else {
+                self.add_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "explicitly typed Go local initialization may perform a non-identity conversion",
+                )?;
+            }
+        }
+        if unsupported {
+            self.add_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "Go multi-name, tuple, and multi-result var initialization flow is not yet lowered",
+            )?;
+        }
+        if !lowered_any && !unsupported {
+            self.add_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "Go local initializer identity could not be established structurally",
+            )?;
+        }
+        self.edge(builder, boundary, next)?;
+        self.note_deterministic_evaluation_order(builder, boundary, node, &initializers)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &initializers,
             EdgeTarget::normal(boundary),
             scope,
             stack,
@@ -1098,7 +1792,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .into_iter()
             .find(|child| child.id() != body.id());
         let label = attached_label
-            .and_then(|label| node_text(self.source, label))
+            .and_then(|label| node_text(self.prepared.source(), label))
             .map(Box::<str>::from);
         match control {
             None => self.infinite_loop(builder, body, entry, next, scope, label, stack),
@@ -1421,7 +2115,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), GoLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        if node.kind() == "identifier" {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
         match node.kind() {
+            "call_expression" if self.is_builtin_new_call(node) => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Object)?;
+                self.edge(builder, entry, next)
+            }
             "call_expression" => self.call_expression(builder, node, entry, next, scope, stack),
             "func_literal" => self.callable_expression(builder, node, entry, next),
             "binary_expression" if go_boolean_operator_kind(node).is_some() => {
@@ -1444,10 +2147,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "parenthesized_expression" => {
                 if let Some(value) = first_runtime_named_child(node) {
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let source =
+                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: source,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
                     stack.push(Work::Expression {
                         node: value,
                         entry,
-                        next,
+                        next: EdgeTarget::normal(terminal),
                         scope,
                     });
                     Ok(())
@@ -1475,21 +2190,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
+            "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                let operand = required_field(node, "operand")?;
+                let terminal = self.point(builder, node, Vec::new())?;
+                let source =
+                    self.expression_value(builder, operand, expression_value_kind(operand))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: source,
+                    },
+                )?;
+                self.edge(builder, terminal, next)?;
+                stack.push(Work::Expression {
+                    node: operand,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
             "selector_expression"
             | "index_expression"
             | "slice_expression"
             | "type_assertion_expression" => {
+                let boundary = self.point(builder, node, Vec::new())?;
                 self.add_gap(
                     builder,
-                    entry,
+                    boundary,
                     SemanticGapSubject::Point,
                     SemanticCapability::ExceptionalControlFlow,
                     SemanticGapKind::Unknown,
                     "selection, indexing, slicing, or type assertion may panic",
                 )?;
+                self.edge(builder, boundary, next)?;
                 let children = runtime_expression_children(node);
                 self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
             }
             "binary_expression" | "unary_expression" => {
                 if go_operation_can_panic(node) {
@@ -1506,14 +2252,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
-            "type_conversion_expression"
-            | "composite_literal"
-            | "literal_value"
-            | "literal_element"
-            | "keyed_element"
-            | "expression_list"
-            | "argument_list"
-            | "variadic_argument" => {
+            "type_conversion_expression" => {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go conversion result identity is intentionally not propagated",
+                )?;
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "composite_literal" => {
+                let kind = match node.child_by_field_name("type").map(|node| node.kind()) {
+                    Some(
+                        "array_type" | "implicit_length_array_type" | "slice_type" | "map_type",
+                    ) => AllocationKind::Array,
+                    _ => AllocationKind::Object,
+                };
+                self.session.add_allocation(builder, entry, result, kind)?;
+                let children = runtime_expression_children(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "literal_value" | "literal_element" | "keyed_element" | "expression_list"
+            | "argument_list" | "variadic_argument" => {
                 let children = runtime_expression_children(node);
                 self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
@@ -1537,13 +2301,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let function = required_field(node, "function")?;
+        let callee = self.source_value(builder, function, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, function, SemanticValueKind::Exception)?;
         let receiver_node = go_call_receiver(function);
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
             .transpose()?;
         let callable_kind = if receiver.is_some() {
             CallableReferenceKind::BoundMethod
@@ -1570,7 +2336,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let arguments = call_arguments(node);
         let argument_values = arguments
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(
+                |argument| -> Result<SemanticCallArgument, GoLoweringError> {
+                    let value_node = if argument.kind() == "variadic_argument" {
+                        first_runtime_named_child(*argument).unwrap_or(*argument)
+                    } else {
+                        *argument
+                    };
+                    let value = self.expression_value(
+                        builder,
+                        value_node,
+                        expression_value_kind(value_node),
+                    )?;
+                    Ok(if argument.kind() == "variadic_argument" {
+                        SemanticCallArgument {
+                            value,
+                            expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                        }
+                    } else {
+                        SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                    })
+                },
+            )
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -1578,7 +2365,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: argument_values.into_iter().map(Into::into).collect(),
+                arguments: argument_values.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -1625,11 +2412,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn callable_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        _node: Node<'tree>,
+        node: Node<'tree>,
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), GoLoweringError> {
-        let result = self.value(builder, entry, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
         let resolution = CallableTargetResolution::Unknown;
         let metadata = self.metadata(entry)?;
         let kind = CallableReferenceKind::Lambda;
@@ -1874,6 +2661,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let range = node.byte_range();
         let occurrence = self.session.next_source_occurrence(range.start, range.end);
         let anchor = source_anchor(node, occurrence).map_err(GoLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, GoLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(GoLoweringError::Invalid)?;
         self.session
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
@@ -2158,12 +2955,16 @@ fn call_operand_evaluations(
 }
 
 fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
-    node.child_by_field_name("arguments")
-        .map(named_children)
-        .unwrap_or_default()
+    all_call_arguments(node)
         .into_iter()
         .filter(|argument| !is_go_type_syntax(argument.kind()))
         .collect()
+}
+
+fn all_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    node.child_by_field_name("arguments")
+        .map(named_children)
+        .unwrap_or_default()
 }
 
 fn go_call_receiver(function: Node<'_>) -> Option<Node<'_>> {
@@ -2295,6 +3096,185 @@ fn is_runtime_leaf(kind: &str) -> bool {
             | "escape_sequence"
             | "comment"
     )
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "func_literal" => SemanticValueKind::Callable,
+        "int_literal"
+        | "float_literal"
+        | "imaginary_literal"
+        | "rune_literal"
+        | "interpreted_string_literal"
+        | "raw_string_literal"
+        | "true"
+        | "false"
+        | "nil"
+        | "iota" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+fn go_type_identity(node: Node<'_>, source: &str) -> Option<GoTypeIdentity> {
+    let mut current = node;
+    let mut pointer_depth = 0usize;
+    loop {
+        match current.kind() {
+            "pointer_type" => {
+                pointer_depth = pointer_depth.checked_add(1)?;
+                current = first_named_child(current)?;
+            }
+            "parenthesized_type" => current = first_named_child(current)?,
+            // Substituting a generic type or interface constraint can change
+            // method sets and identity; leave those paths explicitly open.
+            "generic_type"
+            | "interface_type"
+            | "type_parameter_list"
+            | "type_parameter_declaration"
+            | "type_constraint" => return None,
+            "type_identifier" | "qualified_type" => {
+                let name = nonempty_node_text(source, current)?.trim();
+                return (!name.is_empty()).then(|| GoTypeIdentity {
+                    pointer_depth,
+                    name: name.into(),
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_go_callable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration" | "method_declaration" | "func_literal"
+    )
+}
+
+fn go_receiver_uses_generic_type(callable: Node<'_>) -> bool {
+    let Some(receiver) = callable.child_by_field_name("receiver") else {
+        return false;
+    };
+    let mut stack = vec![receiver];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "generic_type" | "type_arguments") {
+            return true;
+        }
+        let children = named_children(node);
+        stack.extend(children);
+    }
+    false
+}
+
+fn go_local_scope(declaration: Node<'_>) -> Option<(usize, usize)> {
+    let mut child = declaration;
+    let mut parent = declaration.parent();
+    while let Some(node) = parent {
+        let owns_header_declaration = match node.kind() {
+            "for_statement" => node.child_by_field_name("body").is_none_or(|body| {
+                !(body.start_byte() <= child.start_byte() && child.end_byte() <= body.end_byte())
+            }),
+            "if_statement" | "expression_switch_statement" | "type_switch_statement" => node
+                .child_by_field_name("initializer")
+                .is_some_and(|initializer| {
+                    initializer.start_byte() <= declaration.start_byte()
+                        && declaration.end_byte() <= initializer.end_byte()
+                }),
+            _ => false,
+        };
+        if owns_header_declaration || node.kind() == "block" {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        child = node;
+        parent = node.parent();
+    }
+    None
+}
+
+fn go_var_specs(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut specs = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "var_spec" {
+            specs.push(current);
+            continue;
+        }
+        let children = named_children(current);
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    specs.sort_by_key(Node::start_byte);
+    specs
+}
+
+fn names_len_matches_values(left: Node<'_>, right: Node<'_>) -> bool {
+    expression_sequence(left).len() == expression_sequence(right).len()
+}
+
+fn go_package_binding_shadows_new(root: Node<'_>, source: &str) -> bool {
+    if super::declarations::collect_go_import_infos(root, source)
+        .into_iter()
+        .any(|import| {
+            import.identifier.as_deref() == Some("new")
+                && !matches!(import.alias.as_deref(), Some("_" | "."))
+        })
+    {
+        return true;
+    }
+    let mut stack = named_children(root);
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_declaration" | "type_spec" | "type_alias" => {
+                if node
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(source, name))
+                    == Some("new")
+                {
+                    return true;
+                }
+            }
+            "var_spec" | "const_spec" => {
+                if children_by_field_name(node, "name")
+                    .into_iter()
+                    .any(|name| node_text(source, name) == Some("new"))
+                {
+                    return true;
+                }
+            }
+            "import_declaration" | "type_declaration" | "var_declaration" | "const_declaration" => {
+                stack.extend(named_children(node))
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn go_callable_result_shadows_new(callable: Node<'_>, source: &str) -> bool {
+    let Some(result) = callable
+        .child_by_field_name("result")
+        .filter(|result| result.kind() == "parameter_list")
+    else {
+        return false;
+    };
+    let mut stack = vec![result];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node_text(source, node) == Some("new") {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
 }
 
 const fn completion_label(kind: CompletionKind) -> &'static str {

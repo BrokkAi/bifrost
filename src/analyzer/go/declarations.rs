@@ -1,7 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, GO_MODULE_SCOPE_SEGMENT, ImportInfo, ParameterMetadata, ProjectFile,
-    SignatureMetadata,
+    CodeUnit, CodeUnitType, DispatchExtensibility, GO_MODULE_SCOPE_SEGMENT, ImportInfo,
+    ParameterMetadata, ProjectFile, SignatureMetadata,
 };
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -306,6 +306,7 @@ fn visit_go_type_spec(
         Some(code_unit.clone()),
     );
     parsed.add_signature(code_unit.clone(), go_type_signature(node, source));
+    parsed.add_raw_supertypes(code_unit.clone(), go_embedded_type_texts(type_node, source));
 
     match type_node.kind() {
         "struct_type" => visit_go_struct_fields(
@@ -418,9 +419,11 @@ fn visit_go_struct_fields(
                             Some(parent.clone()),
                         );
                     }
-                    parsed.add_signature(
+                    let type_text = go_node_text(type_node, source).trim().to_string();
+                    parsed.add_signature_with_metadata(
                         code_unit,
-                        go_node_text(type_node, source).trim().to_string(),
+                        SignatureMetadata::new(type_text.clone(), Vec::new())
+                            .with_return_type_text(Some(type_text)),
                     );
                 }
                 continue;
@@ -451,7 +454,15 @@ fn visit_go_struct_fields(
                         Some(parent.clone()),
                     );
                 }
-                parsed.add_signature(code_unit, format!("{field_name}{suffix}"));
+                let type_text = field
+                    .child_by_field_name("type")
+                    .map(|type_node| go_node_text(type_node, source).trim().to_string())
+                    .filter(|type_text| !type_text.is_empty());
+                parsed.add_signature_with_metadata(
+                    code_unit,
+                    SignatureMetadata::new(format!("{field_name}{suffix}"), Vec::new())
+                        .with_return_type_text(type_text),
+                );
                 if let Some(nested_type) = go_field_inline_container_type(field) {
                     let nested_has_source_range = record_ranges && index == 0;
                     match nested_type.kind() {
@@ -698,8 +709,17 @@ fn go_signature_metadata(
     source: &str,
     parameter_text: &str,
 ) -> SignatureMetadata {
+    let enrich = |metadata: SignatureMetadata| {
+        metadata
+            .with_return_type_text(go_callable_return_type_text(node, source))
+            .with_dispatch_extensibility(if node.kind() == "method_elem" {
+                DispatchExtensibility::Open
+            } else {
+                DispatchExtensibility::Closed
+            })
+    };
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return enrich(SignatureMetadata::new(signature, Vec::new()));
     };
     let raw = go_node_text(node, source);
     let leading_trim_bytes = raw.len().saturating_sub(raw.trim_start().len());
@@ -709,7 +729,7 @@ fn go_signature_metadata(
         .saturating_sub(leading_trim_bytes);
     let parameters_end = parameters_start + parameter_text.len();
     if signature.get(parameters_start..parameters_end) != Some(parameter_text) {
-        return SignatureMetadata::new(signature, Vec::new());
+        return enrich(SignatureMetadata::new(signature, Vec::new()));
     }
     let mut search_start = parameters_start;
     let parameters = go_parameter_label_nodes(node)
@@ -727,7 +747,68 @@ fn go_signature_metadata(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    enrich(SignatureMetadata::new(signature, parameters))
+}
+
+fn go_callable_return_type_text(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("result")
+        .filter(|result| result.kind() != "parameter_list")
+        .map(|result| go_node_text(result, source).trim().to_string())
+        .filter(|result| !result.is_empty())
+}
+
+fn go_embedded_type_texts(node: Node<'_>, source: &str) -> Vec<String> {
+    let candidates = match node.kind() {
+        "struct_type" => {
+            let Some(fields) = named_children_of_kind(node, "field_declaration_list")
+                .into_iter()
+                .next()
+            else {
+                return Vec::new();
+            };
+            named_children_of_kind(fields, "field_declaration")
+                .into_iter()
+                .filter(|field| children_by_field(*field, "name").is_empty())
+                .filter_map(|field| field.child_by_field_name("type"))
+                .collect()
+        }
+        "interface_type" => named_children_of_kind(node, "type_elem")
+            .into_iter()
+            .filter_map(|element| {
+                let children = named_children(element);
+                let [embedded] = children.as_slice() else {
+                    return None;
+                };
+                matches!(embedded.kind(), "type_identifier" | "qualified_type").then_some(*embedded)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut embedded = candidates
+        .into_iter()
+        .map(|candidate| go_node_text(candidate, source).trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+        .collect::<Vec<_>>();
+    embedded.sort();
+    embedded.dedup();
+    embedded
+}
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
+
+fn named_children_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == kind)
+        .collect()
+}
+
+fn children_by_field<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name(field, &mut cursor).collect()
 }
 
 fn go_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
