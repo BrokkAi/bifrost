@@ -87,38 +87,22 @@ impl<'graph> TryFrom<&'graph SemanticOutcome<IcfgSnapshot>> for IcfgSolveInput<'
     type Error = DataflowError;
 
     fn try_from(outcome: &'graph SemanticOutcome<IcfgSnapshot>) -> Result<Self, Self::Error> {
-        let (status, snapshot) = match outcome {
-            SemanticOutcome::Complete { value, .. } => (IcfgInputStatus::Complete, Some(value)),
-            SemanticOutcome::Ambiguous { candidates, .. } => {
-                (IcfgInputStatus::Ambiguous, Some(candidates))
-            }
-            SemanticOutcome::Unknown { partial, .. } => {
-                (IcfgInputStatus::Unknown, partial.as_ref())
-            }
-            SemanticOutcome::Unsupported {
-                capability,
-                partial,
-                ..
-            } => (
-                IcfgInputStatus::Unsupported {
-                    capability: *capability,
-                },
-                partial.as_ref(),
-            ),
-            SemanticOutcome::Unproven { partial, .. } => (IcfgInputStatus::Unproven, Some(partial)),
-            SemanticOutcome::ExceededBudget {
-                partial, exceeded, ..
-            } => (
-                IcfgInputStatus::ExceededBudget {
-                    exceeded: *exceeded,
-                },
-                partial.as_ref(),
-            ),
-            SemanticOutcome::Cancelled { partial, .. } => {
-                (IcfgInputStatus::Cancelled, partial.as_ref())
-            }
+        let status = match outcome {
+            SemanticOutcome::Complete { .. } => IcfgInputStatus::Complete,
+            SemanticOutcome::Ambiguous { .. } => IcfgInputStatus::Ambiguous,
+            SemanticOutcome::Unknown { .. } => IcfgInputStatus::Unknown,
+            SemanticOutcome::Unsupported { capability, .. } => IcfgInputStatus::Unsupported {
+                capability: *capability,
+            },
+            SemanticOutcome::Unproven { .. } => IcfgInputStatus::Unproven,
+            SemanticOutcome::ExceededBudget { exceeded, .. } => IcfgInputStatus::ExceededBudget {
+                exceeded: *exceeded,
+            },
+            SemanticOutcome::Cancelled { .. } => IcfgInputStatus::Cancelled,
         };
-        let snapshot = snapshot.ok_or(DataflowError::MissingIcfgSnapshot { status })?;
+        let snapshot = outcome
+            .available_value()
+            .ok_or(DataflowError::MissingIcfgSnapshot { status })?;
         Ok(Self::new(snapshot, status))
     }
 }
@@ -151,7 +135,7 @@ impl SolverWork {
         }
     }
 
-    pub fn checked_add(self, other: Self) -> Option<Self> {
+    fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             interned_facts: self.interned_facts.checked_add(other.interned_facts)?,
             reached_states: self.reached_states.checked_add(other.reached_states)?,
@@ -162,7 +146,7 @@ impl SolverWork {
         })
     }
 
-    pub const fn saturating_sub(self, other: Self) -> Self {
+    pub(crate) const fn saturating_sub(self, other: Self) -> Self {
         Self {
             interned_facts: self.interned_facts.saturating_sub(other.interned_facts),
             reached_states: self.reached_states.saturating_sub(other.reached_states),
@@ -185,7 +169,7 @@ pub enum SolverBudgetDimension {
 }
 
 impl SolverBudgetDimension {
-    pub const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::InternedFacts,
         Self::ReachedStates,
         Self::FlowEvaluations,
@@ -360,14 +344,14 @@ impl PathQuality {
     pub const PROVEN_PARTIAL: Self = Self::new(true, false);
     pub const UNPROVEN_COMPLETE: Self = Self::new(false, true);
     pub const UNPROVEN_PARTIAL: Self = Self::new(false, false);
-    pub const ALL: [Self; 4] = [
+    const ALL: [Self; 4] = [
         Self::PROVEN_COMPLETE,
         Self::PROVEN_PARTIAL,
         Self::UNPROVEN_COMPLETE,
         Self::UNPROVEN_PARTIAL,
     ];
 
-    pub const fn new(proven: bool, complete: bool) -> Self {
+    const fn new(proven: bool, complete: bool) -> Self {
         Self { proven, complete }
     }
 
@@ -379,7 +363,7 @@ impl PathQuality {
         self.complete
     }
 
-    pub fn through_edge(self, edge: &IcfgEdge) -> Self {
+    pub(crate) fn through_edge(self, edge: &IcfgEdge) -> Self {
         Self {
             proven: self.proven && matches!(&edge.proof, ProofStatus::Proven),
             complete: self.complete && matches!(&edge.completeness, EvidenceCompleteness::Complete),
@@ -387,18 +371,12 @@ impl PathQuality {
     }
 
     /// Whether this path is at least as strong on both quality axes.
-    pub const fn dominates(self, other: Self) -> bool {
+    const fn dominates(self, other: Self) -> bool {
         (!other.proven || self.proven) && (!other.complete || self.complete)
     }
 
-    pub const fn strictly_dominates(self, other: Self) -> bool {
+    const fn strictly_dominates(self, other: Self) -> bool {
         (self.proven != other.proven || self.complete != other.complete) && self.dominates(other)
-    }
-}
-
-impl Default for PathQuality {
-    fn default() -> Self {
-        Self::UNPROVEN_PARTIAL
     }
 }
 
@@ -414,7 +392,7 @@ pub struct PathQualityFrontier {
 }
 
 impl PathQualityFrontier {
-    pub const fn singleton(quality: PathQuality) -> Self {
+    pub(crate) const fn singleton(quality: PathQuality) -> Self {
         Self {
             bits: quality_bit(quality),
         }
@@ -442,7 +420,7 @@ impl PathQualityFrontier {
 
     /// Insert one concrete path quality and discard only qualities it
     /// component-wise dominates. Returns whether the frontier changed.
-    pub fn insert(&mut self, candidate: PathQuality) -> bool {
+    pub(crate) fn insert(&mut self, candidate: PathQuality) -> bool {
         if self.iter().any(|existing| existing.dominates(candidate)) {
             return false;
         }

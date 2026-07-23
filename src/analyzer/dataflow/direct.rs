@@ -17,23 +17,11 @@ pub struct DirectFlowProblem {
 impl DirectFlowProblem {
     /// Construct a direct-flow problem from explicit snapshot-local seed nodes.
     ///
-    /// Nodes are sorted and deduplicated so the client emits canonical seeds;
-    /// the solver still validates every node against its input snapshot.
+    /// The kernel validates and canonicalizes the emitted seeds.
     pub fn new(seed_nodes: impl IntoIterator<Item = IcfgNodeId>) -> Self {
-        let mut seed_nodes = seed_nodes.into_iter().collect::<Vec<_>>();
-        seed_nodes.sort_unstable();
-        seed_nodes.dedup();
         Self {
-            seed_nodes: seed_nodes.into_boxed_slice(),
+            seed_nodes: seed_nodes.into_iter().collect(),
         }
-    }
-
-    pub fn seed_nodes(&self) -> &[IcfgNodeId] {
-        &self.seed_nodes
-    }
-
-    fn preserve(fact: DirectFact, out: &mut Vec<DirectFact>) {
-        out.push(fact);
     }
 }
 
@@ -53,33 +41,26 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
         );
     }
 
-    fn normal_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
-        Self::preserve(fact, out);
-    }
+    // `DirectFact` is the distinguished zero fact, which the kernel preserves.
+    fn normal_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
-        Self::preserve(fact, out);
-    }
+    fn call_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
 
-    fn return_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
-        Self::preserve(fact, out);
-    }
+    fn return_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
 
     fn call_to_return_flow(
         &self,
         _edge: DataflowEdge<'_>,
-        fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        _fact: Self::Fact,
+        _out: &mut Vec<Self::Fact>,
     ) {
-        Self::preserve(fact, out);
     }
 
     fn exceptional_flow(
         &self,
         _edge: DataflowEdge<'_>,
-        fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        _fact: Self::Fact,
+        _out: &mut Vec<Self::Fact>,
     ) {
-        Self::preserve(fact, out);
     }
 }

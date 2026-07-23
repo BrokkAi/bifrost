@@ -13,7 +13,7 @@ use crate::analyzer::semantic::{IcfgEdge, IcfgEdgeId, IcfgNodeId, IcfgNodeKey, I
 pub struct FactId(u32);
 
 impl FactId {
-    pub const fn new(raw: u32) -> Self {
+    pub(crate) const fn new(raw: u32) -> Self {
         Self(raw)
     }
 
@@ -21,7 +21,7 @@ impl FactId {
         self.0
     }
 
-    pub const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 
@@ -46,14 +46,6 @@ pub struct DataflowSeed<F> {
 impl<F> DataflowSeed<F> {
     pub const fn new(node: IcfgNodeId, fact: F) -> Self {
         Self { node, fact }
-    }
-
-    pub const fn node(&self) -> IcfgNodeId {
-        self.node
-    }
-
-    pub const fn fact(&self) -> &F {
-        &self.fact
     }
 }
 

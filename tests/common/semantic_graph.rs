@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::sync::Arc;
@@ -233,6 +233,18 @@ pub enum IcfgOutcomeKind {
     Unproven,
     ExceededBudget,
     Cancelled,
+}
+
+const fn icfg_outcome_kind(status: IcfgInputStatus) -> IcfgOutcomeKind {
+    match status {
+        IcfgInputStatus::Complete => IcfgOutcomeKind::Complete,
+        IcfgInputStatus::Ambiguous => IcfgOutcomeKind::Ambiguous,
+        IcfgInputStatus::Unknown => IcfgOutcomeKind::Unknown,
+        IcfgInputStatus::Unsupported { .. } => IcfgOutcomeKind::Unsupported,
+        IcfgInputStatus::Unproven => IcfgOutcomeKind::Unproven,
+        IcfgInputStatus::ExceededBudget { .. } => IcfgOutcomeKind::ExceededBudget,
+        IcfgInputStatus::Cancelled => IcfgOutcomeKind::Cancelled,
+    }
 }
 
 /// Typed boundary expectations that deliberately omit unstable target detail
@@ -1112,13 +1124,35 @@ impl SemanticGraph {
     }
 }
 
+/// Compute ordinary reachability over the materialized ICFG topology.
+pub fn reachable_icfg_nodes(
+    snapshot: &IcfgSnapshot,
+    seeds: impl IntoIterator<Item = IcfgNodeId>,
+) -> BTreeSet<IcfgNodeId> {
+    let mut reached = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for seed in seeds {
+        if reached.insert(seed) {
+            queue.push_back(seed);
+        }
+    }
+    while let Some(source) = queue.pop_front() {
+        for (_, edge) in snapshot.successor_edges(source) {
+            if reached.insert(edge.target) {
+                queue.push_back(edge.target);
+            }
+        }
+    }
+    reached
+}
+
 /// A bounded ICFG snapshot plus source-backed point and call-site aliases.
 ///
 /// Dense snapshot IDs remain an implementation detail. Nodes are selected by
 /// file, ordinary [`PointSelector`], and an exact call-context alias sequence.
 pub struct IcfgGraph {
     snapshot: IcfgSnapshot,
-    outcome: IcfgOutcomeKind,
+    input_status: IcfgInputStatus,
     files: HashMap<Box<str>, FixtureSemanticFile>,
     aliases: HashMap<Box<str>, IcfgNodeId>,
     call_aliases: HashMap<Box<str>, CallSiteHandle>,
@@ -1130,26 +1164,9 @@ impl IcfgGraph {
         &self.snapshot
     }
 
-    /// Pair this fixture with the exact payload-free provider status it kept.
-    ///
-    /// Unsupported and budget-exhausted outcomes carry typed payloads that
-    /// `IcfgOutcomeKind` intentionally does not retain; tests for those cases
-    /// should construct input directly from the original provider outcome.
-    pub fn solve_input(&self) -> IcfgSolveInput<'_> {
-        let status = match self.outcome {
-            IcfgOutcomeKind::Complete => IcfgInputStatus::Complete,
-            IcfgOutcomeKind::Ambiguous => IcfgInputStatus::Ambiguous,
-            IcfgOutcomeKind::Unknown => IcfgInputStatus::Unknown,
-            IcfgOutcomeKind::Unproven => IcfgInputStatus::Unproven,
-            IcfgOutcomeKind::Cancelled => IcfgInputStatus::Cancelled,
-            IcfgOutcomeKind::Unsupported | IcfgOutcomeKind::ExceededBudget => {
-                panic!(
-                    "{:?} ICFG fixture discarded a required status payload",
-                    self.outcome
-                )
-            }
-        };
-        IcfgSolveInput::new(&self.snapshot, status)
+    /// Pair this fixture with the exact provider status retained with its snapshot.
+    pub const fn solve_input(&self) -> IcfgSolveInput<'_> {
+        IcfgSolveInput::new(&self.snapshot, self.input_status)
     }
 
     /// Resolve a previously bound readable alias to its snapshot-local node.
@@ -1217,7 +1234,7 @@ impl IcfgGraph {
             .icfg_provider()
             .snapshot(&root, limits, request)
             .map_err(|error| SemanticGraphError::new(error.to_string()))?;
-        let (snapshot, outcome) = take_icfg_snapshot(outcome)?;
+        let (snapshot, input_status) = take_icfg_snapshot(outcome)?;
 
         let mut files = HashMap::new();
         insert_fixture_semantic_file(
@@ -1246,7 +1263,7 @@ impl IcfgGraph {
 
         Ok(Self {
             snapshot,
-            outcome,
+            input_status,
             files,
             aliases: HashMap::new(),
             call_aliases: HashMap::new(),
@@ -1254,12 +1271,12 @@ impl IcfgGraph {
     }
 
     pub const fn outcome(&self) -> IcfgOutcomeKind {
-        self.outcome
+        icfg_outcome_kind(self.input_status)
     }
 
     pub fn assert_outcome(&self, expected: IcfgOutcomeKind) {
         assert_eq!(
-            self.outcome,
+            self.outcome(),
             expected,
             "unexpected ICFG outcome\n\n{}",
             self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
@@ -1743,16 +1760,7 @@ impl IcfgGraph {
     fn assert_reachability(&self, from: &str, to: &str, expected: bool) {
         let from = self.bound_node(from);
         let to = self.bound_node(to);
-        let mut queue = VecDeque::from([from]);
-        let mut visited = HashSet::from([from]);
-        while let Some(node) = queue.pop_front() {
-            for (_, edge) in self.snapshot.successor_edges(node) {
-                if visited.insert(edge.target) {
-                    queue.push_back(edge.target);
-                }
-            }
-        }
-        let actual = visited.contains(&to);
+        let actual = reachable_icfg_nodes(&self.snapshot, [from]).contains(&to);
         if actual != expected {
             let relation = if expected { "reachable" } else { "unreachable" };
             panic!(
@@ -1944,30 +1952,43 @@ pub fn resolve_procedure_handle(
 
 fn take_icfg_snapshot(
     outcome: SemanticOutcome<IcfgSnapshot>,
-) -> Result<(IcfgSnapshot, IcfgOutcomeKind), SemanticGraphError> {
-    let missing = |kind: IcfgOutcomeKind| {
+) -> Result<(IcfgSnapshot, IcfgInputStatus), SemanticGraphError> {
+    let missing = |status: IcfgInputStatus| {
         SemanticGraphError::new(format!(
-            "ICFG provider returned {kind:?} without an available bounded snapshot"
+            "ICFG provider returned {:?} without an available bounded snapshot",
+            icfg_outcome_kind(status)
         ))
     };
     match outcome {
-        SemanticOutcome::Complete { value, .. } => Ok((value, IcfgOutcomeKind::Complete)),
+        SemanticOutcome::Complete { value, .. } => Ok((value, IcfgInputStatus::Complete)),
         SemanticOutcome::Ambiguous { candidates, .. } => {
-            Ok((candidates, IcfgOutcomeKind::Ambiguous))
+            Ok((candidates, IcfgInputStatus::Ambiguous))
         }
         SemanticOutcome::Unknown { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::Unknown))
-            .ok_or_else(|| missing(IcfgOutcomeKind::Unknown)),
-        SemanticOutcome::Unsupported { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::Unsupported))
-            .ok_or_else(|| missing(IcfgOutcomeKind::Unsupported)),
-        SemanticOutcome::Unproven { partial, .. } => Ok((partial, IcfgOutcomeKind::Unproven)),
-        SemanticOutcome::ExceededBudget { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::ExceededBudget))
-            .ok_or_else(|| missing(IcfgOutcomeKind::ExceededBudget)),
+            .map(|snapshot| (snapshot, IcfgInputStatus::Unknown))
+            .ok_or_else(|| missing(IcfgInputStatus::Unknown)),
+        SemanticOutcome::Unsupported {
+            capability,
+            partial,
+            ..
+        } => {
+            let status = IcfgInputStatus::Unsupported { capability };
+            partial
+                .map(|snapshot| (snapshot, status))
+                .ok_or_else(|| missing(status))
+        }
+        SemanticOutcome::Unproven { partial, .. } => Ok((partial, IcfgInputStatus::Unproven)),
+        SemanticOutcome::ExceededBudget {
+            partial, exceeded, ..
+        } => {
+            let status = IcfgInputStatus::ExceededBudget { exceeded };
+            partial
+                .map(|snapshot| (snapshot, status))
+                .ok_or_else(|| missing(status))
+        }
         SemanticOutcome::Cancelled { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::Cancelled))
-            .ok_or_else(|| missing(IcfgOutcomeKind::Cancelled)),
+            .map(|snapshot| (snapshot, IcfgInputStatus::Cancelled))
+            .ok_or_else(|| missing(IcfgInputStatus::Cancelled)),
     }
 }
 

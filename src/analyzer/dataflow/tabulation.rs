@@ -14,6 +14,8 @@ use super::{
     ReachedFact, SolverTermination, SolverWork,
 };
 
+const ZERO_FACT_ID: FactId = FactId::new(0);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ExplodedState {
     node: IcfgNodeId,
@@ -109,7 +111,7 @@ where
 
         let mut staged_facts = vec![zero_fact];
         let mut staged_fact_ids = HashMap::default();
-        staged_fact_ids.insert(zero_fact, FactId::new(0));
+        staged_fact_ids.insert(zero_fact, ZERO_FACT_ID);
         let mut staged_states = Vec::with_capacity(seeds.len());
 
         for seed in seeds {
@@ -130,7 +132,7 @@ where
             });
             staged_states.push(ExplodedState {
                 node: seed.node,
-                fact: FactId::new(0),
+                fact: ZERO_FACT_ID,
             });
         }
         staged_states.sort_unstable();
@@ -173,14 +175,16 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
+        let mut outputs = Vec::new();
         while let Some(queued) = self.worklist.pop_front() {
             if request.cancellation.is_cancelled() {
                 return Ok(SolverTermination::Cancelled);
             }
 
-            let Some(&path_qualities) = self.reached.get(&queued.state) else {
-                continue;
-            };
+            let path_qualities = *self
+                .reached
+                .get(&queued.state)
+                .expect("queued states remain in the reached table");
             if !path_qualities.contains(queued.quality) {
                 continue;
             }
@@ -208,10 +212,10 @@ where
 
                 let descriptor = DataflowEdge::from_snapshot(self.snapshot, edge_id)
                     .expect("validated ICFG edge remains in its immutable snapshot");
-                let mut outputs = Vec::new();
+                outputs.clear();
                 apply_transfer(problem, descriptor, fact, &mut outputs);
-                if queued.state.fact == FactId::new(0) {
-                    outputs.push(self.facts[FactId::new(0).index()]);
+                if queued.state.fact == ZERO_FACT_ID {
+                    outputs.push(self.facts[ZERO_FACT_ID.index()]);
                 }
 
                 // A callback may cooperatively cancel through a shared token.
@@ -224,7 +228,7 @@ where
                 outputs.dedup();
                 let output_quality = queued.quality.through_edge(edge);
                 if let Some(termination) =
-                    self.publish_outputs(edge.target, output_quality, outputs, request)?
+                    self.publish_outputs(edge.target, output_quality, &outputs, request)?
                 {
                     return Ok(termination);
                 }
@@ -246,7 +250,7 @@ where
         &mut self,
         target: IcfgNodeId,
         quality: PathQuality,
-        outputs: Vec<Fact>,
+        outputs: &[Fact],
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, DataflowError> {
         let propagated_outputs = outputs.len();
@@ -254,7 +258,7 @@ where
         let mut staged_states = Vec::with_capacity(propagated_outputs);
         let mut new_reached_states = 0;
 
-        for output in outputs {
+        for &output in outputs {
             let fact = match self.fact_ids.get(&output).copied() {
                 Some(fact) => fact,
                 None => {
@@ -270,11 +274,12 @@ where
             let state = ExplodedState { node: target, fact };
             let existing = self.reached.get(&state).copied();
             let mut prospective = existing.unwrap_or_default();
-            let changed = prospective.insert(quality);
-            if existing.is_none() {
-                new_reached_states += 1;
+            if prospective.insert(quality) {
+                if existing.is_none() {
+                    new_reached_states += 1;
+                }
+                staged_states.push((state, prospective));
             }
-            staged_states.push((state, prospective, changed));
         }
 
         let charge = SolverWork {
@@ -303,11 +308,9 @@ where
             self.facts.push(fact);
         }
 
-        for (state, path_qualities, changed) in staged_states {
-            if changed {
-                self.reached.insert(state, path_qualities);
-                self.worklist.push_back(QueuedState { state, quality });
-            }
+        for (state, path_qualities) in staged_states {
+            self.reached.insert(state, path_qualities);
+            self.worklist.push_back(QueuedState { state, quality });
         }
         Ok(None)
     }
@@ -316,8 +319,7 @@ where
         self,
         input_status: super::IcfgInputStatus,
         termination: SolverTermination,
-        initial_work: SolverWork,
-        final_work: SolverWork,
+        work: SolverWork,
     ) -> DataflowResult<Fact> {
         let reached_nodes = self
             .reached
@@ -345,13 +347,7 @@ where
             .collect::<Vec<_>>();
         reached.sort_unstable_by_key(|row| (row.node(), row.fact()));
 
-        DataflowResult::from_parts(
-            self.facts,
-            reached,
-            coverage,
-            termination,
-            final_work.saturating_sub(initial_work),
-        )
+        DataflowResult::from_parts(self.facts, reached, coverage, termination, work)
     }
 }
 
@@ -367,38 +363,15 @@ where
     let initial_work = request.budget.used();
     let mut state = TabulationState::new(input.snapshot());
 
-    if request.cancellation.is_cancelled() {
-        return Ok(state.finish(
-            input.status(),
-            SolverTermination::Cancelled,
-            initial_work,
-            request.budget.used(),
-        ));
-    }
-    if let Some(termination) = state.validate_snapshot(request)? {
-        return Ok(state.finish(
-            input.status(),
-            termination,
-            initial_work,
-            request.budget.used(),
-        ));
-    }
-    if let Some(termination) = state.initialize(problem, request)? {
-        return Ok(state.finish(
-            input.status(),
-            termination,
-            initial_work,
-            request.budget.used(),
-        ));
-    }
-
-    let termination = state.propagate(problem, request)?;
-    Ok(state.finish(
-        input.status(),
-        termination,
-        initial_work,
-        request.budget.used(),
-    ))
+    let termination = if let Some(termination) = state.validate_snapshot(request)? {
+        termination
+    } else if let Some(termination) = state.initialize(problem, request)? {
+        termination
+    } else {
+        state.propagate(problem, request)?
+    };
+    let work = request.budget.used().saturating_sub(initial_work);
+    Ok(state.finish(input.status(), termination, work))
 }
 
 fn apply_transfer<P>(problem: &P, edge: DataflowEdge<'_>, fact: P::Fact, out: &mut Vec<P::Fact>)

@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowError, DataflowRequest, DataflowResult, DataflowSeed, DirectFact,
@@ -18,7 +18,7 @@ use common::{
     dataflow_reference::reference_solve,
     semantic_graph::{
         CallContextSelector, ExpectedIcfgBoundary, ExpectedIcfgBoundaryKind, IcfgGraph,
-        PointSelector,
+        PointSelector, reachable_icfg_nodes,
     },
 };
 
@@ -157,27 +157,6 @@ fn result_nodes<Fact>(result: &DataflowResult<Fact>) -> BTreeSet<IcfgNodeId> {
         .collect()
 }
 
-fn ordinary_reachability(
-    snapshot: &IcfgSnapshot,
-    seeds: impl IntoIterator<Item = IcfgNodeId>,
-) -> BTreeSet<IcfgNodeId> {
-    let mut reached = BTreeSet::new();
-    let mut queue = VecDeque::new();
-    for seed in seeds {
-        if reached.insert(seed) {
-            queue.push_back(seed);
-        }
-    }
-    while let Some(source) = queue.pop_front() {
-        for (_, edge) in snapshot.successor_edges(source) {
-            if reached.insert(edge.target) {
-                queue.push_back(edge.target);
-            }
-        }
-    }
-    reached
-}
-
 fn has_fact<Fact: PartialEq>(result: &DataflowResult<Fact>, fact: Fact) -> bool {
     result.facts().contains(&fact)
 }
@@ -250,7 +229,7 @@ fn direct_client_equals_bounded_graph_reachability_and_reference_semantics() {
 
     assert_eq!(
         result_nodes(&result),
-        ordinary_reachability(graph.snapshot(), [root])
+        reachable_icfg_nodes(graph.snapshot(), [root])
     );
     assert_eq!(result_nodes(&result), reference.reached_nodes());
     assert_eq!(result.facts(), &[DirectFact]);
@@ -643,7 +622,7 @@ fn each_budget_dimension_stops_atomically_before_output_publication() {
     assert_eq!(complete.termination(), SolverTermination::FixedPoint);
     assert_eq!(
         reached_nodes_for_fact(&complete, &GeneratingFact::Seed),
-        ordinary_reachability(graph.snapshot(), [root]),
+        reachable_icfg_nodes(graph.snapshot(), [root]),
         "the distinguished zero fact must survive callbacks that omit it"
     );
 

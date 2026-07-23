@@ -26,10 +26,6 @@ impl<F: Copy + Ord> ReferenceDataflowResult<F> {
         &self.reached
     }
 
-    pub fn contains(&self, node: IcfgNodeId, fact: &F) -> bool {
-        self.reached.contains(&(node, *fact))
-    }
-
     pub fn reached_nodes(&self) -> BTreeSet<IcfgNodeId> {
         self.reached.iter().map(|(node, _)| *node).collect()
     }
