@@ -70,6 +70,14 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
         ),
         "manual string inputs must enter the workflow through environment variables"
     );
+    let job_environment = workflow
+        .split_once("    env:\n")
+        .and_then(|(_, rest)| rest.split_once("\n\n    steps:").map(|(env, _)| env))
+        .expect("benchmark job should define an environment block");
+    assert!(
+        !job_environment.contains("SLACK_DAILY_PERF_WEBHOOK_URL"),
+        "the Slack webhook must not be exposed through the job environment"
+    );
     assert!(
         workflow.contains(
             "if [ -n \"$BENCHMARK_REPO\" ]; then\n            args+=(--repo \"$BENCHMARK_REPO\")"
@@ -109,23 +117,53 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
         workflow.contains("strict_compare=\"${{ steps.paths.outputs.effective_strict_compare }}\""),
         "Slack must report the centralized strictness output"
     );
-    let slack_policy = "env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack))";
+    let slack_policy = "if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack))";
     assert_eq!(
         workflow.matches(slack_policy).count(),
+        1,
+        "the secret availability check must enforce the schedule-or-opted-in-dispatch policy"
+    );
+    assert_eq!(
+        workflow
+            .matches("${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}")
+            .count(),
         2,
-        "payload preparation and Slack transmission must share the schedule-or-opted-in-dispatch policy"
+        "only the availability check and Slack action may receive the webhook secret"
+    );
+    assert_eq!(
+        workflow
+            .matches("if: always() && steps.slack.outputs.enabled == 'true'")
+            .count(),
+        2,
+        "payload preparation and transmission must require the secret availability output"
+    );
+    assert!(
+        workflow.contains("webhook: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}"),
+        "the Slack action must receive the secret directly instead of through job state"
     );
 
     let compare = step_position(&workflow, "      - name: Compare against blessed baseline");
     let artifacts = step_position(&workflow, "      - name: Upload benchmark artifacts");
     let summary = step_position(&workflow, "      - name: Publish benchmark summary");
+    let slack_check = step_position(
+        &workflow,
+        "      - name: Check Slack notification availability",
+    );
+    let slack_payload = step_position(&workflow, "      - name: Prepare Slack payload");
     let slack = step_position(
         &workflow,
         "      - name: Send benchmark data to Slack Workflow",
     );
     let enforcement = step_position(&workflow, "      - name: Enforce benchmark outcome");
     assert!(workflow[compare..artifacts].contains("continue-on-error: true"));
-    assert!(compare < artifacts && artifacts < summary && summary < slack && slack < enforcement);
+    assert!(
+        compare < artifacts
+            && artifacts < summary
+            && summary < slack_check
+            && slack_check < slack_payload
+            && slack_payload < slack
+            && slack < enforcement
+    );
     assert!(
         workflow[enforcement..]
             .contains("if [ \"${{ steps.compare.outcome }}\" = \"failure\" ]; then"),

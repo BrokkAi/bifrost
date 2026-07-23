@@ -15,6 +15,9 @@ on:
         description: Validated Cargo package version
         value: ${{ jobs.validate.outputs.version }}
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     name: validate release context
@@ -26,14 +29,16 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           ref: ${{ inputs.tag }}
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Validate release version and metadata
         id: release

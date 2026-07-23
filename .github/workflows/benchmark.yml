@@ -41,23 +41,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
       BENCHMARK_REPO: ${{ inputs.repo || '' }}
       BENCHMARK_MAX_FILES: ${{ inputs.max_files || '' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.0
 
       - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cache benchmark repos
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: benchmark/.cache/repos
           key: benchmark-repos-${{ runner.os }}-${{ hashFiles('benchmark/targets.toml') }}
@@ -140,7 +141,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-${{ github.run_id }}
           path: benchmark/benchmark-output
@@ -172,9 +173,23 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check Slack notification availability
+        id: slack
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack))
+        shell: bash
+        env:
+          SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SLACK_DAILY_PERF_WEBHOOK_URL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prepare Slack payload
         id: slack_payload
-        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack))
+        if: always() && steps.slack.outputs.enabled == 'true'
         continue-on-error: true
         shell: bash
         run: |
@@ -337,11 +352,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Send benchmark data to Slack Workflow
-        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack)) && steps.slack_payload.outputs.payload != ''
+        if: always() && steps.slack.outputs.enabled == 'true' && steps.slack_payload.outputs.payload != ''
         continue-on-error: true
-        uses: slackapi/slack-github-action@v3
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
-          webhook: ${{ env.SLACK_DAILY_PERF_WEBHOOK_URL }}
+          webhook: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
           webhook-type: webhook-trigger
           payload: ${{ steps.slack_payload.outputs.payload }}
 
