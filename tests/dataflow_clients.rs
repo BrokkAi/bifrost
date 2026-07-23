@@ -187,9 +187,7 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
     fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
         for fact in 1..=10 {
             self.attempts.set(self.attempts.get() + 1);
-            if !out.emit(DataflowSeed::new(self.seed, fact)) {
-                break;
-            }
+            let _ = out.emit(DataflowSeed::new(self.seed, fact));
         }
     }
 
@@ -244,11 +242,10 @@ impl TransferBurstProblem {
     fn transfer(&self, out: &mut dyn DataflowOutput<u32>) {
         for fact in 1..=10 {
             self.attempts.set(self.attempts.get() + 1);
-            if !out.emit(fact) {
-                if let Some(cancellation) = &self.cancel_on_stop {
-                    cancellation.cancel();
-                }
-                break;
+            if !out.emit(fact)
+                && let Some(cancellation) = &self.cancel_on_stop
+            {
+                cancellation.cancel();
             }
         }
     }
@@ -687,7 +684,7 @@ fn each_budget_dimension_stops_atomically_before_output_publication() {
 
     for (dimension, limit, attempted) in [
         (SolverBudgetDimension::InternedFacts, 1, 2),
-        (SolverBudgetDimension::ReachedStates, 1, 3),
+        (SolverBudgetDimension::ReachedStates, 1, 2),
         (SolverBudgetDimension::FlowEvaluations, 0, 1),
         (SolverBudgetDimension::PropagatedOutputs, 0, 1),
     ] {
@@ -726,7 +723,7 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
         attempts: Cell::new(0),
     };
     let cancellation = CancellationToken::default();
-    let mut seed_budget = budget_with_limit(SolverBudgetDimension::ReachedStates, 3);
+    let mut seed_budget = budget_with_limit(SolverBudgetDimension::InternedFacts, 1);
     let seed_result = solve(
         graph.solve_input(),
         &seed_problem,
@@ -743,9 +740,9 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
             seed_exceeded.limit(),
             seed_exceeded.attempted(),
         ),
-        (SolverBudgetDimension::ReachedStates, 3, 4)
+        (SolverBudgetDimension::InternedFacts, 1, 2)
     );
-    assert_eq!(seed_problem.attempts.get(), 4);
+    assert_eq!(seed_problem.attempts.get(), 10);
     assert!(seed_result.facts().is_empty());
     assert!(seed_result.reached().is_empty());
     assert_eq!(seed_budget.used(), SolverWork::default());
@@ -774,10 +771,41 @@ fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
         ),
         (SolverBudgetDimension::PropagatedOutputs, 3, 4)
     );
-    assert_eq!(transfer_problem.attempts.get(), 4);
+    assert_eq!(transfer_problem.attempts.get(), 10);
     assert_eq!(transfer_result.facts(), &[0]);
     assert_eq!(result_nodes(&transfer_result), BTreeSet::from([root]));
     assert_eq!(transfer_result.work().propagated_outputs, 0);
+
+    let cross_dimension_problem = TransferBurstProblem {
+        seed: root,
+        attempts: Cell::new(0),
+        cancel_on_stop: None,
+    };
+    let mut cross_dimension_budget = budget_with_limit(SolverBudgetDimension::InternedFacts, 1);
+    let cross_dimension_result = solve(
+        graph.solve_input(),
+        &cross_dimension_problem,
+        &mut DataflowRequest::new(&mut cross_dimension_budget, &cancellation),
+    )
+    .expect("cross-dimension output exhaustion is a normal result");
+    let cross_dimension_exceeded = cross_dimension_result
+        .termination()
+        .budget_exceeded()
+        .expect("the tighter fact limit must stop the transfer sink");
+    assert_eq!(
+        (
+            cross_dimension_exceeded.dimension(),
+            cross_dimension_exceeded.limit(),
+            cross_dimension_exceeded.attempted(),
+        ),
+        (SolverBudgetDimension::InternedFacts, 1, 2)
+    );
+    assert_eq!(cross_dimension_problem.attempts.get(), 10);
+    assert_eq!(cross_dimension_result.facts(), &[0]);
+    assert_eq!(
+        result_nodes(&cross_dimension_result),
+        BTreeSet::from([root])
+    );
 }
 
 #[test]
@@ -797,7 +825,7 @@ fn cancellation_after_sink_exhaustion_takes_precedence() {
     )
     .expect("cancellation is a normal partial result");
 
-    assert_eq!(problem.attempts.get(), 4);
+    assert_eq!(problem.attempts.get(), 10);
     assert_eq!(result.termination(), SolverTermination::Cancelled);
     assert_eq!(result.work().propagated_outputs, 0);
 }

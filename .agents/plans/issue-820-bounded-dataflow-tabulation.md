@@ -24,6 +24,7 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - [x] (2026-07-23 15:50Z) Completed architecture, security/resource, test/intent, API/scope, and duplication reviews. Fixed both high-risk architecture findings, added the missing behavior regressions, and retained only two low-value test-helper duplication notes.
 - [x] (2026-07-23 16:19Z) Simplified the unmerged child after three focused audits: collapsed solver finalization, reused transfer buffers, stopped staging dominated frontiers, tightened solver-only API, made the direct client rely on kernel-owned zero propagation, and removed the two test-helper duplications. The focused 45-test dataflow/ICFG gate remains green.
 - [x] (2026-07-23 17:15Z) Fixed all seven guided-review findings: bounded callback emission, shared budget and dense-ID machinery, non-fabricable fact IDs, snapshot-owned invariant validation, cohesive dataflow contract modules, and shared source-backed fixtures. The expanded focused gate passes 12 client, 10 tabulation, and 25 ICFG contract tests.
+- [x] (2026-07-23 17:34Z) Resolved the post-fix resource audit by replacing proxy sink limits with exact prospective multi-dimensional charges and adding ignored-stop plus cross-dimension burst coverage. Restored the two public-contract explanations lost during the module split and reconciled this living plan with the sealed-snapshot architecture.
 
 ## Surprises & Discoveries
 
@@ -89,8 +90,8 @@ This first child deliberately stops before reusable procedure summaries, recursi
   Rationale: a proven path can support a may finding while another reachable partial edge or boundary prevents a complete absence claim. Cancellation or a solver budget is a run termination cause, not a rewrite of the provider's input status.
   Date/Author: 2026-07-23 / Codex
 
-- Decision: use four independently charged solver dimensions—interned facts, reached states, flow evaluations, and propagated outputs—and use those same limits to preflight callback sinks.
-  Rationale: these are the first slice's distinct sources of retained growth. A unique seed necessarily implies at least one reached state, and a unique transfer fact is exactly one propagated output, so the existing dimensions bound temporary callback storage without adding a second accounting vocabulary. Duplicate rows are suppressed before growth, failed callbacks publish nothing, and the existing atomic publication charge remains the authoritative successful work record.
+- Decision: use four independently charged solver dimensions—interned facts, reached states, flow evaluations, and propagated outputs—and preflight the full prospective publication charge before every unique callback row is retained.
+  Rationale: these are the first slice's distinct sources of retained growth. Seed emission projects the exact zero-inclusive fact and state sets; transfer emission projects new interned facts, new reached states, and canonical outputs against the current tables. This bounds temporary storage by the tightest applicable dimension, preserves declared dimension precedence and exact attempted work, suppresses duplicates before growth, and keeps successful publication atomic without adding a second accounting vocabulary.
   Date/Author: 2026-07-23 / Codex
 
 - Decision: share fixed-width dense-ID generation and multidimensional atomic budget accounting as private analyzer infrastructure.
@@ -127,7 +128,7 @@ Validation is green: `cargo fmt --all -- --check`; `git diff --check`; 10/10 tes
 
 `src/analyzer/semantic/provider.rs` defines `SemanticOutcome<T>`, `SemanticBudget`, and `SemanticRequest`. Its outcome envelope is part of the solver input contract because `IcfgSnapshot` alone cannot say whether graph construction was complete. `src/cancellation.rs` defines the shared cooperative `CancellationToken`.
 
-`src/analyzer/mod.rs` is the analyzer module registry. The only existing production file expected to change is this registry, where `pub mod dataflow;` will expose the new implementation. All solver implementation files belong under `src/analyzer/dataflow/`. Receiver analysis, semantic oracles, storage, structural search, policy, and RQL files are out of scope.
+`src/analyzer/mod.rs` is the analyzer module registry. `pub mod dataflow;` exposes the new implementation, while private `dense_id` and `work_budget` modules share policy-free mechanics with semantic IDs and budgets. `src/analyzer/semantic/icfg.rs` owns snapshot invariants at sealing. Receiver analysis, semantic oracles, storage, structural search, policy, and RQL files remain out of scope.
 
 A fact is one finite abstract proposition supplied by a client. The kernel interns each distinct typed fact into a run-local dense `FactId`; these IDs are not stable across runs or snapshots. A reached state is one `(IcfgNodeId, FactId)` pair. A transfer function maps one input fact on one typed edge to zero or more output facts. Since the kernel applies that unary relation independently to each reached fact and unions the results, the accepted problem is a distributive may problem.
 
@@ -137,9 +138,9 @@ Path quality describes the strongest individual path retained for one reached st
 
 Create `src/analyzer/dataflow/problem.rs`. Define the dense `FactId`, typed `DataflowSeed<Fact>`, and a borrowed `DataflowEdge` descriptor containing the edge ID, edge, and source/target node keys. Define `DistributiveDataflowProblem` with an orderable, copyable, hashable associated `Fact`, a distinguished `zero_fact`, an explicit seed producer, and separate `normal_flow`, `call_flow`, `return_flow`, `call_to_return_flow`, and `exceptional_flow` callbacks. Every callback receives the original edge descriptor so normal and exceptional return channels remain distinguishable. No callback receives the whole reached set or a protocol type.
 
-Create `src/analyzer/dataflow/outcome.rs`. Define `IcfgInputStatus` mirroring every `SemanticOutcome<IcfgSnapshot>` quality and `IcfgSolveInput` with checked outcome conversion. Define `SolverWork`, `SolverBudgetDimension`, `SolverBudget`, `SolverBudgetExceeded`, and `DataflowRequest` following the atomic check-and-charge pattern in `SemanticBudget`. Define solver termination, concrete path quality and its nondominated frontier, global coverage, reached rows, result accessors, and stable graph/seed errors. A result is globally complete only when its input status is complete, termination reached a fixed point, and no reachable unproven edge, partial edge, or ICFG boundary was observed.
+Create cohesive private dataflow contract modules behind one stable facade: `input.rs` for `IcfgInputStatus`, checked `IcfgSolveInput` conversion, and malformed-input errors; `budget.rs` for solver work, dimensions, limits, and request controls; `quality.rs` for concrete path quality and its nondominated frontier; and `result.rs` for termination, coverage, reached rows, and result accessors. A result is globally complete only when its input status is complete, termination reached a fixed point, and no reachable unproven edge, partial edge, or ICFG boundary was observed.
 
-Create `src/analyzer/dataflow/tabulation.rs`. Validate interprocedural edge origins and every seed node before propagation. Intern the zero fact first, inject it beside every explicit seed, canonicalize seeds by `(node, fact)`, and use a FIFO `VecDeque` plus hash-backed reached/interner tables. Never iterate a hash table to schedule work. For each current state and nondominated path-quality profile, traverse the already canonical successor row, invoke exactly one transfer family, preserve zero automatically, sort and deduplicate outputs, check cancellation, stage all work charges, then publish fact IDs and new or quality-improved states atomically. Requeue a profile only when it is newly admitted to a state's frontier. Freeze facts and reached rows deterministically.
+Create `src/analyzer/dataflow/tabulation.rs`. Rely on the sealed `IcfgSnapshot` edge invariants and validate every emitted seed node. Intern the zero fact first, inject it beside every explicit seed, canonicalize seeds by `(node, fact)`, and use a FIFO `VecDeque` plus hash-backed reached/interner tables. Never iterate a hash table to schedule work. Route callbacks through bounded, cancellation-aware output sinks that deduplicate and preflight the full prospective charge before retaining each unique row. For each current state and nondominated path-quality profile, traverse the already canonical successor row, invoke exactly one transfer family, preserve zero automatically, sort canonical outputs, check cancellation, stage all work charges, then publish fact IDs and new or quality-improved states atomically. Requeue a profile only when it is newly admitted to a state's frontier. Freeze facts and reached rows deterministically.
 
 Create `src/analyzer/dataflow/direct.rs`. Implement a one-fact `DirectFlowProblem` whose sole fact is the kernel-preserved zero fact, so its five callbacks need not reproduce identity propagation. Its constructor accepts explicit seed node IDs; it never assumes that dense node zero is the analysis root. This is a small real client rather than a typestate-shaped test double.
 
@@ -147,9 +148,9 @@ Create `src/analyzer/dataflow/mod.rs` to document and re-export the public surfa
 
 Create `tests/common/dataflow_reference.rs`. Implement an intentionally slow fixed-point by repeatedly scanning all ICFG edges and all currently reached typed facts in canonical order until no fact changes. It must independently classify the five edge families and use a `BTreeMap` or `BTreeSet` for clarity. It has no compact worklist, budgets, summary cache, witness table, or production interner. Add it to `tests/common/mod.rs`.
 
-Create `tests/dataflow_tabulation.rs`. Use `InlineTestProject` and the public ICFG provider to build small TypeScript and Rust snapshots. Differentially compare the worklist and repeated-scan solvers for loops, fact generation and killing, direct calls, two call sites to one callee, normal and exceptional returns, and deferred normal/exceptional call-to-return edges. Assert repeat-run equality under seed and transfer-output permutations. Assert invalid seed IDs and malformed missing origins are rejected where constructible.
+Create `tests/dataflow_tabulation.rs`. Use `InlineTestProject` and the public ICFG provider to build small TypeScript and Rust snapshots. Differentially compare the worklist and repeated-scan solvers for loops, fact generation and killing, direct calls, two call sites to one callee, normal and exceptional returns, and deferred normal/exceptional call-to-return edges. Assert repeat-run equality under seed and transfer-output permutations and reject invalid seed IDs. Test malformed edge endpoints and missing interprocedural origins at the private snapshot-sealing boundary, because published snapshots cannot contain them.
 
-Create `tests/dataflow_clients.rs`. Run `DirectFlowProblem` through the same public solver and prove its reached nodes equal bounded ICFG reachability. Cover input-quality preservation, a reachable recursive-depth boundary, cancellation before seeding and during propagation, and all four budget dimensions. Cancellation during propagation can be deterministic by letting a test problem cancel a shared token from its first transfer callback; the solver's post-callback checkpoint must win before output publication.
+Create `tests/dataflow_clients.rs`. Run `DirectFlowProblem` through the same public solver and prove its reached nodes equal bounded ICFG reachability. Cover input-quality preservation, a reachable recursive-depth boundary, cancellation before seeding and during propagation, all four budget dimensions, ignored-stop callback bursts, and tighter cross-dimension limits. Cancellation during propagation can be deterministic by letting a test problem cancel a shared token from its first transfer callback; the solver's post-callback checkpoint must win before output publication.
 
 After focused behavior is green, run formatting and strict lint. Then run the feature-enabled repository tests required by the local instructions. Finally, run parallel security, duplication, intent, operational, and architecture review over the completed diff, resolve all high-risk findings, and update this plan with evidence and retrospective.
 
@@ -270,25 +271,25 @@ In `src/analyzer/dataflow/problem.rs`, define these public contracts, allowing m
         type Fact: Copy + Eq + Hash + Ord;
 
         fn zero_fact(&self) -> Self::Fact;
-        fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>);
-        fn normal_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
-        fn call_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
-        fn return_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
+        fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>);
+        fn normal_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut dyn DataflowOutput<Self::Fact>);
+        fn call_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut dyn DataflowOutput<Self::Fact>);
+        fn return_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut dyn DataflowOutput<Self::Fact>);
         fn call_to_return_flow(
             &self,
             edge: DataflowEdge<'_>,
             fact: Self::Fact,
-            out: &mut Vec<Self::Fact>,
+            out: &mut dyn DataflowOutput<Self::Fact>,
         );
         fn exceptional_flow(
             &self,
             edge: DataflowEdge<'_>,
             fact: Self::Fact,
-            out: &mut Vec<Self::Fact>,
+            out: &mut dyn DataflowOutput<Self::Fact>,
         );
     }
 
-In `src/analyzer/dataflow/outcome.rs`, define:
+Across `src/analyzer/dataflow/{input,budget,quality,result}.rs`, define and re-export:
 
     IcfgInputStatus
     IcfgSolveInput<'graph>

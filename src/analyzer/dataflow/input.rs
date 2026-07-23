@@ -7,6 +7,10 @@ use crate::analyzer::semantic::{
 };
 
 /// Quality retained from the semantic outcome that produced an ICFG snapshot.
+///
+/// The snapshot itself does not retain this envelope, so callers must keep it
+/// beside the graph to prevent a partial input from becoming a complete
+/// data-flow result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IcfgInputStatus {
     Complete,

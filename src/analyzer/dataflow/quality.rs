@@ -50,6 +50,11 @@ impl PathQuality {
 }
 
 /// The component-wise nondominated concrete path qualities for one state.
+///
+/// `PROVEN_PARTIAL` and `UNPROVEN_COMPLETE` are incomparable and therefore
+/// may coexist. Keeping both is necessary because edge conjunction can make
+/// either one the stronger continuation later; combining their axes would
+/// invent a path quality that no concrete path established.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PathQualityFrontier {
     bits: u8,

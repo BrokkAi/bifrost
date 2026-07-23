@@ -29,64 +29,16 @@ struct QueuedState {
     quality: PathQuality,
 }
 
-struct BoundedOutputs<'request, Value> {
-    values: &'request mut HashSet<Value>,
-    budget: &'request SolverBudget,
-    cancellation: &'request crate::analyzer::semantic::CancellationToken,
-    work_for_count: fn(usize) -> SolverWork,
-    exceeded: Option<SolverBudgetExceeded>,
-}
-
-impl<'request, Value> BoundedOutputs<'request, Value>
-where
-    Value: Copy + Eq + std::hash::Hash,
-{
-    fn new(
-        values: &'request mut HashSet<Value>,
-        budget: &'request SolverBudget,
-        cancellation: &'request crate::analyzer::semantic::CancellationToken,
-        work_for_count: fn(usize) -> SolverWork,
-    ) -> Self {
-        Self {
-            values,
-            budget,
-            cancellation,
-            work_for_count,
-            exceeded: None,
-        }
-    }
-
-    const fn exceeded(&self) -> Option<SolverBudgetExceeded> {
-        self.exceeded
-    }
-}
-
-impl<Value> DataflowOutput<Value> for BoundedOutputs<'_, Value>
-where
-    Value: Copy + Eq + std::hash::Hash,
-{
-    fn emit(&mut self, value: Value) -> bool {
-        if self.cancellation.is_cancelled() || self.exceeded.is_some() {
-            return false;
-        }
-        if self.values.contains(&value) {
-            return true;
-        }
-
-        let prospective_count = self.values.len().saturating_add(1);
-        if let Err(exceeded) = self.budget.check((self.work_for_count)(prospective_count)) {
-            self.exceeded = Some(exceeded);
-            return false;
-        }
-        self.values.insert(value);
-        true
-    }
-}
-
 struct BoundedSeedOutputs<'graph, 'request, Fact> {
     snapshot: &'graph IcfgSnapshot,
-    inner: BoundedOutputs<'request, DataflowSeed<Fact>>,
+    zero_fact: Fact,
+    values: HashSet<DataflowSeed<Fact>>,
+    prospective_facts: HashSet<Fact>,
+    prospective_states: HashSet<DataflowSeed<Fact>>,
+    budget: &'request SolverBudget,
+    cancellation: &'request crate::analyzer::semantic::CancellationToken,
     invalid_node: Option<IcfgNodeId>,
+    exceeded: Option<SolverBudgetExceeded>,
 }
 
 impl<'graph, 'request, Fact> BoundedSeedOutputs<'graph, 'request, Fact>
@@ -95,14 +47,22 @@ where
 {
     fn new(
         snapshot: &'graph IcfgSnapshot,
-        values: &'request mut HashSet<DataflowSeed<Fact>>,
+        zero_fact: Fact,
         budget: &'request SolverBudget,
         cancellation: &'request crate::analyzer::semantic::CancellationToken,
     ) -> Self {
+        let mut prospective_facts = HashSet::default();
+        prospective_facts.insert(zero_fact);
         Self {
             snapshot,
-            inner: BoundedOutputs::new(values, budget, cancellation, seed_output_work),
+            zero_fact,
+            values: HashSet::default(),
+            prospective_facts,
+            prospective_states: HashSet::default(),
+            budget,
+            cancellation,
             invalid_node: None,
+            exceeded: None,
         }
     }
 
@@ -111,7 +71,11 @@ where
     }
 
     const fn exceeded(&self) -> Option<SolverBudgetExceeded> {
-        self.inner.exceeded()
+        self.exceeded
+    }
+
+    fn into_values(self) -> HashSet<DataflowSeed<Fact>> {
+        self.values
     }
 }
 
@@ -120,7 +84,7 @@ where
     Fact: Copy + Eq + std::hash::Hash,
 {
     fn emit(&mut self, seed: DataflowSeed<Fact>) -> bool {
-        if self.inner.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled() {
             return false;
         }
         if self.snapshot.node(seed.node).is_none() {
@@ -133,21 +97,119 @@ where
         if self.invalid_node.is_some() {
             return true;
         }
-        self.inner.emit(seed)
+        if self.exceeded.is_some() {
+            return false;
+        }
+        if self.values.contains(&seed) {
+            return true;
+        }
+
+        let zero_state = DataflowSeed::new(seed.node, self.zero_fact);
+        let additional_states = usize::from(!self.prospective_states.contains(&seed))
+            + usize::from(zero_state != seed && !self.prospective_states.contains(&zero_state));
+        let prospective_work = SolverWork {
+            interned_facts: self
+                .prospective_facts
+                .len()
+                .saturating_add(usize::from(!self.prospective_facts.contains(&seed.fact))),
+            reached_states: self
+                .prospective_states
+                .len()
+                .saturating_add(additional_states),
+            ..SolverWork::uniform(0)
+        };
+        if let Err(exceeded) = self.budget.check(prospective_work) {
+            self.exceeded = Some(exceeded);
+            return false;
+        }
+
+        self.values.insert(seed);
+        self.prospective_facts.insert(seed.fact);
+        self.prospective_states.insert(seed);
+        self.prospective_states.insert(zero_state);
+        true
     }
 }
 
-const fn seed_output_work(count: usize) -> SolverWork {
-    SolverWork {
-        reached_states: count,
-        ..SolverWork::uniform(0)
+struct BoundedFactOutputs<'state, 'request, Fact> {
+    values: &'request mut HashSet<Fact>,
+    fact_ids: &'state HashMap<Fact, FactId>,
+    reached: &'state HashMap<ExplodedState, PathQualityFrontier>,
+    target: IcfgNodeId,
+    budget: &'request SolverBudget,
+    cancellation: &'request crate::analyzer::semantic::CancellationToken,
+    new_facts: usize,
+    new_reached_states: usize,
+    exceeded: Option<SolverBudgetExceeded>,
+}
+
+impl<'state, 'request, Fact> BoundedFactOutputs<'state, 'request, Fact>
+where
+    Fact: Copy + Eq + std::hash::Hash,
+{
+    fn new(
+        values: &'request mut HashSet<Fact>,
+        fact_ids: &'state HashMap<Fact, FactId>,
+        reached: &'state HashMap<ExplodedState, PathQualityFrontier>,
+        target: IcfgNodeId,
+        budget: &'request SolverBudget,
+        cancellation: &'request crate::analyzer::semantic::CancellationToken,
+    ) -> Self {
+        Self {
+            values,
+            fact_ids,
+            reached,
+            target,
+            budget,
+            cancellation,
+            new_facts: 0,
+            new_reached_states: 0,
+            exceeded: None,
+        }
+    }
+
+    const fn exceeded(&self) -> Option<SolverBudgetExceeded> {
+        self.exceeded
     }
 }
 
-const fn transfer_output_work(count: usize) -> SolverWork {
-    SolverWork {
-        propagated_outputs: count,
-        ..SolverWork::uniform(0)
+impl<Fact> DataflowOutput<Fact> for BoundedFactOutputs<'_, '_, Fact>
+where
+    Fact: Copy + Eq + std::hash::Hash,
+{
+    fn emit(&mut self, value: Fact) -> bool {
+        if self.cancellation.is_cancelled() || self.exceeded.is_some() {
+            return false;
+        }
+        if self.values.contains(&value) {
+            return true;
+        }
+
+        let existing_fact = self.fact_ids.get(&value).copied();
+        let adds_fact = existing_fact.is_none();
+        let adds_state = existing_fact.is_none_or(|fact| {
+            !self.reached.contains_key(&ExplodedState {
+                node: self.target,
+                fact,
+            })
+        });
+        let prospective_work = SolverWork {
+            interned_facts: self.new_facts.saturating_add(usize::from(adds_fact)),
+            reached_states: self
+                .new_reached_states
+                .saturating_add(usize::from(adds_state)),
+            propagated_outputs: self.values.len().saturating_add(1),
+            ..SolverWork::uniform(0)
+        };
+        if let Err(exceeded) = self.budget.check(prospective_work) {
+            self.exceeded = Some(exceeded);
+            return false;
+        }
+
+        self.values.insert(value);
+        self.new_facts = prospective_work.interned_facts;
+        self.new_reached_states = prospective_work.reached_states;
+        true
     }
 }
 
@@ -190,28 +252,31 @@ where
         }
 
         let zero_fact = problem.zero_fact();
-        let mut emitted_seeds = HashSet::default();
-        let mut seed_outputs = BoundedSeedOutputs::new(
-            self.snapshot,
-            &mut emitted_seeds,
-            request.budget,
-            request.cancellation,
-        );
-        problem.seeds(&mut seed_outputs);
+        let (invalid_node, sink_exceeded, emitted_seeds) = {
+            let mut seed_outputs = BoundedSeedOutputs::new(
+                self.snapshot,
+                zero_fact,
+                request.budget,
+                request.cancellation,
+            );
+            problem.seeds(&mut seed_outputs);
+            let invalid_node = seed_outputs.invalid_node();
+            let exceeded = seed_outputs.exceeded();
+            (invalid_node, exceeded, seed_outputs.into_values())
+        };
 
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
         }
-        if let Some(node) = seed_outputs.invalid_node() {
+        if let Some(node) = invalid_node {
             return Err(DataflowError::InvalidSeedNode {
                 node,
                 node_count: self.snapshot.node_count(),
             });
         }
-        if let Some(exceeded) = seed_outputs.exceeded() {
+        if let Some(exceeded) = sink_exceeded {
             return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
         }
-        drop(seed_outputs);
         let mut seeds = emitted_seeds.into_iter().collect::<Vec<_>>();
         seeds.sort_unstable();
 
@@ -319,26 +384,30 @@ where
                 let descriptor = DataflowEdge::from_snapshot(self.snapshot, edge_id)
                     .expect("validated ICFG edge remains in its immutable snapshot");
                 emitted_outputs.clear();
-                let mut outputs = BoundedOutputs::new(
-                    &mut emitted_outputs,
-                    request.budget,
-                    request.cancellation,
-                    transfer_output_work,
-                );
-                apply_transfer(problem, descriptor, fact, &mut outputs);
-                if queued.state.fact == ZERO_FACT_ID {
-                    let _ = outputs.emit(self.facts[ZERO_FACT_ID.index()]);
-                }
+                let sink_exceeded = {
+                    let mut outputs = BoundedFactOutputs::new(
+                        &mut emitted_outputs,
+                        &self.fact_ids,
+                        &self.reached,
+                        edge.target,
+                        request.budget,
+                        request.cancellation,
+                    );
+                    apply_transfer(problem, descriptor, fact, &mut outputs);
+                    if queued.state.fact == ZERO_FACT_ID {
+                        let _ = outputs.emit(self.facts[ZERO_FACT_ID.index()]);
+                    }
+                    outputs.exceeded()
+                };
 
                 // A callback may cooperatively cancel through a shared token.
                 // Its outputs must not become visible after that checkpoint.
                 if request.cancellation.is_cancelled() {
                     return Ok(SolverTermination::Cancelled);
                 }
-                if let Some(exceeded) = outputs.exceeded() {
+                if let Some(exceeded) = sink_exceeded {
                     return Ok(SolverTermination::ExceededBudget(exceeded));
                 }
-                drop(outputs);
                 let mut canonical_outputs = emitted_outputs.iter().copied().collect::<Vec<_>>();
                 canonical_outputs.sort_unstable();
                 let output_quality = queued.quality.through_edge(edge);
