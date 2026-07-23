@@ -686,6 +686,11 @@ fn generate_probes(
         {
             continue;
         }
+        if let Some(shard) = &config.shard
+            && !shard.contains(config.seed, &symbol.fq_name)
+        {
+            continue;
+        }
         service_symbols.push(index);
         if service_symbols.len() >= config.max_service_symbols {
             break;

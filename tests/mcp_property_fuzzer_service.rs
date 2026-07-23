@@ -74,6 +74,7 @@ fn fuzzer_config(language: &str) -> FuzzerConfig {
         max_scan_probes: 100,
         symbol_filter: None,
         path_filter: None,
+        shard: None,
         seed: 0,
     }
 }

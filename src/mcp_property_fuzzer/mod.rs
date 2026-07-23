@@ -137,7 +137,59 @@ pub struct FuzzerConfig {
     /// symbol, so `--rerun` targets those signatures via this filter.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub path_filter: Option<String>,
+    /// Optional hash partition restricting service probes to one shard of the
+    /// symbol census (see [`ShardSpec`]). Sharded runs write one ledger
+    /// record per shard; triage reads them jointly.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub shard: Option<ShardSpec>,
     pub seed: u64,
+}
+
+/// Hash-partition spec for sharded runs (`--shard K/N`): a shard keeps only
+/// symbols whose `(seed, fq_name)` SHA-256 hash falls into bucket K
+/// (1-based). Shards are disjoint and their union covers the census, so N
+/// sharded processes — each with its own analyzer store connection, since
+/// #1054's single-connection ceiling is per process — probe the same total
+/// coverage as one unsharded run when each is capped at
+/// `max_service_symbols / N`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardSpec {
+    /// 1-based shard index, in `1..=count`.
+    pub index: usize,
+    /// Total number of shards the run is partitioned into.
+    pub count: usize,
+}
+
+impl ShardSpec {
+    pub fn new(index: usize, count: usize) -> Result<Self, String> {
+        if count == 0 {
+            return Err("--shard count must be at least 1".to_string());
+        }
+        if index == 0 || index > count {
+            return Err(format!("--shard index {index} is out of range 1..={count}"));
+        }
+        Ok(Self { index, count })
+    }
+
+    /// Parse the `K/N` CLI form.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (index, count) = value
+            .split_once('/')
+            .ok_or_else(|| format!("--shard expects K/N, got `{value}`"))?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| format!("--shard index `{index}` is not a positive integer"))?;
+        let count = count
+            .parse::<usize>()
+            .map_err(|_| format!("--shard count `{count}` is not a positive integer"))?;
+        Self::new(index, count)
+    }
+
+    /// Whether `fq_name` belongs to this shard under `seed`. A single-shard
+    /// run keeps everything.
+    pub fn contains(&self, seed: u64, fq_name: &str) -> bool {
+        self.count == 1 || sample_hash(seed, fq_name) % self.count as u64 == (self.index - 1) as u64
+    }
 }
 
 /// One deduplicated contract violation. The first exemplar encountered
@@ -867,7 +919,7 @@ fn stable_sample<T>(items: Vec<T>, cap: usize, seed: u64, key: impl Fn(&T) -> St
     keyed.into_iter().map(|(_, _, item)| item).collect()
 }
 
-fn sample_hash(seed: u64, key: &str) -> u64 {
+pub(crate) fn sample_hash(seed: u64, key: &str) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(seed.to_le_bytes());
     hasher.update(key.as_bytes());
@@ -916,6 +968,50 @@ mod tests {
         let first = stable_sample(items.clone(), 10, 1, |item| item.clone());
         let second = stable_sample(items, 10, 2, |item| item.clone());
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn shard_spec_partitions_the_census_exactly_once() {
+        let symbols: Vec<String> = (0..500).map(|index| format!("ns.Symbol{index}")).collect();
+        for count in [1_usize, 2, 3, 10] {
+            let shards: Vec<ShardSpec> = (1..=count)
+                .map(|index| ShardSpec::new(index, count).expect("valid shard"))
+                .collect();
+            for symbol in &symbols {
+                let memberships = shards
+                    .iter()
+                    .filter(|shard| shard.contains(7, symbol))
+                    .count();
+                assert_eq!(
+                    memberships, 1,
+                    "every symbol lands in exactly one shard (count={count})"
+                );
+            }
+            for shard in &shards {
+                assert!(
+                    symbols.iter().any(|symbol| shard.contains(7, symbol)),
+                    "shard {}/{count} is non-empty",
+                    shard.index
+                );
+            }
+        }
+        // Membership is deterministic under the same seed.
+        let shard = ShardSpec::new(2, 5).expect("valid shard");
+        assert_eq!(
+            shard.contains(7, "ns.Symbol42"),
+            shard.contains(7, "ns.Symbol42")
+        );
+    }
+
+    #[test]
+    fn shard_spec_parse_validates() {
+        assert!(ShardSpec::parse("1/1").is_ok());
+        assert!(ShardSpec::parse("10/10").is_ok());
+        assert!(ShardSpec::parse("0/10").is_err());
+        assert!(ShardSpec::parse("11/10").is_err());
+        assert!(ShardSpec::parse("1/0").is_err());
+        assert!(ShardSpec::parse("x/10").is_err());
+        assert!(ShardSpec::parse("1").is_err());
     }
 
     #[test]

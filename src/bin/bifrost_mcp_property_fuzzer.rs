@@ -25,7 +25,7 @@ use brokk_bifrost::mcp_property_fuzzer::service_probes::{
     DEFAULT_MAX_SCAN_PROBES, DEFAULT_MAX_SERVICE_SYMBOLS,
 };
 use brokk_bifrost::mcp_property_fuzzer::{
-    FuzzerConfig, FuzzerReport, InvariantKind, run_invariants_with_service,
+    FuzzerConfig, FuzzerReport, InvariantKind, ShardSpec, run_invariants_with_service,
 };
 use brokk_bifrost::searchtools_service::SearchToolsService;
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project};
@@ -126,6 +126,7 @@ struct FuzzerArgs {
     max_scan_probes: usize,
     symbol_filter: Option<String>,
     path_filter: Option<String>,
+    shard: Option<ShardSpec>,
     dump_probes: Option<PathBuf>,
     seed: u64,
     parallelism: usize,
@@ -151,6 +152,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
     let mut max_scan_probes = DEFAULT_MAX_SCAN_PROBES;
     let mut symbol_filter = None;
     let mut path_filter = None;
+    let mut shard = None;
     let mut dump_probes = None;
     let mut seed = 0_u64;
     let mut parallelism = DEFAULT_PARALLELISM;
@@ -207,6 +209,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
                 symbol_filter = Some(take_value(args, &mut index, "--symbol-filter")?)
             }
             "--path-filter" => path_filter = Some(take_value(args, &mut index, "--path-filter")?),
+            "--shard" => shard = Some(ShardSpec::parse(&take_value(args, &mut index, "--shard")?)?),
             "--dump-probes" => {
                 dump_probes = Some(PathBuf::from(take_value(
                     args,
@@ -282,6 +285,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
         max_scan_probes,
         symbol_filter,
         path_filter,
+        shard,
         dump_probes,
         seed,
         parallelism,
@@ -645,6 +649,7 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             max_scan_probes: args.max_scan_probes,
             symbol_filter: args.symbol_filter.clone(),
             path_filter: args.path_filter.clone(),
+            shard: args.shard.clone(),
             seed: args.seed,
         };
         let fingerprint = run_fingerprint(&config)?;
@@ -1157,6 +1162,9 @@ fn print_help() {
     );
     println!(
         "  --path-filter TEXT     Restrict service probes to symbols whose declaring file path contains TEXT"
+    );
+    println!(
+        "  --shard K/N            Restrict service probes to hash shard K (1-based) of N; shards partition the census"
     );
     println!(
         "  --dump-probes PATH     Write every executed probe (arguments + outcomes) as JSONL for triage"
