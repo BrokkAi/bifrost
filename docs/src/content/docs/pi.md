@@ -17,14 +17,28 @@ Bifrost and install the package directory as a local Pi package:
 git clone https://github.com/BrokkAi/bifrost.git
 cd bifrost/plugins/bifrost-agent
 npm install
-pi install "$(pwd)"
+pi install "$(pwd)" --approve
+pi list
 ```
+
+`pi list` should show the absolute path to `plugins/bifrost-agent`. The
+`--approve` flag explicitly trusts the local package files that Pi is about to
+load.
+
+Start Pi from the repository you want Bifrost to analyze. If Pi does not
+already have a model provider configured, run `/login` in the interactive TUI
+and complete the provider sign-in before validating Bifrost. Provider
+authentication belongs to Pi and is separate from the Bifrost setup.
 
 Reload Pi after installation. Run `/bifrost` in the interactive TUI to choose
 the Bifrost capabilities for the current workspace. The default selection
 enables symbol navigation, structural queries, and file discovery and ranking.
 Additional selections expose code-quality reports, Git history, raw text
 search, or JSON and XML transforms.
+
+To update an existing checkout to the package version on the current branch,
+pull the checkout, rerun `npm install` and `pi install "$(pwd)" --approve` from
+`plugins/bifrost-agent`, then start a new Pi session.
 
 The package uses the same pinned, checksum-verified Bifrost release launcher as
 the other agent plugins. It can download that binary into a user cache on first
@@ -44,10 +58,10 @@ workspace-switching tools, because Pi owns the session workspace.
 
 ## Validate The Setup
 
-Start Pi in the repository you want to analyze, then ask it to call
-`bifrost_get_summaries` for a source file or directory. Use a source target
-rather than a README so the result proves that Bifrost ran instead of ordinary
-file reading.
+Start a fresh Pi session in the repository you want to analyze, then ask it to
+call `bifrost_get_summaries` for a source file or directory. Use a source
+target rather than a README so the result proves that Bifrost ran instead of
+ordinary file reading.
 
 Apply the shared
 [host-integration evidence contract](/mcp/#validate-host-integration): retain

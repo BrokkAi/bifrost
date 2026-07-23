@@ -9,22 +9,26 @@ For Antigravity's underlying host conventions, see the official [MCP](https://an
 
 ## Configure MCP
 
-Build Bifrost first:
+Install the release verified with this setup and record its absolute path:
 
 ```bash
-cargo build --bin bifrost
+cargo install brokk-bifrost --version 0.8.9 --locked --force
+command -v bifrost
+bifrost --version
 ```
 
-Add a `bifrost` entry to `~/.gemini/config/mcp_config.json`:
+The version check should print `bifrost 0.8.9`. Add a `bifrost` entry to the
+global `~/.gemini/config/mcp_config.json`, using the absolute binary path
+reported by `command -v bifrost`:
 
 ```json
 {
   "mcpServers": {
     "bifrost": {
-      "command": "/path/to/bifrost/target/debug/bifrost",
+      "command": "/absolute/path/to/bifrost",
       "args": [
         "--root",
-        "/path/to/workspace",
+        "/absolute/path/to/workspace",
         "--mcp",
         "symbol|extended"
       ]
@@ -33,23 +37,49 @@ Add a `bifrost` entry to `~/.gemini/config/mcp_config.json`:
 }
 ```
 
-Restart Antigravity or open **Settings -> Customizations** and click **Refresh**. The **Installed MCP Servers** section should show `bifrost` with the Bifrost tools enabled.
+Antigravity also accepts a project-local MCP configuration at
+`<workspace>/.agents/mcp_config.json`. Whichever scope you use, pass the exact
+workspace path to `--root`; do not rely on Antigravity's subprocess working
+directory.
+
+In Antigravity 2.x, create or select a Project that contains this same
+workspace: click the folder-plus icon beside **Projects**, choose **New
+Project**, and add the checkout. Use the **Local** environment when validating
+an existing checkout. **New Worktree** intentionally creates another checkout,
+so its expected analyzer root will differ.
+
+Restart Antigravity or open **Settings -> Customizations** and click **Refresh**.
+The **Installed MCP Servers** section should show `bifrost` with
+`search_symbols` and `query_code`. If an error still quotes an old executable
+or workspace path after Refresh, fully quit and reopen Antigravity so its MCP
+process and cached tool schemas are recreated.
 
 ## Add Skills
 
 Antigravity documents skills as folders with `SKILL.md` under either the workspace or global skill directory:
 
 - `<workspace-root>/.agents/skills/<skill-folder>/`
-- `~/.gemini/antigravity/skills/<skill-folder>/`
+- `~/.gemini/config/skills/<skill-folder>/`
 
-In Antigravity 2.2.1 validation, workspace-local skills loaded reliably and appeared in project-specific settings. If global skills do not appear in your app session, install Bifrost's generic code-intelligence skills into each target workspace:
+Install project-local skills when you want them limited to this checkout:
 
 ```bash
 bifrost --root /path/to/workspace --install-skills --target project --mode copy
 ```
 
-Use `--skills-root ~/.gemini/antigravity/skills` only when you explicitly want
-to install into Antigravity's global app-state root. See
+For a current global Antigravity installation, use:
+
+```bash
+bifrost --root /path/to/workspace \
+  --install-skills \
+  --skills-root ~/.gemini/config/skills \
+  --mode copy
+```
+
+Antigravity 2.2.1 used the older
+`~/.gemini/antigravity/skills` global directory. If you upgrade from that
+version, reinstall the skills into `~/.gemini/config/skills`; leaving only the
+old copies does not make them available to Antigravity 2.3.1. See
 [CLI](/cli/#install-agent-skills) for the full option list.
 
 Then restart Antigravity. Open the project-specific settings page, not only global **Customizations**. The project **Customizations** section should list `bifrost-code-navigation`, `bifrost-code-reading`, and `bifrost-codebase-search` alongside any global skills.
@@ -64,13 +94,26 @@ findings with file and line references.
 
 ## Validate the Setup
 
-Use a source-backed prompt that forces an MCP tool call:
+For strong exact-checkout evidence, add a temporary declaration whose name is
+unique to this smoke, for example:
 
-```text
-Use the bifrost-code-reading skill. Inspect the current changes, use the Bifrost MCP get_summaries tool on src/analyzer/usages for source context, and report review findings with file and line references.
+```rust
+// src/antigravity_bifrost_host_probe_4f6f2b7.rs
+pub fn antigravity_bifrost_host_probe_4f6f2b7() {}
 ```
 
-Antigravity should ask for MCP permission the first time it calls the tool. A successful smoke should show a `bifrost / get_summaries` tool call before it presents review context or findings.
+Start a fresh conversation under the Project you created above and use a prompt
+that requires two real MCP calls:
+
+```text
+Load the bifrost-codebase-search skill. Use only Bifrost MCP tools for this verification; do not use terminal commands or built-in file-reading or search tools. Call search_symbols for antigravity_bifrost_host_probe_4f6f2b7, then call query_code with schema_version 2, languages ["rust"], match {"kind":"function","name":"antigravity_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". PASS only if both real calls return src/antigravity_bifrost_host_probe_4f6f2b7.rs.
+```
+
+Antigravity should ask for permission to call `bifrost/*` the first time. You
+can save that rule for only this Project. A successful smoke shows real
+`bifrost/search_symbols` and `bifrost/query_code` calls, and both results name
+the temporary project-relative path. Remove the temporary file after retaining
+the evidence.
 
 Avoid prompts that only ask about `README.md` or docs files; those can pass through ordinary file reading without proving the MCP server ran.
 
