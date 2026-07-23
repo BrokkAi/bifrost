@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::analyzer::DispatchExtensibility;
 use brokk_bifrost::{
     CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject,
     TypeHierarchyProvider,
@@ -404,4 +405,66 @@ fn test_csharp_multi_assignment_and_complex_initializer_parity() {
         .unwrap();
     assert_code_eq("public int x;", &analyzer.get_skeleton(&x).unwrap());
     assert_code_eq("public string s;", &analyzer.get_skeleton(&s).unwrap());
+}
+
+#[test]
+fn csharp_signature_metadata_classifies_member_dispatch_extensibility() {
+    let project = inline_csharp_project(&[(
+        "Dispatch.cs",
+        r#"
+public interface IContract
+{
+    int Count { get; }
+}
+
+public class Base
+{
+    public int Plain { get; }
+    public virtual int Virtual { get; }
+    private protected virtual int RestrictedVirtual { get; }
+    public int Field;
+}
+
+public sealed class Final : Base
+{
+    public sealed override int Virtual => 1;
+}
+
+public enum Kind
+{
+    First
+}
+"#,
+    )]);
+    let analyzer = CSharpAnalyzer::from_project(project);
+
+    let dispatch = |fqn: &str| {
+        let unit = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing declaration {fqn}"));
+        analyzer
+            .signature_metadata(&unit)
+            .into_iter()
+            .next()
+            .and_then(|metadata| metadata.dispatch_extensibility())
+    };
+
+    assert_eq!(dispatch("Base.Plain"), Some(DispatchExtensibility::Closed));
+    assert_eq!(dispatch("Base.Field"), Some(DispatchExtensibility::Closed));
+    assert_eq!(dispatch("Kind.First"), Some(DispatchExtensibility::Closed));
+    assert_eq!(
+        dispatch("IContract.Count"),
+        Some(DispatchExtensibility::Open)
+    );
+    assert_eq!(dispatch("Base.Virtual"), Some(DispatchExtensibility::Open));
+    assert_eq!(
+        dispatch("Base.RestrictedVirtual"),
+        Some(DispatchExtensibility::Open)
+    );
+    assert_eq!(
+        dispatch("Final.Virtual"),
+        Some(DispatchExtensibility::Closed)
+    );
 }

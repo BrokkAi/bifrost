@@ -14,14 +14,15 @@ use super::common::{
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathAtPoint,
     AccessPathRoot, AliasExclusivity, AliasExclusivityWitness, AliasQuery, AliasRelation,
-    AliasResult, CandidateCoverage, CaptureSource, EscapeStatus, EscapeWitness,
-    EvidenceCompleteness, EvidenceHandle, HeapOracle, LocationResult, MemoryLocationKind,
-    ObjectCardinality, ObservationPhase, OracleCandidate, OracleRelationArena, OracleRelationId,
-    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, OracleSet, PointsToResult,
-    ProcedureHandle, ProcedurePortHandle, ProofStatus, SemanticCapability, SemanticEffect,
-    SemanticGap, SemanticGapImpact, SemanticGapSubject, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticValueKind, SemanticWork, StoreAtPoint, StrongUpdateEvidence,
-    UpdateEligibility, ValueAtPoint, ValueHandle, WeakUpdateReason,
+    AliasResult, CallResultHandle, CandidateCoverage, CaptureSource, DispatchOracle, EscapeStatus,
+    EscapeWitness, EvidenceCompleteness, EvidenceHandle, HeapOracle, LocationResult,
+    MemoryLocationKind, ObjectCardinality, ObservationPhase, OracleCandidate, OracleContractError,
+    OracleRelationArena, OracleRelationId, OracleRelationKind, OracleRelationOwner,
+    OracleRelationRecord, OracleSet, PointsToResult, ProcedureHandle, ProcedurePortHandle,
+    ProofStatus, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticGap,
+    SemanticGapImpact, SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValueKind, SemanticWork, StoreAtPoint, StrongUpdateEvidence, UpdateEligibility,
+    ValueAtPoint, ValueFlowOracle, ValueHandle, WeakUpdateReason,
 };
 use crate::hash::HashSet;
 
@@ -44,6 +45,7 @@ struct LocationDraft {
 struct DraftSet<T> {
     candidates: Vec<T>,
     coverage: CandidateCoverage,
+    ambiguous: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,6 +84,7 @@ fn candidate_cardinality_for_root(root: &AccessPathRoot) -> ObjectCardinality {
             ObjectCardinality::Summary
         }
         AccessPathRoot::Value(_)
+        | AccessPathRoot::CallResult(_)
         | AccessPathRoot::ProcedurePort(_)
         | AccessPathRoot::Allocation(_)
         | AccessPathRoot::ModuleObject(_)
@@ -97,6 +100,10 @@ fn root_evidence(
         AccessPathRoot::Value(value) => procedure
             .semantics()
             .value(value.id())
+            .map(|row| row.evidence),
+        AccessPathRoot::CallResult(result) => procedure
+            .semantics()
+            .call_site(result.call().id())
             .map(|row| row.evidence),
         AccessPathRoot::Allocation(allocation) => procedure
             .semantics()
@@ -402,6 +409,17 @@ fn push_object(
 ) {
     let evidence = dedup_evidence(evidence);
     let quality = evidence_quality(&evidence);
+    push_object_with_quality(drafts, object, evidence, quality);
+}
+
+fn push_object_with_quality(
+    drafts: &mut Vec<ObjectDraft>,
+    object: AbstractObject,
+    evidence: Vec<EvidenceHandle>,
+    quality: (ProofStatus, EvidenceCompleteness),
+) {
+    let evidence = dedup_evidence(evidence);
+    let quality = merge_quality(&quality, &evidence_quality(&evidence));
     if let Some(existing) = drafts
         .iter_mut()
         .find(|candidate| candidate.object == object)
@@ -478,7 +496,249 @@ fn symbolic_object(
     })
 }
 
+#[derive(Debug, Default)]
+struct CallResultResolution {
+    open: bool,
+    truncated: bool,
+    ambiguous: bool,
+}
+
+impl CallResultResolution {
+    fn absorb_coverage(&mut self, coverage: CandidateCoverage) {
+        match coverage {
+            CandidateCoverage::Exhaustive => {}
+            CandidateCoverage::Open => self.open = true,
+            CandidateCoverage::Truncated => self.truncated = true,
+        }
+    }
+}
+
+fn outcome_is_open<T>(outcome: &SemanticOutcome<T>) -> bool {
+    matches!(
+        outcome,
+        SemanticOutcome::Unknown { .. }
+            | SemanticOutcome::Unsupported { .. }
+            | SemanticOutcome::Unproven { .. }
+    )
+}
+
+fn outcome_is_ambiguous<T>(outcome: &SemanticOutcome<T>) -> bool {
+    matches!(outcome, SemanticOutcome::Ambiguous { .. })
+}
+
+fn outcome_interruption<T>(outcome: &SemanticOutcome<T>) -> Option<Interruption> {
+    match outcome {
+        SemanticOutcome::ExceededBudget { exceeded, .. } => Some(Interruption::Budget(*exceeded)),
+        SemanticOutcome::Cancelled { .. } => Some(Interruption::Cancelled),
+        SemanticOutcome::Complete { .. }
+        | SemanticOutcome::Ambiguous { .. }
+        | SemanticOutcome::Unknown { .. }
+        | SemanticOutcome::Unsupported { .. }
+        | SemanticOutcome::Unproven { .. } => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_call_result(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    query: &ValueAtPoint,
+    state: TraceState,
+    inherited_evidence: &[EvidenceHandle],
+    drafts: &mut Vec<ObjectDraft>,
+    limits: crate::analyzer::semantic::OracleLimits,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<Option<CallResultResolution>, InterruptionOrProvider> {
+    let procedure = query.point().procedure();
+    if cancellation.is_cancelled() {
+        return Err(InterruptionOrProvider::Interruption(
+            Interruption::Cancelled,
+        ));
+    }
+    let Some(call_ids) = procedure
+        .semantics()
+        .call_result_site_ids(state.value, state.point)
+    else {
+        return Ok(None);
+    };
+    let mut resolution = CallResultResolution {
+        ambiguous: call_ids.len() > 1,
+        ..CallResultResolution::default()
+    };
+    for call_id in call_ids {
+        if cancellation.is_cancelled() {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        let call_row = procedure.semantics().call_site(*call_id).ok_or_else(|| {
+            InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                "call-result index reached a stale call site",
+            ))
+        })?;
+        let call_resolution = materialize_one_call_result(
+            oracle,
+            query,
+            state,
+            call_row,
+            inherited_evidence,
+            drafts,
+            limits,
+            staged,
+            cancellation,
+        )?;
+        resolution.open |= call_resolution.open;
+        resolution.truncated |= call_resolution.truncated;
+        resolution.ambiguous |= call_resolution.ambiguous;
+    }
+    Ok(Some(resolution))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_one_call_result(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    query: &ValueAtPoint,
+    state: TraceState,
+    call_row: &SemanticCallSite,
+    inherited_evidence: &[EvidenceHandle],
+    drafts: &mut Vec<ObjectDraft>,
+    limits: crate::analyzer::semantic::OracleLimits,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<CallResultResolution, InterruptionOrProvider> {
+    let procedure = query.point().procedure();
+    let call = procedure.call_site_handle(call_row.id).ok_or_else(|| {
+        InterruptionOrProvider::Provider(SemanticProviderError::internal(
+            "call-result trace reached a stale call site",
+        ))
+    })?;
+    let result = value_handle(procedure, state.value).map_err(InterruptionOrProvider::Provider)?;
+    let result_row = procedure
+        .semantics()
+        .value(state.value)
+        .expect("value handles are validated at construction");
+    let caller_evidence = dedup_evidence(
+        inherited_evidence.iter().cloned().chain([
+            evidence_handle(procedure, call_row.evidence)
+                .map_err(InterruptionOrProvider::Provider)?,
+            evidence_handle(procedure, result_row.evidence)
+                .map_err(InterruptionOrProvider::Provider)?,
+        ]),
+    );
+    let initial_candidates = drafts.len();
+    let mut resolution = CallResultResolution::default();
+
+    let dispatch_outcome = {
+        let mut request = SemanticRequest::new(&mut staged.budget, cancellation);
+        oracle
+            .resolve_call(&call, &mut request)
+            .map_err(InterruptionOrProvider::Provider)?
+    };
+    staged.work = staged.work.conservative_add(dispatch_outcome.work());
+    if let Some(interruption) = outcome_interruption(&dispatch_outcome) {
+        return Err(InterruptionOrProvider::Interruption(interruption));
+    }
+    resolution.open |= outcome_is_open(&dispatch_outcome);
+    resolution.ambiguous |= outcome_is_ambiguous(&dispatch_outcome);
+    let Some(dispatch) = dispatch_outcome.available_value() else {
+        let draft = symbolic_object(procedure, result, caller_evidence)
+            .map_err(InterruptionOrProvider::Provider)?;
+        push_object(&mut *drafts, draft.object, draft.evidence);
+        resolution.open = true;
+        return Ok(resolution);
+    };
+    resolution.absorb_coverage(dispatch.coverage());
+    resolution.open |= !dispatch.boundaries().is_empty();
+
+    for candidate in dispatch.candidates() {
+        if cancellation.is_cancelled() {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        let bindings_outcome = {
+            let mut request = SemanticRequest::new(&mut staged.budget, cancellation);
+            oracle
+                .call_bindings(&call, candidate, query.context(), &mut request)
+                .map_err(InterruptionOrProvider::Provider)?
+        };
+        staged.work = staged.work.conservative_add(bindings_outcome.work());
+        if let Some(interruption) = outcome_interruption(&bindings_outcome) {
+            return Err(InterruptionOrProvider::Interruption(interruption));
+        }
+        resolution.open |= outcome_is_open(&bindings_outcome);
+        resolution.ambiguous |= outcome_is_ambiguous(&bindings_outcome);
+        let Some(bindings) = bindings_outcome.available_value() else {
+            resolution.open = true;
+            continue;
+        };
+        resolution.absorb_coverage(bindings.coverage());
+
+        let callee_context = query.context().extended(call.clone(), limits);
+        resolution.open |= callee_context.was_truncated();
+        let flow_outcome = {
+            let mut request = SemanticRequest::new(&mut staged.budget, cancellation);
+            oracle
+                .procedure_relations(candidate.target(), &callee_context, &mut request)
+                .map_err(InterruptionOrProvider::Provider)?
+        };
+        staged.work = staged.work.conservative_add(flow_outcome.work());
+        if let Some(interruption) = outcome_interruption(&flow_outcome) {
+            return Err(InterruptionOrProvider::Interruption(interruption));
+        }
+        resolution.open |= outcome_is_open(&flow_outcome);
+        resolution.ambiguous |= outcome_is_ambiguous(&flow_outcome);
+        let Some(flow) = flow_outcome.available_value() else {
+            resolution.open = true;
+            continue;
+        };
+        resolution.absorb_coverage(flow.coverage());
+
+        let handle = match CallResultHandle::new(bindings, flow, limits) {
+            Ok(handle) => handle,
+            Err(OracleContractError::LimitExceeded { .. }) => {
+                resolution.truncated = true;
+                continue;
+            }
+            Err(OracleContractError::InvalidAccessRoot(_)) => {
+                resolution.open = true;
+                continue;
+            }
+            Err(error) => {
+                return Err(InterruptionOrProvider::Provider(internal_contract(
+                    "invalid call-result object",
+                    error,
+                )));
+            }
+        };
+        let mut quality = (candidate.proof().clone(), candidate.completeness().clone());
+        for relation in handle.return_relations() {
+            quality = merge_quality(
+                &quality,
+                &(relation.proof.clone(), relation.completeness.clone()),
+            );
+        }
+        let object = AbstractObject::new(
+            AbstractObjectIdentity::CallResult(handle),
+            ObjectCardinality::Unknown,
+        )
+        .map_err(|error| {
+            InterruptionOrProvider::Provider(internal_contract("invalid call-result object", error))
+        })?;
+        push_object_with_quality(drafts, object, caller_evidence.clone(), quality);
+    }
+
+    if drafts.len() == initial_candidates {
+        let draft = symbolic_object(procedure, result, caller_evidence)
+            .map_err(InterruptionOrProvider::Provider)?;
+        push_object(drafts, draft.object, draft.evidence);
+        resolution.open = true;
+    }
+    Ok(resolution)
+}
+
 fn resolve_objects(
+    oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
     limits: crate::analyzer::semantic::OracleLimits,
     staged: &mut WorkStager,
@@ -522,6 +782,7 @@ fn resolve_objects(
     let mut visited = HashSet::default();
     let mut drafts = Vec::new();
     let mut truncated = false;
+    let mut ambiguous = false;
 
     while let Some((state, inherited_evidence)) = stack.pop() {
         if cancellation.is_cancelled() {
@@ -697,6 +958,23 @@ fn resolve_objects(
                 break;
             }
         }
+        if producer.is_none()
+            && let Some(resolution) = materialize_call_result(
+                oracle,
+                query,
+                state,
+                &inherited_evidence,
+                &mut drafts,
+                limits,
+                staged,
+                cancellation,
+            )?
+        {
+            open |= resolution.open;
+            truncated |= resolution.truncated;
+            ambiguous |= resolution.ambiguous;
+            producer = Some((state.value, state.event_limit, Vec::new()));
+        }
         if let Some((source, event_limit, evidence)) = producer {
             if source != state.value {
                 if state.summary_depth >= limits.summary_depth() {
@@ -796,6 +1074,7 @@ fn resolve_objects(
         } else {
             CandidateCoverage::Exhaustive
         },
+        ambiguous,
     })
 }
 
@@ -856,6 +1135,7 @@ fn candidate_publication_work(candidate_count: usize, evidence_count: usize) -> 
 }
 
 fn resolve_locations(
+    oracle: &WorkspaceSemanticOracle<'_>,
     query: &AccessPathAtPoint,
     limits: crate::analyzer::semantic::OracleLimits,
     staged: &mut WorkStager,
@@ -864,6 +1144,7 @@ fn resolve_locations(
     let procedure = query.point().procedure();
     let objects = if let Some(value) = match query.path().root() {
         AccessPathRoot::Value(value) => Some(value.clone()),
+        AccessPathRoot::CallResult(result) => Some(result.result().clone()),
         AccessPathRoot::Allocation(allocation) => procedure
             .semantics()
             .allocation(allocation.id())
@@ -885,12 +1166,23 @@ fn resolve_locations(
         .map_err(|error| {
             InterruptionOrProvider::Provider(internal_contract("invalid value-root query", error))
         })?;
-        let mut objects = resolve_objects(&value, limits, staged, cancellation)?;
+        let mut objects = resolve_objects(oracle, &value, limits, staged, cancellation)?;
         if let AccessPathRoot::Allocation(expected) = query.path().root() {
             objects.candidates.retain(|candidate| {
                 matches!(
                     candidate.object.identity(),
                     AbstractObjectIdentity::Allocation(actual) if actual == expected
+                )
+            });
+            if objects.candidates.is_empty() {
+                objects.coverage = CandidateCoverage::Open;
+            }
+        }
+        if let AccessPathRoot::CallResult(expected) = query.path().root() {
+            objects.candidates.retain(|candidate| {
+                matches!(
+                    candidate.object.identity(),
+                    AbstractObjectIdentity::CallResult(actual) if actual == expected
                 )
             });
             if objects.candidates.is_empty() {
@@ -916,6 +1208,7 @@ fn resolve_locations(
         if matches!(
             query.path().root(),
             AccessPathRoot::Static(_)
+                | AccessPathRoot::CallResult(_)
                 | AccessPathRoot::TypeSummary(_)
                 | AccessPathRoot::ModuleObject(_)
                 | AccessPathRoot::External(_)
@@ -952,10 +1245,12 @@ fn resolve_locations(
             } else {
                 CandidateCoverage::Exhaustive
             },
+            ambiguous: false,
         }
     };
     let mut candidates = Vec::new();
     let mut truncated = objects.coverage == CandidateCoverage::Truncated;
+    let ambiguous = objects.ambiguous;
     for draft in objects.candidates {
         if cancellation.is_cancelled() {
             return Err(InterruptionOrProvider::Interruption(
@@ -1009,6 +1304,7 @@ fn resolve_locations(
         } else {
             objects.coverage
         },
+        ambiguous,
     })
 }
 
@@ -1063,6 +1359,7 @@ fn publish_set_outcome<T>(
     value: T,
     coverage: CandidateCoverage,
     proven_complete: bool,
+    ambiguous: bool,
     interruption: Option<Interruption>,
     work: SemanticWork,
 ) -> SemanticOutcome<T> {
@@ -1084,6 +1381,10 @@ fn publish_set_outcome<T>(
         }
         None if coverage == CandidateCoverage::Open => SemanticOutcome::Unknown {
             partial: Some(value),
+            work,
+        },
+        None if ambiguous => SemanticOutcome::Ambiguous {
+            candidates: value,
             work,
         },
         None => SemanticOutcome::Complete { value, work },
@@ -1226,7 +1527,7 @@ fn materialize_update(
             &drafts.candidates,
         )));
     }
-    if drafts.candidates.len() != 1 {
+    if drafts.ambiguous || drafts.candidates.len() != 1 {
         let mut reasons = vec![
             WeakUpdateReason::MultipleLocations,
             WeakUpdateReason::MultipleObjects,
@@ -1378,26 +1679,34 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             });
         }
         let mut staged = WorkStager::new(request);
-        let drafts = match resolve_objects(value, *self.limits(), &mut staged, request.cancellation)
-        {
+        let drafts = match resolve_objects(
+            self,
+            value,
+            *self.limits(),
+            &mut staged,
+            request.cancellation,
+        ) {
             Ok(drafts) => drafts,
             Err(InterruptionOrProvider::Provider(error)) => return Err(error),
             Err(InterruptionOrProvider::Interruption(interruption)) => {
                 let empty = DraftSet {
                     candidates: Vec::new(),
                     coverage: CandidateCoverage::Open,
+                    ambiguous: false,
                 };
                 let result = materialize_points_to(value, empty, *self.limits())?;
                 return Ok(publish_set_outcome(
                     result,
                     CandidateCoverage::Open,
                     true,
+                    false,
                     Some(interruption),
                     staged.work,
                 ));
             }
         };
         let coverage = drafts.coverage;
+        let ambiguous = drafts.ambiguous;
         let proven_complete = candidates_proven_complete(&drafts.candidates, |candidate| {
             matches!(candidate.proof, ProofStatus::Proven)
                 && matches!(candidate.completeness, EvidenceCompleteness::Complete)
@@ -1414,12 +1723,14 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             let empty = DraftSet {
                 candidates: Vec::new(),
                 coverage: CandidateCoverage::Open,
+                ambiguous: false,
             };
             let result = materialize_points_to(value, empty, *self.limits())?;
             return Ok(publish_set_outcome(
                 result,
                 CandidateCoverage::Open,
                 true,
+                false,
                 Some(interruption),
                 staged.work,
             ));
@@ -1430,6 +1741,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             result,
             coverage,
             proven_complete,
+            ambiguous,
             None,
             staged.work,
         ))
@@ -1447,26 +1759,34 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             });
         }
         let mut staged = WorkStager::new(request);
-        let drafts =
-            match resolve_locations(access, *self.limits(), &mut staged, request.cancellation) {
-                Ok(drafts) => drafts,
-                Err(InterruptionOrProvider::Provider(error)) => return Err(error),
-                Err(InterruptionOrProvider::Interruption(interruption)) => {
-                    let empty = DraftSet {
-                        candidates: Vec::new(),
-                        coverage: CandidateCoverage::Open,
-                    };
-                    let result = materialize_locations(access, empty, *self.limits())?;
-                    return Ok(publish_set_outcome(
-                        result,
-                        CandidateCoverage::Open,
-                        true,
-                        Some(interruption),
-                        staged.work,
-                    ));
-                }
-            };
+        let drafts = match resolve_locations(
+            self,
+            access,
+            *self.limits(),
+            &mut staged,
+            request.cancellation,
+        ) {
+            Ok(drafts) => drafts,
+            Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+            Err(InterruptionOrProvider::Interruption(interruption)) => {
+                let empty = DraftSet {
+                    candidates: Vec::new(),
+                    coverage: CandidateCoverage::Open,
+                    ambiguous: false,
+                };
+                let result = materialize_locations(access, empty, *self.limits())?;
+                return Ok(publish_set_outcome(
+                    result,
+                    CandidateCoverage::Open,
+                    true,
+                    false,
+                    Some(interruption),
+                    staged.work,
+                ));
+            }
+        };
         let coverage = drafts.coverage;
+        let ambiguous = drafts.ambiguous;
         let proven_complete = candidates_proven_complete(&drafts.candidates, |candidate| {
             matches!(candidate.proof, ProofStatus::Proven)
                 && matches!(candidate.completeness, EvidenceCompleteness::Complete)
@@ -1483,12 +1803,14 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             let empty = DraftSet {
                 candidates: Vec::new(),
                 coverage: CandidateCoverage::Open,
+                ambiguous: false,
             };
             let result = materialize_locations(access, empty, *self.limits())?;
             return Ok(publish_set_outcome(
                 result,
                 CandidateCoverage::Open,
                 true,
+                false,
                 Some(interruption),
                 staged.work,
             ));
@@ -1499,6 +1821,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             result,
             coverage,
             proven_complete,
+            ambiguous,
             None,
             staged.work,
         ))
@@ -1517,12 +1840,14 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
         }
         let mut staged = WorkStager::new(request);
         let left = resolve_locations(
+            self,
             query.left(),
             *self.limits(),
             &mut staged,
             request.cancellation,
         );
         let right = resolve_locations(
+            self,
             query.right(),
             *self.limits(),
             &mut staged,
@@ -1536,10 +1861,12 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                 DraftSet {
                     candidates: Vec::new(),
                     coverage: CandidateCoverage::Open,
+                    ambiguous: false,
                 },
                 DraftSet {
                     candidates: Vec::new(),
                     coverage: CandidateCoverage::Open,
+                    ambiguous: false,
                 },
                 Some(interruption),
             ),
@@ -1547,10 +1874,12 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                 DraftSet {
                     candidates: Vec::new(),
                     coverage: CandidateCoverage::Open,
+                    ambiguous: false,
                 },
                 DraftSet {
                     candidates: Vec::new(),
                     coverage: CandidateCoverage::Open,
+                    ambiguous: false,
                 },
                 Some(interruption),
             ),
@@ -1612,6 +1941,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             coverage,
             matches!(quality.0, ProofStatus::Proven)
                 && matches!(quality.1, EvidenceCompleteness::Complete),
+            left.ambiguous || right.ambiguous,
             interruption,
             staged.work,
         ))
@@ -1630,6 +1960,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
         }
         let mut staged = WorkStager::new(request);
         let drafts = match resolve_locations(
+            self,
             store.target(),
             *self.limits(),
             &mut staged,

@@ -3944,6 +3944,71 @@ service.run();
 }
 
 #[test]
+fn csharp_cross_file_receiver_step_does_not_cold_materialize_unheld_facts() {
+    let definitions = r#"
+namespace Demo;
+public class Service {
+    public void Run() {}
+}
+"#;
+    let usage = r#"
+namespace Demo;
+public class Caller {
+    public void Call(Service service) { service.Run(); }
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "Definitions.cs")
+        .write(definitions)
+        .expect("write definitions");
+    ProjectFile::new(root.clone(), "Usage.cs")
+        .write(usage)
+        .expect("write usage");
+    let workspace = WorkspaceAnalyzer::build(
+        Arc::new(TestProject::new(root, Language::CSharp)),
+        AnalyzerConfig::default(),
+    );
+    let query = CodeQuery::from_json(&json!({
+        "where": ["Definitions.cs"],
+        "match": { "kind": "method", "name": "Run" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "references_of", "proof": "proven" },
+            { "op": "member_targets" }
+        ]
+    }))
+    .expect("cross-file receiver query");
+    let provider = workspace
+        .analyzer()
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == Language::CSharp)
+        .expect("C# structural provider");
+    let extractions_before = provider.structural_extraction_count();
+
+    let result = execute_workspace(&workspace, &query);
+
+    assert_eq!(
+        provider.structural_extraction_count(),
+        extractions_before + 2,
+        "the seed and reference traversal each extract their own file; receiver analysis must not perform a third extraction"
+    );
+    assert!(
+        matches!(
+            result.results.as_slice(),
+            [CodeQueryResultItem {
+                value: CodeQueryResultValue::ReceiverAnalysis { value },
+                ..
+            }] if value.outcome == "unsupported"
+                && value.reason == Some("receiver_structural_facts_unavailable")
+        ),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
 fn cancelled_composed_query_retains_no_partial_rows() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");

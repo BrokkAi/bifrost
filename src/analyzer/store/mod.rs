@@ -367,6 +367,38 @@ pub struct CandidateRow {
     pub flags: CandidateFlags,
 }
 
+/// A provider-owned row batch whose work was capped before materialization.
+///
+/// `inspected` counts source rows examined, which can differ from `rows.len()`
+/// after liveness filtering or one persisted blob expanding to multiple live
+/// workspace paths. `complete` is false whenever the provider stopped at its
+/// supplied cap or observed cancellation, so bounded callers never mistake a
+/// partial batch for an authoritative miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LimitedQueryRows<T> {
+    pub(crate) rows: Vec<T>,
+    pub(crate) inspected: usize,
+    pub(crate) complete: bool,
+}
+
+impl<T> LimitedQueryRows<T> {
+    pub(crate) fn complete(rows: Vec<T>, inspected: usize) -> Self {
+        Self {
+            rows,
+            inspected,
+            complete: true,
+        }
+    }
+
+    pub(crate) fn incomplete(rows: Vec<T>, inspected: usize) -> Self {
+        Self {
+            rows,
+            inspected,
+            complete: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CandidatePrimaryRangeRow {
     pub(crate) candidate: CandidateRow,
@@ -1548,6 +1580,63 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// Read at most `limit` signature-metadata rows for one persisted code
+    /// unit without hydrating the owning file state.
+    ///
+    /// The target identity deliberately includes every stable `CodeUnit`
+    /// discriminator. Callers supply a one-row lookahead in `limit`; a batch
+    /// that fills the limit is therefore incomplete and must not be treated as
+    /// authoritative.
+    pub(crate) fn signature_metadata_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<SignatureMetadata>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = signature_metadata_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn raw_supertypes_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<String>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = raw_supertypes_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Read at most `limit` declaration ranges for one persisted code unit
+    /// without hydrating the owning file state.
+    pub(crate) fn ranges_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<Range>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = ranges_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Hydrate many live file states from persisted blob rows using chunked
     /// `IN` scans over the requested OIDs. `source_by_file` controls whether
     /// source-dependent hydrate hooks and file-scope range synthesis run for a
@@ -1693,6 +1782,85 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    pub(crate) fn first_declaration_content_qualifier_for_key(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+    ) -> Result<Option<String>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let sql = format!(
+            "SELECT units.content_qualifier
+             FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             WHERE units.blob_oid = ?1 AND units.lang = ?2
+               AND units.content_qualifier <> ''
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.unit_key
+             LIMIT 1"
+        );
+        let result = tx
+            .query_row(&sql, params![oid.to_string(), lang], |row| row.get(0))
+            .optional()?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn import_infos_for_key_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<ImportInfo>> {
+        if limit == 0 {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+        }
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let oid = oid.to_string();
+        let meta_sql = format!(
+            "SELECT meta.import_count
+             FROM blob_meta AS meta
+             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+        );
+        let Some(import_count) = tx
+            .query_row(&meta_sql, params![&oid, lang], |row| row.get::<_, i64>(0))
+            .optional()?
+        else {
+            tx.commit()?;
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+        };
+        let import_count = i64_to_usize(import_count)?;
+        let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = tx.prepare_cached(
+            "SELECT info FROM import_details
+             WHERE blob_oid = ?1 AND lang = ?2
+             ORDER BY ordinal
+             LIMIT ?3",
+        )?;
+        let mapped = statement.query_map(params![&oid, lang, sql_limit], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut rows = Vec::with_capacity(import_count.min(limit));
+        for row in mapped {
+            rows.push(deserialize_blob(&row?)?);
+        }
+        drop(statement);
+        tx.commit()?;
+        let inspected = rows.len();
+        if import_count > inspected {
+            Ok(LimitedQueryRows::incomplete(rows, inspected))
+        } else {
+            Ok(LimitedQueryRows::complete(rows, inspected))
+        }
+    }
+
     pub fn declaration_candidate_rows_by_short_name(
         &self,
         lang: &str,
@@ -1811,6 +1979,37 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    pub(crate) fn declaration_candidate_rows_by_identifier_for_langs_limited(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        identifier: &str,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<CandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = candidate_rows_sql_with_membership(
+            "units",
+            "FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+            "units.lang = ?1 AND units.identifier = ?2",
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+            "units.blob_oid, units.unit_key",
+        );
+        let sql = format!("{sql} LIMIT ?3");
+        let rows = candidate_rows_for_languages_limited(
+            &tx,
+            langs.iter().map(String::as_str),
+            &sql,
+            &[&identifier],
+            limit,
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     pub(crate) fn declaration_candidate_rows_by_lookup_key_for_langs(
         &self,
         langs: &[String],
@@ -1828,6 +2027,34 @@ impl AnalyzerStore {
         let sql = declaration_candidate_sql(&format!("units.lang = ?1 AND units.{column} = ?2"));
         let rows =
             candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[&value])?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn declaration_candidate_rows_by_lookup_key_for_langs_limited(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        column: PersistedLookupKey,
+        value: &str,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<CandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let column = match column {
+            PersistedLookupKey::ExactFqn => "exact_fqn",
+            PersistedLookupKey::NormalizedFqn => "normalized_fqn",
+        };
+        let sql = declaration_candidate_sql(&format!("units.lang = ?1 AND units.{column} = ?2"));
+        let sql = format!("{sql} LIMIT ?3");
+        let rows = candidate_rows_for_languages_limited(
+            &tx,
+            langs.iter().map(String::as_str),
+            &sql,
+            &[&value],
+            limit,
+        )?;
         tx.commit()?;
         Ok(rows)
     }
@@ -1869,6 +2096,51 @@ impl AnalyzerStore {
             langs.iter().map(String::as_str),
             &sql,
             &[&owner, &identifier],
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn declaration_member_rows_for_owner_for_langs_limited(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        owner: &str,
+        normalized: bool,
+        identifier: &str,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<CandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let owner_column = if normalized {
+            "normalized_fqn"
+        } else {
+            "exact_fqn"
+        };
+        let sql = candidate_rows_sql(
+            "child",
+            "FROM code_units AS owner
+             JOIN unit_children AS edge
+               ON edge.blob_oid = owner.blob_oid AND edge.lang = owner.lang
+              AND edge.parent_key = owner.unit_key
+             JOIN code_units AS child
+               ON child.blob_oid = edge.blob_oid AND child.lang = edge.lang
+              AND child.unit_key = edge.child_key
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = child.blob_oid AND meta.lang = child.lang",
+            &format!(
+                "owner.lang = ?1 AND owner.{owner_column} = ?2
+                 AND owner.in_declarations = 1 AND child.identifier = ?3"
+            ),
+        );
+        let sql = format!("{sql} LIMIT ?4");
+        let rows = candidate_rows_for_languages_limited(
+            &tx,
+            langs.iter().map(String::as_str),
+            &sql,
+            &[&owner, &identifier],
+            limit,
         )?;
         tx.commit()?;
         Ok(rows)
@@ -2542,6 +2814,39 @@ fn candidate_rows_for_languages<'a>(
         )?);
     }
     Ok(rows)
+}
+
+fn candidate_rows_for_languages_limited<'a>(
+    conn: &Connection,
+    langs: impl IntoIterator<Item = &'a str>,
+    sql: &str,
+    values: &[&dyn ToSql],
+    limit: usize,
+) -> Result<LimitedQueryRows<CandidateRow>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+
+    let mut statement = conn.prepare_cached(sql)?;
+    let mut rows = Vec::new();
+    for lang in langs {
+        let remaining = limit.saturating_sub(rows.len());
+        if remaining == 0 {
+            return Ok(LimitedQueryRows::incomplete(rows, limit));
+        }
+        let sql_limit = i64::try_from(remaining).unwrap_or(i64::MAX);
+        let params = std::iter::once(&lang as &dyn ToSql)
+            .chain(values.iter().copied())
+            .chain(std::iter::once(&sql_limit as &dyn ToSql));
+        rows.extend(collect_candidate_rows(
+            statement.query_map(params_from_iter(params), candidate_row_from_row)?,
+        )?);
+        if rows.len() == limit {
+            return Ok(LimitedQueryRows::incomplete(rows, limit));
+        }
+    }
+    let inspected = rows.len();
+    Ok(LimitedQueryRows::complete(rows, inspected))
 }
 
 fn definition_order_candidate_rows_for_languages<'a>(
@@ -5454,6 +5759,124 @@ fn read_signature_metadata(
     Ok(out)
 }
 
+fn signature_metadata_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<SignatureMetadata>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT metadata.metadata
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_signature_metadata AS metadata
+           ON metadata.blob_oid = units.blob_oid
+          AND metadata.lang = units.lang
+          AND metadata.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND units.exact_fqn = ?3
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY metadata.ordinal
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mapped = statement.query_map(
+        params![
+            oid,
+            lang,
+            unit.fq_name(),
+            kind,
+            unit.short_name(),
+            unit.signature(),
+            synthetic,
+            sql_limit,
+        ],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut rows = Vec::new();
+    for bytes in mapped {
+        rows.push(deserialize_blob(&bytes?)?);
+    }
+    let inspected = rows.len();
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
+}
+
+fn raw_supertypes_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<String>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT supertypes.raw
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_supertypes AS supertypes
+           ON supertypes.blob_oid = units.blob_oid
+          AND supertypes.lang = units.lang
+          AND supertypes.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND units.exact_fqn = ?3
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY supertypes.ordinal
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let rows = statement
+        .query_map(
+            params![
+                oid,
+                lang,
+                unit.fq_name(),
+                kind,
+                unit.short_name(),
+                unit.signature(),
+                synthetic,
+                sql_limit,
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let inspected = rows.len();
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
+}
+
 fn read_cpp_template_metadata(
     conn: &Connection,
     oid: &str,
@@ -5476,6 +5899,79 @@ fn read_cpp_template_metadata(
         }
     }
     Ok(out)
+}
+
+fn ranges_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<Range>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_ranges AS ranges
+           ON ranges.blob_oid = units.blob_oid
+          AND ranges.lang = units.lang
+          AND ranges.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND units.exact_fqn = ?3
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY ranges.ordinal
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mapped = statement.query_map(
+        params![
+            oid,
+            lang,
+            unit.fq_name(),
+            kind,
+            unit.short_name(),
+            unit.signature(),
+            synthetic,
+            sql_limit,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        let (start_byte, end_byte, start_line, end_line) = row?;
+        rows.push(Range {
+            start_byte: i64_to_usize(start_byte)?,
+            end_byte: i64_to_usize(end_byte)?,
+            start_line: i64_to_usize(start_line)?,
+            end_line: i64_to_usize(end_line)?,
+        });
+    }
+    let inspected = rows.len();
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
 }
 
 fn read_ranges(

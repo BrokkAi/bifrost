@@ -75,13 +75,11 @@ impl CompleteSemanticArtifactCache {
     }
 }
 
-/// Convert the artifact's exact retained-work census into a conservative byte
-/// weight. Fixed rows use their concrete Rust size; nested entries reserve at
-/// least twice a `SemanticLocator`, and owned text is doubled to cover the
-/// independently cloned Moka key. Hash-map bucket and Arc allocation overhead
-/// are included explicitly. Source bytes are intentionally absent: the prepared
-/// source is not owned by `SemanticArtifact`.
-fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifact) -> u64 {
+/// Convert the artifact's exact retained-work census and fixed cache overhead
+/// into the base portion of its conservative byte weight. Source bytes are
+/// intentionally absent: the prepared source is not owned by
+/// `SemanticArtifact`.
+fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
     fn rows(count: usize, row_size: usize) -> u64 {
         (count as u64).saturating_mul(row_size as u64)
     }
@@ -114,10 +112,26 @@ fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifac
         ))
         .saturating_add((work.owned_text_bytes as u64).saturating_mul(2));
 
+    bytes.max(1)
+}
+
+/// Convert the artifact's retained rows and derived indexes into a conservative
+/// byte weight. Fixed rows use their concrete Rust size; nested entries reserve
+/// at least twice a `SemanticLocator`, and owned text is doubled to cover the
+/// independently cloned Moka key. Hash-map bucket, boxed payload, allocator,
+/// and Arc allocation overhead are included explicitly.
+fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifact) -> u64 {
     // `key` is intentionally used here as an invariant check: the cache must
     // weigh the same immutable identity embedded in the artifact.
     debug_assert_eq!(key, artifact.key());
-    bytes.max(1)
+    artifact
+        .procedures()
+        .iter()
+        .fold(
+            retained_artifact_base_bytes(artifact),
+            |bytes, procedure| bytes.saturating_add(procedure.call_indexes_retained_bytes()),
+        )
+        .max(1)
 }
 
 fn weigh_complete_artifact(key: &SemanticArtifactKey, artifact: &Arc<SemanticArtifact>) -> u32 {
@@ -1161,6 +1175,64 @@ mod tests {
         cache.insert(second.key().clone(), Arc::clone(&second));
 
         assert_eq!(cache.len(), 1, "two byte-weighted entries exceed capacity");
+    }
+
+    #[test]
+    fn complete_cache_weight_includes_derived_call_indexes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(
+            &root,
+            "src/calls.ts",
+            "function target(value: number): number { return value; }\n\
+             export function main(): number { return target(1); }\n",
+        );
+        let analyzer = analyzer(&root);
+        let staging_cache = CompleteSemanticArtifactCache::default();
+        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: artifact, ..
+        } = materialize(
+            &analyzer,
+            &staging_cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        )
+        else {
+            panic!("call-bearing artifact")
+        };
+
+        let call_index_bytes = artifact
+            .procedures()
+            .iter()
+            .map(ProcedureSemantics::call_indexes_retained_bytes)
+            .sum::<u64>();
+        assert!(
+            call_index_bytes > 0,
+            "fixture must retain derived call-phase indexes"
+        );
+        let base_bytes = retained_artifact_base_bytes(&artifact);
+        let retained_bytes = retained_artifact_bytes(artifact.key(), &artifact);
+        assert_eq!(
+            retained_bytes,
+            base_bytes.saturating_add(call_index_bytes),
+            "cache weight must include every derived call-index allocation"
+        );
+
+        let undersized = CompleteSemanticArtifactCache::new(base_bytes);
+        undersized.insert(artifact.key().clone(), Arc::clone(&artifact));
+        assert_eq!(
+            undersized.len(),
+            0,
+            "the former row-only capacity must not retain the indexed artifact"
+        );
+
+        let exact = CompleteSemanticArtifactCache::new(retained_bytes);
+        exact.insert(artifact.key().clone(), artifact);
+        assert_eq!(exact.len(), 1, "the corrected exact capacity retains it");
     }
 
     #[test]

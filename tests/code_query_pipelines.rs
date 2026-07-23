@@ -78,7 +78,8 @@ export function caller() {
     let analysis = &points_to["results"][0];
     assert_eq!(analysis["result_type"], "receiver_analysis", "{points_to}");
     assert_eq!(analysis["analysis_kind"], "points_to", "{points_to}");
-    assert_eq!(analysis["outcome"], "precise", "{points_to}");
+    assert_eq!(analysis["outcome"], "ambiguous", "{points_to}");
+    assert_eq!(points_to["truncated"], false, "{points_to}");
     assert_eq!(analysis["capture"], "service", "{points_to}");
     assert_eq!(
         analysis["values"][0]["receiver_value_kind"], "factory_return",
@@ -122,7 +123,7 @@ export function caller() {
         }),
     ));
     assert_eq!(
-        exact_members["results"][0]["outcome"], "precise",
+        exact_members["results"][0]["outcome"], "ambiguous",
         "{exact_members}"
     );
     assert_eq!(
@@ -321,6 +322,1123 @@ class Labels {
 }
 
 #[test]
+fn csharp_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "ReceiverCases.cs",
+        r#"namespace Demo;
+
+public class Service
+{
+    public void Run() {}
+    public string Name => "service";
+    public Service Next => this;
+    public static Service Create() => new Service();
+
+    public void Mixed(bool flag)
+    {
+        var mixed = flag ? new Service() : new Service();
+        mixed.Run();
+    }
+
+    public void Folded(Service left, Service right, bool flag)
+    {
+        var selected = flag ? left : right;
+        selected.Run();
+    }
+}
+
+public class Other
+{
+    public void Run() {}
+}
+
+public static class ServiceExtensions
+{
+    public static void Extend(this Service value) {}
+}
+
+public static class OtherExtensions
+{
+    public static void Extend(this Other value) {}
+}
+
+public class Caller
+{
+    private readonly Service field = new Service();
+
+    public void Touch(Service value) {}
+
+    public void Call(Service parameter)
+    {
+        var local = new Service();
+        local.Run();
+        field.Run();
+        local.Extend();
+        parameter?.Run();
+        var name = parameter?.Name;
+        this.Touch(local);
+        this.Touch(new Service());
+        local.Next.Run();
+        Service.Create().Run();
+    }
+}
+"#,
+    )];
+
+    let local_points = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "local", "capture": "receiver" }
+            },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(
+        local_points["results"][0]["outcome"], "precise",
+        "{local_points}"
+    );
+    assert_eq!(
+        local_points["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
+        "{local_points}"
+    );
+    assert!(
+        local_points["results"][0]["values"][0]["type_declaration"]["fq_name"]
+            .as_str()
+            .is_some_and(|fqn| fqn.ends_with("Demo.Service")),
+        "{local_points}"
+    );
+
+    let exact_member = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "local" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        exact_member["results"][0]["outcome"], "precise",
+        "{exact_member}"
+    );
+    let member_targets = exact_member["results"][0]["member_targets"]
+        .as_array()
+        .expect("member targets");
+    assert_eq!(member_targets.len(), 1, "{exact_member}");
+    assert_eq!(
+        member_targets[0]["fq_name"], "Demo.Service.Run",
+        "{exact_member}"
+    );
+    assert!(
+        !member_targets.iter().any(|target| target["fq_name"]
+            .as_str()
+            .is_some_and(|fqn| fqn.contains("Demo.Other"))),
+        "{exact_member}"
+    );
+
+    let mixed_receiver = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "mixed", "capture": "receiver" }
+            },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    let mixed_values = mixed_receiver["results"][0]["values"]
+        .as_array()
+        .expect("mixed receiver values");
+    assert_eq!(
+        mixed_receiver["results"][0]["outcome"], "ambiguous",
+        "{mixed_receiver}"
+    );
+    assert_eq!(mixed_values.len(), 2, "{mixed_receiver}");
+    assert!(
+        mixed_values
+            .iter()
+            .all(|value| value["receiver_value_kind"] == "allocation_site"),
+        "{mixed_receiver}"
+    );
+
+    let folded_receiver = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "selected", "capture": "receiver" }
+            },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(
+        folded_receiver["results"][0]["outcome"], "unknown",
+        "{folded_receiver}"
+    );
+    assert!(
+        folded_receiver["results"][0].get("values").is_none(),
+        "{folded_receiver}"
+    );
+
+    let extension_member = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Extend" },
+                "receiver": { "name": "local" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        extension_member["results"][0]["outcome"], "precise",
+        "{extension_member}"
+    );
+    assert_eq!(
+        extension_member["results"][0]["member_targets"][0]["fq_name"],
+        "Demo.ServiceExtensions.Extend",
+        "{extension_member}"
+    );
+    assert!(
+        !extension_member["results"][0]["member_targets"]
+            .as_array()
+            .expect("extension targets")
+            .iter()
+            .any(|target| target["fq_name"] == "Demo.OtherExtensions.Extend"),
+        "{extension_member}"
+    );
+
+    let parameter = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "parameter", "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(parameter["results"][0]["outcome"], "precise", "{parameter}");
+    assert_eq!(
+        parameter["results"][0]["values"][0]["receiver_value_kind"], "instance_type",
+        "{parameter}"
+    );
+
+    let field = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "field", "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(field["results"][0]["outcome"], "ambiguous", "{field}");
+    assert_eq!(
+        field["results"][0]["values"][0]["receiver_value_kind"], "instance_type",
+        "{field}"
+    );
+    assert_eq!(
+        field["results"][0]["values"][0]["declaration"]["fq_name"], "Demo.Service",
+        "{field}"
+    );
+
+    let current_receiver = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Touch" },
+                "receiver": { "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    let current_receiver = current_receiver["results"]
+        .as_array()
+        .expect("current receiver rows")
+        .iter()
+        .find(|row| row["text"] == "this")
+        .expect("current receiver result");
+    assert_eq!(
+        current_receiver["outcome"], "ambiguous",
+        "{current_receiver}"
+    );
+    assert_eq!(
+        current_receiver["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current_receiver}"
+    );
+
+    let conditional_property = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "field_access",
+                "field": { "name": "Name" },
+                "object": { "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(
+        conditional_property["results"][0]["values"][0]["receiver_value_kind"], "instance_type",
+        "{conditional_property}"
+    );
+    assert_eq!(
+        conditional_property["results"][0]["outcome"], "ambiguous",
+        "{conditional_property}"
+    );
+    assert_eq!(
+        conditional_property["results"][0]["values"][0]["declaration"]["fq_name"], "Demo.Service",
+        "{conditional_property}"
+    );
+
+    let static_receiver = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Create" },
+                "receiver": { "name": "Service", "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(
+        static_receiver["results"][0]["values"][0]["receiver_value_kind"], "class_or_static_object",
+        "{static_receiver}"
+    );
+    assert_eq!(
+        static_receiver["results"][0]["outcome"], "precise",
+        "{static_receiver}"
+    );
+    assert_eq!(
+        static_receiver["results"][0]["values"][0]["declaration"]["fq_name"], "Demo.Service",
+        "{static_receiver}"
+    );
+
+    let constructor_input = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "method", "name": "Touch" },
+            "inside": { "kind": "class", "name": "Caller" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to", "proof": "proven" },
+                { "op": "call_input", "parameter_index": 0 },
+                { "op": "points_to" }
+            ]
+        }),
+    ));
+    let constructor = constructor_input["results"]
+        .as_array()
+        .expect("constructor call-input rows")
+        .iter()
+        .find(|row| row["text"] == "new Service()")
+        .expect("constructor receiver result");
+    assert_eq!(constructor["outcome"], "precise", "{constructor_input}");
+    assert_eq!(
+        constructor["values"][0]["receiver_value_kind"], "allocation_site",
+        "{constructor_input}"
+    );
+
+    let dynamic_receiver = serialized(&run(
+        &[(
+            "DynamicReceiver.cs",
+            r#"namespace Demo;
+public class Caller
+{
+    public void Call(dynamic opaque)
+    {
+        opaque.Run();
+    }
+}
+"#,
+        )],
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "opaque", "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(
+        dynamic_receiver["results"][0]["outcome"], "unsupported",
+        "{dynamic_receiver}"
+    );
+    assert!(
+        dynamic_receiver["diagnostics"]
+            .as_array()
+            .is_some_and(
+                |diagnostics| diagnostics.iter().any(|diagnostic| diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("dynamic")))
+            ),
+        "{dynamic_receiver}"
+    );
+
+    let factory_result = serialized(&run(
+        &[(
+            "FactoryReceiver.cs",
+            r#"namespace Demo;
+public class Service
+{
+    public void Run() {}
+    public static Service Create() => new Service();
+}
+public class Other
+{
+    public void Run() {}
+    public static Other Create() => new Other();
+}
+public class Caller
+{
+    public void Call() { Service.Create().Run(); }
+}
+"#,
+        )],
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "capture": "factory" }
+            },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory_rows = factory_result["results"]
+        .as_array()
+        .expect("factory receiver rows");
+    let factory = factory_rows
+        .iter()
+        .find(|row| row["text"] == "Service.Create()")
+        .expect("factory-result receiver row");
+    assert_eq!(factory["outcome"], "ambiguous", "{factory_result}");
+    let factory_value = factory["values"]
+        .as_array()
+        .and_then(|values| {
+            values
+                .iter()
+                .find(|value| value["receiver_value_kind"] == "factory_return")
+        })
+        .expect("factory-return value");
+    assert_eq!(
+        factory_value["factory"]["fq_name"], "Demo.Service.Create",
+        "{factory_result}"
+    );
+    assert_eq!(
+        factory_value["returned_value"]["receiver_value_kind"], "instance_type",
+        "{factory_result}"
+    );
+    assert_eq!(
+        factory_value["returned_value"]["declaration"]["fq_name"], "Demo.Service",
+        "{factory_result}"
+    );
+
+    let ambiguous_factory = serialized(&run(
+        &[(
+            "AmbiguousFactory.cs",
+            r#"namespace Demo;
+public class Service { public void Run() {} }
+public class Factory
+{
+    public static Service Create(int value) => new Service();
+    public static Service Create(string value) => new Service();
+    public void Call() { Create(default).Run(); }
+}
+"#,
+        )],
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "capture": "factory" }
+            },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    assert_eq!(
+        ambiguous_factory["results"][0]["outcome"], "ambiguous",
+        "{ambiguous_factory}"
+    );
+}
+
+#[test]
+fn csharp_property_receiver_retains_its_exact_closed_member_candidate() {
+    let files = [(
+        "PropertyReceiver.cs",
+        r#"namespace Demo;
+class Service
+{
+    public Service Next => this;
+    public void Run() {}
+}
+class Other
+{
+    public void Run() {}
+}
+class Caller
+{
+    void Call()
+    {
+        var local = new Service();
+        local.Next.Run();
+    }
+}
+"#,
+    )];
+
+    let report = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": {
+                    "text": { "regex": "^local\\.Next$" },
+                    "capture": "receiver"
+                }
+            },
+            "steps": [{ "op": "member_targets", "capture": "receiver" }]
+        }),
+    ));
+
+    assert_eq!(report["results"][0]["outcome"], "ambiguous", "{report}");
+    assert_eq!(
+        report["results"][0]["member_targets"][0]["fq_name"], "Demo.Service.Run",
+        "{report}"
+    );
+    assert!(
+        !report["results"][0]["member_targets"]
+            .as_array()
+            .expect("member targets")
+            .iter()
+            .any(|target| target["fq_name"] == "Demo.Other.Run"),
+        "{report}"
+    );
+    assert_eq!(report["truncated"], false, "{report}");
+}
+
+#[test]
+fn csharp_member_targets_preserve_closed_extensions_and_open_dispatch() {
+    let files = [
+        (
+            "Service.cs",
+            r#"namespace Dispatch;
+
+public class Service
+{
+    public int Count { get; }
+}
+
+public interface IService
+{
+    void Run();
+    int Count { get; }
+}
+
+public class BaseService
+{
+    public virtual void Run() {}
+    public virtual int Count { get; }
+}
+"#,
+        ),
+        (
+            "Extensions.cs",
+            r#"namespace Dispatch;
+
+public static class ServiceExtensions
+{
+    public static void Extend(this Service value) {}
+}
+"#,
+        ),
+        (
+            "Caller.cs",
+            r#"namespace Dispatch;
+
+public class Caller
+{
+    public void Call(Service local, IService contract, BaseService service)
+    {
+        local.Extend();
+        contract.Run();
+        service.Run();
+        _ = local.Count;
+        _ = contract.Count;
+        _ = service.Count;
+    }
+}
+"#,
+        ),
+    ];
+
+    let extension = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Extend" },
+                "receiver": { "name": "local" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(extension["results"][0]["outcome"], "precise", "{extension}");
+    assert_eq!(
+        extension["results"][0]["member_targets"][0]["fq_name"],
+        "Dispatch.ServiceExtensions.Extend",
+        "{extension}"
+    );
+
+    for (receiver, expected_target) in [
+        ("contract", "Dispatch.IService.Run"),
+        ("service", "Dispatch.BaseService.Run"),
+    ] {
+        let report = serialized(&run(
+            &files,
+            json!({
+                "match": {
+                    "kind": "call",
+                    "callee": { "name": "Run" },
+                    "receiver": { "name": receiver }
+                },
+                "steps": [{ "op": "member_targets" }]
+            }),
+        ));
+        assert_eq!(report["results"][0]["outcome"], "ambiguous", "{report}");
+        assert_eq!(
+            report["results"][0]["member_targets"][0]["fq_name"], expected_target,
+            "{report}"
+        );
+        assert!(
+            !report["truncated"].as_bool().unwrap_or(false),
+            "open dispatch is ambiguous, not truncated: {report}"
+        );
+    }
+
+    for (receiver, expected_target, expected_outcome) in [
+        ("local", "Dispatch.Service.Count", "precise"),
+        ("contract", "Dispatch.IService.Count", "ambiguous"),
+        ("service", "Dispatch.BaseService.Count", "ambiguous"),
+    ] {
+        let report = serialized(&run(
+            &files,
+            json!({
+                "match": {
+                    "kind": "field_access",
+                    "field": { "name": "Count" },
+                    "object": { "name": receiver }
+                },
+                "steps": [{ "op": "member_targets" }]
+            }),
+        ));
+        assert_eq!(
+            report["results"][0]["outcome"], expected_outcome,
+            "{report}"
+        );
+        assert_eq!(
+            report["results"][0]["member_targets"][0]["fq_name"], expected_target,
+            "{report}"
+        );
+        assert!(
+            !report["truncated"].as_bool().unwrap_or(false),
+            "open property dispatch is ambiguous, not truncated: {report}"
+        );
+    }
+}
+
+#[test]
+fn csharp_overload_and_delegate_dispatch_never_collapse_to_a_precise_member() {
+    let files = [(
+        "OpenDispatch.cs",
+        r#"namespace Dispatch;
+
+public delegate void Work();
+
+public class Overloaded
+{
+    public void Run(int value) {}
+    public void Run(string value) {}
+
+    public void Call(Overloaded service, Work work)
+    {
+        service.Run(default);
+        work.Invoke();
+    }
+}
+"#,
+    )];
+
+    let overload = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "service" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(overload["results"][0]["outcome"], "ambiguous", "{overload}");
+    assert_eq!(
+        overload["results"][0]["member_targets"]
+            .as_array()
+            .expect("overload member targets")
+            .len(),
+        2,
+        "{overload}"
+    );
+    assert!(
+        !overload["truncated"].as_bool().unwrap_or(false),
+        "a complete overload set is ambiguous, not truncated: {overload}"
+    );
+
+    let delegate = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Invoke" },
+                "receiver": { "name": "work" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_ne!(
+        delegate["results"][0]["outcome"], "precise",
+        "delegate invocation stays open until callable targets are modeled: {delegate}"
+    );
+    assert!(
+        !delegate["truncated"].as_bool().unwrap_or(false),
+        "delegate uncertainty is semantic, not a resource exit: {delegate}"
+    );
+}
+
+#[test]
+fn csharp_member_targets_compose_from_a_same_file_exact_reference() {
+    let files = [(
+        "ReferenceComposition.cs",
+        r#"namespace Composition;
+
+public class Service
+{
+    public void Run() {}
+}
+
+public class Caller
+{
+    public void Call(Service service) { service.Run(); }
+}
+"#,
+    )];
+
+    let report = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "method", "name": "Run" },
+            "inside": { "kind": "class", "name": "Service" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "references_of", "proof": "proven" },
+                { "op": "member_targets" }
+            ]
+        }),
+    ));
+    assert_eq!(report["results"][0]["outcome"], "precise", "{report}");
+    assert_eq!(
+        report["results"][0]["member_targets"][0]["fq_name"], "Composition.Service.Run",
+        "{report}"
+    );
+}
+
+#[test]
+fn csharp_unresolved_extension_applicability_stays_nonprecise() {
+    let files = [(
+        "AmbiguousExtensions.cs",
+        r#"using Left;
+using Right;
+
+namespace Dispatch
+{
+    public class Service {}
+
+    public class Caller
+    {
+        public void Call(Service service) { service.Extend(); }
+    }
+}
+
+namespace Left
+{
+    public static class Extensions
+    {
+        public static void Extend(this Dispatch.Service value) {}
+    }
+}
+
+namespace Right
+{
+    public static class Extensions
+    {
+        public static void Extend(this Dispatch.Service value) {}
+    }
+}
+"#,
+    )];
+
+    let report = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Extend" },
+                "receiver": { "name": "service" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    let outcome = report["results"][0]["outcome"]
+        .as_str()
+        .expect("receiver outcome");
+    assert!(
+        matches!(outcome, "unknown" | "ambiguous"),
+        "unresolved extension applicability must remain nonprecise: {report}"
+    );
+    if outcome == "ambiguous" {
+        assert_eq!(
+            report["results"][0]["member_targets"]
+                .as_array()
+                .expect("extension candidates")
+                .len(),
+            2,
+            "{report}"
+        );
+    }
+    assert!(
+        !report["truncated"].as_bool().unwrap_or(false),
+        "unresolved extension applicability is unknown, not truncated: {report}"
+    );
+}
+
+#[test]
+fn csharp_ambiguous_static_receiver_type_cannot_publish_a_precise_member() {
+    let files = [
+        (
+            "Left.cs",
+            r#"namespace Left;
+public class Service
+{
+    public static void Run() {}
+}
+"#,
+        ),
+        (
+            "Right.cs",
+            r#"namespace Right;
+public class Service {}
+"#,
+        ),
+        (
+            "Caller.cs",
+            r#"using Left;
+using Right;
+
+public class Caller
+{
+    public void Call() { Service.Run(); }
+}
+"#,
+        ),
+    ];
+
+    let receiver = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(receiver["results"][0]["outcome"], "ambiguous", "{receiver}");
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(member["results"][0]["outcome"], "ambiguous", "{member}");
+    assert_eq!(
+        member["results"][0]["member_targets"][0]["fq_name"], "Left.Service.Run",
+        "{member}"
+    );
+}
+
+#[test]
+fn csharp_partial_static_receiver_uses_one_logical_type_identity() {
+    let files = [
+        (
+            "PartialService.One.cs",
+            r#"
+namespace Demo;
+public partial class PartialService
+{
+    public static PartialService Create() => new();
+}
+"#,
+        ),
+        (
+            "PartialService.Two.cs",
+            r#"
+namespace Demo;
+public partial class PartialService
+{
+    public static int Count => 1;
+}
+"#,
+        ),
+        (
+            "Caller.cs",
+            r#"
+namespace Demo;
+public class Caller
+{
+    public void Call() { _ = PartialService.Create(); }
+}
+"#,
+        ),
+    ];
+
+    let receivers = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Create" },
+                "receiver": { "name": "PartialService", "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(receivers["results"][0]["outcome"], "precise", "{receivers}");
+    assert_eq!(
+        receivers["results"][0]["values"]
+            .as_array()
+            .expect("receiver values")
+            .len(),
+        1,
+        "{receivers}"
+    );
+    assert_eq!(
+        receivers["results"][0]["values"][0]["declaration"]["fq_name"], "Demo.PartialService",
+        "{receivers}"
+    );
+
+    let members = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Create" },
+                "receiver": { "name": "PartialService" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(members["results"][0]["outcome"], "precise", "{members}");
+    assert_eq!(
+        members["results"][0]["member_targets"][0]["fq_name"], "Demo.PartialService.Create",
+        "{members}"
+    );
+}
+
+#[test]
+fn csharp_null_and_conversion_receivers_never_publish_precise_objects() {
+    let files = [(
+        "Conversions.cs",
+        r#"
+namespace Demo;
+
+public class Service
+{
+    public void Run() {}
+}
+
+public class Source
+{
+    public static implicit operator Service(Source value) => new();
+    public static explicit operator Service(Source value) => new();
+}
+
+public class Caller
+{
+    public void Call()
+    {
+        Service fromNull = null;
+        Service fromDefault = default(Service);
+        object opaque = new Source();
+        Service fromAs = opaque as Service;
+        Service fromCast = (Service)opaque;
+        Source source = new Source();
+        Service converted = source;
+
+        fromNull.Run();
+        fromDefault.Run();
+        fromAs.Run();
+        fromCast.Run();
+        converted.Run();
+    }
+}
+"#,
+    )];
+
+    for receiver in ["fromNull", "fromDefault", "fromAs", "fromCast", "converted"] {
+        let report = serialized(&run(
+            &files,
+            json!({
+                "match": {
+                    "kind": "call",
+                    "callee": { "name": "Run" },
+                    "receiver": { "name": receiver, "capture": "receiver" }
+                },
+                "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
+            }),
+        ));
+        assert_ne!(
+            report["results"][0]["outcome"], "precise",
+            "{receiver} must retain its null/conversion uncertainty: {report}"
+        );
+        assert!(
+            !report["truncated"].as_bool().unwrap_or(false),
+            "{receiver} is semantically incomplete, not truncated: {report}"
+        );
+        assert!(
+            report["results"][0]["values"]
+                .as_array()
+                .is_none_or(|values| values
+                    .iter()
+                    .all(|value| value["receiver_value_kind"] != "allocation_site")),
+            "{receiver} must not relabel a pre-conversion allocation as Service: {report}"
+        );
+    }
+}
+
+#[test]
+fn csharp_static_receiver_alias_and_predefined_shapes_are_precise() {
+    let files = [(
+        "StaticReceivers.cs",
+        r#"public class GlobalService
+{
+    public static GlobalService Create() => new GlobalService();
+}
+
+namespace System
+{
+    public class String
+    {
+        public static bool IsNullOrEmpty(string value) => false;
+    }
+}
+
+namespace Demo
+{
+    public class Caller
+    {
+        public void Call()
+        {
+            global::GlobalService.Create();
+            string.IsNullOrEmpty("");
+        }
+    }
+}
+"#,
+    )];
+
+    for (callee, receiver, expected_type, expected_member) in [
+        (
+            "IsNullOrEmpty",
+            "string",
+            "System.String",
+            "System.String.IsNullOrEmpty",
+        ),
+        (
+            "Create",
+            "global::GlobalService",
+            "GlobalService",
+            "GlobalService.Create",
+        ),
+    ] {
+        for operation in ["receiver_targets", "points_to"] {
+            let report = serialized(&run(
+                &files,
+                json!({
+                    "match": {
+                        "kind": "call",
+                        "callee": { "name": callee },
+                        "receiver": { "capture": "receiver" }
+                    },
+                    "steps": [{ "op": operation, "capture": "receiver" }]
+                }),
+            ));
+            let row = report["results"]
+                .as_array()
+                .expect("static receiver rows")
+                .iter()
+                .find(|row| row["text"] == receiver)
+                .unwrap_or_else(|| panic!("missing receiver {receiver:?}: {report}"));
+            assert_eq!(row["outcome"], "precise", "{report}");
+            assert_eq!(
+                row["values"][0]["receiver_value_kind"], "class_or_static_object",
+                "{report}"
+            );
+            assert_eq!(
+                row["values"][0]["declaration"]["fq_name"], expected_type,
+                "{report}"
+            );
+        }
+
+        let member = serialized(&run(
+            &files,
+            json!({
+                "match": {
+                    "kind": "call",
+                    "callee": { "name": callee }
+                },
+                "steps": [{ "op": "member_targets" }]
+            }),
+        ));
+        assert_eq!(member["results"][0]["outcome"], "precise", "{member}");
+        assert_eq!(
+            member["results"][0]["member_targets"][0]["fq_name"], expected_member,
+            "{member}"
+        );
+    }
+}
+
+#[test]
 fn receiver_traversal_keeps_ambiguity_unknown_and_unsupported_as_rows() {
     let ambiguous = serialized(&run(
         &[(
@@ -423,9 +1541,10 @@ export function caller() { consume(new Service()); }
         }),
     ));
     assert_eq!(
-        call_input["results"][0]["outcome"], "precise",
+        call_input["results"][0]["outcome"], "ambiguous",
         "{call_input}"
     );
+    assert_eq!(call_input["truncated"], false, "{call_input}");
     assert_eq!(
         call_input["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
         "{call_input}"

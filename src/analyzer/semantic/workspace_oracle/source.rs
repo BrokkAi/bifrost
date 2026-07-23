@@ -504,6 +504,7 @@ fn project_procedure_observations(
             && append_observations(
                 &exact.indexes,
                 candidates,
+                procedure,
                 &point_handle,
                 limit,
                 observations,
@@ -519,6 +520,7 @@ fn project_procedure_observations(
             && append_observations(
                 &fallback_candidates,
                 candidates,
+                procedure,
                 &point_handle,
                 limit,
                 observations,
@@ -536,6 +538,7 @@ fn project_procedure_observations(
 fn append_observations(
     candidate_indexes: &[usize],
     candidates: &[SourceValueCandidate],
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
     point: &crate::analyzer::semantic::ProgramPointHandle,
     limit: usize,
     observations: &mut Vec<ValueAtPoint>,
@@ -550,6 +553,13 @@ fn append_observations(
             nested_entries: 1,
             ..SemanticWork::default()
         })?;
+        if procedure
+            .semantics()
+            .call_phase_points(candidates[*index].value.id())
+            .is_some_and(|points| !points.contains(&point.id()))
+        {
+            continue;
+        }
         let Ok(observation) = ValueAtPoint::new(
             candidates[*index].value.clone(),
             point.clone(),

@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v2";
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v3-signature-dispatch-extensibility";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -348,7 +348,7 @@ lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07"
 );
 lang_epoch!(
     Ruby,

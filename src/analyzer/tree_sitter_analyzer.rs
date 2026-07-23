@@ -3,8 +3,8 @@ use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSour
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
-    AnalyzerStore, GenerationId, HierarchyStorageKey, PathSymbolRow, PersistBatchLimits,
-    PersistBatchStats, PreparedParsedBlob, StoreError,
+    AnalyzerStore, GenerationId, HierarchyStorageKey, LimitedQueryRows, PathSymbolRow,
+    PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, StoreError,
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
@@ -54,6 +54,41 @@ const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 128;
 const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+fn limited_projection_rows<T: Clone>(rows: Option<&[T]>, limit: usize) -> LimitedQueryRows<T> {
+    if limit == 0 {
+        return LimitedQueryRows::incomplete(Vec::new(), 0);
+    }
+    let rows = rows.unwrap_or_default();
+    let inspected = rows.len().min(limit);
+    let projected = rows.iter().take(limit).cloned().collect();
+    if rows.len() > limit {
+        LimitedQueryRows::incomplete(projected, inspected)
+    } else {
+        // A dirty in-memory state knows its exact vector length, unlike a
+        // limited SQL cursor, so equality with the cap is authoritative.
+        LimitedQueryRows::complete(projected, inspected)
+    }
+}
+
+fn projection_rows_for_unit<'a, T>(
+    rows: &'a HashMap<CodeUnit, Vec<T>>,
+    unit: &CodeUnit,
+) -> Option<&'a [T]> {
+    rows.get(unit)
+        .or_else(|| {
+            rows.iter()
+                .find(|(candidate, _)| {
+                    candidate.kind() == unit.kind()
+                        && candidate.fq_name() == unit.fq_name()
+                        && candidate.short_name() == unit.short_name()
+                        && candidate.signature() == unit.signature()
+                        && candidate.is_synthetic() == unit.is_synthetic()
+                })
+                .map(|(_, rows)| rows)
+        })
+        .map(Vec::as_slice)
+}
 
 #[cfg(test)]
 static PREPARED_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
@@ -635,6 +670,14 @@ impl AnalyzerRuntimeState {
             .expect("dirty file-state mutex poisoned")
             .get(key)
             .map(|dirty| dirty.state.imports.clone())
+    }
+
+    fn dirty_file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .get(key)
+            .map(|dirty| Arc::clone(&dirty.state))
     }
 }
 
@@ -3666,6 +3709,50 @@ where
         .resolve_rows(rows)
     }
 
+    fn resolve_candidate_rows_limited(
+        &self,
+        rows: Vec<crate::analyzer::store::CandidateRow>,
+        limit: usize,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+
+        let snapshot = self.live_snapshot();
+        let mut resolved = Vec::new();
+        let mut inspected = 0usize;
+        for row in rows {
+            if !continue_query() {
+                return LimitedQueryRows::incomplete(resolved, inspected);
+            }
+            for file in snapshot.paths_for_oid(row.blob_oid) {
+                if inspected == limit || !continue_query() {
+                    return LimitedQueryRows::incomplete(resolved, inspected);
+                }
+                inspected += 1;
+                let Some(file) = self.rebase_live_file_to_project_root(file) else {
+                    continue;
+                };
+                if self.adapter.storage_language_key_for_file(&file) != row.lang
+                    || snapshot.validated_oid_for_path(&file) != Some(row.blob_oid)
+                {
+                    continue;
+                }
+                resolved.push(CodeUnit::with_signature(
+                    file.clone(),
+                    row.kind,
+                    self.adapter
+                        .hydrate_content_qualifier(&row.content_qualifier, &file),
+                    row.short_name.clone(),
+                    row.signature.clone(),
+                    row.flags.synthetic,
+                ));
+            }
+        }
+        LimitedQueryRows::complete(resolved, inspected)
+    }
+
     fn resolve_definition_order_candidate_rows(
         &self,
         rows: Vec<crate::analyzer::store::DefinitionOrderCandidateRow>,
@@ -3896,6 +3983,96 @@ where
             }
         }
         out
+    }
+
+    fn dirty_units_matching_limited(
+        &self,
+        include_definition_lookup_units: bool,
+        limit: usize,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+
+        let snapshot = self.live_snapshot();
+        let dirty = self.state.dirty_snapshot();
+        let mut rows = Vec::new();
+        let mut inspected = 0usize;
+        for (key, dirty) in dirty {
+            if !continue_query() {
+                return LimitedQueryRows::incomplete(rows, inspected);
+            }
+            let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path);
+            if crate::analyzer::common::language_for_file(&file) != self.adapter.language()
+                || snapshot.validated_oid_for_path(&file) != Some(key.oid)
+            {
+                continue;
+            }
+
+            let declaration_sets = std::iter::once(&dirty.state.declarations).chain(
+                include_definition_lookup_units.then_some(&dirty.state.definition_lookup_units),
+            );
+            for declarations in declaration_sets {
+                for unit in declarations {
+                    if inspected == limit || !continue_query() {
+                        return LimitedQueryRows::incomplete(rows, inspected);
+                    }
+                    inspected += 1;
+                    if !unit.is_file_scope() && keep(unit) {
+                        rows.push(unit.clone());
+                    }
+                }
+            }
+        }
+        LimitedQueryRows::complete(rows, inspected)
+    }
+
+    fn finish_limited_declaration_lookup(
+        &self,
+        persisted: LimitedQueryRows<crate::analyzer::store::CandidateRow>,
+        include_definition_lookup_units: bool,
+        limit: usize,
+        keep: impl FnMut(&CodeUnit) -> bool,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let mut inspected = persisted.inspected;
+        if !persisted.complete || inspected >= limit {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
+
+        let resolved = self.resolve_candidate_rows_limited(
+            persisted.rows,
+            limit - inspected,
+            &mut continue_query,
+        );
+        inspected = inspected.saturating_add(resolved.inspected);
+        if !resolved.complete || inspected >= limit {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
+
+        let dirty = self.dirty_units_matching_limited(
+            include_definition_lookup_units,
+            limit - inspected,
+            keep,
+            &mut continue_query,
+        );
+        inspected = inspected.saturating_add(dirty.inspected);
+        if !dirty.complete {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
+
+        // The bounded C# path has no path-synthetic declaration units. Keep
+        // this generic helper conservative if another adapter tries to reuse
+        // it before a bounded path-unit visitor exists.
+        if self.adapter.has_path_synthetic_module_units() {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
+
+        let mut rows: BTreeSet<_> = resolved.rows.into_iter().collect();
+        rows.extend(dirty.rows);
+        LimitedQueryRows::complete(rows.into_iter().collect(), inspected)
     }
 
     fn sql_global_usage_definition_index(
@@ -4601,6 +4778,35 @@ where
         matches
     }
 
+    pub(crate) fn lookup_declarations_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let langs = self.storage_language_keys_for_queries();
+        let persisted = self
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_identifier_for_langs_limited(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        identifier,
+                        limit,
+                    ),
+                format!("querying bounded declarations by identifier `{identifier}`"),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+        self.finish_limited_declaration_lookup(
+            persisted,
+            true,
+            limit,
+            |unit| unit.identifier() == identifier,
+            continue_query,
+        )
+    }
+
     pub(crate) fn lookup_declarations_by_persisted_fqn(
         &self,
         fqn: &str,
@@ -4651,6 +4857,54 @@ where
             .unwrap_or_default(),
         );
         matches
+    }
+
+    pub(crate) fn lookup_declarations_by_persisted_fqn_limited(
+        &self,
+        fqn: &str,
+        normalized: bool,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        use crate::analyzer::store::PersistedLookupKey;
+        let key = if normalized {
+            PersistedLookupKey::NormalizedFqn
+        } else {
+            PersistedLookupKey::ExactFqn
+        };
+        let lookup = if normalized {
+            self.adapter.normalize_full_name(fqn)
+        } else {
+            fqn.to_string()
+        };
+        let persisted = self
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_lookup_key_for_langs_limited(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                        key,
+                        &lookup,
+                        limit,
+                    ),
+                format!("querying bounded declarations by persisted name `{lookup}`"),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+        self.finish_limited_declaration_lookup(
+            persisted,
+            false,
+            limit,
+            |unit| {
+                let candidate = if normalized {
+                    self.adapter.normalize_full_name(&unit.fq_name())
+                } else {
+                    unit.fq_name()
+                };
+                candidate == lookup
+            },
+            continue_query,
+        )
     }
 
     pub(crate) fn lookup_members_for_owner_name(
@@ -4720,6 +4974,82 @@ where
             .unwrap_or_default(),
         );
         matches
+    }
+
+    pub(crate) fn lookup_members_for_owner_name_limited(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+        limit: usize,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let langs = self.storage_language_keys_for_queries();
+        let exact_persisted = self
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_member_rows_for_owner_for_langs_limited(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        owner_fqn,
+                        false,
+                        name,
+                        limit,
+                    ),
+                format!("querying bounded members named `{name}` for `{owner_fqn}`"),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+        let exact_member = format!("{owner_fqn}.{name}");
+        let exact = self.finish_limited_declaration_lookup(
+            exact_persisted,
+            false,
+            limit,
+            |unit| unit.identifier() == name && unit.fq_name() == exact_member,
+            &mut continue_query,
+        );
+        if !exact.complete || !exact.rows.is_empty() {
+            return exact;
+        }
+        if exact.inspected >= limit {
+            return LimitedQueryRows::incomplete(Vec::new(), exact.inspected);
+        }
+
+        let normalized_owner = self.adapter.normalize_full_name(owner_fqn);
+        let remaining = limit - exact.inspected;
+        let normalized_persisted = self
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_member_rows_for_owner_for_langs_limited(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        &normalized_owner,
+                        true,
+                        name,
+                        remaining,
+                    ),
+                format!("querying bounded normalized members named `{name}` for `{owner_fqn}`"),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+        let normalized_member = self
+            .adapter
+            .normalize_full_name(&format!("{owner_fqn}.{name}"));
+        let normalized = self.finish_limited_declaration_lookup(
+            normalized_persisted,
+            false,
+            remaining,
+            |unit| {
+                unit.identifier() == name
+                    && self.adapter.normalize_full_name(&unit.fq_name()) == normalized_member
+            },
+            continue_query,
+        );
+        let inspected = exact.inspected.saturating_add(normalized.inspected);
+        if normalized.complete {
+            LimitedQueryRows::complete(normalized.rows, inspected)
+        } else {
+            LimitedQueryRows::incomplete(Vec::new(), inspected)
+        }
     }
 
     pub(crate) fn persisted_package_exists(&self, package: &str) -> bool {
@@ -4945,6 +5275,76 @@ where
         })
     }
 
+    pub(crate) fn file_namespace_hint_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        fn from_state(state: &FileState, limit: usize) -> LimitedQueryRows<String> {
+            if limit == 0 {
+                return LimitedQueryRows::incomplete(Vec::new(), 0);
+            }
+            if !state.package_name.is_empty() {
+                return LimitedQueryRows::complete(vec![state.package_name.clone()], 1);
+            }
+            let mut inspected = 1usize;
+            for unit in &state.declarations {
+                if inspected == limit {
+                    return LimitedQueryRows::incomplete(Vec::new(), inspected);
+                }
+                inspected += 1;
+                if !unit.package_name().is_empty() {
+                    return LimitedQueryRows::complete(
+                        vec![unit.package_name().to_string()],
+                        inspected,
+                    );
+                }
+            }
+            LimitedQueryRows::complete(vec![String::new()], inspected)
+        }
+
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return from_state(&state, limit);
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return from_state(&state, limit);
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations[&storage_key];
+        let content_qualifier = self.store_query_or_record(
+            self.store_context
+                .store
+                .content_package(oid, &storage_key, generation),
+            format!("querying the bounded namespace qualifier for `{file}`"),
+        );
+        let Some(Some(content_qualifier)) = content_qualifier else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        if !content_qualifier.is_empty() {
+            return LimitedQueryRows::complete(vec![content_qualifier], 1);
+        }
+        if limit == 1 {
+            return LimitedQueryRows::incomplete(Vec::new(), 1);
+        }
+        let declaration_qualifier = self.store_query_or_record(
+            self.store_context
+                .store
+                .first_declaration_content_qualifier_for_key(oid, &storage_key, generation),
+            format!("querying a bounded declaration namespace for `{file}`"),
+        );
+        match declaration_qualifier {
+            Some(qualifier) => LimitedQueryRows::complete(vec![qualifier.unwrap_or_default()], 2),
+            None => LimitedQueryRows::incomplete(Vec::new(), 1),
+        }
+    }
+
     pub(crate) fn ruby_method_dispatch_mode(
         &self,
         code_unit: &CodeUnit,
@@ -4982,6 +5382,81 @@ where
         .unwrap_or_default()
     }
 
+    fn import_info_for_oid_limited(
+        &self,
+        file: &ProjectFile,
+        oid: Oid,
+        limit: usize,
+    ) -> LimitedQueryRows<ImportInfo> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(Some(&state.imports), limit);
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(Some(&state.imports), limit);
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context.store.import_infos_for_key_limited(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+                limit,
+            ),
+            format!("querying bounded imports for `{file}`"),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
+    }
+
+    pub(crate) fn import_info_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> LimitedQueryRows<ImportInfo> {
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        self.import_info_for_oid_limited(file, oid, limit)
+    }
+
+    pub(crate) fn workspace_import_info_limited(
+        &self,
+        limit: usize,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<ImportInfo> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let snapshot = self.live_snapshot();
+        let mut rows = Vec::new();
+        let mut inspected = 0usize;
+        for file in snapshot.all_paths() {
+            if inspected == limit || !continue_query() {
+                return LimitedQueryRows::incomplete(rows, inspected);
+            }
+            inspected += 1;
+            let Some(oid) = snapshot.validated_oid_for_path(file) else {
+                continue;
+            };
+            let Some(file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+                continue;
+            }
+            let imports = self.import_info_for_oid_limited(&file, oid, limit - inspected);
+            inspected = inspected.saturating_add(imports.inspected);
+            rows.extend(imports.rows);
+            if !imports.complete {
+                return LimitedQueryRows::incomplete(rows, inspected);
+            }
+        }
+        LimitedQueryRows::complete(rows, inspected)
+    }
+
     pub(crate) fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         let Some(state) = self.fetch_file_state(code_unit.source()) else {
             return Vec::new();
@@ -5002,6 +5477,45 @@ where
                     .map(|(_, raw)| raw.clone())
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn raw_supertypes_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.raw_supertypes, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.raw_supertypes, code_unit),
+                limit,
+            );
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context.store.raw_supertypes_for_unit_limited(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+                code_unit,
+                limit,
+            ),
+            format!("querying raw supertypes for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
 
     pub(crate) fn is_scala_trait(&self, code_unit: &CodeUnit) -> bool {
@@ -5076,6 +5590,86 @@ where
         self.fetch_file_state(code_unit.source())
             .and_then(|state| state.signature_metadata.get(code_unit).cloned())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signature_metadata, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signature_metadata, code_unit),
+                limit,
+            );
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context
+                .store
+                .signature_metadata_for_unit_limited(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    code_unit,
+                    limit,
+                ),
+            format!("querying signature metadata for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<Range> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.ranges, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.ranges, code_unit),
+                limit,
+            );
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context.store.ranges_for_unit_limited(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+                code_unit,
+                limit,
+            ),
+            format!("querying ranges for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
 
     pub(crate) fn cpp_template_metadata_of(

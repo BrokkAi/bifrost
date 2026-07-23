@@ -4760,6 +4760,7 @@ fn apply_pipeline_step(
                         .expect("receiver query service exists for receiver steps"),
                     operation,
                     &trace.seed.file,
+                    Some(&trace.seed.facts),
                     ranges,
                     input,
                     filter.capture.clone(),
@@ -5043,6 +5044,7 @@ fn apply_pipeline_step(
                         .expect("receiver query service exists for receiver steps"),
                     operation,
                     &seed.file,
+                    Some(&seed.facts),
                     ranges,
                     input,
                     filter.capture.clone(),
@@ -5067,6 +5069,7 @@ fn apply_pipeline_step(
                     .expect("receiver query service exists for receiver steps"),
                 receiver_operation(step),
                 &site.file,
+                coherent_trace_facts_for_file(&row.traces, &site.file),
                 vec![site.range],
                 if matches!(step, QueryStep::PointsTo(_)) {
                     ReceiverQueryInput::Expression
@@ -5090,6 +5093,7 @@ fn apply_pipeline_step(
                         .expect("receiver query service exists for receiver steps"),
                     ReceiverQueryOperation::ReceiverTargets,
                     &site.0.file,
+                    coherent_trace_facts_for_file(&row.traces, &site.0.file),
                     vec![site.0.range],
                     ReceiverQueryInput::ContainingSite,
                     None,
@@ -5112,6 +5116,7 @@ fn apply_pipeline_step(
                     .expect("receiver query service exists for receiver steps"),
                 receiver_operation(step),
                 &site.call_site.0.file,
+                coherent_trace_facts_for_file(&row.traces, &site.call_site.0.file),
                 vec![site.range],
                 ReceiverQueryInput::Expression,
                 None,
@@ -5304,11 +5309,31 @@ fn structural_receiver_ranges(
     (ranges, input)
 }
 
+fn coherent_trace_facts_for_file<'a>(
+    traces: &'a [PipelineTrace],
+    file: &ProjectFile,
+) -> Option<&'a Arc<FileFacts>> {
+    let mut selected: Option<&Arc<FileFacts>> = None;
+    for facts in traces
+        .iter()
+        .filter(|trace| &trace.seed.file == file)
+        .map(|trace| &trace.seed.facts)
+    {
+        match selected {
+            Some(existing) if existing.source() != facts.source() => return None,
+            Some(_) => {}
+            None => selected = Some(facts),
+        }
+    }
+    selected
+}
+
 #[allow(clippy::too_many_arguments)]
 fn receiver_analysis_expansions(
     service: &ReceiverQueryService<'_>,
     operation: ReceiverQueryOperation,
     file: &ProjectFile,
+    structural_facts: Option<&Arc<FileFacts>>,
     mut ranges: Vec<Range>,
     input: ReceiverQueryInput,
     capture: Option<String>,
@@ -5338,25 +5363,37 @@ fn receiver_analysis_expansions(
             remaining_facts,
             remaining_rows.saturating_sub(1),
         );
-        let report =
-            match service.analyze(operation, file, range, input, receiver_budget, cancellation) {
-                Ok(report) => report,
-                Err(ReceiverQueryError::Cancelled) => {
-                    *shared_budget_exhausted = true;
-                    break;
-                }
-                Err(ReceiverQueryError::SemanticProvider(error)) => {
-                    *receiver_diagnostics
-                        .entry((
-                            CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
-                            crate::analyzer::common::language_for_file(file),
-                            operation.as_str(),
-                            error.to_string(),
-                        ))
-                        .or_default() += 1;
-                    break;
-                }
-            };
+        let report = match structural_facts.map_or_else(
+            || service.analyze(operation, file, range, input, receiver_budget, cancellation),
+            |facts| {
+                service.analyze_with_structural_facts(
+                    operation,
+                    file,
+                    range,
+                    input,
+                    facts,
+                    receiver_budget,
+                    cancellation,
+                )
+            },
+        ) {
+            Ok(report) => report,
+            Err(ReceiverQueryError::Cancelled) => {
+                *shared_budget_exhausted = true;
+                break;
+            }
+            Err(ReceiverQueryError::SemanticProvider(error)) => {
+                *receiver_diagnostics
+                    .entry((
+                        CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
+                        crate::analyzer::common::language_for_file(file),
+                        operation.as_str(),
+                        error.to_string(),
+                    ))
+                    .or_default() += 1;
+                break;
+            }
+        };
 
         let candidate_count = receiver_candidate_count(&report);
         budget.fact_nodes = budget
@@ -5413,6 +5450,19 @@ fn receiver_analysis_expansions(
                 | ReceiverAnalysisOutcome::Ambiguous(_)
                 | ReceiverAnalysisOutcome::Unknown,
             ) => {}
+        }
+        if let Some(capability) = report.semantic_unsupported {
+            *receiver_diagnostics
+                .entry((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                    language,
+                    operation.as_str(),
+                    format!(
+                        "semantic evidence is incomplete because {} is unsupported",
+                        capability.label()
+                    ),
+                ))
+                .or_default() += 1;
         }
         if report.candidates_truncated {
             *receiver_truncated = true;

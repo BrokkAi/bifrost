@@ -7920,7 +7920,19 @@ fn csharp_indexed_access_preserves_nested_call_sites() {
             "conditional_binding",
             PointSelector::new("[NextIndex()]")
                 .procedure("ConditionalIndex")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "conditional_access_gap",
+            PointSelector::new("[NextIndex()]")
+                .procedure("ConditionalIndex")
                 .effect("gap"),
+        )
+        .bind(
+            "conditional_assignment",
+            PointSelector::new("value = items?[NextIndex()]")
+                .procedure("ConditionalIndex")
+                .effect("assignment"),
         )
         .bind(
             "conditional_next_expression",
@@ -7965,10 +7977,6 @@ fn csharp_indexed_access_preserves_nested_call_sites() {
         SemanticGapKind::Unsupported,
     );
     graph.assert_successors(
-        "indexed_access_gap",
-        &[cfg_edge("handlers_value", ControlEdgeKind::Normal)],
-    );
-    graph.assert_successors(
         "handlers_value",
         &[cfg_edge("indexed_binding", ControlEdgeKind::Normal)],
     );
@@ -7986,11 +7994,15 @@ fn csharp_indexed_access_preserves_nested_call_sites() {
     );
     graph.assert_successors(
         "indexed_next_normal",
+        &[cfg_edge("indexed_access_gap", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "indexed_access_gap",
         &[cfg_edge("indexed_outer_invoke", ControlEdgeKind::Normal)],
     );
     graph.assert_predecessors(
         "indexed_outer_invoke",
-        &[cfg_edge("indexed_next_normal", ControlEdgeKind::Normal)],
+        &[cfg_edge("indexed_access_gap", ControlEdgeKind::Normal)],
     );
     graph.assert_successors(
         "indexed_outer_invoke",
@@ -8016,7 +8028,7 @@ fn csharp_indexed_access_preserves_nested_call_sites() {
         SemanticGapKind::Unsupported,
     );
     graph.assert_point_gap(
-        "conditional_binding",
+        "conditional_access_gap",
         SemanticCapability::ExceptionalControlFlow,
         SemanticGapKind::Unsupported,
     );
@@ -8028,10 +8040,7 @@ fn csharp_indexed_access_preserves_nested_call_sites() {
         "conditional_split",
         &[
             cfg_edge("conditional_binding", ControlEdgeKind::ConditionalTrue),
-            cfg_edge(
-                "after_conditional_statement",
-                ControlEdgeKind::ConditionalFalse,
-            ),
+            cfg_edge("conditional_assignment", ControlEdgeKind::ConditionalFalse),
         ],
     );
     graph.assert_successors(
@@ -8051,17 +8060,25 @@ fn csharp_indexed_access_preserves_nested_call_sites() {
     );
     graph.assert_successors(
         "conditional_next_normal",
+        &[cfg_edge("conditional_access_gap", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "conditional_access_gap",
+        &[cfg_edge("conditional_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "conditional_assignment",
+        &[
+            cfg_edge("conditional_split", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("conditional_access_gap", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "conditional_assignment",
         &[cfg_edge(
             "after_conditional_statement",
             ControlEdgeKind::Normal,
         )],
-    );
-    graph.assert_predecessors(
-        "after_conditional_statement",
-        &[
-            cfg_edge("conditional_split", ControlEdgeKind::ConditionalFalse),
-            cfg_edge("conditional_next_normal", ControlEdgeKind::Normal),
-        ],
     );
     graph.assert_successors(
         "after_conditional_statement",

@@ -80,6 +80,22 @@ pub(crate) fn formal_parameter_slots(
     declaration_range: &Range,
 ) -> Option<FormalParameterLayout> {
     let owner = parameter_owner_for_range(language, root, declaration_range)?;
+    formal_parameter_slots_for_owner(language, owner, source, declaration_range)
+}
+
+/// Return formal parameter slots for a callable node already selected by the
+/// caller. Semantic lowerers should prefer this entry point because their
+/// procedure inventory already owns the exact callable and need not rescan the
+/// syntax tree to rediscover it.
+pub(crate) fn formal_parameter_slots_for_owner(
+    language: Language,
+    owner: Node<'_>,
+    source: &str,
+    declaration_range: &Range,
+) -> Option<FormalParameterLayout> {
+    if !is_parameter_owner(language, owner.kind()) {
+        return None;
+    }
     let python_binding = (language == Language::Python)
         .then(|| python_method_binding(owner, source, declaration_range));
     let lambda = is_lambda_owner(language, owner.kind());
@@ -735,12 +751,17 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
             kind,
             "method_declaration"
                 | "constructor_declaration"
+                | "destructor_declaration"
+                | "operator_declaration"
+                | "conversion_operator_declaration"
+                | "indexer_declaration"
                 | "local_function_statement"
                 | "lambda_expression"
                 | "anonymous_method_expression"
                 | "class_declaration"
                 | "struct_declaration"
                 | "record_declaration"
+                | "record_struct_declaration"
         ),
         Language::Ruby => matches!(kind, "method" | "singleton_method" | "lambda" | "block"),
         Language::None => false,

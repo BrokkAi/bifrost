@@ -32,6 +32,27 @@ impl CSharpAnalyzer {
         }
     }
 
+    pub(crate) fn attribute_type_candidates_with_lookups<Visible, Evidence>(
+        &self,
+        names: &[String],
+        visible_type_candidates: &mut Visible,
+        attribute_class_is_applicable: &mut Evidence,
+    ) -> Option<(Vec<CodeUnit>, bool)>
+    where
+        Visible: FnMut(&str) -> Option<Vec<CodeUnit>>,
+        Evidence: FnMut(&CodeUnit) -> Option<bool>,
+    {
+        match self.attribute_type_resolution_with_lookups(
+            names,
+            visible_type_candidates,
+            attribute_class_is_applicable,
+        )? {
+            AttributeTypeResolution::Unresolved => Some((Vec::new(), false)),
+            AttributeTypeResolution::Resolved(candidates) => Some((candidates, false)),
+            AttributeTypeResolution::Ambiguous(candidates) => Some((candidates, true)),
+        }
+    }
+
     /// Inverse usage proof requires one logical attribute type. An ambiguous
     /// annotation is not a proven reference to every declaration it might name.
     pub(crate) fn usage_unambiguous_attribute_type_candidates(
@@ -61,14 +82,41 @@ impl CSharpAnalyzer {
         names: &[String],
         usage: bool,
     ) -> AttributeTypeResolution {
-        let mut candidates = Vec::new();
-        let mut successful_spellings = 0usize;
-        for name in names {
-            let visible = if usage {
+        let mut visible_type_candidates = |name: &str| {
+            Some(if usage {
                 self.usage_visible_type_candidates(file, name)
             } else {
                 self.visible_type_candidates(file, name)
-            };
+            })
+        };
+        let mut attribute_class_is_applicable = |candidate: &CodeUnit| {
+            Some(
+                self.attribute_class_evidence(candidate, usage)
+                    != AttributeClassEvidence::DefinitelyNot,
+            )
+        };
+        self.attribute_type_resolution_with_lookups(
+            names,
+            &mut visible_type_candidates,
+            &mut attribute_class_is_applicable,
+        )
+        .unwrap_or(AttributeTypeResolution::Unresolved)
+    }
+
+    fn attribute_type_resolution_with_lookups<Visible, Evidence>(
+        &self,
+        names: &[String],
+        visible_type_candidates: &mut Visible,
+        attribute_class_is_applicable: &mut Evidence,
+    ) -> Option<AttributeTypeResolution>
+    where
+        Visible: FnMut(&str) -> Option<Vec<CodeUnit>>,
+        Evidence: FnMut(&CodeUnit) -> Option<bool>,
+    {
+        let mut candidates = Vec::new();
+        let mut successful_spellings = 0usize;
+        for name in names {
+            let visible = visible_type_candidates(name)?;
             // C# suppresses errors from each of the two attribute spellings
             // independently. An ambiguous spelling contributes no candidate;
             // the other spelling can still resolve uniquely.
@@ -77,10 +125,13 @@ impl CSharpAnalyzer {
             }
             let applicable = visible
                 .into_iter()
-                .filter(|candidate| {
-                    self.attribute_class_evidence(candidate, usage)
-                        != AttributeClassEvidence::DefinitelyNot
+                .map(|candidate| {
+                    attribute_class_is_applicable(&candidate)
+                        .map(|applicable| applicable.then_some(candidate))
                 })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
                 .collect::<Vec<_>>();
             if !applicable.is_empty() {
                 successful_spellings += 1;
@@ -89,11 +140,13 @@ impl CSharpAnalyzer {
         }
         self.sort_type_candidates(&mut candidates);
         candidates.dedup();
-        match (successful_spellings, self.logical_type_count(&candidates)) {
-            (0, _) | (_, 0) => AttributeTypeResolution::Unresolved,
-            (1, 1) => AttributeTypeResolution::Resolved(candidates),
-            _ => AttributeTypeResolution::Ambiguous(candidates),
-        }
+        Some(
+            match (successful_spellings, self.logical_type_count(&candidates)) {
+                (0, _) | (_, 0) => AttributeTypeResolution::Unresolved,
+                (1, 1) => AttributeTypeResolution::Resolved(candidates),
+                _ => AttributeTypeResolution::Ambiguous(candidates),
+            },
+        )
     }
 
     fn attribute_class_evidence(

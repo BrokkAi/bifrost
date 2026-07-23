@@ -17,6 +17,8 @@ mod js_ts;
 mod rust;
 mod scala;
 
+pub(crate) use csharp::resolve_csharp_type_bounded;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TypeLookupRequest {
     pub(crate) file: ProjectFile,

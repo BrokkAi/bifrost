@@ -104,6 +104,7 @@ pub(crate) mod java;
 pub(crate) mod js_ts;
 mod php;
 mod python;
+mod resolution_session;
 mod ruby;
 mod rust;
 mod scala;
@@ -114,7 +115,10 @@ pub(crate) use call_sites::{
     call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
 };
 pub(crate) use cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC;
-pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
+pub(crate) use csharp::{
+    CSharpTypeLookupResolution, csharp_type_lookup_resolution,
+    csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
+};
 pub(crate) use go::{
     AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,
     go_type_lookup_resolution,
@@ -123,6 +127,7 @@ pub(crate) use java::{
     JavaTypeLookupResolution, java_lombok_accessor_field_candidates,
     java_lombok_generated_accessor_field_candidates, java_type_lookup_resolution,
 };
+pub(crate) use resolution_session::{BoundedResolution, ResolutionSession};
 pub(crate) use scala::{ScalaTypeLookupResolution, scala_type_lookup_resolution};
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost

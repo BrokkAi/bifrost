@@ -6,17 +6,20 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{CSharpAnalyzer, ProjectFile};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"csharp-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v2";
 
 impl_program_semantics_provider!(CSharpAnalyzer, CSharpSemanticLowerer);
 
@@ -97,6 +100,12 @@ fn csharp_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
         SemanticCapability::DeferredExecution,
@@ -462,6 +471,8 @@ fn callable_shape<'tree>(
         _ => return None,
     };
     let is_generator = body_contains_yield(body);
+    let dispatch_extensibility =
+        super::csharp_callable_dispatch_extensibility(source, node, is_static);
     Some((
         kind,
         segment_kind,
@@ -476,7 +487,7 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
-            ..ProcedureProperties::default()
+            dispatch_extensibility,
         },
     ))
 }
@@ -593,8 +604,21 @@ impl<'tree> CleanupBody<'tree> {
 }
 
 struct LoweringContext<'tree, 'targets> {
+    prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
+}
+
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
 }
 
 fn lower_procedure<'tree>(
@@ -621,9 +645,27 @@ fn lower_procedure<'tree>(
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
+        prepared,
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
         cleanups: Vec::new(),
     };
+    context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
+
+    if spec.lexical_parent.is_some() {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "lexical captures by nested C# callables are not yet modeled",
+        )?;
+    }
 
     if spec.kind == ProcedureKind::Initializer {
         context.add_gap(
@@ -709,7 +751,18 @@ fn lower_procedure<'tree>(
         }
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let source =
+            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: value,
+            },
+        )?;
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -814,6 +867,224 @@ fn callable_returns_value(source: &str, spec: &ProcedureSpec<'_>) -> bool {
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+        procedure_kind: ProcedureKind,
+        properties: ProcedureProperties,
+    ) -> Result<(), CSharpLoweringError> {
+        let declaration_range = node_range(callable);
+        if self.session.cancellation().is_cancelled() {
+            return Err(CSharpLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let layout = formal_parameter_slots_for_owner(
+            Language::CSharp,
+            callable,
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        if self.session.cancellation().is_cancelled() {
+            return Err(CSharpLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(CSharpLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let node = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let metadata = self.value_mapping(builder, node)?;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    CSharpLoweringError::Invalid("too many formal parameters".into())
+                })?;
+                value
+            };
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+
+        if self.receiver.is_none()
+            && !properties.is_static
+            && matches!(
+                procedure_kind,
+                ProcedureKind::Method
+                    | ProcedureKind::Constructor
+                    | ProcedureKind::Initializer
+                    | ProcedureKind::Accessor
+            )
+        {
+            let metadata = self.value_mapping(builder, callable)?;
+            self.receiver = Some(self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?);
+        }
+        if let Some(receiver) = self.receiver {
+            self.parameters.insert("this".into(), receiver);
+            self.parameters.insert("base".into(), receiver);
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), CSharpLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(CSharpLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if is_csharp_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "variable_declarator"
+                && is_local_variable_declarator(node)
+                && let Some(name) = node.child_by_field_name("name")
+                && name.kind() == "identifier"
+                && let Some(text) = node_text(self.prepared.source(), name)
+                && let Some((scope_start, scope_end)) = csharp_local_scope(node)
+            {
+                let metadata = self.value_mapping(builder, name)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals
+                    .entry(text.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: name.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| binding.scope_end - binding.scope_start)
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .find(|binding| binding.declaration_start == declaration_start)
+            .map(|binding| binding.value)
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, CSharpLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, CSharpLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), CSharpLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let (source, kind) = if matches!(node.kind(), "this" | "base") {
+            (self.receiver, ValueFlowKind::Receiver)
+        } else if node.kind() == "identifier" {
+            if let Some(local) = self.local_at(name, node.start_byte()) {
+                (Some(local), ValueFlowKind::Local)
+            } else {
+                (self.parameters.get(name).copied(), ValueFlowKind::Parameter)
+            }
+        } else {
+            (None, ValueFlowKind::Local)
+        };
+        if let Some(source) = source
+            && source != target
+        {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -844,6 +1115,233 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
         }
+    }
+
+    fn local_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let declared_type = declaration.child_by_field_name("type");
+        let initializers = named_children(declaration)
+            .into_iter()
+            .filter(|child| child.kind() == "variable_declarator")
+            .filter_map(|declarator| {
+                let name = declarator.child_by_field_name("name")?;
+                let initializer = variable_declarator_initializer(declarator)?;
+                (name.kind() == "identifier").then_some((declarator, name, initializer))
+            })
+            .collect::<Vec<_>>();
+        if initializers.is_empty() {
+            return self.edge(builder, entry, next);
+        }
+
+        let expression_entries = initializers
+            .iter()
+            .map(|(_, _, initializer)| self.point(builder, *initializer, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminals = initializers
+            .iter()
+            .map(|(declarator, _, _)| self.point(builder, *declarator, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
+        for (index, (_, name, initializer)) in initializers.iter().enumerate().rev() {
+            let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
+                CSharpLoweringError::Invalid("local declaration has invalid name range".into())
+            })?;
+            let target = self
+                .local_declaration_value(target_name, name.start_byte())
+                .ok_or_else(|| {
+                    CSharpLoweringError::Invalid("local declaration was not preindexed".into())
+                })?;
+            let value =
+                self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
+            let identity_conversion = declared_type.is_some_and(|declared_type| {
+                local_initializer_has_identity_conversion(
+                    declared_type,
+                    *initializer,
+                    self.prepared.source(),
+                )
+            });
+            if identity_conversion {
+                self.append_effect(
+                    builder,
+                    terminals[index],
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminals[index],
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: value,
+                        target,
+                    },
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    terminals[index],
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "explicitly typed C# local initialization may invoke a user-defined conversion",
+                )?;
+            }
+            let following = expression_entries
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(next);
+            self.edge(builder, terminals[index], following)?;
+            stack.push(Work::Expression {
+                node: *initializer,
+                entry: expression_entries[index],
+                next: EdgeTarget::normal(terminals[index]),
+                scope,
+            });
+        }
+        Ok(())
+    }
+
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "C# assignment result identity is unavailable until implicit conversion resolution is available",
+        )?;
+
+        let evaluations = if left.kind() == "identifier" {
+            let name = node_text(self.prepared.source(), left).ok_or_else(|| {
+                CSharpLoweringError::Invalid("assignment has invalid target range".into())
+            })?;
+            let local = self.local_at(name, left.start_byte());
+            let target = local.or_else(|| self.parameters.get(name).copied());
+            if let Some(target) = target {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "C# assignment target identity is unavailable until implicit conversion resolution is available",
+                )?;
+            }
+            vec![right]
+        } else {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "property, field, index, tuple, or ref assignment targets are not yet lowered into memory flow",
+            )?;
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "assignment target accessors and overloaded assignment conversions require type refinement",
+            )?;
+            self.implicit_exception_gap(builder, terminal, node)?;
+            runtime_expression_children(node)
+        };
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transparent_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        value: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let source = self.expression_value(builder, value, expression_value_kind(value))?;
+        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        self.edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conversion_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        value: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Value(target),
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "C# cast/as identity is provisional until conversion resolution is available",
+        )?;
+        if node.kind() == "cast_expression" {
+            self.implicit_exception_gap(builder, terminal, node)?;
+        }
+        self.edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1039,7 +1537,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "return_statement" => {
                 let terminal = if let Some(value_node) = first_named_child(node) {
                     let point = self.point(builder, node, Vec::new())?;
+                    let source =
+                        self.expression_value(builder, value_node, expression_value_kind(value_node))?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Return,
+                            source,
+                            target: value,
+                        },
+                    )?;
                     self.append_effect(
                         builder,
                         point,
@@ -1337,8 +1846,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         )?;
                     }
                 }
-                let initializers = variable_initializers(declaration);
-                self.schedule_expressions(builder, entry, &initializers, next, scope, stack)
+                self.local_declaration(builder, declaration, entry, next, scope, stack)
             }
             "empty_statement"
             | "local_function_statement"
@@ -1371,6 +1879,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        if matches!(node.kind(), "identifier" | "this" | "base") {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
         match node.kind() {
             "invocation_expression"
             | "object_creation_expression"
@@ -1388,16 +1900,61 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let alternative = required_field(node, "alternative")?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                let consequence_terminal = self.point(builder, consequence, Vec::new())?;
+                let alternative_terminal = self.point(builder, alternative, Vec::new())?;
+                let consequence_value = self.expression_value(
+                    builder,
+                    consequence,
+                    expression_value_kind(consequence),
+                )?;
+                let alternative_value = self.expression_value(
+                    builder,
+                    alternative,
+                    expression_value_kind(alternative),
+                )?;
+                if conditional_branches_have_identity_preserving_construction(
+                    consequence,
+                    alternative,
+                    self.prepared.source(),
+                ) {
+                    self.append_effect(
+                        builder,
+                        consequence_terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: consequence_value,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        alternative_terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: alternative_value,
+                        },
+                    )?;
+                } else {
+                    self.add_gap(
+                        builder,
+                        consequence_terminal,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "C# conditional-expression result identity is unavailable until branch conversions are resolved",
+                    )?;
+                }
+                self.edge(builder, consequence_terminal, next)?;
+                self.edge(builder, alternative_terminal, next)?;
                 stack.push(Work::Expression {
                     node: alternative,
                     entry: alternative_entry,
-                    next,
+                    next: EdgeTarget::normal(alternative_terminal),
                     scope,
                 });
                 stack.push(Work::Expression {
                     node: consequence,
                     entry: consequence_entry,
-                    next,
+                    next: EdgeTarget::normal(consequence_terminal),
                     scope,
                 });
                 stack.push(Work::Condition {
@@ -1457,11 +2014,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
+            "assignment_expression" if is_simple_assignment(node) => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
             "assignment_expression"
                 if node
                     .child_by_field_name("operator")
                     .is_some_and(|operator| operator.kind() == "??=") =>
             {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    "null-coalescing assignment target flow is not yet lowered",
+                )?;
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
@@ -1551,24 +2119,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.implicit_exception_gap(builder, entry, node)?;
                 }
                 if let Some(value) = first_runtime_named_child(node) {
-                    stack.push(Work::Expression {
-                        node: value,
-                        entry,
-                        next,
-                        scope,
-                    });
-                    Ok(())
+                    self.transparent_expression(builder, node, value, entry, next, scope, stack)
                 } else {
                     self.edge(builder, entry, next)
                 }
+            }
+            "cast_expression" | "as_expression" => {
+                let value = node
+                    .child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("left"))
+                    .or_else(|| first_runtime_named_child(node))
+                    .ok_or_else(|| missing_field(node, "value"))?;
+                self.conversion_expression(builder, node, value, entry, next, scope, stack)
+            }
+            "null_literal" | "default_expression" => {
+                let value = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "null/default object identity is not represented in the semantic value domain",
+                )?;
+                self.edge(builder, entry, next)
+            }
+            "variable_declaration" => {
+                self.local_declaration(builder, node, entry, next, scope, stack)
             }
             "member_access_expression"
             | "member_binding_expression"
             | "element_access_expression"
             | "element_binding_expression" => {
-                self.implicit_exception_gap(builder, entry, node)?;
+                // Receiver and index expressions are evaluated before the
+                // access itself can throw. Keeping the exceptional boundary on
+                // a terminal preserves conservative downstream control flow
+                // without making the already-evaluated receiver incomplete.
+                let terminal = self.point(builder, node, Vec::new())?;
+                self.implicit_exception_gap(builder, terminal, node)?;
+                self.edge(builder, terminal, next)?;
                 let children = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
             }
             "interpolated_string_expression" | "interpolation" => {
                 let values = runtime_expression_children(node);
@@ -1598,8 +2196,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "binary_expression"
             | "prefix_unary_expression"
             | "postfix_unary_expression"
-            | "cast_expression"
-            | "as_expression"
             | "is_expression"
             | "is_pattern_expression"
             | "array_creation_expression"
@@ -1616,11 +2212,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "argument_list"
             | "bracketed_argument_list"
             | "variable_declarator"
-            | "variable_declaration"
             | "declaration_expression"
-            | "default_expression"
             | "sizeof_expression"
             | "typeof_expression" => {
+                if node.kind() == "assignment_expression" || is_update_expression(node) {
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unsupported,
+                        "compound or increment/decrement assignment flow is not yet lowered",
+                    )?;
+                }
                 if operation_can_throw_implicitly(node) {
                     self.implicit_exception_gap(builder, entry, node)?;
                 }
@@ -2431,13 +3035,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let function = node.child_by_field_name("function");
+        let callable_anchor = function
+            .or_else(|| node.child_by_field_name("type"))
+            .or_else(|| first_named_child(node))
+            .unwrap_or(node);
+        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
         let receiver_node = function.and_then(csharp_call_receiver);
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver_node| {
+                self.expression_value(builder, receiver_node, expression_value_kind(receiver_node))
+            })
             .transpose()?;
         let constructor = matches!(
             node.kind(),
@@ -2477,17 +3087,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
 
         let arguments = call_arguments(node);
-        let argument_values = arguments
-            .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut argument_nodes = Vec::with_capacity(arguments.len());
+        let mut argument_values = Vec::with_capacity(arguments.len());
+        let mut incomplete_argument_mapping = false;
+        for argument in arguments {
+            let Some(value_node) = call_argument_value(argument) else {
+                continue;
+            };
+            argument_nodes.push(value_node);
+            let value =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let semantic_argument = match csharp_call_argument_shape(argument) {
+                CSharpCallArgumentShape::Positional => {
+                    SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                }
+                CSharpCallArgumentShape::Named => {
+                    incomplete_argument_mapping = true;
+                    SemanticCallArgument::direct(value, ArgumentDomain::Keyword)
+                }
+                CSharpCallArgumentShape::ByReference => {
+                    incomplete_argument_mapping = true;
+                    SemanticCallArgument::unclassified(value)
+                }
+            };
+            argument_values.push(semantic_argument);
+        }
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: argument_values.into_iter().map(Into::into).collect(),
+                arguments: argument_values.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2495,6 +3126,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if incomplete_argument_mapping {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::ParameterFlow,
+                SemanticGapKind::Unsupported,
+                "named and by-reference C# argument-to-parameter mapping is not yet lowered",
+            )?;
+        }
+        if matches!(
+            node.kind(),
+            "object_creation_expression" | "implicit_object_creation_expression"
+        ) {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -2550,11 +3198,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "conditional invocation uses a null-test split; conditional result values are not modeled",
             )?;
-            let mut evaluations = Vec::with_capacity(arguments.len() + 1);
+            let mut evaluations = Vec::with_capacity(argument_nodes.len() + 1);
             if binding.kind() == "element_binding_expression" {
                 evaluations.push(binding);
             }
-            evaluations.extend(arguments.iter().copied());
+            evaluations.extend(argument_nodes.iter().copied());
             self.schedule_expressions(
                 builder,
                 conditional_entry,
@@ -2579,7 +3227,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(());
         }
 
-        let mut evaluations = Vec::with_capacity(arguments.len() + 1);
+        let mut evaluations = Vec::with_capacity(argument_nodes.len() + 1);
         if let Some(receiver_node) = receiver_node {
             evaluations.push(receiver_node);
         } else if let Some(function) = function
@@ -2587,7 +3235,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             evaluations.push(function);
         }
-        evaluations.extend(arguments);
+        evaluations.extend(argument_nodes);
         self.schedule_expressions(
             builder,
             entry,
@@ -2681,11 +3329,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn callable_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        _node: Node<'tree>,
+        node: Node<'tree>,
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), CSharpLoweringError> {
-        let result = self.value(builder, entry, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
         let resolution = CallableTargetResolution::Unknown;
         let metadata = self.metadata(entry)?;
         let kind = CallableReferenceKind::Lambda;
@@ -3039,6 +3687,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, CSharpLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(CSharpLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, CSharpLoweringError> {
         self.session.metadata(point)
     }
@@ -3200,6 +3858,30 @@ fn is_pattern_syntax(kind: &str) -> bool {
         )
 }
 
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "lambda_expression" | "anonymous_method_expression" => SemanticValueKind::Callable,
+        "integer_literal"
+        | "real_literal"
+        | "boolean_literal"
+        | "character_literal"
+        | "string_literal"
+        | "verbatim_string_literal"
+        | "raw_string_literal"
+        | "null_literal" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
 fn is_callable_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -3213,6 +3895,54 @@ fn is_callable_kind(kind: &str) -> bool {
             | "conversion_operator_declaration"
             | "destructor_declaration"
     )
+}
+
+fn is_csharp_nested_execution_boundary(node: Node<'_>) -> bool {
+    is_callable_kind(node.kind())
+        || matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        )
+}
+
+fn is_local_variable_declarator(node: Node<'_>) -> bool {
+    node.parent()
+        .filter(|parent| parent.kind() == "variable_declaration")
+        .and_then(|declaration| declaration.parent())
+        .is_none_or(|owner| {
+            !matches!(
+                owner.kind(),
+                "field_declaration" | "event_field_declaration"
+            )
+        })
+}
+
+fn csharp_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "block"
+                | "for_statement"
+                | "foreach_statement"
+                | "switch_section"
+                | "using_statement"
+                | "fixed_statement"
+                | "catch_clause"
+        ) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        if is_csharp_nested_execution_boundary(parent) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn is_statement_kind(kind: &str) -> bool {
@@ -3253,12 +3983,68 @@ fn is_conditional_compilation_kind(kind: &str) -> bool {
     )
 }
 
-fn variable_initializers(declaration: Node<'_>) -> Vec<Node<'_>> {
-    named_children(declaration)
-        .into_iter()
-        .filter(|child| child.kind() == "variable_declarator")
-        .flat_map(runtime_expression_children)
-        .collect()
+fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
+    declarator
+        .child_by_field_name("value")
+        .or_else(|| declarator.child_by_field_name("initializer"))
+        .or_else(|| {
+            named_children(declarator)
+                .into_iter()
+                .find(|child| child.kind() == "equals_value_clause")
+                .and_then(|clause| {
+                    clause
+                        .child_by_field_name("value")
+                        .or_else(|| clause.named_child(0))
+                })
+        })
+        .or_else(|| {
+            let name = declarator.child_by_field_name("name")?;
+            named_children(declarator)
+                .into_iter()
+                .find(|child| child.start_byte() > name.end_byte())
+        })
+}
+
+fn local_initializer_has_identity_conversion(
+    declared_type: Node<'_>,
+    initializer: Node<'_>,
+    source: &str,
+) -> bool {
+    if declared_type.kind() == "implicit_type"
+        || initializer.kind() == "implicit_object_creation_expression"
+    {
+        return true;
+    }
+    if initializer.kind() != "object_creation_expression" {
+        return false;
+    }
+    initializer
+        .child_by_field_name("type")
+        .is_some_and(|created_type| {
+            super::csharp_type_node_identity(declared_type, source)
+                == super::csharp_type_node_identity(created_type, source)
+        })
+}
+
+fn conditional_branches_have_identity_preserving_construction(
+    consequence: Node<'_>,
+    alternative: Node<'_>,
+    source: &str,
+) -> bool {
+    if consequence.kind() != "object_creation_expression"
+        || alternative.kind() != "object_creation_expression"
+    {
+        return false;
+    }
+    let Some(consequence_type) = consequence.child_by_field_name("type") else {
+        return false;
+    };
+    let Some(alternative_type) = alternative.child_by_field_name("type") else {
+        return false;
+    };
+    let consequence_type = super::csharp_type_node_identity(consequence_type, source);
+    !consequence_type.is_empty()
+        && consequence_type == super::csharp_type_node_identity(alternative_type, source)
 }
 
 fn switch_section_control_nodes(section: Node<'_>) -> Vec<Node<'_>> {
@@ -3320,6 +4106,45 @@ fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
         .unwrap_or_default()
 }
 
+fn call_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+    if argument.kind() != "argument" {
+        return Some(argument);
+    }
+    let keyword = argument.child_by_field_name("name");
+    argument
+        .child_by_field_name("value")
+        .or_else(|| argument.child_by_field_name("expression"))
+        .or_else(|| {
+            named_children(argument)
+                .into_iter()
+                .find(|child| keyword.is_none_or(|keyword| child.id() != keyword.id()))
+        })
+}
+
+#[derive(Clone, Copy)]
+enum CSharpCallArgumentShape {
+    Positional,
+    Named,
+    ByReference,
+}
+
+fn csharp_call_argument_shape(argument: Node<'_>) -> CSharpCallArgumentShape {
+    if argument.kind() != "argument" {
+        return CSharpCallArgumentShape::Positional;
+    }
+    if (0..argument.child_count()).any(|index| {
+        argument
+            .child(index)
+            .is_some_and(|child| matches!(child.kind(), "ref" | "out" | "in"))
+    }) {
+        CSharpCallArgumentShape::ByReference
+    } else if argument.child_by_field_name("name").is_some() {
+        CSharpCallArgumentShape::Named
+    } else {
+        CSharpCallArgumentShape::Positional
+    }
+}
+
 fn call_function_requires_evaluation(function: Node<'_>) -> bool {
     !matches!(
         function.kind(),
@@ -3330,6 +4155,20 @@ fn call_function_requires_evaluation(function: Node<'_>) -> bool {
             | "member_access_expression"
             | "conditional_access_expression"
     )
+}
+
+fn is_simple_assignment(node: Node<'_>) -> bool {
+    node.child_by_field_name("operator")
+        .is_some_and(|operator| operator.kind() == "=")
+}
+
+fn is_update_expression(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "prefix_unary_expression" | "postfix_unary_expression"
+    ) && node
+        .child_by_field_name("operator")
+        .is_some_and(|operator| matches!(operator.kind(), "++" | "--"))
 }
 
 fn may_invoke_user_code(node: Node<'_>) -> bool {

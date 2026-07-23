@@ -8,12 +8,13 @@ use brokk_bifrost::analyzer::semantic::{
     CaptureMode, CaptureSource, DispatchCandidate, DispatchExtensibility, DispatchOracle,
     FormalMultiplicity, HeapOracle, IndexSelector, MemoryAccessKind, MemoryLocationKind,
     MemoryStoreHandle, ObjectCardinality, ObservationPhase, OracleCallContext, OracleContractError,
-    OracleLimitValues, OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle,
-    ProcedurePortKind, ProcedureSemantics, ScopedSemanticLocator, SemanticBudget,
-    SemanticBudgetDimension, SemanticCapability, SemanticEffect, SemanticGapImpact,
-    SemanticGapSubject, SemanticOutcome, SemanticRequest, SemanticValueKind, StoreAtPoint,
-    UpdateEligibility, ValueAtPoint, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
-    ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason, WorkspaceSemanticOracle,
+    OracleLimitValues, OracleLimits, OracleRelationOwner, ProcedureHandle, ProcedureKind,
+    ProcedurePortHandle, ProcedurePortKind, ProcedureSemantics, ScopedSemanticLocator,
+    SemanticBudget, SemanticBudgetDimension, SemanticCapability, SemanticEffect, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticOutcome, SemanticRequest, SemanticValueKind,
+    StoreAtPoint, UpdateEligibility, ValueAtPoint, ValueFlowEndpoint, ValueFlowKind,
+    ValueFlowOracle, ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason,
+    WorkspaceSemanticOracle,
 };
 
 use common::{
@@ -1943,6 +1944,530 @@ class Sample {
 }
 
 #[test]
+fn csharp_publishes_neutral_receiver_and_value_flow_facts() {
+    const CSHARP: &str = r#"class Box {
+    public Box(object value) {}
+}
+
+class Sample {
+    Sample() {}
+
+    Box instance(object input) {
+        Box made = new Box(input);
+        this.sink(input, made);
+        return made;
+    }
+
+    void sink(object input, Box made) {}
+
+    static Box factory(object input) {
+        return new Box(input);
+    }
+
+    virtual object overridable(object input) {
+        return input;
+    }
+
+    object branch(bool flag, object input) {
+        object choice;
+        if (flag) choice = new Box(input); else choice = input;
+        return choice;
+    }
+
+    object coalesce(object input) {
+        object maybe = new Box(input);
+        maybe ??= input;
+        return maybe;
+    }
+
+    object capture(object input) {
+        System.Func<object> thunk = () => input;
+        return thunk();
+    }
+}
+"#;
+
+    let project = InlineTestProject::new()
+        .file("values/Sample.cs", CSHARP)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let csharp = SemanticGraph::materialize(&project, &analyzer, "values/Sample.cs");
+
+    assert_value_contract(&csharp, CSHARP, "instance", "this.sink(input, made)");
+    let branch = procedure_named(&csharp, "branch", ProcedureKind::Method);
+    let branch_choice = branch
+        .values()
+        .iter()
+        .find(|value| {
+            value.kind == SemanticValueKind::Local
+                && mapped_source(branch, CSHARP, value.source) == "choice"
+        })
+        .expect("C# branch fixture must publish its local binding");
+    assert!(
+        branch.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Value(branch_choice.id)
+                && gap.capability == SemanticCapability::Values
+        }),
+        "unresolved C# assignment conversions must keep the target identity open"
+    );
+    assert!(
+        branch
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .all(|event| !matches!(
+                event.effect,
+                SemanticEffect::Assignment { target, .. } if target == branch_choice.id
+            )),
+        "pre-conversion branch objects must not flow into the typed C# target"
+    );
+
+    let constructor = procedure_named(&csharp, "Sample", ProcedureKind::Constructor);
+    assert!(
+        constructor
+            .values()
+            .iter()
+            .any(|value| value.kind == SemanticValueKind::Receiver),
+        "instance constructors must publish their receiver port"
+    );
+    let factory = procedure_named(&csharp, "factory", ProcedureKind::Method);
+    assert!(
+        factory
+            .values()
+            .iter()
+            .all(|value| value.kind != SemanticValueKind::Receiver),
+        "static C# methods must not manufacture receiver ports"
+    );
+    assert_eq!(
+        factory.properties().dispatch_extensibility,
+        DispatchExtensibility::Closed,
+        "static C# methods have closed dispatch"
+    );
+    assert_eq!(
+        procedure_named(&csharp, "instance", ProcedureKind::Method)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Closed,
+        "ordinary non-virtual C# methods have closed dispatch"
+    );
+    assert_eq!(
+        procedure_named(&csharp, "overridable", ProcedureKind::Method)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Open,
+        "virtual C# methods retain an open override boundary"
+    );
+
+    let file = project.file("values/Sample.cs");
+    let allocation_text = "new Box(input)";
+    let allocation_start = CSHARP.find(allocation_text).expect("instance allocation");
+    let allocation_line = CSHARP[..allocation_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let allocation_outcome = analyzer
+        .semantic_oracle_provider()
+        .pointees_at_source(
+            &file,
+            brokk_bifrost::analyzer::Range {
+                start_byte: allocation_start,
+                end_byte: allocation_start + allocation_text.len(),
+                start_line: allocation_line,
+                end_line: allocation_line,
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("C# construction points-to query");
+    let allocation_points_to = available(&allocation_outcome);
+    assert_eq!(
+        allocation_points_to.coverage(),
+        CandidateCoverage::Exhaustive,
+        "{allocation_outcome:#?}"
+    );
+    assert!(
+        matches!(&allocation_outcome, SemanticOutcome::Complete { .. }),
+        "{allocation_outcome:#?}"
+    );
+    assert!(
+        allocation_points_to
+            .object_candidates()
+            .all(|candidate| matches!(
+                candidate.value().identity(),
+                AbstractObjectIdentity::Allocation(_)
+            )),
+        "the exact construction range must not alias its transient callee or exception values: {allocation_outcome:#?}"
+    );
+
+    let coalesce_text = "return maybe;";
+    let coalesce_statement = CSHARP.find(coalesce_text).expect("coalesced return");
+    let coalesce_start = coalesce_statement + "return ".len();
+    let coalesce_line = CSHARP[..coalesce_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let mut budget = SemanticBudget::default();
+    let coalesce_outcome = analyzer
+        .semantic_oracle_provider()
+        .pointees_at_source(
+            &file,
+            brokk_bifrost::analyzer::Range {
+                start_byte: coalesce_start,
+                end_byte: coalesce_start + "maybe".len(),
+                start_line: coalesce_line,
+                end_line: coalesce_line,
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("C# compound-assignment points-to query");
+    assert_eq!(
+        available(&coalesce_outcome).coverage(),
+        CandidateCoverage::Open,
+        "unmodeled compound assignment must keep a later receiver non-precise: {coalesce_outcome:#?}"
+    );
+
+    let lambda = csharp
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Lambda)
+        .expect("capture fixture must materialize its nested lambda");
+    assert!(
+        lambda.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Procedure
+                && gap.capability == SemanticCapability::Captures
+        }),
+        "unmodeled C# lexical captures must explicitly keep receiver analysis open"
+    );
+}
+
+#[test]
+fn csharp_named_and_by_reference_arguments_remain_open_until_mapped() {
+    const CSHARP: &str = r#"
+class Sample {
+    static void Named(object first, object second) {}
+    static void References(ref object first, out object second, in object third) {
+        second = first;
+    }
+
+    static void Caller(object a, object b) {
+        Named(second: b, first: a);
+        References(ref a, out b, in a);
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("values/Arguments.cs", CSHARP)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "values/Arguments.cs");
+    let caller = procedure_named(&graph, "Caller", ProcedureKind::Method);
+
+    let named = caller
+        .call_sites()
+        .iter()
+        .find(|call| mapped_source(caller, CSHARP, call.source).contains("Named("))
+        .expect("named-argument call");
+    assert!(
+        named.arguments.iter().all(|argument| {
+            argument.expansion == CallArgumentExpansion::Direct(ArgumentDomain::Keyword)
+        }),
+        "named arguments must not be rebound positionally: {:?}",
+        named.arguments
+    );
+
+    let references = caller
+        .call_sites()
+        .iter()
+        .find(|call| mapped_source(caller, CSHARP, call.source).contains("References("))
+        .expect("by-reference call");
+    assert!(
+        references
+            .arguments
+            .iter()
+            .all(|argument| argument.expansion == CallArgumentExpansion::Unclassified),
+        "by-reference arguments must not be published as by-value positional bindings: {:?}",
+        references.arguments
+    );
+
+    for call in [named, references] {
+        assert!(
+            caller.gaps().iter().any(|gap| {
+                gap.subject == SemanticGapSubject::CallSite(call.id)
+                    && gap.capability == SemanticCapability::ParameterFlow
+                    && gap.kind == SemanticGapKind::Unsupported
+            }),
+            "non-positional C# call must retain an explicit parameter-flow boundary"
+        );
+    }
+}
+
+#[test]
+fn csharp_factory_results_use_caller_local_call_result_identity() {
+    const CSHARP: &str = r#"class Product {}
+
+class Factory {
+    static object make(object input) {
+        return new Product();
+    }
+
+    object caller(object input) {
+        return make(input);
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("values/Factory.cs", CSHARP)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "values/Factory.cs");
+    let oracle = analyzer.semantic_oracle_provider();
+    let call = call_named(&graph, CSHARP, "caller", "make(input)");
+    let call_row = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("selected call handle must remain live");
+    let result = call
+        .procedure()
+        .value_handle(call_row.result.expect("factory call must publish a result"))
+        .expect("factory result must have a scoped handle");
+    let normal_point = call
+        .procedure()
+        .point_handle(
+            call_row
+                .normal_continuation
+                .target()
+                .expect("factory call must publish a normal continuation"),
+        )
+        .expect("normal continuation must have a scoped handle");
+    let query = ValueAtPoint::new(
+        result.clone(),
+        normal_point.clone(),
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .expect("factory result observation");
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = oracle
+        .pointees(
+            &query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("factory result points-to query");
+    assert_eq!(
+        budget.used(),
+        outcome.work(),
+        "nested dispatch and return-flow work must be staged into the caller query"
+    );
+    let points_to = available(&outcome);
+    let call_results = points_to
+        .objects()
+        .candidates()
+        .iter()
+        .filter_map(|candidate| match candidate.value().identity() {
+            AbstractObjectIdentity::CallResult(handle) => Some(handle),
+            AbstractObjectIdentity::Value(_)
+            | AbstractObjectIdentity::ProcedurePort(_)
+            | AbstractObjectIdentity::Allocation(_)
+            | AbstractObjectIdentity::Static(_)
+            | AbstractObjectIdentity::LexicalCell(_)
+            | AbstractObjectIdentity::CaptureSlot(_)
+            | AbstractObjectIdentity::TypeSummary(_)
+            | AbstractObjectIdentity::ModuleObject(_)
+            | AbstractObjectIdentity::External(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_results.len(),
+        1,
+        "the factory result must retain one structured caller-local identity: {outcome:#?}"
+    );
+    assert!(
+        points_to.objects().candidates().iter().all(|candidate| {
+            !matches!(
+                candidate.value().identity(),
+                AbstractObjectIdentity::Allocation(_)
+            )
+        }),
+        "callee allocation handles must not escape into the caller result: {outcome:#?}"
+    );
+
+    let handle = call_results[0];
+    assert_eq!(handle.call(), &call);
+    assert_eq!(handle.result(), &result);
+    assert_eq!(
+        handle.callee(),
+        &procedure_handle_named(&graph, "make", ProcedureKind::Method)
+    );
+    assert_eq!(handle.caller_context(), &OracleCallContext::empty());
+    assert_eq!(handle.callee_context().calls(), std::slice::from_ref(&call));
+    assert!(!handle.dispatch_provenance().is_empty());
+    assert!(matches!(
+        handle.dispatch_provenance()[0].owner(),
+        OracleRelationOwner::Dispatch(actual) if actual == &call
+    ));
+    assert!(matches!(
+        handle.binding_relation().owner(),
+        OracleRelationOwner::CallBinding {
+            call: actual_call,
+            callee,
+            context,
+        } if actual_call == &call
+            && callee == handle.callee()
+            && context == handle.caller_context()
+    ));
+    assert!(!handle.return_relations().is_empty());
+    assert!(handle.return_relations().iter().all(|relation| {
+        relation.kind == ValueFlowRelationKind::NormalReturn
+            && matches!(
+                relation.id.owner(),
+                OracleRelationOwner::ProcedureValueFlow { procedure, context }
+                    if procedure == handle.callee() && context == handle.callee_context()
+            )
+            && matches!(
+                (&relation.source, &relation.target),
+                (ValueFlowEndpoint::Value(source), ValueFlowEndpoint::Port(target))
+                    if source.procedure() == handle.callee()
+                        && target.kind() == ProcedurePortKind::NormalReturn
+            )
+    }));
+
+    let start_byte = CSHARP.rfind("make(input)").expect("caller factory call");
+    let start_line = CSHARP[..start_byte]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let mut source_budget = SemanticBudget::default();
+    let source_outcome = oracle
+        .pointees_at_source(
+            &project.file("values/Factory.cs"),
+            brokk_bifrost::analyzer::Range {
+                start_byte,
+                end_byte: start_byte + "make(input)".len(),
+                start_line,
+                end_line: start_line,
+            },
+            &mut SemanticRequest::new(&mut source_budget, &cancellation),
+        )
+        .expect("factory result source query");
+    let source_points_to = available(&source_outcome);
+    assert!(
+        !source_points_to.observations().is_empty()
+            && source_points_to.observations().iter().all(|observation| {
+                observation.query().value() == &result
+                    && observation.query().point() == &normal_point
+                    && observation.objects().candidates().iter().any(|candidate| {
+                        matches!(
+                            candidate.value().identity(),
+                            AbstractObjectIdentity::CallResult(_)
+                        )
+                    })
+            }),
+        "the call result must be observed only at its normal continuation: {source_outcome:#?}"
+    );
+
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut cancelled_budget = SemanticBudget::default();
+    assert!(matches!(
+        oracle
+            .pointees(
+                &query,
+                &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+            )
+            .expect("cancelled points-to query"),
+        SemanticOutcome::Cancelled {
+            partial: None,
+            work
+        } if work == Default::default()
+    ));
+
+    let mut bounded_budget = SemanticBudget::uniform(1).unwrap();
+    let bounded = oracle
+        .pointees(
+            &query,
+            &mut SemanticRequest::new(&mut bounded_budget, &cancellation),
+        )
+        .expect("bounded points-to query");
+    assert!(
+        matches!(bounded, SemanticOutcome::ExceededBudget { .. }),
+        "{bounded:#?}"
+    );
+    assert_eq!(
+        bounded_budget.used(),
+        Default::default(),
+        "an interrupted nested materialization must not commit staged work"
+    );
+}
+
+#[test]
+fn csharp_ambiguous_factory_dispatch_remains_ambiguous() {
+    const CSHARP: &str = r#"class Product {}
+
+class Factory {
+    static Product make(int input) {
+        return new Product();
+    }
+
+    static Product make(string input) {
+        return new Product();
+    }
+
+    Product caller() {
+        return make(default);
+    }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("values/AmbiguousFactory.cs", CSHARP)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "values/AmbiguousFactory.cs");
+    let call = call_named(&graph, CSHARP, "caller", "make(default)");
+    let call_row = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("ambiguous factory call");
+    let result = call
+        .procedure()
+        .value_handle(call_row.result.expect("call result"))
+        .expect("call-result handle");
+    let normal_point = call
+        .procedure()
+        .point_handle(
+            call_row
+                .normal_continuation
+                .target()
+                .expect("normal continuation"),
+        )
+        .expect("normal point");
+    let query = ValueAtPoint::new(
+        result,
+        normal_point,
+        ObservationPhase::AfterEffects,
+        OracleCallContext::empty(),
+    )
+    .expect("ambiguous result query");
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .semantic_oracle_provider()
+        .pointees(
+            &query,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("ambiguous factory points-to query");
+    assert!(
+        !matches!(&outcome, SemanticOutcome::Complete { .. }),
+        "ambiguous overload dispatch must not be promoted to complete"
+    );
+}
+
+#[test]
 fn source_points_to_preserves_path_specialized_finally_observations() {
     const SOURCE: &str = r#"class Service { void run() {} }
 class Sample {
@@ -2085,6 +2610,59 @@ fn source_points_to_projection_is_pre_cancellable_and_budget_staged() {
         .expect("large fixture materialization");
     assert!(materialized.available_value().is_some());
     let materialization_work = materialization_budget.used();
+
+    let mut baseline_budget = SemanticBudget::default();
+    let baseline = oracle
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut baseline_budget, &cancellation),
+        )
+        .expect("unbounded source points-to query");
+    let baseline_points_to = available(&baseline);
+    let mut direct_call_site_work = 0;
+    for observation in baseline_points_to.observations() {
+        let mut direct_budget = SemanticBudget::default();
+        let direct = oracle
+            .pointees(
+                observation.query(),
+                &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+            )
+            .expect("direct points-to query");
+        assert_eq!(direct_budget.used(), direct.work());
+        direct_call_site_work += direct.work().call_sites;
+    }
+    let expected_call_site_work = materialization_work.call_sites + direct_call_site_work;
+    assert_eq!(
+        baseline.work().call_sites,
+        expected_call_site_work,
+        "source projection must not charge flat call-row indexing as call expansion"
+    );
+
+    let mut limits = SemanticBudget::default().limits();
+    limits.call_sites = expected_call_site_work;
+    let mut call_site_budget = SemanticBudget::new(limits).unwrap();
+    let outcome = oracle
+        .pointees_at_source(
+            &file,
+            range,
+            &mut SemanticRequest::new(&mut call_site_budget, &cancellation),
+        )
+        .expect("source projection with exact call-expansion budget");
+    assert!(
+        outcome.available_value().is_some()
+            && !matches!(
+                outcome,
+                SemanticOutcome::ExceededBudget { exceeded, .. }
+                    if exceeded.dimension() == SemanticBudgetDimension::CallSites
+            ),
+        "flat call-row indexing must not consume call-expansion work: {outcome:#?}"
+    );
+    assert_eq!(
+        call_site_budget.used().call_sites,
+        expected_call_site_work,
+        "flat call-row indexing must not consume call-expansion work"
+    );
 
     let mut limits = SemanticBudget::default().limits();
     limits.values = materialization_work.values + 4;

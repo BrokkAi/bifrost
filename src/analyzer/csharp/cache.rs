@@ -20,6 +20,7 @@ pub(super) struct CSharpMemoCaches {
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
     pub(super) global_using_aliases: OnceLock<HashMap<String, String>>,
+    pub(super) global_static_using_type_names: OnceLock<Vec<String>>,
     pub(super) global_static_using_types: OnceLock<Vec<CodeUnit>>,
     pub(super) usage_global_static_using_types: OnceLock<Vec<CodeUnit>>,
 }
@@ -42,6 +43,7 @@ impl CSharpMemoCaches {
             implicit_reference_index: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),
+            global_static_using_type_names: OnceLock::new(),
             global_static_using_types: OnceLock::new(),
             usage_global_static_using_types: OnceLock::new(),
         }

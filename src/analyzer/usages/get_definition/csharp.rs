@@ -1,52 +1,395 @@
 use super::*;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
-    csharp_resolve_type_fq_name, csharp_usage_direct_base,
+    csharp_extension_invocation_return_type_fq_name_in_session,
+    csharp_member_declared_type_fq_name_in_session,
+    csharp_method_return_type_fq_name_for_arity_in_session, csharp_resolve_type_fq_name,
+    csharp_usage_direct_base, csharp_visible_extension_method_candidates_in_session,
+    seed_csharp_bindings_before_in_session,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    csharp_attribute_name_node, csharp_attribute_type_names, csharp_conditional_member_access,
-    csharp_member_name, csharp_method_generic_arity, csharp_normalize_full_name,
-    csharp_source_identifier,
+    TypeHierarchyProvider, csharp_attribute_name_node, csharp_attribute_type_names,
+    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
+    csharp_normalize_full_name, csharp_source_identifier,
 };
 
 pub(super) struct CSharpDefinitionProvider<'a> {
     csharp: &'a CSharpAnalyzer,
+    session: Option<&'a ResolutionSession>,
 }
 
 impl<'a> CSharpDefinitionProvider<'a> {
     pub(super) fn new(csharp: &'a CSharpAnalyzer) -> Self {
-        Self { csharp }
+        Self {
+            csharp,
+            session: None,
+        }
+    }
+
+    fn bounded(csharp: &'a CSharpAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self {
+            csharp,
+            session: Some(session),
+        }
+    }
+
+    fn scope_step(&self) -> bool {
+        self.session.is_none_or(ResolutionSession::scope_step)
+    }
+
+    fn summary_step(&self) -> bool {
+        self.session.is_none_or(ResolutionSession::summary_step)
+    }
+
+    fn observe_cancellation(&self) -> bool {
+        self.session
+            .is_none_or(ResolutionSession::observe_cancellation)
+    }
+
+    fn query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
+        match self.session {
+            Some(session) => session.query(query),
+            None => Some(query()),
+        }
+    }
+
+    fn query_optional<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
+        match self.session {
+            Some(session) => session.query_optional(query),
+            None => query(),
+        }
+    }
+
+    fn query_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
+        match self.session {
+            Some(session) => session.query_rows(query),
+            None => query(),
+        }
+    }
+
+    fn signature_metadata(&self, unit: &CodeUnit) -> Vec<crate::analyzer::SignatureMetadata> {
+        match self.session {
+            Some(session) => session
+                .query_limited_rows(|limit| self.csharp.signature_metadata_limited(unit, limit)),
+            None => self.csharp.signature_metadata(unit),
+        }
     }
 
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let exact: Vec<_> = self
-            .csharp
-            .declaration_candidates_by_fqn(fqn, false)
-            .into_iter()
-            .collect();
+        let exact = match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .declaration_candidates_by_fqn_limited(fqn, false, limit, || {
+                        session.observe_cancellation()
+                    })
+            }),
+            None => self
+                .csharp
+                .declaration_candidates_by_fqn(fqn, false)
+                .into_iter()
+                .collect(),
+        };
         if !exact.is_empty() {
             return exact;
         }
-        self.csharp
-            .declaration_candidates_by_fqn(fqn, true)
-            .into_iter()
-            .collect()
+        match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .declaration_candidates_by_fqn_limited(fqn, true, limit, || {
+                        session.observe_cancellation()
+                    })
+            }),
+            None => self
+                .csharp
+                .declaration_candidates_by_fqn(fqn, true)
+                .into_iter()
+                .collect(),
+        }
     }
 
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
-        self.csharp
-            .member_candidates_for_owner(owner_fqn, name)
-            .into_iter()
-            .collect()
+        match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
+                        session.observe_cancellation()
+                    })
+            }),
+            None => self
+                .csharp
+                .member_candidates_for_owner(owner_fqn, name)
+                .into_iter()
+                .collect(),
+        }
     }
 
     fn package_exists(&self, package: &str) -> bool {
-        self.csharp.workspace_namespace_exists(package)
+        self.query(|| self.csharp.workspace_namespace_exists(package))
+            .unwrap_or(false)
     }
 
     fn type_exists(&self, fqn: &str) -> bool {
         self.fqn(fqn).into_iter().any(|unit| unit.is_class())
+    }
+
+    fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+        if self.session.is_none() {
+            return self.csharp.visible_type_candidates(file, name);
+        }
+        let mut using_aliases = || {
+            let aliases = self.using_aliases(file);
+            self.observe_cancellation().then_some(aliases)
+        };
+        let mut namespace_of_file = || self.namespace_of_file(file);
+        let mut using_namespaces = || {
+            let namespaces = self.using_namespaces(file);
+            self.observe_cancellation().then_some(namespaces)
+        };
+        let mut type_candidates_by_fqn = |fqn: &str| {
+            let candidates = self
+                .fqn(fqn)
+                .into_iter()
+                .filter(CodeUnit::is_class)
+                .collect();
+            self.observe_cancellation().then_some(candidates)
+        };
+        self.csharp.visible_type_candidates_with_lookups(
+            name,
+            true,
+            &mut using_aliases,
+            &mut namespace_of_file,
+            &mut using_namespaces,
+            &mut type_candidates_by_fqn,
+        )
+    }
+
+    fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .partial_type_parts_limited(owner, limit, || session.observe_cancellation())
+            }),
+            None => self.csharp.partial_type_parts(owner),
+        }
+    }
+
+    fn using_namespaces(&self, file: &ProjectFile) -> Vec<String> {
+        match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .using_namespaces_of_limited(file, limit, || session.observe_cancellation())
+            }),
+            None => self.csharp.using_namespaces_of(file),
+        }
+    }
+
+    fn using_aliases(&self, file: &ProjectFile) -> HashMap<String, String> {
+        let aliases = match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .using_aliases_of_limited(file, limit, || session.observe_cancellation())
+            }),
+            None => self.csharp.using_aliases_of(file).into_iter().collect(),
+        };
+        aliases.into_iter().collect()
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        match self.session {
+            Some(session) => session
+                .query_limited_rows(|limit| self.csharp.import_statements_limited(file, limit)),
+            None => self.csharp.import_statements(file),
+        }
+    }
+
+    fn namespace_of_file(&self, file: &ProjectFile) -> Option<String> {
+        match self.session {
+            Some(session) => session
+                .query_limited_rows(|limit| self.csharp.namespace_of_file_limited(file, limit))
+                .into_iter()
+                .next(),
+            None => Some(self.csharp.namespace_of_file(file)),
+        }
+    }
+
+    fn attribute_type_candidates(
+        &self,
+        file: &ProjectFile,
+        names: &[String],
+    ) -> (Vec<CodeUnit>, bool) {
+        if self.session.is_none() {
+            return self
+                .csharp
+                .attribute_type_candidates_with_ambiguity(file, names);
+        }
+        let mut visible_type_candidates = |name: &str| {
+            let candidates = self.visible_type_candidates(file, name);
+            self.observe_cancellation().then_some(candidates)
+        };
+        let mut attribute_class_is_applicable =
+            |candidate: &CodeUnit| self.attribute_class_is_applicable(candidate);
+        self.csharp
+            .attribute_type_candidates_with_lookups(
+                names,
+                &mut visible_type_candidates,
+                &mut attribute_class_is_applicable,
+            )
+            .unwrap_or((Vec::new(), false))
+    }
+
+    fn attribute_class_is_applicable(&self, candidate: &CodeUnit) -> Option<bool> {
+        const ATTRIBUTE_FQN: &str = "System.Attribute";
+
+        let session = self.session?;
+        let mut stack = vec![candidate.clone()];
+        let mut seen = HashSet::default();
+        let mut unresolved_ancestry = false;
+        while let Some(current) = stack.pop() {
+            if !self.scope_step() {
+                return None;
+            }
+            let current_fqn = current.fq_name();
+            if !seen.insert(current_fqn.clone()) {
+                continue;
+            }
+            if csharp_normalize_full_name(&current_fqn) == ATTRIBUTE_FQN {
+                return Some(true);
+            }
+
+            let mut parts = self.partial_type_parts(&current);
+            if !self.observe_cancellation() {
+                return None;
+            }
+            if parts.is_empty() {
+                parts.push(current);
+            }
+            for part in parts {
+                if !self.scope_step() {
+                    return None;
+                }
+                let raw_supertypes = session
+                    .query_limited_rows(|limit| self.csharp.raw_supertypes_limited(&part, limit));
+                if !self.observe_cancellation() {
+                    return None;
+                }
+                for raw in raw_supertypes {
+                    let normalized_raw = csharp_normalize_full_name(&raw);
+                    if normalized_raw == ATTRIBUTE_FQN {
+                        return Some(true);
+                    }
+                    if matches!(normalized_raw.as_str(), "object" | "System.Object") {
+                        continue;
+                    }
+                    let ancestors = self.visible_type_candidates(part.source(), &raw);
+                    if !self.observe_cancellation() {
+                        return None;
+                    }
+                    if ancestors.is_empty() || self.csharp.logical_type_count(&ancestors) > 1 {
+                        unresolved_ancestry = true;
+                    } else {
+                        stack.extend(ancestors);
+                    }
+                }
+            }
+        }
+
+        if unresolved_ancestry {
+            session.mark_scope_incomplete();
+            None
+        } else {
+            Some(false)
+        }
+    }
+
+    fn direct_ancestors(
+        &self,
+        provider: &dyn TypeHierarchyProvider,
+        owner: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        let Some(session) = self.session else {
+            return provider.get_direct_ancestors(owner);
+        };
+        if !self.summary_step() {
+            return Vec::new();
+        }
+
+        let mut parts = self.partial_type_parts(owner);
+        if !self.observe_cancellation() {
+            return Vec::new();
+        }
+        if parts.is_empty() {
+            parts.push(owner.clone());
+        }
+        let mut ancestors = Vec::new();
+        for part in parts {
+            if !self.scope_step() {
+                return Vec::new();
+            }
+            let raw_supertypes = session
+                .query_limited_rows(|limit| self.csharp.raw_supertypes_limited(&part, limit));
+            if !self.observe_cancellation() {
+                return Vec::new();
+            }
+            for raw in raw_supertypes {
+                let mut candidates = self.visible_type_candidates(part.source(), &raw);
+                if !self.observe_cancellation() {
+                    return Vec::new();
+                }
+                if self.csharp.logical_type_count(&candidates) == 1 {
+                    self.csharp.sort_type_candidates(&mut candidates);
+                    if let Some(ancestor) = candidates.into_iter().next() {
+                        ancestors.push(ancestor);
+                    }
+                }
+            }
+        }
+        self.csharp.sort_dedup_type_candidates(&mut ancestors);
+        ancestors
+    }
+
+    fn parent_of(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+        if !self.summary_step() {
+            return None;
+        }
+        let parent = analyzer.parent_of(unit);
+        if !self.observe_cancellation() {
+            return None;
+        }
+        let parent = parent?;
+        self.scope_step().then_some(parent)
+    }
+
+    fn session(&self) -> Option<&ResolutionSession> {
+        self.session
+    }
+}
+
+fn csharp_smallest_named_node_covering<'tree>(
+    definitions: &CSharpDefinitionProvider<'_>,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !definitions.scope_step() || node.end_byte() < end || node.start_byte() > start {
+        return None;
+    }
+    loop {
+        let mut cursor = node.walk();
+        let mut containing_child = None;
+        for child in node.children(&mut cursor) {
+            if !definitions.scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing_child = Some(child);
+                break;
+            }
+        }
+        match containing_child {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
     }
 }
 
@@ -56,6 +399,9 @@ pub(crate) enum CSharpTypeLookupResolution {
         candidates: Vec<CodeUnit>,
         target_kind: TypeLookupTargetKind,
         ambiguous: bool,
+    },
+    Dynamic {
+        target_kind: TypeLookupTargetKind,
     },
     InappropriateSymbolContext,
 }
@@ -67,13 +413,63 @@ pub(crate) fn csharp_type_lookup_resolution(
     root: Node<'_>,
     site: &ResolvedReferenceSite,
 ) -> Option<CSharpTypeLookupResolution> {
+    let session = ResolutionSession::unbounded();
+    csharp_type_lookup_resolution_in_session(analyzer, file, source, root, site, &session)
+}
+
+pub(crate) fn csharp_type_lookup_resolution_in_session(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    session: &ResolutionSession,
+) -> Option<CSharpTypeLookupResolution> {
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-    let definitions = CSharpDefinitionProvider::new(csharp);
-    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let definitions = CSharpDefinitionProvider::bounded(csharp, session);
+    let node = csharp_smallest_named_node_covering(
+        &definitions,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
     csharp_type_lookup_node_resolution(analyzer, csharp, &definitions, file, source, root, node)
 }
 
 pub(super) fn resolve_csharp(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    resolve_csharp_in_session(analyzer, definitions, file, source, tree, site)
+}
+
+pub(crate) fn resolve_csharp_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "csharp_analyzer_unavailable",
+            "C# analyzer is unavailable",
+        ));
+    };
+    let definitions = CSharpDefinitionProvider::bounded(csharp, &session);
+    let outcome = resolve_csharp_in_session(analyzer, &definitions, file, source, tree, site);
+    session.finish(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_csharp_in_session(
     analyzer: &dyn IAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
@@ -87,9 +483,12 @@ pub(super) fn resolve_csharp(
     let Some(tree) = tree else {
         return no_definition("csharp_parse_failed", "C# source could not be parsed");
     };
-    let Some(node) =
-        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
-    else {
+    let Some(node) = csharp_smallest_named_node_covering(
+        definitions,
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
         return no_definition(
             "no_indexed_definition",
             format!(
@@ -105,7 +504,7 @@ pub(super) fn resolve_csharp(
         );
     }
 
-    match csharp_reference_node(node) {
+    match csharp_reference_node(node, definitions) {
         Some(CSharpReferenceNode::Attribute(name)) => {
             csharp_attribute_outcome(csharp, definitions, file, name, source)
         }
@@ -115,12 +514,12 @@ pub(super) fn resolve_csharp(
             // the scope-blind type resolver, so a bare `Config` inside `namespace B`
             // resolves to `B.Config` rather than a same-named sibling namespace's
             // (#431).
-            if let Some(unit) = resolve_in_enclosing_scopes(
+            if let Some(unit) = resolve_csharp_in_enclosing_scopes(
                 analyzer,
+                definitions,
                 file,
                 &reference,
                 type_node.start_byte(),
-                CodeUnit::is_class,
             ) {
                 return candidates_outcome(vec![unit]);
             }
@@ -160,13 +559,14 @@ pub(super) fn resolve_csharp(
             if receiver_type_names.is_empty() {
                 receiver_type_names = csharp_structured_receiver_type_names(
                     csharp,
+                    definitions,
                     file,
                     source,
                     tree.root_node(),
                     receiver,
                 );
             }
-            let arity = csharp_invocation_arity(name, source);
+            let arity = csharp_invocation_arity(name, source, definitions);
             let outcome = csharp_member_outcome(
                 analyzer,
                 definitions,
@@ -177,18 +577,33 @@ pub(super) fn resolve_csharp(
                 false,
             );
             if outcome.status == DefinitionLookupStatus::NoDefinition {
-                let extensions = csharp_visible_extension_method_candidates(
-                    csharp,
-                    analyzer,
-                    file,
-                    source,
-                    member_name_node,
-                    &receiver_type_names,
-                    member,
-                    arity,
-                    explicit_generic_arity,
-                    false,
-                );
+                let extensions = match definitions.session() {
+                    Some(session) => csharp_visible_extension_method_candidates_in_session(
+                        csharp,
+                        analyzer,
+                        file,
+                        source,
+                        member_name_node,
+                        &receiver_type_names,
+                        member,
+                        arity,
+                        explicit_generic_arity,
+                        false,
+                        session,
+                    ),
+                    None => csharp_visible_extension_method_candidates(
+                        csharp,
+                        analyzer,
+                        file,
+                        source,
+                        member_name_node,
+                        &receiver_type_names,
+                        member,
+                        arity,
+                        explicit_generic_arity,
+                        false,
+                    ),
+                };
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
                 }
@@ -204,18 +619,33 @@ pub(super) fn resolve_csharp(
                 if fallback.status != DefinitionLookupStatus::NoDefinition {
                     return fallback;
                 }
-                let extensions = csharp_visible_extension_method_candidates(
-                    csharp,
-                    analyzer,
-                    file,
-                    source,
-                    member_name_node,
-                    &receiver_type_names,
-                    member,
-                    arity,
-                    explicit_generic_arity,
-                    true,
-                );
+                let extensions = match definitions.session() {
+                    Some(session) => csharp_visible_extension_method_candidates_in_session(
+                        csharp,
+                        analyzer,
+                        file,
+                        source,
+                        member_name_node,
+                        &receiver_type_names,
+                        member,
+                        arity,
+                        explicit_generic_arity,
+                        true,
+                        session,
+                    ),
+                    None => csharp_visible_extension_method_candidates(
+                        csharp,
+                        analyzer,
+                        file,
+                        source,
+                        member_name_node,
+                        &receiver_type_names,
+                        member,
+                        arity,
+                        explicit_generic_arity,
+                        true,
+                    ),
+                };
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
                 }
@@ -242,10 +672,10 @@ pub(super) fn resolve_csharp(
                     format!("`{member}` is a local C# value or local function"),
                 );
             }
-            let owners = csharp_enclosing_class(analyzer, file, name.start_byte())
+            let owners = csharp_enclosing_class(analyzer, definitions, file, name.start_byte())
                 .into_iter()
                 .collect();
-            let arity = csharp_invocation_arity(name, source);
+            let arity = csharp_invocation_arity(name, source, definitions);
             let outcome = csharp_member_outcome(
                 analyzer,
                 definitions,
@@ -301,7 +731,7 @@ pub(super) fn resolve_csharp(
             if !bindings.is_shadowed(text) {
                 if csharp_is_unqualified_member_reference(identifier)
                     && let Some(owner) =
-                        csharp_enclosing_class(analyzer, file, identifier.start_byte())
+                        csharp_enclosing_class(analyzer, definitions, file, identifier.start_byte())
                 {
                     let outcome = csharp_member_outcome(
                         analyzer,
@@ -346,15 +776,22 @@ pub(super) fn resolve_csharp(
 
 fn csharp_structured_receiver_type_names(
     csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     mut receiver: Node<'_>,
 ) -> Vec<String> {
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
     while matches!(
         receiver.kind(),
         "parenthesized_expression" | "checked_expression"
     ) {
+        if !definitions.scope_step() {
+            return Vec::new();
+        }
         let Some(inner) = receiver.named_child(0) else {
             return Vec::new();
         };
@@ -362,8 +799,14 @@ fn csharp_structured_receiver_type_names(
     }
     if receiver.kind() == "identifier" {
         let name = csharp_node_text(receiver, source);
-        let bindings =
-            csharp_legacy_bindings_before_scoped(csharp, file, source, root, receiver.start_byte());
+        let bindings = csharp_legacy_bindings_before_scoped(
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            receiver.start_byte(),
+        );
         return bindings
             .resolve_symbol(name)
             .as_precise()
@@ -382,11 +825,13 @@ fn csharp_structured_receiver_type_names(
     if reference.is_empty() {
         return Vec::new();
     }
-    if let Some(resolved) = csharp_resolve_type_fq_name(csharp, file, &reference) {
+    if let Some(resolved) =
+        definitions.query_optional(|| csharp_resolve_type_fq_name(csharp, file, &reference))
+    {
         return vec![resolved];
     }
 
-    let aliases = csharp.using_aliases_of(file);
+    let aliases = definitions.using_aliases(file);
     let mut names = vec![
         aliases
             .get(&reference)
@@ -394,12 +839,13 @@ fn csharp_structured_receiver_type_names(
             .unwrap_or_else(|| reference.clone()),
     ];
     if !reference.contains('.') && !aliases.contains_key(&reference) {
-        names.extend(
-            csharp
-                .using_namespaces_of(file)
-                .into_iter()
-                .map(|namespace| format!("{namespace}.{reference}")),
-        );
+        let namespaces = definitions.using_namespaces(file);
+        for namespace in namespaces {
+            if !definitions.scope_step() {
+                return Vec::new();
+            }
+            names.push(format!("{namespace}.{reference}"));
+        }
     }
     names.sort();
     names.dedup();
@@ -415,9 +861,12 @@ fn csharp_type_lookup_node_resolution(
     root: Node<'_>,
     node: Node<'_>,
 ) -> Option<CSharpTypeLookupResolution> {
+    if !definitions.scope_step() {
+        return None;
+    }
     if let Some(name) = csharp_attribute_name_node(node) {
         let names = csharp_attribute_type_names(name, source);
-        let (candidates, ambiguous) = csharp.attribute_type_candidates_with_ambiguity(file, &names);
+        let (candidates, ambiguous) = definitions.attribute_type_candidates(file, &names);
         return csharp_type_candidates_resolution_with_kind(
             names.first().map(String::as_str).unwrap_or_default(),
             candidates,
@@ -426,16 +875,30 @@ fn csharp_type_lookup_node_resolution(
         );
     }
 
-    if node.kind() == "member_access_expression"
-        && let Some(receiver) = csharp_member_access_receiver(node)
-    {
+    if matches!(
+        node.kind(),
+        "invocation_expression"
+            | "object_creation_expression"
+            | "member_access_expression"
+            | "conditional_access_expression"
+    ) {
+        if csharp_expression_is_dynamic(csharp, definitions, file, source, root, node) {
+            return Some(CSharpTypeLookupResolution::Dynamic {
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            });
+        }
         let candidates =
-            csharp_receiver_type_lookup_units(csharp, definitions, file, source, root, receiver);
-        return csharp_type_candidates_resolution(csharp_node_text(receiver, source), candidates);
+            csharp_receiver_type_units(analyzer, csharp, definitions, file, source, root, node);
+        return csharp_type_candidates_resolution(csharp_node_text(node, source), candidates);
     }
 
     if csharp_is_type_reference_node(node) {
         let reference = csharp_reference_type_text(node, source);
+        if csharp_is_dynamic_type_reference(&reference) {
+            return Some(CSharpTypeLookupResolution::Dynamic {
+                target_kind: TypeLookupTargetKind::TypeReference,
+            });
+        }
         return csharp_type_candidates_resolution_with_kind(
             &reference,
             csharp_visible_type_output_candidates(csharp, definitions, file, &reference),
@@ -444,13 +907,25 @@ fn csharp_type_lookup_node_resolution(
         );
     }
 
-    if let Some(parent) = node.parent() {
+    if definitions.scope_step()
+        && let Some(parent) = node.parent()
+    {
         if parent.kind() == "member_access_expression"
             && csharp_member_access_receiver(parent) == Some(node)
         {
-            let candidates =
+            if csharp_expression_is_dynamic(csharp, definitions, file, source, root, node) {
+                return Some(CSharpTypeLookupResolution::Dynamic {
+                    target_kind: TypeLookupTargetKind::ValueExpression,
+                });
+            }
+            let (candidates, target_kind) =
                 csharp_receiver_type_lookup_units(csharp, definitions, file, source, root, node);
-            return csharp_type_candidates_resolution(csharp_node_text(node, source), candidates);
+            return csharp_type_candidates_resolution_with_kind(
+                csharp_node_text(node, source),
+                candidates,
+                target_kind,
+                false,
+            );
         }
         if csharp_is_callable_declaration_name(parent, node) {
             return Some(CSharpTypeLookupResolution::InappropriateSymbolContext);
@@ -474,6 +949,11 @@ fn csharp_type_lookup_node_resolution(
     }
 
     let name = csharp_node_text(node, source);
+    if csharp_expression_is_dynamic(csharp, definitions, file, source, root, node) {
+        return Some(CSharpTypeLookupResolution::Dynamic {
+            target_kind: TypeLookupTargetKind::ValueExpression,
+        });
+    }
     let bindings = csharp_type_bindings_before_scoped(
         csharp,
         definitions,
@@ -497,7 +977,7 @@ fn csharp_receiver_type_lookup_units(
     source: &str,
     root: Node<'_>,
     receiver: Node<'_>,
-) -> Vec<CodeUnit> {
+) -> (Vec<CodeUnit>, TypeLookupTargetKind) {
     if receiver.kind() == "identifier" {
         let name = csharp_node_text(receiver, source);
         let bindings = csharp_type_bindings_before_scoped(
@@ -509,20 +989,42 @@ fn csharp_receiver_type_lookup_units(
             receiver.start_byte(),
         );
         if let Some(targets) = bindings.resolve_symbol(name).as_precise() {
-            return targets.iter().cloned().collect();
+            return (
+                targets.iter().cloned().collect(),
+                TypeLookupTargetKind::ValueExpression,
+            );
         }
         if bindings.is_shadowed(name) {
-            return Vec::new();
+            return (Vec::new(), TypeLookupTargetKind::ValueExpression);
         }
+        let member_candidates =
+            csharp_enclosing_member_type_units(csharp, csharp, definitions, file, receiver, name);
+        if !member_candidates.is_empty() {
+            return (member_candidates, TypeLookupTargetKind::ValueExpression);
+        }
+        return (
+            csharp_logical_visible_type_candidates(csharp, definitions, file, name),
+            TypeLookupTargetKind::TypeReference,
+        );
     }
-    csharp_receiver_type_units(
-        csharp as &dyn IAnalyzer,
-        csharp,
-        definitions,
-        file,
-        source,
-        root,
-        receiver,
+    (
+        csharp_receiver_type_units(
+            csharp as &dyn IAnalyzer,
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            receiver,
+        ),
+        if matches!(
+            receiver.kind(),
+            "qualified_name" | "alias_qualified_name" | "generic_name" | "predefined_type"
+        ) {
+            TypeLookupTargetKind::TypeReference
+        } else {
+            TypeLookupTargetKind::ValueExpression
+        },
     )
 }
 
@@ -566,13 +1068,18 @@ fn csharp_declaration_name_type_resolution(
         _ if matches!(parent.kind(), "property_declaration" | "field_declaration")
             && parent.child_by_field_name("name") == Some(name) =>
         {
-            let owner = csharp_enclosing_class(analyzer, file, name.start_byte())?;
-            let fqn = csharp_member_declared_type_fq_name(
-                csharp,
-                file,
-                &owner,
-                csharp_node_text(name, source),
-            )?;
+            let owner = csharp_enclosing_class(analyzer, definitions, file, name.start_byte())?;
+            let member_name = csharp_node_text(name, source);
+            let fqn = match definitions.session() {
+                Some(session) => csharp_member_declared_type_fq_name_in_session(
+                    csharp,
+                    file,
+                    &owner,
+                    member_name,
+                    session,
+                ),
+                None => csharp_member_declared_type_fq_name(csharp, file, &owner, member_name),
+            }?;
             csharp_type_candidates_resolution(csharp_node_text(name, source), definitions.fqn(&fqn))
         }
         _ => {
@@ -609,6 +1116,11 @@ fn csharp_type_node_resolution(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<CSharpTypeLookupResolution> {
+    if csharp_is_dynamic_type_reference(reference) {
+        return Some(CSharpTypeLookupResolution::Dynamic {
+            target_kind: TypeLookupTargetKind::ValueExpression,
+        });
+    }
     csharp_type_candidates_resolution_with_kind(
         reference,
         csharp_visible_type_output_candidates(csharp, definitions, file, reference),
@@ -672,6 +1184,213 @@ fn csharp_type_bindings_before_scoped(
     bindings
 }
 
+fn csharp_is_dynamic_type_reference(reference: &str) -> bool {
+    csharp_normalize_full_name(reference) == "dynamic"
+}
+
+fn csharp_expression_is_dynamic(
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+) -> bool {
+    let mut stack = vec![expression];
+    while let Some(current) = stack.pop() {
+        if !definitions.scope_step() {
+            return false;
+        }
+        match current.kind() {
+            "identifier" => {
+                if csharp_dynamic_binding_is_visible(
+                    csharp,
+                    definitions,
+                    file,
+                    source,
+                    root,
+                    current,
+                ) {
+                    return true;
+                }
+            }
+            "member_access_expression" => {
+                if let Some(receiver) = csharp_member_access_receiver(current) {
+                    stack.push(receiver);
+                }
+            }
+            "conditional_access_expression" => {
+                if let Some(access) = csharp_conditional_member_access(current) {
+                    stack.push(access.receiver);
+                }
+            }
+            "invocation_expression" => {
+                if let Some(function) = current.child_by_field_name("function") {
+                    stack.push(function);
+                }
+            }
+            "parenthesized_expression" | "checked_expression" => {
+                if let Some(inner) = current.named_child(0) {
+                    stack.push(inner);
+                }
+            }
+            "cast_expression" | "as_expression" => {
+                let field = if current.kind() == "cast_expression" {
+                    "type"
+                } else {
+                    "right"
+                };
+                if current
+                    .child_by_field_name(field)
+                    .map(|type_node| csharp_reference_type_text(type_node, source))
+                    .is_some_and(|reference| csharp_is_dynamic_type_reference(&reference))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn csharp_dynamic_binding_is_visible(
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    identifier: Node<'_>,
+) -> bool {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    csharp_seed_dynamic_active_path(
+        definitions,
+        source,
+        root,
+        identifier.start_byte(),
+        &mut bindings,
+    );
+    let name = csharp_node_text(identifier, source);
+    if bindings.resolve_symbol(name).as_precise().is_some() {
+        return true;
+    }
+    if bindings.is_shadowed(name) {
+        return false;
+    }
+
+    let Some(owner) = csharp_enclosing_class(
+        csharp as &dyn IAnalyzer,
+        definitions,
+        file,
+        identifier.start_byte(),
+    ) else {
+        return false;
+    };
+    for candidate in definitions.members_for_owner_name(&owner.fq_name(), name) {
+        if !definitions.scope_step() {
+            return false;
+        }
+        let metadata = definitions.signature_metadata(&candidate);
+        if metadata.iter().any(|metadata| {
+            metadata
+                .return_type_text()
+                .is_some_and(csharp_is_dynamic_type_reference)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn csharp_seed_dynamic_active_path(
+    definitions: &CSharpDefinitionProvider<'_>,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<()>,
+) {
+    if !definitions.scope_step() || node.start_byte() >= cutoff_start {
+        return;
+    }
+
+    if node.kind() == "local_function_statement"
+        && let Some(name) = node.child_by_field_name("name")
+        && name.start_byte() < cutoff_start
+    {
+        bindings.declare_shadow(csharp_node_text(name, source));
+    }
+
+    let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
+    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+        return;
+    }
+    if enters_scope {
+        bindings.enter_scope();
+    }
+
+    if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
+        && node.end_byte() <= cutoff_start
+    {
+        csharp_seed_dynamic_binding(definitions, source, node, bindings);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= cutoff_start {
+            break;
+        }
+        csharp_seed_dynamic_active_path(definitions, source, child, cutoff_start, bindings);
+    }
+}
+
+fn csharp_seed_dynamic_binding(
+    definitions: &CSharpDefinitionProvider<'_>,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<()>,
+) {
+    if !definitions.scope_step() {
+        return;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let is_dynamic =
+        csharp_is_dynamic_type_reference(&csharp_reference_type_text(type_node, source));
+    match node.kind() {
+        "parameter" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            if is_dynamic {
+                bindings.seed_symbol(csharp_node_text(name, source), ());
+            } else {
+                bindings.declare_shadow(csharp_node_text(name, source));
+            }
+        }
+        "variable_declaration" => {
+            let mut cursor = node.walk();
+            for declarator in node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "variable_declarator")
+            {
+                if !definitions.scope_step() {
+                    return;
+                }
+                let Some(name) = declarator.child_by_field_name("name") else {
+                    continue;
+                };
+                if is_dynamic {
+                    bindings.seed_symbol(csharp_node_text(name, source), ());
+                } else {
+                    bindings.declare_shadow(csharp_node_text(name, source));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn csharp_seed_type_active_path(
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
@@ -681,6 +1400,9 @@ fn csharp_seed_type_active_path(
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
+    if !definitions.scope_step() {
+        return;
+    }
     if node.start_byte() >= cutoff_start {
         return;
     }
@@ -731,6 +1453,9 @@ fn csharp_seed_type_binding(
     source: &str,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
+    if !definitions.scope_step() {
+        return;
+    }
     match node.kind() {
         "parameter" => {
             let Some(name) = node.child_by_field_name("name") else {
@@ -756,6 +1481,9 @@ fn csharp_seed_type_binding(
             let inferred = csharp_node_text(type_node, source) == "var";
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
+                if !definitions.scope_step() {
+                    return;
+                }
                 if child.kind() != "variable_declarator" {
                     continue;
                 }
@@ -835,7 +1563,13 @@ enum CSharpReferenceNode<'tree> {
     Identifier(Node<'tree>),
 }
 
-fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
+fn csharp_reference_node<'tree>(
+    node: Node<'tree>,
+    definitions: &CSharpDefinitionProvider<'_>,
+) -> Option<CSharpReferenceNode<'tree>> {
+    if !definitions.scope_step() {
+        return None;
+    }
     if let Some(name) = csharp_attribute_name_node(node) {
         return Some(CSharpReferenceNode::Attribute(name));
     }
@@ -843,6 +1577,9 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
     let original = node;
     let mut current = node;
     while let Some(parent) = current.parent() {
+        if !definitions.scope_step() {
+            return None;
+        }
         if (matches!(parent.kind(), "generic_name" | "qualified_name")
             && parent.start_byte() <= current.start_byte()
             && parent.end_byte() >= current.end_byte())
@@ -913,9 +1650,16 @@ fn csharp_is_unqualified_invocation_target(node: Node<'_>) -> bool {
     })
 }
 
-fn csharp_invocation_arity(node: Node<'_>, source: &str) -> Option<usize> {
+fn csharp_invocation_arity(
+    node: Node<'_>,
+    source: &str,
+    definitions: &CSharpDefinitionProvider<'_>,
+) -> Option<usize> {
     let mut current = node;
     while let Some(parent) = current.parent() {
+        if !definitions.scope_step() {
+            return None;
+        }
         if matches!(
             parent.kind(),
             "member_access_expression"
@@ -929,11 +1673,32 @@ fn csharp_invocation_arity(node: Node<'_>, source: &str) -> Option<usize> {
         if parent.kind() == "invocation_expression"
             && parent.child_by_field_name("function") == Some(current)
         {
-            return Some(csharp_argument_count(parent, source));
+            return Some(csharp_argument_count_in_session(
+                parent,
+                source,
+                definitions,
+            ));
         }
         break;
     }
     None
+}
+
+fn csharp_argument_count_in_session(
+    node: Node<'_>,
+    source: &str,
+    definitions: &CSharpDefinitionProvider<'_>,
+) -> usize {
+    if !definitions.scope_step() {
+        return 0;
+    }
+    let count = csharp_argument_count(node, source);
+    for _ in 0..count {
+        if !definitions.scope_step() {
+            return 0;
+        }
+    }
+    count
 }
 
 fn csharp_member_name_parts<'a>(
@@ -966,13 +1731,14 @@ fn resolve_csharp_constructor(
     // its owner type before the constructor-overload lookup below runs.
     if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
         analyzer,
+        definitions,
         file,
         &reference,
         type_node.start_byte(),
     ) {
         return candidates_outcome(vec![unit]);
     }
-    if csharp.using_aliases_of(file).contains_key(&reference) {
+    if definitions.using_aliases(file).contains_key(&reference) {
         return csharp_type_outcome(
             analyzer,
             csharp,
@@ -994,6 +1760,7 @@ fn resolve_csharp_constructor(
     constructors.dedup();
     let applicable = csharp_filter_candidates_by_arity(
         csharp,
+        definitions,
         &constructors,
         Some(csharp_argument_count(creation, source)),
     );
@@ -1036,9 +1803,13 @@ fn csharp_type_outcome(
     // dishonest using-boundary claim for a type indexed in the very same
     // file (#1105). Runs after the scope-blind resolvers so currently
     // resolving lookups are unaffected.
-    if let Some(unit) =
-        resolve_csharp_nested_type_in_enclosing_classes(analyzer, file, reference, byte)
-    {
+    if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
+        analyzer,
+        definitions,
+        file,
+        reference,
+        byte,
+    ) {
         return candidates_outcome(vec![unit]);
     }
     if csharp_import_boundary_for_type(csharp, definitions, file, reference) {
@@ -1060,8 +1831,7 @@ fn csharp_attribute_outcome(
     source: &str,
 ) -> DefinitionLookupOutcome {
     let names = csharp_attribute_type_names(name, source);
-    let (candidates, ambiguous_spelling) =
-        csharp.attribute_type_candidates_with_ambiguity(file, &names);
+    let (candidates, ambiguous_spelling) = definitions.attribute_type_candidates(file, &names);
     if !candidates.is_empty() {
         let mut outcome = candidates_outcome(candidates);
         if ambiguous_spelling {
@@ -1092,7 +1862,7 @@ fn csharp_attribute_outcome(
 }
 
 fn csharp_attribute_alias_boundary(
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: Node<'_>,
@@ -1109,8 +1879,8 @@ fn csharp_attribute_alias_boundary(
                 return false;
             };
             let alias = csharp_node_text(alias, source);
-            return csharp
-                .using_aliases_of(file)
+            return definitions
+                .using_aliases(file)
                 .get(alias)
                 .is_some_and(|target| {
                     !definitions.type_exists(target) && !definitions.package_exists(target)
@@ -1131,6 +1901,12 @@ fn csharp_member_outcome(
     explicit_generic_arity: Option<usize>,
     fallback_when_inapplicable: bool,
 ) -> DefinitionLookupOutcome {
+    if !definitions.scope_step() {
+        return no_definition(
+            "csharp_resolution_stopped",
+            "C# member resolution stopped before completion",
+        );
+    }
     if owners.is_empty() {
         return no_definition(
             "unsupported_csharp_receiver",
@@ -1139,40 +1915,39 @@ fn csharp_member_outcome(
     };
 
     let mut direct_candidates = Vec::new();
-    if let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) {
-        let mut seen_owner_fqns = HashSet::default();
-        for owner in &owners {
-            let mut parts = csharp.partial_type_parts(owner);
-            if parts.is_empty() {
-                parts.push(owner.clone());
-            }
-            for part in parts {
-                let owner_fqn = part.fq_name();
-                if seen_owner_fqns.insert(owner_fqn.clone()) {
-                    direct_candidates.extend(csharp_non_constructor_member_candidates(
-                        analyzer,
-                        definitions,
-                        &part,
-                        member,
-                    ));
-                }
-            }
+    let mut seen_owner_fqns = HashSet::default();
+    for owner in &owners {
+        if !definitions.scope_step() {
+            break;
         }
-    } else {
-        for owner in &owners {
-            direct_candidates.extend(csharp_non_constructor_member_candidates(
-                analyzer,
-                definitions,
-                owner,
-                member,
-            ));
+        let mut parts = definitions.partial_type_parts(owner);
+        if parts.is_empty() {
+            parts.push(owner.clone());
+        }
+        for part in parts {
+            if !definitions.scope_step() {
+                break;
+            }
+            let owner_fqn = part.fq_name();
+            if seen_owner_fqns.insert(owner_fqn.clone()) {
+                direct_candidates.extend(csharp_non_constructor_member_candidates(
+                    analyzer,
+                    definitions,
+                    &part,
+                    member,
+                ));
+            }
         }
     }
     sort_units(&mut direct_candidates);
     direct_candidates.dedup();
-    let direct_candidates =
-        csharp_filter_candidates_by_generic_arity(&direct_candidates, explicit_generic_arity);
-    let applicable = csharp_filter_candidates_by_arity(analyzer, &direct_candidates, arity);
+    let direct_candidates = csharp_filter_candidates_by_generic_arity(
+        definitions,
+        &direct_candidates,
+        explicit_generic_arity,
+    );
+    let applicable =
+        csharp_filter_candidates_by_arity(analyzer, definitions, &direct_candidates, arity);
     if !applicable.is_empty() {
         return candidates_outcome(applicable);
     }
@@ -1182,13 +1957,22 @@ fn csharp_member_outcome(
         let mut seen = HashSet::default();
         let mut level = Vec::new();
         for owner in owners {
+            if !definitions.scope_step() {
+                break;
+            }
             seen.insert(owner.clone());
-            level.extend(provider.get_direct_ancestors(&owner));
+            level.extend(definitions.direct_ancestors(provider, &owner));
         }
         while !level.is_empty() {
+            if !definitions.scope_step() {
+                break;
+            }
             let mut level_candidates = Vec::new();
             let mut next_level = Vec::new();
             for ancestor in level {
+                if !definitions.scope_step() {
+                    break;
+                }
                 if !seen.insert(ancestor.clone()) {
                     continue;
                 }
@@ -1198,15 +1982,17 @@ fn csharp_member_outcome(
                     &ancestor,
                     member,
                 ));
-                next_level.extend(provider.get_direct_ancestors(&ancestor));
+                next_level.extend(definitions.direct_ancestors(provider, &ancestor));
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
             let level_candidates = csharp_filter_candidates_by_generic_arity(
+                definitions,
                 &level_candidates,
                 explicit_generic_arity,
             );
-            let applicable = csharp_filter_candidates_by_arity(analyzer, &level_candidates, arity);
+            let applicable =
+                csharp_filter_candidates_by_arity(analyzer, definitions, &level_candidates, arity);
             if !applicable.is_empty() {
                 return candidates_outcome(applicable);
             }
@@ -1238,13 +2024,19 @@ fn csharp_non_constructor_member_candidates(
     owner: &CodeUnit,
     name: &str,
 ) -> Vec<CodeUnit> {
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
     let constructor_name = csharp_source_identifier(owner);
     definitions
         .members_for_owner_name(&owner.fq_name(), name)
         .into_iter()
         .filter(|candidate| {
-            analyzer
-                .parent_of(candidate)
+            if !definitions.scope_step() {
+                return false;
+            }
+            definitions
+                .parent_of(analyzer, candidate)
                 .is_some_and(|parent| parent.fq_name() == owner.fq_name())
                 && !(candidate.is_function() && candidate.identifier() == constructor_name)
         })
@@ -1328,6 +2120,7 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
 
 fn csharp_filter_candidates_by_arity(
     analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
     candidates: &[CodeUnit],
     arity: Option<usize>,
 ) -> Vec<CodeUnit> {
@@ -1337,10 +2130,15 @@ fn csharp_filter_candidates_by_arity(
     let applicable: Vec<_> = candidates
         .iter()
         .filter_map(|unit| {
+            if !definitions.scope_step() {
+                return None;
+            }
             if !unit.is_function() {
                 return None;
             }
-            let callable_arity = csharp_callable_arity(analyzer, unit);
+            let callable_arity = definitions
+                .query(|| csharp_callable_arity(analyzer, unit))
+                .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0));
             callable_arity
                 .accepts(expected)
                 .then(|| (unit.clone(), callable_arity))
@@ -1350,12 +2148,16 @@ fn csharp_filter_candidates_by_arity(
 }
 
 fn csharp_filter_candidates_by_generic_arity(
+    definitions: &CSharpDefinitionProvider<'_>,
     candidates: &[CodeUnit],
     explicit_generic_arity: Option<usize>,
 ) -> Vec<CodeUnit> {
     candidates
         .iter()
         .filter(|unit| {
+            if !definitions.scope_step() {
+                return false;
+            }
             explicit_generic_arity.is_none_or(|arity| {
                 unit.is_function() && csharp_method_generic_arity(unit.signature()) == arity
             })
@@ -1373,6 +2175,9 @@ fn csharp_receiver_type_units(
     root: Node<'_>,
     receiver: Node<'_>,
 ) -> Vec<CodeUnit> {
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
     match receiver.kind() {
         "identifier" => {
             let name = csharp_node_text(receiver, source);
@@ -1390,6 +2195,7 @@ fn csharp_receiver_type_units(
             if bindings.is_shadowed(name) {
                 let legacy = csharp_legacy_bindings_before_scoped(
                     csharp,
+                    definitions,
                     file,
                     source,
                     root,
@@ -1414,19 +2220,31 @@ fn csharp_receiver_type_units(
                 candidates
             }
         }
-        "this" => csharp_enclosing_class(analyzer, file, receiver.start_byte())
+        "this" => csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
             .into_iter()
             .collect(),
-        "base" => csharp_enclosing_class(analyzer, file, receiver.start_byte())
+        "base" => csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
             .and_then(|owner| csharp_usage_direct_base(analyzer, csharp, &owner))
             .into_iter()
             .collect(),
-        "qualified_name" | "generic_name" => csharp_logical_visible_type_candidates(
-            csharp,
-            definitions,
-            file,
-            &csharp_reference_type_text(receiver, source),
-        ),
+        "qualified_name" | "alias_qualified_name" | "generic_name" => {
+            csharp_logical_visible_type_candidates(
+                csharp,
+                definitions,
+                file,
+                &csharp_reference_type_text(receiver, source),
+            )
+        }
+        "predefined_type" => definitions
+            .query_optional(|| {
+                csharp_resolve_type_fq_name(
+                    csharp,
+                    file,
+                    &csharp_reference_type_text(receiver, source),
+                )
+            })
+            .map(|fqn| definitions.fqn(&fqn))
+            .unwrap_or_default(),
         "member_access_expression" | "conditional_access_expression" => {
             csharp_member_access_result_type_units(
                 analyzer,
@@ -1496,6 +2314,9 @@ fn csharp_member_access_result_type_units(
     root: Node<'_>,
     expression: Node<'_>,
 ) -> Vec<CodeUnit> {
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
     if let Some(access) = csharp_conditional_member_access(expression) {
         let owners = csharp_receiver_type_units(
             analyzer,
@@ -1522,6 +2343,9 @@ fn csharp_member_access_result_type_units(
     let mut layers = Vec::new();
     let mut base = expression;
     while base.kind() == "member_access_expression" {
+        if !definitions.scope_step() {
+            return Vec::new();
+        }
         let Some(receiver) = csharp_member_access_receiver(base) else {
             return Vec::new();
         };
@@ -1561,6 +2385,9 @@ fn csharp_member_access_result_type_units(
 
         let mut type_prefix = None;
         for (index, (receiver, _)) in layers.iter().enumerate() {
+            if !definitions.scope_step() {
+                return Vec::new();
+            }
             let type_name = csharp_reference_type_text(*receiver, source);
             let candidates =
                 csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
@@ -1579,6 +2406,9 @@ fn csharp_member_access_result_type_units(
     };
 
     for index in (0..=first_member).rev() {
+        if !definitions.scope_step() {
+            return Vec::new();
+        }
         let name = csharp_node_text(layers[index].1, source);
         let member_types =
             csharp_nearest_member_type_units(analyzer, csharp, definitions, file, owners, name);
@@ -1601,13 +2431,22 @@ fn csharp_nearest_member_type_units(
     let provider = analyzer.type_hierarchy_provider();
     let mut result = Vec::new();
     for owner in owners {
+        if !definitions.scope_step() {
+            return Vec::new();
+        }
         let mut seen = HashSet::default();
         let mut level = vec![owner];
         while !level.is_empty() {
+            if !definitions.scope_step() {
+                return Vec::new();
+            }
             let mut level_types = Vec::new();
             let mut level_declares_member = false;
             let mut next_level = Vec::new();
             for current in level {
+                if !definitions.scope_step() {
+                    return Vec::new();
+                }
                 if !seen.insert(current.clone()) {
                     continue;
                 }
@@ -1623,7 +2462,7 @@ fn csharp_nearest_member_type_units(
                     &mut level_types,
                 );
                 if let Some(provider) = provider {
-                    next_level.extend(provider.get_direct_ancestors(&current));
+                    next_level.extend(definitions.direct_ancestors(provider, &current));
                 }
             }
             if level_declares_member {
@@ -1662,6 +2501,9 @@ fn csharp_invocation_return_type_units(
     root: Node<'_>,
     invocation: Node<'_>,
 ) -> Vec<CodeUnit> {
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
     let Some(function) = invocation.child_by_field_name("function") else {
         return Vec::new();
     };
@@ -1716,7 +2558,7 @@ fn csharp_invocation_return_type_units(
         }
         // `Method()` — an unqualified call resolves against the enclosing class.
         "identifier" => {
-            let owners = csharp_enclosing_class(analyzer, file, function.start_byte())
+            let owners = csharp_enclosing_class(analyzer, definitions, file, function.start_byte())
                 .into_iter()
                 .collect();
             CSharpInvocationCallee {
@@ -1738,7 +2580,7 @@ fn csharp_invocation_return_type_units(
                 source,
                 name.type_arguments,
             );
-            let owners = csharp_enclosing_class(analyzer, file, function.start_byte())
+            let owners = csharp_enclosing_class(analyzer, definitions, file, function.start_byte())
                 .into_iter()
                 .collect();
             CSharpInvocationCallee {
@@ -1764,17 +2606,33 @@ fn csharp_invocation_return_type_units(
 
     let receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
     let mut return_type_units = Vec::new();
-    let value_arity = csharp_argument_count(invocation, source);
+    let value_arity = csharp_argument_count_in_session(invocation, source, definitions);
     for owner in &owners {
-        if let Some(type_fqn) = csharp_method_return_type_fq_name_for_arity(
-            csharp,
-            file,
-            owner,
-            method,
-            Some(value_arity),
-            explicit_generic_arity,
-            explicit_type_arguments.as_deref(),
-        ) {
+        if !definitions.scope_step() {
+            return Vec::new();
+        }
+        let type_fqn = match definitions.session() {
+            Some(session) => csharp_method_return_type_fq_name_for_arity_in_session(
+                csharp,
+                file,
+                &owner,
+                method,
+                Some(value_arity),
+                explicit_generic_arity,
+                explicit_type_arguments.as_deref(),
+                session,
+            ),
+            None => csharp_method_return_type_fq_name_for_arity(
+                csharp,
+                file,
+                &owner,
+                method,
+                Some(value_arity),
+                explicit_generic_arity,
+                explicit_type_arguments.as_deref(),
+            ),
+        };
+        if let Some(type_fqn) = type_fqn {
             return_type_units.extend(definitions.fqn(&type_fqn));
         }
     }
@@ -1785,20 +2643,37 @@ fn csharp_invocation_return_type_units(
     // the shared extension matcher + return-type derivation — no duplicated typing.
     if return_type_units.is_empty()
         && let Some(site) = extension_site
-        && let Some(type_fqn) = csharp_extension_invocation_return_type_fq_name(
-            csharp,
-            analyzer,
-            source,
-            site,
-            &receiver_type_names,
-            method,
-            Some(value_arity),
-            explicit_generic_arity,
-            explicit_type_arguments.as_deref(),
-            false,
-        )
     {
-        return_type_units.extend(definitions.fqn(&type_fqn));
+        let type_fqn = match definitions.session() {
+            Some(session) => csharp_extension_invocation_return_type_fq_name_in_session(
+                csharp,
+                analyzer,
+                source,
+                site,
+                &receiver_type_names,
+                method,
+                Some(value_arity),
+                explicit_generic_arity,
+                explicit_type_arguments.as_deref(),
+                false,
+                session,
+            ),
+            None => csharp_extension_invocation_return_type_fq_name(
+                csharp,
+                analyzer,
+                source,
+                site,
+                &receiver_type_names,
+                method,
+                Some(value_arity),
+                explicit_generic_arity,
+                explicit_type_arguments.as_deref(),
+                false,
+            ),
+        };
+        if let Some(type_fqn) = type_fqn {
+            return_type_units.extend(definitions.fqn(&type_fqn));
+        }
     }
     sort_units(&mut return_type_units);
     return_type_units.dedup();
@@ -1817,6 +2692,9 @@ fn csharp_resolved_type_arguments(
     type_arguments
         .named_children(&mut cursor)
         .map(|argument| {
+            if !definitions.scope_step() {
+                return None;
+            }
             let reference = csharp_reference_type_text(argument, source);
             let mut candidates =
                 csharp_logical_visible_type_candidates(csharp, definitions, file, &reference);
@@ -1833,13 +2711,25 @@ fn csharp_enclosing_member_type_units(
     receiver: Node<'_>,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let Some(owner) = csharp_enclosing_class(analyzer, file, receiver.start_byte()) else {
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
+    let Some(owner) = csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
+    else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
     csharp_collect_member_type_units(csharp, definitions, file, &owner, name, &mut candidates);
     if let Some(provider) = analyzer.type_hierarchy_provider() {
-        for ancestor in provider.get_ancestors(&owner) {
+        let mut seen = HashSet::default();
+        let mut stack = definitions.direct_ancestors(provider, &owner);
+        while let Some(ancestor) = stack.pop() {
+            if !definitions.scope_step() {
+                return Vec::new();
+            }
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
             csharp_collect_member_type_units(
                 csharp,
                 definitions,
@@ -1848,6 +2738,7 @@ fn csharp_enclosing_member_type_units(
                 name,
                 &mut candidates,
             );
+            stack.extend(definitions.direct_ancestors(provider, &ancestor));
         }
     }
     sort_units(&mut candidates);
@@ -1863,7 +2754,16 @@ fn csharp_collect_member_type_units(
     name: &str,
     candidates: &mut Vec<CodeUnit>,
 ) {
-    if let Some(type_fqn) = csharp_member_declared_type_fq_name(csharp, file, owner, name) {
+    if !definitions.scope_step() {
+        return;
+    }
+    let type_fqn = match definitions.session() {
+        Some(session) => {
+            csharp_member_declared_type_fq_name_in_session(csharp, file, owner, name, session)
+        }
+        None => csharp_member_declared_type_fq_name(csharp, file, owner, name),
+    };
+    if let Some(type_fqn) = type_fqn {
         candidates.extend(definitions.fqn(&type_fqn));
     }
 }
@@ -1892,20 +2792,34 @@ fn csharp_logical_visible_type_candidates(
 }
 
 fn csharp_visible_type_candidates(
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let _ = definitions;
-    csharp.visible_type_candidates(file, name)
+    definitions.visible_type_candidates(file, name)
 }
 
 fn csharp_enclosing_class(
     analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
+    if definitions.session().is_some() {
+        let range = Range {
+            start_byte: byte,
+            end_byte: byte.saturating_add(1),
+            start_line: 0,
+            end_line: 0,
+        };
+        let mut current =
+            definitions.query_optional(|| analyzer.enclosing_code_unit(file, &range))?;
+        while !current.is_class() {
+            current = definitions.parent_of(analyzer, &current)?;
+        }
+        return Some(current);
+    }
     if let Some(unit) = ClassRangeIndex::build(analyzer, file).enclosing_unit(byte) {
         return Some(unit.clone());
     }
@@ -1925,8 +2839,9 @@ fn csharp_enclosing_class(
     }
 }
 
-fn resolve_csharp_nested_type_in_enclosing_classes(
+fn resolve_csharp_in_enclosing_scopes(
     analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: &str,
     byte: usize,
@@ -1934,13 +2849,58 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
     if name.is_empty() || name.contains('.') {
         return None;
     }
-    let mut enclosing = csharp_enclosing_class(analyzer, file, byte)?;
+    let range = Range {
+        start_byte: byte,
+        end_byte: byte.saturating_add(1),
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut scope = definitions
+        .query_optional(|| analyzer.enclosing_code_unit(file, &range))?
+        .fq_name();
     loop {
-        let child_fqn = format!("{}.{}", enclosing.fq_name(), name);
-        if let Some(child) = analyzer.definitions(&child_fqn).find(CodeUnit::is_class) {
+        if scope.is_empty() || !definitions.scope_step() {
+            return None;
+        }
+        let child_fqn = format!("{scope}.{name}");
+        if let Some(child) = definitions
+            .fqn(&child_fqn)
+            .into_iter()
+            .find(CodeUnit::is_class)
+        {
             return Some(child);
         }
-        let parent = analyzer.parent_of(&enclosing)?;
+        match scope.rfind('.') {
+            Some(index) => scope.truncate(index),
+            None => return None,
+        }
+    }
+}
+
+fn resolve_csharp_nested_type_in_enclosing_classes(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let mut enclosing = csharp_enclosing_class(analyzer, definitions, file, byte)?;
+    loop {
+        if !definitions.scope_step() {
+            return None;
+        }
+        let child_fqn = format!("{}.{}", enclosing.fq_name(), name);
+        if let Some(child) = definitions
+            .query_rows(|| analyzer.definitions(&child_fqn).collect())
+            .into_iter()
+            .find(CodeUnit::is_class)
+        {
+            return Some(child);
+        }
+        let parent = definitions.parent_of(analyzer, &enclosing)?;
         if !parent.is_class() {
             return None;
         }
@@ -1958,8 +2918,8 @@ fn csharp_import_boundary_for_type(
         return true;
     }
     let simple = reference.rsplit('.').next().unwrap_or(reference);
-    csharp
-        .using_namespaces_of(file)
+    definitions
+        .using_namespaces(file)
         .into_iter()
         .any(|namespace| {
             !definitions.package_exists(&namespace)
@@ -1968,23 +2928,23 @@ fn csharp_import_boundary_for_type(
 }
 
 fn csharp_alias_using_boundary_for_type(
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     reference: &str,
 ) -> bool {
-    csharp
-        .using_aliases_of(file)
+    definitions
+        .using_aliases(file)
         .get(reference)
         .is_some_and(|target| !definitions.type_exists(target))
 }
 
 fn csharp_static_using_boundary_for_member(
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
 ) -> bool {
-    csharp.import_statements(file).iter().any(|raw| {
+    definitions.import_statements(file).iter().any(|raw| {
         raw.trim()
             .trim_start_matches("global ")
             .trim_start_matches("using ")
@@ -2012,45 +2972,83 @@ const CSHARP_SCOPE_NODES: &[&str] = &[
 
 fn csharp_legacy_bindings_before_scoped(
     csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<String> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    csharp_seed_legacy_active_path(root, cutoff_start, csharp, file, source, &mut bindings);
+    csharp_seed_legacy_active_path(
+        root,
+        cutoff_start,
+        csharp,
+        definitions,
+        file,
+        source,
+        &mut bindings,
+    );
     bindings
 }
 
 fn csharp_seed_legacy_active_path(
-    node: Node<'_>,
+    root: Node<'_>,
     cutoff_start: usize,
     csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if node.start_byte() >= cutoff_start {
-        return;
-    }
-    let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
-    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
-        return;
-    }
-    if enters_scope {
-        bindings.enter_scope();
-    }
-    if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
-        && node.end_byte() <= cutoff_start
-    {
-        seed_csharp_bindings_before(node, cutoff_start, csharp, file, source, bindings);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= cutoff_start {
-            break;
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, next_child)) = stack.pop() {
+        if next_child == 0 {
+            if node.start_byte() >= cutoff_start || !definitions.scope_step() {
+                continue;
+            }
+            let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
+            if enters_scope
+                && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte())
+            {
+                continue;
+            }
+            if enters_scope {
+                bindings.enter_scope();
+            }
+            if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
+                && node.end_byte() <= cutoff_start
+            {
+                match definitions.session() {
+                    Some(session) => seed_csharp_bindings_before_in_session(
+                        node,
+                        cutoff_start,
+                        csharp,
+                        file,
+                        source,
+                        bindings,
+                        session,
+                    ),
+                    None => {
+                        seed_csharp_bindings_before(
+                            node,
+                            cutoff_start,
+                            csharp,
+                            file,
+                            source,
+                            bindings,
+                        );
+                    }
+                }
+            }
         }
-        csharp_seed_legacy_active_path(child, cutoff_start, csharp, file, source, bindings);
+        let Some(child) = node.named_child(next_child) else {
+            continue;
+        };
+        if child.start_byte() >= cutoff_start {
+            continue;
+        }
+        stack.push((node, next_child + 1));
+        stack.push((child, 0));
     }
 }
 
@@ -2059,4 +3057,279 @@ fn csharp_is_local_variable_declaration(node: Node<'_>) -> bool {
         && node
             .parent()
             .is_none_or(|parent| parent.kind() != "field_declaration")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use crate::analyzer::{Language, Range};
+    use crate::path_utils::rel_path_string;
+    use crate::test_support::AnalyzerFixture;
+
+    fn member_fixture() -> (
+        AnalyzerFixture,
+        ProjectFile,
+        String,
+        Tree,
+        ResolvedReferenceSite,
+    ) {
+        let source = r#"
+namespace Demo;
+public class Product { public void Work() {} }
+public class Consumer
+{
+    public void Run(Product product) { product.Work(); }
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[("BoundedDefinition.cs", &source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "BoundedDefinition.cs");
+        let tree = parse_csharp_tree(&source).expect("C# tree");
+        let call_start = source.rfind("product.Work()").expect("member call");
+        let start_byte = call_start + "product.".len();
+        let end_byte = start_byte + "Work".len();
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "Work".to_string(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line: 6,
+                end_line: 6,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+        };
+        (fixture, file, source, tree, site)
+    }
+
+    #[test]
+    fn bounded_definition_lookup_completes_with_accounted_work() {
+        let (fixture, file, source, tree, site) = member_fixture();
+        let outcome = resolve_csharp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        let BoundedResolution::Complete { value, work } = outcome else {
+            panic!("member lookup should complete");
+        };
+        assert!(work.scope_nodes > 0);
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved);
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|unit| { unit.fq_name() == "Demo.Product.Work" })
+        );
+    }
+
+    #[test]
+    fn bounded_definition_lookup_stops_at_scope_budget() {
+        let (fixture, file, source, tree, site) = member_fixture();
+        let budget = ReceiverAnalysisBudget::tiny();
+        let outcome = resolve_csharp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            budget,
+            None,
+        );
+
+        assert!(matches!(
+            outcome,
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+    }
+
+    #[test]
+    fn bounded_member_lookup_caps_overload_materialization() {
+        let source = r#"
+namespace Demo;
+public class Product
+{
+    public void Work() {}
+    public void Work(int first) {}
+    public void Work(int first, int second) {}
+    public void Work(string first) {}
+    public void Work(string first, string second) {}
+    public void Work(long first) {}
+    public void Work(double first) {}
+    public void Work(decimal first) {}
+}
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::CSharp, &[("BoundedOverloads.cs", source)]);
+        let csharp =
+            resolve_analyzer::<CSharpAnalyzer>(fixture.analyzer.analyzer()).expect("C# analyzer");
+        assert!(
+            csharp
+                .member_candidates_for_owner("Demo.Product", "Work")
+                .len()
+                > 3,
+            "fixture must contain more overloads than the bounded lookahead"
+        );
+
+        let provider_batch =
+            csharp.member_candidates_for_owner_limited("Demo.Product", "Work", 3, || true);
+        assert!(!provider_batch.complete);
+        assert_eq!(provider_batch.inspected, 3);
+        assert!(provider_batch.rows.is_empty());
+
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 3,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded(budget, None);
+        let definitions = CSharpDefinitionProvider::bounded(csharp, &session);
+        assert!(
+            definitions
+                .members_for_owner_name("Demo.Product", "Work")
+                .is_empty()
+        );
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+    }
+
+    #[test]
+    fn bounded_global_using_scan_stops_cold_without_hydration() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[
+                (
+                    "GlobalA.cs",
+                    "global using Alpha.One; namespace Demo; public class A {}",
+                ),
+                (
+                    "GlobalB.cs",
+                    "global using Beta.Two; namespace Demo; public class B {}",
+                ),
+                (
+                    "GlobalC.cs",
+                    "global using Gamma.Three; namespace Demo; public class C {}",
+                ),
+                (
+                    "GlobalD.cs",
+                    "global using Delta.Four; namespace Demo; public class D {}",
+                ),
+            ],
+        );
+        let csharp =
+            resolve_analyzer::<CSharpAnalyzer>(fixture.analyzer.analyzer()).expect("C# analyzer");
+        csharp.reset_full_hydration_count_for_test();
+
+        let direct = csharp.global_using_namespaces_limited(3, || true);
+        assert!(!direct.complete);
+        assert_eq!(direct.inspected, 3);
+        assert_eq!(csharp.full_hydration_count_for_test(), 0);
+
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 4,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded(budget, None);
+        let definitions = CSharpDefinitionProvider::bounded(csharp, &session);
+        let file = ProjectFile::new(fixture.project_root(), "GlobalA.cs");
+        assert!(definitions.using_namespaces(&file).is_empty());
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+        assert_eq!(csharp.full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn bounded_attribute_evidence_rejects_unresolved_ancestry_as_incomplete() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[(
+                "Attributes.cs",
+                r#"
+namespace System { public class Attribute {} }
+namespace Demo
+{
+    public class ProvenAttribute : System.Attribute {}
+    public class UnknownAttribute : External.AttributeBase {}
+}
+"#,
+            )],
+        );
+        let csharp =
+            resolve_analyzer::<CSharpAnalyzer>(fixture.analyzer.analyzer()).expect("C# analyzer");
+        let proven = csharp
+            .declaration_candidates_by_fqn("Demo.ProvenAttribute", false)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("proven attribute");
+        let unknown = csharp
+            .declaration_candidates_by_fqn("Demo.UnknownAttribute", false)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("unknown attribute");
+
+        let proven_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let proven_definitions = CSharpDefinitionProvider::bounded(csharp, &proven_session);
+        assert_eq!(
+            proven_definitions.attribute_class_is_applicable(&proven),
+            Some(true)
+        );
+        assert!(matches!(
+            proven_session.finish(()),
+            BoundedResolution::Complete { .. }
+        ));
+
+        let unknown_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let unknown_definitions = CSharpDefinitionProvider::bounded(csharp, &unknown_session);
+        assert_eq!(
+            unknown_definitions.attribute_class_is_applicable(&unknown),
+            None
+        );
+        assert!(matches!(
+            unknown_session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_definition_lookup_stops_on_cancellation() {
+        let (fixture, file, source, tree, site) = member_fixture();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let outcome = resolve_csharp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+
+        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
 }

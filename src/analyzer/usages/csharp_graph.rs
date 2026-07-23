@@ -10,18 +10,23 @@ pub(in crate::analyzer::usages) use extractor::{
 pub(in crate::analyzer::usages) use resolver::{
     argument_count as csharp_argument_count,
     extension_invocation_return_type_fq_name as csharp_extension_invocation_return_type_fq_name,
+    extension_invocation_return_type_fq_name_in_session as csharp_extension_invocation_return_type_fq_name_in_session,
     first_type_child as csharp_first_type_child,
     is_type_reference_node as csharp_is_type_reference_node,
     member_declared_type_fq_name as csharp_member_declared_type_fq_name,
+    member_declared_type_fq_name_in_session as csharp_member_declared_type_fq_name_in_session,
     method_return_type_fq_name_for_arity as csharp_method_return_type_fq_name_for_arity,
+    method_return_type_fq_name_for_arity_in_session as csharp_method_return_type_fq_name_for_arity_in_session,
     node_text as csharp_node_text, object_created_type as csharp_object_created_type,
     object_initializer_for_label as csharp_object_initializer_for_label,
     object_initializer_owner_type_node as csharp_object_initializer_owner_type_node,
     reference_type_text as csharp_reference_type_text,
     resolve_type_fq_name as csharp_resolve_type_fq_name,
     seed_bindings_before as seed_csharp_bindings_before,
+    seed_bindings_before_in_session as seed_csharp_bindings_before_in_session,
     usage_direct_base as csharp_usage_direct_base,
     visible_extension_method_candidates as csharp_visible_extension_method_candidates,
+    visible_extension_method_candidates_in_session as csharp_visible_extension_method_candidates_in_session,
 };
 
 use crate::analyzer::usages::common::language_for_target;

@@ -34,6 +34,7 @@ pub(crate) mod php_graph;
 pub(crate) mod python_graph;
 pub(crate) mod receiver_analysis;
 pub(crate) mod receiver_query;
+pub(crate) mod receiver_sites;
 mod reexport_seeds;
 pub(crate) mod reference_site;
 pub(crate) mod ruby_graph;

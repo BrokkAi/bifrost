@@ -8,8 +8,13 @@ use super::super::ir::{
     ProcedureHandle, ProgramPointHandle, SemanticArtifact, SemanticEffect, SemanticValueKind,
     ValueHandle,
 };
+use super::call::{CallBinding, CallBindings};
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
+use super::relation::{OracleRelationHandle, validate_retained_relation_arenas};
+use super::value_flow::{
+    ValueFlowEndpoint, ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
+};
 
 /// How many concrete runtime objects one abstract object may denote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,6 +56,23 @@ impl OracleCallContext {
 
     pub fn calls(&self) -> &[CallSiteHandle] {
         &self.calls
+    }
+
+    /// Extend this context with one call while retaining only the configured
+    /// recent-call suffix. Prior truncation remains observable even when the
+    /// already-retained suffix is shorter than the current limit.
+    pub fn extended(&self, call: CallSiteHandle, limits: OracleLimits) -> Self {
+        let mut calls = self.calls.to_vec();
+        calls.push(call);
+        let retained = limits.call_context_depth();
+        let truncated = self.truncated || calls.len() > retained;
+        if calls.len() > retained {
+            calls.drain(..calls.len() - retained);
+        }
+        Self {
+            calls: calls.into_boxed_slice(),
+            truncated,
+        }
     }
 
     pub const fn was_truncated(&self) -> bool {
@@ -257,6 +279,167 @@ impl Hash for ScopedSemanticLocator {
     }
 }
 
+/// Caller-local identity for the value produced by one resolved call arm.
+///
+/// Callee allocations and temporary values remain procedure-local. This
+/// handle instead retains the validated dispatch, call-binding, and
+/// normal-return-flow facts that justify projecting the result into the
+/// caller. Relation handles are audit material rather than identity: repeated
+/// materializations of the same call arm compare equal even though each query
+/// owns fresh relation arenas.
+#[derive(Debug, Clone)]
+pub struct CallResultHandle {
+    call: CallSiteHandle,
+    result: ValueHandle,
+    callee: ProcedureHandle,
+    caller_context: OracleCallContext,
+    callee_context: OracleCallContext,
+    dispatch_provenance: Box<[OracleRelationHandle]>,
+    binding_relation: OracleRelationHandle,
+    return_relations: Box<[ValueFlowRelation]>,
+}
+
+impl CallResultHandle {
+    pub(crate) fn new(
+        bindings: &CallBindings,
+        flow: &ValueFlowSnapshot,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError> {
+        bindings.candidate().validate_for_call(bindings.call())?;
+        let (binding_relation, formal, result) = bindings
+            .bindings()
+            .iter()
+            .find_map(|binding| match binding {
+                CallBinding::NormalReturn {
+                    relation,
+                    formal,
+                    result,
+                } => Some((relation.clone(), formal, result.clone())),
+                CallBinding::Receiver { .. }
+                | CallBinding::ArgumentGroup(_)
+                | CallBinding::ImplicitArgument { .. }
+                | CallBinding::ExceptionalReturn { .. } => None,
+            })
+            .ok_or(OracleContractError::InvalidAccessRoot(
+                "call-result roots require a validated normal-return binding",
+            ))?;
+
+        let call = bindings.call().clone();
+        let callee = bindings.callee().clone();
+        let callee_context = bindings.context().extended(call.clone(), limits);
+        if flow.procedure() != &callee || flow.context() != &callee_context {
+            return Err(OracleContractError::InvalidAccessRoot(
+                "call-result return flow must belong to the bound callee and context",
+            ));
+        }
+        let return_relations = flow
+            .relations()
+            .iter()
+            .filter(|relation| {
+                relation.kind == ValueFlowRelationKind::NormalReturn
+                    && matches!(&relation.source, ValueFlowEndpoint::Value(_))
+                    && matches!(&relation.target, ValueFlowEndpoint::Port(port) if port == formal)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if return_relations.is_empty() {
+            return Err(OracleContractError::InvalidAccessRoot(
+                "call-result roots require a validated callee normal-return flow",
+            ));
+        }
+
+        validate_retained_relation_arenas(
+            bindings
+                .candidate()
+                .provenance()
+                .iter()
+                .chain(std::iter::once(&binding_relation))
+                .chain(return_relations.iter().map(|relation| &relation.id)),
+            limits,
+        )?;
+        Ok(Self {
+            call,
+            result,
+            callee,
+            caller_context: bindings.context().clone(),
+            callee_context,
+            dispatch_provenance: bindings.candidate().provenance().into(),
+            binding_relation,
+            return_relations: return_relations.into_boxed_slice(),
+        })
+    }
+
+    pub fn call(&self) -> &CallSiteHandle {
+        &self.call
+    }
+
+    pub fn result(&self) -> &ValueHandle {
+        &self.result
+    }
+
+    pub fn callee(&self) -> &ProcedureHandle {
+        &self.callee
+    }
+
+    pub fn caller_context(&self) -> &OracleCallContext {
+        &self.caller_context
+    }
+
+    pub fn callee_context(&self) -> &OracleCallContext {
+        &self.callee_context
+    }
+
+    pub fn dispatch_provenance(&self) -> &[OracleRelationHandle] {
+        &self.dispatch_provenance
+    }
+
+    pub fn binding_relation(&self) -> &OracleRelationHandle {
+        &self.binding_relation
+    }
+
+    pub fn return_relations(&self) -> &[ValueFlowRelation] {
+        &self.return_relations
+    }
+
+    fn validate_shape(&self) -> Result<(), OracleContractError> {
+        require_same_procedure(self.call.procedure(), self.result.procedure())?;
+        let call = self
+            .call
+            .procedure()
+            .semantics()
+            .call_site(self.call.id())
+            .expect("call-site handles are validated at construction");
+        if call.result != Some(self.result.id()) {
+            return Err(OracleContractError::InvalidAccessRoot(
+                "call-result root does not name the call's normal result",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for CallResultHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.call == other.call
+            && self.result == other.result
+            && self.callee == other.callee
+            && self.caller_context == other.caller_context
+            && self.callee_context == other.callee_context
+    }
+}
+
+impl Eq for CallResultHandle {}
+
+impl Hash for CallResultHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.call.hash(state);
+        self.result.hash(state);
+        self.callee.hash(state);
+        self.caller_context.hash(state);
+        self.callee_context.hash(state);
+    }
+}
+
 /// A value observed at one precise point and bounded call context.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueAtPoint {
@@ -304,6 +487,7 @@ impl ValueAtPoint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AccessPathRoot {
     Value(ValueHandle),
+    CallResult(CallResultHandle),
     ProcedurePort(ProcedurePortHandle),
     Allocation(AllocationHandle),
     Static(ScopedSemanticLocator),
@@ -318,6 +502,7 @@ impl AccessPathRoot {
     fn scoped_procedure(&self) -> Option<&ProcedureHandle> {
         match self {
             Self::Value(value) => Some(value.procedure()),
+            Self::CallResult(result) => Some(result.result().procedure()),
             Self::ProcedurePort(port) | Self::CaptureSlot(port) => Some(port.procedure()),
             Self::Allocation(allocation) => Some(allocation.procedure()),
             Self::LexicalCell(location) => Some(location.procedure()),
@@ -329,6 +514,7 @@ impl AccessPathRoot {
 
     fn validate_shape(&self) -> Result<(), OracleContractError> {
         match self {
+            Self::CallResult(result) => result.validate_shape()?,
             Self::ProcedurePort(port)
                 if matches!(port.kind(), ProcedurePortKind::Capture { .. }) =>
             {
@@ -375,6 +561,10 @@ impl AccessPathRoot {
     fn validate_at(&self, procedure: &ProcedureHandle) -> Result<(), OracleContractError> {
         match self {
             Self::Value(value) => require_same_procedure(value.procedure(), procedure),
+            Self::CallResult(result) => {
+                result.validate_shape()?;
+                require_same_procedure(result.result().procedure(), procedure)
+            }
             Self::Allocation(allocation) => {
                 require_same_procedure(allocation.procedure(), procedure)
             }
@@ -517,6 +707,7 @@ impl AccessPath {
             | AccessPathRoot::ModuleObject(locator)
             | AccessPathRoot::External(locator) => locator.validate_at(procedure)?,
             AccessPathRoot::Value(_)
+            | AccessPathRoot::CallResult(_)
             | AccessPathRoot::ProcedurePort(_)
             | AccessPathRoot::Allocation(_)
             | AccessPathRoot::LexicalCell(_)
@@ -874,6 +1065,7 @@ fn access_path_matches_memory_location(
 fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool {
     match root {
         AccessPathRoot::Value(actual) => actual == value,
+        AccessPathRoot::CallResult(result) => result.result() == value,
         AccessPathRoot::ProcedurePort(port) => {
             require_same_procedure(port.procedure(), value.procedure()).is_ok()
                 && match port.kind() {

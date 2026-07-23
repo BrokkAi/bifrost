@@ -95,8 +95,8 @@ pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use model::{
     CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
-    CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
-    ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
+    CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
+    ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
     MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
     Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
     StructuredImportPathKind, StructuredImportScope, SummaryFileProjection, TestAssertionSmell,

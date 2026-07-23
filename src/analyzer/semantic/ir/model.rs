@@ -6,6 +6,7 @@ use super::super::ids::{
     ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId, ValueId,
 };
 use super::super::provider::SemanticBudgetExceeded;
+pub use crate::analyzer::DispatchExtensibility;
 
 /// A stable category for one validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -175,27 +176,6 @@ impl ProcedureInvocationKind {
         match self {
             Self::Immediate => "immediate",
             Self::Deferred => "deferred",
-        }
-    }
-}
-
-/// Orthogonal properties that should not be encoded in [`ProcedureKind`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DispatchExtensibility {
-    /// Additional runtime targets may exist unless a dispatch oracle proves
-    /// closure through stronger language-specific evidence.
-    #[default]
-    Open,
-    /// The declaration itself proves that invocation cannot select an
-    /// overriding implementation.
-    Closed,
-}
-
-impl DispatchExtensibility {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Closed => "closed",
         }
     }
 }

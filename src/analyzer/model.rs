@@ -251,6 +251,28 @@ pub(crate) enum CallableLinkage {
     Internal,
 }
 
+/// Whether one callable declaration proves that runtime dispatch is closed.
+///
+/// Signature metadata carries this declaration-side fact so bounded query
+/// layers can reason about dispatch without reparsing or rematerializing the
+/// target file. Languages that have not published the fact leave it absent,
+/// which callers must treat conservatively.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DispatchExtensibility {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl DispatchExtensibility {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SignatureMetadata {
     label: String,
@@ -267,6 +289,8 @@ pub struct SignatureMetadata {
     bare_return_type_parameter: Option<String>,
     #[serde(default)]
     callable_linkage: Option<CallableLinkage>,
+    #[serde(default)]
+    dispatch_extensibility: Option<DispatchExtensibility>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -330,6 +354,7 @@ impl SignatureMetadata {
             type_parameters: Vec::new(),
             bare_return_type_parameter: None,
             callable_linkage: None,
+            dispatch_extensibility: None,
         }
     }
 
@@ -370,6 +395,7 @@ impl SignatureMetadata {
             type_parameters: Vec::new(),
             bare_return_type_parameter: None,
             callable_linkage: None,
+            dispatch_extensibility: None,
         }
     }
 
@@ -412,6 +438,14 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_dispatch_extensibility(
+        mut self,
+        dispatch_extensibility: DispatchExtensibility,
+    ) -> Self {
+        self.dispatch_extensibility = Some(dispatch_extensibility);
+        self
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -442,6 +476,10 @@ impl SignatureMetadata {
 
     pub(crate) fn callable_linkage(&self) -> Option<CallableLinkage> {
         self.callable_linkage
+    }
+
+    pub const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
+        self.dispatch_extensibility
     }
 }
 

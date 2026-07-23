@@ -1,7 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
+    CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
+    SignatureMetadata, csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
     csharp_type_node_identity, csharp_type_reference_root,
 };
 use crate::hash::HashSet;
@@ -328,8 +328,11 @@ impl<'a> CSharpVisitor<'a> {
             Some(parent.clone()),
             None,
         );
-        self.parsed
-            .add_signature(code_unit, csharp_property_signature(node, self.source));
+        let signature = csharp_property_signature(node, self.source);
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            csharp_dispatch_signature_metadata(signature, node, self.source),
+        );
     }
 
     fn visit_field_declaration(&mut self, node: Node<'_>, scope: &CSharpScope) {
@@ -375,9 +378,12 @@ impl<'a> CSharpVisitor<'a> {
                 Some(parent.clone()),
                 None,
             );
-            self.parsed.add_signature(
+            let signature =
+                csharp_field_signature(&prefix, &type_text, &declaration_text, child, self.source);
+            self.parsed.add_signature_with_metadata(
                 code_unit,
-                csharp_field_signature(&prefix, &type_text, &declaration_text, child, self.source),
+                SignatureMetadata::new(signature, Vec::new())
+                    .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
         }
     }
@@ -406,9 +412,11 @@ impl<'a> CSharpVisitor<'a> {
             Some(parent.clone()),
             None,
         );
-        self.parsed.add_signature(
+        let signature = normalize_cs_whitespace(cs_node_text(node, self.source));
+        self.parsed.add_signature_with_metadata(
             code_unit,
-            normalize_cs_whitespace(cs_node_text(node, self.source)),
+            SignatureMetadata::new(signature, Vec::new())
+                .with_dispatch_extensibility(DispatchExtensibility::Closed),
         );
     }
 }
@@ -532,6 +540,20 @@ fn csharp_constructor_skeleton(node: Node<'_>, source: &str) -> String {
     csharp_method_skeleton(node, source)
 }
 
+fn csharp_dispatch_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+) -> SignatureMetadata {
+    SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(
+        super::csharp_callable_dispatch_extensibility(
+            source,
+            node,
+            super::csharp_has_modifier(source, node, "static"),
+        ),
+    )
+}
+
 fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
     let callable_arity = csharp_callable_arity(node);
     let type_parameters = csharp_method_type_parameters(node, source);
@@ -539,35 +561,41 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
     let bare_return_type_parameter =
         csharp_bare_return_type_parameter(node, source, &type_parameters);
     let parameter_text = csharp_rendered_parameter_text(node, source);
-    let Some(parameters_start) = signature.find(&parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new())
+    let metadata = if let Some(parameters_start) = signature.find(&parameter_text) {
+        let parameters_end = parameters_start + parameter_text.len();
+        let mut search_start = parameters_start;
+        let parameters = csharp_parameter_label_nodes(node)
+            .into_iter()
+            .filter_map(|label_node| {
+                let label = normalize_cs_whitespace(cs_node_text(label_node, source));
+                if label.is_empty() || search_start > parameters_end {
+                    return None;
+                }
+                let haystack = signature.get(search_start..parameters_end)?;
+                let relative_start = haystack.find(&label)?;
+                let start_byte = search_start + relative_start;
+                let end_byte = start_byte + label.len();
+                search_start = end_byte;
+                Some(ParameterMetadata::new(label, start_byte, end_byte))
+            })
+            .collect();
+        SignatureMetadata::new(signature, parameters)
             .with_callable_arity(callable_arity)
             .with_type_parameters(type_parameters)
             .with_return_type_text(return_type_text)
-            .with_bare_return_type_parameter(bare_return_type_parameter);
+            .with_bare_return_type_parameter(bare_return_type_parameter)
+    } else {
+        SignatureMetadata::new(signature, Vec::new())
+            .with_callable_arity(callable_arity)
+            .with_type_parameters(type_parameters)
+            .with_return_type_text(return_type_text)
+            .with_bare_return_type_parameter(bare_return_type_parameter)
     };
-    let parameters_end = parameters_start + parameter_text.len();
-    let mut search_start = parameters_start;
-    let parameters = csharp_parameter_label_nodes(node)
-        .into_iter()
-        .filter_map(|label_node| {
-            let label = normalize_cs_whitespace(cs_node_text(label_node, source));
-            if label.is_empty() || search_start > parameters_end {
-                return None;
-            }
-            let haystack = signature.get(search_start..parameters_end)?;
-            let relative_start = haystack.find(&label)?;
-            let start_byte = search_start + relative_start;
-            let end_byte = start_byte + label.len();
-            search_start = end_byte;
-            Some(ParameterMetadata::new(label, start_byte, end_byte))
-        })
-        .collect();
-    SignatureMetadata::new(signature, parameters)
-        .with_callable_arity(callable_arity)
-        .with_type_parameters(type_parameters)
-        .with_return_type_text(return_type_text)
-        .with_bare_return_type_parameter(bare_return_type_parameter)
+    metadata.with_dispatch_extensibility(super::csharp_callable_dispatch_extensibility(
+        source,
+        node,
+        super::csharp_has_modifier(source, node, "static"),
+    ))
 }
 
 fn csharp_return_type_text(node: Node<'_>, source: &str) -> Option<String> {
