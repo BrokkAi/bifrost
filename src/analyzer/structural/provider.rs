@@ -17,6 +17,27 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Opaque snapshot-local acceleration capability for built-in structural
+/// providers. This type is public only so external implementations of
+/// [`StructuralSearchProvider`] can name the defaulted method's return type;
+/// concrete cache representation and lifecycle remain crate-private.
+#[doc(hidden)]
+pub struct StructuralSearchSnapshotCache {
+    inner: super::index::SnapshotStructuralIndexCache,
+}
+
+impl StructuralSearchSnapshotCache {
+    pub(crate) fn new(max_retained_bytes: u64) -> Self {
+        Self {
+            inner: super::index::SnapshotStructuralIndexCache::new(max_retained_bytes),
+        }
+    }
+
+    pub(crate) fn inner(&self) -> &super::index::SnapshotStructuralIndexCache {
+        &self.inner
+    }
+}
+
 pub trait StructuralSearchProvider: Send + Sync {
     fn structural_language(&self) -> Language;
 
@@ -59,6 +80,18 @@ pub trait StructuralSearchProvider: Send + Sync {
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
 
     fn structural_supports_role(&self, role: Role) -> bool;
+
+    /// Monotonic source generation for providers backed by a live overlay.
+    /// Ordinary immutable analyzer generations keep the zero default.
+    fn structural_source_generation(&self) -> u64 {
+        0
+    }
+
+    /// Snapshot-owned immutable posting cache. Third-party providers may keep
+    /// the default and use scan-only execution.
+    fn snapshot_structural_index_cache(&self) -> Option<&StructuralSearchSnapshotCache> {
+        None
+    }
 }
 
 /// Where one structural-facts lookup was satisfied. This distinguishes the
@@ -234,6 +267,14 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.supports_role(role))
+    }
+
+    fn structural_source_generation(&self) -> u64 {
+        self.project().analysis_generation()
+    }
+
+    fn snapshot_structural_index_cache(&self) -> Option<&StructuralSearchSnapshotCache> {
+        Some(self.structural_index_cache())
     }
 }
 

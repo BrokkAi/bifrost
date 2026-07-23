@@ -37,8 +37,29 @@ pub(crate) fn match_query(
     facts: &FileFacts,
     max_matches: usize,
 ) -> Vec<FactMatch> {
+    match_query_candidates(
+        query,
+        facts,
+        0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"),
+        max_matches,
+    )
+}
+
+/// Evaluate a sound candidate slice in source order. Candidate selection is
+/// never authoritative: this invokes the exact same pattern and containment
+/// verifier as the scan path.
+pub(crate) fn match_query_candidates(
+    query: &CodeQuerySeed,
+    facts: &FileFacts,
+    candidates: impl IntoIterator<Item = u32>,
+    max_matches: usize,
+) -> Vec<FactMatch> {
     let mut matches = Vec::new();
-    for id in 0..facts.nodes().len() as u32 {
+    let mut previous = None;
+    for id in candidates {
+        debug_assert!((id as usize) < facts.nodes().len());
+        debug_assert!(previous.is_none_or(|previous| previous < id));
+        previous = Some(id);
         if matches.len() >= max_matches {
             break;
         }

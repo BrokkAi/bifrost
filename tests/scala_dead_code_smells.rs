@@ -48,6 +48,7 @@ class Service {
 "#,
     )]);
     let helper = scala_definition(&analyzer, "example.Service.helper");
+    analyzer.reset_definition_candidates_query_count_for_test();
 
     let report = report(
         &analyzer,
@@ -65,6 +66,11 @@ class Service {
         "{report}"
     );
     assert!(report.contains("| 0 | 0 |"), "{report}");
+    assert_eq!(
+        analyzer.definition_candidates_query_count_for_test(),
+        0,
+        "bulk classification must use the declaration snapshot instead of issuing one definition query per function"
+    );
 }
 
 #[test]

@@ -50,6 +50,10 @@ mod text_utils;
 pub mod tool_arguments;
 mod util;
 mod workspace_document;
+
+/// Exact source revision embedded into every binary from this Cargo build.
+/// Benchmark clients use it to reject a stale sibling MCP server.
+pub const BIFROST_BUILD_IDENTITY: &str = env!("BIFROST_BUILD_IDENTITY");
 pub use analyzer::policy;
 pub use analyzer::usages;
 

@@ -704,6 +704,10 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner
             .direct_children(code_unit)

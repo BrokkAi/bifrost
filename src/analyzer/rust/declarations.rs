@@ -455,15 +455,20 @@ fn visit_rust_macro_invocation_definitions(
     // braces do not expand to the items inside, so indexing them would be a lie
     // (`Some(false)` -> suppress). Otherwise -- proven faithful (`Some(true)`) or
     // the definition lives in another file and is unknown here (`None`) -- admit
-    // the interior and let the parse gate below be the arbiter.
-    if rust_latest_visible_rules_item_macro(
+    // ordinary items and let the parse gate below be the arbiter. Macro
+    // definitions require positive passthrough evidence because an unknown
+    // external macro can accept a syntactically valid `macro_rules!` token tree
+    // without emitting that declaration. Known inert built-ins were suppressed
+    // above before reaching this fallback.
+    let locally_proven_passthrough = match rust_latest_visible_rules_item_macro(
         item_macro_definitions,
         invoked_macro,
         node.start_byte(),
-    ) == Some(false)
-    {
-        return;
-    }
+    ) {
+        Some(false) => return,
+        Some(true) => true,
+        None => false,
+    };
 
     let Some(arguments) = rust_macro_invocation_arguments(node) else {
         return;
@@ -515,6 +520,7 @@ fn visit_rust_macro_invocation_definitions(
             package_name,
             item_macro_definitions,
             &interior_binder,
+            locally_proven_passthrough,
             parsed,
         );
     }
@@ -613,6 +619,7 @@ fn visit_rust_macro_item(
     package_name: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
     impl_binder: &ImportBinder,
+    replay_macro_definitions: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
     match child.kind() {
@@ -640,7 +647,7 @@ fn visit_rust_macro_item(
         "type_item" => {
             visit_rust_alias(file, source, child, parent, package_name, parsed);
         }
-        "macro_definition" => {
+        "macro_definition" if replay_macro_definitions => {
             visit_rust_macro(file, source, child, parent, package_name, parsed);
         }
         "impl_item" => {

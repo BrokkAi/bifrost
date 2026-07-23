@@ -1351,6 +1351,13 @@ pub struct TreeSitterAnalyzer<A> {
     /// hash of the current in-memory source, so surviving stale entries are
     /// self-healing rather than wrong.
     structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
+    /// Complete immutable postings for this exact analyzer generation.
+    /// Ordinary clones share the owner; updates and overlays replace it.
+    structural_index_cache:
+        Arc<crate::analyzer::structural::provider::StructuralSearchSnapshotCache>,
+    /// Complete immutable typed relations for this exact analyzer snapshot.
+    /// Ordinary clones share the owner; updates and overlays replace it.
+    snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
     store_context: AnalyzerStoreContext,
     /// Per-request persisted read model. Live OIDs are validated once and
@@ -1388,6 +1395,8 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             structural_cache: Arc::clone(&self.structural_cache),
+            structural_index_cache: Arc::clone(&self.structural_index_cache),
+            snapshot_caches: Arc::clone(&self.snapshot_caches),
             semantic_cache: self.semantic_cache.clone(),
             store_context: self.store_context.clone(),
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
@@ -1425,6 +1434,14 @@ impl<A> TreeSitterAnalyzer<A> {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut snapshot = self.clone();
         snapshot.project = project;
+        snapshot.structural_index_cache = Arc::new(
+            crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
+                self.config.memo_cache_budget_bytes() / 8,
+            ),
+        );
+        snapshot.snapshot_caches = Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
+            self.config.memo_cache_budget_bytes() / 8,
+        ));
         snapshot
     }
 }
@@ -1548,6 +1565,8 @@ where
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
+        let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
+        let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
         let semantic_cache = crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
             config.memo_cache_budget_bytes() / 8,
         );
@@ -1557,6 +1576,8 @@ where
             config,
             state,
             structural_cache,
+            structural_index_cache,
+            snapshot_caches,
             semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
@@ -1603,6 +1624,28 @@ where
         &self,
     ) -> &crate::analyzer::structural::provider::StructuralFactsCache {
         &self.structural_cache
+    }
+
+    fn build_structural_index_cache(
+        config: &AnalyzerConfig,
+    ) -> crate::analyzer::structural::provider::StructuralSearchSnapshotCache {
+        crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
+            config.memo_cache_budget_bytes() / 8,
+        )
+    }
+
+    pub(crate) fn structural_index_cache(
+        &self,
+    ) -> &crate::analyzer::structural::provider::StructuralSearchSnapshotCache {
+        &self.structural_index_cache
+    }
+
+    fn build_snapshot_caches(config: &AnalyzerConfig) -> crate::analyzer::AnalyzerSnapshotCaches {
+        crate::analyzer::AnalyzerSnapshotCaches::new(config.memo_cache_budget_bytes() / 8)
+    }
+
+    pub(crate) fn snapshot_caches(&self) -> &crate::analyzer::AnalyzerSnapshotCaches {
+        &self.snapshot_caches
     }
 
     pub(crate) fn materialize_semantics_with_lowerer(
@@ -1711,12 +1754,16 @@ where
         let mut source_snapshot_file_states =
             FileStateCache::new(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
+        let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
+        let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
         Self {
             project,
             adapter,
             config,
             state: Arc::new(state),
             structural_cache,
+            structural_index_cache,
+            snapshot_caches,
             semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
@@ -5635,6 +5682,10 @@ where
         } else {
             Vec::new()
         }
+    }
+
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.snapshot_caches())
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {

@@ -286,6 +286,9 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
             return publish_cached(artifact, source_work, staged_budget, request);
         }
         CompleteValueAcquisition::Leader { permit } => permit,
+        CompleteValueAcquisition::Rejected => {
+            unreachable!("semantic artifact cache never publishes rejected flights")
+        }
         CompleteValueAcquisition::Cancelled => {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,

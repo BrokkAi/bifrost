@@ -908,6 +908,10 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }

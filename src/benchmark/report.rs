@@ -34,16 +34,132 @@ pub enum ScenarioTransport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioReport {
     pub name: BenchmarkScenario,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
     pub transport: ScenarioTransport,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_duration_ms: Option<f64>,
     pub warmup_durations_ms: Vec<f64>,
     pub measured_durations_ms: Vec<f64>,
     pub median_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
     pub mean_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_artifacts: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_code: Option<QueryCodeBenchmarkMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeBenchmarkMetrics {
+    pub cold_contract: String,
+    pub first: QueryCodeProfileMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_transition: Option<QueryCodeProfileMetrics>,
+    pub warm: QueryCodeProfileMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeProfileMetrics {
+    pub profile_format: String,
+    pub result_cardinality: usize,
+    pub truncated: bool,
+    pub diagnostic_codes: Vec<String>,
+    pub total_ns: u64,
+    pub scanned_files: u64,
+    pub scanned_source_bytes: u64,
+    pub fact_nodes: u64,
+    pub pipeline_rows: u64,
+    pub examined_references: u64,
+    pub import_files_resolved: u64,
+    pub import_edges_resolved: u64,
+    pub facts_cache: QueryCodeFactsCacheMetrics,
+    #[serde(default)]
+    pub direct_import_topology: QueryCodeDerivedLayerMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_path: Option<QueryCodeAccessPathMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeFactsCacheMetrics {
+    pub lookups: u64,
+    pub memory_hits: u64,
+    pub persisted_hydrations: u64,
+    pub extractions: u64,
+    pub unavailable: u64,
+    pub unknown_outcomes: u64,
+    pub replayed_files: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeDerivedLayerMetrics {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub builds: u64,
+    pub waits: u64,
+    pub wait_ns: u64,
+    pub complete_hits: u64,
+    pub incomplete_hits: u64,
+    pub complete_builds: u64,
+    pub incomplete_builds: u64,
+    pub unknown_outcomes: u64,
+    pub cancelled: u64,
+    pub unavailable: u64,
+    pub over_budget: u64,
+    pub fallbacks: u64,
+    pub replayed_items: u64,
+    pub build_files: u64,
+    pub build_edges: u64,
+    pub build_ns: u64,
+    pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeAccessPathMetrics {
+    pub selected: String,
+    pub representation_version: u32,
+    pub estimated_provider_files: u64,
+    pub scoped_files: u64,
+    pub scoped_fact_nodes: u64,
+    pub admitted_fact_nodes: u64,
+    pub candidate_files: u64,
+    pub candidate_facts: u64,
+    pub selected_terms: Vec<QueryCodeAccessPathTermMetrics>,
+    pub source_verification_required: bool,
+    pub cache_ready_lookups: u64,
+    pub materialized_files: u64,
+    pub materialized_fact_nodes: u64,
+    pub inspected_source_bytes: u64,
+    pub examined_fact_nodes: u64,
+    pub index_lookups: u64,
+    pub index_hits: u64,
+    pub index_misses: u64,
+    pub index_builds: u64,
+    pub index_waits: u64,
+    pub index_wait_ns: u64,
+    pub index_cancelled: u64,
+    pub index_unavailable: u64,
+    pub index_over_budget: u64,
+    pub scan_fallbacks: u64,
+    pub index_build_files: u64,
+    pub index_build_source_bytes: u64,
+    pub index_build_fact_nodes: u64,
+    pub index_build_facts_bytes: u64,
+    pub index_build_ns: u64,
+    pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeAccessPathTermMetrics {
+    pub label: String,
+    pub candidate_facts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +210,8 @@ pub enum ScenarioCompareOutcome {
 pub struct ScenarioCompareReport {
     pub repo_name: String,
     pub scenario: BenchmarkScenario,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
     pub transport: ScenarioTransport,
     pub outcome: ScenarioCompareOutcome,
     pub baseline_success: Option<bool>,
@@ -120,15 +238,45 @@ impl ScenarioReport {
     ) -> Self {
         Self {
             name,
+            case_id: None,
             transport,
             success,
+            skipped: false,
+            first_duration_ms: None,
             median_ms: median_ms(&measured_durations_ms),
+            p95_ms: None,
             mean_ms: mean_ms(&measured_durations_ms),
             warmup_durations_ms,
             measured_durations_ms,
             failure_message,
             profile_artifacts: Vec::new(),
+            query_code: None,
         }
+    }
+
+    pub fn with_query_code(
+        mut self,
+        case_id: String,
+        first_duration_ms: f64,
+        metrics: QueryCodeBenchmarkMetrics,
+    ) -> Self {
+        self.case_id = Some(case_id);
+        self.first_duration_ms = Some(first_duration_ms);
+        self.p95_ms = percentile_ms(&self.measured_durations_ms, 95);
+        self.query_code = Some(metrics);
+        self
+    }
+
+    pub fn with_case_id(mut self, case_id: String) -> Self {
+        self.case_id = Some(case_id);
+        self
+    }
+
+    pub fn as_skipped(mut self, reason: String) -> Self {
+        self.success = true;
+        self.skipped = true;
+        self.failure_message = Some(reason);
+        self
     }
 }
 
@@ -255,6 +403,10 @@ fn mean_ms(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn median_ms(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -270,10 +422,22 @@ fn median_ms(values: &[f64]) -> Option<f64> {
     }
 }
 
+fn percentile_ms(values: &[f64], percentile: usize) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    debug_assert!((1..=100).contains(&percentile));
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = sorted.len().saturating_mul(percentile).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ScenarioKey<'a> {
     repo_name: &'a str,
     scenario: BenchmarkScenario,
+    case_id: Option<&'a str>,
     transport: ScenarioTransport,
 }
 
@@ -285,6 +449,7 @@ fn index_scenarios(report: &BenchmarkRunReport) -> HashMap<ScenarioKey<'_>, &Sce
                 ScenarioKey {
                     repo_name: repo.name.as_str(),
                     scenario: scenario.name,
+                    case_id: scenario.case_id.as_deref(),
                     transport: scenario.transport,
                 },
                 scenario,
@@ -298,6 +463,7 @@ fn compare_keys(left: &ScenarioKey<'_>, right: &ScenarioKey<'_>) -> std::cmp::Or
     left.repo_name
         .cmp(right.repo_name)
         .then_with(|| left.scenario.cmp(&right.scenario))
+        .then_with(|| left.case_id.cmp(&right.case_id))
         .then_with(|| left.transport.cmp(&right.transport))
 }
 
@@ -314,6 +480,7 @@ fn compare_scenario_pair(
         (Some(baseline), None) => ScenarioCompareReport {
             repo_name: key.repo_name.to_string(),
             scenario: key.scenario,
+            case_id: key.case_id.map(str::to_string),
             transport: key.transport,
             outcome: ScenarioCompareOutcome::MissingCandidate,
             baseline_success: Some(baseline.success),
@@ -325,20 +492,29 @@ fn compare_scenario_pair(
             is_regression: true,
             detail: Some("scenario missing from candidate report".to_string()),
         },
-        (None, Some(candidate)) => ScenarioCompareReport {
-            repo_name: key.repo_name.to_string(),
-            scenario: key.scenario,
-            transport: key.transport,
-            outcome: ScenarioCompareOutcome::NewCandidate,
-            baseline_success: None,
-            candidate_success: Some(candidate.success),
-            baseline_median_ms: None,
-            candidate_median_ms: candidate.median_ms,
-            delta_ms: None,
-            delta_pct: None,
-            is_regression: false,
-            detail: Some("scenario only present in candidate report".to_string()),
-        },
+        (None, Some(candidate)) => {
+            let invariant_failure =
+                query_code_cold_ratio_failure(key.scenario, candidate, thresholds);
+            let candidate_failure =
+                (!candidate.success).then(|| "new candidate scenario failed".to_string());
+            ScenarioCompareReport {
+                repo_name: key.repo_name.to_string(),
+                scenario: key.scenario,
+                case_id: key.case_id.map(str::to_string),
+                transport: key.transport,
+                outcome: ScenarioCompareOutcome::NewCandidate,
+                baseline_success: None,
+                candidate_success: Some(candidate.success),
+                baseline_median_ms: None,
+                candidate_median_ms: candidate.median_ms,
+                delta_ms: None,
+                delta_pct: None,
+                is_regression: invariant_failure.is_some() || candidate_failure.is_some(),
+                detail: invariant_failure
+                    .or(candidate_failure)
+                    .or_else(|| Some("scenario only present in candidate report".to_string())),
+            }
+        }
         (None, None) => unreachable!("scenario key without baseline or candidate"),
     }
 }
@@ -358,6 +534,7 @@ fn compare_present_scenarios(
         _ => None,
     };
 
+    let cold_ratio_failure = query_code_cold_ratio_failure(key.scenario, candidate, thresholds);
     let (outcome, is_regression, detail) = if baseline.success && !candidate.success {
         (
             ScenarioCompareOutcome::Regression,
@@ -370,6 +547,8 @@ fn compare_present_scenarios(
             false,
             Some("candidate recovered from a failing baseline".to_string()),
         )
+    } else if baseline.success && candidate.success && cold_ratio_failure.is_some() {
+        (ScenarioCompareOutcome::Regression, true, cold_ratio_failure)
     } else if baseline.success && candidate.success {
         match (baseline.median_ms, candidate.median_ms) {
             (Some(baseline_ms), Some(candidate_ms))
@@ -405,6 +584,7 @@ fn compare_present_scenarios(
     ScenarioCompareReport {
         repo_name: key.repo_name.to_string(),
         scenario: key.scenario,
+        case_id: key.case_id.map(str::to_string),
         transport: key.transport,
         outcome,
         baseline_success: Some(baseline.success),
@@ -418,6 +598,32 @@ fn compare_present_scenarios(
     }
 }
 
+fn query_code_cold_ratio_failure(
+    scenario: BenchmarkScenario,
+    candidate: &ScenarioReport,
+    thresholds: CompareThresholds,
+) -> Option<String> {
+    const MAX_COLD_TO_WARM_RATIO: f64 = 10.0;
+    if scenario != BenchmarkScenario::QueryCode {
+        return None;
+    }
+    let (Some(first_ms), Some(warm_median_ms)) = (candidate.first_duration_ms, candidate.median_ms)
+    else {
+        return None;
+    };
+    if !first_ms.is_finite() || !warm_median_ms.is_finite() || warm_median_ms <= 0.0 {
+        return None;
+    }
+    let ratio = first_ms / warm_median_ms;
+    let excess_ms = first_ms - MAX_COLD_TO_WARM_RATIO * warm_median_ms;
+    (ratio > MAX_COLD_TO_WARM_RATIO && excess_ms >= thresholds.absolute_ms).then(|| {
+        format!(
+            "query_code first request is {ratio:.2}x warm median and exceeds the {MAX_COLD_TO_WARM_RATIO:.1}x retention limit by {excess_ms:.1} ms (absolute floor {:.1} ms)",
+            thresholds.absolute_ms
+        )
+    })
+}
+
 fn relative_delta_pct(baseline_ms: f64, candidate_ms: f64) -> Option<f64> {
     (baseline_ms > 0.0).then_some(((candidate_ms - baseline_ms) / baseline_ms) * 100.0)
 }
@@ -426,7 +632,9 @@ fn detect_environment_variance(
     scenarios: &[ScenarioCompareReport],
     thresholds: CompareThresholds,
 ) -> Option<EnvironmentVarianceReport> {
-    if scenarios.iter().any(non_timing_regression) {
+    if scenarios.iter().any(|scenario| {
+        non_timing_regression(scenario) && !is_query_code_candidate_invariant_failure(scenario)
+    }) {
         return None;
     }
 
@@ -446,7 +654,9 @@ fn detect_environment_variance(
     let timing_regressions = timed
         .iter()
         .copied()
-        .filter(|scenario| scenario.is_regression)
+        .filter(|scenario| {
+            scenario.is_regression && !is_query_code_candidate_invariant_failure(scenario)
+        })
         .collect::<Vec<_>>();
     if timing_regressions.is_empty() {
         return None;
@@ -531,8 +741,34 @@ fn detect_environment_variance(
 
 fn non_timing_regression(scenario: &ScenarioCompareReport) -> bool {
     scenario.is_regression
-        && !(scenario.baseline_success == Some(true)
-            && scenario.candidate_success == Some(true)
-            && scenario.delta_ms.is_some()
-            && scenario.delta_pct.is_some())
+        && (is_query_code_candidate_invariant_failure(scenario)
+            || !(scenario.baseline_success == Some(true)
+                && scenario.candidate_success == Some(true)
+                && scenario.delta_ms.is_some()
+                && scenario.delta_pct.is_some()))
+}
+
+fn is_query_code_candidate_invariant_failure(scenario: &ScenarioCompareReport) -> bool {
+    scenario.scenario == BenchmarkScenario::QueryCode
+        && scenario
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("retention limit"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile_ms;
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        assert_eq!(percentile_ms(&[], 95), None);
+        assert_eq!(percentile_ms(&[4.0], 95), Some(4.0));
+        assert_eq!(percentile_ms(&[4.0, 1.0], 95), Some(4.0));
+        assert_eq!(percentile_ms(&[5.0, 1.0, 3.0], 95), Some(5.0));
+        assert_eq!(
+            percentile_ms(&[10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], 95),
+            Some(10.0)
+        );
+    }
 }

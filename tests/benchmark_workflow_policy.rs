@@ -37,6 +37,10 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
     assert!(workflow.contains("  workflow_dispatch:\n"));
     assert!(!workflow.contains("  push:\n"));
     assert!(!workflow.contains("  pull_request:\n"));
+    assert!(
+        workflow.contains("    timeout-minutes: 180\n"),
+        "the scheduled benchmark needs a hard job-level deadlock backstop"
+    );
 
     let strict_input = workflow
         .split_once("      strict_compare:\n")

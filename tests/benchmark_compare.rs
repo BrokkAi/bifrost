@@ -167,6 +167,119 @@ fn selected_repo_comparison_ignores_unselected_baseline_scenarios() {
 }
 
 #[test]
+fn query_code_cases_are_compared_independently() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![
+            query_scenario("exact-class", 100.0),
+            query_scenario("typed-callers", 100.0),
+        ],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![
+            query_scenario("exact-class", 170.0),
+            query_scenario("typed-callers", 110.0),
+        ],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    assert_eq!(comparison.compared_scenarios_count, 2, "{comparison:?}");
+    let exact = comparison
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.case_id.as_deref() == Some("exact-class"))
+        .expect("exact-name case");
+    assert_eq!(exact.outcome, ScenarioCompareOutcome::Regression);
+    let typed = comparison
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.case_id.as_deref() == Some("typed-callers"))
+        .expect("typed traversal case");
+    assert_eq!(typed.outcome, ScenarioCompareOutcome::Unchanged);
+}
+
+#[test]
+fn query_code_cold_to_warm_ratio_blocks_false_warm_improvement() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 200.0, 100.0)],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 330.0, 25.0)],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+    let scenario = &comparison.scenarios[0];
+    assert_eq!(scenario.outcome, ScenarioCompareOutcome::Regression);
+    assert!(scenario.is_regression);
+    assert!(
+        scenario
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("13.20x")),
+        "{scenario:?}"
+    );
+}
+
+#[test]
+fn query_code_cold_to_warm_ratio_ignores_sub_floor_boundary_jitter() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 200.0, 25.0)],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![query_scenario_with_first("workspace", 270.0, 25.0)],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+    let scenario = &comparison.scenarios[0];
+    assert_eq!(scenario.outcome, ScenarioCompareOutcome::Unchanged);
+    assert!(!scenario.is_regression, "{scenario:?}");
+    assert!(!comparison.has_actionable_regressions, "{comparison:?}");
+}
+
+#[test]
+fn new_query_code_candidate_still_enforces_cold_to_warm_invariant() {
+    let baseline = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![scenario(
+            BenchmarkScenario::WorkspaceBuild,
+            true,
+            Some(100.0),
+        )],
+    )]);
+    let candidate = report_with_scenarios(vec![repo_with_scenarios(
+        "fixture-java",
+        vec![
+            scenario(BenchmarkScenario::WorkspaceBuild, true, Some(100.0)),
+            query_scenario_with_first("new-query", 1_200.0, 100.0),
+        ],
+    )]);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+    let query = comparison
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.case_id.as_deref() == Some("new-query"))
+        .expect("new query scenario");
+
+    assert_eq!(query.outcome, ScenarioCompareOutcome::NewCandidate);
+    assert!(query.is_regression, "{query:?}");
+    assert!(
+        query
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("12.00x")),
+        "{query:?}"
+    );
+    assert!(comparison.has_actionable_regressions, "{comparison:?}");
+}
+
+#[test]
 fn broad_workspace_slowdown_is_classified_as_environment_variance() {
     let baseline = report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0));
     let candidate = report_with_scenarios(broad_slowdown_repos(260.0, 125.0, 230.0));
@@ -188,6 +301,27 @@ fn broad_workspace_slowdown_is_classified_as_environment_variance() {
     assert_eq!(variance.workspace_build_regression_count, 4, "{variance:?}");
     assert_eq!(variance.median_workspace_build_delta_ms, 60.0);
     assert_eq!(variance.median_workspace_build_delta_pct, 30.0);
+}
+
+#[test]
+fn cold_ratio_invariant_is_not_suppressed_by_broad_environment_variance() {
+    let baseline = report_with_scenarios(broad_slowdown_repos(200.0, 100.0, 200.0));
+    let mut candidate_repos = broad_slowdown_repos(260.0, 125.0, 230.0);
+    candidate_repos[0]
+        .scenarios
+        .push(query_scenario_with_first("new-query", 1_200.0, 100.0));
+    let candidate = report_with_scenarios(candidate_repos);
+
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    assert_eq!(comparison.regression_count, 5, "{comparison:?}");
+    assert_eq!(comparison.actionable_regression_count, 1, "{comparison:?}");
+    assert!(comparison.has_actionable_regressions, "{comparison:?}");
+    let variance = comparison
+        .environment_variance
+        .as_ref()
+        .expect("environment variance report");
+    assert_eq!(variance.covered_regression_count, 4, "{variance:?}");
 }
 
 #[test]
@@ -312,6 +446,58 @@ fn compare_subcommand_strict_mode_allows_environment_variance() {
     );
 }
 
+#[test]
+fn compare_subcommand_prints_cold_ratio_detail_even_with_a_timing_delta() {
+    let (output, _) = run_compare_subcommand(
+        report_with_scenarios(vec![repo_with_scenarios(
+            "fixture-java",
+            vec![query_scenario_with_first("workspace", 200.0, 100.0)],
+        )]),
+        report_with_scenarios(vec![repo_with_scenarios(
+            "fixture-java",
+            vec![query_scenario_with_first("workspace", 1_200.0, 100.0)],
+        )]),
+    );
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("retention limit"), "{stdout}");
+    assert!(stdout.contains("delta=0.0 ms"), "{stdout}");
+}
+
+#[test]
+fn compare_subcommand_rejects_subset_reports() {
+    let temp = TempDir::new().expect("temp dir");
+    let baseline_path = temp.path().join("baseline.json");
+    let candidate_path = temp.path().join("candidate.json");
+    let baseline = report_with_scenarios(Vec::new());
+    let mut candidate = report_with_scenarios(Vec::new());
+    candidate.max_files = Some(10);
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&baseline).expect("serialize baseline"),
+    )
+    .expect("write baseline");
+    fs::write(
+        &candidate_path,
+        serde_json::to_string_pretty(&candidate).expect("serialize candidate"),
+    )
+    .expect("write candidate");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("compare")
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .arg("--candidate")
+        .arg(&candidate_path)
+        .output()
+        .expect("run bifrost_benchmark compare");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("subset benchmark reports"), "{stderr}");
+}
+
 fn run_compare_subcommand(
     baseline: BenchmarkRunReport,
     candidate: BenchmarkRunReport,
@@ -374,6 +560,20 @@ fn repo_with_scenarios(name: &str, scenarios: Vec<ScenarioReport>) -> BenchmarkR
 
 fn scenario(name: BenchmarkScenario, success: bool, median_ms: Option<f64>) -> ScenarioReport {
     scenario_with_transport(name, ScenarioTransport::Mcp, success, median_ms)
+}
+
+fn query_scenario(case_id: &str, median_ms: f64) -> ScenarioReport {
+    scenario(BenchmarkScenario::QueryCode, true, Some(median_ms)).with_case_id(case_id.to_string())
+}
+
+fn query_scenario_with_first(
+    case_id: &str,
+    first_duration_ms: f64,
+    median_ms: f64,
+) -> ScenarioReport {
+    let mut scenario = query_scenario(case_id, median_ms);
+    scenario.first_duration_ms = Some(first_duration_ms);
+    scenario
 }
 
 fn scenario_with_transport(

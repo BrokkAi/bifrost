@@ -39,6 +39,7 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     env:
       SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
       BENCHMARK_REPO: ${{ inputs.repo || '' }}
@@ -111,7 +112,7 @@ jobs:
 
       - name: Compare against blessed baseline
         id: compare
-        if: always() && steps.paths.outputs.report_path != '' && hashFiles('benchmark/baselines/ubuntu-latest.json') != ''
+        if: always() && env.BENCHMARK_MAX_FILES == '' && steps.paths.outputs.report_path != '' && hashFiles('benchmark/baselines/ubuntu-latest.json') != ''
         continue-on-error: true
         shell: bash
         run: |

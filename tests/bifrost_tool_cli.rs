@@ -671,7 +671,7 @@ fn query_code_tool_returns_versioned_explain_and_profile_reports() {
     let profile: Value = serde_json::from_slice(&profile.stdout).expect("profile JSON output");
     assert_eq!(
         profile["structuredContent"]["format"],
-        "bifrost_code_query_profile/v1"
+        "bifrost_code_query_profile/v2"
     );
     assert_eq!(
         profile["structuredContent"]["result"]["results"][0]["kind"],

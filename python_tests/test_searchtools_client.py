@@ -22,6 +22,7 @@ from bifrost_searchtools import (
     CodeQueryCompletionKind,
     CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact,
+    CodeQueryDerivedLayerCacheCounters,
     CodeQueryExecutionMode,
     CodeQueryExpressionSite,
     CodeQueryExplain,
@@ -146,7 +147,7 @@ def _code_query_explain_payload(
 
 def _code_query_profile_payload() -> dict:
     return {
-        "format": "bifrost_code_query_profile/v1",
+        "format": "bifrost_code_query_profile/v2",
         "result": {"results": [], "truncated": False, "diagnostics": []},
         "explain": _code_query_explain_payload(execution_mode="profile"),
         "timings_ns": {
@@ -184,7 +185,55 @@ def _code_query_profile_payload() -> dict:
                     "replayed_files": 1,
                 },
             },
+            {
+                "layer": "direct_import_topology",
+                "metrics": {
+                    "kind": "complete_value",
+                    "lookups": 1,
+                    "hits": 1,
+                    "build_files": 3,
+                    "build_edges": 2,
+                    "retained_bytes": 256,
+                },
+            },
         ],
+        "access_path": {
+            "selected": "posting:kind+name",
+            "representation_version": 1,
+            "estimated_provider_files": 1,
+            "scoped_files": 1,
+            "scoped_fact_nodes": 4,
+            "admitted_fact_nodes": 4,
+            "candidate_files": 1,
+            "candidate_facts": 1,
+            "selected_terms": [
+                {"label": "name", "candidate_facts": 1},
+                {"label": "kind", "candidate_facts": 4},
+            ],
+            "source_verification_required": True,
+            "cache_ready_lookups": 1,
+            "materialized_files": 1,
+            "materialized_fact_nodes": 4,
+            "inspected_source_bytes": 120,
+            "examined_fact_nodes": 1,
+            "index_lookups": 1,
+            "index_hits": 1,
+            "index_misses": 0,
+            "index_builds": 0,
+            "index_waits": 0,
+            "index_wait_ns": 0,
+            "index_cancelled": 0,
+            "index_unavailable": 0,
+            "index_over_budget": 0,
+            "scan_fallbacks": 0,
+            "index_build_files": 0,
+            "index_build_source_bytes": 0,
+            "index_build_fact_nodes": 0,
+            "index_build_facts_bytes": 0,
+            "index_build_ns": 0,
+            "retained_bytes": 512,
+            "future_access_fact": True,
+        },
         "scheduling": {
             "peak_concurrency": 1,
             "bounded_dispatch": {
@@ -295,6 +344,12 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertEqual(response.explain.parsed_query.execution_mode, "profile")
         self.assertEqual(response.timings_ns.total, 66)
         self.assertEqual(response.work.scanned_source_bytes, 120)
+        self.assertEqual(response.access_path.selected, "posting:kind+name")
+        self.assertEqual(response.access_path.candidate_facts, 1)
+        self.assertEqual(response.access_path.selected_terms[0].label, "name")
+        self.assertTrue(response.access_path.source_verification_required)
+        self.assertEqual(response.access_path.cache_ready_lookups, 1)
+        self.assertTrue(response.access_path.extra["future_access_fact"])
         self.assertIs(
             response.cache_layers[0].layer, CodeQueryCacheLayerKind.SEED_RESULT
         )
@@ -311,6 +366,17 @@ class CodeQueryModelTest(unittest.TestCase):
             response.cache_layers[1].metrics,
             CodeQueryStructuralFactsCacheCounters,
         )
+        self.assertEqual(
+            response.cache_layers[2].layer,
+            CodeQueryCacheLayerKind.DIRECT_IMPORT_TOPOLOGY,
+        )
+        self.assertIsInstance(
+            response.cache_layers[2].metrics,
+            CodeQueryDerivedLayerCacheCounters,
+        )
+        self.assertEqual(response.cache_layers[2].metrics.build_files, 3)
+        self.assertEqual(response.cache_layers[2].metrics.build_edges, 2)
+        self.assertEqual(response.cache_layers[2].metrics.retained_bytes, 256)
         self.assertEqual(response.scheduling.bounded_dispatch.worker_limit, 4)
         self.assertEqual(
             response.scheduling.bounded_dispatch.extra["future_scheduler_fact"], 9
@@ -771,7 +837,11 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIsInstance(profile.result.results[0], CodeQueryMatch)
         self.assertEqual(profile.explain.parsed_query.execution_mode, "profile")
         self.assertGreaterEqual(len(profile.operators), 2)
-        self.assertEqual(len(profile.cache_layers), 8)
+        self.assertEqual(len(profile.cache_layers), 9)
+        self.assertEqual(
+            profile.cache_layers[-1].layer,
+            CodeQueryCacheLayerKind.DIRECT_IMPORT_TOPOLOGY,
+        )
         self.assertGreaterEqual(profile.scheduling.peak_concurrency, 1)
 
     def test_query_code_builds_typed_set_plans_and_parses_branch_paths(self) -> None:

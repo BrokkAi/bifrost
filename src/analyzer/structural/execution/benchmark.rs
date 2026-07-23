@@ -1477,37 +1477,112 @@ fn assert_profile_cache_contract(sample: &ExecutionSample, spec: &CaseSpec) {
     let reverse = profile.cache.import_reverse;
     if spec.shared_dependency == Some("complete direct import graph") {
         assert_eq!(reverse.lookups, 2, "{} import lookups", spec.name);
-        assert_eq!(reverse.misses, 1, "{} import build miss", spec.name);
-        assert_eq!(reverse.complete_builds, 1, "{} import build", spec.name);
-        assert_eq!(reverse.hits, 1, "{} import sibling hit", spec.name);
+        let topology = profile.cache.direct_import_topology;
+        assert_eq!(topology.lookups, 2, "{} topology lookups", spec.name);
+        let topology_built = topology.builds == 1;
+        let (expected_misses, expected_builds, expected_hits, expected_replayed) =
+            match sample.cache_state {
+                CacheState::FreshAnalyzerFirstRequest => (1, 1, 1, 1),
+                CacheState::SameAnalyzerLaterRequest if topology_built => (1, 1, 1, 1),
+                CacheState::SameAnalyzerLaterRequest => (0, 0, 2, 2),
+            };
         assert_eq!(
-            reverse.complete_hits, 1,
-            "{} complete import hit",
+            reverse.misses, expected_misses,
+            "{} import build misses",
+            spec.name
+        );
+        assert_eq!(
+            reverse.complete_builds, expected_builds,
+            "{} import builds",
+            spec.name
+        );
+        assert_eq!(reverse.hits, expected_hits, "{} import hits", spec.name);
+        assert_eq!(
+            reverse.complete_hits, expected_hits,
+            "{} complete import hits",
             spec.name
         );
         assert_eq!(
             reverse.replayed_items,
-            u64::try_from(spec.expected_branch_results).unwrap_or(u64::MAX),
+            u64::try_from(
+                spec.expected_branch_results
+                    .saturating_mul(expected_replayed),
+            )
+            .unwrap_or(u64::MAX),
             "{} relevant reverse edges replayed",
             spec.name
         );
-        let build = profile
-            .operators
-            .iter()
-            .find(|observation| observation.cache.import_reverse.complete_builds == 1)
-            .expect("import benchmark observes the graph builder");
+        let (topology_misses, topology_builds, topology_hits, topology_fallbacks) =
+            match sample.cache_state {
+                CacheState::FreshAnalyzerFirstRequest => (2, 0, 0, 2),
+                CacheState::SameAnalyzerLaterRequest if topology_built => (1, 1, 1, 0),
+                CacheState::SameAnalyzerLaterRequest => (0, 0, 2, 0),
+            };
         assert_eq!(
-            build.work.import_files_resolved,
-            u64::try_from(spec.expected_branch_results.saturating_add(2)).unwrap_or(u64::MAX),
-            "{} import files resolved",
+            topology.misses, topology_misses,
+            "{} topology misses",
             spec.name
         );
         assert_eq!(
-            build.work.import_edges_resolved,
-            u64::try_from(spec.expected_branch_results.saturating_mul(2)).unwrap_or(u64::MAX),
-            "{} import edges resolved",
+            topology.builds, topology_builds,
+            "{} topology builds",
             spec.name
         );
+        assert_eq!(topology.hits, topology_hits, "{} topology hits", spec.name);
+        assert_eq!(
+            topology.unavailable, 0,
+            "{} topology unavailable",
+            spec.name
+        );
+        assert_eq!(
+            topology.fallbacks, topology_fallbacks,
+            "{} topology fallbacks",
+            spec.name
+        );
+        if expected_builds == 1 {
+            let build = profile
+                .operators
+                .iter()
+                .find(|observation| observation.cache.import_reverse.complete_builds == 1)
+                .expect("import benchmark observes the graph builder");
+            assert_eq!(
+                build.work.import_files_resolved,
+                u64::try_from(spec.expected_branch_results.saturating_add(2)).unwrap_or(u64::MAX),
+                "{} import files resolved",
+                spec.name
+            );
+            assert_eq!(
+                build.work.import_edges_resolved,
+                u64::try_from(spec.expected_branch_results.saturating_mul(2)).unwrap_or(u64::MAX),
+                "{} import edges resolved",
+                spec.name
+            );
+        }
+        if topology_built {
+            assert_eq!(
+                topology.build_files,
+                u64::try_from(spec.expected_branch_results.saturating_add(2)).unwrap_or(u64::MAX),
+                "{} topology build files",
+                spec.name
+            );
+            assert_eq!(
+                topology.build_edges,
+                u64::try_from(spec.expected_branch_results.saturating_mul(2)).unwrap_or(u64::MAX),
+                "{} topology build edges",
+                spec.name
+            );
+        } else {
+            assert_eq!(
+                topology.build_files, 0,
+                "{} topology build files",
+                spec.name
+            );
+            assert_eq!(
+                topology.build_edges, 0,
+                "{} topology build edges",
+                spec.name
+            );
+        }
     } else {
         assert_eq!(reverse.lookups, 0, "{} has no import dependency", spec.name);
     }
@@ -1611,9 +1686,19 @@ fn git_tree_fingerprint(root: &Path) -> Option<String> {
             continue;
         }
         let relative = std::str::from_utf8(raw_path).ok()?;
-        let contents = fs::read(root.join(relative)).ok()?;
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).ok()?;
         hasher.update(u64::try_from(raw_path.len()).ok()?.to_le_bytes());
         hasher.update(raw_path);
+        if metadata.is_dir() {
+            // Git reports an untracked nested repository as one directory
+            // entry. It is not part of this repository's source tree, but its
+            // presence must not make provenance collection fail.
+            hasher.update([b'd']);
+            continue;
+        }
+        let contents = fs::read(path).ok()?;
+        hasher.update([b'f']);
         hasher.update(u64::try_from(contents.len()).ok()?.to_le_bytes());
         hasher.update(contents);
     }

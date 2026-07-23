@@ -25,6 +25,7 @@ pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
+pub(crate) mod index;
 pub mod kinds;
 pub mod matcher;
 pub mod planner;
@@ -35,18 +36,19 @@ pub mod search;
 pub mod spec;
 
 pub use execution::{
-    CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind, CodeQueryExplain,
-    CodeQueryExplainScheduling, CodeQueryLogicalNode, CodeQueryLogicalOperation,
-    CodeQueryLogicalPlan, CodeQueryOperatorDisposition, CodeQueryOperatorObservation,
-    CodeQueryOperatorTermination, CodeQueryOperatorTimings, CodeQueryPhysicalNode,
-    CodeQueryPhysicalOperator, CodeQueryPhysicalPlan, CodeQueryProfile,
-    CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer, CodeQueryProfileScheduling,
-    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQuerySchedulingPolicy,
-    CodeQuerySelectedScheduling, CodeQueryStructuralFactsCacheCounters,
+    CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
+    CodeQueryDerivedLayerCacheCounters, CodeQueryExplain, CodeQueryExplainScheduling,
+    CodeQueryLogicalNode, CodeQueryLogicalOperation, CodeQueryLogicalPlan,
+    CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
+    CodeQueryOperatorTimings, CodeQueryPhysicalNode, CodeQueryPhysicalOperator,
+    CodeQueryPhysicalPlan, CodeQueryProfile, CodeQueryProfileCacheCounters,
+    CodeQueryProfileCacheLayer, CodeQueryProfileScheduling, CodeQueryProfileTimings,
+    CodeQueryProfileWork, CodeQuerySchedulingPolicy, CodeQuerySelectedScheduling,
+    CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
-pub use provider::{StructuralFactsCache, StructuralSearchProvider};
+pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
     CodeQuerySeed, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,

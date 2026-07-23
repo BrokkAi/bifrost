@@ -90,7 +90,7 @@ void test("retains profiled ordinary results for navigation", async () => {
         Promise.resolve({
           text: "1 result\n\nCodeQuery profile\n",
           mode: "profile",
-          report: { format: "bifrost_code_query_profile/v1" },
+          report: { format: "bifrost_code_query_profile/v2" },
           results: [
             {
               uri: "file:///workspace/src/app.py",
@@ -107,7 +107,7 @@ void test("retains profiled ordinary results for navigation", async () => {
   assert.equal(response.mode, "profile");
   assert.equal(response.results.length, 1);
   assert.match(formatRqlQueryOutput(response), /CodeQuery profile report:/);
-  assert.match(formatRqlQueryOutput(response), /bifrost_code_query_profile\/v1/);
+  assert.match(formatRqlQueryOutput(response), /bifrost_code_query_profile\/v2/);
 });
 
 void test("warns without issuing a request when Bifrost is not ready", async () => {

@@ -1058,16 +1058,37 @@ impl SearchToolsService {
         Self::new_deferred_with_watcher_starter(root, production_watcher_starter())
     }
 
+    /// Construct a deferred, persisted service for an immutable workspace.
+    /// Queries never poll a file watcher; callers must use `refresh` when they
+    /// intentionally change the workspace after construction.
+    pub fn new_deferred_manual(root: PathBuf) -> Result<Self, String> {
+        Self::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            production_watcher_starter(),
+        )
+    }
+
     /// Construct an MCP service that has not yet been bound to a client-approved
     /// workspace root. Analyzer-backed tools return an actionable error until a
     /// later roots response or negotiated host metadata installs a workspace.
     pub fn new_unbound() -> Self {
+        Self::new_unbound_with_strategy(UpdateStrategy::WatchFiles)
+    }
+
+    /// Construct an unbound MCP service whose eventual client-selected
+    /// workspace is updated only by explicit refresh requests.
+    pub fn new_unbound_manual() -> Self {
+        Self::new_unbound_with_strategy(UpdateStrategy::Manual)
+    }
+
+    fn new_unbound_with_strategy(update_strategy: UpdateStrategy) -> Self {
         Self {
             root: RwLock::new(None),
             session: RwLock::new(None),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
-            update_strategy: UpdateStrategy::WatchFiles,
+            update_strategy,
             semantic_indexing: semantic_indexing_enabled(),
             watcher_starter: production_watcher_starter(),
         }
@@ -1161,7 +1182,18 @@ impl SearchToolsService {
         root: PathBuf,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let update_strategy = UpdateStrategy::WatchFiles;
+        Self::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::WatchFiles,
+            watcher_starter,
+        )
+    }
+
+    fn new_deferred_with_strategy_and_watcher_starter(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
         let semantic_indexing = semantic_indexing_enabled();
         let canonical = root
             .canonicalize()
@@ -2266,6 +2298,23 @@ mod watcher_startup_tests {
             assert_watcher_error(&error);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn deferred_manual_service_does_not_invoke_watcher_starter() {
+        let (_temp, root) = workspace("DeferredManual.java", "class DeferredManual {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -459,6 +459,10 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
         self.inner.get_all_declarations()
     }

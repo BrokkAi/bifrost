@@ -92,6 +92,7 @@ fn run() -> Result<(), String> {
                     other => return Err(format!("unknown run argument: {other}")),
                 }
             }
+            validate_query_code_access_mode()?;
             run_manifest(manifest_path, selected_repo, output_dir, max_files, profile)
         }
         "compare" => {
@@ -139,6 +140,19 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+fn validate_query_code_access_mode() -> Result<(), String> {
+    let Some(value) = env::var_os("BIFROST_BENCHMARK_QUERY_CODE_ACCESS") else {
+        return Ok(());
+    };
+    match value.to_str() {
+        Some("auto" | "scan_only") => Ok(()),
+        _ => Err(format!(
+            "BIFROST_BENCHMARK_QUERY_CODE_ACCESS must be `auto` or `scan_only`, got `{}`",
+            value.to_string_lossy()
+        )),
     }
 }
 
@@ -235,6 +249,12 @@ fn compare_reports(
 ) -> Result<(), String> {
     let baseline = load_report(&baseline_path)?;
     let candidate = load_report(&candidate_path)?;
+    if baseline.max_files.is_some() || candidate.max_files.is_some() {
+        return Err(
+            "subset benchmark reports (--max-files) cannot be compared with baseline reports"
+                .to_string(),
+        );
+    }
     let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
 
     if let Some(path) = output_path {
@@ -310,15 +330,28 @@ fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
         }
         for scenario in &repo.scenarios {
             let status = if scenario.success { "ok" } else { "failed" };
+            let case_suffix = scenario
+                .case_id
+                .as_deref()
+                .map(|case_id| format!("/{case_id}"))
+                .unwrap_or_default();
             match scenario.median_ms {
                 Some(median) => {
                     println!(
-                        "  {}: {status} median={median:.1} ms",
-                        scenario.name.label()
+                        "  {}{case_suffix}: {status} median={median:.1} ms{}{}",
+                        scenario.name.label(),
+                        scenario
+                            .p95_ms
+                            .map(|p95| format!(" p95={p95:.1} ms"))
+                            .unwrap_or_default(),
+                        scenario
+                            .first_duration_ms
+                            .map(|first| format!(" first={first:.1} ms"))
+                            .unwrap_or_default()
                     );
                 }
                 None => {
-                    println!("  {}: {status}", scenario.name.label());
+                    println!("  {}{case_suffix}: {status}", scenario.name.label());
                 }
             }
             if let Some(message) = &scenario.failure_message {
@@ -367,17 +400,22 @@ fn print_compare_summary(report: &BenchmarkCompareReport) {
             continue;
         }
         let detail = scenario.detail.as_deref().unwrap_or("state changed");
+        let case_suffix = scenario
+            .case_id
+            .as_deref()
+            .map(|case_id| format!("/{case_id}"))
+            .unwrap_or_default();
         match scenario.delta_ms {
             Some(delta_ms) => match scenario.delta_pct {
                 Some(delta_pct) => println!(
-                    "  {} {} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%)",
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%) ({detail})",
                     scenario.repo_name,
                     scenario.scenario.label(),
                     scenario.transport,
                     scenario.outcome
                 ),
                 None => println!(
-                    "  {} {} {:?}: {:?} delta={delta_ms:.1} ms",
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({detail})",
                     scenario.repo_name,
                     scenario.scenario.label(),
                     scenario.transport,
@@ -385,7 +423,7 @@ fn print_compare_summary(report: &BenchmarkCompareReport) {
                 ),
             },
             None => println!(
-                "  {} {} {:?}: {:?} ({detail})",
+                "  {} {}{case_suffix} {:?}: {:?} ({detail})",
                 scenario.repo_name,
                 scenario.scenario.label(),
                 scenario.transport,
@@ -410,6 +448,9 @@ fn print_validate_help() {
 fn print_run_help() {
     println!(
         "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N] [--profile]"
+    );
+    println!(
+        "  BIFROST_BENCHMARK_QUERY_CODE_ACCESS=auto|scan_only selects the query_code reference access path"
     );
 }
 

@@ -4,15 +4,21 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::mcp_common::{BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD};
+use crate::mcp_common::{
+    BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
+};
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
 const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
 const PROFILE_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
+const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const BENCHMARK_QUERY_ACCESS_ENV: &str = "BIFROST_BENCHMARK_QUERY_CODE_ACCESS";
+const SERVER_QUERY_ACCESS_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
 
 #[derive(Debug, Clone, Copy)]
 pub struct StderrCursor {
@@ -260,13 +266,104 @@ fn close_boundary_stream(boundaries: &(Mutex<BoundaryState>, Condvar)) {
 pub struct McpSession {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    stdout: StdoutDrain,
     stderr: StderrDrain,
     next_id: u64,
 }
 
+struct StdoutDrain {
+    responses: Receiver<Result<Value, String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StdoutDrain {
+    fn spawn(stdout: ChildStdout) -> Result<Self, String> {
+        let (sender, responses) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("bifrost-benchmark-stdout".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => {
+                            let _ = sender.send(Err("bifrost MCP server closed early".to_string()));
+                            break;
+                        }
+                        Ok(_) => match serde_json::from_str(&line) {
+                            Ok(response) => {
+                                if sender.send(Ok(response)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(format!(
+                                    "failed to parse MCP JSON response: {error}; line={line}"
+                                )));
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            let _ =
+                                sender.send(Err(format!("failed to read MCP response: {error}")));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to spawn MCP stdout reader: {error}"))?;
+        Ok(Self {
+            responses,
+            worker: Some(worker),
+        })
+    }
+
+    fn receive(&self, timeout: Duration) -> Result<Value, String> {
+        receive_response(&self.responses, timeout)
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn receive_response(
+    responses: &Receiver<Result<Value, String>>,
+    timeout: Duration,
+) -> Result<Value, String> {
+    match responses.recv_timeout(timeout) {
+        Ok(response) => response,
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "timed out after {}s waiting for bifrost MCP response",
+            timeout.as_secs_f64()
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("bifrost MCP stdout reader stopped early".to_string())
+        }
+    }
+}
+
 impl McpSession {
     pub fn start(root: &Path, no_line_numbers: bool, profile: bool) -> Result<Self, String> {
+        Self::start_with_query_access(root, no_line_numbers, profile, None)
+    }
+
+    pub(super) fn start_scan_only(
+        root: &Path,
+        no_line_numbers: bool,
+        profile: bool,
+    ) -> Result<Self, String> {
+        Self::start_with_query_access(root, no_line_numbers, profile, Some("scan_only"))
+    }
+
+    fn start_with_query_access(
+        root: &Path,
+        no_line_numbers: bool,
+        profile: bool,
+        query_access: Option<&str>,
+    ) -> Result<Self, String> {
         let bifrost_binary = bifrost_binary_path()?;
         let mut command = Command::new(&bifrost_binary);
         command
@@ -274,11 +371,24 @@ impl McpSession {
             .arg(root)
             .arg("--server")
             .arg("searchtools");
+        // Pinned benchmark checkouts are immutable for the lifetime of a run.
+        // Watching them lets delayed VCS/cache events invalidate analyzer caches
+        // between samples and measures rebuild jitter rather than warm queries.
+        command.env(MCP_FILE_WATCHER_ENV, "off");
         if no_line_numbers {
             command.arg("--no-line-numbers");
         }
         if profile {
             command.env("BIFROST_TIMING", "1");
+        }
+        // The server selector is an internal transport detail. Never inherit
+        // an ambient value into a benchmark process; only the validated
+        // benchmark-facing selector below may set it.
+        command.env_remove(SERVER_QUERY_ACCESS_ENV);
+        if let Some(access_mode) = query_access {
+            command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
+        } else if let Some(access_mode) = std::env::var_os(BENCHMARK_QUERY_ACCESS_ENV) {
+            command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -314,10 +424,18 @@ impl McpSession {
                 return Err(err);
             }
         };
+        let mut stdout = match StdoutDrain::spawn(stdout) {
+            Ok(stdout) => stdout,
+            Err(err) => {
+                terminate_child(&mut child);
+                return Err(err);
+            }
+        };
         let stderr = match StderrDrain::spawn(stderr, STDERR_TAIL_CAPACITY_BYTES) {
             Ok(stderr) => stderr,
             Err(err) => {
                 terminate_child(&mut child);
+                stdout.join();
                 return Err(err);
             }
         };
@@ -325,7 +443,7 @@ impl McpSession {
         Ok(Self {
             child,
             stdin,
-            reader: BufReader::new(stdout),
+            stdout,
             stderr,
             next_id: 1,
         })
@@ -348,6 +466,7 @@ impl McpSession {
         if response.get("error").is_some() {
             return Err(format!("bifrost initialize failed: {response}"));
         }
+        validate_server_build_identity(&response)?;
 
         self.notify(json!({
             "jsonrpc": "2.0",
@@ -422,7 +541,13 @@ impl McpSession {
 
     fn request(&mut self, payload: Value) -> Result<Value, String> {
         self.write_line(&payload)?;
-        self.read_line()
+        match self.stdout.receive(MCP_RESPONSE_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.shutdown();
+                Err(error)
+            }
+        }
     }
 
     fn notify(&mut self, payload: Value) -> Result<(), String> {
@@ -435,21 +560,6 @@ impl McpSession {
             .map_err(|err| format!("failed to write MCP request: {err}"))
     }
 
-    fn read_line(&mut self) -> Result<Value, String> {
-        let mut line = String::new();
-        let bytes = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|err| format!("failed to read MCP response: {err}"))?;
-        if bytes == 0 {
-            self.shutdown();
-            return Err("bifrost MCP server closed early".to_string());
-        }
-
-        serde_json::from_str(&line)
-            .map_err(|err| format!("failed to parse MCP JSON response: {err}; line={line}"))
-    }
-
     fn take_id(&mut self) -> u64 {
         let next = self.next_id;
         self.next_id += 1;
@@ -459,8 +569,26 @@ impl McpSession {
     fn shutdown(&mut self) {
         let _ = self.stdin.flush();
         terminate_child(&mut self.child);
+        self.stdout.join();
         self.stderr.join();
     }
+}
+
+fn validate_server_build_identity(response: &Value) -> Result<(), String> {
+    let server_identity = response
+        .pointer("/result/serverInfo/buildIdentity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "bifrost MCP initialize response omitted serverInfo.buildIdentity; rebuild the server binary"
+                .to_string()
+        })?;
+    if server_identity != crate::BIFROST_BUILD_IDENTITY {
+        return Err(format!(
+            "bifrost MCP server build identity `{server_identity}` does not match benchmark harness `{}`; rebuild both bifrost and bifrost_benchmark",
+            crate::BIFROST_BUILD_IDENTITY
+        ));
+    }
+    Ok(())
 }
 
 fn terminate_child(child: &mut Child) {
@@ -625,5 +753,39 @@ mod tests {
         let captured = tail.capture_since(cursor);
         assert_eq!(captured.text, "new-one\n");
         assert!(!captured.truncated);
+    }
+
+    #[test]
+    fn stdout_response_wait_has_a_hard_timeout() {
+        let (_sender, responses) = mpsc::channel();
+
+        let error = receive_response(&responses, Duration::from_millis(1))
+            .expect_err("silent child must time out");
+
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn initialize_build_identity_rejects_missing_and_stale_servers() {
+        let missing = json!({"result": {"serverInfo": {}}});
+        let error = validate_server_build_identity(&missing)
+            .expect_err("missing identity must be rejected");
+        assert!(
+            error.contains("omitted serverInfo.buildIdentity"),
+            "{error}"
+        );
+
+        let stale = json!({
+            "result": {"serverInfo": {"buildIdentity": "stale-binary"}}
+        });
+        let error =
+            validate_server_build_identity(&stale).expect_err("stale server must be rejected");
+        assert!(error.contains("stale-binary"), "{error}");
+        assert!(error.contains(crate::BIFROST_BUILD_IDENTITY), "{error}");
+
+        let current = json!({
+            "result": {"serverInfo": {"buildIdentity": crate::BIFROST_BUILD_IDENTITY}}
+        });
+        validate_server_build_identity(&current).expect("matching server identity");
     }
 }

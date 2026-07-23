@@ -2633,6 +2633,34 @@ object Types {
 }
 
 #[test]
+fn scala_enclosing_class_self_type_precedes_incomplete_ancestor_lookup_for_bare_apply() {
+    let source = r#"package app
+object Elem {
+  def apply(value: Int): Elem = new Elem(value)
+}
+abstract class Node
+class Elem(val value: Int) extends Node with Serializable {
+  def copy(value: Int = this.value): Elem = Elem(value)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Elem.scala", source)
+        .build();
+    let reference = source.rfind("Elem(value)").expect("companion apply");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [location_in("app/Elem.scala", source, reference)]}).to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Elem$.apply",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_bare_application_prefers_exact_lexical_singleton_before_package_decoys() {
     let source = r#"package app
 object cons { def apply(left: Int, right: Int): Int = 0 }

@@ -211,6 +211,31 @@ where
     pub(crate) fn edge_count(&self) -> usize {
         self.outgoing.len()
     }
+
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        Self::estimated_bytes_for_parts(
+            self.nodes.len(),
+            self.index_by_node.capacity(),
+            self.edge_count(),
+        )
+    }
+
+    pub(crate) fn estimated_bytes_for_parts(
+        node_count: usize,
+        index_capacity: usize,
+        edge_count: usize,
+    ) -> u64 {
+        let rows_bytes = ((node_count.saturating_add(1)) as u64)
+            .saturating_mul(std::mem::size_of::<u32>() as u64)
+            .saturating_add((edge_count as u64).saturating_mul(std::mem::size_of::<u32>() as u64));
+        (std::mem::size_of::<Self>() as u64)
+            .saturating_add((node_count as u64).saturating_mul(std::mem::size_of::<K>() as u64))
+            .saturating_add(
+                (index_capacity as u64)
+                    .saturating_mul((std::mem::size_of::<(K, u32)>() + 1) as u64),
+            )
+            .saturating_add(rows_bytes.saturating_mul(2))
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +278,14 @@ mod tests {
         assert_eq!(graph.outgoing(0), [1, 2]);
         assert_eq!(graph.incoming(1), [0, 2]);
         assert_eq!(graph.node_id(&"c"), Some(2));
+        assert!(graph.estimated_bytes() > 0);
+        assert_eq!(
+            graph.estimated_bytes(),
+            CompactDirectedGraph::<&str>::estimated_bytes_for_parts(
+                graph.nodes.len(),
+                graph.index_by_node.capacity(),
+                graph.edge_count(),
+            )
+        );
     }
 }

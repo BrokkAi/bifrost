@@ -31,6 +31,47 @@ threshold-crossing improvements and one remaining threshold-crossing regression;
 this promotion registers the broad analyzer-performance improvements as the new
 comparison point without changing the regression detector.
 
+The July 15 blessed Ubuntu baseline (`run-20260715T120808Z.json`, Bifrost commit
+`e3860e0b5d50e8b82bb963569d4c5a170b9d977c`) had zero scenario failures across
+the same 10 repositories and 76 scenarios. It was checked in by commit
+`0d12e86f982c734d8caf446e42990b02fec0b997`; the originating Actions run was not
+recorded in the repository.
+
+The issue #920 query-regression baseline is promoted from the complete full
+manual benchmark artifact on July 22, 2026 (`run-20260722T214543Z.json` from
+Actions run 29959610518, Bifrost commit
+`ba488b66a840356ed946f19d2d81e2960c84d7f2`). The harness had zero scenario
+failures across the same 10 repositories and 92 scenarios, including all 16 new
+`query_code` cases with stable result cardinalities and no query diagnostics.
+The artifact also passes strict comparison against itself, including the
+dual-arm first-to-warm retention invariant. A provisional artifact from run
+29956839833 was rejected as an unusually fast sample after two current-head
+replays produced 27 and 21 timing flags against it. The promoted artifact has no
+regressions when compared with either the immediately preceding current-head
+artifact from run 29958615453 or the earlier representative artifact from run
+29955662059. The cold-retention comparator also applies its ordinary 50 ms
+absolute noise floor to the 10x ratio gate, retaining the original eager-build
+failure while ignoring 1-11 ms boundary jitter. This promotion deliberately
+establishes the reviewed final-head post-#920 floor so subsequent strict runs
+exercise the new query correctness, cache-path, and timing contracts instead of
+treating all 16 cases as absent from the baseline.
+
+The July 23 post-sync issue #920 refresh is promoted from the exact-branch
+artifact `run-20260723T015503Z.json` from Actions run 29972484784 at Bifrost
+commit `cf46d197f1324af149bea45907c35eebca0d8f20`. All 92 scenarios succeeded,
+including all 16 `query_code` cases, and the workflow reported no regression
+against the prior blessed baseline. The artifact has no threshold crossings in
+either comparison direction against exact-head run 29971751784 and passes strict
+comparison against itself. Run 29966995969 was rejected because its broadly
+faster runner produced 30 threshold crossings when a representative replay was
+compared against it; blessing that sample would have manufactured regressions
+across unrelated languages. This refresh includes the Rust analysis-epoch fix,
+the Scala relative-import changes, the O(1) lazy-LRU/SearchTools cache work, and
+the known inert built-in macro suppression, read-first service locking,
+HEAD-keyed relevance caches, and fragmented C++ export-member recovery from the
+cutoff master, so future comparisons use the current persisted-store, cache,
+concurrency, and declaration contracts.
+
 It is not written automatically. Promote it deliberately:
 
 1. Run the benchmark workflow or a local `bifrost_benchmark run`.

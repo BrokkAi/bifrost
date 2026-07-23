@@ -18,6 +18,7 @@ use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
 use crate::hash::HashSet;
+use std::sync::Arc;
 
 pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};
 pub(in crate::analyzer::usages) use resolver::{
@@ -42,14 +43,14 @@ where
 pub(crate) fn build_full_scala_usage_edges(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
-) -> Option<UsageEdges> {
+) -> Option<Arc<UsageEdges>> {
     let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
     let edges = scala.full_usage_edges(nodes, || {
         let resolver = ScalaEdgeResolver::try_new(analyzer)
             .expect("resolved Scala analyzer must construct a Scala edge resolver");
         resolver.build_edges(analyzer, nodes, |_| true)
     });
-    Some((*edges).clone())
+    Some(edges)
 }
 
 pub(crate) fn build_scala_usage_edge_weights<F>(
@@ -576,5 +577,20 @@ object Use {
         let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
         updated.full_usage_edges(&first_nodes, build);
         assert_eq!(builds.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn full_usage_edge_builder_returns_the_cached_graph_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "Target.scala");
+        file.write("package app\nclass Target\n").unwrap();
+        let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
+        let nodes = HashSet::from_iter(["app.Target".to_string()]);
+
+        let first = build_full_scala_usage_edges(&analyzer, &nodes).unwrap();
+        let second = build_full_scala_usage_edges(&analyzer, &nodes).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

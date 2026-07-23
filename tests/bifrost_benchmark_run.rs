@@ -1,5 +1,7 @@
 use git2::Repository;
 use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,6 +38,7 @@ required_scenarios = [
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
+  "query_code",
 ]
 
 [[repos]]
@@ -56,6 +59,7 @@ scenarios = [
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
+  "query_code",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
@@ -75,6 +79,13 @@ call_hierarchy_queries = [
 ]
 type_hierarchy_queries = [
   {{ path = "XExtendsY.java", line = 1, column = 14, min_supertypes = 1 }},
+]
+query_code_queries = [
+  {{ id = "class-a", workloads = ["exact_name", "warm_reuse"], query_json = '{{"match":{{"kind":"class","name":"A"}},"limit":20}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "broad-classes", workloads = ["broad"], query_json = '{{"match":{{"kind":"class"}},"limit":100}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "regex-class-a", workloads = ["regex"], query_json = '{{"match":{{"kind":"class","name":{{"regex":"^A$"}}}},"limit":20}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "methods-inside-a", workloads = ["containment"], query_json = '{{"match":{{"kind":"method"}},"inside":{{"kind":"class","name":"A"}},"limit":100}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"method"}}', min_results = 1, expected_truncated = false }},
+  {{ id = "class-a-file", workloads = ["typed_traversal"], query_json = '{{"match":{{"kind":"class","name":"A"}},"steps":[{{"op":"file_of"}}],"limit":20}}', expected_witness_json = '{{"result_type":"file","path":"A.java"}}', min_results = 1, expected_truncated = false }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -108,7 +119,7 @@ type_hierarchy_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 11, "report: {report}");
+    assert_eq!(scenarios.len(), 16, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
         assert!(
@@ -132,6 +143,150 @@ type_hierarchy_queries = [
     assert!(names.contains(&"get_definition"), "report: {report}");
     assert!(names.contains(&"call_hierarchy"), "report: {report}");
     assert!(names.contains(&"type_hierarchy"), "report: {report}");
+    assert!(names.contains(&"query_code"), "report: {report}");
+
+    let query_code = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "query_code")
+        .expect("query_code scenario");
+    assert_eq!(query_code["case_id"], "class-a", "report: {report}");
+    assert!(
+        query_code["first_duration_ms"].is_number(),
+        "report: {report}"
+    );
+    assert!(query_code["p95_ms"].is_number(), "report: {report}");
+    assert_eq!(
+        query_code["query_code"]["first"]["result_cardinality"], 1,
+        "report: {report}"
+    );
+    assert!(
+        query_code["query_code"]["cold_contract"]
+            .as_str()
+            .is_some_and(|contract| contract.contains("primed by an untimed scan-only process")),
+        "report: {report}"
+    );
+    assert!(
+        query_code["query_code"]["first"]["facts_cache"]["persisted_hydrations"]
+            .as_u64()
+            .is_some_and(|hydrations| hydrations > 0),
+        "the measured process must hydrate the primed durable facts: {report}"
+    );
+    assert_eq!(
+        query_code["query_code"]["first"]["facts_cache"]["extractions"], 0,
+        "the measured first request must not include structural-fact extraction: {report}"
+    );
+    assert!(
+        query_code["query_code"]["warm"]["facts_cache"]["memory_hits"]
+            .as_u64()
+            .is_some_and(|hits| hits > 0),
+        "report: {report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn query_code_empty_fast_response_fails_oracle_and_discards_all_timings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-repo");
+    copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
+    init_git_repo(&repo_root);
+
+    let fake_server = temp.path().join("fake-bifrost");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake-bifrost","version":"0","buildIdentity":"__IDENTITY__"}}}'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"format":"bifrost_code_query_profile/v2","result":{"results":[],"truncated":false},"timings_ns":{"total":1},"work":{"scanned_files":0,"scanned_source_bytes":0,"fact_nodes":0,"pipeline_rows":0,"examined_references":0,"import_files_resolved":0,"import_edges_resolved":0},"cache_layers":[],"access_path":{}}}}'
+      ;;
+    *'"method":"bifrost/benchmark-profile-boundary"'*)
+      printf '\n\036bifrost-benchmark-profile-boundary\036\n' >&2
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+      ;;
+  esac
+done
+"#
+    .replace("__IDENTITY__", brokk_bifrost::BIFROST_BUILD_IDENTITY);
+    fs::write(&fake_server, script).expect("write fake MCP server");
+    let mut permissions = fs::metadata(&fake_server)
+        .expect("fake metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_server, permissions).expect("make fake executable");
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = ["workspace_build"]
+
+[[repos]]
+name = "fixture-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["workspace_build", "query_code"]
+query_code_queries = [
+  {{ id = "class-a", workloads = ["exact_name", "warm_reuse"], query_json = '{{"match":{{"kind":"class","name":"A"}},"limit":20}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, max_results = 1 }},
+]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .env("BIFROST_BENCHMARK_BIFROST_BIN", &fake_server)
+        .output()
+        .expect("run bifrost_benchmark");
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let query = report["repos"][0]["scenarios"]
+        .as_array()
+        .expect("scenario array")
+        .iter()
+        .find(|scenario| scenario["name"] == "query_code")
+        .expect("query_code scenario");
+    assert_eq!(query["success"], false, "report: {report}");
+    assert!(
+        query["failure_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("returned 0 result(s), expected at least 1")),
+        "report: {report}"
+    );
+    assert!(query.get("first_duration_ms").is_none(), "report: {report}");
+    assert_eq!(query["warmup_durations_ms"], json!([]), "report: {report}");
+    assert_eq!(
+        query["measured_durations_ms"],
+        json!([]),
+        "report: {report}"
+    );
 }
 
 #[test]
@@ -288,6 +443,7 @@ scenarios = [
   "get_summaries",
   "scan_usages",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
@@ -298,6 +454,9 @@ usage_targets = [
 ]
 definition_queries = [
   {{ path = "E.java", line = 10, column = 17, expected_status = "no_definition" }},
+]
+query_code_queries = [
+  {{ id = "class-a", workloads = ["exact_name", "warm_reuse"], query_json = '{{"match":{{"kind":"class","name":"A"}},"limit":20}}', required_paths = ["A.java"], expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, max_results = 1 }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -343,10 +502,26 @@ definition_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 6, "report: {report}");
+    assert_eq!(scenarios.len(), 7, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
     }
+    let query_code = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "query_code")
+        .expect("query_code scenario");
+    assert_eq!(query_code["skipped"], true, "report: {report}");
+    assert!(
+        query_code.get("first_duration_ms").is_none(),
+        "report: {report}"
+    );
+    assert!(query_code.get("query_code").is_none(), "report: {report}");
+    assert!(
+        query_code["failure_message"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("full-workspace oracle skipped")),
+        "report: {report}"
+    );
 }
 
 #[test]

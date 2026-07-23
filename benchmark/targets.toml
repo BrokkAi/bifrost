@@ -26,6 +26,7 @@ required_scenarios = [
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
+  "query_code",
 ]
 
 [[repos]]
@@ -44,6 +45,7 @@ scenarios = [
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
+  "query_code",
 ]
 search_patterns = ["Gson"]
 location_symbols = ["Gson.fromJson"]
@@ -58,6 +60,12 @@ call_hierarchy_queries = [
 ]
 type_hierarchy_queries = [
   { path = "gson/src/main/java/com/google/gson/TypeAdapter.java", line = 121, column = 23, min_subtypes = 1 },
+]
+query_code_queries = [
+  { id = "exact-gson-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["java"],"where":["gson/src/main/java/com/google/gson/Gson.java"],"match":{"kind":"class","name":"Gson"},"limit":100}', required_paths = ["gson/src/main/java/com/google/gson/Gson.java"], expected_witness_json = '{"result_type":"structural_match","path":"gson/src/main/java/com/google/gson/Gson.java","kind":"class","enclosing_symbol":"com.google.gson.Gson"}', min_results = 1, max_results = 1 },
+  { id = "regex-gson-class", workloads = ["regex"], query_json = '{"languages":["java"],"where":["gson/src/main/java/com/google/gson/Gson.java"],"match":{"kind":"class","name":{"regex":"^Gson$"}},"limit":100}', required_paths = ["gson/src/main/java/com/google/gson/Gson.java"], expected_witness_json = '{"result_type":"structural_match","path":"gson/src/main/java/com/google/gson/Gson.java","kind":"class","enclosing_symbol":"com.google.gson.Gson"}', min_results = 1, max_results = 1 },
+  { id = "methods-inside-gson", workloads = ["containment"], query_json = '{"languages":["java"],"where":["gson/src/main/java/com/google/gson/Gson.java"],"match":{"kind":"method"},"inside":{"kind":"class","name":"Gson"},"limit":1000}', required_paths = ["gson/src/main/java/com/google/gson/Gson.java"], expected_witness_json = '{"result_type":"structural_match","path":"gson/src/main/java/com/google/gson/Gson.java","kind":"method","enclosing_symbol":"com.google.gson.Gson.newBuilder"}', min_results = 38, max_results = 38 },
+  { id = "gson-class-importers", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["java"],"where":["gson/src/main/java/com/google/gson/Gson.java"],"match":{"kind":"class","name":"Gson"},"steps":[{"op":"file_of"},{"op":"importers_of"}],"limit":1000}', required_paths = ["gson/src/main/java/com/google/gson/Gson.java", "extras/src/main/java/com/google/gson/extras/examples/rawcollections/RawCollectionsExample.java"], expected_witness_json = '{"result_type":"file","path":"extras/src/main/java/com/google/gson/extras/examples/rawcollections/RawCollectionsExample.java","provenance":[{"seed":{"path":"gson/src/main/java/com/google/gson/Gson.java","kind":"class","start_line":135,"end_line":1265},"steps":[{"op":"file_of","result":{"result_type":"file","path":"gson/src/main/java/com/google/gson/Gson.java"}},{"op":"importers_of","result":{"result_type":"file","path":"extras/src/main/java/com/google/gson/extras/examples/rawcollections/RawCollectionsExample.java"}}]}]}', min_results = 112, max_results = 112 },
 ]
 
 [[repos]]
@@ -74,6 +82,7 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["Engine"]
 location_symbols = ["gin.New"]
@@ -82,6 +91,9 @@ seed_file_paths = ["gin.go"]
 usage_symbols = ["gin.New"]
 definition_queries = [
   { path = "gin.go", line = 238, column = 12, symbol = "New", expected_status = "resolved", expected_fqn = "github.com/gin-gonic/gin.New" },
+]
+query_code_queries = [
+  { id = "exact-engine-type", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["go"],"where":["gin.go"],"match":{"kind":"class","name":"Engine"},"limit":100}', required_paths = ["gin.go"], expected_witness_json = '{"result_type":"structural_match","path":"gin.go","kind":"class","enclosing_symbol":"github.com/gin-gonic/gin.Engine"}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
@@ -97,6 +109,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["format"]
 location_symbols = ["vformat"]
@@ -106,6 +119,9 @@ definition_queries = [
   { path = "include/fmt/base.h", line = 2798, column = 11, symbol = "vformat_to", expected_status = "resolved", expected_fqn = "detail.vformat_to" },
   { path = "include/fmt/base.h", line = 2798, column = 11, symbol = "vformat_to", expected_status = "resolved", expected_fqn = "detail.vformat_to" },
   { path = "include/fmt/base.h", line = 2798, column = 11, symbol = "vformat_to", expected_status = "resolved", expected_fqn = "detail.vformat_to" },
+]
+query_code_queries = [
+  { id = "broad-functions-base-header", workloads = ["broad", "warm_reuse"], query_json = '{"languages":["cpp"],"where":["include/fmt/base.h"],"match":{"kind":"function"},"limit":1000}', required_paths = ["include/fmt/base.h"], expected_witness_json = '{"result_type":"structural_match","path":"include/fmt/base.h","kind":"function","enclosing_symbol":"min_of"}', min_results = 129, max_results = 129 },
 ]
 
 [[repos]]
@@ -123,6 +139,7 @@ scenarios = [
   "scan_usages",
   "dead_code_smells",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["listen"]
 location_symbols = ["request.js.accepts"]
@@ -137,6 +154,10 @@ dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
 dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "lib/application.js", line = 574, column = 3, symbol = "tryRender", expected_status = "resolved", expected_fqn = "tryRender" },
+]
+query_code_queries = [
+  { id = "exact-try-render-function", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["javascript"],"where":["lib/application.js"],"match":{"kind":"function","name":"tryRender"},"limit":100}', required_paths = ["lib/application.js"], expected_witness_json = '{"result_type":"structural_match","path":"lib/application.js","kind":"function","enclosing_symbol":"tryRender"}', min_results = 1, max_results = 1 },
+  { id = "try-render-importers", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["javascript"],"where":["lib/application.js"],"match":{"kind":"function","name":"tryRender"},"steps":[{"op":"file_of"},{"op":"importers_of"}],"limit":1000}', required_paths = ["lib/application.js", "lib/express.js"], expected_witness_json = '{"result_type":"file","path":"lib/express.js","provenance":[{"seed":{"path":"lib/application.js","kind":"function","start_line":625,"end_line":631},"steps":[{"op":"file_of","result":{"result_type":"file","path":"lib/application.js"}},{"op":"importers_of","result":{"result_type":"file","path":"lib/express.js"}}]}]}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
@@ -154,6 +175,7 @@ scenarios = [
   "scan_usages",
   "dead_code_smells",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["Ky"]
 location_symbols = ["Ky.create$static"]
@@ -166,6 +188,10 @@ dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
 dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "source/core/Ky.ts", line = 151, column = 18, symbol = "Ky", expected_status = "resolved", expected_fqn = "Ky" },
+]
+query_code_queries = [
+  { id = "ky-class-file", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["typescript"],"where":["source/core/Ky.ts"],"match":{"kind":"class","name":"Ky"},"steps":[{"op":"file_of"}],"limit":100}', required_paths = ["source/core/Ky.ts"], expected_witness_json = '{"result_type":"file","path":"source/core/Ky.ts","provenance":[{"seed":{"path":"source/core/Ky.ts","kind":"class","start_line":142,"end_line":1042},"steps":[{"op":"file_of","result":{"result_type":"file","path":"source/core/Ky.ts"}}]}]}', min_results = 1, max_results = 1 },
+  { id = "ky-class-importers", workloads = ["exact_name", "typed_traversal", "warm_reuse"], query_json = '{"languages":["typescript"],"where":["source/core/Ky.ts"],"match":{"kind":"class","name":"Ky"},"steps":[{"op":"file_of"},{"op":"importers_of"}],"limit":1000}', required_paths = ["source/core/Ky.ts", "source/index.ts"], expected_witness_json = '{"result_type":"file","path":"source/index.ts","provenance":[{"seed":{"path":"source/core/Ky.ts","kind":"class","start_line":142,"end_line":1042},"steps":[{"op":"file_of","result":{"result_type":"file","path":"source/core/Ky.ts"}},{"op":"importers_of","result":{"result_type":"file","path":"source/index.ts"}}]}]}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
@@ -183,6 +209,7 @@ scenarios = [
   "scan_usages",
   "dead_code_smells",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["Command"]
 location_symbols = ["click.core.Command.main"]
@@ -195,6 +222,9 @@ dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
 dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
 definition_queries = [
   { path = "src/click/core.py", line = 1366, column = 42, symbol = "_complete_visible_commands", expected_status = "resolved", expected_fqn = "click.core._complete_visible_commands" },
+]
+query_code_queries = [
+  { id = "exact-command-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["python"],"where":["src/click/core.py"],"match":{"kind":"class","name":"Command"},"limit":100}', required_paths = ["src/click/core.py"], expected_witness_json = '{"result_type":"structural_match","path":"src/click/core.py","kind":"class","enclosing_symbol":"click.core.Command"}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
@@ -210,6 +240,7 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["Value"]
 location_symbols = ["value.to_value"]
@@ -217,6 +248,9 @@ summary_targets = ["src/value/mod.rs"]
 seed_file_paths = ["src/value/mod.rs"]
 definition_queries = [
   { path = "src/value/mod.rs", line = 535, column = 20, symbol = "Number", expected_status = "resolved", expected_fqn = "value.Value.Number" },
+]
+query_code_queries = [
+  { id = "exact-value-type", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["rust"],"where":["src/value/mod.rs"],"match":{"kind":"class","name":"Value"},"limit":100}', required_paths = ["src/value/mod.rs"], expected_witness_json = '{"result_type":"structural_match","path":"src/value/mod.rs","kind":"class","enclosing_symbol":"value.Value"}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
@@ -235,6 +269,7 @@ scenarios = [
   "scan_usages",
   "dead_code_smells",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["RouteCollector"]
 location_symbols = ["FastRoute.RouteCollector.addRoute"]
@@ -253,6 +288,9 @@ dead_code_expect_report_absent = ["no definition found", "not yet supported for 
 definition_queries = [
   { path = "src/RouteCollector.php", line = 74, column = 16, symbol = "addRoute", expected_status = "resolved", expected_fqn = "FastRoute.RouteCollector.addRoute" },
 ]
+query_code_queries = [
+  { id = "exact-route-collector-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["php"],"where":["src/RouteCollector.php"],"match":{"kind":"class","name":"RouteCollector"},"limit":100}', required_paths = ["src/RouteCollector.php"], expected_witness_json = '{"result_type":"structural_match","path":"src/RouteCollector.php","kind":"class","enclosing_symbol":"FastRoute.RouteCollector"}', min_results = 1, max_results = 1 },
+]
 
 [[repos]]
 name = "scala-xml"
@@ -269,6 +307,7 @@ scenarios = [
   "scan_usages",
   "dead_code_smells",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["Elem"]
 location_symbols = ["scala.xml.Elem.copy"]
@@ -283,6 +322,9 @@ definition_queries = [
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
+]
+query_code_queries = [
+  { id = "exact-elem-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["scala"],"where":["shared/src/main/scala/scala/xml/Elem.scala"],"match":{"kind":"class","name":"Elem"},"limit":100}', required_paths = ["shared/src/main/scala/scala/xml/Elem.scala"], expected_witness_json = '{"result_type":"structural_match","path":"shared/src/main/scala/scala/xml/Elem.scala","kind":"class","enclosing_symbol":"scala.xml.Elem$"}', min_results = 2, max_results = 2 },
 ]
 
 [[repos]]
@@ -299,6 +341,7 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "get_definition",
+  "query_code",
 ]
 search_patterns = ["SqlMapper"]
 location_symbols = ["Dapper.SqlMapper$CacheInfo"]
@@ -307,4 +350,8 @@ seed_file_paths = ["Dapper/SqlMapper.cs"]
 usage_symbols = ["Dapper.SqlMapper$CacheInfo"]
 definition_queries = [
   { path = "Dapper/SqlMapper.cs", line = 1862, column = 28, symbol = "CacheInfo", expected_status = "resolved", expected_fqn = "Dapper.SqlMapper$CacheInfo" },
+]
+query_code_queries = [
+  { id = "exact-sql-mapper-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["csharp"],"where":["Dapper/SqlMapper.cs"],"match":{"kind":"class","name":"SqlMapper"},"limit":100}', required_paths = ["Dapper/SqlMapper.cs"], expected_witness_json = '{"result_type":"structural_match","path":"Dapper/SqlMapper.cs","kind":"class","enclosing_symbol":"Dapper.SqlMapper"}', min_results = 1, max_results = 1 },
+  { id = "workspace-exact-sql-mapper-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["csharp"],"match":{"kind":"class","name":"SqlMapper"},"limit":100}', required_paths = ["Dapper/SqlMapper.cs"], expected_witness_json = '{"result_type":"structural_match","path":"Dapper/SqlMapper.cs","kind":"class","enclosing_symbol":"Dapper.SqlMapper"}', min_results = 27, max_results = 27 },
 ]

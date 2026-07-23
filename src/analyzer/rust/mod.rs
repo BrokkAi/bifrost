@@ -528,6 +528,10 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.structural_search_providers()
     }
 
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }

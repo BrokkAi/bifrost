@@ -1,4 +1,5 @@
 /target
+/.cache/
 /docs/dist
 /docs/.astro
 **/node_modules/
