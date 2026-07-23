@@ -20882,6 +20882,59 @@ fn cpp_type_reference_does_not_resolve_to_same_named_function() {
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
+// An object-like annotation macro parses as the declaration's type: the
+// reference must resolve to the `#define` in the same file, not miss every
+// type path and claim an include boundary for a name indexed in the very
+// file being probed (#1122, the xxhash/unity shape).
+#[test]
+fn cpp_annotation_macro_resolves_to_define_in_same_file() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "state.h",
+            "#define XXH_ALIGN_MEMBER(align, type) type __attribute__((aligned(align)))\ntypedef struct { XXH_ALIGN_MEMBER(64, long long acc[8]); } XXH3_state_s;\n",
+        )
+        .build();
+
+    let line = "typedef struct { XXH_ALIGN_MEMBER(64, long long acc[8]); } XXH3_state_s;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"state.h","line":2,"column":{}}}]}}"#,
+            column_of(line, "XXH_ALIGN_MEMBER")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "state.h", "{value}");
+}
+
+// A function-like macro call resolves to its `#define` in an included
+// header (#1122's call-path sibling shape).
+#[test]
+fn cpp_function_like_macro_call_resolves_to_define_in_included_header() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("util.h", "#define MAX2(a, b) ((a) > (b) ? (a) : (b))\n")
+        .file(
+            "app.c",
+            "#include \"util.h\"\nint f(int x) { return MAX2(x, 1); }\n",
+        )
+        .build();
+
+    let line = "int f(int x) { return MAX2(x, 1); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.c","line":2,"column":{}}}]}}"#,
+            column_of(line, "MAX2")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "util.h", "{value}");
+}
+
 #[test]
 fn cpp_qualified_call_does_not_cross_unrelated_namespace() {
     let project = InlineTestProject::with_language(Language::Cpp)

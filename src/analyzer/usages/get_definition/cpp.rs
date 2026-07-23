@@ -852,6 +852,44 @@ fn cpp_template_application_node(mut node: Node<'_>) -> Option<Node<'_>> {
     application
 }
 
+/// Macros are indexed as bare-named `CodeUnitType::Macro` units, but the
+/// type and callable resolvers never consult them: an annotation macro
+/// (`XXH_ALIGN_MEMBER(64, ...)`, `UNITY_PTR_ATTRIBUTE`) parses as the
+/// declaration's type, and a function-like macro call parses as a call, so
+/// every structured path missed and the include-boundary heuristic then
+/// claimed the name was not indexed — while the `#define` sat in the very
+/// file being probed (#1122). Resolve visible macro units: definitions in
+/// the referencing file itself, plus definitions in headers the file
+/// includes directly (structured include-target resolution, the same
+/// information the boundary heuristic uses).
+fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+    if name.is_empty() || name.contains(':') {
+        return Vec::new();
+    }
+    let include_targets =
+        resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
+    analyzer
+        .definitions(name)
+        .filter(CodeUnit::is_macro)
+        .filter(|unit| {
+            unit.source() == file
+                || analyzer.import_statements(file).iter().any(|import| {
+                    cpp_include_paths(std::slice::from_ref(import))
+                        .iter()
+                        .any(|include| {
+                            let targets = match include_targets {
+                                Some(index) => {
+                                    resolve_include_targets_with_index(file, include, index)
+                                }
+                                None => resolve_include_targets(analyzer.project(), file, include),
+                            };
+                            targets.iter().any(|target| target == unit.source())
+                        })
+                })
+        })
+        .collect()
+}
+
 fn resolve_cpp_type_without_focused_qualifier(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -983,6 +1021,10 @@ fn resolve_cpp_type_without_focused_qualifier(
             })
             .collect();
         return candidates_outcome(candidates);
+    }
+    let macros = cpp_macro_candidates(analyzer, file, text);
+    if !macros.is_empty() {
+        return candidates_outcome(macros);
     }
     if cpp_unresolved_include_boundary(analyzer, file, text) {
         return boundary(format!(
@@ -1567,6 +1609,10 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     ));
                 }
                 CppBareCallTargetResolution::Missing => {}
+            }
+            let macros = cpp_macro_candidates(ctx.analyzer, ctx.file, name);
+            if !macros.is_empty() {
+                return candidates_outcome(macros);
             }
             no_definition(
                 "no_indexed_definition",
