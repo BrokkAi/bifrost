@@ -40,7 +40,11 @@ To regenerate, work from this directory and run:
 Then run the focused acceptance tests from the repository root:
 
     cargo test --lib analyzer::scala::language::tests
+    cargo test --lib scala_empty_lambda_parser_epoch_invalidates_prior_parsed_blobs
     cargo test --test scala_extension_soft_keyword_test
     cargo test --test scala_analyzer_test issue_1016_scala_annotated_constructor_whitespace_forms_keep_parameters_and_bodies
+    cargo test --test scala_analyzer_test issue_1068_empty_lambda_keeps_following_class_members
     cargo test --test mcp_property_fuzzer issue_1016_i1_accepts_annotated_constructor_jobctrl_scala_fixture
+    cargo test --test mcp_property_fuzzer issue_1068_i1_accepts_empty_lambda_scala_fixture
     cargo test --test searchtools_definition_selectors issue_1016_scala_annotated_constructor_supports_sources_and_body_reference_context
+    cargo test --test searchtools_definition_selectors issue_1068_scala_empty_lambda_supports_complete_symbol_source
