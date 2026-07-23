@@ -99,7 +99,8 @@ After installing or changing Bifrost or its MCP configuration, restart or
 reload the host as its integration page requires, then open a new agent session.
 Run these checks in order:
 
-1. Confirm the host lists the expected Bifrost server and tool schemas.
+1. Confirm the host lists the expected Bifrost server and that the active
+   session or Agent profile exposes the expected tool schemas.
 2. Call a Bifrost symbol tool for a declaration known to exist only in the
    active workspace. Forbid shell search and direct file reading in the smoke
    prompt.
