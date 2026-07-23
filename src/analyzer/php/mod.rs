@@ -11,6 +11,7 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
     IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic, SignatureMetadata,
@@ -106,6 +107,71 @@ impl PhpAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    pub(crate) fn prepared_syntax_limited(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<
+        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
+    > {
+        self.inner.prepared_syntax_limited(file, max_source_bytes)
+    }
+
+    pub(crate) fn declaration_candidates_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
+    }
+
+    pub(crate) fn declaration_candidates_by_fqn_limited(
+        &self,
+        fqn: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        };
+        // PHP names are intrinsic to source contents, but the adapter predates
+        // persisted FQN lookup keys. Query the bounded identifier index, then
+        // retain only the exact analyzer identity; this is still an exact
+        // lookup and never falls back to a same-name declaration.
+        let mut candidates =
+            self.inner
+                .lookup_declarations_by_identifier_limited(identifier, limit, continue_query);
+        candidates.rows.retain(|unit| unit.fq_name() == fqn);
+        candidates
+    }
+
+    pub(crate) fn direct_children_limited(
+        &self,
+        owner: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner.direct_children_limited(owner, limit)
+    }
+
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<Range> {
+        self.inner.ranges_limited(code_unit, limit)
     }
 
     pub fn is_constructor(

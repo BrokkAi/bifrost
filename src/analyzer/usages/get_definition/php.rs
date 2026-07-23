@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::ForwardQueryProvider;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::usages::php_graph::syntax::{
     assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
@@ -7,6 +8,232 @@ use crate::analyzer::usages::php_graph::syntax::{
     seed_parameter_types, static_member_parts as php_static_member_parts,
     variable_identifier as php_variable_identifier,
 };
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+
+pub(crate) struct PhpDefinitionProvider<'a> {
+    php: &'a PhpAnalyzer,
+    session: &'a ResolutionSession,
+}
+
+impl<'a> PhpDefinitionProvider<'a> {
+    pub(crate) fn new(php: &'a PhpAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self { php, session }
+    }
+}
+
+impl BoundedDefinitionLookup for PhpDefinitionProvider<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.fqn_in_language(fqn, Language::Php)
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        if language != Language::Php {
+            return Vec::new();
+        }
+        let mut units = self.session.query_limited_rows(|limit| {
+            self.php
+                .declaration_candidates_by_fqn_limited(fqn, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        units.retain(|unit| {
+            unit.fq_name() == fqn && language_for_file(unit.source()) == Language::Php
+        });
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        let mut units = self.session.query_limited_rows(|limit| {
+            self.php
+                .declaration_candidates_by_identifier_limited(ident, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        units.retain(|unit| unit.source() == file && unit.identifier() == ident);
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut children = Vec::new();
+        for owner in self.fqn(fqn) {
+            children.extend(
+                self.session
+                    .query_limited_rows(|limit| self.php.direct_children_limited(&owner, limit)),
+            );
+        }
+        sort_units(&mut children);
+        children.dedup();
+        children
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.package_exists_in_language(package, Language::Php)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        language == Language::Php
+            && self
+                .session
+                .query(|| self.php.forward_package_exists(package))
+                .unwrap_or(false)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.session
+            .query(|| self.php.forward_fqn_prefix_exists(prefix))
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PhpTypeLookupResolution {
+    pub(crate) fqn: String,
+    pub(crate) target_kind: TypeLookupTargetKind,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn php_type_lookup_resolution_bounded(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    session: &ResolutionSession,
+) -> Option<PhpTypeLookupResolution> {
+    let php = resolve_analyzer::<PhpAnalyzer>(analyzer)?;
+    let root = tree?.root_node();
+    let node = php_smallest_named_node_covering(
+        session,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let ctx = php.file_context_from_source(file, source);
+    let class_ranges = session.query(|| ClassRangeIndex::build(analyzer, file))?;
+    let bindings = php_bindings_before(
+        php,
+        file,
+        source,
+        root,
+        site.range.start_byte,
+        &class_ranges,
+        &ctx,
+        support,
+        Some(session),
+    );
+    let target_kind = if php_is_static_receiver(node) {
+        TypeLookupTargetKind::TypeReference
+    } else {
+        TypeLookupTargetKind::ValueExpression
+    };
+    let fqn = if target_kind == TypeLookupTargetKind::TypeReference {
+        php_static_scope_fqn(php, support, node, source, &ctx, &class_ranges)
+    } else {
+        php_expression_type_fqn(
+            php,
+            analyzer,
+            support,
+            node,
+            source,
+            &class_ranges,
+            &bindings,
+            &ctx,
+        )
+    }?;
+    Some(PhpTypeLookupResolution { fqn, target_kind })
+}
+
+fn php_is_static_receiver(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_call_expression"
+                | "scoped_property_access_expression"
+                | "class_constant_access_expression"
+        ) && parent
+            .child_by_field_name("scope")
+            .is_some_and(|scope| scope.id() == node.id())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn php_expression_type_fqn(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    node: Node<'_>,
+    source: &str,
+    class_ranges: &ClassRangeIndex,
+    bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
+) -> Option<String> {
+    match node.kind() {
+        "variable_name" => {
+            let name = php_variable_identifier(node, source);
+            if name == "this" {
+                class_ranges
+                    .enclosing(node.start_byte())
+                    .map(str::to_string)
+            } else {
+                first_precise(bindings, name)
+            }
+        }
+        "object_creation_expression" => php_object_creation_type(node)
+            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
+        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
+            php_expression_type_fqn(
+                php,
+                analyzer,
+                support,
+                inner,
+                source,
+                class_ranges,
+                bindings,
+                ctx,
+            )
+        }),
+        "function_call_expression" | "scoped_call_expression" => {
+            php_assignment_receiver_fqn(php, support, node, source, class_ranges, ctx)
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            php_member_call_return_type_fqn(
+                php,
+                analyzer,
+                support,
+                node,
+                source,
+                class_ranges,
+                bindings,
+                ctx,
+            )
+        }
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            php_member_access_receiver_fqn(
+                php,
+                analyzer,
+                support,
+                node,
+                source,
+                class_ranges,
+                bindings,
+                ctx,
+            )
+        }
+        "name" | "qualified_name" | "relative_scope" if php_is_static_receiver(node) => {
+            php_static_scope_fqn(php, support, node, source, ctx, class_ranges)
+        }
+        _ => None,
+    }
+}
 
 pub(super) fn resolve_php(
     analyzer: &dyn IAnalyzer,
@@ -16,6 +243,41 @@ pub(super) fn resolve_php(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
+    resolve_php_with_session(analyzer, support, file, source, tree, site, None)
+}
+
+pub(crate) fn resolve_php_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "php_analyzer_unavailable",
+            "PHP analyzer is unavailable",
+        ));
+    };
+    let support = PhpDefinitionProvider::new(php, &session);
+    let outcome =
+        resolve_php_with_session(analyzer, &support, file, source, tree, site, Some(&session));
+    session.finish(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_php_with_session(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    session: Option<&ResolutionSession>,
+) -> DefinitionLookupOutcome {
     let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
         return no_definition("php_analyzer_unavailable", "PHP analyzer is unavailable");
     };
@@ -23,8 +285,16 @@ pub(super) fn resolve_php(
         return no_definition("php_parse_failed", "PHP source could not be parsed");
     };
     let root = tree.root_node();
-    let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
-    else {
+    let node = match session {
+        Some(session) => php_smallest_named_node_covering(
+            session,
+            root,
+            site.focus_start_byte,
+            site.focus_end_byte,
+        ),
+        None => smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte),
+    };
+    let Some(node) = node else {
         return no_definition(
             "no_indexed_definition",
             format!(
@@ -34,7 +304,18 @@ pub(super) fn resolve_php(
         );
     };
     let ctx = php.file_context_from_source(file, source);
-    let class_ranges = ClassRangeIndex::build(analyzer, file);
+    let class_ranges = match session {
+        Some(session) => match session.query(|| ClassRangeIndex::build(analyzer, file)) {
+            Some(ranges) => ranges,
+            None => {
+                return no_definition(
+                    "php_resolution_interrupted",
+                    "PHP enclosing-type lookup was interrupted",
+                );
+            }
+        },
+        None => ClassRangeIndex::build(analyzer, file),
+    };
     if php_is_declaration_name(node)
         && let Some(outcome) =
             php_interface_method_declaration_outcome(php, support, source, node, &class_ranges)
@@ -94,6 +375,7 @@ pub(super) fn resolve_php(
                 &class_ranges,
                 &ctx,
                 support,
+                session,
             );
             let owner = php_instance_receiver_fqn(
                 php,
@@ -115,6 +397,34 @@ pub(super) fn resolve_php(
                 node.kind()
             ),
         ),
+    }
+}
+
+fn php_smallest_named_node_covering<'tree>(
+    session: &ResolutionSession,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !session.scope_step() || node.end_byte() < end || node.start_byte() > start {
+        return None;
+    }
+    loop {
+        let mut cursor = node.walk();
+        let mut containing = None;
+        for child in node.named_children(&mut cursor) {
+            if !session.scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing = Some(child);
+                break;
+            }
+        }
+        match containing {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
     }
 }
 
@@ -612,11 +922,15 @@ fn php_bindings_before(
     class_ranges: &ClassRangeIndex,
     ctx: &FileContext,
     support: &dyn BoundedDefinitionLookup,
+    session: Option<&ResolutionSession>,
 ) -> LocalInferenceEngine<String> {
-    let scope = php_enclosing_scope(root, byte).unwrap_or(root);
+    let scope = php_enclosing_scope(root, byte, session).unwrap_or(root);
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut stack = vec![scope];
     while let Some(node) = stack.pop() {
+        if session.is_some_and(|session| !session.scope_step()) {
+            break;
+        }
         if node.start_byte() >= byte {
             continue;
         }
@@ -647,10 +961,17 @@ fn php_bindings_before(
     bindings
 }
 
-fn php_enclosing_scope<'tree>(root: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
+fn php_enclosing_scope<'tree>(
+    root: Node<'tree>,
+    byte: usize,
+    session: Option<&ResolutionSession>,
+) -> Option<Node<'tree>> {
     let mut best = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return None;
+        }
         if node.start_byte() <= byte && byte < node.end_byte() {
             if php_is_local_scope(node) {
                 best = Some(node);

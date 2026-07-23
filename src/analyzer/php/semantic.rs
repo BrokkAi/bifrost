@@ -6,17 +6,20 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{PhpAnalyzer, ProjectFile};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{DispatchExtensibility, Language, PhpAnalyzer, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"php-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v2";
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 
@@ -97,6 +100,12 @@ fn php_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::DeferredExecution,
         SemanticCapability::NonLocalControl,
@@ -110,6 +119,7 @@ fn php_capabilities() -> SemanticCapabilities {
 #[derive(Clone)]
 struct ProcedureSpec<'tree> {
     id: ProcedureId,
+    callable: Node<'tree>,
     body: Node<'tree>,
     locator: SemanticLocator,
     lexical_parent: Option<ProcedureId>,
@@ -228,6 +238,7 @@ fn enumerate_procedures<'tree>(
             preflight = candidate;
             specs.push(ProcedureSpec {
                 id,
+                callable: frame.node,
                 body,
                 locator,
                 lexical_parent: frame.lexical_parent,
@@ -403,6 +414,22 @@ fn callable_shape<'tree>(
         _ => return None,
     };
     let is_generator = body_contains_yield(body);
+    let dispatch_extensibility = if is_static
+        || matches!(
+            kind,
+            ProcedureKind::Constructor
+                | ProcedureKind::Function
+                | ProcedureKind::LocalFunction
+                | ProcedureKind::Closure
+                | ProcedureKind::Lambda
+        )
+        || has_direct_named_child(node, "final_modifier")
+        || has_private_visibility(node, source)
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    };
     Some((
         kind,
         segment_kind,
@@ -417,10 +444,33 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
-            ..ProcedureProperties::default()
+            dispatch_extensibility,
         },
         returns_value,
     ))
+}
+
+fn has_private_visibility(node: Node<'_>, source: &str) -> bool {
+    named_children(node).into_iter().any(|child| {
+        child.kind() == "visibility_modifier"
+            && node_text(source, child).is_some_and(|text| text.eq_ignore_ascii_case("private"))
+    })
+}
+
+fn enclosing_trait(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "trait_declaration" {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn enclosing_property_is_static(node: Node<'_>) -> bool {
@@ -529,11 +579,21 @@ struct PhpControlFrame {
 }
 
 struct LoweringContext<'tree, 'targets> {
-    source: &'tree str,
+    prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, LocalBinding>,
+    receiver: Option<ValueId>,
     next_control_label: usize,
     cleanups: Vec<CleanupRegion<'tree>>,
     controls: HashMap<ScopeFrameId, Box<[PhpControlFrame]>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalBinding {
+    declaration_start: usize,
+    value: ValueId,
 }
 
 fn lower_procedure<'tree>(
@@ -562,12 +622,24 @@ fn lower_procedure<'tree>(
     let mut controls = HashMap::default();
     controls.insert(function_scope, Box::default());
     let mut context = LoweringContext {
-        source: prepared.source(),
+        prepared,
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
         next_control_label: 0,
         cleanups: Vec::new(),
         controls,
     };
+    context.emit_procedure_inputs(
+        &mut builder,
+        entry,
+        spec.callable,
+        spec.kind,
+        spec.properties,
+    )?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
 
     if spec.properties.is_generator {
         context.add_gap(
@@ -577,6 +649,26 @@ fn lower_procedure<'tree>(
             SemanticCapability::GeneratorSuspension,
             SemanticGapKind::Unsupported,
             "generator construction, suspension, delegation, send, and resumption are not fully modeled",
+        )?;
+    }
+    if spec.lexical_parent.is_some() {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "PHP closure use-lists, implicit by-value captures, and bound current receivers are not fully modeled",
+        )?;
+    }
+    if enclosing_trait(spec.callable) {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            "trait composition, conflict resolution, and consuming-class refinement require workspace dispatch evidence",
         )?;
     }
 
@@ -590,7 +682,18 @@ fn lower_procedure<'tree>(
         }
     } else if spec.returns_value {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let source =
+            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: value,
+            },
+        )?;
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -660,6 +763,317 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        callable: Node<'tree>,
+        procedure_kind: ProcedureKind,
+        properties: ProcedureProperties,
+    ) -> Result<(), PhpLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Php,
+            callable,
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(PhpLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let mapping_node = slot
+                .names
+                .first()
+                .and_then(|name| {
+                    declaration.child_by_field_name("name").filter(|candidate| {
+                        php_variable_name(self.prepared.source(), *candidate)
+                            == normalize_php_name(name)
+                    })
+                })
+                .unwrap_or(declaration);
+            let metadata = self.value_mapping(builder, mapping_node)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Parameter {
+                    ordinal,
+                    multiplicity: formal_multiplicity(slot.variadic),
+                },
+            )?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| PhpLoweringError::Invalid("too many PHP parameters".into()))?;
+            for name in slot.names {
+                let name = normalize_php_name(&name);
+                if !name.is_empty() {
+                    self.parameters.insert(name.into(), value);
+                }
+            }
+            if slot.variadic.is_some() || has_direct_named_child(declaration, "reference_modifier")
+            {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unsupported,
+                    "PHP variadic expansion and by-reference parameter aliasing are not fully modeled",
+                )?;
+            }
+        }
+
+        if !properties.is_static
+            && matches!(
+                procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Accessor
+            )
+        {
+            let metadata = self.value_mapping(builder, callable)?;
+            let receiver = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?;
+            self.receiver = Some(receiver);
+            self.parameters.insert("this".into(), receiver);
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), PhpLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(PhpLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node.id() != body.id() && is_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "assignment_expression"
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "variable_name"
+            {
+                let name = php_variable_name(self.prepared.source(), left);
+                if name.is_empty()
+                    || name == "this"
+                    || self.parameters.contains_key(name)
+                    || self.locals.contains_key(name)
+                {
+                    return Ok(WalkControl::Continue);
+                }
+                let metadata = self.value_mapping(builder, left)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals.insert(
+                    name.into(),
+                    LocalBinding {
+                        declaration_start: left.start_byte(),
+                        value,
+                    },
+                );
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn binding_value(&self, name: &str) -> Option<(ValueId, ValueFlowKind)> {
+        if let Some(binding) = self.locals.get(name) {
+            Some((binding.value, ValueFlowKind::Local))
+        } else if let Some(value) = self.parameters.get(name) {
+            Some((
+                *value,
+                if Some(*value) == self.receiver {
+                    ValueFlowKind::Receiver
+                } else {
+                    ValueFlowKind::Parameter
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn local_declaration_value(&self, name: &str, start_byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)
+            .filter(|binding| binding.declaration_start == start_byte)
+            .map(|binding| binding.value)
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, PhpLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, PhpLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), PhpLoweringError> {
+        if node.kind() != "variable_name" {
+            return Ok(());
+        }
+        let name = php_variable_name(self.prepared.source(), node);
+        let Some((source, kind)) = self.binding_value(name) else {
+            return Ok(());
+        };
+        if source != target {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn leaf_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), PhpLoweringError> {
+        let value = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.emit_lexical_input_flow(builder, node, entry, value)?;
+        self.edge(builder, entry, next)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PhpLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        if left.kind() == "variable_name" {
+            let name = php_variable_name(self.prepared.source(), left);
+            let target = self
+                .local_declaration_value(name, left.start_byte())
+                .or_else(|| self.binding_value(name).map(|(value, _)| value));
+            if let Some(target) = target {
+                let value = self.expression_value(builder, right, expression_value_kind(right))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                if matches!(
+                    right.kind(),
+                    "match_expression" | "conditional_expression" | "binary_expression"
+                ) {
+                    let children = runtime_expression_children(node);
+                    self.note_unspecified_evaluation_order(builder, terminal, node, &children)?;
+                    self.add_magic_dispatch_gaps(
+                        builder,
+                        terminal,
+                        "branching expression assignment",
+                    )?;
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "PHP branch and coalescing value joins are not yet lowered into explicit alternatives",
+                    )?;
+                }
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unknown,
+                    "dynamic or unbound PHP assignment target is not represented as a stable local",
+                )?;
+            }
+            self.edge(builder, terminal, next)?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &[right],
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            );
+        }
+
+        self.add_magic_dispatch_gaps(builder, terminal, "property or indexed assignment")?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Assignments,
+            SemanticGapKind::Unsupported,
+            "PHP property, index, destructuring, and dynamic-variable assignment flow is not lowered",
+        )?;
+        self.edge(builder, terminal, next)?;
+        let children = runtime_expression_children(node);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1005,9 +1419,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             self.point(builder, node, Vec::new())?
         };
-        let value = (!values.is_empty())
-            .then(|| self.value(builder, terminal, SemanticValueKind::Return))
-            .transpose()?;
+        let value = if let [returned] = values.as_slice() {
+            let source =
+                self.expression_value(builder, *returned, expression_value_kind(*returned))?;
+            let target = self.value(builder, terminal, SemanticValueKind::Return)?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    target,
+                },
+            )?;
+            Some(target)
+        } else {
+            None
+        };
+        if values.len() > 1 {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ReturnFlow,
+                SemanticGapKind::Unsupported,
+                "PHP return statement contained an unexpected multi-expression value shape",
+            )?;
+        }
         self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
         self.abrupt(
             builder,
@@ -1078,8 +1516,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             CompletionKind::Continue
         };
         let level = if let Some(level_node) = first_runtime_named_child(node) {
-            let Some(level) =
-                node_text(self.source, level_node).and_then(|text| text.parse::<usize>().ok())
+            let Some(level) = node_text(self.prepared.source(), level_node)
+                .and_then(|text| text.parse::<usize>().ok())
             else {
                 return self.add_gap(
                     builder,
@@ -1973,8 +2411,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "assignment_expression"
-            | "augmented_assignment_expression"
+            "assignment_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "augmented_assignment_expression"
             | "reference_assignment_expression"
             | "binary_expression"
             | "unary_op_expression"
@@ -2025,7 +2465,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
+            kind if is_runtime_leaf(kind) => self.leaf_expression(builder, node, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry),
         }
     }
@@ -2484,15 +2924,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
-        let receiver = matches!(
+        let callable_anchor = php_callable_anchor(node).unwrap_or(node);
+        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
+        let receiver_node = matches!(
             node.kind(),
             "member_call_expression" | "nullsafe_member_call_expression"
         )
-        .then(|| self.value(builder, invoke, SemanticValueKind::Receiver))
-        .transpose()?;
+        .then(|| node.child_by_field_name("object"))
+        .flatten();
+        let receiver = receiver_node
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
+            .transpose()?;
         let callable_kind = match node.kind() {
             "member_call_expression" | "nullsafe_member_call_expression" => {
                 CallableReferenceKind::BoundMethod
@@ -2518,18 +2964,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
 
-        let argument_nodes = call_arguments(node);
-        let arguments = argument_nodes
-            .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut arguments = Vec::new();
+        let mut incomplete_argument_mapping = false;
+        for argument in call_arguments(node) {
+            let Some(value_node) = php_call_argument_value(argument) else {
+                incomplete_argument_mapping = true;
+                continue;
+            };
+            let value =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let semantic = match php_call_argument_shape(argument) {
+                PhpCallArgumentShape::Positional => {
+                    SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                }
+                PhpCallArgumentShape::Named => {
+                    incomplete_argument_mapping = true;
+                    SemanticCallArgument::direct(value, ArgumentDomain::Keyword)
+                }
+                PhpCallArgumentShape::ByReferenceOrSpread => {
+                    incomplete_argument_mapping = true;
+                    SemanticCallArgument::unclassified(value)
+                }
+            };
+            arguments.push(semantic);
+        }
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: arguments.into_iter().map(Into::into).collect(),
+                arguments: arguments.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2537,6 +3002,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if callable_kind == CallableReferenceKind::Constructor {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
+        if incomplete_argument_mapping {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::ParameterFlow,
+                SemanticGapKind::Unsupported,
+                "PHP named, unpacked, and by-reference arguments require resolved parameter binding",
+            )?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -2556,7 +3035,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-        let uses_runtime_class_dispatch = runtime_class_dispatch_scope(self.source, node);
+        let uses_runtime_class_dispatch =
+            runtime_class_dispatch_scope(self.prepared.source(), node);
         if receiver.is_some() || uses_runtime_class_dispatch {
             self.add_gap(
                 builder,
@@ -3246,6 +3726,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, PhpLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(PhpLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, PhpLoweringError> {
         self.session.metadata(point)
     }
@@ -3378,6 +3868,58 @@ fn call_arguments_node(node: Node<'_>) -> Option<Node<'_>> {
         named_children(node)
             .into_iter()
             .find(|child| child.kind() == "arguments")
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhpCallArgumentShape {
+    Positional,
+    Named,
+    ByReferenceOrSpread,
+}
+
+fn php_call_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+    argument
+        .child_by_field_name("value")
+        .or_else(|| first_runtime_named_child(argument))
+        .or_else(|| {
+            (!matches!(
+                argument.kind(),
+                "argument" | "named_argument" | "variadic_unpacking"
+            ))
+            .then_some(argument)
+        })
+}
+
+fn php_call_argument_shape(argument: Node<'_>) -> PhpCallArgumentShape {
+    if argument.kind() == "named_argument" {
+        PhpCallArgumentShape::Named
+    } else if argument.kind() == "variadic_unpacking"
+        || has_direct_token(argument, "&")
+        || has_direct_named_child(argument, "reference_modifier")
+    {
+        PhpCallArgumentShape::ByReferenceOrSpread
+    } else {
+        PhpCallArgumentShape::Positional
+    }
+}
+
+fn php_callable_anchor(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "function_call_expression" => node.child_by_field_name("function"),
+        "member_call_expression" | "nullsafe_member_call_expression" | "scoped_call_expression" => {
+            node.child_by_field_name("name")
+        }
+        "object_creation_expression" => php_object_creation_type(node),
+        _ => None,
+    }
+}
+
+fn php_object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("class").or_else(|| {
+        named_children(node)
+            .into_iter()
+            .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
     })
 }
 
@@ -3631,6 +4173,34 @@ fn missing_field(node: Node<'_>, field: &str) -> PhpLoweringError {
         node.start_byte(),
         node.end_byte()
     ))
+}
+
+fn php_variable_name<'source>(source: &'source str, node: Node<'_>) -> &'source str {
+    node_text(source, node)
+        .unwrap_or_default()
+        .trim_start_matches('$')
+}
+
+fn normalize_php_name(name: &str) -> &str {
+    name.trim_start_matches('$')
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "anonymous_function" | "arrow_function" => SemanticValueKind::Callable,
+        "integer" | "float" | "boolean" | "null" | "string" | "string_content"
+        | "magic_constant" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
 }
 
 fn is_runtime_leaf(kind: &str) -> bool {
