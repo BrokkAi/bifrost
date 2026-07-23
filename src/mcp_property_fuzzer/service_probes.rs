@@ -65,6 +65,13 @@ const HONESTY_PHRASES: [&str; 4] = [
     "external crate",
     "external module",
 ];
+/// Claim templates that assert the target's namespace role rather than its
+/// non-indexing. "`fs` is a Go import namespace rather than an indexed
+/// declaration" says the qualifier is a namespace — it does not claim that
+/// no declaration shares its name, so a same-named field or variable hit
+/// (rclone's `Fs.vfs` field) cannot contradict it (tier-3 rclone x24).
+const HONESTY_EXCLUSION_PHRASES: [&str; 1] =
+    ["import namespace rather than an indexed declaration"];
 /// Tokens skipped when picking a reference target from a source line:
 /// declaration/control-flow keywords and literals make poor references. This
 /// is the union of the corpus languages' (c, cpp, csharp, go, java, js, php,
@@ -1337,7 +1344,10 @@ pub fn disputed_name(selector: &str, message: &str) -> String {
 
 fn claims_non_indexed(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    HONESTY_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    HONESTY_EXCLUSION_PHRASES
+        .iter()
+        .all(|phrase| !lower.contains(phrase))
+        && HONESTY_PHRASES.iter().any(|phrase| lower.contains(phrase))
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,5 +2415,27 @@ pub fn check_i5(
                 }),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claims_non_indexed_excludes_namespace_role_assertions() {
+        // The rclone shape: "`fs` is a Go import namespace rather than an
+        // indexed declaration" asserts the qualifier's namespace role; a
+        // same-named field or variable cannot contradict it.
+        assert!(!claims_non_indexed(
+            "`fs` is a Go import namespace rather than an indexed declaration; the imported package, module, namespace, or file may be outside the indexed workspace"
+        ));
+        // The boundary family still triggers.
+        assert!(claims_non_indexed(
+            "`AbstractSet[A]` appears to cross a Scala import boundary not indexed in this workspace"
+        ));
+        assert!(claims_non_indexed(
+            "`SimpleReferenceType` appears to cross a C# using boundary not indexed in this workspace"
+        ));
     }
 }
