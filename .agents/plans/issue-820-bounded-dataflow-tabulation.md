@@ -263,17 +263,18 @@ In `src/analyzer/dataflow/problem.rs`, define these public contracts, allowing m
     }
 
     pub struct DataflowEdge<'graph> {
-        edge_id: IcfgEdgeId,
-        edge: &'graph IcfgEdge,
-        source: &'graph IcfgNodeKey,
-        target: &'graph IcfgNodeKey,
+        kind: IcfgEdgeKind,
+        origin: Option<&'graph CallSiteHandle>,
+        source: &'graph ProgramPointHandle,
+        target: &'graph ProgramPointHandle,
+        proof: &'graph ProofStatus,
+        completeness: &'graph EvidenceCompleteness,
     }
 
     pub trait DistributiveDataflowProblem {
         type Fact: Copy + Eq + Hash + Ord;
 
         fn zero_fact(&self) -> Self::Fact;
-        fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>);
         fn normal_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut dyn DataflowOutput<Self::Fact>);
         fn call_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut dyn DataflowOutput<Self::Fact>);
         fn return_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut dyn DataflowOutput<Self::Fact>);
@@ -291,6 +292,10 @@ In `src/analyzer/dataflow/problem.rs`, define these public contracts, allowing m
         );
     }
 
+    pub trait BoundedSnapshotDataflowProblem: DistributiveDataflowProblem {
+        fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>);
+    }
+
 Across `src/analyzer/dataflow/{input,budget,quality,result}.rs`, define and re-export:
 
     IcfgInputStatus
@@ -301,6 +306,7 @@ Across `src/analyzer/dataflow/{input,budget,quality,result}.rs`, define and re-e
     SolverBudgetExceeded
     DataflowRequest<'request>
     PathQuality
+    PathQualityFrontier
     DataflowCoverage
     SolverTermination
     ReachedFact
@@ -309,7 +315,7 @@ Across `src/analyzer/dataflow/{input,budget,quality,result}.rs`, define and re-e
 
 In `src/analyzer/dataflow/tabulation.rs`, expose:
 
-    pub fn solve<P: DistributiveDataflowProblem>(
+    pub fn solve<P: BoundedSnapshotDataflowProblem>(
         input: IcfgSolveInput<'_>,
         problem: &P,
         request: &mut DataflowRequest<'_>,
