@@ -4033,8 +4033,9 @@ where
         &self,
         persisted: LimitedQueryRows<crate::analyzer::store::CandidateRow>,
         include_definition_lookup_units: bool,
+        include_path_synthetic_modules: bool,
         limit: usize,
-        keep: impl FnMut(&CodeUnit) -> bool,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let mut inspected = persisted.inspected;
@@ -4055,7 +4056,7 @@ where
         let dirty = self.dirty_units_matching_limited(
             include_definition_lookup_units,
             limit - inspected,
-            keep,
+            &mut keep,
             &mut continue_query,
         );
         inspected = inspected.saturating_add(dirty.inspected);
@@ -4063,10 +4064,11 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
 
-        // The bounded C# path has no path-synthetic declaration units. Keep
-        // this generic helper conservative if another adapter tries to reuse
-        // it before a bounded path-unit visitor exists.
-        if self.adapter.has_path_synthetic_module_units() {
+        // Path-synthetic modules are not represented by the declaration-row
+        // query above. Callers that need modules cannot claim completeness
+        // until a bounded path-unit visitor has also run. Callers whose
+        // predicate explicitly excludes modules may soundly skip that source.
+        if include_path_synthetic_modules && self.adapter.has_path_synthetic_module_units() {
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
 
@@ -4279,6 +4281,65 @@ where
 
     pub(crate) fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
         <Self as IAnalyzer>::direct_children(self, owner)
+    }
+
+    /// Return a provider-capped page of one declaration's direct children
+    /// without hydrating the complete owning file state on a cold persisted
+    /// analyzer.
+    pub(crate) fn direct_children_limited(
+        &self,
+        owner: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<CodeUnit> {
+        if limit == 0 || (owner.is_module() && self.adapter.language() == Language::Java) {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+
+        let file = owner.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(state.children.get(owner).map(Vec::as_slice), limit);
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(state.children.get(owner).map(Vec::as_slice), limit);
+        }
+
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let persisted = self
+            .store_query_or_record(
+                self.store_context.store.direct_children_for_unit_limited(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    owner,
+                    limit,
+                ),
+                format!("querying bounded direct children for `{}`", owner.fq_name()),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
+        let rows = persisted
+            .rows
+            .into_iter()
+            .map(|row| {
+                CodeUnit::with_signature(
+                    file.clone(),
+                    row.kind,
+                    self.adapter
+                        .hydrate_content_qualifier(&row.content_qualifier, file),
+                    row.short_name,
+                    row.signature,
+                    row.flags.synthetic,
+                )
+            })
+            .collect();
+        if persisted.complete {
+            LimitedQueryRows::complete(rows, persisted.inspected)
+        } else {
+            LimitedQueryRows::incomplete(rows, persisted.inspected)
+        }
     }
 
     pub(crate) fn forward_package_exists(&self, package: &str) -> bool {
@@ -4801,8 +4862,39 @@ where
         self.finish_limited_declaration_lookup(
             persisted,
             true,
+            true,
             limit,
             |unit| unit.identifier() == identifier,
+            continue_query,
+        )
+    }
+
+    pub(crate) fn lookup_non_module_declarations_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let langs = self.storage_language_keys_for_queries();
+        let persisted = self
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_identifier_for_langs_limited(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        identifier,
+                        limit,
+                    ),
+                format!("querying bounded non-module declarations by identifier `{identifier}`"),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+        self.finish_limited_declaration_lookup(
+            persisted,
+            true,
+            false,
+            limit,
+            |unit| !unit.is_module() && unit.identifier() == identifier,
             continue_query,
         )
     }
@@ -4894,6 +4986,7 @@ where
         self.finish_limited_declaration_lookup(
             persisted,
             false,
+            true,
             limit,
             |unit| {
                 let candidate = if normalized {
@@ -5003,6 +5096,7 @@ where
         let exact = self.finish_limited_declaration_lookup(
             exact_persisted,
             false,
+            true,
             limit,
             |unit| unit.identifier() == name && unit.fq_name() == exact_member,
             &mut continue_query,
@@ -5037,6 +5131,7 @@ where
         let normalized = self.finish_limited_declaration_lookup(
             normalized_persisted,
             false,
+            true,
             remaining,
             |unit| {
                 unit.identifier() == name

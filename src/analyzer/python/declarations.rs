@@ -575,11 +575,13 @@ fn python_function_signature(node: Node<'_>, source: &str) -> String {
 
 fn python_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_dispatch_extensibility(DispatchExtensibility::Open);
     };
     let parameter_text = py_node_text(parameters_node, source).trim();
     let Some(parameters_start) = signature.find(parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_dispatch_extensibility(DispatchExtensibility::Open);
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -599,6 +601,7 @@ fn python_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
         })
         .collect();
     SignatureMetadata::new(signature, parameters)
+        .with_dispatch_extensibility(DispatchExtensibility::Open)
 }
 
 fn python_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
