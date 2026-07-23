@@ -2287,10 +2287,7 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
             arena.handle(OracleRelationId::new(7)).unwrap(),
             arena.handle(OracleRelationId::new(8)).unwrap(),
             fixture.callee.clone(),
-            CallArgumentEndpoint::Location {
-                value: fixture.value.clone(),
-                location: reference_location.clone(),
-            },
+            CallArgumentEndpoint::location(fixture.value.clone(), reference_location.clone()),
             mode,
         );
         call_bindings(
@@ -2308,10 +2305,7 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
         arena.handle(OracleRelationId::new(7)).unwrap(),
         arena.handle(OracleRelationId::new(8)).unwrap(),
         fixture.callee.clone(),
-        CallArgumentEndpoint::Location {
-            value: fixture.value.clone(),
-            location: reference_location,
-        },
+        CallArgumentEndpoint::location(fixture.value.clone(), reference_location),
         CallPassingMode::Value,
     );
     assert!(matches!(
@@ -2375,10 +2369,7 @@ fn call_bindings_retain_context_and_reject_cross_arena_or_cross_context_inputs()
         first.handle(OracleRelationId::new(0)).unwrap(),
         first.handle(OracleRelationId::new(1)).unwrap(),
         fixture.callee.clone(),
-        CallArgumentEndpoint::Location {
-            value: fixture.value.clone(),
-            location: wrong_context_location,
-        },
+        CallArgumentEndpoint::location(fixture.value.clone(), wrong_context_location),
         CallPassingMode::SharedReference,
     );
     assert!(matches!(

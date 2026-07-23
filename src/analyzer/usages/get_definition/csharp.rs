@@ -2605,6 +2605,7 @@ fn csharp_nearest_member_type_units(
 /// Fold one invocation transition over already-resolved owners. Keeping owner
 /// evaluation outside this helper prevents alternating call/member syntax from
 /// recursing through the Rust stack.
+#[allow(clippy::too_many_arguments)]
 fn csharp_invocation_return_type_units_for_owners(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,

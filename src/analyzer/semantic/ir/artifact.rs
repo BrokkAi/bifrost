@@ -438,8 +438,8 @@ pub struct ProcedureSemantics {
     memory_locations: Box<[MemoryLocation]>,
     captures: Box<[CaptureBinding]>,
     call_sites: Box<[SemanticCallSite]>,
-    call_phase_points: HashMap<ValueId, Box<[ProgramPointId]>>,
-    call_result_sites: HashMap<(ValueId, ProgramPointId), Box<[CallSiteId]>>,
+    call_phase_points: CallPhasePointIndex,
+    call_result_sites: CallResultSiteIndex,
     source_mappings: Box<[SourceMapping]>,
     evidence_rows: Box<[Evidence]>,
     gaps: Box<[SemanticGap]>,
@@ -659,12 +659,12 @@ impl ProcedureSemantics {
     }
 }
 
+type CallPhasePointIndex = HashMap<ValueId, Box<[ProgramPointId]>>;
+type CallResultSiteIndex = HashMap<(ValueId, ProgramPointId), Box<[CallSiteId]>>;
+
 fn index_call_phases(
     call_sites: &[SemanticCallSite],
-) -> (
-    HashMap<ValueId, Box<[ProgramPointId]>>,
-    HashMap<(ValueId, ProgramPointId), Box<[CallSiteId]>>,
-) {
+) -> (CallPhasePointIndex, CallResultSiteIndex) {
     let mut indexed = HashMap::<ValueId, Vec<ProgramPointId>>::default();
     let mut indexed_pairs = HashSet::default();
     let mut result_sites = HashMap::<(ValueId, ProgramPointId), Vec<CallSiteId>>::default();

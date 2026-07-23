@@ -898,17 +898,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn binding_value(&self, name: &str) -> Option<(ValueId, ValueFlowKind)> {
         if let Some(binding) = self.locals.get(name) {
             Some((binding.value, ValueFlowKind::Local))
-        } else if let Some(value) = self.parameters.get(name) {
-            Some((
-                *value,
-                if Some(*value) == self.receiver {
-                    ValueFlowKind::Receiver
-                } else {
-                    ValueFlowKind::Parameter
-                },
-            ))
         } else {
-            None
+            self.parameters.get(name).map(|value| {
+                (
+                    *value,
+                    if Some(*value) == self.receiver {
+                        ValueFlowKind::Receiver
+                    } else {
+                        ValueFlowKind::Parameter
+                    },
+                )
+            })
         }
     }
 

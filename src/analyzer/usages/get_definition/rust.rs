@@ -4315,6 +4315,7 @@ fn rust_function_code_unit_return_type_fqn(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rust_code_unit_type_fqn(
     analyzer: &dyn IAnalyzer,
     support: &dyn RustDefinitionProvider,

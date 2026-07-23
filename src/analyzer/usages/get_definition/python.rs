@@ -280,10 +280,7 @@ fn python_reference_node_bounded<'tree>(
     }
     let original = node;
     let mut node = node;
-    loop {
-        let Some(parent) = node.parent() else {
-            break;
-        };
+    while let Some(parent) = node.parent() {
         if !support.scope_step() {
             return None;
         }
@@ -968,9 +965,7 @@ fn python_callable_return_type_in_tree(
             returns.push(candidate);
             continue;
         }
-        let Some(children) = python_named_children_bounded(support, node) else {
-            return None;
-        };
+        let children = python_named_children_bounded(support, node)?;
         stack.extend(children.into_iter().rev());
     }
     unique_python_candidate(returns)

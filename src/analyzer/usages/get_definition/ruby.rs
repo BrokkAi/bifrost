@@ -651,7 +651,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
             return None;
         }
         let ranges = self.provider.ranges(method);
-        let range = (ranges.len() == 1).then(|| ranges[0].clone())?;
+        let range = (ranges.len() == 1).then(|| ranges[0])?;
         let method_node = self.method_node_for_range(&range)?;
         let mut expression = self.tail_expression(method_node)?;
         if expression.kind() == "assignment" {

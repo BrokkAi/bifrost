@@ -3471,12 +3471,10 @@ fn cpp_callable_lexical_scope(node: Node<'_>, source: &str) -> Vec<String> {
             parent.kind(),
             "namespace_definition" | "class_specifier" | "struct_specifier" | "union_specifier"
         ) && let Some(name_node) = parent.child_by_field_name("name")
+            && let Some(components) = cpp_structured_type_path(name_node, source)
+            && !components.is_empty()
         {
-            if let Some(components) = cpp_structured_type_path(name_node, source)
-                && !components.is_empty()
-            {
-                groups.push(components);
-            }
+            groups.push(components);
         }
         current = parent.parent();
     }

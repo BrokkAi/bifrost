@@ -737,10 +737,10 @@ fn collect_binding_leaves_with_step<'tree>(
             if !push_field_children_with_step(node, "pattern", &mut pattern, scope_step) {
                 return None;
             }
-            if pattern.is_empty() {
-                if !push_field_children_with_step(node, "name", &mut pattern, scope_step) {
-                    return None;
-                }
+            if pattern.is_empty()
+                && !push_field_children_with_step(node, "name", &mut pattern, scope_step)
+            {
+                return None;
             }
             stack.extend(pattern);
             continue;

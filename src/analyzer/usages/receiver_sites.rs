@@ -109,6 +109,16 @@ struct IndexedReceiverSite {
     source_order: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReceiverSiteRank {
+    match_rank: u8,
+    target_width: usize,
+    kind_rank: u8,
+    site_width: usize,
+    site_start: usize,
+    source_order: u32,
+}
+
 /// Immutable, source-generation-coherent receiver sites for one [`FileFacts`] snapshot.
 #[derive(Debug)]
 pub(crate) struct ReceiverSiteIndex {
@@ -151,7 +161,7 @@ impl ReceiverSiteIndex {
         }
 
         let mut inspected_sites = 0;
-        let mut best: Option<((u8, usize, u8, usize, usize, u32), ReceiverSite)> = None;
+        let mut best: Option<(ReceiverSiteRank, ReceiverSite)> = None;
         for indexed in &self.sites {
             if is_cancelled(cancellation) {
                 return ReceiverSiteSelection::Cancelled { inspected_sites };
@@ -199,14 +209,14 @@ impl ReceiverSiteIndex {
             };
             let site_width = range_width(indexed.site.site_range);
             let candidate = (
-                (
+                ReceiverSiteRank {
                     match_rank,
                     target_width,
                     kind_rank,
                     site_width,
-                    indexed.site.site_range.start_byte,
-                    indexed.source_order,
-                ),
+                    site_start: indexed.site.site_range.start_byte,
+                    source_order: indexed.source_order,
+                },
                 indexed.site,
             );
             if best.is_none_or(|current| candidate.0 < current.0) {

@@ -20,11 +20,18 @@ pub enum CallArgumentEndpoint {
     Value(ValueHandle),
     Location {
         value: ValueHandle,
-        location: AccessPathAtPoint,
+        location: Box<AccessPathAtPoint>,
     },
 }
 
 impl CallArgumentEndpoint {
+    pub fn location(value: ValueHandle, location: AccessPathAtPoint) -> Self {
+        Self::Location {
+            value,
+            location: Box::new(location),
+        }
+    }
+
     pub fn value(&self) -> &ValueHandle {
         match self {
             Self::Value(value) | Self::Location { value, .. } => value,

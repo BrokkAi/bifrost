@@ -459,6 +459,7 @@ impl<'a> ReceiverQueryService<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn analyze_with_structural_facts(
         &self,
         operation: ReceiverQueryOperation,
@@ -513,17 +514,17 @@ impl<'a> ReceiverQueryService<'a> {
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         check_cancelled(cancellation)?;
         let language = language_for_file(file);
-        let structural_receiver_supported = match language {
+        let structural_receiver_supported = matches!(
+            language,
             Language::Cpp
-            | Language::CSharp
-            | Language::Go
-            | Language::Php
-            | Language::Python
-            | Language::Ruby
-            | Language::Rust
-            | Language::Scala => true,
-            _ => false,
-        };
+                | Language::CSharp
+                | Language::Go
+                | Language::Php
+                | Language::Python
+                | Language::Ruby
+                | Language::Rust
+                | Language::Scala
+        );
         if structural_receiver_supported {
             return self.analyze_structural(
                 operation,
@@ -1905,7 +1906,7 @@ impl<'a> ReceiverQueryService<'a> {
                     workspace,
                     &points_to,
                     &type_outcome,
-                    factory.as_ref().map_or(&[], std::slice::from_ref),
+                    factory.as_slice(),
                     type_reference,
                     cancellation,
                     &mut ledger,

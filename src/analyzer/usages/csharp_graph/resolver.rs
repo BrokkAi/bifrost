@@ -989,11 +989,8 @@ fn member_declared_type_fq_name_inner(
                     identity,
                     session,
                 )
-            });
-            if resolved.is_none() {
-                return None;
-            }
-            resolved
+            })?;
+            Some(resolved)
         } else {
             let declared_type = metadata
                 .iter()
@@ -1109,11 +1106,7 @@ fn method_return_type_fq_name_for_arity_inner(
         if !unit.is_function() {
             continue;
         }
-        let Some(callable_arity) =
-            resolution_query(session, || csharp_callable_arity(csharp, &unit))
-        else {
-            return None;
-        };
+        let callable_arity = resolution_query(session, || csharp_callable_arity(csharp, &unit))?;
         if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
             continue;
         }
@@ -2232,8 +2225,8 @@ fn visible_extension_method_candidates_inner(
             if !resolution_scope_step(session) {
                 return Vec::new();
             }
-            if !explicit_generic_arity
-                .is_none_or(|arity| csharp_method_generic_arity(unit.signature()) == arity)
+            if explicit_generic_arity
+                .is_some_and(|arity| csharp_method_generic_arity(unit.signature()) != arity)
             {
                 continue;
             }
@@ -2910,6 +2903,7 @@ pub(super) fn invocation_member_candidates_for_owner(
     candidates
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nearest_member_candidates_for_owner_inner(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,

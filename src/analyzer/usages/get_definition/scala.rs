@@ -3574,7 +3574,7 @@ fn resolve_scala_with_context(
             "Scala lexical-context traversal exceeded the receiver-resolution budget",
         );
     };
-    let resolver = ScalaNameResolver::for_batch(scala, support, &batch).with_lexical_context(
+    let resolver = ScalaNameResolver::for_batch(scala, support, batch).with_lexical_context(
         package_prefixes,
         lexical_scopes,
         node.start_byte(),
@@ -3779,12 +3779,12 @@ fn scala_import_reference_outcome(
     }
     let mut infos = import_infos
         .iter()
-        .cloned()
         .filter(|info| {
             info.path
                 .as_ref()
                 .is_some_and(|path| path.declaration_start_byte == import.start_byte())
         })
+        .cloned()
         .collect::<Vec<_>>();
     if infos.is_empty() {
         infos = scala_import_infos_from_node(import, source);
@@ -8146,19 +8146,20 @@ fn scala_active_path_declares_name_before_bounded(
             continue;
         }
 
+        if matches!(node.kind(), "class_definition" | "function_definition")
+            && scala_parameters_declare_name_before_bounded(
+                session,
+                node,
+                source,
+                name,
+                cutoff_start,
+            )?
+        {
+            return Some(true);
+        }
         match node.kind() {
-            "class_definition" | "function_definition" => {
-                if scala_parameters_declare_name_before_bounded(
-                    session,
-                    node,
-                    source,
-                    name,
-                    cutoff_start,
-                )? {
-                    return Some(true);
-                }
-                if node.kind() == "function_definition"
-                    && scala_is_local_function_definition_bounded(session, node)?
+            "function_definition" => {
+                if scala_is_local_function_definition_bounded(session, node)?
                     && scala_node_declares_name_before_bounded(
                         session,
                         node,
@@ -8183,7 +8184,7 @@ fn scala_active_path_declares_name_before_bounded(
                     }
                 }
             }
-            "val_definition" | "var_definition" => {
+            "val_definition" | "var_definition"
                 if !scala_is_direct_member_value_definition_bounded(session, node)?
                     && scala_node_declares_name_before_bounded(
                         session,
@@ -8192,10 +8193,9 @@ fn scala_active_path_declares_name_before_bounded(
                         name,
                         0,
                         cutoff_start,
-                    )?
-                {
-                    return Some(true);
-                }
+                    )? =>
+            {
+                return Some(true);
             }
             _ => {}
         }
