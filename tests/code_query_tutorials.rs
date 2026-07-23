@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost::analyzer::structural::{ALL_KINDS, CodeQuery, execute};
+use brokk_bifrost::analyzer::structural::{ALL_KINDS, CodeQuery, execute_workspace};
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use common::{InlineTestProject, normalize_line_endings};
 use pretty_assertions::assert_eq;
@@ -316,9 +316,9 @@ fn verify_tutorial_contents(path: &Path, markdown: &str) {
             path.display()
         );
 
-        let rql_result = serde_json::to_value(execute(workspace.analyzer(), &rql_query))
+        let rql_result = serde_json::to_value(execute_workspace(&workspace, &rql_query))
             .expect("serialize RQL result");
-        let json_result = serde_json::to_value(execute(workspace.analyzer(), &json_query))
+        let json_result = serde_json::to_value(execute_workspace(&workspace, &json_query))
             .expect("serialize JSON result");
         assert_eq!(
             rql_result,

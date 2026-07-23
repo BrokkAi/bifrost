@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-23 (`query_code` schema version 2).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -92,6 +92,101 @@ class Api {
   "truncated": false
 }
 ```
+
+## Analyze A Java Receiver
+
+Java receiver traversal uses shared semantic value and heap evidence together with bounded Java type and definition resolution. This query starts from the exact `client.post(path)` structural match and returns the typed `Client` receiver with an explicit analysis outcome.
+
+<!-- code-query-case:receiver-target:rql -->
+```lisp
+(receiver-targets
+  (inside
+    (method :name "save")
+    (language java
+      (call :callee "post" :receiver "client"))))
+```
+
+<!-- code-query-case:receiver-target:json -->
+```json
+{
+  "languages": ["java"],
+  "match": {
+    "kind": "call",
+    "callee": {"name": "post"},
+    "receiver": {"name": "client"}
+  },
+  "inside": {"kind": "method", "name": "save"},
+  "steps": [{"op": "receiver_targets"}]
+}
+```
+
+<!-- code-query-case:receiver-target:expected -->
+```json
+{
+  "results": [
+    {
+      "analysis_kind": "receiver_targets",
+      "input_kind": "identifier",
+      "language": "java",
+      "outcome": "precise",
+      "path": "java/App.java",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 25,
+            "kind": "call",
+            "path": "java/App.java",
+            "result_type": "structural_match",
+            "start_line": 25
+          },
+          "steps": [
+            {
+              "op": "receiver_targets",
+              "result": {
+                "analysis_kind": "receiver_targets",
+                "outcome": "precise",
+                "path": "java/App.java",
+                "range": {
+                  "end_column": 30,
+                  "end_line": 25,
+                  "start_column": 24,
+                  "start_line": 25
+                },
+                "result_type": "receiver_analysis"
+              }
+            }
+          ]
+        }
+      ],
+      "range": {
+        "end_column": 30,
+        "end_line": 25,
+        "start_column": 24,
+        "start_line": 25
+      },
+      "result_type": "receiver_analysis",
+      "text": "client",
+      "values": [
+        {
+          "declaration": {
+            "end_line": 11,
+            "fq_name": "app.Client",
+            "kind": "class",
+            "language": "java",
+            "path": "java/App.java",
+            "signature": "class Client {",
+            "start_line": 9
+          },
+          "receiver_value_kind": "instance_type"
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+The companion `points_to` and `member_targets` steps use the same Java receiver-query path. As in JavaScript and TypeScript, every analyzed input returns `precise`, `ambiguous`, `unknown`, `unsupported`, or `exceeded_budget`; a zero-result is not substituted for uncertainty.
 
 ## Find An Annotated Constructor
 
