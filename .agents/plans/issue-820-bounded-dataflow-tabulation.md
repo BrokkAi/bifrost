@@ -20,8 +20,8 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - [x] (2026-07-23 14:46Z) Implemented the public problem, input, budget, outcome, and direct-flow contracts under `src/analyzer/dataflow/`.
 - [x] (2026-07-23 14:46Z) Implemented deterministic iterative propagation and path/input completeness accounting; `cargo check --lib` passes.
 - [x] (2026-07-23 15:10Z) Added the independent repeated-scan reference and behavior-focused direct/differential tests; the two new integration binaries pass 20 tests in total, including 12 dataflow cases and their shared harness tests.
-- [ ] Run formatting, focused tests, strict all-target/all-feature Clippy, and the feature-enabled regression suite.
-- [ ] Run specialist review, resolve findings, and record final outcomes and validation evidence.
+- [x] (2026-07-23 15:50Z) Ran formatting, focused tests, strict all-target/all-feature Clippy, and the complete `nlp,python` regression suite. The final unrestricted all-feature pass was green across library, binary, integration, and doc-test targets.
+- [x] (2026-07-23 15:50Z) Completed architecture, security/resource, test/intent, API/scope, and duplication reviews. Fixed both high-risk architecture findings, added the missing behavior regressions, and retained only two low-value test-helper duplication notes.
 
 ## Surprises & Discoveries
 
@@ -51,6 +51,15 @@ This first child deliberately stops before reusable procedure summaries, recursi
 
 - Observation: current source-backed ICFG adapters do not expose a stable unproven-complete edge topology for an end-to-end incomparable-path-frontier fixture.
   Evidence: local edges are proven-complete; currently unproven dispatch edges also carry partial completeness; return gaps downgrade both axes; and C++ virtual open-world uncertainty is retained as a separate boundary rather than an unproven edge. The frontier and edge-conjunction algebra therefore have focused unit regressions, while solver-level frontier requeue remains a later test when a contract-backed topology exists. No synthetic production snapshot constructor was added only for testing.
+
+- Observation: the macOS all-feature test link requires the repository's documented PyO3 dynamic-lookup flags.
+  Evidence: the first isolated run failed while linking `libbrokk_bifrost.dylib` with unresolved `_Py*` symbols. Re-running with `RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup'` passed the linker boundary.
+
+- Observation: three existing benchmark subprocess tests cannot run inside the managed sandbox.
+  Evidence: the sandboxed all-feature run passed 1,717 library tests before `benchmark::mcp_session` tests failed to spawn helpers with `Operation not permitted`. The same tests passed in the unrestricted run.
+
+- Observation: `broken_stdout_pipe_is_an_operational_status_two_failure` is transient under the full concurrent suite on this host.
+  Evidence: one unrestricted full run observed status 1 instead of 2. An immediate focused rerun passed, and the final complete warm all-feature run also passed the entire `bifrost_policy_cli` target.
 
 ## Decision Log
 
@@ -92,7 +101,11 @@ This first child deliberately stops before reusable procedure summaries, recursi
 
 ## Outcomes & Retrospective
 
-The additive production module and its independent reference suite now pass focused validation. The implementation contains the finite unary problem contract, run-local deterministic fact interning, explicit input and nondominated path quality, four-dimensional atomic budgeting, cancellation checkpoints, direct-flow client, and a FIFO worklist over every current ICFG edge family. Tests prove exact normal/exceptional return and bypass routing, cleanup classification, nonzero fact killing with zero preservation, deterministic seed/output permutations, all four atomic budget stops, synchronous callback cancellation, provider-outcome status retention, recursive boundaries, ordinary reachability parity, and worklist/reference equality. Repository-wide lint and feature-enabled regression gates remain in progress. The scope boundary remains unchanged: this child establishes context-respecting propagation over a bounded ICFG, not the epic's later summary-driven recursion or reusable procedure-summary claims.
+The first bounded #820 child is complete. The additive production module contains the finite unary problem contract, run-local deterministic fact interning, kernel-owned zero injection and preservation, explicit input quality, component-wise nondominated path frontiers, four-dimensional atomic budgeting, cancellation checkpoints, a one-state direct-flow client, and a FIFO worklist over every current ICFG edge family. The independent repeated-scan implementation agrees with the worklist on calls, matched normal and exceptional returns, deferred continuations, cleanup, loops, fact generation and killing, and bounded recursion.
+
+Architecture review found two high-risk issues before finalization: the original zero fact was interned but not automatically propagated, and a proof-first single path quality could discard an incomparable path that later became stronger after edge conjunction. Both were corrected in production and covered by focused regressions. Follow-up reviews found no security, operational, API, intent, or scope blocker and confirmed that the change does not touch #1107's active receiver, semantic-oracle, storage, or structural-query surfaces. The remaining low-severity notes concern duplicated test-only status mapping and graph reachability helpers, neither of which justifies widening this child.
+
+Validation is green: `cargo fmt --all -- --check`; `git diff --check`; 10/10 tests in each new dataflow integration binary; 25/25 existing ICFG contract tests; strict `cargo clippy --all-targets --all-features -- -D warnings`; and the final unrestricted `cargo test --features nlp,python` pass across all library, binary, integration, and doc-test targets. The library target reported 1,720 passed and 5 ignored. The scope boundary remains unchanged: this child establishes context-respecting propagation over a bounded ICFG, not reusable procedure summaries, unbounded recursive convergence, heap or taint clients, typestate automata, persistence, policy compilation, or RQL.
 
 ## Context and Orientation
 
@@ -166,9 +179,11 @@ Run strict lint in a self-cleaning isolated target:
 
 Expected: Clippy exits successfully with no warnings.
 
-Run the full feature-enabled gate:
+Run the full feature-enabled gate on macOS with the repository's PyO3 linker mode:
 
-    scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
+    env RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' \
+        BIFROST_SEMANTIC_INDEX=off \
+        scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
 
 Expected: all enabled library and integration tests pass, with only repository-documented ignored tests. No semantic model downloads or real semantic-index threads may start.
 
@@ -285,4 +300,4 @@ In `src/analyzer/dataflow/tabulation.rs`, expose:
 
 Use only existing standard-library and repository dependencies: `VecDeque`, ordinary vectors and boxed slices, `crate::hash::{HashMap, HashSet}`, current semantic ICFG/provider types, and `CancellationToken`. Do not add a graph, solver, property-test, persistence, or algebra crate in this child.
 
-Plan revision note (2026-07-23): Created the issue-specific plan after live GitHub verification, detached-worktree synchronization, current-API code navigation, and three parallel architecture/precedent audits. The plan corrects the older roadmap sketch from procedure-local CFG IDs to context-specific `IcfgSnapshot` IDs, makes input quality mandatory, and narrows this child to bounded deterministic propagation so later summary and IDE work remains honest.
+Plan revision note (2026-07-23): Created the issue-specific plan after live GitHub verification, detached-worktree synchronization, current-API code navigation, and three parallel architecture/precedent audits. The plan corrects the older roadmap sketch from procedure-local CFG IDs to context-specific `IcfgSnapshot` IDs, makes input quality mandatory, and narrows this child to bounded deterministic propagation so later summary and IDE work remains honest. Finalized it after five specialist review categories, two architecture corrections, focused and differential coverage, strict lint, and the complete feature-enabled regression gate.
