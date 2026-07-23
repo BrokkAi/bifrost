@@ -1,7 +1,7 @@
 use super::imports::parse_ruby_require_call;
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{RubyMethodDispatchMode, SignatureMetadata};
+use crate::analyzer::{DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Parses Ruby source into a tree-sitter tree, or `None` if parsing fails.
@@ -720,7 +720,8 @@ fn first_line(node: Node<'_>, source: &str) -> String {
 
 fn ruby_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_dispatch_extensibility(DispatchExtensibility::Open);
     };
     let mut cursor = parameters_node.walk();
     let labels = parameters_node
@@ -730,6 +731,7 @@ fn ruby_signature_metadata(signature: String, node: Node<'_>, source: &str) -> S
         .filter(|label| !label.is_empty())
         .collect();
     SignatureMetadata::with_parameter_labels(signature, labels)
+        .with_dispatch_extensibility(DispatchExtensibility::Open)
 }
 
 fn ruby_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {

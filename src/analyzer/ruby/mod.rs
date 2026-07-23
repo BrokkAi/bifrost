@@ -9,6 +9,7 @@ pub(crate) mod structural;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, CodeUnitType,
@@ -168,6 +169,82 @@ impl RubyAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    pub(crate) fn prepared_syntax_limited(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<
+        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
+    > {
+        self.inner.prepared_syntax_limited(file, max_source_bytes)
+    }
+
+    pub(crate) fn declaration_candidates_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
+    }
+
+    pub(crate) fn declaration_candidates_by_fqn_limited(
+        &self,
+        fqn: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        };
+        let mut candidates =
+            self.inner
+                .lookup_declarations_by_identifier_limited(identifier, limit, continue_query);
+        if candidates.complete {
+            candidates
+                .rows
+                .retain(|candidate| candidate.fq_name() == fqn);
+        }
+        candidates
+    }
+
+    pub(crate) fn member_candidates_for_owner_limited(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        let exact_fqn = if owner_fqn.is_empty() {
+            name.to_string()
+        } else {
+            format!("{owner_fqn}.{name}")
+        };
+        self.declaration_candidates_by_fqn_limited(&exact_fqn, limit, continue_query)
+    }
+
+    pub(crate) fn direct_children_limited(
+        &self,
+        owner: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner.direct_children_limited(owner, limit)
+    }
+
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(&self, unit: &CodeUnit, limit: usize) -> LimitedQueryRows<Range> {
+        self.inner.ranges_limited(unit, limit)
     }
 
     pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {

@@ -7,17 +7,19 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
+use crate::analyzer::semantic::lowering::formal_multiplicity;
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{ProjectFile, RubyAnalyzer};
+use crate::analyzer::{Language, ProjectFile, Range, RubyAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"ruby-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v2";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -774,6 +776,12 @@ fn ruby_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::DeferredExecution,
         SemanticCapability::ConcurrentSpawn,
@@ -1239,6 +1247,10 @@ struct LoweringContext<'tree, 'targets> {
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
     procedure_runtime_body_node_id: usize,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, ValueId>,
+    receiver: Option<ValueId>,
     reuse_first_statement_entry: bool,
     nonlocal_cleanup_label: Option<Box<str>>,
     next_control_label: usize,
@@ -1283,6 +1295,10 @@ fn lower_procedure<'tree, 'request>(
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
         procedure_runtime_body_node_id: runtime_body.id(),
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
         reuse_first_statement_entry: matches!(
             spec.kind,
             ProcedureKind::Lambda | ProcedureKind::Closure
@@ -1294,6 +1310,8 @@ fn lower_procedure<'tree, 'request>(
         local_bindings,
     };
     context.controls.insert(function_scope, Box::new([]));
+    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    context.emit_local_bindings(&mut builder, spec.callable)?;
 
     if has_parameter_defaults {
         for (capability, detail) in [
@@ -1328,6 +1346,16 @@ fn lower_procedure<'tree, 'request>(
             SemanticCapability::CallableReferences,
             SemanticGapKind::Unknown,
             "ordinary Ruby block capture and dynamic yielding target are not bound",
+        )?;
+    }
+    if spec.lexical_parent.is_some() {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "Ruby lexical captures require closure-environment refinement",
         )?;
     }
     if spec.kind == ProcedureKind::Constructor {
@@ -1426,6 +1454,22 @@ fn lower_procedure<'tree, 'request>(
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        if let Some(result_node) = ruby_implicit_result_node(runtime_body) {
+            let source = context.expression_value(
+                &mut builder,
+                result_node,
+                expression_value_kind(result_node),
+            )?;
+            context.append_effect(
+                &mut builder,
+                implicit_return,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    target: value,
+                },
+            )?;
+        }
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -1493,6 +1537,210 @@ fn lower_procedure<'tree, 'request>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), RubyLoweringError> {
+        // `self` exists in every Ruby execution context, including singleton
+        // methods, class/module bodies, and nested callables.  Nested
+        // callables retain a capture gap below, but publishing the port keeps
+        // their structured `self` reads connected to one stable identity.
+        let receiver_metadata = self.value_mapping(builder, callable)?;
+        let receiver = self.session.add_value_with_metadata(
+            builder,
+            receiver_metadata,
+            SemanticValueKind::Receiver,
+        )?;
+        self.receiver = Some(receiver);
+        self.parameters.insert("self".into(), receiver);
+
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Ruby,
+            callable,
+            self.source,
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RubyLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let mapping_node = slot
+                .names
+                .iter()
+                .find_map(|name| ruby_binding_name_node(declaration, self.source, name))
+                .unwrap_or(declaration);
+            let metadata = self.value_mapping(builder, mapping_node)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Parameter {
+                    ordinal,
+                    multiplicity: formal_multiplicity(slot.variadic),
+                },
+            )?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| RubyLoweringError::Invalid("too many Ruby parameters".into()))?;
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), RubyLoweringError> {
+        let mut activations = self
+            .local_bindings
+            .activations
+            .iter()
+            .map(|(name, start)| (name.as_ref(), *start))
+            .collect::<Vec<_>>();
+        activations.sort_by_key(|(_, start)| *start);
+        for (name, start) in activations {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RubyLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if self.parameters.contains_key(name) || self.locals.contains_key(name) {
+                continue;
+            }
+            let end = start.saturating_add(name.len());
+            let node = callable
+                .named_descendant_for_byte_range(start, end)
+                .filter(|node| node.kind() == "identifier")
+                .unwrap_or(callable);
+            let metadata = self.value_mapping(builder, node)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            self.locals.insert(name.into(), value);
+        }
+        Ok(())
+    }
+
+    fn binding_value(&self, name: &str) -> Option<(ValueId, ValueFlowKind)> {
+        self.locals
+            .get(name)
+            .copied()
+            .map(|value| (value, ValueFlowKind::Local))
+            .or_else(|| {
+                self.parameters.get(name).copied().map(|value| {
+                    let kind = if Some(value) == self.receiver {
+                        ValueFlowKind::Receiver
+                    } else {
+                        ValueFlowKind::Parameter
+                    };
+                    (value, kind)
+                })
+            })
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RubyLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RubyLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn semantic_call_argument(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        argument: Node<'tree>,
+    ) -> Result<SemanticCallArgument, RubyLoweringError> {
+        let (value_node, expansion) = match argument.kind() {
+            "pair" => (
+                argument.child_by_field_name("value").unwrap_or(argument),
+                CallArgumentExpansion::Direct(ArgumentDomain::Keyword),
+            ),
+            "splat_argument" => (
+                first_runtime_named_child(argument).unwrap_or(argument),
+                CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+            ),
+            "hash_splat_argument" => (
+                first_runtime_named_child(argument).unwrap_or(argument),
+                CallArgumentExpansion::Spread(ArgumentDomain::Keyword),
+            ),
+            "block_argument" | "forward_argument" => (
+                first_runtime_named_child(argument).unwrap_or(argument),
+                CallArgumentExpansion::Unclassified,
+            ),
+            _ => (
+                argument,
+                CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+            ),
+        };
+        let value =
+            self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+        Ok(SemanticCallArgument { value, expansion })
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<bool, RubyLoweringError> {
+        let Some(name) = node_text(self.source, node) else {
+            return Ok(false);
+        };
+        let Some((source, kind)) = self.binding_value(name) else {
+            return Ok(false);
+        };
+        if source != target {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(true)
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1700,7 +1948,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.callable_value(builder, node, entry, next)
             }
             "super" => self.unsupported_super(builder, node, entry, next, scope, stack),
-            _ if is_runtime_leaf(node.kind()) => self.edge(builder, entry, next),
+            _ if is_runtime_leaf(node.kind()) => {
+                let value = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.emit_lexical_input_flow(builder, node, entry, value)?;
+                self.edge(builder, entry, next)
+            }
             _ => {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
@@ -2604,6 +2856,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         } else {
             let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+            let arguments = node
+                .named_child(0)
+                .map(runtime_expression_children)
+                .unwrap_or_default();
+            if let [source_node] = arguments.as_slice() {
+                let source = self.expression_value(
+                    builder,
+                    *source_node,
+                    expression_value_kind(*source_node),
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        target: value,
+                    },
+                )?;
+            } else if arguments.len() > 1 {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::ReturnFlow,
+                    SemanticGapKind::Unsupported,
+                    "Ruby multiple-value return packing is not represented as one identity flow",
+                )?;
+            }
             self.append_effect(
                 builder,
                 terminal,
@@ -2752,18 +3033,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
+        let method_node = node.child_by_field_name("method").unwrap_or(node);
+        let callee = self.source_value(builder, method_node, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, method_node, SemanticValueKind::Exception)?;
         let receiver_node = node.child_by_field_name("receiver");
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
             .transpose()?;
         let method = node
             .child_by_field_name("method")
             .and_then(|method| node_text(self.source, method));
         let receiver_text = receiver_node.and_then(|receiver| node_text(self.source, receiver));
-        let callable_kind = if receiver.is_some() {
+        let constructor = ruby_constructor_call(node, self.source);
+        let callable_kind = if constructor {
+            CallableReferenceKind::Constructor
+        } else if receiver.is_some() {
             CallableReferenceKind::BoundMethod
         } else {
             CallableReferenceKind::Function
@@ -2783,7 +3070,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     kind: callable_kind,
                     targets: resolution.clone(),
                     target_evidence: metadata.evidence,
-                    bound_receiver: receiver,
+                    bound_receiver: (!constructor).then_some(receiver).flatten(),
                     environment: None,
                 },
             },
@@ -2791,17 +3078,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
         let argument_nodes = call_arguments(node);
         let attached_block = node.child_by_field_name("block");
-        let argument_count = argument_nodes.len() + usize::from(attached_block.is_some());
-        let arguments = (0..argument_count)
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+        let mut arguments = argument_nodes
+            .iter()
+            .map(|argument| self.semantic_call_argument(builder, *argument))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(block) = attached_block {
+            let value = self.expression_value(builder, block, SemanticValueKind::Callable)?;
+            arguments.push(SemanticCallArgument::unclassified(value));
+        }
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: arguments.into_iter().map(Into::into).collect(),
+                arguments: arguments.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2809,6 +3100,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if constructor {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -2843,6 +3138,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .and_then(|operator| node_text(self.source, operator))
             == Some("&.");
         if safe_navigation {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "Ruby safe navigation may produce nil without invoking the selected member",
+            )?;
             let decision = self.point(builder, node, Vec::new())?;
             self.schedule_expressions_with_first_edge(
                 builder,
@@ -3316,14 +3619,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             None
         };
-        self.add_gap(
-            builder,
-            merge.unwrap_or(terminal),
-            SemanticGapSubject::Point,
-            SemanticCapability::Values,
-            SemanticGapKind::Unknown,
-            "Ruby assignment target and assigned value are not yet connected by value-flow rows",
-        )?;
+        let identity_assignment =
+            (node.kind() == "assignment" || short_circuit) && left.kind() == "identifier";
+        if identity_assignment {
+            let name = node_text(self.source, left).unwrap_or_default();
+            if let Some((target, flow_kind)) = self.binding_value(name) {
+                let value = self.expression_value(builder, right, expression_value_kind(right))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: flow_kind,
+                        source: value,
+                        target,
+                    },
+                )?;
+                if !short_circuit {
+                    self.expression_values.insert(node.id(), value);
+                }
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::LocalFlow,
+                    SemanticGapKind::Unknown,
+                    "Ruby local assignment target was not present in the structured binding timeline",
+                )?;
+            }
+        } else {
+            self.add_gap(
+                builder,
+                merge.unwrap_or(terminal),
+                SemanticGapSubject::Point,
+                if dispatching_target {
+                    SemanticCapability::Assignments
+                } else {
+                    SemanticCapability::LocalFlow
+                },
+                SemanticGapKind::Unsupported,
+                if dispatching_target {
+                    "Ruby writer assignment does not preserve plain local identity"
+                } else {
+                    "Ruby destructuring or non-local assignment is not lowered as one identity-preserving local flow"
+                },
+            )?;
+        }
         if node.kind() == "operator_assignment" && !short_circuit {
             self.add_gap(
                 builder,
@@ -3552,6 +3898,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RubyLoweringError> {
         let name = node_text(self.source, node).unwrap_or_default();
         if self.local_bindings.is_active_at(name, node.start_byte()) {
+            let value = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+            if !self.emit_lexical_input_flow(builder, node, entry, value)? {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unknown,
+                    "Ruby lexical binding is active but its capture or implicit block port is not represented",
+                )?;
+            }
             return self.edge(builder, entry, next);
         }
         self.bare_call_expression(builder, node, entry, next, scope, stack)
@@ -4047,6 +4404,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.add_mapping(builder, anchor)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, RubyLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(RubyLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn add_mapping(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -4108,6 +4475,69 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RubyLoweringError> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
+    }
+}
+
+fn ruby_binding_name_node<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    expected: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node_text(source, node) == Some(expected) {
+            return Some(node);
+        }
+        stack.extend(named_children(node).into_iter().rev());
+    }
+    None
+}
+
+fn ruby_implicit_result_node(node: Node<'_>) -> Option<Node<'_>> {
+    if matches!(
+        node.kind(),
+        "program" | "body_statement" | "block_body" | "do" | "then" | "else" | "ensure"
+    ) {
+        return runtime_statement_children(node)
+            .into_iter()
+            .rev()
+            .find(|child| !statement_definitely_abrupt(*child));
+    }
+    (!statement_definitely_abrupt(node)).then_some(node)
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
+            SemanticValueKind::Callable
+        }
+        "integer" | "float" | "rational" | "complex" | "true" | "false" | "nil" | "constant"
+        | "simple_symbol" | "hash_key_symbol" | "bare_symbol" | "character" => {
+            SemanticValueKind::Constant
+        }
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+fn ruby_constructor_call(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("method")
+            .and_then(|method| node_text(source, method))
+            != Some("new")
+    {
+        return false;
+    }
+    node.child_by_field_name("receiver")
+        .is_some_and(|receiver| matches!(receiver.kind(), "constant" | "scope_resolution"))
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
     }
 }
 
