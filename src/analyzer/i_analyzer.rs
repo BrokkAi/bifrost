@@ -297,7 +297,11 @@ pub trait IAnalyzer: Send + Sync + Any {
                     .ranges(&code_unit)
                     .into_iter()
                     .min_by_key(|range| (range.start_line, range.start_byte)),
-                contains_tests: self.contains_tests(code_unit.source()),
+                // Structurally-evidenced suppression only: analyzers without a
+                // per-declaration taint surface default untainted here (path-based
+                // test filtering in `search_symbols` still applies), so production
+                // symbols in a file with inline tests are never hidden (#1102).
+                in_test_region: self.in_test_region(&code_unit),
                 code_unit,
             })
             .collect()
@@ -498,6 +502,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn contains_tests(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+
+    /// Whether `code_unit` sits in a structurally-evidenced test region — a
+    /// test-attributed item, or a declaration nested inside a `#[cfg(test)]`
+    /// (or otherwise test-attributed) module/item (issue #1102).
+    ///
+    /// Unlike [`contains_tests`](Self::contains_tests), which classifies whole
+    /// files, this is per declaration, so symbol-level test filtering can hide a
+    /// file's test symbols while still surfacing its production API. Analyzers
+    /// that do not thread per-declaration taint default to `false` (untainted):
+    /// structurally-evidenced suppression only.
+    fn in_test_region(&self, _code_unit: &CodeUnit) -> bool {
         false
     }
 

@@ -461,6 +461,12 @@ pub struct FileState {
     pub(crate) scala_traits: HashSet<CodeUnit>,
     pub(crate) type_aliases: HashSet<CodeUnit>,
     pub(crate) contains_tests: bool,
+    /// Declarations that lie in a structurally-evidenced test region (see
+    /// [`ParsedFile::test_region_units`]). Persisted per-unit via the
+    /// `code_units.in_test_region` column and consulted by symbol-level test
+    /// filtering (`search_symbols`, commit symbol snapshots). Empty for
+    /// languages that do not thread test-region taint.
+    pub(crate) test_region_units: HashSet<CodeUnit>,
     /// Tree-sitter parse errors captured during `analyze_file`. The LSP
     /// diagnostic handler reads this instead of re-parsing on every keystroke
     /// — see issue #102. `None` when the `FileState` was hydrated from the
@@ -976,6 +982,12 @@ pub struct ParsedFile {
     pub(crate) navigation_ranges: HashMap<CodeUnit, Vec<Range>>,
     pub(crate) navigation_ranges_truncated: HashSet<CodeUnit>,
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    /// Declarations that lie in a structurally-evidenced test region: a
+    /// test-attributed item or any declaration nested inside a `#[cfg(test)]`
+    /// (or otherwise test-attributed) module/item. Populated by language walks
+    /// that thread test-region taint through their traversal (currently Rust);
+    /// other languages leave it empty, so their declarations default untainted.
+    pub(crate) test_region_units: HashSet<CodeUnit>,
 }
 
 const MAX_NAVIGATION_RANGES_PER_CODE_UNIT: usize = 257;
@@ -1055,7 +1067,14 @@ impl ParsedFile {
             navigation_ranges: HashMap::default(),
             navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
+            test_region_units: HashSet::default(),
         }
+    }
+
+    /// Records that `code_unit` sits in a structurally-evidenced test region.
+    /// Idempotent; safe to call after `add_code_unit`.
+    pub fn mark_test_region(&mut self, code_unit: &CodeUnit) {
+        self.test_region_units.insert(code_unit.clone());
     }
 
     pub fn add_code_unit(
@@ -1855,6 +1874,7 @@ where
             scala_traits: parsed.scala_traits,
             type_aliases: parsed.type_aliases,
             contains_tests,
+            test_region_units: parsed.test_region_units,
             parse_errors: Some(parse_errors),
         })
     }
@@ -4835,9 +4855,9 @@ where
             self.live_snapshot(),
         );
         let mut candidates = BTreeMap::new();
-        for (code_unit, (primary_range, contains_tests)) in resolver.resolve_rows_with_payload(
+        for (code_unit, (primary_range, in_test_region)) in resolver.resolve_rows_with_payload(
             rows.into_iter()
-                .map(|row| (row.candidate, (row.primary_range, row.contains_tests))),
+                .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
         ) {
             let fq_name = self.adapter.normalize_full_name(&code_unit.fq_name());
             if !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name) {
@@ -4846,7 +4866,7 @@ where
                     .or_insert(SearchSymbolCandidate {
                         code_unit,
                         primary_range,
-                        contains_tests,
+                        in_test_region,
                     });
             }
         }
@@ -4862,7 +4882,7 @@ where
                         .ranges(&code_unit)
                         .into_iter()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
-                    contains_tests: self.contains_tests(code_unit.source()),
+                    in_test_region: self.in_test_region(&code_unit),
                     code_unit,
                 });
         }
@@ -4877,7 +4897,7 @@ where
                         .ranges(&code_unit)
                         .into_iter()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
-                    contains_tests: self.contains_tests(code_unit.source()),
+                    in_test_region: self.in_test_region(&code_unit),
                     code_unit,
                 });
         }
@@ -5906,6 +5926,11 @@ where
             .unwrap_or(false)
     }
 
+    fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
+        self.fetch_file_state(code_unit.source())
+            .is_some_and(|state| state.test_region_units.contains(code_unit))
+    }
+
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.signatures_vec_of(code_unit)
     }
@@ -6782,6 +6807,7 @@ mod tests {
             scala_traits: HashSet::default(),
             type_aliases: HashSet::default(),
             contains_tests,
+            test_region_units: HashSet::default(),
             parse_errors: None,
         }
     }
@@ -8268,7 +8294,7 @@ mod tests {
         assert!(candidates.iter().any(|candidate| {
             candidate.code_unit.fq_name() == "demo.Gson.fromJson"
                 && candidate.primary_range.is_some()
-                && !candidate.contains_tests
+                && !candidate.in_test_region
         }));
     }
 }

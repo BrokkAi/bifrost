@@ -9287,3 +9287,74 @@ fn list_symbols_reports_loc_from_indexed_snapshot() {
     assert_eq!("Widget.java", value["files"][0]["path"], "payload: {value}");
     assert_eq!(4, value["files"][0]["loc"], "payload: {value}");
 }
+
+/// Issue #1102: a Rust file with a production API plus an inline
+/// `#[cfg(test)] mod tests` must still surface its production symbols under the
+/// default `include_tests:false`, while the inline test function is hidden and
+/// only appears with `include_tests:true`. Before the per-declaration taint fix
+/// the whole file was gated on the file-level `contains_tests` flag, so
+/// `make_widget` returned "No files matched".
+#[test]
+fn search_symbols_surfaces_production_api_of_file_with_inline_tests() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "widget.rs",
+            r#"pub fn make_widget() -> u32 {
+    7
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        assert_eq!(make_widget(), 7);
+    }
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    // Default (include_tests:false): the production symbol is found.
+    let production = service
+        .call_tool_json("search_symbols", r#"{"patterns":["make_widget"]}"#)
+        .unwrap();
+    let production_value: Value = serde_json::from_str(&production).unwrap();
+    assert!(
+        production_value["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()),
+        "production symbol should surface by default: {production}"
+    );
+    assert!(
+        production.contains("make_widget"),
+        "payload should name make_widget: {production}"
+    );
+
+    // Default (include_tests:false): the inline test function is hidden.
+    let hidden = service
+        .call_tool_json("search_symbols", r#"{"patterns":["it_works"]}"#)
+        .unwrap();
+    let hidden_value: Value = serde_json::from_str(&hidden).unwrap();
+    assert!(
+        hidden_value["files"]
+            .as_array()
+            .is_none_or(|files| files.is_empty()),
+        "inline test symbol must be hidden by default: {hidden}"
+    );
+
+    // include_tests:true: the inline test function appears.
+    let revealed = service
+        .call_tool_json(
+            "search_symbols",
+            r#"{"patterns":["it_works"],"include_tests":true}"#,
+        )
+        .unwrap();
+    assert!(
+        revealed.contains("it_works"),
+        "test symbol should appear with include_tests:true: {revealed}"
+    );
+}

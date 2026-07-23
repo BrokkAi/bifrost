@@ -1565,6 +1565,10 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.contains_tests(file)
     }
 
+    fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
+        self.inner.in_test_region(code_unit)
+    }
+
     fn find_test_assertion_smells(
         &self,
         file: &ProjectFile,

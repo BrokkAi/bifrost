@@ -69,7 +69,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                     "include_tests": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Whether to include symbols from detected test files."
+                        "description": "Whether to include test symbols. When false (default), test symbols are filtered out per declaration: a symbol is treated as a test only when it is itself a test (e.g. a `#[test]`/`#[cfg(test)]`-gated declaration) or lives under a test-tree path. Production symbols in a file that also contains inline tests still surface."
                     },
                     "limit": {
                         "type": "integer",

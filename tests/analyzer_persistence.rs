@@ -1759,3 +1759,79 @@ fn update_repopulates_parse_errors_for_delta_only() {
     let updated = analyzer.update(&changed);
     assert_eq!(updated.parse_errors(&file), Some(Vec::new()));
 }
+
+/// Issue #1102: per-declaration test-region taint must survive a store
+/// round-trip. A cold build computes taint live and persists it; a warm build
+/// reopens the store and must hydrate identical taint (`code_units.in_test_region`
+/// -> `FileState::test_region_units`). Both surfaces must agree that the
+/// production function is untainted and the inline `#[cfg(test)]` symbols are
+/// tainted.
+#[test]
+fn persisted_rust_test_region_taint_survives_store_roundtrip() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "widget.rs",
+        r#"pub fn make_widget() -> u32 {
+    7
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
+}
+"#,
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+
+    let taint_by_short_name = |analyzer: &dyn IAnalyzer| {
+        analyzer
+            .all_declarations()
+            .filter(|unit| !unit.is_synthetic())
+            .map(|unit| {
+                (
+                    unit.short_name().to_string(),
+                    analyzer.in_test_region(&unit),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    // Cold build: taint computed from live extraction, then persisted.
+    let cold = build_persisted(
+        language_python_project(root, Language::Rust),
+        AnalyzerConfig::default(),
+    );
+    let cold_taint = taint_by_short_name(cold.analyzer());
+    drop(cold);
+
+    // Warm build: reopen the store; taint is hydrated from the persisted column.
+    let warm = build_persisted(
+        language_python_project(root, Language::Rust),
+        AnalyzerConfig::default(),
+    );
+    let warm_taint = taint_by_short_name(warm.analyzer());
+
+    assert_eq!(
+        cold_taint, warm_taint,
+        "live-extraction and warm-store taint must agree"
+    );
+    assert_eq!(
+        warm_taint.get("make_widget"),
+        Some(&false),
+        "production fn untainted: {warm_taint:?}"
+    );
+    assert_eq!(
+        warm_taint.get("tests"),
+        Some(&true),
+        "cfg(test) module tainted: {warm_taint:?}"
+    );
+    assert_eq!(
+        warm_taint.get("tests.it_works"),
+        Some(&true),
+        "inline test fn tainted: {warm_taint:?}"
+    );
+}

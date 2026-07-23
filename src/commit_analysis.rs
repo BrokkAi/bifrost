@@ -615,7 +615,10 @@ fn symbol_snapshot_map(
             continue;
         }
         let path = rel_path(unit.source());
-        let is_test = analyzer.contains_tests(unit.source())
+        // Symbol-level test filtering (#1102): filter a declaration only when it
+        // is itself in a structurally-evidenced test region or under a test-tree
+        // path, so production symbols in a file with inline tests still surface.
+        let is_test = analyzer.in_test_region(&unit)
             || test_paths::is_test_like_path(&path, path_language(unit.source().rel_path()));
         if is_test && !include_tests {
             continue;

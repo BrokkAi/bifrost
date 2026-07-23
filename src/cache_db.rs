@@ -16,7 +16,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 10;
+const CURRENT_MIGRATION_VERSION: i64 = 11;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -34,6 +34,8 @@ const CPP_TEMPLATE_METADATA_SQL: &str =
 const SCALA_EXPORTS_SQL: &str = include_str!("../migrations/cache/0009-scala-exports.sql");
 const IDENTIFIER_LOOKUP_MEMBERSHIP_SQL: &str =
     include_str!("../migrations/cache/0010-identifier-lookup-membership.sql");
+const CODE_UNIT_TEST_REGION_SQL: &str =
+    include_str!("../migrations/cache/0011-code-unit-test-region.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -45,6 +47,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CPP_TEMPLATE_METADATA_SQL,
     SCALA_EXPORTS_SQL,
     IDENTIFIER_LOOKUP_MEMBERSHIP_SQL,
+    CODE_UNIT_TEST_REGION_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -78,6 +81,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply Scala exports migration");
     conn.execute_batch(IDENTIFIER_LOOKUP_MEMBERSHIP_SQL)
         .expect("apply identifier lookup membership migration");
+    conn.execute_batch(CODE_UNIT_TEST_REGION_SQL)
+        .expect("apply code unit test region migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -1141,6 +1146,73 @@ mod tests {
             })
             .unwrap(),
             "unicode_é"
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn populated_v10_cache_migrates_additively_to_code_unit_test_region() {
+        // A code_units row written before migration 0011 must survive the
+        // additive `in_test_region` column, which defaults to 0 (untainted).
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        Migrations::new(vec![
+            M::up(CURRENT_BASELINE_SQL),
+            M::up(PATH_SYMBOL_UNITS_SQL),
+            M::up(FORWARD_FACTS_SQL),
+            M::up(ANALYZER_GENERATIONS_SQL),
+            M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
+            M::up(ANALYZER_BLOB_PAYLOAD_COSTS_SQL),
+            M::up(STRUCTURAL_FACTS_SNAPSHOTS_SQL),
+            M::up(CPP_TEMPLATE_METADATA_SQL),
+            M::up(SCALA_EXPORTS_SQL),
+            M::up(IDENTIFIER_LOOKUP_MEMBERSHIP_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        let oid = "3333333333333333333333333333333333333333";
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 11)",
+            [oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+               synthetic, is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
+             ) VALUES(?1, 'rust', 0, 1, 'make_widget', 'make_widget', '', 0, 0, 0, 1, 0)",
+            [oid],
+        )
+        .unwrap();
+
+        // The column does not exist before migration 0011.
+        let before: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('code_units')
+                   WHERE name = 'in_test_region'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!before, "in_test_region should not exist before 0011");
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT short_name, in_test_region FROM code_units",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            ("make_widget".to_string(), 0),
+            "pre-existing units default to untainted after the additive column"
         );
         assert!(current_schema_is_valid(&conn).unwrap());
     }

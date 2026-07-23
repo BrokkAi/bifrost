@@ -620,6 +620,10 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.contains_tests(file)
     }
 
+    fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
+        self.inner.in_test_region(code_unit)
+    }
+
     fn comment_density(&self, code_unit: &CodeUnit) -> Option<CommentDensityStats> {
         if file_language(code_unit.source()) != Language::Java {
             return None;

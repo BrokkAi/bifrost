@@ -11,6 +11,33 @@ pub(super) fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
+/// Whether `item` is directly preceded by a test-evidence attribute
+/// (`#[test]`, `#[cfg(test)]`, `#[tokio::test]`, `#[sqlx::test]`, ...).
+///
+/// In tree-sitter-rust, outer attributes attach to an item as *preceding
+/// siblings*, not children, so we walk backward across the contiguous run of
+/// attribute/comment siblings and stop at the first real item. This is the
+/// per-item half of the test-region taint: combined with the taint inherited
+/// from enclosing items, it decides whether a declaration lies in a test
+/// region. It operates on whatever tree/source the caller passes, so it also
+/// covers the padded reparse of item-position macros (#1015).
+fn rust_item_carries_test_attribute(item: Node<'_>, source: &str) -> bool {
+    let mut prev = item.prev_sibling();
+    while let Some(node) = prev {
+        match node.kind() {
+            "attribute_item" => {
+                if super::tests::rust_attribute_is_test_evidence(node, source) {
+                    return true;
+                }
+            }
+            "inner_attribute_item" | "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = node.prev_sibling();
+    }
+    false
+}
+
 pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let mut parsed = ParsedFile::new(rust_package_name(file));
     let root = tree.root_node();
@@ -46,6 +73,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
+                    false,
                     &mut parsed,
                 );
             }
@@ -57,6 +85,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     None,
                     &parsed.package_name.clone(),
                     &item_macro_definitions,
+                    false,
                     &mut parsed,
                 );
             }
@@ -67,6 +96,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
+                    false,
                     &mut parsed,
                 );
             }
@@ -77,6 +107,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
+                    false,
                     &mut parsed,
                 );
             }
@@ -87,6 +118,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
+                    false,
                     &mut parsed,
                 );
             }
@@ -98,6 +130,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     None,
                     &parsed.package_name.clone(),
                     &item_macro_definitions,
+                    false,
                     &mut parsed,
                 );
             }
@@ -108,6 +141,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     None,
                     &parsed.package_name.clone(),
+                    false,
                     &mut parsed,
                 );
             }
@@ -118,6 +152,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     child,
                     &parsed.package_name.clone(),
                     &impl_import_binder,
+                    false,
                     &mut parsed,
                 );
             }
@@ -169,6 +204,7 @@ fn visit_rust_class_like(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
@@ -177,6 +213,7 @@ fn visit_rust_class_like(
         return None;
     }
 
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
@@ -194,6 +231,9 @@ fn visit_rust_class_like(
         parent.cloned(),
         Some(top_level.clone()),
     );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
     parsed.add_signature(
         code_unit.clone(),
         rust_type_signature(node, source, package_name.is_empty()),
@@ -206,7 +246,15 @@ fn visit_rust_class_like(
             };
             match child.kind() {
                 "field_declaration" | "enum_variant" | "const_item" => {
-                    visit_rust_field(file, source, child, Some(&code_unit), package_name, parsed);
+                    visit_rust_field(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
                 }
                 "function_item" | "function_signature_item" => {
                     visit_rust_function(
@@ -215,11 +263,20 @@ fn visit_rust_class_like(
                         child,
                         Some(&code_unit),
                         package_name,
+                        in_test_region,
                         parsed,
                     );
                 }
                 "associated_type" | "type_item" => {
-                    visit_rust_alias(file, source, child, Some(&code_unit), package_name, parsed);
+                    visit_rust_alias(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
                 }
                 _ => {}
             }
@@ -229,6 +286,7 @@ fn visit_rust_class_like(
     Some(code_unit)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_rust_module(
     file: &ProjectFile,
     source: &str,
@@ -236,6 +294,7 @@ fn visit_rust_module(
     parent: Option<&CodeUnit>,
     package_name: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
@@ -244,6 +303,7 @@ fn visit_rust_module(
         return None;
     }
 
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
@@ -261,6 +321,9 @@ fn visit_rust_module(
         parent.cloned(),
         Some(top_level.clone()),
     );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
     parsed.add_signature(code_unit.clone(), format!("mod {name} {{"));
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -276,6 +339,7 @@ fn visit_rust_module(
                         child,
                         Some(&code_unit),
                         package_name,
+                        in_test_region,
                         parsed,
                     );
                 }
@@ -286,6 +350,7 @@ fn visit_rust_module(
                         child,
                         Some(&code_unit),
                         package_name,
+                        in_test_region,
                         parsed,
                     );
                 }
@@ -297,11 +362,20 @@ fn visit_rust_module(
                         Some(&code_unit),
                         package_name,
                         item_macro_definitions,
+                        in_test_region,
                         parsed,
                     );
                 }
                 "macro_definition" => {
-                    visit_rust_macro(file, source, child, Some(&code_unit), package_name, parsed);
+                    visit_rust_macro(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
                 }
                 "macro_invocation" => {
                     visit_rust_macro_invocation_definitions(
@@ -311,6 +385,7 @@ fn visit_rust_module(
                         Some(&code_unit),
                         package_name,
                         item_macro_definitions,
+                        in_test_region,
                         parsed,
                     );
                 }
@@ -328,6 +403,7 @@ fn visit_rust_function(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
@@ -336,6 +412,7 @@ fn visit_rust_function(
         return None;
     }
 
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let signature = rust_impl_member_identity_signature(node, source).or_else(|| {
         node.child_by_field_name("parameters")
             .map(|parameters| rust_node_text(parameters, source).trim().to_string())
@@ -359,6 +436,9 @@ fn visit_rust_function(
         parent.cloned(),
         Some(top_level),
     );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
     let signature = rust_function_signature(node, source);
     parsed.add_signature_with_metadata(
         code_unit.clone(),
@@ -373,6 +453,7 @@ fn visit_rust_macro(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
@@ -381,6 +462,7 @@ fn visit_rust_macro(
         return None;
     }
 
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     register_rust_macro(
         file,
         name,
@@ -388,10 +470,12 @@ fn visit_rust_macro(
         parent,
         rust_range_from_node(node),
         rust_macro_signature(node, source),
+        in_test_region,
         parsed,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_rust_macro(
     file: &ProjectFile,
     name: &str,
@@ -399,6 +483,7 @@ fn register_rust_macro(
     parent: Option<&CodeUnit>,
     range: Range,
     signature: String,
+    in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let short_name = parent
@@ -412,6 +497,9 @@ fn register_rust_macro(
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit_with_range(code_unit.clone(), range, parent.cloned(), Some(top_level));
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
     parsed.add_signature(code_unit.clone(), signature);
     Some(code_unit)
 }
@@ -435,6 +523,7 @@ fn register_rust_macro(
 /// every node's byte offset and line number matches the original file exactly.
 /// This lets the existing visitors (which derive ranges from node positions via
 /// `node_range`) run unchanged and still slice the correct source text.
+#[allow(clippy::too_many_arguments)]
 fn visit_rust_macro_invocation_definitions(
     file: &ProjectFile,
     source: &str,
@@ -442,6 +531,7 @@ fn visit_rust_macro_invocation_definitions(
     parent: Option<&CodeUnit>,
     package_name: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
     let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
@@ -469,6 +559,14 @@ fn visit_rust_macro_invocation_definitions(
         Some(true) => true,
         None => false,
     };
+
+    // Taint carried into the reparsed items: the enclosing test region plus any
+    // test attribute directly on the macro invocation (`#[cfg(test)] mac! {...}`).
+    // A `#[cfg(test)]` written *inside* the token tree, guarding an individual
+    // reparsed item, is additionally caught by `visit_rust_macro_item`'s own
+    // preceding-attribute check over the padded reparse tree.
+    let invocation_in_test_region =
+        parent_in_test_region || rust_item_carries_test_attribute(node, source);
 
     let Some(arguments) = rust_macro_invocation_arguments(node) else {
         return;
@@ -521,6 +619,7 @@ fn visit_rust_macro_invocation_definitions(
             item_macro_definitions,
             &interior_binder,
             locally_proven_passthrough,
+            invocation_in_test_region,
             parsed,
         );
     }
@@ -620,12 +719,21 @@ fn visit_rust_macro_item(
     item_macro_definitions: &[RustRulesItemMacroDefinition],
     impl_binder: &ImportBinder,
     replay_macro_definitions: bool,
+    in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
     match child.kind() {
         "use_declaration" => {}
         "struct_item" | "enum_item" | "trait_item" => {
-            visit_rust_class_like(file, source, child, parent, package_name, parsed);
+            visit_rust_class_like(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
         }
         "mod_item" => {
             visit_rust_module(
@@ -635,23 +743,64 @@ fn visit_rust_macro_item(
                 parent,
                 package_name,
                 item_macro_definitions,
+                in_test_region,
                 parsed,
             );
         }
         "function_item" => {
-            visit_rust_function(file, source, child, parent, package_name, parsed);
+            visit_rust_function(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
         }
         "const_item" | "static_item" => {
-            visit_rust_field(file, source, child, parent, package_name, parsed);
+            visit_rust_field(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
         }
         "type_item" => {
-            visit_rust_alias(file, source, child, parent, package_name, parsed);
+            visit_rust_alias(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
         }
         "macro_definition" if replay_macro_definitions => {
-            visit_rust_macro(file, source, child, parent, package_name, parsed);
+            visit_rust_macro(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
         }
         "impl_item" => {
-            visit_rust_impl(file, source, child, package_name, impl_binder, parsed);
+            visit_rust_impl(
+                file,
+                source,
+                child,
+                package_name,
+                impl_binder,
+                in_test_region,
+                parsed,
+            );
         }
         "macro_invocation" => {
             visit_rust_macro_invocation_definitions(
@@ -661,6 +810,7 @@ fn visit_rust_macro_item(
                 parent,
                 package_name,
                 item_macro_definitions,
+                in_test_region,
                 parsed,
             );
         }
@@ -1135,6 +1285,7 @@ fn visit_rust_field(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name").unwrap_or(node);
@@ -1146,6 +1297,7 @@ fn visit_rust_field(
         return None;
     }
 
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| format!("_module_.{name}"));
@@ -1165,6 +1317,9 @@ fn visit_rust_field(
         parent.cloned(),
         Some(top_level),
     );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
     parsed.add_signature(
         code_unit.clone(),
         rust_node_text(node, source)
@@ -1181,6 +1336,7 @@ fn visit_rust_alias(
     node: Node<'_>,
     parent: Option<&CodeUnit>,
     package_name: &str,
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
@@ -1188,6 +1344,7 @@ fn visit_rust_alias(
     if name.is_empty() {
         return None;
     }
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
@@ -1207,6 +1364,9 @@ fn visit_rust_alias(
         parent.cloned(),
         Some(top_level),
     );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
     parsed.add_signature(
         code_unit.clone(),
         rust_node_text(node, source).trim().to_string(),
@@ -1221,6 +1381,7 @@ fn visit_rust_impl(
     node: Node<'_>,
     package_name: &str,
     import_binder: &ImportBinder,
+    parent_in_test_region: bool,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
     let Some(type_node) = node.child_by_field_name("type") else {
@@ -1231,6 +1392,11 @@ fn visit_rust_impl(
     else {
         return;
     };
+
+    // A `#[cfg(test)]`-gated `impl` (or one nested in a test region) taints its
+    // members, but never the impl owner type itself — that type may be defined
+    // in production and only extended by a test impl.
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
 
     let Some(body) = node.child_by_field_name("body") else {
         return;
@@ -1247,6 +1413,7 @@ fn visit_rust_impl(
                     child,
                     Some(&parent),
                     parent.package_name(),
+                    in_test_region,
                     parsed,
                 );
             }
@@ -1257,6 +1424,7 @@ fn visit_rust_impl(
                     child,
                     Some(&parent),
                     parent.package_name(),
+                    in_test_region,
                     parsed,
                 );
             }
@@ -1267,6 +1435,7 @@ fn visit_rust_impl(
                     child,
                     Some(&parent),
                     parent.package_name(),
+                    in_test_region,
                     parsed,
                 );
             }
@@ -1710,5 +1879,194 @@ other::wrapper! { macro_rules! QualifiedPhantom { () => {} } }
                 "unexpected {phantom}: {macros:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod test_region_taint_tests {
+    use super::*;
+
+    /// Parse `source` as `src/lib.rs` and return the set of short names for the
+    /// declarations recorded in the per-declaration test-region taint side-map.
+    fn tainted_short_names(source: &str) -> HashSet<String> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "src/lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+        parsed
+            .test_region_units
+            .iter()
+            .map(|unit| unit.short_name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn inline_cfg_test_module_taints_only_the_test_symbols() {
+        // The issue's exact shape: a production fn plus an inline
+        // `#[cfg(test)] mod tests`. Production API must stay untainted.
+        let tainted = tainted_short_names(
+            r#"
+pub fn make_widget() {}
+
+#[cfg(test)]
+mod tests {
+    fn it_works() {}
+}
+
+pub fn after_tests() {}
+"#,
+        );
+        assert!(tainted.contains("tests"), "{tainted:?}");
+        assert!(tainted.contains("tests.it_works"), "{tainted:?}");
+        assert!(!tainted.contains("make_widget"), "{tainted:?}");
+        assert!(!tainted.contains("after_tests"), "{tainted:?}");
+    }
+
+    #[test]
+    fn test_attributed_free_functions_are_tainted() {
+        let tainted = tainted_short_names(
+            r#"
+#[test]
+fn top_level_test() {}
+
+#[tokio::test]
+async fn tokio_test() {}
+
+#[my_framework::test]
+fn custom_last_segment_test() {}
+
+pub fn production() {}
+"#,
+        );
+        assert!(tainted.contains("top_level_test"), "{tainted:?}");
+        assert!(tainted.contains("tokio_test"), "{tainted:?}");
+        assert!(tainted.contains("custom_last_segment_test"), "{tainted:?}");
+        assert!(!tainted.contains("production"), "{tainted:?}");
+    }
+
+    #[test]
+    fn nested_modules_inside_cfg_test_inherit_the_taint() {
+        let tainted = tainted_short_names(
+            r#"
+#[cfg(test)]
+mod outer {
+    mod inner {
+        fn helper() {}
+        struct Fixture {}
+    }
+}
+"#,
+        );
+        for name in [
+            "outer",
+            "outer.inner",
+            "outer.inner.helper",
+            "outer.inner.Fixture",
+        ] {
+            assert!(tainted.contains(name), "missing {name}: {tainted:?}");
+        }
+    }
+
+    #[test]
+    fn cfg_all_test_feature_is_tainted_but_cfg_not_test_is_not() {
+        let positive = tainted_short_names(
+            r#"
+#[cfg(all(test, feature = "x"))]
+mod gated {
+    fn used() {}
+}
+"#,
+        );
+        assert!(positive.contains("gated"), "{positive:?}");
+        assert!(positive.contains("gated.used"), "{positive:?}");
+
+        let negative = tainted_short_names(
+            r#"
+#[cfg(not(test))]
+mod prod_only {
+    fn used() {}
+}
+"#,
+        );
+        assert!(
+            negative.is_empty(),
+            "cfg(not(test)) must not taint: {negative:?}"
+        );
+    }
+
+    #[test]
+    fn production_symbol_after_a_test_module_is_untainted() {
+        let tainted = tainted_short_names(
+            r#"
+#[cfg(test)]
+mod tests {
+    fn t() {}
+}
+
+pub struct Widget {}
+"#,
+        );
+        assert!(tainted.contains("tests"), "{tainted:?}");
+        assert!(!tainted.contains("Widget"), "{tainted:?}");
+    }
+
+    #[test]
+    fn cfg_test_gated_macro_region_taints_reparsed_items() {
+        // A `#[cfg(test)]`-gated item-position macro invocation taints the items
+        // recovered through the #1015 reparse path, both when the attribute sits
+        // on the invocation and when it guards an item *inside* the token tree.
+        let tainted = tainted_short_names(
+            r#"
+macro_rules! passthrough { ($($item:item)*) => { $($item)* }; }
+
+#[cfg(test)]
+passthrough! {
+    fn generated_under_test() {}
+    pub struct GeneratedFixture {}
+}
+
+passthrough! {
+    #[cfg(test)]
+    fn inner_gated_test() {}
+
+    pub fn inner_production() {}
+}
+"#,
+        );
+        assert!(tainted.contains("generated_under_test"), "{tainted:?}");
+        assert!(tainted.contains("GeneratedFixture"), "{tainted:?}");
+        assert!(tainted.contains("inner_gated_test"), "{tainted:?}");
+        assert!(!tainted.contains("inner_production"), "{tainted:?}");
+    }
+
+    #[test]
+    fn test_impl_taints_members_not_the_owner_type() {
+        let tainted = tainted_short_names(
+            r#"
+pub struct Widget {}
+
+#[cfg(test)]
+impl Widget {
+    fn test_only_helper() {}
+}
+"#,
+        );
+        assert!(
+            !tainted.contains("Widget"),
+            "owner type must stay untainted: {tainted:?}"
+        );
+        assert!(
+            tainted
+                .iter()
+                .any(|name| name.ends_with("test_only_helper")),
+            "impl member should be tainted: {tainted:?}"
+        );
     }
 }

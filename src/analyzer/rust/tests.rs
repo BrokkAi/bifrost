@@ -7,7 +7,7 @@ use tree_sitter::Node;
 pub(super) fn rust_source_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut found = false;
     walk_named_tree_preorder(root, true, |node| {
-        found |= node.kind() == "attribute_item" && rust_test_attribute(node, source);
+        found |= node.kind() == "attribute_item" && rust_attribute_is_test_evidence(node, source);
         if found {
             WalkControl::SkipChildren
         } else {
@@ -17,13 +17,72 @@ pub(super) fn rust_source_contains_tests(root: Node<'_>, source: &str) -> bool {
     found
 }
 
-fn rust_test_attribute(node: Node<'_>, source: &str) -> bool {
-    let text = compact_attribute_text(node_text(node, source));
-    matches!(text.as_str(), "#[test]" | "#[tokio::test]" | "#[rstest]")
-        || text
-            .strip_prefix("#[cfg(")
-            .and_then(|body| body.strip_suffix(")]"))
-            .is_some_and(cfg_body_has_positive_test_token)
+/// Shared attribute test-evidence predicate used by both file-level test
+/// classification (`rust_source_contains_tests`) and the per-declaration
+/// test-region taint recorded during the declaration walk (see
+/// `declarations::rust_item_carries_test_attribute`).
+///
+/// Positive evidence is any of:
+///  - an attribute whose path's **last segment is `test`**
+///    (`#[test]`, `#[tokio::test]`, `#[sqlx::test]`, `#[actix_rt::test]`,
+///    custom `#[my::test]`), which subsumes the historical literal allowlist;
+///  - `#[rstest]`, whose spelling has no `test` segment but is a well-known
+///    test-case attribute;
+///  - `#[cfg(...)]` whose predicate carries a positive `test` token
+///    (`cfg(test)`, `cfg(all(test, feature = "x"))`), while `cfg(not(test))`
+///    is not evidence.
+///
+/// `cfg_attr` is intentionally out of scope: it re-gates *other* attributes and
+/// does not by itself establish a test region.
+pub(super) fn rust_attribute_is_test_evidence(attribute_item: Node<'_>, source: &str) -> bool {
+    let Some(attribute) = rust_attribute_node(attribute_item) else {
+        return false;
+    };
+    let Some(path) = attribute.named_child(0) else {
+        return false;
+    };
+    let last_segment = rust_attribute_path_last_segment(path, source);
+    if last_segment == Some("cfg") {
+        return attribute
+            .child_by_field_name("arguments")
+            .and_then(|arguments| rust_token_tree_interior_text(arguments, source))
+            .is_some_and(cfg_body_has_positive_test_token);
+    }
+    matches!(last_segment, Some("test") | Some("rstest"))
+}
+
+/// The `attribute` node nested inside an `attribute_item` (`# [ attribute ]`).
+fn rust_attribute_node(attribute_item: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = attribute_item.walk();
+    attribute_item
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "attribute")
+}
+
+/// Last path segment of an attribute path node. For a `scoped_identifier`
+/// (`tokio::test`) this is the `name` field (`test`); for a bare `identifier`
+/// (`test`, `cfg`) it is the identifier text itself. Other path shapes (e.g.
+/// `crate`, `self`, generics) have no meaningful trailing test segment.
+fn rust_attribute_path_last_segment<'a>(path: Node<'_>, source: &'a str) -> Option<&'a str> {
+    match path.kind() {
+        "scoped_identifier" => {
+            let name = path.child_by_field_name("name")?;
+            Some(node_text(name, source).trim())
+        }
+        "identifier" => Some(node_text(path, source).trim()),
+        _ => None,
+    }
+}
+
+/// Interior text of a delimited `token_tree` (`( ... )`), excluding the
+/// outermost delimiters, so `#[cfg(all(test))]`'s arguments yield `all(test)`.
+fn rust_token_tree_interior_text<'a>(token_tree: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if token_tree.kind() != "token_tree" {
+        return None;
+    }
+    let open = token_tree.child(0)?;
+    let close = token_tree.child(token_tree.child_count().checked_sub(1)?)?;
+    source.get(open.end_byte()..close.start_byte())
 }
 
 fn cfg_body_has_positive_test_token(body: &str) -> bool {
@@ -52,10 +111,6 @@ fn cfg_body_has_positive_test_token(body: &str) -> bool {
         token.clear();
     }
     token == "test"
-}
-
-fn compact_attribute_text(text: &str) -> String {
-    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

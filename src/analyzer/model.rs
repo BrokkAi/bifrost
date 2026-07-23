@@ -830,7 +830,11 @@ pub struct SummaryFileProjection {
 pub struct SearchSymbolCandidate {
     pub code_unit: CodeUnit,
     pub primary_range: Option<Range>,
-    pub contains_tests: bool,
+    /// Per-declaration test-region taint (issue #1102): whether this specific
+    /// symbol is inside a structurally-evidenced test region. `search_symbols`
+    /// combines it with a path-based test check to decide test filtering, so a
+    /// production symbol in a file with inline tests still surfaces.
+    pub in_test_region: bool,
 }
 
 /// A tree-sitter parse-error span captured during analysis so the LSP

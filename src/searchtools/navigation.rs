@@ -287,7 +287,12 @@ pub fn search_symbols(
                 let range = candidate
                     .primary_range
                     .or_else(|| primary_range(analyzer, &candidate.code_unit))?;
-                let is_test = candidate.contains_tests
+                // Symbol-level test filtering (#1102): a declaration is treated as
+                // a test symbol only when it is itself in a structurally-evidenced
+                // test region, or lives under a test-tree path. The old whole-file
+                // `contains_tests` gate hid the production API of any file carrying
+                // an inline `#[cfg(test)] mod tests`.
+                let is_test = candidate.in_test_region
                     || test_paths::is_test_like_path(
                         &rel_path_string(candidate.code_unit.source()),
                         language_for_file(candidate.code_unit.source()),
@@ -393,7 +398,7 @@ pub(super) fn search_symbols_note(truncated: bool, shown: usize, total: usize) -
         ))
     } else if total == 0 {
         Some(
-            "No files matched. Try a broader identifier, qualified, or regex-like pattern; if matches may be in test files, set `include_tests` to true."
+            "No files matched. Try a broader identifier, qualified, or regex-like pattern; if the symbol is itself a test (or lives under a test-tree path), set `include_tests` to true."
                 .to_string(),
         )
     } else {

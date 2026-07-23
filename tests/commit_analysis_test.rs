@@ -335,3 +335,67 @@ fn analyze_commit_rejects_root_commit() {
         .unwrap_err();
     assert!(err.message.contains("root commits"));
 }
+
+/// Issue #1102 (commit-analysis half): with `include_tests:false`, symbol
+/// filtering is per declaration, not whole-file. A Rust file that adds both a
+/// production function and an inline `#[cfg(test)] mod tests` must report the
+/// production symbol as introduced while suppressing the inline test symbol.
+/// Before the fix, the whole file was gated on `contains_tests`, so the
+/// production symbol was suppressed too.
+#[test]
+fn analyze_commit_filters_test_symbols_per_declaration_not_whole_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+
+    fs::write(root.join("widget.rs"), "pub fn seed() -> u32 {\n    1\n}\n").unwrap();
+    commit(root, "base");
+
+    fs::write(
+        root.join("widget.rs"),
+        r#"pub fn seed() -> u32 {
+    1
+}
+
+pub fn make_widget() -> u32 {
+    7
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        assert_eq!(make_widget(), 7);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let head = commit(root, "add production fn plus inline tests");
+
+    let service =
+        SearchToolsService::new_without_semantic_index(root.to_path_buf()).expect("service");
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_commit",
+                &serde_json::json!({"revision": head, "include_tests": false}).to_string(),
+            )
+            .expect("analyze_commit"),
+    )
+    .expect("json");
+
+    let introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
+    assert!(
+        find_symbol(introduced, "make_widget").is_some(),
+        "production symbol should be introduced with include_tests:false: {result}"
+    );
+    assert!(
+        find_symbol(introduced, "it_works").is_none(),
+        "inline test symbol must be filtered with include_tests:false: {result}"
+    );
+}

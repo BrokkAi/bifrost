@@ -484,7 +484,11 @@ fn insert_path_symbol_row(
 pub struct SearchCandidateRow {
     pub candidate: CandidateRow,
     pub primary_range: Option<Range>,
-    pub contains_tests: bool,
+    /// Per-declaration test-region taint (issue #1102): true when this specific
+    /// unit is inside a structurally-evidenced test region, replacing the old
+    /// file-level `contains_tests` replication so production symbols in a file
+    /// with inline tests are not hidden.
+    pub in_test_region: bool,
 }
 
 /// Persisted facts required to derive callable arity and return types without
@@ -2009,7 +2013,7 @@ impl AnalyzerStore {
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, meta.contains_tests,
+                    units.in_definition_lookup, units.in_test_region,
                     primary_range.start_byte, primary_range.end_byte,
                     primary_range.start_line, primary_range.end_line
              FROM code_units AS units
@@ -2574,6 +2578,7 @@ struct StoredUnit {
     top_level_ordinal: Option<usize>,
     in_declarations: bool,
     in_definition_lookup: bool,
+    in_test_region: bool,
 }
 
 #[derive(Debug)]
@@ -2592,6 +2597,7 @@ struct PreparedUnitRow {
     top_level_ordinal: Option<i64>,
     in_declarations: i64,
     in_definition_lookup: i64,
+    in_test_region: i64,
 }
 
 #[derive(Debug)]
@@ -2796,6 +2802,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             top_level_ordinal: stored.top_level_ordinal.map(usize_to_i64).transpose()?,
             in_declarations: bool_to_i64(stored.in_declarations),
             in_definition_lookup: bool_to_i64(stored.in_definition_lookup),
+            in_test_region: bool_to_i64(stored.in_test_region),
         });
     }
 
@@ -3011,8 +3018,9 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             "INSERT OR IGNORE INTO code_units(
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name, signature, synthetic,
-               is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+               is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
+               in_test_region
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )?;
         for row in &blob.units {
             stmt.execute(params![
@@ -3032,6 +3040,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
                 row.top_level_ordinal,
                 row.in_declarations,
                 row.in_definition_lookup,
+                row.in_test_region,
             ])?;
         }
     }
@@ -3199,8 +3208,8 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name,
                signature, synthetic, is_type_alias, top_level_ordinal,
-               in_declarations, in_definition_lookup
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+               in_declarations, in_definition_lookup, in_test_region
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )?;
         for stored in &units {
             let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
@@ -3227,6 +3236,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                 stored.top_level_ordinal.map(usize_to_i64).transpose()?,
                 bool_to_i64(stored.in_declarations),
                 bool_to_i64(stored.in_definition_lookup),
+                bool_to_i64(stored.in_test_region),
             ])?;
         }
     }
@@ -3310,6 +3320,7 @@ fn collect_stored_units<A: LanguageAdapter>(adapter: &A, state: &FileState) -> V
                 top_level_ordinal,
                 in_declarations: state.declarations.contains(&unit),
                 in_definition_lookup: state.definition_lookup_units.contains(&unit),
+                in_test_region: state.test_region_units.contains(&unit),
                 unit,
             }
         })
@@ -3708,6 +3719,7 @@ struct UnitRow {
     top_level_ordinal: Option<usize>,
     in_declarations: bool,
     in_definition_lookup: bool,
+    in_test_region: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3722,6 +3734,7 @@ struct RawUnitRow {
     top_level_ordinal: Option<usize>,
     in_declarations: bool,
     in_definition_lookup: bool,
+    in_test_region: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3802,6 +3815,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
     let mut declarations = set_with_capacity(by_key.len());
     let mut definition_lookup_units = HashSet::default();
     let mut type_aliases = HashSet::default();
+    let mut test_region_units = HashSet::default();
     for row in by_key.values() {
         if row.in_declarations {
             declarations.insert(row.unit.clone());
@@ -3811,6 +3825,9 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         }
         if row.is_type_alias {
             type_aliases.insert(row.unit.clone());
+        }
+        if row.in_test_region {
+            test_region_units.insert(row.unit.clone());
         }
     }
 
@@ -3867,6 +3884,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         ruby_method_dispatch_modes,
         scala_traits,
         contains_tests: meta.contains_tests,
+        test_region_units,
         parse_errors: None,
     };
 
@@ -3984,6 +4002,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
                     top_level_ordinal: raw.top_level_ordinal,
                     in_declarations: raw.in_declarations,
                     in_definition_lookup: raw.in_definition_lookup,
+                    in_test_region: raw.in_test_region,
                 },
             );
         }
@@ -4000,6 +4019,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
         let mut declarations = set_with_capacity(by_key.len());
         let mut definition_lookup_units = HashSet::default();
         let mut type_aliases = HashSet::default();
+        let mut test_region_units = HashSet::default();
         for row in by_key.values() {
             if row.in_declarations {
                 declarations.insert(row.unit.clone());
@@ -4009,6 +4029,9 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             }
             if row.is_type_alias {
                 type_aliases.insert(row.unit.clone());
+            }
+            if row.in_test_region {
+                test_region_units.insert(row.unit.clone());
             }
         }
 
@@ -4077,6 +4100,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             ruby_method_dispatch_modes,
             scala_traits,
             contains_tests: adapter.hydrate_contains_tests(meta.contains_tests, file, source_text),
+            test_region_units,
             parse_errors: None,
         };
 
@@ -4371,7 +4395,8 @@ fn read_unit_rows_bulk(
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
             "SELECT blob_oid, unit_key, kind, short_name, content_qualifier, signature, synthetic,
-                    is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
+                    is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
+                    in_test_region
              FROM code_units
              WHERE lang = ? AND blob_oid IN ({placeholders})
              ORDER BY blob_oid, unit_key"
@@ -4402,6 +4427,7 @@ fn read_unit_rows_bulk(
                         .and_then(|value| usize::try_from(value).ok()),
                     in_declarations: row.get::<_, i64>(9)? != 0,
                     in_definition_lookup: row.get::<_, i64>(10)? != 0,
+                    in_test_region: row.get::<_, i64>(11)? != 0,
                 },
             ))
         })?;
@@ -5014,7 +5040,7 @@ fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
     Ok(SearchCandidateRow {
         candidate,
         primary_range,
-        contains_tests: row.get::<_, i64>(12)? != 0,
+        in_test_region: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -5061,7 +5087,7 @@ fn search_candidate_rows_by_lang_conn(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, meta.contains_tests,
+                units.in_definition_lookup, units.in_test_region,
                 primary_range.start_byte, primary_range.end_byte,
                 primary_range.start_line, primary_range.end_line
          FROM code_units AS units
@@ -5253,7 +5279,8 @@ fn read_unit_rows<A: LanguageAdapter>(
 ) -> Result<Vec<UnitRow>> {
     let mut stmt = conn.prepare_cached(
         "SELECT unit_key, kind, short_name, content_qualifier, signature, synthetic,
-                is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
+                is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
+                in_test_region
          FROM code_units
          WHERE blob_oid = ?1 AND lang = ?2
          ORDER BY unit_key",
@@ -5271,6 +5298,7 @@ fn read_unit_rows<A: LanguageAdapter>(
             .and_then(|value| usize::try_from(value).ok());
         let in_declarations = row.get::<_, i64>(8)? != 0;
         let in_definition_lookup = row.get::<_, i64>(9)? != 0;
+        let in_test_region = row.get::<_, i64>(10)? != 0;
         Ok((
             key,
             kind_raw,
@@ -5282,6 +5310,7 @@ fn read_unit_rows<A: LanguageAdapter>(
             top_level_ordinal,
             in_declarations,
             in_definition_lookup,
+            in_test_region,
         ))
     })?;
 
@@ -5298,6 +5327,7 @@ fn read_unit_rows<A: LanguageAdapter>(
             top_level_ordinal,
             in_declarations,
             in_definition_lookup,
+            in_test_region,
         ) = row?;
         let kind = code_unit_kind_from_i64(kind_raw)?;
         let package_name = adapter.hydrate_content_qualifier(&content_qualifier, file);
@@ -5316,6 +5346,7 @@ fn read_unit_rows<A: LanguageAdapter>(
             top_level_ordinal,
             in_declarations,
             in_definition_lookup,
+            in_test_region,
         });
     }
     Ok(out)
@@ -6863,7 +6894,7 @@ mod tests {
             .find(|row| row.candidate.short_name.ends_with(".fromJson"))
             .expect("method search candidate");
         assert!(method.primary_range.is_some());
-        assert!(!method.contains_tests);
+        assert!(!method.in_test_region);
     }
 
     #[test]
@@ -8664,6 +8695,7 @@ mod tests {
             ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
             scala_traits: parsed.scala_traits,
             contains_tests,
+            test_region_units: parsed.test_region_units,
             parse_errors: Some(Vec::new()),
         }
     }
@@ -8706,6 +8738,7 @@ mod tests {
         );
         assert_eq!(actual.scala_traits, expected.scala_traits);
         assert_eq!(actual.contains_tests, expected.contains_tests);
+        assert_eq!(actual.test_region_units, expected.test_region_units);
         assert!(actual.source.is_empty());
         assert!(actual.parse_errors.is_none());
     }
