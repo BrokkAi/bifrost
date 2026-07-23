@@ -7675,16 +7675,12 @@ mod tests {
         );
     }
 
-    /// M3: `analyzed_live_files`' full sweep calls
-    /// `LiveSnapshot::validated_oid_for_path` once per live path, which used
-    /// to `fs::metadata` every one of them on every call. The `QueryReadCache`
-    /// above only memoizes *within* one query context (one tool call), so
-    /// this drives two *separate* contexts — exactly the "next unrelated
-    /// call" shape the fuzzer's `--jobs N` probe loop hammers — and asserts
-    /// the second context's sweep reuses the first context's already-stat-
-    /// validated `LiveSnapshot` without touching the filesystem again.
+    /// Direct analyzers do not own a watcher, so later query contexts must
+    /// revalidate filesystem-backed live paths. The request cache still
+    /// prevents duplicate sweeps within one query context, but an unrelated
+    /// later call must be able to notice an out-of-band disk edit.
     #[test]
-    fn analyzed_live_files_reuses_validated_stamps_across_query_contexts() {
+    fn analyzed_live_files_revalidates_filesystem_paths_across_query_contexts() {
         // Git-backed on purpose: `resolve_live_oids` only routes through
         // `LivePathValidation::Filesystem` (the `PathState.stat: Some(_)`
         // shape M3 memoizes) when `store_context.liveness` resolves a repo
@@ -7706,23 +7702,18 @@ mod tests {
         analyzer.end_query(&first);
         assert_eq!(files_first.len(), 1, "files: {files_first:?}");
 
-        // Construction (`build_state` -> `resolve_live_oids(replace_live_paths:
-        // true)`) already fully stat-validated `live_paths`'s current
-        // generation, so even this first query context may not need to
-        // `fs::metadata` again. From here on, unrelated later query contexts
-        // (the "next unrelated tool call" shape the fuzzer's `--jobs N` probe
-        // loop hammers) must keep reusing it without touching the filesystem.
+        // A later direct-analyzer query must still validate the filesystem:
+        // no SearchToolsService watcher is available here to bump the live
+        // path generation after an out-of-band edit.
         crate::analyzer::store::liveness::reset_stat_call_count_for_test();
         let second = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         analyzer.begin_query(&second);
         let files_second = analyzer.analyzed_live_files();
         analyzer.end_query(&second);
         assert_eq!(files_second, files_first);
-        assert_eq!(
-            crate::analyzer::store::liveness::stat_call_count_for_test(),
-            0,
-            "an unrelated later query context must reuse the already-validated LiveSnapshot, \
-             not re-stat every live path"
+        assert!(
+            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
+            "an unrelated direct-analyzer query context must re-stat live filesystem paths"
         );
 
         // A real update to the changed file (the watcher/Manual write path's
@@ -7756,18 +7747,16 @@ mod tests {
         );
 
         // ...and every later, unrelated query context against that same
-        // (unchanged) generation goes back to being free, exactly as after
-        // the very first build above.
+        // direct analyzer still revalidates the filesystem.
         crate::analyzer::store::liveness::reset_stat_call_count_for_test();
         let fourth = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         updated.begin_query(&fourth);
         let files_fourth = updated.analyzed_live_files();
         updated.end_query(&fourth);
         assert_eq!(files_fourth, files_third);
-        assert_eq!(
-            crate::analyzer::store::liveness::stat_call_count_for_test(),
-            0,
-            "a second query context against the post-update generation must reuse its LiveSnapshot"
+        assert!(
+            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
+            "a second direct-analyzer query context must re-stat post-update filesystem paths"
         );
     }
 

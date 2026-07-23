@@ -161,37 +161,12 @@ struct IndexFingerprint {
 struct PathState {
     oid: Oid,
     stat: Option<FileStat>,
-    /// Whether this entry's `stat` has already been confirmed, as of *this*
-    /// `PathState` instance, to match the filesystem — set exactly once, by
-    /// `snapshot_from_path_states`, immediately after it performs that check
-    /// while building a fresh `LiveSnapshot`. It is never written again after
-    /// that: `LiveSnapshot` is published behind an `Arc` and treated as
-    /// immutable from that point on, so a plain `bool` is sound here without
-    /// atomics or interior mutability — there is no concurrent-mutation case
-    /// to guard against, only concurrent *reads* of an already-fixed value.
-    ///
-    /// `LivePathMap`'s own source-of-truth entries (constructed only via
-    /// `PathState::new`, in `refresh`/`replace_all`) always carry `false`;
-    /// only the copies `snapshot_from_path_states` inserts into
-    /// `LiveSnapshot::path_to_state` are ever promoted to `true`. That is
-    /// deliberate: `LivePathMap`'s generation counter is bumped by every
-    /// mutation that can change a path's live content (see `refresh`,
-    /// `replace_all`, `remove`), so once `snapshot_from_path_states` rebuilds
-    /// a `LiveSnapshot` after a generation change, every entry in it is
-    /// correct until the *next* generation change discards that whole `Arc`
-    /// and a fresh, re-validated one takes its place — trusting the
-    /// just-performed check for the remaining lifetime of that instance is
-    /// therefore safe, and lets `validated_oid_for_path`/`validate` skip the
-    /// redundant per-call `fs::metadata`.
-    ///
-    /// `Liveness::snapshot()` (`build_snapshot`, below) deliberately does NOT
-    /// opt in: it memoizes on the git index fingerprint plus the overlay
-    /// generation, which do not change on a plain working-tree edit, so an
-    /// out-of-band edit to a tracked file can leave the *same* memoized
-    /// `Arc<LiveSnapshot>` in place indefinitely. Its callers rely on
-    /// `validate`/`validated_oid_for_path` re-checking every time to catch
-    /// that (see `validate_flags_path_edited_after_snapshot_build` below), so
-    /// its entries keep `validated = false` forever.
+    /// Whether this entry is intrinsically current for the lifetime of the
+    /// `LiveSnapshot`. Overlay entries have no filesystem stat and can be
+    /// trusted until their overlay generation changes. Filesystem entries keep
+    /// this `false` even after snapshot construction: direct analyzers have no
+    /// watcher, so an out-of-band disk edit can stale an otherwise memoized
+    /// snapshot without bumping `LivePathMap`'s generation.
     validated: bool,
 }
 
@@ -494,19 +469,8 @@ fn snapshot_from_path_states(path_to_state: &HashMap<ProjectFile, PathState>) ->
             .entry(state.oid)
             .or_default()
             .push(file.clone());
-        // This entry's `stat` was just confirmed, above, to match the
-        // filesystem right now. Promote the clone that goes into the fresh,
-        // about-to-be-`Arc`-published `LiveSnapshot` to `validated = true` so
-        // `validated_oid_for_path`/`validate` can trust it for the remainder
-        // of this snapshot's lifetime without re-`fs::metadata`-ing on every
-        // call — `LivePathMap`'s generation counter guarantees a path whose
-        // live content can change gets a fresh (unvalidated-until-checked)
-        // `PathState` and forces this function to rerun before it is
-        // observed again. The source-of-truth `state` itself (in
-        // `LivePathMapState.paths`) is left untouched — only this snapshot
-        // copy is promoted.
         let mut live_state = state.clone();
-        live_state.validated = true;
+        live_state.validated = state.stat.is_none();
         live_states.insert(file.clone(), live_state);
     }
     LiveSnapshot {
@@ -763,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_oid_for_path_memoizes_after_first_snapshot_build() {
+    fn filesystem_validated_oid_for_path_rechecks_memoized_snapshots() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(temp.path().join("b.rs"), "fn b() {}\n").unwrap();
@@ -785,26 +749,26 @@ mod tests {
             "refreshing the map and building the first snapshot must validate on disk at least once"
         );
 
-        // Many repeated queries against the same (unchanged) LiveSnapshot must
-        // not call fs::metadata again — this is the per-call stat storm M3
-        // removes (`validated_oid_for_path` and `analyzed_live_files`'s sweep
-        // both funnel through this method).
+        // Filesystem-backed entries must re-check the path even when the
+        // LiveSnapshot itself is memoized. Direct analyzers do not have a
+        // watcher, so this validation is what prevents a later out-of-band
+        // edit from serving stale rows.
         for _ in 0..5 {
             assert_eq!(snapshot.validated_oid_for_path(&file_a), Some(oid_a));
             assert_eq!(snapshot.validated_oid_for_path(&file_b), Some(oid_b));
             assert!(snapshot.validate([&file_a, &file_b].into_iter()).is_empty());
         }
-        assert_eq!(
-            stat_call_count_for_test(),
-            stats_after_build,
-            "repeated validated_oid_for_path/validate calls on an unchanged LiveSnapshot must not re-stat"
+        assert!(
+            stat_call_count_for_test() > stats_after_build,
+            "filesystem-backed snapshots must keep revalidating memoized entries"
         );
 
         // Repeated LivePathMap::snapshot() calls with no mutation between
         // them must keep returning the same memoized Arc, not rebuild.
+        let stats_before_snapshot_again = stat_call_count_for_test();
         let snapshot_again = map.snapshot();
         assert!(Arc::ptr_eq(&snapshot, &snapshot_again));
-        assert_eq!(stat_call_count_for_test(), stats_after_build);
+        assert_eq!(stat_call_count_for_test(), stats_before_snapshot_again);
     }
 
     #[test]
@@ -846,11 +810,10 @@ mod tests {
             "the changed path must be re-validated before its new oid is trusted"
         );
 
-        // The old snapshot Arc (if anyone still held it, e.g. a concurrent
-        // reader mid-call) keeps serving the old, now-stale content — the
-        // same call-boundary consistency M2 established for the session
-        // lock.
-        assert_eq!(snapshot.validated_oid_for_path(&file_a), Some(oid_a));
+        // The old snapshot Arc may still be held by a concurrent reader, but
+        // filesystem validation must refuse its now-stale path instead of
+        // serving the old oid.
+        assert_eq!(snapshot.validated_oid_for_path(&file_a), None);
     }
 
     #[test]
