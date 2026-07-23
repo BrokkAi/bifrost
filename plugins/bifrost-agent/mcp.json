@@ -2,7 +2,7 @@
   "mcpServers": {
     "bifrost": {
       "type": "stdio",
-      "command": "./bin/bifrost-launcher.mjs",
+      "command": "${CURSOR_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
       "args": [
         "--mcp",
         "symbol|extended"
