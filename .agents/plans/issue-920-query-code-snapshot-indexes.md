@@ -44,6 +44,7 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - [x] (2026-07-22 22:56Z) Refetched and rebased the complete branch without conflict onto origin/master `88a8d2a9`, including the new concurrent read-only store implementation. The focused 39 benchmark tests, 11 MCP/watcher unit tests, formatting, all-target/all-feature Clippy, and an exact-identity serde profile pass on the rebased head; the ten definition samples remain tightly grouped at 24.4-25.0 ms.
 - [x] (2026-07-22 23:36Z) Used exact-head full run 29964700517 and focused profile run 29965514174 as a deliberate dummy-baseline probe. All 92 scenarios and all 16 QueryCode cases were correct, but the strict comparison isolated one `scala-xml dead_code_smells` regression. Local phase profiling traced it to an N+1 overload-classification query; replacing the repeated definition lookups with one declaration-snapshot grouping reduced the pinned Scala median from 747.8 ms to 43.7 ms while preserving all 21 Scala dead-code tests and adding an operation-count regression.
 - [x] (2026-07-22 23:44Z) Refetched and rebased all 28 issue commits cleanly onto origin/master `1bbaeb54`, incorporating the new C++ and identifier-lookup work. Formatting, diff hygiene, 128 focused benchmark/dead-code tests, and warnings-denied all-target/all-feature Clippy pass on rebased head `24701e60` before its documentation checkpoint.
+- [x] (2026-07-23 00:06Z) Triaged the three native Rust PR failures to the same `test_inert_macro_rules_tokens_are_not_indexed_as_macros` regression already failing on master run 29966480778. Unknown item-position macros may still expose ordinary reparsed items, but embedded `macro_rules!` declarations now require positive local passthrough proof; the Rust store epoch was bumped, and both the complete 14-test Rust analyzer suite and all 9 item-macro indexing tests pass locally.
 
 ## Surprises & Discoveries
 
@@ -94,6 +95,9 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 
 - Observation: Overload classification issued `get_definitions` once per function even though every lookup reconstructed the same declaration set already returned by `all_declarations`. For `scala-xml`, 1,032 declarations caused this helper alone to consume about 710 ms locally on every warm request and accounted for the Ubuntu-only strict regression; grouping FQNs in one pass is equivalent because an exact declaration FQN makes definition lookup select that exact bucket and the old code only tested whether its cardinality exceeded one.
   Evidence: local profiles `/private/tmp/bifrost-scala-subphases.RffjcF` and `/private/tmp/bifrost-scala-linear-overloads.e1by2e`; `scala_dead_code_smell_reports_unused_private_method` now asserts that bulk classification performs zero definition-candidate queries.
+
+- Observation: The new general Rust item-position macro reparser treated every syntactically valid item stream inside an unknown macro as emitted output. That policy is useful for cross-file `cfg_*` wrappers, but it also published `macro_rules! also_fake` from the inert built-in `stringify!`, failing the pre-existing analyzer regression on master and every native PR host. Macro definitions need a stronger proof boundary than ordinary best-effort item recovery because their input token tree is itself valid Rust even when the macro emits only a string or discards it.
+  Evidence: master Actions run 29966480778 and PR run 29966986493 failed the same test on Linux x86/ARM and macOS ARM; the focused local failure reproduced before the proof gate and passed afterward alongside `test_wrapped_macro_rules_declaration_is_indexed_as_macro`.
 
 - Observation: `scoped_fact_nodes` cannot be counted on a scan-only path without materializing files that exact source anchors excluded. The profile now reports zero when that total is unavailable and separately records `admitted_fact_nodes`, the compatibility-budget denominator available on both scan and indexed paths.
   Evidence: the Dapper scan admitted 49,181 facts after source filtering while the complete indexed scope contained 85,325 facts.
@@ -271,6 +275,10 @@ The behavior is visible in three ways. The benchmark report contains one stable 
 - Decision: Launch benchmark MCP children with `BIFROST_MCP_FILE_WATCHER=off`, backed by deferred persisted and unbound manual service constructors. Keep the environment unset and file watching enabled for every normal MCP launch.
   Rationale: Pinned benchmark checkouts are immutable and explicit refresh remains available; disabling automatic watcher polling removes asynchronous VCS/cache invalidations from warm timing without weakening ordinary live-workspace behavior or changing benchmark persistence semantics.
   Date/Author: 2026-07-22 / Codex.
+
+- Decision: Require positive locally visible passthrough proof before replaying `macro_definition` items from an item-position macro, while retaining parse-gated best-effort indexing for ordinary items in unknown cross-file wrappers.
+  Rationale: An unknown inert macro such as `stringify!` can accept a syntactically valid macro declaration without emitting it. Ordinary item recovery remains useful when a wrapper definition lives in another file, but publishing a new macro changes later expansion and therefore needs stronger structured evidence.
+  Date/Author: 2026-07-23 / Codex.
 
 ## Outcomes & Retrospective
 
