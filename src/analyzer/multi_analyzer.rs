@@ -8,7 +8,7 @@ use crate::analyzer::{
     SummaryFileProjection, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     TypescriptAnalyzer,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -371,6 +371,50 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.import_info_of(file))
             .unwrap_or_default()
+    }
+
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        if files.is_empty() {
+            return None;
+        }
+        // Route each file to its language delegate and prefer that delegate's
+        // bulk reader (one store round-trip for the whole group) over the
+        // per-file `import_info_of` path the shared candidate walker would
+        // otherwise take. Delegates without a bulk model fall back to per-file
+        // reads within their own group so the merged map still covers every
+        // file, keeping the caller's result identical to the file-at-a-time
+        // path while collapsing thousands of single-row queries into one.
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            grouped
+                .entry(language_for_file(file))
+                .or_default()
+                .push(file.clone());
+        }
+        let mut out: HashMap<ProjectFile, Vec<ImportInfo>> = HashMap::default();
+        let mut any = false;
+        for (language, group) in grouped {
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            any = true;
+            if let Some(map) = provider.import_infos_for_files(&group) {
+                out.extend(map);
+            } else {
+                for file in group {
+                    let infos = provider.import_info_of(&file);
+                    out.insert(file, infos);
+                }
+            }
+        }
+        any.then_some(out)
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {

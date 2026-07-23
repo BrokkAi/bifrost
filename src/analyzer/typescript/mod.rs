@@ -486,6 +486,13 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        Some(self.inner.bulk_import_infos(files.iter().cloned()))
+    }
+
     fn imported_files_from_infos(
         &self,
         file: &ProjectFile,
