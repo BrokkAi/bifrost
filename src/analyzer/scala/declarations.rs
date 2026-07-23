@@ -1188,7 +1188,8 @@ fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
             names
         }
         _ => {
-            let text = scala_node_text(node, source).trim();
+            let text = scala_pattern_spelling(node, source);
+            let text = text.trim();
             if text.is_empty() {
                 Vec::new()
             } else {
@@ -1196,6 +1197,51 @@ fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
             }
         }
     }
+}
+
+/// Renders a compound pattern node (tuple, typed, extractor, nested, ...) the
+/// same way the pre-existing convention does -- the verbatim source text of
+/// the pattern's span -- but with any comments excised. Comments are attached
+/// to the tree as `extra` nodes (see tree-sitter-scala's node-types.json) and
+/// can appear between any of a pattern's identifiers (e.g.
+/// `(left/*: Int*/, right)`), so a plain `source[start..end]` slice of the
+/// pattern node would otherwise swallow that comment text verbatim into the
+/// emitted binding name. This walks the pattern's own descendants to find
+/// every comment node's byte range structurally (via `Node::kind`, not by
+/// scanning the text for comment syntax) and copies every other byte of the
+/// span unchanged, so a comment-free pattern renders byte-for-byte identical
+/// to today's `scala_node_text(node, source).trim()` output.
+fn scala_pattern_spelling(node: Node<'_>, source: &str) -> String {
+    let mut comment_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = node.walk();
+    let mut stack = node.named_children(&mut cursor).collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(child) = stack.pop() {
+        if matches!(child.kind(), "comment" | "line_comment" | "block_comment") {
+            comment_ranges.push((child.start_byte(), child.end_byte()));
+            continue;
+        }
+        let mut child_cursor = child.walk();
+        let mut grandchildren = child.named_children(&mut child_cursor).collect::<Vec<_>>();
+        grandchildren.reverse();
+        stack.extend(grandchildren);
+    }
+    comment_ranges.sort_unstable();
+
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let mut rendered = String::with_capacity(end - start);
+    let mut cursor_byte = start;
+    for (comment_start, comment_end) in comment_ranges {
+        if comment_start > cursor_byte {
+            rendered.push_str(&source[cursor_byte..comment_start]);
+        }
+        cursor_byte = cursor_byte.max(comment_end);
+    }
+    if cursor_byte < end {
+        rendered.push_str(&source[cursor_byte..end]);
+    }
+    rendered
 }
 
 fn scala_literal_initializer(

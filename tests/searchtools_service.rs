@@ -3663,6 +3663,81 @@ object Use {
     }
 }
 
+// #1079 / I3(a): get_summaries must never list a spelling that
+// get_symbol_sources can't resolve. A Scala tuple-destructure pattern with
+// comments between its identifiers (metals' inlay-hint fixture idiom) used to
+// index the whole comment-laden pattern text as the binding's name, so the
+// name get_summaries listed could never round-trip back through
+// get_symbol_sources.
+#[test]
+fn get_summaries_scala_tuple_pattern_binding_name_round_trips_through_get_symbol_sources() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/PatternMatching.scala",
+            r#"
+package example
+
+object PatternMatching {
+  val (left/*: Int<<scala/Int#>>*/, right/*: Int<<scala/Int#>>*/) = (1, 2)
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let summaries_payload = service
+        .call_tool_json(
+            "get_summaries",
+            r#"{"targets":["example/PatternMatching.scala"]}"#,
+        )
+        .unwrap();
+    let summaries: Value = serde_json::from_str(&summaries_payload).unwrap();
+    let elements = summaries["summaries"][0]["elements"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no summary elements: {summaries_payload}"));
+    let binding = elements
+        .iter()
+        .find(|element| {
+            element["symbol"]
+                .as_str()
+                .is_some_and(|symbol| symbol.contains("left") && symbol.contains("right"))
+        })
+        .unwrap_or_else(|| panic!("no tuple-pattern binding element in {summaries_payload}"));
+    let symbol = binding["symbol"].as_str().unwrap();
+
+    // The listed name must not carry the pattern's inline comments.
+    assert!(
+        !symbol.contains("/*"),
+        "summaries-listed symbol still carries comment text: {symbol}"
+    );
+    assert_eq!("example.PatternMatching.(left, right)", symbol);
+
+    // I3(a): the exact spelling get_summaries listed must resolve through
+    // get_symbol_sources, uniquely, back to the same file.
+    let sources_args = serde_json::json!({ "symbols": [symbol] }).to_string();
+    let sources_payload = service
+        .call_tool_json("get_symbol_sources", &sources_args)
+        .unwrap();
+    let sources: Value = serde_json::from_str(&sources_payload).unwrap();
+    assert!(
+        sources["not_found"].as_array().unwrap().is_empty(),
+        "summaries-listed symbol did not resolve: {sources}"
+    );
+    assert!(
+        sources["ambiguous"].as_array().unwrap().is_empty(),
+        "summaries-listed symbol resolved ambiguously: {sources}"
+    );
+    let resolved = sources["sources"]
+        .as_array()
+        .filter(|matches| matches.len() == 1)
+        .unwrap_or_else(|| panic!("expected exactly one resolved source: {sources}"));
+    assert_eq!(
+        "example/PatternMatching.scala", resolved[0]["path"],
+        "{sources}"
+    );
+}
+
 #[test]
 fn scan_usages_by_reference_finds_scala_companion_apply_and_infix_calls() {
     let project = InlineTestProject::with_language(Language::Scala)

@@ -585,3 +585,174 @@ fn test_private_field_context_is_preserved() {
         &analyzer.get_skeleton(&count).unwrap(),
     );
 }
+
+// #1079: a val/var destructure pattern with comments interleaved between its
+// identifiers (the metals inlay-hint fixture idiom, e.g.
+// `val (left/*: Int*/, right/*: Int*/) = (1, 2)`) must not fold that comment
+// text into the binding's indexed name. The fix has to match today's
+// comment-free convention exactly (a single binding named after the whole
+// pattern's spelling), not invent a new shape, so every case here compares a
+// comment-bearing source against its comment-free equivalent and asserts the
+// two index identical field short names.
+fn field_short_names(analyzer: &ScalaAnalyzer, package: &str) -> Vec<String> {
+    let mut names: Vec<String> = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Field && unit.package_name() == package)
+        .map(|unit| unit.short_name().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn scala_tuple_pattern_binding_name_ignores_interleaved_comments() {
+    let commented = inline_scala_project(&[(
+        "example/PatternMatching.scala",
+        r#"
+        package example
+
+        object PatternMatching {
+          val (left/*: Int<<scala/Int#>>*/, right/*: Int<<scala/Int#>>*/) = (1, 2)
+        }
+        "#,
+    )]);
+    let commented_analyzer = ScalaAnalyzer::from_project(commented.clone());
+
+    let plain = inline_scala_project(&[(
+        "example/PatternMatching.scala",
+        r#"
+        package example
+
+        object PatternMatching {
+          val (left, right) = (1, 2)
+        }
+        "#,
+    )]);
+    let plain_analyzer = ScalaAnalyzer::from_project(plain.clone());
+
+    let plain_names = field_short_names(&plain_analyzer, "example");
+    let commented_names = field_short_names(&commented_analyzer, "example");
+
+    // Today's comment-free convention: one binding, named after the whole
+    // tuple pattern's spelling (objects get a trailing `$` on their own
+    // segment; that's pre-existing and orthogonal to this fix). The fix must
+    // not change this.
+    assert_eq!(
+        vec!["PatternMatching$.(left, right)".to_string()],
+        plain_names
+    );
+    // The comment-bearing source must index the identical spelling -- no
+    // comment text leaking into the name.
+    assert_eq!(plain_names, commented_names);
+
+    let bound = definition(
+        &commented_analyzer,
+        "example.PatternMatching$.(left, right)",
+    );
+    assert_eq!(CodeUnitType::Field, bound.kind());
+    assert!(
+        !bound.fq_name().contains("/*"),
+        "indexed name still carries comment text: {}",
+        bound.fq_name()
+    );
+}
+
+#[test]
+fn scala_nested_tuple_pattern_binding_name_ignores_interleaved_comments() {
+    let commented = inline_scala_project(&[(
+        "example/Nested.scala",
+        r#"
+        package example
+
+        object Nested {
+          val ((c/*: Int*/, d), e/*: Int*/) = ((1, 2), 3)
+        }
+        "#,
+    )]);
+    let commented_analyzer = ScalaAnalyzer::from_project(commented.clone());
+
+    let plain = inline_scala_project(&[(
+        "example/Nested.scala",
+        r#"
+        package example
+
+        object Nested {
+          val ((c, d), e) = ((1, 2), 3)
+        }
+        "#,
+    )]);
+    let plain_analyzer = ScalaAnalyzer::from_project(plain.clone());
+
+    let plain_names = field_short_names(&plain_analyzer, "example");
+    let commented_names = field_short_names(&commented_analyzer, "example");
+
+    assert_eq!(vec!["Nested$.((c, d), e)".to_string()], plain_names);
+    assert_eq!(plain_names, commented_names);
+}
+
+#[test]
+fn scala_typed_tuple_pattern_binding_name_ignores_interleaved_comments() {
+    let commented = inline_scala_project(&[(
+        "example/Typed.scala",
+        r#"
+        package example
+
+        object Typed {
+          val (f: Int/*: annotated*/, g) = (1, 2)
+        }
+        "#,
+    )]);
+    let commented_analyzer = ScalaAnalyzer::from_project(commented.clone());
+
+    let plain = inline_scala_project(&[(
+        "example/Typed.scala",
+        r#"
+        package example
+
+        object Typed {
+          val (f: Int, g) = (1, 2)
+        }
+        "#,
+    )]);
+    let plain_analyzer = ScalaAnalyzer::from_project(plain.clone());
+
+    let plain_names = field_short_names(&plain_analyzer, "example");
+    let commented_names = field_short_names(&commented_analyzer, "example");
+
+    assert_eq!(vec!["Typed$.(f: Int, g)".to_string()], plain_names);
+    assert_eq!(plain_names, commented_names);
+}
+
+#[test]
+fn scala_extractor_pattern_binding_name_ignores_interleaved_comments() {
+    let commented = inline_scala_project(&[(
+        "example/Extractor.scala",
+        r#"
+        package example
+
+        object Extractor {
+          val Some(x/*: Int*/) = Some(1)
+        }
+        "#,
+    )]);
+    let commented_analyzer = ScalaAnalyzer::from_project(commented.clone());
+
+    let plain = inline_scala_project(&[(
+        "example/Extractor.scala",
+        r#"
+        package example
+
+        object Extractor {
+          val Some(x) = Some(1)
+        }
+        "#,
+    )]);
+    let plain_analyzer = ScalaAnalyzer::from_project(plain.clone());
+
+    let plain_names = field_short_names(&plain_analyzer, "example");
+    let commented_names = field_short_names(&commented_analyzer, "example");
+
+    assert_eq!(vec!["Extractor$.Some(x)".to_string()], plain_names);
+    assert_eq!(plain_names, commented_names);
+}
