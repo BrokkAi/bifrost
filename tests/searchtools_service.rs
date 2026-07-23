@@ -8816,3 +8816,123 @@ fn semantic_search_status_reports_disabled_without_indexer() {
         err.message
     );
 }
+
+// --- M4 handler-path regressions: routing snippet/source-window reads through
+// the analyzer's indexed snapshot instead of a fresh `ProjectFile::read_to_string`
+// disk read. Each test below pins a golden fixture + expected response for one
+// representative handler site category so a future change that regresses the
+// routing (e.g. reverting to a disk read, or reading the wrong file) fails loud.
+
+#[test]
+fn get_definitions_by_reference_resolves_target_from_indexed_snapshot() {
+    // Covers src/searchtools/definitions.rs's `resolve_definition_context_query`,
+    // which locates `query.target` inside the byte range of an already-resolved
+    // unit's source text.
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            "public class Widget {\n    void caller() {\n        target();\n    }\n    void target() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "get_definitions_by_reference",
+            r#"{"references":[{"symbol":"Widget","context":"target();","target":"target"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let result = &value["results"][0];
+
+    assert_eq!("resolved", result["status"], "payload: {value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions
+                .iter()
+                .any(|definition| definition["fqn"] == "Widget.target")),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_location_ambiguous_reports_exact_candidate_positions() {
+    // Covers `ambiguous_usage_symbol_from_groups`'s `ScanUsagesSurface::Location`
+    // branch (candidate_details), which reads each candidate's declaration name
+    // range out of its own file's source text, and `resolve_scan_usages_target`,
+    // which reads the target file's source to interpret the requested line.
+    // `foo` and `bar` are both 3-byte identifiers on line 2 so their declaration
+    // name ranges tie for narrowest span and neither location-selects the other,
+    // producing a genuine ambiguity with two exact candidate positions.
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            "public class Widget {\n    void foo() {} void bar() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"Widget.java","line":2}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let ambiguous = only_result(&value);
+
+    assert_eq!("ambiguous", ambiguous["status"], "payload: {value}");
+    let details = ambiguous["candidate_details"]
+        .as_array()
+        .expect("candidate_details present for a Location-surface ambiguity");
+    assert_eq!(2, details.len(), "payload: {value}");
+    for detail in details {
+        assert_eq!("Widget.java", detail["path"], "payload: {value}");
+        assert_eq!(2, detail["start_line"], "payload: {value}");
+    }
+    let foo_detail = details
+        .iter()
+        .find(|detail| {
+            detail["target"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("foo")
+        })
+        .unwrap_or_else(|| panic!("no `foo` candidate detail: {value}"));
+    let bar_detail = details
+        .iter()
+        .find(|detail| {
+            detail["target"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bar")
+        })
+        .unwrap_or_else(|| panic!("no `bar` candidate detail: {value}"));
+    assert_eq!(10, foo_detail["scan_usages_by_location_target"]["column"]);
+    assert_eq!(24, bar_detail["scan_usages_by_location_target"]["column"]);
+}
+
+#[test]
+fn list_symbols_reports_loc_from_indexed_snapshot() {
+    // Covers `skim_files_for_files`'s `loc` field (src/searchtools/summaries.rs),
+    // which reports the analyzed file's line count for `list_symbols`.
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Widget.java",
+            "public class Widget {\n    void foo() {}\n    void bar() {}\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json("list_symbols", r#"{"file_patterns":["Widget.java"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("Widget.java", value["files"][0]["path"], "payload: {value}");
+    assert_eq!(4, value["files"][0]["loc"], "payload: {value}");
+}

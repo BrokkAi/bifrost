@@ -433,9 +433,11 @@ pub fn get_symbol_locations(
                 .into_iter()
                 .filter_map(|code_unit| {
                     let primary_range = primary_range(analyzer, &code_unit)?;
-                    let loc = code_unit
-                        .source()
-                        .read_to_string()
+                    // Line count is rendering metadata for an already-resolved
+                    // unit; the analyzed snapshot the unit was resolved
+                    // against is the consistent source, not a fresh disk read.
+                    let loc = analyzer
+                        .indexed_source(code_unit.source())
                         .map(|content| line_count(&content))
                         .unwrap_or(0);
                     Some(SymbolLocation {

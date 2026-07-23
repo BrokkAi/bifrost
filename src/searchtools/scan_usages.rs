@@ -444,7 +444,10 @@ pub(super) fn ambiguous_usage_symbol_from_groups(
                 .take(SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT)
                 .filter_map(|(selector, units)| {
                     let unit = units.first()?;
-                    let source = unit.source().read_to_string().ok()?;
+                    // `unit` and `range` below both come from the analyzer's
+                    // own declaration data, so read the same analyzed
+                    // snapshot rather than the live file on disk.
+                    let source = analyzer.indexed_source(unit.source())?;
                     let range =
                         code_unit_declaration_name_range(analyzer, unit.source(), &source, unit)?;
                     let path = rel_path_string(unit.source());
@@ -818,13 +821,21 @@ pub(super) fn resolve_scan_usages_target(
         }
     };
 
-    let source = match file.read_to_string() {
-        Ok(source) => source,
-        Err(err) => {
+    // The byte offset computed below from `target.line`/`target.column` is
+    // matched against `analyzer.ranges_of(&unit)` further down, which is
+    // itself keyed to the analyzer's indexed snapshot — so the line/column
+    // must be interpreted against that same snapshot, not a fresh disk read,
+    // or the two coordinate systems could disagree on a just-edited file.
+    let source = match analyzer.indexed_source(&file) {
+        Some(source) => source,
+        None => {
             return location_selector_failure(
                 &target,
                 "read_failed",
-                format!("failed to read `{}`: {err}", rel_path_string(&file)),
+                format!(
+                    "failed to read `{}`: not indexed by analyzer",
+                    rel_path_string(&file)
+                ),
             );
         }
     };
@@ -1147,7 +1158,7 @@ pub(super) fn unresolved_hit_matches_target_shape(
     overloads: &[CodeUnit],
     hit: &UsageHit,
 ) -> bool {
-    let hit_is_member_access = usage_hit_is_member_access(hit);
+    let hit_is_member_access = usage_hit_is_member_access(analyzer, hit);
     overloads.iter().any(|unit| {
         declaration_is_member_access(analyzer, unit)
             .map(|is_member| is_member == hit_is_member_access)
@@ -1155,8 +1166,13 @@ pub(super) fn unresolved_hit_matches_target_shape(
     })
 }
 
-pub(super) fn usage_hit_is_member_access(hit: &UsageHit) -> bool {
-    source_has_dot_before(hit.file.read_to_string().ok().as_deref(), hit.start_offset)
+pub(super) fn usage_hit_is_member_access(analyzer: &dyn IAnalyzer, hit: &UsageHit) -> bool {
+    // `hit.start_offset` was produced by the analyzer's own usage scan, so
+    // it is only meaningful against the same analyzed snapshot.
+    source_has_dot_before(
+        analyzer.indexed_source(&hit.file).as_deref(),
+        hit.start_offset,
+    )
 }
 
 pub(super) fn declaration_is_member_access(
@@ -1164,7 +1180,7 @@ pub(super) fn declaration_is_member_access(
     unit: &CodeUnit,
 ) -> Option<bool> {
     let range = primary_range(analyzer, unit)?;
-    let source = unit.source().read_to_string().ok()?;
+    let source = analyzer.indexed_source(unit.source())?;
     let identifier_offset = source
         .get(range.start_byte..range.end_byte)?
         .find(unit.identifier())
@@ -2309,7 +2325,9 @@ pub(super) fn external_usage_definition_ranges(
         return ranges;
     }
 
-    let Ok(source) = target.source().read_to_string() else {
+    // `target`'s ranges above already come from the analyzer, so name-range
+    // refinement must read the same analyzed snapshot to stay consistent.
+    let Some(source) = analyzer.indexed_source(target.source()) else {
         return ranges;
     };
     let exact_ranges =
