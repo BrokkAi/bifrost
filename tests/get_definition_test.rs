@@ -25104,6 +25104,33 @@ fn rust_super_import_braced_single_resolves_call() {
     );
 }
 
+// A derive-macro re-export and its trait share a name in separate Rust
+// namespaces: the unresolvable `use diesel_derives::AsExpression` must not
+// blind a where-clause to the trait defined in the same file (tier-3
+// diesel x22: the bound drew a dishonest "explicitly imported across a
+// boundary that is not indexed" claim while the trait sat two lines away).
+#[test]
+fn rust_derive_reexport_does_not_shadow_same_named_local_trait() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub trait AsExpression<T> {}\n\npub use diesel_derives::AsExpression;\n\npub struct SqlQuery;\n\nimpl SqlQuery {\n    pub fn as_sql<'a>(&'a self) -> ()\n    where\n        &'a Self: AsExpression<String>,\n    {\n    }\n}\n",
+        )
+        .build();
+    let line = "        &'a Self: AsExpression<String>,";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":10,"column":{}}}]}}"#,
+            column_of(line, "AsExpression")
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "AsExpression", "{value}");
+}
+
 #[test]
 fn rust_super_import_unbraced_resolves_call() {
     let project = InlineTestProject::with_language(Language::Rust)

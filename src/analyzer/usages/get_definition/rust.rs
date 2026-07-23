@@ -645,6 +645,41 @@ fn resolve_rust_unscoped(
                     if local.is_empty() { candidates } else { local }
                 }
                 RustVisibleImportResolution::BoundButUnindexed => {
+                    // An unresolvable import must not blind the reference to a
+                    // same-named local item in another namespace: Rust keeps
+                    // types and macros in separate namespaces, so a derive
+                    // re-export (`pub use diesel_derives::AsExpression;`)
+                    // never shadows the trait defined in the same file —
+                    // claiming an unindexed boundary there is dishonest
+                    // (tier-3 diesel/ripgrep/meilisearch/nushell evidence).
+                    let lexical = (role == RustBareReferenceRole::Type)
+                        .then(|| {
+                            resolve_in_enclosing_scopes(
+                                analyzer,
+                                file,
+                                reference,
+                                site.focus_start_byte,
+                                CodeUnit::is_class,
+                            )
+                        })
+                        .flatten();
+                    if let Some(unit) = lexical {
+                        return candidates_outcome(vec![unit]);
+                    }
+                    let local = rust_current_module_candidates(
+                        analyzer,
+                        rust,
+                        support,
+                        file,
+                        tree.root_node(),
+                        site.focus_start_byte,
+                        site.focus_end_byte,
+                        reference,
+                        role,
+                    );
+                    if !local.is_empty() {
+                        return candidates_outcome(local);
+                    }
                     return boundary(format!(
                         "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
                     ));
