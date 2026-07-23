@@ -994,12 +994,12 @@ fn build_index(
                 metrics,
             ));
         }
-        let fact_nodes = match u32::try_from(facts.nodes().len()) {
+        let fact_nodes = match u32::try_from(facts.work_item_count()) {
             Ok(count) => count,
             Err(_) => {
                 return Err(unavailable_failure(
                     started,
-                    "structural index per-file fact limit exceeded",
+                    "structural index per-file node-and-role fact limit exceeded",
                     metrics,
                 ));
             }
@@ -1009,7 +1009,7 @@ fn build_index(
         if metrics.fact_nodes > MAX_INDEX_FACT_NODES {
             return Err(unavailable_failure(
                 started,
-                "structural index fact-node limit exceeded",
+                "structural index node-and-role fact limit exceeded",
                 metrics,
             ));
         }

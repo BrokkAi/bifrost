@@ -11,6 +11,7 @@
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
 use crate::analyzer::Language;
+use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use tree_sitter::{Language as TsLanguage, Node};
 
@@ -89,6 +90,15 @@ pub struct RoleSink<'a> {
     fact_by_ts_node: &'a HashMap<usize, u32>,
     name: Option<Span>,
     roles: &'a mut Vec<RoleTarget>,
+    max_roles: usize,
+    cancellation: Option<&'a CancellationToken>,
+    stop: Option<RoleSinkStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoleSinkStop {
+    Exceeded,
+    Cancelled,
 }
 
 fn span_of(node: Node<'_>) -> Span {
@@ -102,16 +112,41 @@ impl<'a> RoleSink<'a> {
     pub(crate) fn new(
         fact_by_ts_node: &'a HashMap<usize, u32>,
         roles: &'a mut Vec<RoleTarget>,
+        max_roles: usize,
+        cancellation: Option<&'a CancellationToken>,
     ) -> Self {
         Self {
             fact_by_ts_node,
             name: None,
             roles,
+            max_roles,
+            cancellation,
+            stop: None,
         }
     }
 
-    pub(crate) fn into_name(self) -> Option<Span> {
-        self.name
+    pub(crate) fn into_parts(self) -> (Option<Span>, Option<RoleSinkStop>) {
+        (self.name, self.stop)
+    }
+
+    /// Poll cancellation and the role-edge admission cap before adapters
+    /// inspect or append the next variable-length role.
+    pub(crate) fn should_continue(&mut self) -> bool {
+        if self.stop.is_some() {
+            return false;
+        }
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.stop = Some(RoleSinkStop::Cancelled);
+            return false;
+        }
+        if self.roles.len() >= self.max_roles {
+            self.stop = Some(RoleSinkStop::Exceeded);
+            return false;
+        }
+        true
     }
 
     /// Set the fact's own name from the given node's span.
@@ -121,18 +156,18 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge without a derived name.
     pub fn role(&mut self, role: Role, target: Node<'_>) {
-        self.push(role, false, None, target, None);
+        let _ = self.push(role, false, None, target, None);
     }
 
     /// Attach a role edge whose name is the span of `name_node`.
     pub fn role_named(&mut self, role: Role, target: Node<'_>, name_node: Node<'_>) {
-        self.push(role, false, None, target, Some(span_of(name_node)));
+        let _ = self.push(role, false, None, target, Some(span_of(name_node)));
     }
 
     /// Attach an argument role, preserving whether it came from a
     /// spread/unpack expression.
     pub fn argument_maybe_named(&mut self, target: Node<'_>, name: Option<Node<'_>>, spread: bool) {
-        self.push(Role::Arg, spread, None, target, name.map(span_of));
+        let _ = self.push(Role::Arg, spread, None, target, name.map(span_of));
     }
 
     /// Attach a role edge with a derived name when the language spec found
@@ -147,13 +182,13 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge whose name is a precise span inside `target`.
     pub fn role_named_span(&mut self, role: Role, target: Node<'_>, name: Span) {
-        self.push(role, false, None, target, Some(name));
+        let _ = self.push(role, false, None, target, Some(name));
     }
 
     /// Attach a keyword-argument edge (`shell=True` → keyword `shell`,
     /// target the value node).
     pub fn kwarg(&mut self, keyword_node: Node<'_>, value: Node<'_>) {
-        self.push(Role::Kwarg, false, Some(span_of(keyword_node)), value, None);
+        let _ = self.push(Role::Kwarg, false, Some(span_of(keyword_node)), value, None);
     }
 
     fn push(
@@ -163,7 +198,10 @@ impl<'a> RoleSink<'a> {
         keyword: Option<Span>,
         target: Node<'_>,
         name: Option<Span>,
-    ) {
+    ) -> bool {
+        if !self.should_continue() {
+            return false;
+        }
         self.roles.push(RoleTarget {
             role,
             spread,
@@ -172,5 +210,6 @@ impl<'a> RoleSink<'a> {
             span: span_of(target),
             name,
         });
+        true
     }
 }

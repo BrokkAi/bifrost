@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::analyzer::StructuredTypeIdentity;
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject,
     TypeAliasProvider,
@@ -263,6 +264,51 @@ fn go_signature_metadata_keeps_anonymous_variadic_marker() {
     assert_eq!(
         "...int",
         &label[parameter.start_byte()..parameter.end_byte()]
+    );
+}
+
+#[test]
+fn go_signature_metadata_preserves_parser_derived_return_type_shapes() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "shapes.go",
+        r#"
+        package main
+
+        import svc "example.com/app/service"
+
+        type Box[T any] struct{}
+        func qualified() *svc.Service { return nil }
+        func sliced() []svc.Service { return nil }
+        func arrayed() [2]svc.Service { panic("unused") }
+        func mapped() map[string]svc.Service { return nil }
+        func generic() Box[svc.Service] { panic("unused") }
+        "#,
+    )]));
+
+    let return_identity = |name: &str| {
+        let unit = definition(&analyzer, &format!("main.{name}"));
+        analyzer
+            .signature_metadata(&unit)
+            .into_iter()
+            .find_map(|metadata| metadata.return_type_identity().cloned())
+            .unwrap_or_else(|| panic!("missing structured return identity for {name}"))
+    };
+    let qualified_name = |identity: &StructuredTypeIdentity| {
+        identity
+            .nominal_name()
+            .map(|name| name.path().to_vec())
+            .expect("nominal Go type")
+    };
+
+    assert!(return_identity("qualified").is_pointer());
+    assert!(return_identity("sliced").is_slice());
+    assert!(return_identity("arrayed").is_array());
+    assert!(return_identity("mapped").is_map());
+    let generic = return_identity("generic");
+    assert_eq!(generic.generic_argument_count(), Some(1));
+    assert_eq!(
+        qualified_name(&return_identity("qualified")),
+        ["svc".to_string(), "Service".to_string()]
     );
 }
 

@@ -238,6 +238,22 @@ fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
     );
 }
 
+fn assert_closed_dispatch_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
+    let project = InlineTestProject::with_language(fixture.language)
+        .file(fixture.callee_path, fixture.callee_source)
+        .file(fixture.caller_path, fixture.caller_source)
+        .build();
+    assert_direct_call_project_conformance(
+        &project,
+        fixture,
+        DirectCallExpectations {
+            unproven_return: true,
+            closed_dispatch_refinement: true,
+            ..DirectCallExpectations::default()
+        },
+    );
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct DirectCallExpectations {
     unproven_link_unit: bool,
@@ -635,7 +651,7 @@ fn java_direct_call_conformance() {
 
 #[test]
 fn scala_direct_call_conformance() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::Scala,
         dialect: SemanticLanguage::Standard(Language::Scala),
         callee_path: "scala/conformance/ScalaLibrary.scala",
@@ -781,7 +797,7 @@ int cpp_root(int value) {
 
 #[test]
 fn rust_turbofish_direct_call_uses_the_shared_dispatch_oracle() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::Rust,
         dialect: SemanticLanguage::Standard(Language::Rust),
         callee_path: "leaf.rs",
@@ -809,7 +825,7 @@ fn rust_turbofish_direct_call_uses_the_shared_dispatch_oracle() {
 
 #[test]
 fn rust_generic_method_call_uses_the_shared_dispatch_oracle() {
-    assert_return_partial_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Rust,
         dialect: SemanticLanguage::Standard(Language::Rust),
         callee_path: "worker.rs",
@@ -2242,10 +2258,15 @@ fn rust_raii_scope_exit_preserves_normal_flow_with_exact_gaps() {
         )
         .bind(
             "scope_exit",
-            PointSelector::new("{\n                        let guard = acquire();")
-                .procedure("scoped_resource")
-                .effect("gap")
-                .anchor_occurrence(1),
+            PointSelector::new(
+                r#"{
+                        let guard = acquire();
+                        use_guard(&guard);
+                    }"#,
+            )
+            .procedure("scoped_resource")
+            .effect("gap")
+            .anchor_occurrence(1),
         )
         .bind(
             "after_scope_statement",
@@ -5343,6 +5364,14 @@ func rangeFlow(sink []int) {
                 .outgoing_kind(ControlEdgeKind::Exceptional),
         )
         .bind(
+            "target_operation_boundary",
+            PointSelector::new("sink[index()]")
+                .procedure("rangeFlow")
+                .effect("gap")
+                .anchor_occurrence(3)
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
             "target_binding",
             PointSelector::new("sink[index()]")
                 .procedure("rangeFlow")
@@ -5435,6 +5464,18 @@ func rangeFlow(sink []int) {
     );
     graph.assert_successors(
         "index_normal",
+        &[cfg_edge(
+            "target_operation_boundary",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_point_gap(
+        "target_operation_boundary",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors(
+        "target_operation_boundary",
         &[cfg_edge("target_binding", ControlEdgeKind::Normal)],
     );
     graph.assert_point_gap(
@@ -6166,7 +6207,7 @@ func shadowBuiltins() int {
 
 #[test]
 fn csharp_direct_call_conformance() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::CSharp,
         dialect: SemanticLanguage::Standard(Language::CSharp),
         callee_path: "csharp/Conformance/CSharpLibrary.cs",
@@ -7520,6 +7561,12 @@ fn csharp_cleanup_constructs_preserve_flow_and_report_scoped_gaps() {
                 .outgoing_kind(ControlEdgeKind::Normal),
         )
         .bind(
+            "using_assignment",
+            PointSelector::new("resource = Acquire()")
+                .procedure("Managed")
+                .effect("assignment"),
+        )
+        .bind(
             "using_boundary",
             PointSelector::new("var resource = Acquire()")
                 .procedure("Managed")
@@ -7659,6 +7706,12 @@ fn csharp_cleanup_constructs_preserve_flow_and_report_scoped_gaps() {
                 .outgoing_kind(ControlEdgeKind::Normal),
         )
         .bind(
+            "declared_assignment",
+            PointSelector::new("resource = AcquireDeclared()")
+                .procedure("UsingDeclaration")
+                .effect("assignment"),
+        )
+        .bind(
             "after_using_declaration_statement",
             PointSelector::new("AfterUsingDeclaration();")
                 .procedure("UsingDeclaration")
@@ -7673,11 +7726,15 @@ fn csharp_cleanup_constructs_preserve_flow_and_report_scoped_gaps() {
 
     graph.assert_successors(
         "acquire_normal",
+        &[cfg_edge("using_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "using_assignment",
         &[cfg_edge("using_boundary", ControlEdgeKind::Normal)],
     );
     graph.assert_predecessors(
         "using_boundary",
-        &[cfg_edge("acquire_normal", ControlEdgeKind::Normal)],
+        &[cfg_edge("using_assignment", ControlEdgeKind::Normal)],
     );
     graph.assert_point_gap(
         "using_boundary",
@@ -7768,6 +7825,10 @@ fn csharp_cleanup_constructs_preserve_flow_and_report_scoped_gaps() {
     graph.assert_reachable("declared_expression", "declared_acquire");
     graph.assert_successors(
         "declared_normal",
+        &[cfg_edge("declared_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "declared_assignment",
         &[cfg_edge(
             "after_using_declaration_statement",
             ControlEdgeKind::Normal,
@@ -7775,7 +7836,7 @@ fn csharp_cleanup_constructs_preserve_flow_and_report_scoped_gaps() {
     );
     graph.assert_predecessors(
         "after_using_declaration_statement",
-        &[cfg_edge("declared_normal", ControlEdgeKind::Normal)],
+        &[cfg_edge("declared_assignment", ControlEdgeKind::Normal)],
     );
     graph.assert_successors(
         "after_using_declaration_statement",
@@ -8176,7 +8237,7 @@ fn csharp_target_typed_new_evaluates_arguments_then_initializer() {
         )
         .bind(
             "initializer_property",
-            PointSelector::new("P")
+            PointSelector::new("P = G()")
                 .procedure("Build")
                 .anchor_occurrence(0),
         )
@@ -8205,6 +8266,12 @@ fn csharp_target_typed_new_evaluates_arguments_then_initializer() {
                 .procedure("Build")
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "variable_assignment",
+            PointSelector::new("widget = new(F()) { P = G() }")
+                .procedure("Build")
+                .effect("assignment"),
         )
         .bind(
             "after_construction_statement",
@@ -8247,15 +8314,11 @@ fn csharp_target_typed_new_evaluates_arguments_then_initializer() {
     );
     graph.assert_successors(
         "constructor_normal",
-        &[cfg_edge("initializer_assignment", ControlEdgeKind::Normal)],
+        &[cfg_edge("initializer_property", ControlEdgeKind::Normal)],
     );
     graph.assert_predecessors(
-        "initializer_assignment",
+        "initializer_property",
         &[cfg_edge("constructor_normal", ControlEdgeKind::Normal)],
-    );
-    graph.assert_successors(
-        "initializer_assignment",
-        &[cfg_edge("initializer_property", ControlEdgeKind::Normal)],
     );
     graph.assert_successors(
         "initializer_property",
@@ -8277,6 +8340,14 @@ fn csharp_target_typed_new_evaluates_arguments_then_initializer() {
     );
     graph.assert_successors(
         "initializer_normal",
+        &[cfg_edge("initializer_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "initializer_assignment",
+        &[cfg_edge("variable_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "variable_assignment",
         &[cfg_edge(
             "after_construction_statement",
             ControlEdgeKind::Normal,
@@ -8284,7 +8355,7 @@ fn csharp_target_typed_new_evaluates_arguments_then_initializer() {
     );
     graph.assert_predecessors(
         "after_construction_statement",
-        &[cfg_edge("initializer_normal", ControlEdgeKind::Normal)],
+        &[cfg_edge("variable_assignment", ControlEdgeKind::Normal)],
     );
     graph.assert_reachable("after_construction_statement", "after_construction_invoke");
     graph.assert_reachable("after_construction_invoke", "build_return");
@@ -8831,6 +8902,12 @@ def evaluate():
                 .outgoing_kind(ControlEdgeKind::Exceptional),
         )
         .bind(
+            "combine_assignment",
+            PointSelector::new("result = combine(first(), second(inner()))")
+                .procedure("evaluate")
+                .effect("assignment"),
+        )
+        .bind(
             "after_calls_statement",
             PointSelector::new("after_calls(result)")
                 .procedure("evaluate")
@@ -8929,6 +9006,10 @@ def evaluate():
     );
     graph.assert_successors(
         "combine_normal",
+        &[cfg_edge("combine_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "combine_assignment",
         &[cfg_edge("after_calls_statement", ControlEdgeKind::Normal)],
     );
     graph.assert_reachable("after_calls_statement", "after_calls_invoke");
@@ -9738,6 +9819,12 @@ def compare_value():
                 .outgoing_kind(ControlEdgeKind::Normal),
         )
         .bind(
+            "value_assignment",
+            PointSelector::new("outcome = first_value() < middle_value() < last_value()")
+                .procedure("compare_value")
+                .effect("assignment"),
+        )
+        .bind(
             "consume_value_statement",
             PointSelector::new("consume_value(outcome)")
                 .procedure("compare_value")
@@ -9919,11 +10006,15 @@ def compare_value():
     );
     graph.assert_successors(
         "value_merge",
+        &[cfg_edge("value_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "value_assignment",
         &[cfg_edge("consume_value_statement", ControlEdgeKind::Normal)],
     );
     graph.assert_predecessors(
         "consume_value_statement",
-        &[cfg_edge("value_merge", ControlEdgeKind::Normal)],
+        &[cfg_edge("value_assignment", ControlEdgeKind::Normal)],
     );
     graph.assert_reachable("value_entry", "consume_value_invoke");
     graph.assert_unreachable("consume_value_statement", "last_value_invoke");
@@ -10614,6 +10705,12 @@ async def iterate(items):
                 .outgoing_kind(ControlEdgeKind::Exceptional),
         )
         .bind(
+            "await_assignment",
+            PointSelector::new("result = await fetch()")
+                .procedure("await_one")
+                .effect("assignment"),
+        )
+        .bind(
             "after_await_statement",
             PointSelector::new("after_await(result)")
                 .procedure("await_one")
@@ -10801,6 +10898,10 @@ async def iterate(items):
     );
     graph.assert_successors(
         "await_normal_resume",
+        &[cfg_edge("await_assignment", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "await_assignment",
         &[cfg_edge("after_await_statement", ControlEdgeKind::Normal)],
     );
     graph.assert_successors(
@@ -14921,12 +15022,6 @@ fn scala_generic_method_direct_call_conformance() {
             .procedure("root")
             .effect("gap"),
     );
-    graph.assert_point_gap(
-        "generic_selection",
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticGapKind::Unknown,
-    );
-
     let caller = graph
         .artifact()
         .procedures()
@@ -14941,6 +15036,11 @@ fn scala_generic_method_direct_call_conformance() {
                 == Some("root")
         })
         .expect("missing Scala generic-method caller");
+    assert!(caller.gaps().iter().any(|gap| {
+        matches!(gap.subject, SemanticGapSubject::Value(_))
+            && gap.capability == SemanticCapability::ExceptionalControlFlow
+            && gap.kind == SemanticGapKind::Unknown
+    }));
     assert_eq!(caller.call_sites().len(), 1);
     let call = &caller.call_sites()[0];
     assert!(
@@ -16346,6 +16446,20 @@ fn ruby_methods_singletons_lambdas_and_attached_blocks_are_separate() {
         SemanticCapability::DeferredExecution,
         SemanticGapKind::Unknown,
     );
+    let each_call = exact_call_site(
+        outer,
+        SOURCE,
+        "items.each do |item|\n            block_body(item)\n          end",
+    );
+    let deferred = outer
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(each_call.id)
+                && gap.capability == SemanticCapability::DeferredExecution
+        })
+        .expect("attached block must retain a deferred-execution gap");
+    assert_deferred_effect_impacts(deferred, false, "attached Ruby block");
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());
@@ -17627,7 +17741,6 @@ fn ruby_overrideable_negation_and_writer_assignments_keep_exact_control_boundari
             "either_merge",
             PointSelector::new("either ||= choose_rhs()")
                 .procedure("operators")
-                .effect("gap")
                 .anchor_occurrence(2),
         )
         .bind(
@@ -17652,7 +17765,6 @@ fn ruby_overrideable_negation_and_writer_assignments_keep_exact_control_boundari
             "both_merge",
             PointSelector::new("both &&= confirm_rhs()")
                 .procedure("operators")
-                .effect("gap")
                 .anchor_occurrence(2),
         )
         .bind(
@@ -18483,8 +18595,7 @@ fn ruby_yield_retry_and_metaprogramming_boundaries_are_explicit() {
             "yield_assignment",
             PointSelector::new("yielded = yield(argument(value))")
                 .procedure("invoke_block")
-                .effect("gap")
-                .anchor_occurrence(1),
+                .effect("assignment"),
         )
         .bind(
             "after_yield_statement",

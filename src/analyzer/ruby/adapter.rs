@@ -39,6 +39,10 @@ impl LanguageAdapter for RubyAdapter {
         "rb"
     }
 
+    fn persist_content_stable_lookup_keys(&self) -> bool {
+        true
+    }
+
     fn contains_tests(
         &self,
         _file: &ProjectFile,

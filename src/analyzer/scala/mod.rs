@@ -34,7 +34,10 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 pub(crate) use declarations::scala_class_parameter_field_keyword;
-pub(crate) use imports::{ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at};
+pub(crate) use imports::{
+    ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at,
+    scala_lexical_scope_path_checked,
+};
 pub(crate) use supertypes::{
     ScalaSupertypeLookupPath, scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
@@ -44,7 +47,7 @@ pub(crate) use wildcard_imports::{
     ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
     scala_import_path, scala_import_path_candidates, scala_import_visible_at,
-    scala_package_prefixes_at,
+    scala_package_prefixes_at, scala_package_prefixes_at_checked,
 };
 
 pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
@@ -247,6 +250,95 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
+    pub(crate) fn declaration_candidates_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> crate::analyzer::store::LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
+    }
+
+    pub(crate) fn declaration_candidates_by_fqn_limited(
+        &self,
+        fqn: &str,
+        normalized: bool,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> crate::analyzer::store::LimitedQueryRows<CodeUnit> {
+        self.inner.lookup_declarations_by_persisted_fqn_limited(
+            fqn,
+            normalized,
+            limit,
+            continue_query,
+        )
+    }
+
+    pub(crate) fn direct_children_limited(
+        &self,
+        owner: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<CodeUnit> {
+        self.inner.direct_children_limited(owner, limit)
+    }
+
+    pub(crate) fn import_info_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::ImportInfo> {
+        self.inner.import_info_of_limited(file, limit)
+    }
+
+    pub(crate) fn namespace_of_file_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.file_namespace_hint_limited(file, limit)
+    }
+
+    pub(crate) fn workspace_package_exists(&self, package: &str) -> bool {
+        self.inner.persisted_package_exists(package)
+    }
+
+    pub(crate) fn workspace_fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.inner.forward_fqn_prefix_exists(prefix)
+    }
+
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::Range> {
+        self.inner.ranges_limited(code_unit, limit)
+    }
+
+    pub(crate) fn supertype_lookup_paths_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.supertype_lookup_paths_limited(code_unit, limit)
+    }
+
+    pub(crate) fn raw_supertypes_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.raw_supertypes_limited(code_unit, limit)
+    }
+
     pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
     }

@@ -1177,8 +1177,8 @@ auto T::trailing() -> T* { return this; }
             "fixture must retain declaration and definition for {name}: {callables:#?}"
         );
         for callable in callables {
-            let return_types = analyzer
-                .signature_metadata(&callable)
+            let metadata = analyzer.signature_metadata(&callable);
+            let return_types = metadata
                 .iter()
                 .filter_map(|metadata| metadata.return_type_text().map(str::to_owned))
                 .collect::<BTreeSet<_>>();
@@ -1186,6 +1186,29 @@ auto T::trailing() -> T* { return this; }
                 return_types,
                 BTreeSet::from([expected.to_owned()]),
                 "persisted return type for {callable:#?}"
+            );
+            let identities = metadata
+                .iter()
+                .filter_map(|metadata| metadata.return_type_identity())
+                .collect::<Vec<_>>();
+            assert_eq!(identities.len(), 1, "structured return identity");
+            assert_eq!(
+                identities[0]
+                    .nominal_name()
+                    .expect("nominal return type")
+                    .path(),
+                &["T".to_string()],
+                "AST-derived return path for {callable:#?}"
+            );
+            let wrapper_matches = match name {
+                "pointer" | "trailing" => identities[0].is_pointer(),
+                "reference" => identities[0].is_reference(),
+                _ => false,
+            };
+            assert!(
+                wrapper_matches,
+                "AST-derived return wrapper for {callable:#?}: {:?}",
+                identities[0]
             );
         }
     }
@@ -1198,7 +1221,9 @@ auto T::trailing() -> T* { return this; }
         analyzer
             .signature_metadata(&exported)
             .iter()
-            .all(|metadata| metadata.return_type_text().is_none()),
+            .all(|metadata| {
+                metadata.return_type_text().is_none() && metadata.return_type_identity().is_none()
+            }),
         "the export macro token must not be persisted as the callable return type"
     );
 }

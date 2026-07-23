@@ -22,9 +22,8 @@ use crate::analyzer::usages::csharp_graph::{
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
-    GoIndexedMemberLookup, GoReferenceResolution, GoSelectorDescriptor, extract_go_import_path,
-    go_embedded_field_unit_type_text, go_selector_descriptor, go_simple_type_name,
-    go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth,
+    GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
+    go_selector_descriptor_with_scope, go_simple_type_name, go_type_name_parts,
     resolve_go_reference_with_namespaces,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
@@ -87,7 +86,7 @@ use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use rust::{
-    AnalyzerRustDefinitionProvider, RustTypeLookupCache,
+    AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
     rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
     rust_field_definition_type_candidates_cached, rust_forward_bare_token_reference_fqn,
     rust_is_type_definition, rust_resolve_type_node_fqn,
@@ -114,21 +113,35 @@ pub(crate) use call_sites::{
     call_reference_ranges_in_tree, call_reference_requires_point_lookup, call_signature_context,
     call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
 };
-pub(crate) use cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC;
+pub(crate) use cpp::{
+    CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC, cpp_type_lookup_resolution_in_session, resolve_cpp_bounded,
+};
 pub(crate) use csharp::{
     CSharpTypeLookupResolution, csharp_type_lookup_resolution,
     csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
 };
 pub(crate) use go::{
     AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,
-    go_type_lookup_resolution,
+    go_type_lookup_resolution, resolve_go_bounded,
 };
 pub(crate) use java::{
     JavaTypeLookupResolution, java_lombok_accessor_field_candidates,
     java_lombok_generated_accessor_field_candidates, java_type_lookup_resolution,
 };
+pub(crate) use php::{
+    PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
+};
+pub(crate) use python::{
+    PythonDefinitionProvider, python_type_lookup_resolution_bounded, resolve_python_bounded,
+};
 pub(crate) use resolution_session::{BoundedResolution, ResolutionSession};
-pub(crate) use scala::{ScalaTypeLookupResolution, scala_type_lookup_resolution};
+pub(crate) use ruby::{
+    RubyDefinitionProvider, resolve_ruby_bounded, ruby_type_lookup_resolution_bounded,
+};
+pub(crate) use scala::{
+    ScalaDefinitionProvider, ScalaTypeLookupResolution, resolve_scala_bounded,
+    scala_type_lookup_resolution, scala_type_lookup_resolution_in_session,
+};
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost
 /// first — the language-agnostic generalization of Java's nested-type resolution

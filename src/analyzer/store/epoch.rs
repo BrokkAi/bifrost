@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v3-signature-dispatch-extensibility";
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v4-structured-signature-types";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///

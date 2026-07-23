@@ -475,6 +475,14 @@ impl FileFacts {
         self.roles.len()
     }
 
+    /// Total bounded extraction work retained by this snapshot.
+    ///
+    /// Normalized nodes and their semantic role edges share the CodeQuery
+    /// fact budget: either collection can grow independently for valid syntax.
+    pub(crate) fn work_item_count(&self) -> usize {
+        self.nodes.len().saturating_add(self.roles.len())
+    }
+
     pub fn subtree_end(&self, id: u32) -> u32 {
         self.node(id).subtree_end
     }

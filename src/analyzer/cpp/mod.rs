@@ -11,10 +11,11 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
-    PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    PoolSafeMemo, Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
     TypeHierarchyProvider,
 };
@@ -170,6 +171,75 @@ impl CppAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         self.inner.prepared_syntax(file)
+    }
+
+    pub(crate) fn prepared_syntax_limited_cancellable(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome {
+        self.inner
+            .prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation)
+    }
+
+    pub(crate) fn receiver_query_supported(file: &ProjectFile) -> bool {
+        file.rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("c")
+    }
+
+    pub(crate) fn declaration_candidates_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
+    }
+
+    pub(crate) fn declaration_candidates_by_fqn_limited(
+        &self,
+        fqn: &str,
+        normalized: bool,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner.lookup_declarations_by_persisted_fqn_limited(
+            fqn,
+            normalized,
+            limit,
+            continue_query,
+        )
+    }
+
+    pub(crate) fn member_candidates_for_owner_limited(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_members_for_owner_name_limited(owner_fqn, name, limit, continue_query)
+    }
+
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<Range> {
+        self.inner.ranges_limited(code_unit, limit)
     }
 
     pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {

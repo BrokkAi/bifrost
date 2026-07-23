@@ -358,6 +358,14 @@ impl TypescriptAnalyzer {
         Self::new(Arc::new(project))
     }
 
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::Range> {
+        self.inner.ranges_limited(code_unit, limit)
+    }
+
     #[doc(hidden)]
     pub fn reset_full_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();

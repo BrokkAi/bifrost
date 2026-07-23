@@ -5,8 +5,8 @@ use crate::analyzer::scala::{
     ScalaWildcardOwnerFacts, resolve_scala_wildcard_import_environment,
     scala_enclosing_package_root_candidates, scala_enclosing_template_owner_fq_names,
     scala_import_path, scala_import_path_candidates, scala_import_visible_at,
-    scala_lexical_scope_path_at, scala_nested_type_candidates, scala_package_prefixes_at,
-    scala_type_lookup_segments,
+    scala_lexical_scope_path_at, scala_lexical_scope_path_checked, scala_nested_type_candidates,
+    scala_package_prefixes_at, scala_package_prefixes_at_checked, scala_type_lookup_segments,
 };
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
@@ -32,8 +32,9 @@ use crate::analyzer::usages::scala_graph::{
     method_signature_arity, resolved_extension_receiver_type,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{ImportInfo, StructuredImportPath, StructuredImportScope};
-use std::collections::VecDeque;
+use crate::analyzer::{ImportInfo, SignatureMetadata, StructuredImportPath, StructuredImportScope};
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 
 struct ForwardScalaExtensionMethod {
     fqn: String,
@@ -100,6 +101,157 @@ struct ForwardScalaNameResolver<'a> {
 }
 
 type ScalaNameResolver<'a> = ForwardScalaNameResolver<'a>;
+
+pub(crate) struct ScalaDefinitionProvider<'a> {
+    scala: &'a ScalaAnalyzer,
+    session: &'a ResolutionSession,
+}
+
+impl<'a> ScalaDefinitionProvider<'a> {
+    pub(crate) fn new(scala: &'a ScalaAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self { scala, session }
+    }
+
+    fn direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        self.session
+            .query_limited_rows(|limit| self.scala.direct_children_limited(owner, limit))
+    }
+
+    fn imports(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.session
+            .query_limited_rows(|limit| self.scala.import_info_of_limited(file, limit))
+    }
+
+    fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+        self.session
+            .query_limited_rows(|limit| self.scala.ranges_limited(unit, limit))
+    }
+
+    fn signature_metadata(&self, unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.session
+            .query_limited_rows(|limit| self.scala.signature_metadata_limited(unit, limit))
+    }
+
+    fn supertype_lookup_paths(&self, unit: &CodeUnit) -> Vec<String> {
+        self.session
+            .query_limited_rows(|limit| self.scala.supertype_lookup_paths_limited(unit, limit))
+    }
+
+    fn raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
+        self.session
+            .query_limited_rows(|limit| self.scala.raw_supertypes_limited(unit, limit))
+    }
+}
+
+impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units = self.session.query_limited_rows(|limit| {
+            self.scala
+                .declaration_candidates_by_fqn_limited(fqn, false, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        if units.is_empty() && self.session.observe_cancellation() {
+            units = self.session.query_limited_rows(|limit| {
+                self.scala
+                    .declaration_candidates_by_fqn_limited(fqn, true, limit, || {
+                        self.session.observe_cancellation()
+                    })
+            });
+        }
+        if units.is_empty()
+            && self.session.observe_cancellation()
+            && let Some(terminal) = fqn.rsplit('.').next().filter(|name| !name.is_empty())
+        {
+            let normalized = crate::analyzer::scala::scala_normalize_full_name(fqn);
+            let mut identifiers = vec![terminal];
+            let plain = terminal.trim_end_matches('$');
+            if !plain.is_empty() && plain != terminal {
+                identifiers.push(plain);
+            }
+            for identifier in identifiers {
+                units.extend(
+                    self.session
+                        .query_limited_rows(|limit| {
+                            self.scala.declaration_candidates_by_identifier_limited(
+                                identifier,
+                                limit,
+                                || self.session.observe_cancellation(),
+                            )
+                        })
+                        .into_iter()
+                        .filter(|unit| {
+                            unit.fq_name() == fqn
+                                || crate::analyzer::scala::scala_normalize_full_name(
+                                    &unit.fq_name(),
+                                ) == normalized
+                        }),
+                );
+            }
+        }
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        if language == Language::Scala {
+            self.fqn(fqn)
+        } else {
+            // The bounded receiver path does not materialize another
+            // language's provider speculatively. An absent cross-language
+            // candidate is a resolution boundary, not resource exhaustion.
+            Vec::new()
+        }
+    }
+
+    fn file_identifier(&self, _file: &ProjectFile, _ident: &str) -> Vec<CodeUnit> {
+        // Bounded Scala resolution requires a parser-derived lexical/import
+        // path or an exact FQN. It intentionally exposes no same-file
+        // identifier fallback through the shared lookup trait.
+        Vec::new()
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut children = Vec::new();
+        for owner in self.fqn(fqn) {
+            children.extend(
+                self.session
+                    .query_limited_rows(|limit| self.scala.direct_children_limited(&owner, limit)),
+            );
+            if !self.session.observe_cancellation() {
+                return Vec::new();
+            }
+        }
+        sort_units(&mut children);
+        children.dedup();
+        children
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.session
+            .query(|| self.scala.workspace_package_exists(package))
+            .unwrap_or(false)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        if language == Language::Scala {
+            self.package_exists(package)
+        } else {
+            false
+        }
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.session
+            .query(|| self.scala.workspace_fqn_prefix_exists(prefix))
+            .unwrap_or(false)
+    }
+}
 
 fn scala_name_resolver_for_unit<'a>(
     scala: &'a ScalaAnalyzer,
@@ -195,16 +347,18 @@ impl<'a> ForwardScalaNameResolver<'a> {
     }
 
     fn resolve_explicit_singleton(&self, raw: &str) -> ScalaNameResolution {
-        let Some(simple) = scala_forward_simple_name(raw) else {
+        let simple = raw.trim();
+        if simple.is_empty() {
             return ScalaNameResolution::Unresolved;
-        };
+        }
         self.resolve_explicit_owner_segments(&[simple.to_string()], ScalaOwnerKind::SingletonObject)
     }
 
     fn resolve_owner(&self, raw: &str, kind: ScalaOwnerKind) -> ScalaNameResolution {
-        let Some(simple) = scala_forward_simple_name(raw) else {
+        let simple = raw.trim();
+        if simple.is_empty() {
             return ScalaNameResolution::Unresolved;
-        };
+        }
         self.resolve_owner_segments(&[simple.to_string()], kind)
     }
 
@@ -732,7 +886,10 @@ impl<'a> ForwardScalaNameResolver<'a> {
     }
 
     fn resolve_member(&self, raw: &str) -> Option<String> {
-        let simple = scala_forward_simple_name(raw)?;
+        let simple = raw.trim();
+        if simple.is_empty() {
+            return None;
+        }
         let mut members = Vec::new();
         for import in self.visible_imports().filter(|import| !import.is_wildcard) {
             let Some(path) = import.path.as_ref() else {
@@ -867,14 +1024,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
     }
 }
 
-fn scala_forward_simple_name(raw: &str) -> Option<&str> {
-    raw.trim()
-        .split(['[', '(', '{', '.', ' ', '<'])
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-}
-
+#[derive(Debug)]
 pub(crate) enum ScalaTypeLookupResolution {
     Type {
         fqn: String,
@@ -892,9 +1042,58 @@ pub(crate) fn scala_type_lookup_resolution(
     site: &ResolvedReferenceSite,
 ) -> Option<ScalaTypeLookupResolution> {
     let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-    let resolver = ScalaNameResolver::for_file(scala, support, file).with_lexical_context(
-        scala_package_prefixes_at(root, source, site.focus_start_byte),
-        scala_lexical_scope_path_at(root, site.focus_start_byte),
+    let batch = ScalaDefinitionContext {
+        file: file.clone(),
+        package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
+        imports: Arc::new(scala.import_info_of(file)),
+    };
+    scala_type_lookup_resolution_with_context(
+        analyzer, scala, support, &batch, file, source, root, site, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scala_type_lookup_resolution_in_session(
+    analyzer: &dyn IAnalyzer,
+    support: &ScalaDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    session: &ResolutionSession,
+) -> Option<ScalaTypeLookupResolution> {
+    let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
+    let batch = bounded_scala_definition_context(scala, file, session);
+    let walk = ScalaBoundedWalk::new(session);
+    bounded_scala_type_lookup_resolution(scala, support, &batch, file, source, root, site, &walk)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scala_type_lookup_resolution_with_context(
+    analyzer: &dyn IAnalyzer,
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    batch: &ScalaDefinitionContext,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    session: Option<&ResolutionSession>,
+) -> Option<ScalaTypeLookupResolution> {
+    let node = scala_smallest_named_node_covering(
+        session,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    if !scala_charge_ancestor_path(session, node) {
+        return None;
+    }
+    let (package_prefixes, lexical_scopes) =
+        scala_lexical_context_at(session, root, source, node, site.focus_start_byte)?;
+    let resolver = ScalaNameResolver::for_batch(scala, support, batch).with_lexical_context(
+        package_prefixes,
+        lexical_scopes,
         site.focus_start_byte,
     );
     let ctx = ScalaLookupCtx {
@@ -903,9 +1102,27 @@ pub(crate) fn scala_type_lookup_resolution(
         support,
         file,
         source,
+        session,
     };
-    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
     scala_type_lookup_node_fqn(ctx, &resolver, root, node)
+}
+
+fn bounded_scala_definition_context(
+    scala: &ScalaAnalyzer,
+    file: &ProjectFile,
+    session: &ResolutionSession,
+) -> ScalaDefinitionContext {
+    let package = session
+        .query_limited_rows(|limit| scala.namespace_of_file_limited(file, limit))
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let imports = session.query_limited_rows(|limit| scala.import_info_of_limited(file, limit));
+    ScalaDefinitionContext {
+        file: file.clone(),
+        package: Arc::from(package),
+        imports: Arc::new(imports),
+    }
 }
 
 pub(super) fn resolve_scala(
@@ -922,14 +1139,2368 @@ pub(super) fn resolve_scala(
             "Scala analyzer is unavailable",
         );
     };
+    let batch = context.scala_context(scala, file);
+    let support = context.bounded_support();
+    resolve_scala_with_context(
+        analyzer, scala, support, &batch, file, source, tree, site, None,
+    )
+}
+
+pub(crate) fn resolve_scala_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "scala_analyzer_unavailable",
+            "Scala analyzer is unavailable",
+        ));
+    };
+    let support = ScalaDefinitionProvider::new(scala, &session);
+    let batch = bounded_scala_definition_context(scala, file, &session);
+    let walk = ScalaBoundedWalk::new(&session);
+    let outcome = bounded_scala_definition_resolution(
+        scala, &support, &batch, file, source, tree, site, &walk,
+    );
+    session.finish(outcome)
+}
+
+struct ScalaBoundedWalk<'a> {
+    session: &'a ResolutionSession,
+    steps: Cell<usize>,
+    #[cfg(test)]
+    cancellation: Option<(CancellationToken, usize)>,
+}
+
+impl<'a> ScalaBoundedWalk<'a> {
+    fn new(session: &'a ResolutionSession) -> Self {
+        Self {
+            session,
+            steps: Cell::new(0),
+            #[cfg(test)]
+            cancellation: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn cancelling_after(
+        session: &'a ResolutionSession,
+        cancellation: CancellationToken,
+        steps: usize,
+    ) -> Self {
+        Self {
+            session,
+            steps: Cell::new(0),
+            cancellation: Some((cancellation, steps)),
+        }
+    }
+
+    fn step(&self) -> bool {
+        let next = self.steps.get().saturating_add(1);
+        self.steps.set(next);
+        #[cfg(test)]
+        if let Some((cancellation, cancel_after)) = &self.cancellation
+            && next == *cancel_after
+        {
+            cancellation.cancel();
+        }
+        self.session.scope_step()
+    }
+}
+
+struct BoundedScalaCtx<'a, 'tree> {
+    provider: &'a ScalaDefinitionProvider<'a>,
+    batch: &'a ScalaDefinitionContext,
+    file: &'a ProjectFile,
+    source: &'a str,
+    root: Node<'tree>,
+    package_prefixes: Vec<String>,
+    lexical_scopes: Vec<StructuredImportScope>,
+    reference_byte: usize,
+    walk: &'a ScalaBoundedWalk<'a>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_scala_type_lookup_resolution(
+    _scala: &ScalaAnalyzer,
+    provider: &ScalaDefinitionProvider<'_>,
+    batch: &ScalaDefinitionContext,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    walk: &ScalaBoundedWalk<'_>,
+) -> Option<ScalaTypeLookupResolution> {
+    let node = bounded_scala_smallest_named_node_covering(
+        walk,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let (package_prefixes, lexical_scopes) =
+        bounded_scala_lexical_context(walk, root, source, node, site.focus_start_byte)?;
+    let ctx = BoundedScalaCtx {
+        provider,
+        batch,
+        file,
+        source,
+        root,
+        package_prefixes,
+        lexical_scopes,
+        reference_byte: site.focus_start_byte,
+        walk,
+    };
+    let declaration = bounded_scala_expression_type(&ctx, node, site.focus_start_byte)?;
+    Some(ScalaTypeLookupResolution::Type {
+        fqn: declaration.fq_name(),
+        target_kind: TypeLookupTargetKind::ValueExpression,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_scala_definition_resolution(
+    _scala: &ScalaAnalyzer,
+    provider: &ScalaDefinitionProvider<'_>,
+    batch: &ScalaDefinitionContext,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    walk: &ScalaBoundedWalk<'_>,
+) -> DefinitionLookupOutcome {
     let Some(tree) = tree else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
-    let batch = context.scala_context(scala, file);
-    let support = context.bounded_support();
     let root = tree.root_node();
-    let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
+    let Some(node) = bounded_scala_smallest_named_node_covering(
+        walk,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
+        return no_definition(
+            "scala_receiver_budget_exhausted",
+            "Scala syntax traversal exceeded the receiver-resolution budget",
+        );
+    };
+    let Some((package_prefixes, lexical_scopes)) =
+        bounded_scala_lexical_context(walk, root, source, node, site.focus_start_byte)
     else {
+        return no_definition(
+            "scala_receiver_budget_exhausted",
+            "Scala lexical-context traversal exceeded the receiver-resolution budget",
+        );
+    };
+    let ctx = BoundedScalaCtx {
+        provider,
+        batch,
+        file,
+        source,
+        root,
+        package_prefixes,
+        lexical_scopes,
+        reference_byte: site.focus_start_byte,
+        walk,
+    };
+
+    if let Some(reference) = bounded_scala_member_reference(&ctx, node) {
+        let Some(owner) = bounded_scala_expression_type(
+            &ctx,
+            reference.receiver,
+            reference.receiver.start_byte(),
+        ) else {
+            return no_definition(
+                SCALA_UNSUPPORTED_RECEIVER,
+                format!(
+                    "receiver for Scala member `{}` has no bounded structured type",
+                    scala_node_text(reference.member, source).trim()
+                ),
+            );
+        };
+        let member_name = scala_node_text(reference.member, source).trim();
+        let direct = if reference.receiver_scope == ScalaBoundedReceiverScope::Super {
+            ScalaBoundedMemberCandidates::NoMatch
+        } else {
+            bounded_scala_applicable_direct_members(&ctx, &owner, member_name, reference.call_shape)
+        };
+        match direct {
+            ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous: true,
+            } => {
+                return bounded_scala_ambiguous_candidates(
+                    candidates,
+                    format!(
+                        "Scala member `{member_name}` has multiple applicable overloads on `{}`",
+                        owner.fq_name()
+                    ),
+                );
+            }
+            ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous: false,
+            } => return candidates_outcome(candidates),
+            ScalaBoundedMemberCandidates::Unknown => {
+                return no_definition(
+                    SCALA_UNSUPPORTED_RECEIVER,
+                    format!(
+                        "Scala member `{member_name}` on `{}` has incomplete callable applicability metadata",
+                        owner.fq_name()
+                    ),
+                );
+            }
+            ScalaBoundedMemberCandidates::NoMatch => {}
+        }
+        match bounded_scala_inherited_members(&ctx, &owner, member_name, reference.call_shape) {
+            ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous: true,
+            } => {
+                return bounded_scala_ambiguous_candidates(
+                    candidates,
+                    format!(
+                        "Scala inherited member `{member_name}` has multiple applicable overloads for `{}`",
+                        owner.fq_name()
+                    ),
+                );
+            }
+            ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous: false,
+            } => return candidates_outcome(candidates),
+            ScalaBoundedMemberCandidates::Unknown => {
+                return no_definition(
+                    SCALA_UNSUPPORTED_RECEIVER,
+                    format!(
+                        "Scala hierarchy for `{}` is incomplete while resolving inherited member `{member_name}`",
+                        owner.fq_name()
+                    ),
+                );
+            }
+            ScalaBoundedMemberCandidates::NoMatch => {}
+        }
+        if reference.receiver_scope == ScalaBoundedReceiverScope::Super {
+            return no_definition(
+                SCALA_UNSUPPORTED_RECEIVER,
+                format!(
+                    "explicit Scala `super` scope for `{}` has no applicable inherited member `{member_name}`",
+                    owner.fq_name()
+                ),
+            );
+        }
+        match bounded_scala_extension_members(
+            &ctx,
+            reference.member,
+            &owner,
+            member_name,
+            reference.call_shape,
+        ) {
+            ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous: true,
+            } => {
+                return bounded_scala_ambiguous_candidates(
+                    candidates,
+                    format!(
+                        "Scala extension member `{member_name}` has multiple applicable overloads for `{}`",
+                        owner.fq_name()
+                    ),
+                );
+            }
+            ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous: false,
+            } => return candidates_outcome(candidates),
+            ScalaBoundedMemberCandidates::Unknown => {
+                return no_definition(
+                    SCALA_UNSUPPORTED_RECEIVER,
+                    format!(
+                        "Scala extension member `{member_name}` has unresolved visibility or applicability for `{}`",
+                        owner.fq_name()
+                    ),
+                );
+            }
+            ScalaBoundedMemberCandidates::NoMatch => {}
+        }
+        return no_definition(
+            SCALA_UNSUPPORTED_RECEIVER,
+            format!(
+                "receiver for Scala member `{member_name}` resolved to `{}`, but no applicable direct, inherited, or exact extension member was found",
+                owner.fq_name()
+            ),
+        );
+    }
+
+    if bounded_scala_is_type_node(node)
+        && let Some(declaration) = bounded_scala_resolve_type_node(&ctx, node)
+    {
+        return candidates_outcome(vec![declaration]);
+    }
+
+    if matches!(node.kind(), "identifier" | "operator_identifier")
+        && let Some(owner) = bounded_scala_nearest_enclosing_owner(&ctx, node)
+    {
+        let name = scala_node_text(node, source).trim();
+        let candidates = bounded_scala_direct_members(&ctx, &owner, name);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
+
+    no_definition(
+        "no_indexed_definition",
+        format!(
+            "`{}` did not resolve through bounded structured Scala lookup",
+            site.text
+        ),
+    )
+}
+
+fn bounded_scala_smallest_named_node_covering<'tree>(
+    walk: &ScalaBoundedWalk<'_>,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !walk.step() || node.start_byte() > start || node.end_byte() < end {
+        return None;
+    }
+    loop {
+        let mut containing = None;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if !walk.step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing = Some(child);
+                break;
+            }
+        }
+        match containing {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
+    }
+}
+
+fn bounded_scala_lexical_context(
+    walk: &ScalaBoundedWalk<'_>,
+    root: Node<'_>,
+    source: &str,
+    reference_node: Node<'_>,
+    reference_byte: usize,
+) -> Option<(Vec<String>, Vec<StructuredImportScope>)> {
+    let mut inspect = |_: Node<'_>| walk.step();
+    let package_prefixes =
+        scala_package_prefixes_at_checked(root, source, reference_byte, &mut inspect)?;
+    let lexical_scopes =
+        scala_lexical_scope_path_checked(reference_node, |_: Node<'_>| walk.step())?;
+    Some((package_prefixes, lexical_scopes))
+}
+
+#[derive(Clone, Copy)]
+enum ScalaBoundedCallShape {
+    Access,
+    Ordinary(usize),
+    Unsupported,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalaBoundedReceiverScope {
+    Ordinary,
+    Super,
+}
+
+#[derive(Clone, Copy)]
+struct ScalaBoundedMemberReference<'tree> {
+    receiver: Node<'tree>,
+    member: Node<'tree>,
+    call_shape: ScalaBoundedCallShape,
+    receiver_scope: ScalaBoundedReceiverScope,
+}
+
+fn bounded_scala_member_reference<'tree>(
+    ctx: &BoundedScalaCtx<'_, 'tree>,
+    mut node: Node<'tree>,
+) -> Option<ScalaBoundedMemberReference<'tree>> {
+    loop {
+        match node.kind() {
+            "field_expression" => {
+                let receiver = node.child_by_field_name("value")?;
+                if !ctx.walk.step() {
+                    return None;
+                }
+                let member = node.child_by_field_name("field")?;
+                if !ctx.walk.step() {
+                    return None;
+                }
+                let call_shape = bounded_scala_member_call_shape(ctx, node)?;
+                let receiver_scope = if scala_node_text(receiver, ctx.source).trim() == "super" {
+                    ScalaBoundedReceiverScope::Super
+                } else {
+                    ScalaBoundedReceiverScope::Ordinary
+                };
+                return Some(ScalaBoundedMemberReference {
+                    receiver,
+                    member,
+                    call_shape,
+                    receiver_scope,
+                });
+            }
+            "infix_expression" => {
+                let member = node.child_by_field_name("operator")?;
+                if !ctx.walk.step() {
+                    return None;
+                }
+                let right_associative = scala_node_text(member, ctx.source).trim().ends_with(':');
+                let receiver =
+                    node.child_by_field_name(if right_associative { "right" } else { "left" })?;
+                if !ctx.walk.step() {
+                    return None;
+                }
+                return Some(ScalaBoundedMemberReference {
+                    receiver,
+                    member,
+                    call_shape: ScalaBoundedCallShape::Ordinary(1),
+                    receiver_scope: ScalaBoundedReceiverScope::Ordinary,
+                });
+            }
+            "postfix_expression" => {
+                let mut member = None;
+                let mut children = Vec::new();
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if !ctx.walk.step() {
+                        return None;
+                    }
+                    if matches!(child.kind(), "identifier" | "operator_identifier") {
+                        member = Some(child);
+                    }
+                    children.push(child);
+                }
+                let member = member?;
+                let receiver = children
+                    .into_iter()
+                    .find(|child| child.end_byte() <= member.start_byte())?;
+                return Some(ScalaBoundedMemberReference {
+                    receiver,
+                    member,
+                    call_shape: ScalaBoundedCallShape::Ordinary(0),
+                    receiver_scope: ScalaBoundedReceiverScope::Ordinary,
+                });
+            }
+            _ => {}
+        }
+        let parent = node.parent()?;
+        if !ctx.walk.step() {
+            return None;
+        }
+        if !matches!(
+            parent.kind(),
+            "call_expression"
+                | "generic_function"
+                | "field_expression"
+                | "infix_expression"
+                | "postfix_expression"
+        ) {
+            return None;
+        }
+        node = parent;
+    }
+}
+
+fn bounded_scala_member_call_shape(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    field: Node<'_>,
+) -> Option<ScalaBoundedCallShape> {
+    let mut function = field;
+    let Some(mut parent) = function.parent() else {
+        return Some(ScalaBoundedCallShape::Access);
+    };
+    if !ctx.walk.step() {
+        return None;
+    }
+    if parent.kind() == "generic_function" {
+        let generic_function = parent.child_by_field_name("function")?;
+        if !ctx.walk.step() {
+            return None;
+        }
+        if generic_function != function {
+            return Some(ScalaBoundedCallShape::Access);
+        }
+        function = parent;
+        let Some(call_parent) = function.parent() else {
+            return Some(ScalaBoundedCallShape::Access);
+        };
+        if !ctx.walk.step() {
+            return None;
+        }
+        parent = call_parent;
+    }
+    if parent.kind() != "call_expression" {
+        return Some(ScalaBoundedCallShape::Access);
+    }
+    let applied = parent.child_by_field_name("function")?;
+    if !ctx.walk.step() {
+        return None;
+    }
+    if applied != function {
+        return Some(ScalaBoundedCallShape::Access);
+    }
+    let arguments = parent.child_by_field_name("arguments")?;
+    if !ctx.walk.step() {
+        return None;
+    }
+    if arguments.kind() != "arguments" {
+        return Some(
+            if matches!(arguments.kind(), "block" | "case_block" | "colon_argument") {
+                ScalaBoundedCallShape::Ordinary(1)
+            } else {
+                ScalaBoundedCallShape::Unsupported
+            },
+        );
+    }
+    let mut arity = 0usize;
+    let mut unsupported = false;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if !ctx.walk.step() {
+            return None;
+        }
+        unsupported |= is_scala_named_argument_assignment(argument);
+        arity = arity.checked_add(1)?;
+    }
+    Some(if unsupported {
+        ScalaBoundedCallShape::Unsupported
+    } else {
+        ScalaBoundedCallShape::Ordinary(arity)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum BoundedScalaBinding<'tree> {
+    DeclaredType(Node<'tree>),
+    Initializer(Node<'tree>),
+}
+
+#[derive(Clone, Copy)]
+struct BoundedScalaBindingFact<'tree> {
+    declaration_start: usize,
+    binding: BoundedScalaBinding<'tree>,
+}
+
+fn bounded_scala_expression_type<'tree>(
+    ctx: &BoundedScalaCtx<'_, 'tree>,
+    mut expression: Node<'tree>,
+    mut cutoff_start: usize,
+) -> Option<CodeUnit> {
+    // Members are collected outside-in. Redirecting an identifier to its
+    // initializer keeps walking the same explicit state machine, so even a
+    // very long chain of local aliases never consumes the Rust call stack.
+    let mut members = Vec::new();
+    let mut bindings = None;
+    let mut first_member_scope = ScalaBoundedReceiverScope::Ordinary;
+    let mut owner = loop {
+        if !ctx.walk.step() {
+            return None;
+        }
+        match expression.kind() {
+            "call_expression" => {
+                let function = expression
+                    .child_by_field_name("function")
+                    .or_else(|| expression.named_child(0))?;
+                if !ctx.walk.step() {
+                    return None;
+                }
+                match function.kind() {
+                    "field_expression" => {
+                        let member = function.child_by_field_name("field")?;
+                        if !ctx.walk.step() {
+                            return None;
+                        }
+                        let name = scala_node_text(member, ctx.source).trim();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        members.push(name.to_string());
+                        expression = function.child_by_field_name("value")?;
+                        if !ctx.walk.step() {
+                            return None;
+                        }
+                    }
+                    "identifier" | "operator_identifier" => {
+                        let name = scala_node_text(function, ctx.source).trim();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        members.push(name.to_string());
+                        break bounded_scala_nearest_enclosing_owner(ctx, function)?;
+                    }
+                    "instance_expression" => {
+                        break bounded_scala_constructed_type(ctx, function)?;
+                    }
+                    _ => return None,
+                }
+            }
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                let name = scala_node_text(expression, ctx.source).trim();
+                if matches!(name, "this" | "super") {
+                    if name == "super" {
+                        first_member_scope = ScalaBoundedReceiverScope::Super;
+                    }
+                    break bounded_scala_nearest_enclosing_owner(ctx, expression)?;
+                }
+                if bindings.is_none() {
+                    bindings = Some(bounded_scala_bindings_before(ctx, cutoff_start)?);
+                }
+                if let Some(binding) = bindings.as_ref().and_then(|bindings| {
+                    bounded_scala_visible_binding(bindings, name, cutoff_start)
+                }) {
+                    match binding {
+                        BoundedScalaBinding::DeclaredType(type_node) => {
+                            break bounded_scala_resolve_type_node(ctx, type_node)?;
+                        }
+                        BoundedScalaBinding::Initializer(initializer) => {
+                            if initializer.start_byte() >= cutoff_start {
+                                return None;
+                            }
+                            cutoff_start = initializer.start_byte();
+                            expression = initializer;
+                            continue;
+                        }
+                    }
+                }
+                break bounded_scala_resolve_segments(ctx, &[name.to_string()], true)
+                    .or_else(|| bounded_scala_resolve_segments(ctx, &[name.to_string()], false))?;
+            }
+            "instance_expression" => {
+                break bounded_scala_constructed_type(ctx, expression)?;
+            }
+            kind if bounded_scala_is_type_kind(kind) => {
+                break bounded_scala_resolve_type_node(ctx, expression)?;
+            }
+            "parenthesized_expression" => {
+                let mut cursor = expression.walk();
+                let mut children = expression.named_children(&mut cursor);
+                let child = children.next()?;
+                if children.next().is_some() || !ctx.walk.step() {
+                    return None;
+                }
+                expression = child;
+            }
+            _ => return None,
+        }
+    };
+    for (index, member) in members.iter().rev().enumerate() {
+        let receiver_scope = if index == 0 {
+            first_member_scope
+        } else {
+            ScalaBoundedReceiverScope::Ordinary
+        };
+        owner = bounded_scala_member_return_type(ctx, &owner, member, receiver_scope)?;
+    }
+    Some(owner)
+}
+
+fn bounded_scala_member_return_type(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    member: &str,
+    receiver_scope: ScalaBoundedReceiverScope,
+) -> Option<CodeUnit> {
+    let selected = if receiver_scope == ScalaBoundedReceiverScope::Super {
+        bounded_scala_inherited_members(ctx, owner, member, ScalaBoundedCallShape::Access)
+    } else {
+        match bounded_scala_applicable_direct_members(
+            ctx,
+            owner,
+            member,
+            ScalaBoundedCallShape::Access,
+        ) {
+            ScalaBoundedMemberCandidates::NoMatch => {
+                bounded_scala_inherited_members(ctx, owner, member, ScalaBoundedCallShape::Access)
+            }
+            direct => direct,
+        }
+    };
+    let candidates = match selected {
+        ScalaBoundedMemberCandidates::Found {
+            candidates,
+            overload_ambiguous: false,
+        } => candidates
+            .into_iter()
+            .filter(CodeUnit::is_function)
+            .collect::<Vec<_>>(),
+        ScalaBoundedMemberCandidates::NoMatch
+        | ScalaBoundedMemberCandidates::Found {
+            overload_ambiguous: true,
+            ..
+        }
+        | ScalaBoundedMemberCandidates::Unknown => return None,
+    };
+    let mut resolved = Vec::new();
+    for candidate in candidates {
+        if !ctx.walk.step() {
+            return None;
+        }
+        let metadata = ctx.provider.signature_metadata(&candidate);
+        if metadata.is_empty() {
+            return None;
+        }
+        for signature in metadata {
+            if !ctx.walk.step() || signature.bare_return_type_parameter().is_some() {
+                return None;
+            }
+            let identity = signature.return_type_identity()?;
+            let name = identity.nominal_name_with(|| ctx.walk.step())?;
+            resolved.push(bounded_scala_resolve_metadata_type(ctx, &candidate, name)?);
+        }
+    }
+    sort_units(&mut resolved);
+    resolved.dedup();
+    match resolved.as_slice() {
+        [declaration] => Some(declaration.clone()),
+        _ => None,
+    }
+}
+
+fn bounded_scala_resolve_metadata_type(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    name: &crate::analyzer::StructuredTypeName,
+) -> Option<CodeUnit> {
+    if name.path().is_empty() {
+        return None;
+    }
+
+    if name.is_absolute() {
+        return bounded_scala_metadata_type_tier(
+            ctx,
+            scala_nested_type_candidates(String::new(), name.path(), false),
+        )
+        .unique();
+    }
+
+    // Lexically enclosing types are the first exact tier. The callable's
+    // parser-derived scope is persisted with its signature, so an unrelated
+    // same-file declaration can never enter this lookup by identifier alone.
+    for depth in (1..=name.lexical_scope().len()).rev() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        let mut prefix = Vec::with_capacity(depth.saturating_add(1));
+        if !owner.package_name().is_empty() {
+            prefix.push(owner.package_name().to_string());
+        };
+        prefix.extend_from_slice(&name.lexical_scope()[..depth]);
+        match bounded_scala_metadata_type_tier(
+            ctx,
+            scala_nested_type_candidates(prefix.join("."), name.path(), false),
+        ) {
+            ScalaMetadataTypeTier::Empty => {}
+            ScalaMetadataTypeTier::Unique(declaration) => return Some(declaration),
+            ScalaMetadataTypeTier::Ambiguous => return None,
+        };
+    }
+
+    let owner_start = ctx
+        .provider
+        .ranges(owner)
+        .into_iter()
+        .map(|range| range.start_byte)
+        .min()?;
+    let mut explicit_claim = false;
+    let mut imported = Vec::new();
+    let mut visible_wildcard = false;
+    for import in ctx.provider.imports(owner.source()) {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if !bounded_scala_metadata_import_visible(&import, owner, owner_start) {
+            continue;
+        }
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        if import.is_wildcard {
+            visible_wildcard = true;
+            continue;
+        }
+        let Some(imported_name) = path.segments.last() else {
+            continue;
+        };
+        if import.identifier.as_deref().unwrap_or(imported_name) != name.path()[0] {
+            continue;
+        }
+        explicit_claim = true;
+        let mut imported_path = path.segments.clone();
+        imported_path.extend_from_slice(&name.path()[1..]);
+
+        let mut selected = ScalaMetadataTypeTier::Empty;
+        for prefix in path
+            .lexical_prefixes
+            .iter()
+            .rev()
+            .map(String::as_str)
+            .chain(std::iter::once(""))
+        {
+            if !ctx.walk.step() {
+                return None;
+            }
+            selected = bounded_scala_metadata_type_tier(
+                ctx,
+                scala_nested_type_candidates(prefix.to_string(), &imported_path, false),
+            );
+            if !matches!(selected, ScalaMetadataTypeTier::Empty) {
+                break;
+            }
+        }
+        match selected {
+            ScalaMetadataTypeTier::Empty => {}
+            ScalaMetadataTypeTier::Unique(declaration) => imported.push(declaration),
+            ScalaMetadataTypeTier::Ambiguous => return None,
+        }
+    }
+    if explicit_claim {
+        sort_units(&mut imported);
+        imported.dedup();
+        return match imported.as_slice() {
+            [declaration] => Some(declaration.clone()),
+            _ => None,
+        };
+    }
+
+    // A wildcard can introduce an identity that is absent from persisted
+    // evidence. Do not silently prefer a package/global spelling across it.
+    if visible_wildcard {
+        return None;
+    }
+
+    if !owner.package_name().is_empty() {
+        match bounded_scala_metadata_type_tier(
+            ctx,
+            scala_nested_type_candidates(owner.package_name().to_string(), name.path(), false),
+        ) {
+            ScalaMetadataTypeTier::Empty => {}
+            ScalaMetadataTypeTier::Unique(declaration) => return Some(declaration),
+            ScalaMetadataTypeTier::Ambiguous => return None,
+        }
+    }
+
+    // Qualified paths and declarations in the empty package may name a global
+    // declaration directly. A simple name in a non-empty package needs
+    // `_root_` to cross that boundary.
+    if name.path().len() > 1 || owner.package_name().is_empty() {
+        return bounded_scala_metadata_type_tier(
+            ctx,
+            scala_nested_type_candidates(String::new(), name.path(), false),
+        )
+        .unique();
+    }
+    None
+}
+
+fn bounded_scala_metadata_import_visible(
+    import: &ImportInfo,
+    owner: &CodeUnit,
+    owner_start: usize,
+) -> bool {
+    let Some(path) = import.path.as_ref() else {
+        return true;
+    };
+    path.declaration_start_byte <= owner_start
+        && (path.lexical_prefixes.is_empty()
+            || path
+                .lexical_prefixes
+                .last()
+                .is_some_and(|prefix| prefix == owner.package_name()))
+        && path
+            .lexical_scopes
+            .iter()
+            .all(|scope| scope.start_byte <= owner_start && owner_start <= scope.end_byte)
+}
+
+enum ScalaMetadataTypeTier {
+    Empty,
+    Unique(CodeUnit),
+    Ambiguous,
+}
+
+impl ScalaMetadataTypeTier {
+    fn unique(self) -> Option<CodeUnit> {
+        match self {
+            Self::Unique(declaration) => Some(declaration),
+            Self::Empty | Self::Ambiguous => None,
+        }
+    }
+}
+
+fn bounded_scala_metadata_type_tier(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    mut fqns: Vec<String>,
+) -> ScalaMetadataTypeTier {
+    fqns.sort();
+    fqns.dedup();
+    let mut declarations = Vec::new();
+    for fqn in fqns {
+        if !ctx.walk.step() {
+            return ScalaMetadataTypeTier::Ambiguous;
+        }
+        declarations.extend(
+            ctx.provider
+                .fqn(&fqn)
+                .into_iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == fqn),
+        );
+    }
+    sort_units(&mut declarations);
+    declarations.dedup();
+    match declarations.as_slice() {
+        [] => ScalaMetadataTypeTier::Empty,
+        [declaration] => ScalaMetadataTypeTier::Unique(declaration.clone()),
+        _ => ScalaMetadataTypeTier::Ambiguous,
+    }
+}
+
+fn bounded_scala_constructed_type(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    mut node: Node<'_>,
+) -> Option<CodeUnit> {
+    while node.kind() == "call_expression" {
+        if !ctx.walk.step() {
+            return None;
+        }
+        node = node.child_by_field_name("function")?;
+    }
+    if node.kind() != "instance_expression" {
+        return None;
+    }
+    let mut type_node = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if matches!(
+            child.kind(),
+            "arguments" | "template_body" | "block" | "indented_block"
+        ) {
+            continue;
+        }
+        if type_node.replace(child).is_some() {
+            return None;
+        }
+    }
+    let type_node = type_node?;
+    if matches!(
+        type_node.kind(),
+        "compound_type" | "infix_type" | "intersection_type" | "with_type"
+    ) {
+        return None;
+    }
+    bounded_scala_resolve_type_node(ctx, type_node)
+}
+
+fn bounded_scala_bindings_before<'tree>(
+    ctx: &BoundedScalaCtx<'_, 'tree>,
+    cutoff_start: usize,
+) -> Option<HashMap<String, Vec<BoundedScalaBindingFact<'tree>>>> {
+    let mut stack = vec![ctx.root];
+    let mut bindings = HashMap::<String, Vec<BoundedScalaBindingFact<'tree>>>::new();
+    while let Some(node) = stack.pop() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if node.start_byte() >= cutoff_start {
+            continue;
+        }
+        let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
+        let contains_cutoff = node.start_byte() <= cutoff_start && cutoff_start < node.end_byte();
+        if enters_scope && !contains_cutoff {
+            continue;
+        }
+        match node.kind() {
+            "parameter" | "class_parameter" => {
+                let name_node = node.child_by_field_name("name");
+                if let Some(name_node) = name_node {
+                    if !ctx.walk.step() {
+                        return None;
+                    }
+                    let name = scala_node_text(name_node, ctx.source).trim();
+                    if !name.is_empty()
+                        && let Some(type_node) = node.child_by_field_name("type")
+                    {
+                        if !ctx.walk.step() {
+                            return None;
+                        }
+                        bindings.entry(name.to_string()).or_default().push(
+                            BoundedScalaBindingFact {
+                                declaration_start: node.start_byte(),
+                                binding: BoundedScalaBinding::DeclaredType(type_node),
+                            },
+                        );
+                    }
+                }
+            }
+            "val_definition" | "var_definition" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    if !ctx.walk.step() {
+                        return None;
+                    }
+                    let binding = if let Some(type_node) = node.child_by_field_name("type") {
+                        if !ctx.walk.step() {
+                            return None;
+                        }
+                        Some(BoundedScalaBinding::DeclaredType(type_node))
+                    } else if let Some(value) = node.child_by_field_name("value") {
+                        if !ctx.walk.step() {
+                            return None;
+                        }
+                        Some(BoundedScalaBinding::Initializer(value))
+                    } else {
+                        None
+                    };
+                    if let Some(binding) = binding {
+                        for name in bounded_scala_pattern_names(ctx, pattern)? {
+                            bindings
+                                .entry(name)
+                                .or_default()
+                                .push(BoundedScalaBindingFact {
+                                    declaration_start: node.start_byte(),
+                                    binding,
+                                });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut children = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if !ctx.walk.step() {
+                return None;
+            }
+            if child.start_byte() >= cutoff_start {
+                break;
+            }
+            children.push(child);
+        }
+        children.reverse();
+        stack.extend(children);
+    }
+    Some(bindings)
+}
+
+fn bounded_scala_visible_binding<'tree>(
+    bindings: &HashMap<String, Vec<BoundedScalaBindingFact<'tree>>>,
+    name: &str,
+    cutoff_start: usize,
+) -> Option<BoundedScalaBinding<'tree>> {
+    bindings
+        .get(name)?
+        .iter()
+        .rev()
+        .find_map(|fact| (fact.declaration_start < cutoff_start).then_some(fact.binding))
+}
+
+fn bounded_scala_pattern_names(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    pattern: Node<'_>,
+) -> Option<Vec<String>> {
+    let mut stack = vec![pattern];
+    let mut names = Vec::new();
+    while let Some(node) = stack.pop() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if matches!(node.kind(), "identifier" | "operator_identifier") {
+            let name = scala_node_text(node, ctx.source).trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "stable_identifier"
+                | "stable_type_identifier"
+                | "type_identifier"
+                | "given_pattern"
+                | "literal"
+                | "wildcard"
+        ) {
+            continue;
+        }
+        let mut cursor = node.walk();
+        let mut children = Vec::new();
+        for child in node.named_children(&mut cursor) {
+            if !ctx.walk.step() {
+                return None;
+            }
+            children.push(child);
+        }
+        children.reverse();
+        stack.extend(children);
+    }
+    Some(names)
+}
+
+fn bounded_scala_resolve_type_node(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    let segments = bounded_scala_type_segments(ctx, node)?;
+    bounded_scala_resolve_segments(ctx, &segments, false)
+}
+
+fn bounded_scala_type_segments(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    root: Node<'_>,
+) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        match node.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                let segment = scala_node_text(node, ctx.source).trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+            }
+            "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
+            _ => {
+                let mut cursor = node.walk();
+                let mut children = Vec::new();
+                for child in node.named_children(&mut cursor) {
+                    if !ctx.walk.step() {
+                        return None;
+                    }
+                    children.push(child);
+                }
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn bounded_scala_resolve_segments(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    segments: &[String],
+    singleton: bool,
+) -> Option<CodeUnit> {
+    if segments.is_empty() {
+        return None;
+    }
+    let mut candidate_fqns = Vec::new();
+    let root_name = &segments[0];
+    for import in ctx.batch.imports.iter().filter(|import| {
+        scala_import_visible_at(
+            import,
+            &ctx.package_prefixes,
+            &ctx.lexical_scopes,
+            ctx.reference_byte,
+        )
+    }) {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        if import.is_wildcard {
+            for prefix in path
+                .lexical_prefixes
+                .iter()
+                .rev()
+                .map(String::as_str)
+                .chain(std::iter::once(""))
+            {
+                let base = if prefix.is_empty() {
+                    path.segments.join(".")
+                } else {
+                    format!("{prefix}.{}", path.segments.join("."))
+                };
+                candidate_fqns.extend(scala_nested_type_candidates(base, segments, true));
+            }
+            continue;
+        }
+        let Some(imported) = path.segments.last() else {
+            continue;
+        };
+        if import.identifier.as_deref().unwrap_or(imported) != root_name {
+            continue;
+        }
+        let mut imported_segments = path.segments.clone();
+        imported_segments.extend_from_slice(&segments[1..]);
+        candidate_fqns.push(imported_segments.join("."));
+    }
+    for prefix in ctx
+        .package_prefixes
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .chain(std::iter::once(""))
+    {
+        candidate_fqns.extend(scala_nested_type_candidates(
+            prefix.to_string(),
+            segments,
+            false,
+        ));
+    }
+    if segments.len() == 1 {
+        candidate_fqns.extend(scala_nested_type_candidates(
+            "scala".to_string(),
+            segments,
+            false,
+        ));
+    }
+    if singleton {
+        for candidate in &mut candidate_fqns {
+            if !candidate.ends_with('$') {
+                candidate.push('$');
+            }
+        }
+    }
+    candidate_fqns.sort();
+    candidate_fqns.dedup();
+
+    let mut declarations = Vec::new();
+    for fqn in candidate_fqns {
+        declarations.extend(
+            ctx.provider
+                .fqn(&fqn)
+                .into_iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == fqn),
+        );
+        if !ctx.walk.session.observe_cancellation() {
+            return None;
+        }
+    }
+    sort_units(&mut declarations);
+    declarations.dedup();
+    match declarations.as_slice() {
+        [declaration] => Some(declaration.clone()),
+        _ => None,
+    }
+}
+
+fn bounded_scala_nearest_enclosing_owner(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    bounded_scala_enclosing_owners(ctx, node).and_then(|owners| owners.into_iter().next())
+}
+
+fn bounded_scala_enclosing_owners(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    mut node: Node<'_>,
+) -> Option<Vec<CodeUnit>> {
+    let mut declarations = Vec::new();
+    while let Some(parent) = node.parent() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if matches!(
+            parent.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) {
+            let name = parent.child_by_field_name("name")?;
+            if !ctx.walk.step() {
+                return None;
+            }
+            let name_text = scala_node_text(name, ctx.source).trim();
+            if name_text.is_empty() {
+                return None;
+            }
+            declarations.push((
+                parent,
+                if parent.kind() == "object_definition" {
+                    format!("{name_text}$")
+                } else {
+                    name_text.to_string()
+                },
+            ));
+        }
+        node = parent;
+    }
+
+    declarations.reverse();
+    let package = ctx
+        .package_prefixes
+        .last()
+        .map(String::as_str)
+        .unwrap_or(ctx.batch.package.as_ref());
+    let mut path = Vec::new();
+    let mut owners = Vec::new();
+    for (declaration_node, segment) in declarations {
+        if !ctx.walk.step() {
+            return None;
+        }
+        path.push(segment);
+        let relative = path.join(".");
+        let fqn = if package.is_empty() {
+            relative
+        } else {
+            format!("{package}.{relative}")
+        };
+        let mut candidates = Vec::new();
+        for candidate in ctx.provider.fqn(&fqn) {
+            if !ctx.walk.step() {
+                return None;
+            }
+            if !candidate.is_class() || candidate.fq_name() != fqn || candidate.source() != ctx.file
+            {
+                continue;
+            }
+            let mut exact_range = false;
+            for range in ctx.provider.ranges(&candidate) {
+                if !ctx.walk.step() {
+                    return None;
+                }
+                exact_range |= range.start_byte == declaration_node.start_byte()
+                    && range.end_byte == declaration_node.end_byte();
+            }
+            if exact_range {
+                candidates.push(candidate);
+            }
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
+        match candidates.as_slice() {
+            [owner] => owners.push(owner.clone()),
+            [] => return None,
+            _ => return None,
+        }
+    }
+    owners.reverse();
+    Some(owners)
+}
+
+fn bounded_scala_direct_members(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = ctx
+        .provider
+        .direct_children(owner)
+        .into_iter()
+        .filter(|candidate| candidate.identifier() == name)
+        .filter(|candidate| candidate.is_function() || candidate.is_field())
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+enum ScalaBoundedAncestorResolution {
+    Resolved(Vec<CodeUnit>),
+    Unknown,
+}
+
+enum ScalaBoundedTypeResolution {
+    Missing,
+    Unique(CodeUnit),
+    Unknown,
+}
+
+fn bounded_scala_direct_ancestors(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+) -> ScalaBoundedAncestorResolution {
+    let raw_supertypes = ctx.provider.raw_supertypes(owner);
+    if !ctx.walk.step() {
+        return ScalaBoundedAncestorResolution::Unknown;
+    }
+    let encoded_paths = ctx.provider.supertype_lookup_paths(owner);
+    if !ctx.walk.step() || raw_supertypes.len() != encoded_paths.len() {
+        return ScalaBoundedAncestorResolution::Unknown;
+    }
+    if encoded_paths.is_empty() {
+        return ScalaBoundedAncestorResolution::Resolved(Vec::new());
+    }
+
+    let Some(owner_start) = ctx
+        .provider
+        .ranges(owner)
+        .into_iter()
+        .map(|range| range.start_byte)
+        .min()
+    else {
+        return ScalaBoundedAncestorResolution::Unknown;
+    };
+    if !ctx.walk.step() {
+        return ScalaBoundedAncestorResolution::Unknown;
+    }
+    let imports = ctx.provider.imports(owner.source());
+    if !ctx.walk.step() {
+        return ScalaBoundedAncestorResolution::Unknown;
+    }
+
+    let mut ancestors = Vec::new();
+    for encoded in encoded_paths {
+        if !ctx.walk.step() {
+            return ScalaBoundedAncestorResolution::Unknown;
+        }
+        let Some(path) = ScalaSupertypeLookupPath::decode(&encoded) else {
+            return ScalaBoundedAncestorResolution::Unknown;
+        };
+        match bounded_scala_resolve_supertype_path(ctx, owner, &path, owner_start, &imports) {
+            ScalaBoundedTypeResolution::Unique(ancestor) => ancestors.push(ancestor),
+            ScalaBoundedTypeResolution::Missing | ScalaBoundedTypeResolution::Unknown => {
+                return ScalaBoundedAncestorResolution::Unknown;
+            }
+        }
+    }
+    sort_units(&mut ancestors);
+    ancestors.dedup();
+    ScalaBoundedAncestorResolution::Resolved(ancestors)
+}
+
+fn bounded_scala_resolve_supertype_path(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    path: &ScalaSupertypeLookupPath,
+    owner_start: usize,
+    imports: &[ImportInfo],
+) -> ScalaBoundedTypeResolution {
+    let segments = path.segments();
+    if segments.is_empty() {
+        return ScalaBoundedTypeResolution::Unknown;
+    }
+    if segments.first().is_some_and(|segment| segment == "_root_") {
+        if segments.len() == 1 {
+            return ScalaBoundedTypeResolution::Unknown;
+        }
+        return bounded_scala_type_tier(
+            ctx,
+            scala_nested_type_candidates(String::new(), &segments[1..], false),
+        );
+    }
+
+    let binding = &segments[0];
+    let mut explicit_claim = false;
+    let mut explicit = Vec::new();
+    for import in imports {
+        if !ctx.walk.step() {
+            return ScalaBoundedTypeResolution::Unknown;
+        }
+        if !scala_import_visible_at(
+            import,
+            path.package_prefixes(),
+            path.lexical_scopes(),
+            owner_start,
+        ) || import.is_wildcard
+        {
+            continue;
+        }
+        let Some(import_path) = import.path.as_ref() else {
+            continue;
+        };
+        let Some(imported_name) = import_path.segments.last() else {
+            return ScalaBoundedTypeResolution::Unknown;
+        };
+        if import.identifier.as_deref().unwrap_or(imported_name) != binding {
+            continue;
+        }
+        explicit_claim = true;
+        let mut imported_path = import_path.segments.clone();
+        imported_path.extend_from_slice(&segments[1..]);
+        match bounded_scala_prefixed_type_tiers(ctx, &import_path.lexical_prefixes, &imported_path)
+        {
+            ScalaBoundedTypeResolution::Missing => {}
+            ScalaBoundedTypeResolution::Unique(declaration) => explicit.push(declaration),
+            ScalaBoundedTypeResolution::Unknown => return ScalaBoundedTypeResolution::Unknown,
+        }
+    }
+    if explicit_claim {
+        sort_units(&mut explicit);
+        explicit.dedup();
+        return match explicit.as_slice() {
+            [declaration] => ScalaBoundedTypeResolution::Unique(declaration.clone()),
+            [] | [_, _, ..] => ScalaBoundedTypeResolution::Unknown,
+        };
+    }
+
+    let mut saw_wildcard = false;
+    let mut wildcard = Vec::new();
+    for import in imports {
+        if !ctx.walk.step() {
+            return ScalaBoundedTypeResolution::Unknown;
+        }
+        if !import.is_wildcard
+            || !scala_import_visible_at(
+                import,
+                path.package_prefixes(),
+                path.lexical_scopes(),
+                owner_start,
+            )
+        {
+            continue;
+        }
+        saw_wildcard = true;
+        let Some(import_path) = import.path.as_ref() else {
+            return ScalaBoundedTypeResolution::Unknown;
+        };
+        let mut imported_path = import_path.segments.clone();
+        imported_path.extend_from_slice(segments);
+        match bounded_scala_prefixed_type_tiers(ctx, &import_path.lexical_prefixes, &imported_path)
+        {
+            ScalaBoundedTypeResolution::Missing => {}
+            ScalaBoundedTypeResolution::Unique(declaration) => wildcard.push(declaration),
+            ScalaBoundedTypeResolution::Unknown => return ScalaBoundedTypeResolution::Unknown,
+        }
+    }
+    if saw_wildcard {
+        sort_units(&mut wildcard);
+        wildcard.dedup();
+        return match wildcard.as_slice() {
+            [declaration] => ScalaBoundedTypeResolution::Unique(declaration.clone()),
+            [] | [_, _, ..] => ScalaBoundedTypeResolution::Unknown,
+        };
+    }
+
+    for package_prefix in path
+        .package_prefixes()
+        .iter()
+        .rev()
+        .filter(|prefix| !prefix.is_empty())
+    {
+        if !ctx.walk.step() {
+            return ScalaBoundedTypeResolution::Unknown;
+        }
+        match bounded_scala_type_tier(
+            ctx,
+            scala_nested_type_candidates(package_prefix.clone(), segments, false),
+        ) {
+            ScalaBoundedTypeResolution::Missing => {}
+            resolved => return resolved,
+        }
+    }
+    if !owner.package_name().is_empty()
+        && !path
+            .package_prefixes()
+            .iter()
+            .any(|prefix| prefix == owner.package_name())
+    {
+        match bounded_scala_type_tier(
+            ctx,
+            scala_nested_type_candidates(owner.package_name().to_string(), segments, false),
+        ) {
+            ScalaBoundedTypeResolution::Missing => {}
+            resolved => return resolved,
+        }
+    }
+    if segments.len() > 1 || owner.package_name().is_empty() {
+        return bounded_scala_type_tier(
+            ctx,
+            scala_nested_type_candidates(String::new(), segments, false),
+        );
+    }
+    ScalaBoundedTypeResolution::Missing
+}
+
+fn bounded_scala_prefixed_type_tiers(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    prefixes: &[String],
+    segments: &[String],
+) -> ScalaBoundedTypeResolution {
+    for prefix in prefixes
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .chain(std::iter::once(""))
+    {
+        if !ctx.walk.step() {
+            return ScalaBoundedTypeResolution::Unknown;
+        }
+        match bounded_scala_type_tier(
+            ctx,
+            scala_nested_type_candidates(prefix.to_string(), segments, false),
+        ) {
+            ScalaBoundedTypeResolution::Missing => {}
+            resolved => return resolved,
+        }
+    }
+    ScalaBoundedTypeResolution::Missing
+}
+
+fn bounded_scala_type_tier(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    fqns: Vec<String>,
+) -> ScalaBoundedTypeResolution {
+    match bounded_scala_metadata_type_tier(ctx, fqns) {
+        ScalaMetadataTypeTier::Empty => ScalaBoundedTypeResolution::Missing,
+        ScalaMetadataTypeTier::Unique(declaration) => {
+            ScalaBoundedTypeResolution::Unique(declaration)
+        }
+        ScalaMetadataTypeTier::Ambiguous => ScalaBoundedTypeResolution::Unknown,
+    }
+}
+
+fn bounded_scala_next_ancestor_frontier(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    frontier: &[CodeUnit],
+    discovered: &mut HashSet<CodeUnit>,
+) -> ScalaBoundedAncestorResolution {
+    let mut next = Vec::new();
+    for current in frontier {
+        if !ctx.walk.step() {
+            return ScalaBoundedAncestorResolution::Unknown;
+        }
+        let direct = match bounded_scala_direct_ancestors(ctx, current) {
+            ScalaBoundedAncestorResolution::Resolved(direct) => direct,
+            ScalaBoundedAncestorResolution::Unknown => {
+                return ScalaBoundedAncestorResolution::Unknown;
+            }
+        };
+        for ancestor in direct {
+            if !ctx.walk.step() {
+                return ScalaBoundedAncestorResolution::Unknown;
+            }
+            if discovered.insert(ancestor.clone()) {
+                next.push(ancestor);
+            }
+        }
+    }
+    sort_units(&mut next);
+    next.dedup();
+    ScalaBoundedAncestorResolution::Resolved(next)
+}
+
+fn bounded_scala_inherited_members(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    name: &str,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedMemberCandidates {
+    let mut frontier = vec![owner.clone()];
+    let mut discovered = HashSet::default();
+    discovered.insert(owner.clone());
+    loop {
+        let next = match bounded_scala_next_ancestor_frontier(ctx, &frontier, &mut discovered) {
+            ScalaBoundedAncestorResolution::Resolved(next) => next,
+            ScalaBoundedAncestorResolution::Unknown => {
+                return ScalaBoundedMemberCandidates::Unknown;
+            }
+        };
+        if next.is_empty() {
+            return ScalaBoundedMemberCandidates::NoMatch;
+        }
+
+        let mut candidates = Vec::new();
+        let mut overload_ambiguous = false;
+        for ancestor in &next {
+            if !ctx.walk.step() {
+                return ScalaBoundedMemberCandidates::Unknown;
+            }
+            match bounded_scala_applicable_direct_members(ctx, ancestor, name, call_shape) {
+                ScalaBoundedMemberCandidates::NoMatch => {}
+                ScalaBoundedMemberCandidates::Found {
+                    candidates: mut found,
+                    overload_ambiguous: ambiguous,
+                } => {
+                    candidates.append(&mut found);
+                    overload_ambiguous |= ambiguous;
+                }
+                ScalaBoundedMemberCandidates::Unknown => {
+                    return ScalaBoundedMemberCandidates::Unknown;
+                }
+            }
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
+        if !candidates.is_empty() {
+            return ScalaBoundedMemberCandidates::Found {
+                candidates,
+                overload_ambiguous,
+            };
+        }
+        frontier = next;
+    }
+}
+
+enum ScalaBoundedConformance {
+    Yes,
+    No,
+    Unknown,
+}
+
+fn bounded_scala_receiver_conforms_to(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    receiver: &CodeUnit,
+    expected: &CodeUnit,
+) -> ScalaBoundedConformance {
+    if receiver == expected {
+        return ScalaBoundedConformance::Yes;
+    }
+    let mut frontier = vec![receiver.clone()];
+    let mut discovered = HashSet::default();
+    discovered.insert(receiver.clone());
+    loop {
+        let next = match bounded_scala_next_ancestor_frontier(ctx, &frontier, &mut discovered) {
+            ScalaBoundedAncestorResolution::Resolved(next) => next,
+            ScalaBoundedAncestorResolution::Unknown => {
+                return ScalaBoundedConformance::Unknown;
+            }
+        };
+        if next.is_empty() {
+            return ScalaBoundedConformance::No;
+        }
+        for ancestor in &next {
+            if !ctx.walk.step() {
+                return ScalaBoundedConformance::Unknown;
+            }
+            if ancestor == expected {
+                return ScalaBoundedConformance::Yes;
+            }
+        }
+        frontier = next;
+    }
+}
+
+enum ScalaBoundedMemberCandidates {
+    NoMatch,
+    Found {
+        candidates: Vec<CodeUnit>,
+        overload_ambiguous: bool,
+    },
+    Unknown,
+}
+
+fn bounded_scala_ambiguous_candidates(
+    candidates: Vec<CodeUnit>,
+    message: String,
+) -> DefinitionLookupOutcome {
+    let mut outcome = candidates_outcome(candidates);
+    outcome.status = DefinitionLookupStatus::Ambiguous;
+    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        kind: "ambiguous_definition".to_string(),
+        message,
+    });
+    outcome
+}
+
+enum ScalaBoundedCandidateApplicability {
+    NotCandidate,
+    Inapplicable,
+    Applicable { overload_ambiguous: bool },
+    Unknown,
+}
+
+fn bounded_scala_applicable_direct_members(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    name: &str,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedMemberCandidates {
+    let direct = bounded_scala_direct_members(ctx, owner, name);
+    let mut candidates = Vec::new();
+    let mut overload_ambiguous = false;
+    for candidate in direct {
+        if !ctx.walk.step() {
+            return ScalaBoundedMemberCandidates::Unknown;
+        }
+        match bounded_scala_direct_candidate_applicability(ctx, &candidate, call_shape) {
+            ScalaBoundedCandidateApplicability::NotCandidate
+            | ScalaBoundedCandidateApplicability::Inapplicable => {}
+            ScalaBoundedCandidateApplicability::Applicable {
+                overload_ambiguous: candidate_ambiguous,
+            } => {
+                overload_ambiguous |= candidate_ambiguous;
+                candidates.push(candidate);
+            }
+            ScalaBoundedCandidateApplicability::Unknown => {
+                return ScalaBoundedMemberCandidates::Unknown;
+            }
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        ScalaBoundedMemberCandidates::NoMatch
+    } else {
+        ScalaBoundedMemberCandidates::Found {
+            candidates,
+            overload_ambiguous,
+        }
+    }
+}
+
+fn bounded_scala_direct_candidate_applicability(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    candidate: &CodeUnit,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedCandidateApplicability {
+    if candidate.is_field() {
+        return match call_shape {
+            ScalaBoundedCallShape::Access => ScalaBoundedCandidateApplicability::Applicable {
+                overload_ambiguous: false,
+            },
+            ScalaBoundedCallShape::Ordinary(_) | ScalaBoundedCallShape::Unsupported => {
+                ScalaBoundedCandidateApplicability::Unknown
+            }
+        };
+    }
+    if !candidate.is_function() {
+        return ScalaBoundedCandidateApplicability::NotCandidate;
+    }
+    let metadata = ctx.provider.signature_metadata(candidate);
+    if metadata.is_empty() {
+        return ScalaBoundedCandidateApplicability::Unknown;
+    }
+    let mut applicable = 0usize;
+    let mut saw_ordinary = false;
+    let mut saw_unknown = false;
+    for signature in metadata {
+        if !ctx.walk.step() {
+            return ScalaBoundedCandidateApplicability::Unknown;
+        }
+        if scala_signature_is_extension(&signature) {
+            continue;
+        }
+        saw_ordinary = true;
+        match call_shape {
+            ScalaBoundedCallShape::Access => applicable = applicable.saturating_add(1),
+            ScalaBoundedCallShape::Ordinary(arity) => match signature.callable_arity() {
+                Some(callable_arity) if callable_arity.accepts(arity) => {
+                    applicable = applicable.saturating_add(1);
+                }
+                Some(_) => {}
+                None => saw_unknown = true,
+            },
+            ScalaBoundedCallShape::Unsupported => saw_unknown = true,
+        }
+    }
+    if !saw_ordinary {
+        return ScalaBoundedCandidateApplicability::NotCandidate;
+    }
+    if saw_unknown {
+        return ScalaBoundedCandidateApplicability::Unknown;
+    }
+    if applicable == 0 {
+        ScalaBoundedCandidateApplicability::Inapplicable
+    } else {
+        ScalaBoundedCandidateApplicability::Applicable {
+            overload_ambiguous: applicable > 1,
+        }
+    }
+}
+
+fn scala_signature_is_extension(metadata: &SignatureMetadata) -> bool {
+    metadata.extension_receiver_type_identity().is_some()
+        || metadata.extension_receiver_type().is_some()
+}
+
+fn bounded_scala_extension_members(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    site: Node<'_>,
+    receiver: &CodeUnit,
+    name: &str,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedMemberCandidates {
+    let Some(enclosing_owners) = bounded_scala_enclosing_owners(ctx, site) else {
+        return ScalaBoundedMemberCandidates::Unknown;
+    };
+
+    // A lexically enclosing extension scope wins over imported extensions.
+    // Each owner is its own tier, nearest first.
+    for owner in &enclosing_owners {
+        if !ctx.walk.step() {
+            return ScalaBoundedMemberCandidates::Unknown;
+        }
+        let direct = ctx
+            .provider
+            .direct_children(owner)
+            .into_iter()
+            .filter(|candidate| candidate.identifier() == name)
+            .collect::<Vec<_>>();
+        match bounded_scala_select_extension_candidates(ctx, direct, receiver, call_shape) {
+            ScalaBoundedMemberCandidates::NoMatch => {}
+            selected => return selected,
+        }
+    }
+
+    // A top-level extension from this compilation unit has lexical-definition
+    // precedence. Same-package extensions from other files are the lowest
+    // binding tier and are retained for consideration after imports.
+    let package = ctx
+        .package_prefixes
+        .last()
+        .map(String::as_str)
+        .unwrap_or(ctx.batch.package.as_ref());
+    let package_candidate = if package.is_empty() {
+        name.to_string()
+    } else {
+        format!("{package}.{name}")
+    };
+    let (same_file_package_candidates, other_file_package_candidates): (Vec<_>, Vec<_>) = ctx
+        .provider
+        .fqn(&package_candidate)
+        .into_iter()
+        .partition(|candidate| candidate.source() == ctx.file);
+    match bounded_scala_select_extension_candidates(
+        ctx,
+        same_file_package_candidates,
+        receiver,
+        call_shape,
+    ) {
+        ScalaBoundedMemberCandidates::NoMatch => {}
+        selected => return selected,
+    }
+
+    let mut explicit_candidates = Vec::new();
+    let mut explicit_overload_ambiguous = false;
+    let mut unresolved_explicit_claim = false;
+    for import in ctx.batch.imports.iter() {
+        if !ctx.walk.step() {
+            return ScalaBoundedMemberCandidates::Unknown;
+        }
+        let Some(visible) = bounded_scala_import_visible_at(ctx, import) else {
+            return ScalaBoundedMemberCandidates::Unknown;
+        };
+        if !visible || import.is_wildcard {
+            continue;
+        }
+        let Some(path) = import.path.as_ref() else {
+            unresolved_explicit_claim = true;
+            continue;
+        };
+        let Some((imported_name, owner_segments)) = path.segments.split_last() else {
+            unresolved_explicit_claim = true;
+            continue;
+        };
+        if import.identifier.as_deref().unwrap_or(imported_name) != name {
+            continue;
+        }
+        let Some(declarations) = bounded_scala_imported_member_candidates(
+            ctx,
+            &enclosing_owners,
+            path,
+            owner_segments,
+            imported_name,
+        ) else {
+            return ScalaBoundedMemberCandidates::Unknown;
+        };
+        if declarations.is_empty() {
+            unresolved_explicit_claim = true;
+            continue;
+        }
+        match bounded_scala_select_extension_candidates(ctx, declarations, receiver, call_shape) {
+            ScalaBoundedMemberCandidates::NoMatch => {}
+            ScalaBoundedMemberCandidates::Found {
+                mut candidates,
+                overload_ambiguous,
+            } => {
+                explicit_candidates.append(&mut candidates);
+                explicit_overload_ambiguous |= overload_ambiguous;
+            }
+            ScalaBoundedMemberCandidates::Unknown => {
+                return ScalaBoundedMemberCandidates::Unknown;
+            }
+        }
+    }
+    if unresolved_explicit_claim {
+        return ScalaBoundedMemberCandidates::Unknown;
+    }
+    sort_units(&mut explicit_candidates);
+    explicit_candidates.dedup();
+    if !explicit_candidates.is_empty() {
+        return ScalaBoundedMemberCandidates::Found {
+            candidates: explicit_candidates,
+            overload_ambiguous: explicit_overload_ambiguous,
+        };
+    }
+
+    let mut wildcard_candidates = Vec::new();
+    let mut wildcard_overload_ambiguous = false;
+    let mut unresolved_wildcard_claim = false;
+    for import in ctx.batch.imports.iter() {
+        if !ctx.walk.step() {
+            return ScalaBoundedMemberCandidates::Unknown;
+        }
+        let Some(visible) = bounded_scala_import_visible_at(ctx, import) else {
+            return ScalaBoundedMemberCandidates::Unknown;
+        };
+        if !visible || !import.is_wildcard {
+            continue;
+        }
+        let Some(path) = import.path.as_ref() else {
+            unresolved_wildcard_claim = true;
+            continue;
+        };
+        let Some(declarations) = bounded_scala_imported_member_candidates(
+            ctx,
+            &enclosing_owners,
+            path,
+            &path.segments,
+            name,
+        ) else {
+            return ScalaBoundedMemberCandidates::Unknown;
+        };
+        if declarations.is_empty() {
+            unresolved_wildcard_claim = true;
+            continue;
+        }
+        match bounded_scala_select_extension_candidates(ctx, declarations, receiver, call_shape) {
+            ScalaBoundedMemberCandidates::NoMatch => {}
+            ScalaBoundedMemberCandidates::Found {
+                mut candidates,
+                overload_ambiguous,
+            } => {
+                wildcard_candidates.append(&mut candidates);
+                wildcard_overload_ambiguous |= overload_ambiguous;
+            }
+            ScalaBoundedMemberCandidates::Unknown => {
+                return ScalaBoundedMemberCandidates::Unknown;
+            }
+        }
+    }
+    if unresolved_wildcard_claim {
+        return ScalaBoundedMemberCandidates::Unknown;
+    }
+    sort_units(&mut wildcard_candidates);
+    wildcard_candidates.dedup();
+    if !wildcard_candidates.is_empty() {
+        return ScalaBoundedMemberCandidates::Found {
+            candidates: wildcard_candidates,
+            overload_ambiguous: wildcard_overload_ambiguous,
+        };
+    }
+    bounded_scala_select_extension_candidates(
+        ctx,
+        other_file_package_candidates,
+        receiver,
+        call_shape,
+    )
+}
+
+fn bounded_scala_select_extension_candidates(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    declarations: Vec<CodeUnit>,
+    receiver: &CodeUnit,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedMemberCandidates {
+    let mut candidates = Vec::new();
+    let mut overload_ambiguous = false;
+    for candidate in declarations {
+        if !ctx.walk.step() {
+            return ScalaBoundedMemberCandidates::Unknown;
+        }
+        match bounded_scala_extension_candidate_applicability(ctx, &candidate, receiver, call_shape)
+        {
+            ScalaBoundedCandidateApplicability::NotCandidate
+            | ScalaBoundedCandidateApplicability::Inapplicable => {}
+            ScalaBoundedCandidateApplicability::Applicable {
+                overload_ambiguous: candidate_ambiguous,
+            } => {
+                overload_ambiguous |= candidate_ambiguous;
+                candidates.push(candidate);
+            }
+            ScalaBoundedCandidateApplicability::Unknown => {
+                return ScalaBoundedMemberCandidates::Unknown;
+            }
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        ScalaBoundedMemberCandidates::NoMatch
+    } else {
+        ScalaBoundedMemberCandidates::Found {
+            candidates,
+            overload_ambiguous,
+        }
+    }
+}
+
+fn bounded_scala_extension_candidate_applicability(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    candidate: &CodeUnit,
+    receiver: &CodeUnit,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedCandidateApplicability {
+    if !candidate.is_function() {
+        return ScalaBoundedCandidateApplicability::NotCandidate;
+    }
+    let metadata = ctx.provider.signature_metadata(candidate);
+    if metadata.is_empty() {
+        return ScalaBoundedCandidateApplicability::Unknown;
+    }
+    let mut saw_extension = false;
+    let mut saw_unknown = false;
+    let mut applicable = 0usize;
+    for signature in metadata {
+        if !ctx.walk.step() {
+            return ScalaBoundedCandidateApplicability::Unknown;
+        }
+        if !scala_signature_is_extension(&signature) {
+            continue;
+        }
+        saw_extension = true;
+        let Some(identity) = signature.extension_receiver_type_identity() else {
+            saw_unknown = true;
+            continue;
+        };
+        if identity.generic_argument_count().is_some() {
+            saw_unknown = true;
+            continue;
+        }
+        let Some(name) = identity.nominal_name_with(|| ctx.walk.step()) else {
+            saw_unknown = true;
+            continue;
+        };
+        let mut receiver_is_type_parameter = false;
+        if name.path().len() == 1 {
+            for parameter in signature.type_parameters() {
+                if !ctx.walk.step() {
+                    return ScalaBoundedCandidateApplicability::Unknown;
+                }
+                receiver_is_type_parameter |= parameter == &name.path()[0];
+            }
+        }
+        if receiver_is_type_parameter {
+            saw_unknown = true;
+            continue;
+        }
+        let Some(extension_receiver) = bounded_scala_resolve_metadata_type(ctx, candidate, name)
+        else {
+            saw_unknown = true;
+            continue;
+        };
+        match bounded_scala_receiver_conforms_to(ctx, receiver, &extension_receiver) {
+            ScalaBoundedConformance::Yes => {}
+            ScalaBoundedConformance::No => continue,
+            ScalaBoundedConformance::Unknown => {
+                saw_unknown = true;
+                continue;
+            }
+        }
+        match call_shape {
+            ScalaBoundedCallShape::Access => applicable = applicable.saturating_add(1),
+            ScalaBoundedCallShape::Ordinary(arity) => match signature.callable_arity() {
+                Some(callable_arity) if callable_arity.accepts(arity) => {
+                    applicable = applicable.saturating_add(1);
+                }
+                Some(_) => {}
+                None => saw_unknown = true,
+            },
+            ScalaBoundedCallShape::Unsupported => saw_unknown = true,
+        }
+    }
+    if !saw_extension {
+        return ScalaBoundedCandidateApplicability::NotCandidate;
+    }
+    if saw_unknown {
+        return ScalaBoundedCandidateApplicability::Unknown;
+    }
+    if applicable == 0 {
+        ScalaBoundedCandidateApplicability::Inapplicable
+    } else {
+        ScalaBoundedCandidateApplicability::Applicable {
+            overload_ambiguous: applicable > 1,
+        }
+    }
+}
+
+fn bounded_scala_imported_member_candidates(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    enclosing_owners: &[CodeUnit],
+    path: &StructuredImportPath,
+    owner_segments: &[String],
+    member: &str,
+) -> Option<Vec<CodeUnit>> {
+    let mut prefixes = Vec::new();
+    for owner in enclosing_owners {
+        if !ctx.walk.step() {
+            return None;
+        }
+        prefixes.push(owner.fq_name());
+    }
+    let lexical_prefixes = if path.lexical_prefixes.is_empty() {
+        &ctx.package_prefixes
+    } else {
+        &path.lexical_prefixes
+    };
+    for prefix in lexical_prefixes.iter().rev() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        prefixes.push(prefix.clone());
+    }
+    prefixes.push(String::new());
+
+    for prefix in prefixes {
+        if !ctx.walk.step() {
+            return None;
+        }
+        let fqns = bounded_scala_import_member_fqns(ctx, &prefix, owner_segments, member)?;
+        let mut declarations = Vec::new();
+        for fqn in fqns {
+            if !ctx.walk.step() {
+                return None;
+            }
+            declarations.extend(
+                ctx.provider
+                    .fqn(&fqn)
+                    .into_iter()
+                    .filter(|unit| unit.fq_name() == fqn),
+            );
+        }
+        sort_units(&mut declarations);
+        declarations.dedup();
+        if !declarations.is_empty() {
+            return Some(declarations);
+        }
+    }
+    Some(Vec::new())
+}
+
+fn bounded_scala_import_visible_at(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    import: &ImportInfo,
+) -> Option<bool> {
+    let Some(path) = import.path.as_ref() else {
+        return Some(true);
+    };
+    if path.declaration_start_byte > ctx.reference_byte {
+        return Some(false);
+    }
+    if !path.lexical_prefixes.is_empty()
+        && path.lexical_prefixes.last() != ctx.package_prefixes.last()
+    {
+        return Some(false);
+    }
+    if path.lexical_scopes.len() > ctx.lexical_scopes.len() {
+        return Some(false);
+    }
+    for (import_scope, active_scope) in path.lexical_scopes.iter().zip(&ctx.lexical_scopes) {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if import_scope != active_scope {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn bounded_scala_import_member_fqns(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    prefix: &str,
+    owner_segments: &[String],
+    member: &str,
+) -> Option<Vec<String>> {
+    if member.is_empty() {
+        return Some(Vec::new());
+    }
+    let direct_owner = bounded_scala_append_import_segments(ctx, prefix, owner_segments, false)?;
+    let mut candidates = vec![if direct_owner.is_empty() {
+        member.to_string()
+    } else {
+        format!("{direct_owner}.{member}")
+    }];
+
+    // Every split is a parser-derived interpretation of the import path's
+    // package prefix versus nested stable-owner suffix. Exact FQN queries
+    // discard spellings that do not exist; no identifier fallback is used.
+    for split in 0..owner_segments.len() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        let package_suffix = &owner_segments[..split];
+        let type_suffix = &owner_segments[split..];
+        let package_prefix =
+            bounded_scala_append_import_segments(ctx, prefix, package_suffix, false)?;
+        let direct =
+            bounded_scala_append_import_segments(ctx, &package_prefix, type_suffix, false)?;
+        let nested = bounded_scala_append_import_segments(ctx, &package_prefix, type_suffix, true)?;
+        for mut owner in [direct, nested] {
+            if !owner.ends_with('$') {
+                owner.push('$');
+            }
+            candidates.push(format!("{owner}.{member}"));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn bounded_scala_append_import_segments(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    prefix: &str,
+    segments: &[String],
+    mark_intermediate_owners: bool,
+) -> Option<String> {
+    let mut path = prefix.to_string();
+    for (index, segment) in segments.iter().enumerate() {
+        if !ctx.walk.step() {
+            return None;
+        }
+        if segment.is_empty() {
+            return None;
+        }
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(segment);
+        if mark_intermediate_owners && index + 1 < segments.len() {
+            path.push('$');
+        }
+    }
+    Some(path)
+}
+
+fn bounded_scala_is_type_node(node: Node<'_>) -> bool {
+    bounded_scala_is_type_kind(node.kind())
+}
+
+fn bounded_scala_is_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "type_identifier"
+            | "stable_type_identifier"
+            | "generic_type"
+            | "projected_type"
+            | "applied_constructor_type"
+            | "singleton_type"
+            | "annotated_type"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_scala_with_context(
+    analyzer: &dyn IAnalyzer,
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    batch: &ScalaDefinitionContext,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    session: Option<&ResolutionSession>,
+) -> DefinitionLookupOutcome {
+    let Some(tree) = tree else {
+        return no_definition("scala_parse_failed", "Scala source could not be parsed");
+    };
+    let root = tree.root_node();
+    let Some(node) = scala_smallest_named_node_covering(
+        session,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
         return no_definition(
             "no_indexed_definition",
             format!(
@@ -938,10 +3509,17 @@ pub(super) fn resolve_scala(
             ),
         );
     };
+    if !scala_charge_ancestor_path(session, node) {
+        return no_definition(
+            "scala_resolution_budget_exceeded",
+            "Scala syntax traversal exceeded the receiver-resolution budget",
+        );
+    }
     if let Some(outcome) = scala_import_reference_outcome(
         analyzer,
         scala,
-        context.bounded_support(),
+        support,
+        &batch.imports,
         file,
         source,
         node,
@@ -988,9 +3566,17 @@ pub(super) fn resolve_scala(
         );
     }
 
+    let Some((package_prefixes, lexical_scopes)) =
+        scala_lexical_context_at(session, root, source, node, node.start_byte())
+    else {
+        return no_definition(
+            "scala_resolution_budget_exceeded",
+            "Scala lexical-context traversal exceeded the receiver-resolution budget",
+        );
+    };
     let resolver = ScalaNameResolver::for_batch(scala, support, &batch).with_lexical_context(
-        scala_package_prefixes_at(root, source, node.start_byte()),
-        scala_lexical_scope_path_at(root, node.start_byte()),
+        package_prefixes,
+        lexical_scopes,
         node.start_byte(),
     );
     let ctx = ScalaLookupCtx {
@@ -999,6 +3585,7 @@ pub(super) fn resolve_scala(
         support,
         file,
         source,
+        session,
     };
     // A compiler lattice type remains a type even when tree-sitter exposes a
     // union leaf as a bare identifier recovery shape. Resolve that structured
@@ -1036,7 +3623,7 @@ pub(super) fn resolve_scala(
         return resolve_scala_type(ctx, &resolver, root, node);
     }
     if let Some(outcome) = resolve_scala_bare_apply_fast_path(
-        scala, analyzer, support, file, source, root, node, &resolver,
+        scala, analyzer, support, file, source, root, node, &resolver, session,
     ) {
         return outcome;
     }
@@ -1157,6 +3744,7 @@ fn scala_import_reference_outcome(
     analyzer: &dyn IAnalyzer,
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    import_infos: &[ImportInfo],
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -1189,9 +3777,9 @@ fn scala_import_reference_outcome(
     if name.is_empty() {
         return None;
     }
-    let mut infos = scala
-        .import_info_of(file)
-        .into_iter()
+    let mut infos = import_infos
+        .iter()
+        .cloned()
         .filter(|info| {
             info.path
                 .as_ref()
@@ -2073,6 +4661,7 @@ fn resolve_scala_bare_apply_fast_path(
     root: Node<'_>,
     node: Node<'_>,
     resolver: &ScalaNameResolver<'_>,
+    session: Option<&ResolutionSession>,
 ) -> Option<DefinitionLookupOutcome> {
     let Some(ScalaReferenceNode::Call(call)) = scala_reference_node(node) else {
         return None;
@@ -2091,9 +4680,25 @@ fn resolve_scala_bare_apply_fast_path(
         support,
         file,
         source,
+        session,
     };
     let call_shape = scala_call_site_shape(ctx, root, function);
-    if scala_active_path_declares_name_before(root, source, name, function.start_byte())
+    let active_path_declares_name = match scala_active_path_declares_name_before_in_session(
+        session,
+        root,
+        source,
+        name,
+        function.start_byte(),
+    ) {
+        Some(declares_name) => declares_name,
+        None => {
+            return Some(no_definition(
+                "scala_resolution_budget_exceeded",
+                "Scala bare-call shadow traversal exceeded the receiver-resolution budget",
+            ));
+        }
+    };
+    if active_path_declares_name
         || scala_enclosing_member_shadows_bare_call(
             scala,
             analyzer,
@@ -2460,6 +5065,16 @@ fn scala_type_lookup_node_fqn(
     root: Node<'_>,
     node: Node<'_>,
 ) -> Option<ScalaTypeLookupResolution> {
+    let node_text = scala_node_text(node, ctx.source).trim();
+    if matches!(node_text, "this" | "super") {
+        return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte()).map(|fqn| {
+            ScalaTypeLookupResolution::Type {
+                fqn,
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            }
+        });
+    }
+
     if matches!(
         node.kind(),
         "type_identifier" | "stable_type_identifier" | "generic_type"
@@ -2473,7 +5088,7 @@ fn scala_type_lookup_node_fqn(
         });
     }
 
-    if matches!(node.kind(), "instance_expression" | "call_expression") {
+    if node.kind() == "instance_expression" {
         return scala_constructed_type(ctx, node, resolver).map(|fqn| {
             ScalaTypeLookupResolution::Type {
                 fqn,
@@ -2481,9 +5096,17 @@ fn scala_type_lookup_node_fqn(
             }
         });
     }
+    if node.kind() == "call_expression" {
+        let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
+        return scala_call_result_type(ctx, resolver, root, node, node.start_byte(), &bindings)
+            .map(|fqn| ScalaTypeLookupResolution::Type {
+                fqn,
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            });
+    }
 
     if let Some(parent) = node.parent() {
-        if parent.kind() == "field_expression" && parent.child_by_field_name("object") == Some(node)
+        if parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
         {
             return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte()).map(
                 |fqn| ScalaTypeLookupResolution::Type {
@@ -2793,6 +5416,75 @@ struct ScalaLookupCtx<'a> {
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     source: &'a str,
+    session: Option<&'a ResolutionSession>,
+}
+
+impl ScalaLookupCtx<'_> {
+    fn scope_step(self) -> bool {
+        self.session.is_none_or(ResolutionSession::scope_step)
+    }
+}
+
+fn scala_smallest_named_node_covering<'tree>(
+    session: Option<&ResolutionSession>,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !session.is_none_or(ResolutionSession::scope_step)
+        || node.start_byte() > start
+        || node.end_byte() < end
+    {
+        return None;
+    }
+    loop {
+        let mut containing = None;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if !session.is_none_or(ResolutionSession::scope_step) {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing = Some(child);
+                break;
+            }
+        }
+        match containing {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
+    }
+}
+
+fn scala_charge_ancestor_path(session: Option<&ResolutionSession>, mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if !session.is_none_or(ResolutionSession::scope_step) {
+            return false;
+        }
+        node = parent;
+    }
+    true
+}
+
+fn scala_lexical_context_at(
+    session: Option<&ResolutionSession>,
+    root: Node<'_>,
+    source: &str,
+    reference_node: Node<'_>,
+    reference_byte: usize,
+) -> Option<(Vec<String>, Vec<StructuredImportScope>)> {
+    let Some(session) = session else {
+        return Some((
+            scala_package_prefixes_at(root, source, reference_byte),
+            scala_lexical_scope_path_at(root, reference_byte),
+        ));
+    };
+    let mut inspect = |_: Node<'_>| session.scope_step();
+    let package_prefixes =
+        scala_package_prefixes_at_checked(root, source, reference_byte, &mut inspect)?;
+    let lexical_scopes =
+        scala_lexical_scope_path_checked(reference_node, |_: Node<'_>| session.scope_step())?;
+    Some((package_prefixes, lexical_scopes))
 }
 
 fn scala_call_site_shape(
@@ -5285,7 +7977,7 @@ fn scala_receiver_owner_with_bindings(
             .map(ScalaReceiverOwner::Logical);
     }
     let name = scala_node_text(receiver, ctx.source).trim();
-    if name == "this" {
+    if matches!(name, "this" | "super") {
         return ClassRangeIndex::build(ctx.analyzer, ctx.file)
             .enclosing_unit(receiver.start_byte())
             .cloned()
@@ -5311,8 +8003,7 @@ fn scala_receiver_owner_with_bindings(
                     }
                     (!bindings.is_shadowed(name))
                         .then(|| {
-                            resolver
-                                .resolve_singleton(name)
+                            scala_resolve_visible_term(ctx, resolver, receiver, name)
                                 .or_else(|| resolver.resolve(name))
                                 .map(ScalaReceiverOwner::Logical)
                         })
@@ -5396,6 +8087,134 @@ fn scala_active_path_declares_name_before(
     cutoff_start: usize,
 ) -> bool {
     scala_active_path_declares_name_before_mode(root, source, name, cutoff_start, true)
+}
+
+fn scala_active_path_declares_name_before_in_session(
+    session: Option<&ResolutionSession>,
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+) -> Option<bool> {
+    match session {
+        Some(session) => scala_active_path_declares_name_before_bounded(
+            session,
+            root,
+            source,
+            name,
+            cutoff_start,
+        ),
+        None => Some(scala_active_path_declares_name_before(
+            root,
+            source,
+            name,
+            cutoff_start,
+        )),
+    }
+}
+
+fn scala_active_path_declares_name_before_bounded(
+    session: &ResolutionSession,
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+) -> Option<bool> {
+    if !session.scope_step() {
+        return None;
+    }
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= cutoff_start {
+            continue;
+        }
+        let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
+        let contains_cutoff = node.start_byte() <= cutoff_start && cutoff_start < node.end_byte();
+        if enters_scope && !contains_cutoff {
+            if node.kind() == "function_definition"
+                && scala_node_declares_name_before_bounded(
+                    session,
+                    node,
+                    source,
+                    name,
+                    0,
+                    cutoff_start,
+                )?
+            {
+                return Some(true);
+            }
+            continue;
+        }
+
+        match node.kind() {
+            "class_definition" | "function_definition" => {
+                if scala_parameters_declare_name_before_bounded(
+                    session,
+                    node,
+                    source,
+                    name,
+                    cutoff_start,
+                )? {
+                    return Some(true);
+                }
+                if node.kind() == "function_definition"
+                    && scala_is_local_function_definition_bounded(session, node)?
+                    && scala_node_declares_name_before_bounded(
+                        session,
+                        node,
+                        source,
+                        name,
+                        0,
+                        cutoff_start,
+                    )?
+                {
+                    return Some(true);
+                }
+            }
+            "case_clause" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    if !session.scope_step() {
+                        return None;
+                    }
+                    if pattern.end_byte() <= cutoff_start
+                        && scala_pattern_declares_name_bounded(session, pattern, source, name)?
+                    {
+                        return Some(true);
+                    }
+                }
+            }
+            "val_definition" | "var_definition" => {
+                if !scala_is_direct_member_value_definition_bounded(session, node)?
+                    && scala_node_declares_name_before_bounded(
+                        session,
+                        node,
+                        source,
+                        name,
+                        0,
+                        cutoff_start,
+                    )?
+                {
+                    return Some(true);
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let mut children = Vec::new();
+        for child in node.named_children(&mut cursor) {
+            if !session.scope_step() {
+                return None;
+            }
+            if child.start_byte() >= cutoff_start {
+                break;
+            }
+            children.push(child);
+        }
+        children.reverse();
+        stack.extend(children);
+    }
+    Some(false)
 }
 
 fn scala_lexical_binding_declares_name_before(
@@ -5484,6 +8303,35 @@ fn scala_parameters_declare_name_before(
         .any(|child| scala_node_declares_name_before(child, source, name, 0, cutoff_start))
 }
 
+fn scala_parameters_declare_name_before_bounded(
+    session: &ResolutionSession,
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    cutoff_start: usize,
+) -> Option<bool> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !session.scope_step() {
+            return None;
+        }
+        if matches!(child.kind(), "parameters" | "class_parameters")
+            && child.start_byte() < cutoff_start
+            && scala_node_declares_name_before_bounded(
+                session,
+                child,
+                source,
+                name,
+                0,
+                cutoff_start,
+            )?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 fn scala_active_path_declares_name_after(
     node: Node<'_>,
     source: &str,
@@ -5559,6 +8407,90 @@ fn scala_node_declares_name_before(
     }
 }
 
+fn scala_node_declares_name_before_bounded(
+    session: &ResolutionSession,
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    lower_bound: usize,
+    target_byte: usize,
+) -> Option<bool> {
+    match node.kind() {
+        "parameter" | "class_parameter" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Some(false);
+            };
+            if !session.scope_step() {
+                return None;
+            }
+            Some(
+                lower_bound <= name_node.start_byte()
+                    && name_node.start_byte() < target_byte
+                    && scala_node_text(name_node, source).trim() == name,
+            )
+        }
+        "parameters" | "class_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !session.scope_step() {
+                    return None;
+                }
+                if scala_node_declares_name_before_bounded(
+                    session,
+                    child,
+                    source,
+                    name,
+                    lower_bound,
+                    target_byte,
+                )? {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        "val_definition" | "var_definition" => {
+            if node.start_byte() >= target_byte {
+                return Some(false);
+            }
+            let Some(pattern) = node.child_by_field_name("pattern") else {
+                return Some(false);
+            };
+            if !session.scope_step() {
+                return None;
+            }
+            if lower_bound > pattern.start_byte() {
+                return Some(false);
+            }
+            scala_pattern_declares_name_bounded(session, pattern, source, name)
+        }
+        "enumerator" => {
+            let Some(pattern) =
+                scala_enumerator_visible_pattern_bounded(session, node, target_byte)?
+            else {
+                return Some(false);
+            };
+            if lower_bound > pattern.start_byte() {
+                return Some(false);
+            }
+            scala_pattern_declares_name_bounded(session, pattern, source, name)
+        }
+        "function_definition" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Some(false);
+            };
+            if !session.scope_step() {
+                return None;
+            }
+            Some(
+                lower_bound <= name_node.start_byte()
+                    && name_node.start_byte() < target_byte
+                    && scala_node_text(name_node, source).trim() == name,
+            )
+        }
+        _ => Some(false),
+    }
+}
+
 fn scala_enumerator_visible_pattern(
     enumerator: Node<'_>,
     reference_byte: usize,
@@ -5571,6 +8503,108 @@ fn scala_enumerator_visible_pattern(
         .find(|child| child.start_byte() >= pattern.end_byte() && child.kind() != "guard")
         .filter(|expression| expression.end_byte() <= reference_byte)
         .map(|_| pattern)
+}
+
+fn scala_enumerator_visible_pattern_bounded<'tree>(
+    session: &ResolutionSession,
+    enumerator: Node<'tree>,
+    reference_byte: usize,
+) -> Option<Option<Node<'tree>>> {
+    let Some(pattern) = enumerator.named_child(0) else {
+        return Some(None);
+    };
+    if !session.scope_step() {
+        return None;
+    }
+    if pattern.kind() == "guard" {
+        return Some(None);
+    }
+    let mut cursor = enumerator.walk();
+    for child in enumerator.named_children(&mut cursor) {
+        if !session.scope_step() {
+            return None;
+        }
+        if child.start_byte() >= pattern.end_byte() && child.kind() != "guard" {
+            return Some((child.end_byte() <= reference_byte).then_some(pattern));
+        }
+    }
+    Some(None)
+}
+
+fn scala_pattern_declares_name_bounded(
+    session: &ResolutionSession,
+    pattern: Node<'_>,
+    source: &str,
+    name: &str,
+) -> Option<bool> {
+    if !scala_charge_named_descendants(session, pattern) {
+        return None;
+    }
+    Some(scala_pattern_binder_names(pattern, source).contains(&name))
+}
+
+fn scala_charge_named_descendants(session: &ResolutionSession, root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if !session.scope_step() {
+                return false;
+            }
+            stack.push(child);
+        }
+    }
+    true
+}
+
+fn scala_is_direct_member_value_definition_bounded(
+    session: &ResolutionSession,
+    node: Node<'_>,
+) -> Option<bool> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if !session.scope_step() {
+            return None;
+        }
+        match ancestor.kind() {
+            "function_definition"
+            | "block"
+            | "block_expression"
+            | "indented_block"
+            | "case_clause"
+            | "lambda_expression" => return Some(false),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                return Some(true);
+            }
+            _ => current = ancestor.parent(),
+        }
+    }
+    Some(false)
+}
+
+fn scala_is_local_function_definition_bounded(
+    session: &ResolutionSession,
+    node: Node<'_>,
+) -> Option<bool> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if !session.scope_step() {
+            return None;
+        }
+        match ancestor.kind() {
+            "function_definition"
+            | "block"
+            | "block_expression"
+            | "indented_block"
+            | "case_clause"
+            | "lambda_expression" => return Some(true),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                return Some(false);
+            }
+            _ => current = ancestor.parent(),
+        }
+    }
+    Some(false)
 }
 
 fn scala_existing_package_type_fqn(
@@ -6304,6 +9338,7 @@ fn scala_enclosing_member_shadows_bare_call(
         support,
         file,
         source: "",
+        session: None,
     };
     match scala_exact_owner_member_candidate_units(ctx, &owner, name, false) {
         ScalaExactMemberResolution::Found(candidates) => candidates.into_iter().any(|unit| {
@@ -6430,6 +9465,9 @@ fn scala_seed_active_path(
     let root = node;
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
+        if !ctx.scope_step() {
+            return;
+        }
         if node.start_byte() >= cutoff_start {
             continue;
         }
@@ -6495,10 +9533,16 @@ fn scala_seed_active_path(
         }
 
         let mut cursor = node.walk();
-        let mut children: Vec<_> = node
-            .named_children(&mut cursor)
-            .take_while(|child| child.start_byte() < cutoff_start)
-            .collect();
+        let mut children = Vec::new();
+        for child in node.named_children(&mut cursor) {
+            if !ctx.scope_step() {
+                return;
+            }
+            if child.start_byte() >= cutoff_start {
+                break;
+            }
+            children.push(child);
+        }
         children.reverse();
         stack.extend(children);
     }
@@ -6550,6 +9594,9 @@ fn scala_seed_parameters(
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        if !ctx.scope_step() {
+            return;
+        }
         if !matches!(child.kind(), "parameters" | "class_parameters")
             || child.start_byte() >= cutoff_start
         {
@@ -6557,6 +9604,9 @@ fn scala_seed_parameters(
         }
         let mut inner = child.walk();
         for parameter in child.named_children(&mut inner) {
+            if !ctx.scope_step() {
+                return;
+            }
             if matches!(parameter.kind(), "parameter" | "class_parameter")
                 && parameter.start_byte() < cutoff_start
             {
@@ -6963,4 +10013,387 @@ fn scala_simple_name(name: &str) -> &str {
         .next()
         .unwrap_or(name)
         .trim()
+}
+
+#[cfg(test)]
+mod bounded_ast_tests {
+    use super::*;
+    use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
+    use crate::analyzer::{
+        AnalyzerConfig, Language, Project, Range, TestProject, WorkspaceAnalyzer,
+    };
+    use crate::path_utils::rel_path_string;
+    use crate::test_support::AnalyzerFixture;
+    use git2::{IndexAddOption, Repository, Signature};
+    use std::sync::Arc;
+    use tree_sitter::Parser;
+
+    fn parse_scala(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .expect("Scala grammar");
+        parser.parse(source, None).expect("Scala tree")
+    }
+
+    #[test]
+    fn bounded_lexical_context_scan_stops_at_scope_budget() {
+        let source = r#"
+package alpha.beta
+
+object Demo {
+  def use(): Unit = Factory()
+}
+"#;
+        let tree = parse_scala(source);
+        let root = tree.root_node();
+        let start = source.find("Factory").expect("Factory reference");
+        let reference =
+            scala_smallest_named_node_covering(None, root, start, start + "Factory".len())
+                .expect("reference node");
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 2,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded(budget, None);
+
+        assert!(scala_lexical_context_at(Some(&session), root, source, reference, start).is_none());
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+    }
+
+    #[test]
+    fn bounded_bare_apply_shadow_scan_stops_at_scope_budget() {
+        let source = r#"
+object Demo {
+  def use(): Unit = {
+    val first = 1
+    val second = 2
+    Factory()
+  }
+}
+"#;
+        let tree = parse_scala(source);
+        let root = tree.root_node();
+        let cutoff = source.find("Factory").expect("Factory reference");
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 3,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded(budget, None);
+
+        assert_eq!(
+            scala_active_path_declares_name_before_in_session(
+                Some(&session),
+                root,
+                source,
+                "Factory",
+                cutoff,
+            ),
+            None
+        );
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+    }
+
+    #[test]
+    fn bounded_scala_full_lookup_observes_mid_walk_cancellation() {
+        let mut source = String::from(
+            r#"
+class Service
+object Factory {
+  def makeService(): Service = new Service()
+}
+object Caller {
+  def use(): Unit = {
+"#,
+        );
+        for index in 0..96 {
+            source.push_str(&format!("    val sibling{index} = {index}\n"));
+        }
+        source.push_str(
+            r#"    Factory.makeService()
+  }
+}
+"#,
+        );
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Scala, &[("Receiver.scala", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
+        let tree = parse_scala(&source);
+        let start = source
+            .find("Factory.makeService()")
+            .expect("factory reference");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "Factory.makeService()".to_string(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + "Factory.makeService()".len(),
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + "Factory.makeService()".len(),
+        };
+        let scala =
+            resolve_analyzer::<ScalaAnalyzer>(fixture.analyzer.analyzer()).expect("Scala analyzer");
+        let cancellation = CancellationToken::new();
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
+        let provider = ScalaDefinitionProvider::new(scala, &session);
+        let batch = bounded_scala_definition_context(scala, &file, &session);
+        let walk = ScalaBoundedWalk::cancelling_after(&session, cancellation.clone(), 32);
+
+        let resolution = bounded_scala_type_lookup_resolution(
+            scala,
+            &provider,
+            &batch,
+            &file,
+            &source,
+            tree.root_node(),
+            &site,
+            &walk,
+        );
+        let steps = walk.steps.get();
+        let outcome = session.finish(resolution);
+
+        assert_eq!(steps, 32, "cancellation must happen during the AST walk");
+        assert!(
+            matches!(
+                outcome,
+                BoundedResolution::Cancelled { work } if work.scope_nodes > 0
+            ),
+            "{outcome:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_scala_extension_lookup_keeps_budget_and_cancellation_terminal() {
+        const SOURCE: &str = r#"
+package app
+
+trait Base
+class Service extends Base
+
+object Ops {
+  extension (service: Base)
+    def enhance(): Unit = ()
+}
+
+object Caller {
+  import Ops.*
+
+  def use(): Unit = {
+    val service: Service = new Service()
+    service.enhance()
+  }
+}
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Scala, &[("Receiver.scala", SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
+        let tree = parse_scala(SOURCE);
+        let start = SOURCE.rfind("enhance").expect("extension call");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "enhance".to_string(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + "enhance".len(),
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + "enhance".len(),
+        };
+        let complete = resolve_scala_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            SOURCE,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = &complete else {
+            panic!("bounded hierarchy extension lookup did not complete: {complete:#?}");
+        };
+        assert_eq!(
+            value.status,
+            DefinitionLookupStatus::Resolved,
+            "{complete:#?}"
+        );
+        assert!(
+            matches!(
+                value.definitions.as_slice(),
+                [definition] if definition.fq_name() == "app.Ops$.enhance"
+            ),
+            "{complete:#?}"
+        );
+
+        let budget = ReceiverAnalysisBudget::tiny();
+        let exhausted = resolve_scala_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            SOURCE,
+            Some(&tree),
+            &site,
+            budget,
+            None,
+        );
+        assert!(
+            matches!(
+                exhausted,
+                BoundedResolution::Exceeded {
+                    limit: ReceiverBudgetLimit::ScopeNodes,
+                    work,
+                } if work.scope_nodes == budget.max_scope_nodes
+            ),
+            "{exhausted:#?}"
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = resolve_scala_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            SOURCE,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+        assert!(
+            matches!(cancelled, BoundedResolution::Cancelled { .. }),
+            "{cancelled:#?}"
+        );
+    }
+
+    #[test]
+    fn cold_bounded_scala_hierarchy_uses_limited_supertype_projection() {
+        const SOURCE: &str = r#"
+package app
+
+trait Base {
+  def run(): Unit = ()
+}
+
+trait OtherBase {
+  def run(): Unit = ()
+}
+
+class Child extends Base
+
+object Caller {
+  def use(): Unit = {
+    val child: Child = new Child()
+    child.run()
+  }
+}
+"#;
+        let _gc_guard = crate::analyzer::store::gc::set_min_interval_secs_for_test(i64::MAX);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "Hierarchy.scala");
+        file.write(SOURCE).expect("write Scala hierarchy fixture");
+
+        let repository = Repository::init(&root).expect("git repository");
+        let mut config = repository.config().expect("git config");
+        config
+            .set_str("user.name", "Bifrost Test")
+            .expect("git user name");
+        config
+            .set_str("user.email", "bifrost@example.com")
+            .expect("git user email");
+        let mut index = repository.index().expect("git index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage Scala fixture");
+        index.write().expect("write git index");
+        let tree_id = index.write_tree().expect("write git tree");
+        let git_tree = repository.find_tree(tree_id).expect("git tree");
+        let signature =
+            Signature::now("Bifrost Test", "bifrost@example.com").expect("git signature");
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "init", &git_tree, &[])
+            .expect("commit Scala fixture");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Scala));
+        let cold =
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .expect("cold persisted Scala analyzer");
+        drop(cold);
+        let warm = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("warm persisted Scala analyzer");
+        let analyzer = warm.analyzer();
+        analyzer.reset_candidate_hydration_count_for_test();
+        let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer).expect("warm Scala analyzer");
+        let tree = parse_scala(SOURCE);
+        let start = SOURCE.rfind("run").expect("inherited member call");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "run".to_string(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + "run".len(),
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + "run".len(),
+        };
+
+        let outcome = resolve_scala_bounded(
+            analyzer,
+            &file,
+            SOURCE,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = &outcome else {
+            panic!("cold bounded Scala hierarchy did not complete: {outcome:#?}");
+        };
+        assert_eq!(
+            value.status,
+            DefinitionLookupStatus::Resolved,
+            "{outcome:#?}"
+        );
+        assert!(
+            matches!(
+                value.definitions.as_slice(),
+                [definition] if definition.fq_name() == "app.Base.run"
+            ),
+            "{outcome:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "app.OtherBase.run"),
+            "NULL-key fallback must retain owner-qualified short-name discrimination: {outcome:#?}"
+        );
+        assert_eq!(
+            scala.full_hydration_count_for_test(),
+            0,
+            "bounded hierarchy lookup must not point-hydrate cold file state"
+        );
+        assert_eq!(
+            scala.bulk_hydration_count_for_test(),
+            0,
+            "bounded hierarchy lookup must not bulk-hydrate cold file state"
+        );
+    }
 }

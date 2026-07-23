@@ -1,9 +1,9 @@
 ---
 title: Receiver Traversal
-description: Trace bounded Java, JavaScript, and TypeScript receiver values and exact member targets with query_code.
+description: Trace bounded receiver values and exact member targets across Bifrost language adapters with query_code.
 ---
 
-Java, JavaScript, and TypeScript queries can expose Bifrost's bounded, demand-driven receiver facts. The three terminal steps preserve uncertainty explicitly:
+Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala queries can expose Bifrost's bounded, demand-driven receiver facts. The three terminal steps preserve uncertainty explicitly:
 
 - `points_to` describes the value denoted by an expression.
 - `receiver_targets` describes the possible receiver values at a call or member access.
@@ -160,7 +160,7 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
 
 ## Compose From A Call Input
 
-`call_input` preserves the exact expression written for a resolved formal parameter. `points_to` then analyzes that expression without pretending it followed assignments or general interprocedural data flow. In this multi-form fixture, the public workspace execution path reaches its shared summary-expansion budget, so the exact expression is preserved while the receiver row reports `exceeded_budget` instead of silently falling back to a guessed value.
+`call_input` preserves the exact expression written for a resolved formal parameter. `points_to` then analyzes that expression without pretending it followed assignments or general interprocedural data flow. Here the exact allocation is retained, while an omitted unresolved call candidate keeps the receiver row `ambiguous` instead of silently claiming whole-program precision.
 
 <!-- code-query-case:call-input:rql -->
 ```lisp
@@ -178,11 +178,11 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
 
 <!-- code-query-case:call-input:expected -->
 ```json
-{"results":[{"analysis_kind":"points_to","input_kind":"new_expression","language":"typescript","limit":"summary_expansions","outcome":"exceeded_budget","path":"receiver.ts","provenance":[{"seed":{"end_line":15,"kind":"function","path":"receiver.ts","result_type":"structural_match","start_line":13},"steps":[{"op":"enclosing_decl","result":{"end_line":15,"fq_name":"consume","kind":"function","path":"receiver.ts","result_type":"declaration","start_line":13}},{"op":"call_sites_to","result":{"callee_fq_name":"consume","caller_fq_name":"caller","path":"receiver.ts","proof":"proven","range":{"end_column":25,"end_line":27,"start_column":3,"start_line":27},"result_type":"call_site"}},{"op":"call_input","result":{"input_kind":"parameter","parameter_index":0,"parameter_name":"value","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"expression_site"}},{"op":"points_to","result":{"analysis_kind":"points_to","outcome":"exceeded_budget","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis"}}]}],"range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis","text":"new Service()"}],"truncated":true,"diagnostics":[{"code":"call_relation_candidates_omitted","impact":"incomplete","language":"typescript","message":"omitted 1 unresolved call candidate for consume"},{"code":"receiver_analysis_partial","impact":"incomplete","language":"typescript","message":"points_to returned 1 analysis row with exceeded receiver limit summary_expansions"}]}
+{"diagnostics":[{"code":"call_relation_candidates_omitted","impact":"incomplete","language":"typescript","message":"omitted 1 unresolved call candidate for consume"}],"results":[{"analysis_kind":"points_to","input_kind":"new_expression","language":"typescript","outcome":"ambiguous","path":"receiver.ts","provenance":[{"seed":{"end_line":15,"kind":"function","path":"receiver.ts","result_type":"structural_match","start_line":13},"steps":[{"op":"enclosing_decl","result":{"end_line":15,"fq_name":"consume","kind":"function","path":"receiver.ts","result_type":"declaration","start_line":13}},{"op":"call_sites_to","result":{"callee_fq_name":"consume","caller_fq_name":"caller","path":"receiver.ts","proof":"proven","range":{"end_column":25,"end_line":27,"start_column":3,"start_line":27},"result_type":"call_site"}},{"op":"call_input","result":{"input_kind":"parameter","parameter_index":0,"parameter_name":"value","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"expression_site"}},{"op":"points_to","result":{"analysis_kind":"points_to","outcome":"ambiguous","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis"}}]}],"range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis","text":"new Service()","values":[{"allocation_site":{"path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27}},"receiver_value_kind":"allocation_site","type_declaration":{"end_line":3,"fq_name":"Service","kind":"class","language":"typescript","path":"receiver.ts","signature":"class Service {","start_line":1}}]}],"truncated":false}
 ```
 
 ## Capability And Safety Boundary
 
-Java, JavaScript, and TypeScript currently support bounded receiver traversal. The [Java tutorial](../java/#analyze-a-java-receiver) executes a typed Java receiver example; this page exercises JavaScript/TypeScript allocation, factory, ambiguity, exact-member, reference-site, and call-input behavior. Other languages return `receiver_analysis` rows with `outcome: "unsupported"` plus aggregated capability diagnostics; they do not masquerade as zero matches.
+The [Java tutorial](../java/#analyze-a-java-receiver) executes a typed Java receiver example; this page exercises the same public contract with JavaScript/TypeScript allocation, factory, ambiguity, exact-member, reference-site, and call-input behavior. C++, C#, Go, PHP, Python, Ruby, Rust, and Scala reuse the neutral semantic oracle and their exact language resolvers. Their supported forms return bounded candidates, while virtual or dynamic dispatch, metaprogramming, unsupported syntax, and plain C remain explicit uncertainty boundaries rather than masquerading as zero matches.
 
 Candidate-cap truncation and receiver budget exits set top-level `truncated`, identify the exhausted limit, and emit a diagnostic. Ordinary bounded ambiguity does not set `truncated`. For a completeness-sensitive decision, require `truncated: false`, inspect every outcome, reject or account for diagnostics whose `impact` is `incomplete` or `invalid`, and check `provenance_truncated` as described in [Agent Result Safety](/agent-result-safety/).

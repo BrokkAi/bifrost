@@ -3267,7 +3267,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point,
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::DeferredExecution,
-                SemanticGapImpacts::CALL_EVALUATION,
+                SemanticGapImpacts::DEFERRED_EFFECTS,
                 SemanticGapKind::Unknown,
                 "an attached Ruby block is a separate callable whose invocation timing depends on the callee",
             )?;

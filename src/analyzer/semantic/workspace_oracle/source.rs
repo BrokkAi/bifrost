@@ -5,7 +5,10 @@ use std::sync::Arc;
 use crate::analyzer::{ProjectFile, Range};
 use crate::hash::HashMap;
 
-use super::{WorkspaceSemanticOracle, common::Interruption, common::WorkStager};
+use super::{
+    WorkspaceSemanticOracle, common::Interruption, common::WorkStager,
+    heap::points_to_capability_surface_is_incomplete,
+};
 use crate::analyzer::semantic::{
     AbstractObject, CandidateCoverage, HeapOracle, ObservationPhase, OracleCallContext,
     OracleCandidate, PointsToResult, SemanticArtifact, SemanticBudgetExceeded, SemanticCapability,
@@ -166,6 +169,24 @@ impl SourcePointsToResult {
         self.observations
             .iter()
             .all(|result| result.objects().candidates().is_empty())
+    }
+
+    /// Whether every retained observation is locally proven even though the
+    /// adapter's whole-language points-to capability surface keeps coverage
+    /// open. Consumers with an independent, syntax-scoped closure proof can
+    /// use this distinction without treating arbitrary open evidence as exact.
+    pub(crate) fn globally_incomplete_with_proven_candidates(&self) -> bool {
+        self.coverage == CandidateCoverage::Open
+            && !self.observations.is_empty()
+            && self.observations.iter().all(|result| {
+                let query = result.query();
+                let candidates = result.objects().candidates();
+                result.objects().coverage() == CandidateCoverage::Open
+                    && points_to_capability_surface_is_incomplete(query.point().procedure())
+                    && !query.context().was_truncated()
+                    && !candidates.is_empty()
+                    && candidates.iter().all(OracleCandidate::is_proven_complete)
+            })
     }
 }
 

@@ -249,17 +249,6 @@ impl CSharpAnalyzer {
         Self::new(Arc::new(project))
     }
 
-    pub(crate) fn prepared_syntax_limited(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<
-        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
-        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
-    > {
-        self.inner.prepared_syntax_limited(file, max_source_bytes)
-    }
-
     #[doc(hidden)]
     pub fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner.reset_full_declaration_scan_count_for_test();

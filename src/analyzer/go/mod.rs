@@ -24,7 +24,9 @@ use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
 use cache::GoMemoCaches;
-pub(crate) use declarations::{collect_go_import_infos, determine_go_package_name};
+pub(crate) use declarations::{
+    collect_go_import_infos, determine_go_package_name, go_structured_type_identity_bounded,
+};
 use tests::detect_go_test_assertion_smells;
 use tree_sitter::Node;
 
@@ -82,17 +84,6 @@ impl GoAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
-    }
-
-    pub(crate) fn prepared_syntax_limited(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<
-        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
-        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
-    > {
-        self.inner.prepared_syntax_limited(file, max_source_bytes)
     }
 
     pub(crate) fn declaration_candidates_by_fqn_limited(

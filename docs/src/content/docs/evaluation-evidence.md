@@ -11,7 +11,7 @@ Bifrost's public documentation currently provides executable correctness example
 | --- | --- | --- |
 | [Ten-minute evaluation](/evaluate-bifrost/) | One checked-in Python fixture produces the same structural result through CLI JSON, saved RQL, agent MCP, and VS Code LSP. | Corpus-wide accuracy, dynamic call completeness, or large-repository performance. |
 | [Language query tutorials](/code-query-tutorials/) | Checked-in source, query, and expected output remain executable across all supported languages. | Representative prevalence or accuracy across real-world repositories. |
-| [Receiver traversal cookbook](/code-query-tutorials/receiver-traversal/) | Bounded Java and JavaScript/TypeScript receiver contracts execute against exact expected output, including allocation, factory, ambiguity, exact-member, reference-site, and call-input cases. | Whole-program points-to completeness, general alias analysis, path feasibility, taint, or data-flow accuracy. |
+| [Receiver traversal cookbook](/code-query-tutorials/receiver-traversal/) | The shared outcome and provenance contract executes against exact Java and JavaScript/TypeScript cookbook output; adapter-specific regressions exercise at least one advertised supported form and one explicit uncertainty boundary for each additional language. TypeScript additionally demonstrates reference-site and call-input composition. | Whole-program points-to completeness, general alias analysis, path feasibility, taint, or data-flow accuracy. |
 | Analyzer and service test suites | Specific resolution, proof, diagnostics, truncation, and language-regression contracts are exercised in the repository. | An independently sampled benchmark or an externally reviewed accuracy result. |
 | [Capability matrix](/capabilities/) | The implemented analysis surfaces and known hard boundaries are stated in one place. | A guarantee that every valid program within a language will resolve every edge. |
 
@@ -41,7 +41,7 @@ For each result, retain Bifrost's proof tier and diagnostics. Report at least:
 - queries with diagnostics, `truncated: true`, or `provenance_truncated: true` separately from complete executions;
 - the exact set of unsupported or excluded cases rather than silently removing them from the denominator.
 
-A structurally guaranteed match means the parsed normalized node satisfied the query. It does not by itself prove runtime reachability, callee identity, control flow, data flow, receiver values, or aliasing. Graph-backed steps add indexed declaration and edge evidence within the [documented capability boundary](/capabilities/). A Java, JavaScript, or TypeScript `receiver_analysis` row adds bounded demand-driven receiver evidence for its exact input and outcome; it is not evidence of whole-program points-to or general alias completeness.
+A structurally guaranteed match means the parsed normalized node satisfied the query. It does not by itself prove runtime reachability, callee identity, control flow, data flow, receiver values, or aliasing. Graph-backed steps add indexed declaration and edge evidence within the [documented capability boundary](/capabilities/). A supported-language `receiver_analysis` row adds bounded demand-driven receiver evidence for its exact input and outcome; it is not evidence of whole-program points-to or general alias completeness.
 
 ## Publishing A Result
 

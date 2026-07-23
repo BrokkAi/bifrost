@@ -78,7 +78,7 @@ export function caller() {
     let analysis = &points_to["results"][0];
     assert_eq!(analysis["result_type"], "receiver_analysis", "{points_to}");
     assert_eq!(analysis["analysis_kind"], "points_to", "{points_to}");
-    assert_eq!(analysis["outcome"], "ambiguous", "{points_to}");
+    assert_eq!(analysis["outcome"], "precise", "{points_to}");
     assert_eq!(points_to["truncated"], false, "{points_to}");
     assert_eq!(analysis["capture"], "service", "{points_to}");
     assert_eq!(
@@ -123,7 +123,7 @@ export function caller() {
         }),
     ));
     assert_eq!(
-        exact_members["results"][0]["outcome"], "ambiguous",
+        exact_members["results"][0]["outcome"], "precise",
         "{exact_members}"
     );
     assert_eq!(
@@ -308,6 +308,15 @@ class Labels {
             "steps": [{ "op": "points_to" }]
         }),
     ));
+    assert_eq!(factory["results"][0]["outcome"], "ambiguous", "{factory}");
+    assert_eq!(
+        factory["results"][0]["values"]
+            .as_array()
+            .expect("Java factory receiver values")
+            .len(),
+        1,
+        "the exact factory result must subsume source-value scaffolding: {factory}"
+    );
     assert_eq!(
         factory["results"][0]["values"][0]["receiver_value_kind"], "factory_return",
         "{factory}"
@@ -317,6 +326,848 @@ class Labels {
             .as_str()
             .unwrap()
             .ends_with("Service.make"),
+        "{factory}"
+    );
+}
+
+#[test]
+fn go_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "receiver.go",
+        r#"package receiver
+
+type Service struct{}
+func (service Service) Run() {}
+func (service Service) Current() { service.Run() }
+
+type Other struct{}
+func (other Other) Run() {}
+
+func MakeService() Service { return Service{} }
+func Call() {
+    service := Service{}
+    service.Run()
+    MakeService().Run()
+}
+"#,
+    )];
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "Run" } },
+            "inside": { "kind": "method", "name": "Current" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(current["results"][0]["outcome"], "precise", "{current}");
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "service", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "Call" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_ne!(
+        points_to["results"][0]["outcome"], "unsupported",
+        "{points_to}"
+    );
+    assert!(
+        points_to["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "{points_to}"
+    );
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "name": "service" }
+            },
+            "inside": { "kind": "function", "name": "Call" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(member["results"][0]["outcome"], "precise", "{member}");
+    let targets = member["results"][0]["member_targets"]
+        .as_array()
+        .expect("Go member targets");
+    assert_eq!(targets.len(), 1, "{member}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Service") && name.ends_with(".Run")),
+        "{member}"
+    );
+    assert!(!targets[0]["fq_name"].as_str().unwrap().contains("Other"));
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "Run" },
+                "receiver": { "capture": "factory" }
+            },
+            "inside": { "kind": "function", "name": "Call" },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory = factory["results"]
+        .as_array()
+        .expect("Go factory rows")
+        .iter()
+        .find(|row| row["text"] == "MakeService()")
+        .unwrap_or_else(|| panic!("Go factory row: {factory}"));
+    assert_ne!(factory["outcome"], "unsupported", "{factory}");
+    assert!(
+        factory["values"].to_string().contains("Service"),
+        "{factory}"
+    );
+}
+
+#[test]
+fn go_container_receivers_do_not_resolve_element_members() {
+    let report = serialized(&run(
+        &[(
+            "container_receiver.go",
+            r#"package receiver
+
+type Service struct{}
+func (service Service) Run() {}
+
+func Invalid(slice []Service, array [2]Service) {
+    slice.Run()
+    array.Run()
+}
+"#,
+        )],
+        json!({
+            "match": { "kind": "call", "callee": { "name": "Run" } },
+            "inside": { "kind": "function", "name": "Invalid" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+
+    let rows = report["results"].as_array().expect("receiver rows");
+    assert_eq!(rows.len(), 2, "{report}");
+    assert!(
+        rows.iter().all(|row| {
+            row["member_targets"].as_array().is_none_or(|targets| {
+                targets.iter().all(|target| {
+                    target["fq_name"]
+                        .as_str()
+                        .is_none_or(|name| !name.ends_with("Service.Run"))
+                })
+            })
+        }),
+        "{report}"
+    );
+}
+
+#[test]
+fn rust_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "receiver.rs",
+        r#"struct Service;
+impl Service {
+    fn run(&self) {}
+    fn current(&self) { self.run(); }
+    fn make() -> Service { Service {} }
+}
+
+struct Other;
+impl Other { fn run(&self) {} }
+
+fn call() {
+    let service = Service {};
+    service.run();
+    Service::make().run();
+}
+"#,
+    )];
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "current" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(current["results"][0]["outcome"], "precise", "{current}");
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_ne!(
+        points_to["results"][0]["outcome"], "unsupported",
+        "{points_to}"
+    );
+    assert!(
+        points_to["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "{points_to}"
+    );
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(member["results"][0]["outcome"], "precise", "{member}");
+    let targets = member["results"][0]["member_targets"]
+        .as_array()
+        .expect("Rust member targets");
+    assert_eq!(targets.len(), 1, "{member}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Service") && name.ends_with(".run")),
+        "{member}"
+    );
+    assert!(!targets[0]["fq_name"].as_str().unwrap().contains("Other"));
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "factory" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory = factory["results"]
+        .as_array()
+        .expect("Rust factory rows")
+        .iter()
+        .find(|row| row["text"] == "Service::make()")
+        .unwrap_or_else(|| panic!("Rust factory row: {factory}"));
+    assert_ne!(factory["outcome"], "unsupported", "{factory}");
+    assert!(
+        factory["values"].to_string().contains("Service"),
+        "{factory}"
+    );
+}
+
+#[test]
+fn scala_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "Receiver.scala",
+        r#"class Service {
+  def run(): Unit = ()
+  def current(): Unit = this.run()
+}
+
+class Other {
+  def run(): Unit = ()
+}
+
+object Factory {
+  def makeService(): Service = new Service()
+}
+
+object Caller {
+  def call(): Unit = {
+    val service: Service = new Service()
+    service.run()
+    Factory.makeService().run()
+  }
+}
+"#,
+    )];
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "current" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(current["results"][0]["outcome"], "precise", "{current}");
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service", "capture": "receiver" }
+            },
+            "inside": { "kind": "method", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_ne!(
+        points_to["results"][0]["outcome"], "unsupported",
+        "{points_to}"
+    );
+    assert!(
+        points_to["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "{points_to}"
+    );
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            },
+            "inside": { "kind": "method", "name": "call" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        member["results"][0]["outcome"], "ambiguous",
+        "ordinary Scala class methods remain overridable even when the exact declared member is known: {member}"
+    );
+    let targets = member["results"][0]["member_targets"]
+        .as_array()
+        .expect("Scala member targets");
+    assert_eq!(targets.len(), 1, "{member}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Service") && name.ends_with(".run")),
+        "{member}"
+    );
+    assert!(!targets[0]["fq_name"].as_str().unwrap().contains("Other"));
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "factory" }
+            },
+            "inside": { "kind": "method", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory = factory["results"]
+        .as_array()
+        .expect("Scala factory rows")
+        .iter()
+        .find(|row| row["text"] == "Factory.makeService()")
+        .unwrap_or_else(|| panic!("Scala factory row: {factory}"));
+    assert_ne!(factory["outcome"], "unsupported", "{factory}");
+    assert!(
+        factory["values"].to_string().contains("Service"),
+        "{factory}"
+    );
+}
+
+#[test]
+fn python_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "receiver.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+    def current(self) -> None:
+        self.run()
+
+class Other:
+    def run(self) -> None:
+        pass
+
+def make_service() -> Service:
+    return Service()
+
+def call() -> None:
+    service: Service = Service()
+    service.run()
+    make_service().run()
+"#,
+    )];
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "languages": ["python"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "current" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(current["results"][0]["outcome"], "precise", "{current}");
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_ne!(
+        points_to["results"][0]["outcome"], "unsupported",
+        "{points_to}"
+    );
+    assert!(
+        points_to["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "{points_to}"
+    );
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        member["results"][0]["outcome"], "ambiguous",
+        "ordinary Python methods retain an open dispatch boundary: {member}"
+    );
+    let targets = member["results"][0]["member_targets"]
+        .as_array()
+        .expect("Python member targets");
+    assert_eq!(targets.len(), 1, "{member}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Service") && name.ends_with(".run")),
+        "{member}"
+    );
+    assert!(!targets[0]["fq_name"].as_str().unwrap().contains("Other"));
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "factory" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory = factory["results"]
+        .as_array()
+        .expect("Python factory rows")
+        .iter()
+        .find(|row| row["text"] == "make_service()")
+        .unwrap_or_else(|| panic!("Python factory row: {factory}"));
+    assert_ne!(factory["outcome"], "unsupported", "{factory}");
+    assert!(
+        factory["values"].to_string().contains("Service"),
+        "{factory}"
+    );
+}
+
+#[test]
+fn python_receiver_class_lookup_respects_lexical_visibility() {
+    let hidden = serialized(&run(
+        &[(
+            "hidden.py",
+            r#"class Container:
+    class Service:
+        def run(self) -> None:
+            pass
+
+def call() -> None:
+    service = Service()
+    service.run()
+"#,
+        )],
+        json!({
+            "languages": ["python"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(hidden["results"].as_array().unwrap().len(), 1, "{hidden}");
+    assert!(
+        hidden["results"][0]["member_targets"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a class nested in an unrelated class is not a visible bare receiver type: {hidden}"
+    );
+    assert!(
+        !hidden["results"][0]
+            .to_string()
+            .contains("Container$Service.run"),
+        "{hidden}"
+    );
+
+    let visible = serialized(&run(
+        &[(
+            "visible.py",
+            r#"class Service:
+    def run(self) -> None:
+        pass
+
+def call() -> None:
+    service = Service()
+    service.run()
+"#,
+        )],
+        json!({
+            "languages": ["python"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    let targets = visible["results"][0]["member_targets"]
+        .as_array()
+        .expect("visible module class member targets");
+    assert_eq!(targets.len(), 1, "{visible}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("Service.run")),
+        "{visible}"
+    );
+
+    let hidden_factory = serialized(&run(
+        &[(
+            "hidden_factory.py",
+            r#"class Service:
+    def run(self) -> None:
+        pass
+
+def outer() -> None:
+    def make() -> Service:
+        return Service()
+
+def caller() -> None:
+    make().run()
+"#,
+        )],
+        json!({
+            "languages": ["python"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        hidden_factory["results"].as_array().unwrap().len(),
+        1,
+        "{hidden_factory}"
+    );
+    assert!(
+        hidden_factory["results"][0]["member_targets"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an unrelated nested factory is not a visible bare callable: {hidden_factory}"
+    );
+    assert!(
+        !hidden_factory["results"][0]
+            .to_string()
+            .contains("Service.run"),
+        "{hidden_factory}"
+    );
+}
+
+#[test]
+fn php_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "receiver.php",
+        r#"<?php
+namespace Receiver;
+
+class Service {
+    public function run(): void {}
+    public function current(): void { $this->run(); }
+}
+
+class Other {
+    public function run(): void {}
+}
+
+function makeService(): Service {
+    return new Service();
+}
+
+function call(): void {
+    $service = new Service();
+    $service->run();
+    makeService()->run();
+}
+"#,
+    )];
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "languages": ["php"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "current" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(current["results"][0]["outcome"], "precise", "{current}");
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_ne!(
+        points_to["results"][0]["outcome"], "unsupported",
+        "{points_to}"
+    );
+    assert!(
+        points_to["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "{points_to}"
+    );
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_ne!(member["results"][0]["outcome"], "unsupported", "{member}");
+    let targets = member["results"][0]["member_targets"]
+        .as_array()
+        .expect("PHP member targets");
+    assert_eq!(targets.len(), 1, "{member}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Service") && name.ends_with(".run")),
+        "{member}"
+    );
+    assert!(!targets[0]["fq_name"].as_str().unwrap().contains("Other"));
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "languages": ["php"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "factory" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory = factory["results"]
+        .as_array()
+        .expect("PHP factory rows")
+        .iter()
+        .find(|row| row["text"] == "makeService()")
+        .unwrap_or_else(|| panic!("PHP factory row: {factory}"));
+    assert_ne!(factory["outcome"], "unsupported", "{factory}");
+    assert!(
+        factory["values"].to_string().contains("Service"),
+        "{factory}"
+    );
+}
+
+#[test]
+fn ruby_receiver_traversal_uses_neutral_values_and_exact_members() {
+    let files = [(
+        "receiver.rb",
+        r#"class Service
+  def run
+  end
+
+  def current
+    self.run
+  end
+end
+
+class Other
+  def run
+  end
+end
+
+class Factory
+  def self.make_service
+    Service.new
+  end
+end
+
+def call
+  service = Service.new
+  service.run
+  Factory.make_service.run
+end
+"#,
+    )];
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "languages": ["ruby"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "method", "name": "current" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(current["results"][0]["outcome"], "precise", "{current}");
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let points_to = serialized(&run(
+        &files,
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_ne!(
+        points_to["results"][0]["outcome"], "unsupported",
+        "{points_to}"
+    );
+    assert!(
+        points_to["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "{points_to}"
+    );
+
+    let member = serialized(&run(
+        &files,
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "service" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(
+        member["results"][0]["outcome"], "ambiguous",
+        "ordinary Ruby methods retain an open dispatch boundary: {member}"
+    );
+    let targets = member["results"][0]["member_targets"]
+        .as_array()
+        .expect("Ruby member targets");
+    assert_eq!(targets.len(), 1, "{member}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.contains("Service") && name.ends_with(".run")),
+        "{member}"
+    );
+    assert!(!targets[0]["fq_name"].as_str().unwrap().contains("Other"));
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "languages": ["ruby"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "factory" }
+            },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to", "capture": "factory" }]
+        }),
+    ));
+    let factory = factory["results"]
+        .as_array()
+        .expect("Ruby factory rows")
+        .iter()
+        .find(|row| row["text"] == "Factory.make_service")
+        .unwrap_or_else(|| panic!("Ruby factory row: {factory}"));
+    assert_ne!(factory["outcome"], "unsupported", "{factory}");
+    assert!(
+        factory["values"].to_string().contains("Service"),
         "{factory}"
     );
 }
@@ -1479,10 +2330,18 @@ export function caller(flag: boolean) {
     assert_eq!(unknown["results"][0]["outcome"], "unknown", "{unknown}");
 
     let unsupported = serialized(&run(
-        &[("unsupported.py", "def caller(value):\n    value.run()\n")],
+        &[(
+            "plain.c",
+            "struct Service { void (*run)(void); };\n\
+             void invoke(struct Service *service) { service->run(); }\n",
+        )],
         json!({
-            "match": { "kind": "call", "callee": { "name": "run" } },
-            "steps": [{ "op": "receiver_targets" }]
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "receiver" }
+            },
+            "steps": [{ "op": "receiver_targets", "capture": "receiver" }]
         }),
     ));
     assert_eq!(
@@ -1490,7 +2349,14 @@ export function caller(flag: boolean) {
         "{unsupported}"
     );
     assert_eq!(
-        unsupported["results"][0]["reason"], "receiver_analysis_language_unsupported",
+        unsupported["results"][0]["reason"], "cpp_c_receiver_unsupported",
+        "{unsupported}"
+    );
+    assert!(
+        unsupported["results"][0].get("values").is_none()
+            || unsupported["results"][0]["values"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
         "{unsupported}"
     );
     assert!(
@@ -1498,7 +2364,12 @@ export function caller(flag: boolean) {
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["language"] == "python"),
+            .any(|diagnostic| {
+                diagnostic["language"] == "cpp"
+                    && diagnostic["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("plain C"))
+            }),
         "{unsupported}"
     );
 
@@ -1652,6 +2523,94 @@ export function simple() {
     assert_eq!(composed["results"][0]["result_type"], "file", "{composed}");
     assert_eq!(composed["results"][0]["path"], "fanout.ts", "{composed}");
     assert_eq!(composed["truncated"], true, "{composed}");
+}
+
+#[test]
+fn receiver_capture_range_cap_marks_top_level_truncation() {
+    let result = serialized(&run(
+        &[(
+            "captured_ranges.ts",
+            r#"class Service {}
+function consume(first: Service, second: Service, third: Service) {}
+consume(new Service(), new Service(), new Service());
+"#,
+        )],
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "consume" },
+                "args": [
+                    { "capture": "receiver" },
+                    { "capture": "receiver" },
+                    { "capture": "receiver" }
+                ]
+            },
+            "steps": [{ "op": "points_to", "capture": "receiver" }],
+            "limit": 1
+        }),
+    ));
+
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["truncated"], true, "{result}");
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                diagnostic["code"] == "receiver_analysis_partial"
+                    && diagnostic["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("pipeline output cap"))
+            })),
+        "{result}"
+    );
+}
+
+#[test]
+fn receiver_step_does_not_emit_after_prior_steps_consume_pipeline_budget() {
+    let project = InlineTestProject::new()
+        .file(
+            "receiver.ts",
+            r#"class Service { run() {} }
+export function caller() { new Service().run(); }
+"#,
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "method", "name": "run" },
+        "inside": { "kind": "class", "name": "Service" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "references_of", "proof": "proven" },
+            { "op": "member_targets" }
+        ]
+    }))
+    .expect("query");
+
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let value = serialized(&result);
+    assert!(result.results.is_empty(), "{value}");
+    assert!(result.truncated, "{value}");
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+        }),
+        "{value}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+                && diagnostic.message.contains("pipeline output cap")
+        }),
+        "{value}"
+    );
 }
 
 #[test]

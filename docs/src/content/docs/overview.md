@@ -25,7 +25,7 @@ its compiler or interpreter model, Bifrost keeps language-specific modelling and
 sub-analysis instead of flattening those rules into a lowest-common-denominator
 abstraction.
 
-See [Language and Analysis Capabilities](/capabilities/) for the language-by-capability matrix, precision tiers, external-dependency boundary, bounded Java/JavaScript/TypeScript receiver provenance, and the remaining unsupported whole-program points-to, general alias, control-flow, taint, and data-flow analyses. If you are deciding which Bifrost surface to use, start with [Choose Bifrost](/choose-bifrost/).
+See [Language and Analysis Capabilities](/capabilities/) for the language-by-capability matrix, precision tiers, external-dependency boundary, bounded receiver provenance, and the remaining unsupported whole-program points-to, general alias, control-flow, taint, and data-flow analyses. If you are deciding which Bifrost surface to use, start with [Choose Bifrost](/choose-bifrost/).
 
 ## Main Surfaces
 

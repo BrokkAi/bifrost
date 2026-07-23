@@ -1,7 +1,5 @@
 use super::extractor::{declared_names, is_definition_identifier, parameter_names, selector_parts};
-use crate::analyzer::usages::get_definition::{
-    ResolvedReferenceSite, smallest_named_node_covering,
-};
+use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::hash::HashMap;
 use tree_sitter::Node;
@@ -44,9 +42,25 @@ pub(in crate::analyzer::usages) fn go_selector_descriptor<'tree>(
     root: Node<'tree>,
     site: &ResolvedReferenceSite,
 ) -> Option<GoSelectorDescriptor<'tree>> {
-    let selected = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    go_selector_descriptor_with_scope(root, site, || true)
+}
+
+pub(in crate::analyzer::usages) fn go_selector_descriptor_with_scope<'tree>(
+    root: Node<'tree>,
+    site: &ResolvedReferenceSite,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<GoSelectorDescriptor<'tree>> {
+    let selected = smallest_named_node_covering_with_scope(
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+        &mut scope_step,
+    )?;
     let mut top = selected;
     while let Some(parent) = top.parent() {
+        if !scope_step() {
+            return None;
+        }
         if matches!(parent.kind(), "selector_expression" | "qualified_type") {
             top = parent;
         } else {
@@ -60,6 +74,9 @@ pub(in crate::analyzer::usages) fn go_selector_descriptor<'tree>(
     let mut base = top;
     let mut members = Vec::new();
     while matches!(base.kind(), "selector_expression" | "qualified_type") {
+        if !scope_step() {
+            return None;
+        }
         let member = base
             .child_by_field_name("field")
             .or_else(|| base.child_by_field_name("name"))?;
@@ -88,6 +105,34 @@ pub(in crate::analyzer::usages) fn go_selector_descriptor<'tree>(
         members,
         focus_segment,
     })
+}
+
+fn smallest_named_node_covering_with_scope<'tree>(
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<Node<'tree>> {
+    if !scope_step() || node.end_byte() < end || node.start_byte() > start {
+        return None;
+    }
+    loop {
+        let mut cursor = node.walk();
+        let mut containing_child = None;
+        for child in node.named_children(&mut cursor) {
+            if !scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing_child = Some(child);
+                break;
+            }
+        }
+        match containing_child {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
+    }
 }
 
 pub(in crate::analyzer::usages) struct GoReferenceResolution {

@@ -1,6 +1,8 @@
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -9,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -280,6 +282,8 @@ pub struct SignatureMetadata {
     #[serde(default)]
     return_type_text: Option<String>,
     #[serde(default)]
+    return_type_identity: Option<StructuredTypeIdentity>,
+    #[serde(default)]
     declaration_only: bool,
     #[serde(default)]
     callable_arity: Option<CallableArity>,
@@ -291,6 +295,1117 @@ pub struct SignatureMetadata {
     callable_linkage: Option<CallableLinkage>,
     #[serde(default)]
     dispatch_extensibility: Option<DispatchExtensibility>,
+    #[serde(default)]
+    extension_receiver_type: Option<String>,
+    #[serde(default)]
+    extension_receiver_type_identity: Option<StructuredTypeIdentity>,
+}
+
+/// A parser-derived nominal type name, including the lexical scope in which an
+/// unqualified path was written. Keeping these components structured lets
+/// bounded consumers resolve persisted signatures without reparsing rendered
+/// source text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct StructuredTypeName {
+    path: Vec<String>,
+    lexical_scope: Vec<String>,
+    absolute: bool,
+}
+
+const MAX_STRUCTURED_TYPE_NAME_COMPONENTS: usize = 1_024;
+const MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES: usize = 1 << 20;
+pub(crate) const MAX_STRUCTURED_TYPE_IDENTITY_NODES: usize = 20_000;
+const MAX_STRUCTURED_TYPE_IDENTITY_EDGES: usize = 40_000;
+pub(crate) const MAX_SIGNATURE_METADATA_BLOB_BYTES: usize = 8 << 20;
+
+struct BoundedStructuredTypeNameComponentsSeed {
+    max_components: usize,
+    max_string_bytes: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedStructuredTypeNameComponentsSeed {
+    type Value = Vec<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ComponentsVisitor {
+            max_components: usize,
+            max_string_bytes: usize,
+        }
+
+        impl<'de> Visitor<'de> for ComponentsVisitor {
+            type Value = Vec<String>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {} structured type-name components totaling at most {} bytes",
+                    self.max_components, self.max_string_bytes
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|size| size > self.max_components)
+                {
+                    return Err(serde::de::Error::custom(
+                        "structured type name exceeds the component cap",
+                    ));
+                }
+                let mut components = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or_default()
+                        .min(self.max_components),
+                );
+                let mut remaining_string_bytes = self.max_string_bytes;
+                loop {
+                    if components.len() == self.max_components {
+                        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "structured type name exceeds the component cap",
+                            ));
+                        }
+                        break;
+                    }
+                    let component =
+                        sequence.next_element_seed(BoundedStructuredTypeStringSeed {
+                            max_bytes: remaining_string_bytes,
+                        })?;
+                    let Some(component) = component else {
+                        break;
+                    };
+                    remaining_string_bytes = remaining_string_bytes
+                        .checked_sub(component.len())
+                        .ok_or_else(|| {
+                            serde::de::Error::custom(
+                                "structured type name exceeds the string-byte cap",
+                            )
+                        })?;
+                    components.push(component);
+                }
+                Ok(components)
+            }
+        }
+
+        deserializer.deserialize_seq(ComponentsVisitor {
+            max_components: self.max_components,
+            max_string_bytes: self.max_string_bytes,
+        })
+    }
+}
+
+struct BoundedStructuredTypeStringSeed {
+    max_bytes: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedStructuredTypeStringSeed {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StringVisitor {
+            max_bytes: usize,
+        }
+
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = String;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "a structured type-name component no longer than {} bytes",
+                    self.max_bytes
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > self.max_bytes {
+                    return Err(E::custom(
+                        "structured type name exceeds the string-byte cap",
+                    ));
+                }
+                Ok(value.to_owned())
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > self.max_bytes {
+                    return Err(E::custom(
+                        "structured type name exceeds the string-byte cap",
+                    ));
+                }
+                Ok(value)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|size| size > self.max_bytes)
+                {
+                    return Err(serde::de::Error::custom(
+                        "structured type name exceeds the string-byte cap",
+                    ));
+                }
+                let mut bytes = Vec::with_capacity(
+                    sequence.size_hint().unwrap_or_default().min(self.max_bytes),
+                );
+                while let Some(byte) = sequence.next_element()? {
+                    if bytes.len() == self.max_bytes {
+                        return Err(serde::de::Error::custom(
+                            "structured type name exceeds the string-byte cap",
+                        ));
+                    }
+                    bytes.push(byte);
+                }
+                String::from_utf8(bytes).map_err(serde::de::Error::custom)
+            }
+        }
+
+        let visitor = StringVisitor {
+            max_bytes: self.max_bytes,
+        };
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_string(visitor)
+        } else {
+            // Bincode encodes strings and byte sequences identically. Reading
+            // the component as a sequence exposes its length hint before a
+            // buffer is allocated while preserving the existing wire format.
+            deserializer.deserialize_seq(visitor)
+        }
+    }
+}
+
+enum StructuredTypeNameField {
+    Path,
+    LexicalScope,
+    Absolute,
+}
+
+impl<'de> Deserialize<'de> for StructuredTypeNameField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = StructuredTypeNameField;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a structured type-name field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "path" => Ok(StructuredTypeNameField::Path),
+                    "lexical_scope" => Ok(StructuredTypeNameField::LexicalScope),
+                    "absolute" => Ok(StructuredTypeNameField::Absolute),
+                    _ => Err(E::unknown_field(
+                        value,
+                        &["path", "lexical_scope", "absolute"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for StructuredTypeName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NameVisitor;
+
+        impl<'de> Visitor<'de> for NameVisitor {
+            type Value = StructuredTypeName;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded structured type name")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let path = sequence
+                    .next_element_seed(BoundedStructuredTypeNameComponentsSeed {
+                        max_components: MAX_STRUCTURED_TYPE_NAME_COMPONENTS,
+                        max_string_bytes: MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES,
+                    })?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let remaining_components = MAX_STRUCTURED_TYPE_NAME_COMPONENTS
+                    .checked_sub(path.len())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("structured type name exceeds the component cap")
+                    })?;
+                let path_string_bytes = path.iter().try_fold(0usize, |total, component| {
+                    total.checked_add(component.len())
+                });
+                let remaining_string_bytes = path_string_bytes
+                    .and_then(|used| MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES.checked_sub(used))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("structured type name exceeds the string-byte cap")
+                    })?;
+                let lexical_scope = sequence
+                    .next_element_seed(BoundedStructuredTypeNameComponentsSeed {
+                        max_components: remaining_components,
+                        max_string_bytes: remaining_string_bytes,
+                    })?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let absolute = sequence
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                StructuredTypeName::new(path, lexical_scope, absolute)
+                    .ok_or_else(|| serde::de::Error::custom("invalid structured type name"))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut path = None;
+                let mut lexical_scope = None;
+                let mut absolute = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        StructuredTypeNameField::Path => {
+                            if path.is_some() {
+                                return Err(serde::de::Error::duplicate_field("path"));
+                            }
+                            path = Some(map.next_value_seed(
+                                BoundedStructuredTypeNameComponentsSeed {
+                                    max_components: MAX_STRUCTURED_TYPE_NAME_COMPONENTS,
+                                    max_string_bytes: MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES,
+                                },
+                            )?);
+                        }
+                        StructuredTypeNameField::LexicalScope => {
+                            if lexical_scope.is_some() {
+                                return Err(serde::de::Error::duplicate_field("lexical_scope"));
+                            }
+                            lexical_scope = Some(map.next_value_seed(
+                                BoundedStructuredTypeNameComponentsSeed {
+                                    max_components: MAX_STRUCTURED_TYPE_NAME_COMPONENTS,
+                                    max_string_bytes: MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES,
+                                },
+                            )?);
+                        }
+                        StructuredTypeNameField::Absolute => {
+                            if absolute.is_some() {
+                                return Err(serde::de::Error::duplicate_field("absolute"));
+                            }
+                            absolute = Some(map.next_value()?);
+                        }
+                    }
+                }
+                let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
+                let lexical_scope = lexical_scope
+                    .ok_or_else(|| serde::de::Error::missing_field("lexical_scope"))?;
+                let absolute =
+                    absolute.ok_or_else(|| serde::de::Error::missing_field("absolute"))?;
+                StructuredTypeName::new(path, lexical_scope, absolute)
+                    .ok_or_else(|| serde::de::Error::custom("invalid structured type name"))
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "StructuredTypeName",
+            &["path", "lexical_scope", "absolute"],
+            NameVisitor,
+        )
+    }
+}
+
+impl StructuredTypeName {
+    pub fn new(path: Vec<String>, lexical_scope: Vec<String>, absolute: bool) -> Option<Self> {
+        let name = Self {
+            path,
+            lexical_scope,
+            absolute,
+        };
+        if !name.is_valid() {
+            return None;
+        }
+        Some(name)
+    }
+
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    pub fn lexical_scope(&self) -> &[String] {
+        &self.lexical_scope
+    }
+
+    pub const fn is_absolute(&self) -> bool {
+        self.absolute
+    }
+
+    fn is_valid(&self) -> bool {
+        let Some(component_count) = self.path.len().checked_add(self.lexical_scope.len()) else {
+            return false;
+        };
+        let Some(string_bytes) = self
+            .path
+            .iter()
+            .chain(&self.lexical_scope)
+            .try_fold(0usize, |total, component| {
+                total.checked_add(component.len())
+            })
+        else {
+            return false;
+        };
+        !self.path.is_empty()
+            && !self
+                .path
+                .iter()
+                .chain(&self.lexical_scope)
+                .any(String::is_empty)
+            && component_count <= MAX_STRUCTURED_TYPE_NAME_COMPONENTS
+            && string_bytes <= MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
+    }
+}
+
+/// Stable index into a [`StructuredTypeIdentity`] arena.
+///
+/// Nodes are appended after their children, so every edge points to a smaller
+/// index. That invariant makes malformed persisted values fail closed and
+/// keeps every traversal iterative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct StructuredTypeNodeId(u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+enum StructuredTypeNode {
+    Named(StructuredTypeName),
+    Pointer(StructuredTypeNodeId),
+    Reference(StructuredTypeNodeId),
+    Array(StructuredTypeNodeId),
+    Slice(StructuredTypeNodeId),
+    Map {
+        key: StructuredTypeNodeId,
+        value: StructuredTypeNodeId,
+    },
+    Generic {
+        base: StructuredTypeNodeId,
+        arguments: Vec<StructuredTypeNodeId>,
+    },
+}
+
+#[derive(Deserialize)]
+enum StructuredTypeNodeWire {
+    Named(StructuredTypeName),
+    Pointer(StructuredTypeNodeId),
+    Reference(StructuredTypeNodeId),
+    Array(StructuredTypeNodeId),
+    Slice(StructuredTypeNodeId),
+    Map {
+        key: StructuredTypeNodeId,
+        value: StructuredTypeNodeId,
+    },
+    Generic {
+        base: StructuredTypeNodeId,
+        arguments: BoundedStructuredTypeNodeIds,
+    },
+}
+
+struct BoundedStructuredTypeNodeIds(Vec<StructuredTypeNodeId>);
+
+impl<'de> Deserialize<'de> for BoundedStructuredTypeNodeIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NodeIdsVisitor;
+
+        impl<'de> Visitor<'de> for NodeIdsVisitor {
+            type Value = BoundedStructuredTypeNodeIds;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {MAX_STRUCTURED_TYPE_IDENTITY_EDGES} generic type arguments"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|size| size > MAX_STRUCTURED_TYPE_IDENTITY_EDGES)
+                {
+                    return Err(serde::de::Error::custom(
+                        "structured type identity exceeds the edge cap",
+                    ));
+                }
+                let mut ids = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or_default()
+                        .min(MAX_STRUCTURED_TYPE_IDENTITY_EDGES),
+                );
+                while let Some(id) = sequence.next_element()? {
+                    if ids.len() == MAX_STRUCTURED_TYPE_IDENTITY_EDGES {
+                        return Err(serde::de::Error::custom(
+                            "structured type identity exceeds the edge cap",
+                        ));
+                    }
+                    ids.push(id);
+                }
+                Ok(BoundedStructuredTypeNodeIds(ids))
+            }
+        }
+
+        deserializer.deserialize_seq(NodeIdsVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for StructuredTypeNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match StructuredTypeNodeWire::deserialize(deserializer)? {
+            StructuredTypeNodeWire::Named(name) => Self::Named(name),
+            StructuredTypeNodeWire::Pointer(inner) => Self::Pointer(inner),
+            StructuredTypeNodeWire::Reference(inner) => Self::Reference(inner),
+            StructuredTypeNodeWire::Array(inner) => Self::Array(inner),
+            StructuredTypeNodeWire::Slice(inner) => Self::Slice(inner),
+            StructuredTypeNodeWire::Map { key, value } => Self::Map { key, value },
+            StructuredTypeNodeWire::Generic { base, arguments } => Self::Generic {
+                base,
+                arguments: arguments.0,
+            },
+        })
+    }
+}
+
+/// A language-neutral, parser-derived type shape suitable for persisted
+/// signature metadata.
+///
+/// The shape is stored as a flat post-order arena rather than recursively
+/// boxed nodes. Source can contain very deeply nested types, and ordinary
+/// operations such as cloning, comparing, hashing, serializing, deserializing
+/// and dropping those values must not consume the Rust call stack.
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuredTypeIdentity {
+    nodes: Vec<StructuredTypeNode>,
+    root: StructuredTypeNodeId,
+    #[serde(skip)]
+    edge_count: usize,
+    #[serde(skip)]
+    string_bytes: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StructuredTypeIdentityWire {
+    nodes: BoundedStructuredTypeNodes,
+    root: StructuredTypeNodeId,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum CanonicalStructuredTypeNode {
+    Named(StructuredTypeName),
+    Pointer(u32),
+    Reference(u32),
+    Array(u32),
+    Slice(u32),
+    Map { key: u32, value: u32 },
+    Generic { base: u32, arguments: Vec<u32> },
+}
+
+#[derive(Clone, Copy)]
+enum StructuredTypeTraversalFrame {
+    Enter(StructuredTypeNodeId),
+    Finish(StructuredTypeNodeId),
+}
+
+#[derive(Serialize)]
+struct BoundedStructuredTypeNodes(Vec<StructuredTypeNode>);
+
+impl<'de> Deserialize<'de> for BoundedStructuredTypeNodes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NodesVisitor;
+
+        impl<'de> Visitor<'de> for NodesVisitor {
+            type Value = BoundedStructuredTypeNodes;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {MAX_STRUCTURED_TYPE_IDENTITY_NODES} structured type nodes"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|size| size > MAX_STRUCTURED_TYPE_IDENTITY_NODES)
+                {
+                    return Err(serde::de::Error::custom(
+                        "structured type identity exceeds the node cap",
+                    ));
+                }
+                let mut nodes = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or_default()
+                        .min(MAX_STRUCTURED_TYPE_IDENTITY_NODES),
+                );
+                let mut edge_count = 0usize;
+                let mut string_bytes = 0usize;
+                while let Some(node) = sequence.next_element()? {
+                    if nodes.len() == MAX_STRUCTURED_TYPE_IDENTITY_NODES {
+                        return Err(serde::de::Error::custom(
+                            "structured type identity exceeds the node cap",
+                        ));
+                    }
+                    let Some((node_edges, node_string_bytes)) =
+                        structured_type_node_resource_cost(&node)
+                    else {
+                        return Err(serde::de::Error::custom(
+                            "structured type identity resource count overflow",
+                        ));
+                    };
+                    edge_count = edge_count.checked_add(node_edges).ok_or_else(|| {
+                        serde::de::Error::custom("structured type identity resource count overflow")
+                    })?;
+                    string_bytes =
+                        string_bytes.checked_add(node_string_bytes).ok_or_else(|| {
+                            serde::de::Error::custom(
+                                "structured type identity resource count overflow",
+                            )
+                        })?;
+                    if edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES {
+                        return Err(serde::de::Error::custom(
+                            "structured type identity exceeds the edge cap",
+                        ));
+                    }
+                    if string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES {
+                        return Err(serde::de::Error::custom(
+                            "structured type identity exceeds the string-byte cap",
+                        ));
+                    }
+                    nodes.push(node);
+                }
+                Ok(BoundedStructuredTypeNodes(nodes))
+            }
+        }
+
+        deserializer.deserialize_seq(NodesVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for StructuredTypeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = StructuredTypeIdentityWire::deserialize(deserializer)?;
+        let identity = Self {
+            nodes: wire.nodes.0,
+            root: wire.root,
+            edge_count: 0,
+            string_bytes: 0,
+        };
+        if !identity.is_valid() {
+            return Err(serde::de::Error::custom(
+                "invalid flat structured type identity",
+            ));
+        }
+        let Some((edge_count, string_bytes)) = identity.validated_resource_counts() else {
+            return Err(serde::de::Error::custom(
+                "invalid flat structured type identity",
+            ));
+        };
+        Ok(Self {
+            edge_count,
+            string_bytes,
+            ..identity
+        })
+    }
+}
+
+impl PartialEq for StructuredTypeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        let mut interner = HashMap::default();
+        let mut visit = || true;
+        let Some(left) = self.canonical_root_id_with(&mut interner, &mut visit) else {
+            return false;
+        };
+        let Some(right) = other.canonical_root_id_with(&mut interner, &mut visit) else {
+            return false;
+        };
+        left == right
+    }
+}
+
+impl Eq for StructuredTypeIdentity {}
+
+impl Hash for StructuredTypeIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash each unique reachable arena node once. Child hashes describe the
+        // expanded structural shape, so shared and duplicated representations
+        // retain identical hashes without expanding every path through a DAG.
+        self.structural_digest().unwrap_or(u64::MAX).hash(state);
+    }
+}
+
+impl StructuredTypeIdentity {
+    fn node(&self, id: StructuredTypeNodeId) -> Option<&StructuredTypeNode> {
+        self.nodes.get(id.0 as usize)
+    }
+
+    fn reachable_postorder_with(
+        &self,
+        visit: &mut impl FnMut() -> bool,
+    ) -> Option<Vec<StructuredTypeNodeId>> {
+        let mut scheduled = HashSet::default();
+        let mut pending = vec![StructuredTypeTraversalFrame::Enter(self.root)];
+        let mut postorder = Vec::new();
+        while let Some(frame) = pending.pop() {
+            match frame {
+                StructuredTypeTraversalFrame::Enter(id) => {
+                    if !scheduled.insert(id) {
+                        continue;
+                    }
+                    if !visit() {
+                        return None;
+                    }
+                    let node = self.node(id)?;
+                    pending.push(StructuredTypeTraversalFrame::Finish(id));
+                    match node {
+                        StructuredTypeNode::Named(_) => {}
+                        StructuredTypeNode::Pointer(inner)
+                        | StructuredTypeNode::Reference(inner)
+                        | StructuredTypeNode::Array(inner)
+                        | StructuredTypeNode::Slice(inner) => {
+                            pending.push(StructuredTypeTraversalFrame::Enter(*inner));
+                        }
+                        StructuredTypeNode::Map { key, value } => {
+                            pending.push(StructuredTypeTraversalFrame::Enter(*value));
+                            pending.push(StructuredTypeTraversalFrame::Enter(*key));
+                        }
+                        StructuredTypeNode::Generic { base, arguments } => {
+                            pending.extend(
+                                arguments
+                                    .iter()
+                                    .rev()
+                                    .copied()
+                                    .map(StructuredTypeTraversalFrame::Enter),
+                            );
+                            pending.push(StructuredTypeTraversalFrame::Enter(*base));
+                        }
+                    }
+                }
+                StructuredTypeTraversalFrame::Finish(id) => postorder.push(id),
+            }
+        }
+        Some(postorder)
+    }
+
+    fn canonical_root_id_with(
+        &self,
+        interner: &mut HashMap<CanonicalStructuredTypeNode, u32>,
+        visit: &mut impl FnMut() -> bool,
+    ) -> Option<u32> {
+        let mut canonical_ids: HashMap<StructuredTypeNodeId, u32> = HashMap::default();
+        for id in self.reachable_postorder_with(visit)? {
+            let node = match self.node(id)? {
+                StructuredTypeNode::Named(name) => CanonicalStructuredTypeNode::Named(name.clone()),
+                StructuredTypeNode::Pointer(inner) => {
+                    CanonicalStructuredTypeNode::Pointer(*canonical_ids.get(inner)?)
+                }
+                StructuredTypeNode::Reference(inner) => {
+                    CanonicalStructuredTypeNode::Reference(*canonical_ids.get(inner)?)
+                }
+                StructuredTypeNode::Array(inner) => {
+                    CanonicalStructuredTypeNode::Array(*canonical_ids.get(inner)?)
+                }
+                StructuredTypeNode::Slice(inner) => {
+                    CanonicalStructuredTypeNode::Slice(*canonical_ids.get(inner)?)
+                }
+                StructuredTypeNode::Map { key, value } => CanonicalStructuredTypeNode::Map {
+                    key: *canonical_ids.get(key)?,
+                    value: *canonical_ids.get(value)?,
+                },
+                StructuredTypeNode::Generic { base, arguments } => {
+                    CanonicalStructuredTypeNode::Generic {
+                        base: *canonical_ids.get(base)?,
+                        arguments: arguments
+                            .iter()
+                            .map(|argument| canonical_ids.get(argument).copied())
+                            .collect::<Option<Vec<_>>>()?,
+                    }
+                }
+            };
+            let next_id = u32::try_from(interner.len()).ok()?;
+            let canonical_id = *interner.entry(node).or_insert(next_id);
+            canonical_ids.insert(id, canonical_id);
+        }
+        canonical_ids.get(&self.root).copied()
+    }
+
+    fn structural_digest(&self) -> Option<u64> {
+        let mut digests: HashMap<StructuredTypeNodeId, u64> = HashMap::default();
+        let mut visit = || true;
+        for id in self.reachable_postorder_with(&mut visit)? {
+            let mut hasher = DefaultHasher::new();
+            match self.node(id)? {
+                StructuredTypeNode::Named(name) => {
+                    0_u8.hash(&mut hasher);
+                    name.hash(&mut hasher);
+                }
+                StructuredTypeNode::Pointer(inner) => {
+                    1_u8.hash(&mut hasher);
+                    digests.get(inner)?.hash(&mut hasher);
+                }
+                StructuredTypeNode::Reference(inner) => {
+                    2_u8.hash(&mut hasher);
+                    digests.get(inner)?.hash(&mut hasher);
+                }
+                StructuredTypeNode::Array(inner) => {
+                    3_u8.hash(&mut hasher);
+                    digests.get(inner)?.hash(&mut hasher);
+                }
+                StructuredTypeNode::Slice(inner) => {
+                    4_u8.hash(&mut hasher);
+                    digests.get(inner)?.hash(&mut hasher);
+                }
+                StructuredTypeNode::Map { key, value } => {
+                    5_u8.hash(&mut hasher);
+                    digests.get(key)?.hash(&mut hasher);
+                    digests.get(value)?.hash(&mut hasher);
+                }
+                StructuredTypeNode::Generic { base, arguments } => {
+                    6_u8.hash(&mut hasher);
+                    digests.get(base)?.hash(&mut hasher);
+                    arguments.len().hash(&mut hasher);
+                    for argument in arguments {
+                        digests.get(argument)?.hash(&mut hasher);
+                    }
+                }
+            }
+            digests.insert(id, hasher.finish());
+        }
+        digests.get(&self.root).copied()
+    }
+
+    fn is_valid(&self) -> bool {
+        if self.node(self.root).is_none() || self.validated_resource_counts().is_none() {
+            return false;
+        }
+        self.nodes.iter().enumerate().all(|(index, node)| {
+            if let StructuredTypeNode::Named(name) = node
+                && !name.is_valid()
+            {
+                return false;
+            }
+            let valid_child = |child: StructuredTypeNodeId| (child.0 as usize) < index;
+            match node {
+                StructuredTypeNode::Named(_) => true,
+                StructuredTypeNode::Pointer(inner)
+                | StructuredTypeNode::Reference(inner)
+                | StructuredTypeNode::Array(inner)
+                | StructuredTypeNode::Slice(inner) => valid_child(*inner),
+                StructuredTypeNode::Map { key, value } => valid_child(*key) && valid_child(*value),
+                StructuredTypeNode::Generic { base, arguments } => {
+                    valid_child(*base) && arguments.iter().copied().all(valid_child)
+                }
+            }
+        })
+    }
+
+    pub fn nominal_name(&self) -> Option<&StructuredTypeName> {
+        self.nominal_name_with(|| true)
+    }
+
+    /// Finds the nominal type while charging the caller once for every arena
+    /// node inspected. A false `visit` result stops without returning partial
+    /// evidence.
+    pub(crate) fn nominal_name_with(
+        &self,
+        mut visit: impl FnMut() -> bool,
+    ) -> Option<&StructuredTypeName> {
+        let mut current = self.root;
+        loop {
+            if !visit() {
+                return None;
+            }
+            match self.node(current)? {
+                StructuredTypeNode::Named(name) => return Some(name),
+                StructuredTypeNode::Pointer(inner) | StructuredTypeNode::Reference(inner) => {
+                    current = *inner
+                }
+                StructuredTypeNode::Generic { base, .. } => current = *base,
+                StructuredTypeNode::Array(_)
+                | StructuredTypeNode::Slice(_)
+                | StructuredTypeNode::Map { .. } => return None,
+            }
+        }
+    }
+
+    /// Consumes an array, slice or map identity and selects its element/value
+    /// node without cloning the arena.
+    pub(crate) fn into_container_element_with(
+        mut self,
+        mut visit: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        if !visit() {
+            return None;
+        }
+        self.root = match self.node(self.root)? {
+            StructuredTypeNode::Array(element) | StructuredTypeNode::Slice(element) => *element,
+            StructuredTypeNode::Map { value, .. } => *value,
+            _ => return None,
+        };
+        Some(self)
+    }
+
+    /// Compares only the reachable type shapes, charging once for each node
+    /// inspected in both identities.
+    pub(crate) fn structurally_eq_with(
+        &self,
+        other: &Self,
+        mut visit: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        let mut interner = HashMap::default();
+        let left = self.canonical_root_id_with(&mut interner, &mut visit)?;
+        let right = other.canonical_root_id_with(&mut interner, &mut visit)?;
+        Some(left == right)
+    }
+
+    pub fn is_pointer(&self) -> bool {
+        matches!(self.node(self.root), Some(StructuredTypeNode::Pointer(_)))
+    }
+
+    pub fn is_reference(&self) -> bool {
+        matches!(self.node(self.root), Some(StructuredTypeNode::Reference(_)))
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self.node(self.root), Some(StructuredTypeNode::Array(_)))
+    }
+
+    pub fn is_slice(&self) -> bool {
+        matches!(self.node(self.root), Some(StructuredTypeNode::Slice(_)))
+    }
+
+    pub fn is_map(&self) -> bool {
+        matches!(self.node(self.root), Some(StructuredTypeNode::Map { .. }))
+    }
+
+    pub fn generic_argument_count(&self) -> Option<usize> {
+        match self.node(self.root)? {
+            StructuredTypeNode::Generic { arguments, .. } => Some(arguments.len()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn wrap_pointer(mut self) -> Option<Self> {
+        self.root = self.push_node(StructuredTypeNode::Pointer(self.root))?;
+        Some(self)
+    }
+
+    pub(crate) fn wrap_reference(mut self) -> Option<Self> {
+        self.root = self.push_node(StructuredTypeNode::Reference(self.root))?;
+        Some(self)
+    }
+
+    pub(crate) fn wrap_array(mut self) -> Option<Self> {
+        self.root = self.push_node(StructuredTypeNode::Array(self.root))?;
+        Some(self)
+    }
+
+    fn push_node(&mut self, node: StructuredTypeNode) -> Option<StructuredTypeNodeId> {
+        let (node_edges, node_string_bytes) = structured_type_node_resource_cost(&node)?;
+        let edge_count = self.edge_count.checked_add(node_edges)?;
+        let string_bytes = self.string_bytes.checked_add(node_string_bytes)?;
+        if self.nodes.len() >= MAX_STRUCTURED_TYPE_IDENTITY_NODES
+            || edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES
+            || string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
+        {
+            return None;
+        }
+        let id = StructuredTypeNodeId(u32::try_from(self.nodes.len()).ok()?);
+        self.nodes.push(node);
+        self.edge_count = edge_count;
+        self.string_bytes = string_bytes;
+        Some(id)
+    }
+
+    fn validated_resource_counts(&self) -> Option<(usize, usize)> {
+        if self.nodes.len() > MAX_STRUCTURED_TYPE_IDENTITY_NODES {
+            return None;
+        }
+        let mut edge_count = 0usize;
+        let mut string_bytes = 0usize;
+        for node in &self.nodes {
+            let (node_edges, node_string_bytes) = structured_type_node_resource_cost(node)?;
+            edge_count = edge_count.checked_add(node_edges)?;
+            string_bytes = string_bytes.checked_add(node_string_bytes)?;
+            if edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES
+                || string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
+            {
+                return None;
+            }
+        }
+        Some((edge_count, string_bytes))
+    }
+}
+
+/// Incremental constructor for a flat [`StructuredTypeIdentity`].
+#[derive(Debug, Default)]
+pub(crate) struct StructuredTypeIdentityBuilder {
+    nodes: Vec<StructuredTypeNode>,
+    edge_count: usize,
+    string_bytes: usize,
+}
+
+impl StructuredTypeIdentityBuilder {
+    pub(crate) fn named(&mut self, name: StructuredTypeName) -> Option<StructuredTypeNodeId> {
+        self.push(StructuredTypeNode::Named(name))
+    }
+
+    pub(crate) fn pointer(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
+        self.push_with_children(StructuredTypeNode::Pointer(inner), &[inner])
+    }
+
+    pub(crate) fn reference(
+        &mut self,
+        inner: StructuredTypeNodeId,
+    ) -> Option<StructuredTypeNodeId> {
+        self.push_with_children(StructuredTypeNode::Reference(inner), &[inner])
+    }
+
+    pub(crate) fn array(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
+        self.push_with_children(StructuredTypeNode::Array(inner), &[inner])
+    }
+
+    pub(crate) fn slice(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
+        self.push_with_children(StructuredTypeNode::Slice(inner), &[inner])
+    }
+
+    pub(crate) fn map(
+        &mut self,
+        key: StructuredTypeNodeId,
+        value: StructuredTypeNodeId,
+    ) -> Option<StructuredTypeNodeId> {
+        self.push_with_children(StructuredTypeNode::Map { key, value }, &[key, value])
+    }
+
+    pub(crate) fn generic(
+        &mut self,
+        base: StructuredTypeNodeId,
+        arguments: Vec<StructuredTypeNodeId>,
+    ) -> Option<StructuredTypeNodeId> {
+        if !self.contains(base) || !arguments.iter().copied().all(|id| self.contains(id)) {
+            return None;
+        }
+        self.push(StructuredTypeNode::Generic { base, arguments })
+    }
+
+    pub(crate) fn finish(self, root: StructuredTypeNodeId) -> Option<StructuredTypeIdentity> {
+        if !self.contains(root) {
+            return None;
+        }
+        Some(StructuredTypeIdentity {
+            nodes: self.nodes,
+            root,
+            edge_count: self.edge_count,
+            string_bytes: self.string_bytes,
+        })
+    }
+
+    fn push_with_children(
+        &mut self,
+        node: StructuredTypeNode,
+        children: &[StructuredTypeNodeId],
+    ) -> Option<StructuredTypeNodeId> {
+        if !children.iter().copied().all(|id| self.contains(id)) {
+            return None;
+        }
+        self.push(node)
+    }
+
+    fn push(&mut self, node: StructuredTypeNode) -> Option<StructuredTypeNodeId> {
+        let (node_edges, node_string_bytes) = structured_type_node_resource_cost(&node)?;
+        let edge_count = self.edge_count.checked_add(node_edges)?;
+        let string_bytes = self.string_bytes.checked_add(node_string_bytes)?;
+        if self.nodes.len() >= MAX_STRUCTURED_TYPE_IDENTITY_NODES
+            || edge_count > MAX_STRUCTURED_TYPE_IDENTITY_EDGES
+            || string_bytes > MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES
+        {
+            return None;
+        }
+        let id = StructuredTypeNodeId(u32::try_from(self.nodes.len()).ok()?);
+        self.nodes.push(node);
+        self.edge_count = edge_count;
+        self.string_bytes = string_bytes;
+        Some(id)
+    }
+
+    fn contains(&self, id: StructuredTypeNodeId) -> bool {
+        (id.0 as usize) < self.nodes.len()
+    }
+}
+
+fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usize, usize)> {
+    let edge_count = match node {
+        StructuredTypeNode::Named(_) => 0,
+        StructuredTypeNode::Pointer(_)
+        | StructuredTypeNode::Reference(_)
+        | StructuredTypeNode::Array(_)
+        | StructuredTypeNode::Slice(_) => 1,
+        StructuredTypeNode::Map { .. } => 2,
+        StructuredTypeNode::Generic { arguments, .. } => arguments.len().checked_add(1)?,
+    };
+    let string_bytes = match node {
+        StructuredTypeNode::Named(name) => name
+            .path
+            .iter()
+            .chain(&name.lexical_scope)
+            .try_fold(0usize, |total, component| {
+                total.checked_add(component.len())
+            })?,
+        StructuredTypeNode::Pointer(_)
+        | StructuredTypeNode::Reference(_)
+        | StructuredTypeNode::Array(_)
+        | StructuredTypeNode::Slice(_)
+        | StructuredTypeNode::Map { .. }
+        | StructuredTypeNode::Generic { .. } => 0,
+    };
+    Some((edge_count, string_bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -349,12 +1464,15 @@ impl SignatureMetadata {
             label: label.into(),
             parameters,
             return_type_text: None,
+            return_type_identity: None,
             declaration_only: false,
             callable_arity: None,
             type_parameters: Vec::new(),
             bare_return_type_parameter: None,
             callable_linkage: None,
             dispatch_extensibility: None,
+            extension_receiver_type: None,
+            extension_receiver_type_identity: None,
         }
     }
 
@@ -390,12 +1508,15 @@ impl SignatureMetadata {
             label,
             parameters,
             return_type_text: None,
+            return_type_identity: None,
             declaration_only: false,
             callable_arity: None,
             type_parameters: Vec::new(),
             bare_return_type_parameter: None,
             callable_linkage: None,
             dispatch_extensibility: None,
+            extension_receiver_type: None,
+            extension_receiver_type_identity: None,
         }
     }
 
@@ -404,6 +1525,14 @@ impl SignatureMetadata {
             .map(Into::into)
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty());
+        self
+    }
+
+    pub fn with_return_type_identity(
+        mut self,
+        return_type_identity: Option<StructuredTypeIdentity>,
+    ) -> Self {
+        self.return_type_identity = return_type_identity;
         self
     }
 
@@ -446,6 +1575,25 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_extension_receiver_type(
+        mut self,
+        extension_receiver_type: Option<impl Into<String>>,
+    ) -> Self {
+        self.extension_receiver_type = extension_receiver_type
+            .map(Into::into)
+            .map(|receiver_type| receiver_type.trim().to_string())
+            .filter(|receiver_type| !receiver_type.is_empty());
+        self
+    }
+
+    pub fn with_extension_receiver_type_identity(
+        mut self,
+        extension_receiver_type_identity: Option<StructuredTypeIdentity>,
+    ) -> Self {
+        self.extension_receiver_type_identity = extension_receiver_type_identity;
+        self
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -456,6 +1604,14 @@ impl SignatureMetadata {
 
     pub fn return_type_text(&self) -> Option<&str> {
         self.return_type_text.as_deref()
+    }
+
+    pub fn return_type_identity(&self) -> Option<&StructuredTypeIdentity> {
+        self.return_type_identity.as_ref()
+    }
+
+    pub(crate) fn into_return_type_identity(self) -> Option<StructuredTypeIdentity> {
+        self.return_type_identity
     }
 
     pub fn is_declaration_only(&self) -> bool {
@@ -480,6 +1636,14 @@ impl SignatureMetadata {
 
     pub const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
         self.dispatch_extensibility
+    }
+
+    pub fn extension_receiver_type(&self) -> Option<&str> {
+        self.extension_receiver_type.as_deref()
+    }
+
+    pub fn extension_receiver_type_identity(&self) -> Option<&StructuredTypeIdentity> {
+        self.extension_receiver_type_identity.as_ref()
     }
 }
 
@@ -1240,6 +2404,268 @@ pub fn metrics_from_declarations(
         .collect::<BTreeSet<_>>()
         .len();
     CodeBaseMetrics::new(file_count, declarations.len())
+}
+
+#[cfg(test)]
+mod structured_type_identity_tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    fn hash(identity: &StructuredTypeIdentity) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        identity.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn flat_identity_operations_are_stack_safe_on_deep_types() {
+        std::thread::Builder::new()
+            .name("flat-structured-type".to_string())
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut builder = StructuredTypeIdentityBuilder::default();
+                let name = StructuredTypeName::new(
+                    vec!["example.com/service".to_string(), "Service".to_string()],
+                    Vec::new(),
+                    false,
+                )
+                .expect("structured name");
+                let mut root = builder.named(name).expect("named node");
+                for _ in 1..MAX_STRUCTURED_TYPE_IDENTITY_NODES {
+                    root = builder.pointer(root).expect("pointer node");
+                }
+                assert!(
+                    builder.pointer(root).is_none(),
+                    "builder must reject identities beyond the fixed admission cap"
+                );
+                let identity = builder.finish(root).expect("deep flat identity");
+                assert!(
+                    identity.clone().wrap_pointer().is_none(),
+                    "finished identities must preserve the same admission cap"
+                );
+
+                let cloned = identity.clone();
+                assert_eq!(identity, cloned);
+                assert_eq!(hash(&identity), hash(&cloned));
+
+                let bytes = bincode::serialize(&identity).expect("serialize flat identity");
+                let decoded: StructuredTypeIdentity =
+                    bincode::deserialize(&bytes).expect("deserialize flat identity");
+                assert_eq!(identity, decoded);
+                assert_eq!(hash(&identity), hash(&decoded));
+
+                let metadata = SignatureMetadata::new("deep", Vec::new())
+                    .with_return_type_identity(Some(decoded));
+                let bytes = bincode::serialize(&metadata).expect("serialize signature metadata");
+                let decoded: SignatureMetadata =
+                    bincode::deserialize(&bytes).expect("deserialize signature metadata");
+                assert_eq!(metadata, decoded);
+            })
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("flat structured-type operations must not overflow");
+    }
+
+    #[test]
+    fn bounded_regression_shared_child_dags_compare_and_hash_in_linear_arena_work() {
+        const DEPTH: usize = 80;
+
+        let leaf_name = || {
+            StructuredTypeName::new(vec!["Leaf".to_string()], Vec::new(), false)
+                .expect("structured leaf")
+        };
+
+        let mut shared_builder = StructuredTypeIdentityBuilder::default();
+        let mut shared_root = shared_builder.named(leaf_name()).expect("shared leaf node");
+        for _ in 0..DEPTH {
+            shared_root = shared_builder
+                .map(shared_root, shared_root)
+                .expect("shared map node");
+        }
+        let shared = shared_builder
+            .finish(shared_root)
+            .expect("shared-child identity");
+
+        // Build the same expanded shape with one level represented by two
+        // distinct-but-equivalent subgraphs. Equality and hashing must not
+        // depend on arena sharing.
+        let mut split_builder = StructuredTypeIdentityBuilder::default();
+        let left_leaf = split_builder.named(leaf_name()).expect("left leaf");
+        let right_leaf = split_builder.named(leaf_name()).expect("right leaf");
+        let left = split_builder
+            .map(left_leaf, left_leaf)
+            .expect("left shared map");
+        let right = split_builder
+            .map(right_leaf, right_leaf)
+            .expect("right shared map");
+        let mut split_root = split_builder.map(left, right).expect("split map root");
+        for _ in 2..DEPTH {
+            split_root = split_builder
+                .map(split_root, split_root)
+                .expect("shared split-map node");
+        }
+        let split = split_builder
+            .finish(split_root)
+            .expect("differently shared identity");
+
+        assert_eq!(shared, split);
+        assert_eq!(hash(&shared), hash(&split));
+
+        let mut visits = 0usize;
+        assert_eq!(
+            shared.structurally_eq_with(&split, || {
+                visits += 1;
+                true
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            visits,
+            shared.nodes.len() + split.nodes.len(),
+            "bounded equality must inspect each reachable arena node once"
+        );
+    }
+
+    #[test]
+    fn deserialization_rejects_structured_identity_above_node_cap() {
+        let name = StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false)
+            .expect("structured name");
+        let mut nodes = Vec::with_capacity(MAX_STRUCTURED_TYPE_IDENTITY_NODES + 1);
+        nodes.push(StructuredTypeNode::Named(name));
+        for index in 1..=MAX_STRUCTURED_TYPE_IDENTITY_NODES {
+            nodes.push(StructuredTypeNode::Pointer(StructuredTypeNodeId(
+                u32::try_from(index - 1).expect("bounded test index"),
+            )));
+        }
+        let wire = StructuredTypeIdentityWire {
+            nodes: BoundedStructuredTypeNodes(nodes),
+            root: StructuredTypeNodeId(
+                u32::try_from(MAX_STRUCTURED_TYPE_IDENTITY_NODES).expect("bounded test root"),
+            ),
+        };
+        let bytes = bincode::serialize(&wire).expect("serialize oversized identity");
+
+        assert!(
+            bincode::deserialize::<StructuredTypeIdentity>(&bytes).is_err(),
+            "deserialization must reject the oversized node sequence before accepting it"
+        );
+    }
+
+    #[test]
+    fn resource_bound_rejects_oversized_structured_name_length_prefixes() {
+        let oversized_component_count =
+            u64::try_from(MAX_STRUCTURED_TYPE_NAME_COMPONENTS + 1).unwrap();
+        assert!(
+            bincode::deserialize::<StructuredTypeName>(&oversized_component_count.to_le_bytes())
+                .is_err(),
+            "the path component count must be rejected from its length prefix"
+        );
+
+        let oversized_string_bytes =
+            u64::try_from(MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES + 1).unwrap();
+        let mut oversized_path_string = Vec::new();
+        oversized_path_string.extend_from_slice(&1_u64.to_le_bytes());
+        oversized_path_string.extend_from_slice(&oversized_string_bytes.to_le_bytes());
+        assert!(
+            bincode::deserialize::<StructuredTypeName>(&oversized_path_string).is_err(),
+            "a path string must be rejected from its length prefix before reading its payload"
+        );
+
+        let mut oversized_lexical_string = Vec::new();
+        oversized_lexical_string.extend_from_slice(&1_u64.to_le_bytes());
+        oversized_lexical_string.extend_from_slice(&1_u64.to_le_bytes());
+        oversized_lexical_string.push(b'S');
+        oversized_lexical_string.extend_from_slice(&1_u64.to_le_bytes());
+        oversized_lexical_string.extend_from_slice(&oversized_string_bytes.to_le_bytes());
+        assert!(
+            bincode::deserialize::<StructuredTypeName>(&oversized_lexical_string).is_err(),
+            "a lexical-scope string must be rejected from its length prefix before reading its payload"
+        );
+    }
+
+    #[test]
+    fn resource_bound_rejects_oversized_generic_argument_length_prefix() {
+        let mut builder = StructuredTypeIdentityBuilder::default();
+        let name = StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false)
+            .expect("structured name");
+        let base = builder.named(name).expect("named node");
+        let generic = builder.generic(base, Vec::new()).expect("generic node");
+        let identity = builder.finish(generic).expect("structured identity");
+        let mut bytes = bincode::serialize(&identity).expect("serialize generic identity");
+
+        let argument_length_offset = bytes
+            .len()
+            .checked_sub(std::mem::size_of::<u64>() + std::mem::size_of::<u32>())
+            .expect("generic identity wire suffix");
+        assert_eq!(
+            &bytes[argument_length_offset..argument_length_offset + std::mem::size_of::<u64>()],
+            &0_u64.to_le_bytes(),
+            "the empty generic argument vector precedes the root node id"
+        );
+        bytes[argument_length_offset..argument_length_offset + std::mem::size_of::<u64>()]
+            .copy_from_slice(
+                &u64::try_from(MAX_STRUCTURED_TYPE_IDENTITY_EDGES + 1)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+
+        assert!(
+            bincode::deserialize::<StructuredTypeIdentity>(&bytes).is_err(),
+            "the generic argument vector must be rejected from its length prefix"
+        );
+    }
+
+    #[test]
+    fn resource_bound_preserves_existing_generic_bincode_wire_roundtrip() {
+        let mut builder = StructuredTypeIdentityBuilder::default();
+        let base = builder
+            .named(
+                StructuredTypeName::new(vec!["Result".to_string()], Vec::new(), false)
+                    .expect("base name"),
+            )
+            .expect("base node");
+        let argument = builder
+            .named(
+                StructuredTypeName::new(
+                    vec!["example".to_string(), "Service".to_string()],
+                    vec!["scope".to_string()],
+                    false,
+                )
+                .expect("argument name"),
+            )
+            .expect("argument node");
+        let generic = builder.generic(base, vec![argument]).expect("generic node");
+        let identity = builder.finish(generic).expect("structured identity");
+
+        let bytes = bincode::serialize(&identity).expect("serialize identity");
+        let decoded: StructuredTypeIdentity =
+            bincode::deserialize(&bytes).expect("deserialize identity");
+        assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn rerooted_container_identity_compares_by_reachable_shape() {
+        let service =
+            StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false).unwrap();
+        let key = StructuredTypeName::new(vec!["string".to_string()], Vec::new(), false).unwrap();
+
+        let mut map_builder = StructuredTypeIdentityBuilder::default();
+        let key_id = map_builder.named(key).unwrap();
+        let value_id = map_builder.named(service.clone()).unwrap();
+        let map_id = map_builder.map(key_id, value_id).unwrap();
+        let value = map_builder
+            .finish(map_id)
+            .unwrap()
+            .into_container_element_with(|| true)
+            .unwrap();
+
+        let mut named_builder = StructuredTypeIdentityBuilder::default();
+        let named_id = named_builder.named(service).unwrap();
+        let named = named_builder.finish(named_id).unwrap();
+
+        assert_eq!(value, named);
+        assert_eq!(hash(&value), hash(&named));
+    }
 }
 
 #[cfg(all(test, windows))]

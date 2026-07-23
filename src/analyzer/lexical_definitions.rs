@@ -93,23 +93,50 @@ pub(crate) fn formal_parameter_slots_for_owner(
     source: &str,
     declaration_range: &Range,
 ) -> Option<FormalParameterLayout> {
-    if !is_parameter_owner(language, owner.kind()) {
+    formal_parameter_slots_for_owner_bounded(language, owner, source, declaration_range, || true)
+}
+
+/// Metered form of [`formal_parameter_slots_for_owner`] for receiver
+/// resolution. Every syntax node or child inspected by parameter/decorator
+/// discovery must first pass `scope_step`; `None` therefore means either the
+/// callable shape was unsupported or the caller's session stopped.
+pub(crate) fn formal_parameter_slots_for_owner_bounded(
+    language: Language,
+    owner: Node<'_>,
+    source: &str,
+    declaration_range: &Range,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<FormalParameterLayout> {
+    if !scope_step() || !is_parameter_owner(language, owner.kind()) {
         return None;
     }
-    let python_binding = (language == Language::Python)
-        .then(|| python_method_binding(owner, source, declaration_range));
+    let python_binding = if language == Language::Python {
+        Some(python_method_binding_with_step(
+            owner,
+            source,
+            declaration_range,
+            &mut scope_step,
+        )?)
+    } else {
+        None
+    };
     let lambda = is_lambda_owner(language, owner.kind());
-    let (ordinary_roots, receiver_roots) = parameter_roots(language, owner);
-    let mut bindings = ordinary_roots
-        .into_iter()
-        .map(|root| (root, None))
-        .chain(
-            receiver_roots
-                .into_iter()
-                .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
-        )
-        .flat_map(|(root, forced_kind)| parameter_bindings(language, root, lambda, forced_kind))
-        .collect::<Vec<_>>();
+    let (ordinary_roots, receiver_roots) =
+        parameter_roots_with_step(language, owner, &mut scope_step)?;
+    let mut bindings = Vec::new();
+    for (root, forced_kind) in ordinary_roots.into_iter().map(|root| (root, None)).chain(
+        receiver_roots
+            .into_iter()
+            .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
+    ) {
+        bindings.extend(parameter_bindings_with_step(
+            language,
+            root,
+            lambda,
+            forced_kind,
+            &mut scope_step,
+        )?);
+    }
     bindings.sort_by_key(|binding| {
         (
             binding.declaration.start_byte(),
@@ -153,36 +180,45 @@ pub(crate) fn formal_parameter_slots_for_owner(
     })
 }
 
-fn python_method_binding(
+fn python_method_binding_with_step(
     owner: Node<'_>,
     source: &str,
     declaration_range: &Range,
-) -> PythonMethodBinding {
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<PythonMethodBinding> {
     let Some(decorated) = owner.parent().filter(|parent| {
         parent.kind() == "decorated_definition"
             && parent.start_byte() >= declaration_range.start_byte
             && parent.end_byte() <= declaration_range.end_byte
     }) else {
-        return PythonMethodBinding::Instance;
+        return Some(PythonMethodBinding::Instance);
     };
     let mut stack = Vec::new();
     let mut cursor = decorated.walk();
-    stack.extend(
-        decorated
-            .named_children(&mut cursor)
-            .filter(|child| child.kind() == "decorator"),
-    );
+    for child in decorated.named_children(&mut cursor) {
+        if !scope_step() {
+            return None;
+        }
+        if child.kind() == "decorator" {
+            stack.push(child);
+        }
+    }
     while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node.kind() == "identifier" {
             match source.get(node.byte_range()) {
-                Some("staticmethod") => return PythonMethodBinding::Static,
-                Some("classmethod") => return PythonMethodBinding::Class,
+                Some("staticmethod") => return Some(PythonMethodBinding::Static),
+                Some("classmethod") => return Some(PythonMethodBinding::Class),
                 _ => {}
             }
         }
-        push_named_children(node, &mut stack);
+        if !push_named_children_with_step(node, &mut stack, scope_step) {
+            return None;
+        }
     }
-    PythonMethodBinding::Instance
+    Some(PythonMethodBinding::Instance)
 }
 
 fn parameter_owner_for_range<'tree>(
@@ -347,10 +383,21 @@ fn parameter_roots<'tree>(
     language: Language,
     owner: Node<'tree>,
 ) -> (Vec<Node<'tree>>, Vec<Node<'tree>>) {
+    parameter_roots_with_step(language, owner, &mut || true)
+        .expect("unbounded parameter traversal cannot stop")
+}
+
+fn parameter_roots_with_step<'tree>(
+    language: Language,
+    owner: Node<'tree>,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<(Vec<Node<'tree>>, Vec<Node<'tree>>)> {
     let mut ordinary_roots = Vec::new();
-    push_field_children(owner, "parameters", &mut ordinary_roots);
-    push_field_children(owner, "parameter", &mut ordinary_roots);
-    push_field_children(owner, "class_parameters", &mut ordinary_roots);
+    for field in ["parameters", "parameter", "class_parameters"] {
+        if !push_field_children_with_step(owner, field, &mut ordinary_roots, scope_step) {
+            return None;
+        }
+    }
     if language == Language::CSharp
         && matches!(
             owner.kind(),
@@ -358,14 +405,19 @@ fn parameter_roots<'tree>(
         )
     {
         let mut cursor = owner.walk();
-        ordinary_roots.extend(
-            owner
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "parameter_list"),
-        );
+        for child in owner.named_children(&mut cursor) {
+            if !scope_step() {
+                return None;
+            }
+            if child.kind() == "parameter_list" {
+                ordinary_roots.push(child);
+            }
+        }
     }
     let mut receiver_roots = Vec::new();
-    push_field_children(owner, "receiver", &mut receiver_roots);
+    if !push_field_children_with_step(owner, "receiver", &mut receiver_roots, scope_step) {
+        return None;
+    }
 
     // C++ stores the parameter list below the callable declarator rather than
     // directly on the function/lambda node.
@@ -374,14 +426,19 @@ fn parameter_roots<'tree>(
     {
         let mut stack = vec![declarator];
         while let Some(node) = stack.pop() {
+            if !scope_step() {
+                return None;
+            }
             if matches!(node.kind(), "parameter_list" | "parameters") {
                 ordinary_roots.push(node);
                 continue;
             }
-            push_named_children(node, &mut stack);
+            if !push_named_children_with_step(node, &mut stack, scope_step) {
+                return None;
+            }
         }
     }
-    (ordinary_roots, receiver_roots)
+    Some((ordinary_roots, receiver_roots))
 }
 
 fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<FormalVariadicKind> {
@@ -417,6 +474,20 @@ fn parameter_bindings(
     lambda: bool,
     forced_kind: Option<DeclarationKind>,
 ) -> Vec<ParameterBinding<'_>> {
+    parameter_bindings_with_step(language, root, lambda, forced_kind, &mut || true)
+        .expect("unbounded parameter traversal cannot stop")
+}
+
+fn parameter_bindings_with_step<'tree>(
+    language: Language,
+    root: Node<'tree>,
+    lambda: bool,
+    forced_kind: Option<DeclarationKind>,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<Vec<ParameterBinding<'tree>>> {
+    if !scope_step() {
+        return None;
+    }
     let mut bindings = Vec::new();
     if !is_parameter_container(language, root.kind())
         && is_direct_parameter_binding(language, root.kind())
@@ -426,17 +497,20 @@ fn parameter_bindings(
         } else {
             DeclarationKind::Parameter
         });
-        for name in binding_name_nodes(language, root, true) {
+        for name in binding_name_nodes_with_step(language, root, true, scope_step)? {
             bindings.push(ParameterBinding {
                 name,
                 declaration: root,
                 kind,
             });
         }
-        return bindings;
+        return Some(bindings);
     }
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node != root && is_parameter_owner(language, node.kind()) {
             continue;
         }
@@ -454,7 +528,7 @@ fn parameter_bindings(
                     DeclarationKind::Parameter
                 }
             });
-            for name in binding_name_nodes(language, node, true) {
+            for name in binding_name_nodes_with_step(language, node, true, scope_step)? {
                 bindings.push(ParameterBinding {
                     name,
                     declaration: node,
@@ -470,7 +544,7 @@ fn parameter_bindings(
             && node != root
             && is_direct_parameter_binding(language, node.kind())
         {
-            for name in binding_name_nodes(language, node, true) {
+            for name in binding_name_nodes_with_step(language, node, true, scope_step)? {
                 bindings.push(ParameterBinding {
                     name,
                     declaration: node,
@@ -484,9 +558,11 @@ fn parameter_bindings(
             continue;
         }
 
-        push_named_children(node, &mut stack);
+        if !push_named_children_with_step(node, &mut stack, scope_step) {
+            return None;
+        }
     }
-    bindings
+    Some(bindings)
 }
 
 fn scope_has_matching_local(
@@ -592,6 +668,16 @@ fn scala_has_value_definition_keyword(node: Node<'_>) -> bool {
 }
 
 fn binding_name_nodes(language: Language, declaration: Node<'_>, parameter: bool) -> Vec<Node<'_>> {
+    binding_name_nodes_with_step(language, declaration, parameter, &mut || true)
+        .expect("unbounded binding traversal cannot stop")
+}
+
+fn binding_name_nodes_with_step<'tree>(
+    language: Language,
+    declaration: Node<'tree>,
+    parameter: bool,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<Vec<Node<'tree>>> {
     let mut roots = Vec::new();
     if language == Language::Scala && declaration.kind() == "enumerator" {
         // tree-sitter-scala represents both generators (`pattern <- expression`)
@@ -602,11 +688,16 @@ fn binding_name_nodes(language: Language, declaration: Node<'_>, parameter: bool
             .named_child(0)
             .filter(|child| child.kind() != "guard")
         {
+            if !scope_step() {
+                return None;
+            }
             roots.push(pattern);
         }
     }
     for field in ["name", "pattern", "declarator", "left"] {
-        push_field_children(declaration, field, &mut roots);
+        if !push_field_children_with_step(declaration, field, &mut roots, scope_step) {
+            return None;
+        }
     }
 
     // Some wrappers deliberately have no named field (Python typed params,
@@ -617,21 +708,25 @@ fn binding_name_nodes(language: Language, declaration: Node<'_>, parameter: bool
 
     let mut names = Vec::new();
     for root in roots {
-        collect_binding_leaves(language, root, parameter, &mut names);
+        collect_binding_leaves_with_step(language, root, parameter, &mut names, scope_step)?;
     }
     names.sort_by_key(Node::start_byte);
     names.dedup_by_key(|node| (node.start_byte(), node.end_byte()));
-    names
+    Some(names)
 }
 
-fn collect_binding_leaves<'tree>(
+fn collect_binding_leaves_with_step<'tree>(
     language: Language,
     root: Node<'tree>,
     parameter: bool,
     output: &mut Vec<Node<'tree>>,
-) {
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<()> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
         if is_binding_leaf(language, node.kind()) {
             output.push(node);
             continue;
@@ -639,9 +734,13 @@ fn collect_binding_leaves<'tree>(
 
         if language == Language::Rust && node.kind() == "field_pattern" {
             let mut pattern = Vec::new();
-            push_field_children(node, "pattern", &mut pattern);
+            if !push_field_children_with_step(node, "pattern", &mut pattern, scope_step) {
+                return None;
+            }
             if pattern.is_empty() {
-                push_field_children(node, "name", &mut pattern);
+                if !push_field_children_with_step(node, "name", &mut pattern, scope_step) {
+                    return None;
+                }
             }
             stack.extend(pattern);
             continue;
@@ -649,13 +748,19 @@ fn collect_binding_leaves<'tree>(
 
         let mut selected = Vec::new();
         for field in binding_child_fields(language, node.kind(), parameter) {
-            push_field_children(node, field, &mut selected);
+            if !push_field_children_with_step(node, field, &mut selected, scope_step) {
+                return None;
+            }
         }
-        if selected.is_empty() && binding_container(language, node.kind()) {
-            push_named_children(node, &mut selected);
+        if selected.is_empty()
+            && binding_container(language, node.kind())
+            && !push_named_children_with_step(node, &mut selected, scope_step)
+        {
+            return None;
         }
         stack.extend(selected);
     }
+    Some(())
 }
 
 fn binding_child_fields(
@@ -676,8 +781,16 @@ fn binding_child_fields(
     }
 }
 
-fn push_field_children<'tree>(node: Node<'tree>, field: &str, output: &mut Vec<Node<'tree>>) {
+fn push_field_children_with_step<'tree>(
+    node: Node<'tree>,
+    field: &str,
+    output: &mut Vec<Node<'tree>>,
+    scope_step: &mut impl FnMut() -> bool,
+) -> bool {
     for index in 0..node.child_count() {
+        if !scope_step() {
+            return false;
+        }
         if node.field_name_for_child(index as u32) == Some(field)
             && let Some(child) = node.child(index)
             && child.is_named()
@@ -685,11 +798,26 @@ fn push_field_children<'tree>(node: Node<'tree>, field: &str, output: &mut Vec<N
             output.push(child);
         }
     }
+    true
 }
 
 fn push_named_children<'tree>(node: Node<'tree>, output: &mut Vec<Node<'tree>>) {
+    let _ = push_named_children_with_step(node, output, &mut || true);
+}
+
+fn push_named_children_with_step<'tree>(
+    node: Node<'tree>,
+    output: &mut Vec<Node<'tree>>,
+    scope_step: &mut impl FnMut() -> bool,
+) -> bool {
     let mut cursor = node.walk();
-    output.extend(node.named_children(&mut cursor));
+    for child in node.named_children(&mut cursor) {
+        if !scope_step() {
+            return false;
+        }
+        output.push(child);
+    }
+    true
 }
 
 fn identifier_matches(language: Language, node: Node<'_>, source: &str, identifier: &str) -> bool {
@@ -997,5 +1125,67 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
                 | "declaration_expression"
         ),
         Language::None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn first_named_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("missing `{kind}` node");
+    }
+
+    #[test]
+    fn bounded_formal_parameter_layout_stops_before_a_wide_parameter_list() {
+        let parameters = (0..64)
+            .map(|index| format!("p{index}: int"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("def invoke({parameters}):\n    return p0\n");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python grammar");
+        let tree = parser.parse(&source, None).expect("Python tree");
+        let owner = first_named_kind(tree.root_node(), "function_definition");
+        let declaration_range = node_range(owner);
+        let mut remaining = 8usize;
+
+        let limited = formal_parameter_slots_for_owner_bounded(
+            Language::Python,
+            owner,
+            &source,
+            &declaration_range,
+            || {
+                let admitted = remaining > 0;
+                remaining = remaining.saturating_sub(1);
+                admitted
+            },
+        );
+
+        assert!(limited.is_none());
+        assert_eq!(remaining, 0);
+
+        let complete = formal_parameter_slots_for_owner_bounded(
+            Language::Python,
+            owner,
+            &source,
+            &declaration_range,
+            || true,
+        )
+        .expect("ample traversal budget");
+        assert_eq!(complete.slots.len(), 64);
+        assert_eq!(complete.slots[0].names, ["p0"]);
+        assert_eq!(complete.slots[63].names, ["p63"]);
     }
 }

@@ -6,16 +6,19 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CompletionKind, CompletionRequest, DriveError, ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{CppAnalyzer, ProjectFile};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{CppAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v2";
 
 impl_program_semantics_provider!(CppAnalyzer, CppSemanticLowerer);
 
@@ -100,6 +103,9 @@ fn cpp_capabilities() -> SemanticCapabilities {
         SemanticCapability::Captures,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
         SemanticCapability::DeferredExecution,
@@ -816,6 +822,12 @@ struct GapFact {
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    identity_bindings: HashSet<ValueId>,
+    receiver: Option<ValueId>,
+    return_identity_preserving: bool,
     labels: HashMap<Box<str>, ProgramPointId>,
     switch_case_entries: HashMap<usize, ProgramPointId>,
     published_gaps: HashSet<GapFact>,
@@ -824,6 +836,15 @@ struct LoweringContext<'tree, 'targets> {
     has_implicit_object_context: bool,
     raii_possible: bool,
     vla_possible: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
 }
 
 fn lower_procedure<'tree>(
@@ -860,6 +881,12 @@ fn lower_procedure<'tree>(
     let mut context = LoweringContext {
         source: prepared.source(),
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        identity_bindings: HashSet::default(),
+        receiver: None,
+        return_identity_preserving: cpp_callable_return_preserves_identity(spec.callable),
         labels: HashMap::default(),
         switch_case_entries: HashMap::default(),
         published_gaps: HashSet::default(),
@@ -874,6 +901,14 @@ fn lower_procedure<'tree>(
         vla_possible: spec.has_vla_boundaries,
     };
 
+    context.emit_procedure_inputs(
+        &mut builder,
+        spec.callable,
+        spec.has_implicit_object_context,
+    )?;
+    if !spec.properties.is_synthetic {
+        context.emit_local_bindings(&mut builder, spec.body)?;
+    }
     context.register_labels(&mut builder, spec.body)?;
 
     if spec.properties.is_synthetic {
@@ -1142,6 +1177,290 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+        has_implicit_object_context: bool,
+    ) -> Result<(), CppLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Cpp,
+            callable,
+            self.source,
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(CppLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let mapping_node =
+                cpp_formal_name_node(declaration, self.source, &slot.names).unwrap_or(declaration);
+            let metadata = self.value_mapping(builder, mapping_node)?;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                self.identity_bindings.insert(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    CppLoweringError::Invalid("too many C++ formal parameters".into())
+                })?;
+                if cpp_declaration_preserves_identity(declaration) {
+                    self.identity_bindings.insert(value);
+                }
+                value
+            };
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+
+        if self.receiver.is_none() && has_implicit_object_context {
+            let metadata = self.value_mapping(builder, callable)?;
+            let receiver = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?;
+            self.receiver = Some(receiver);
+            self.identity_bindings.insert(receiver);
+        }
+        if has_implicit_object_context && let Some(receiver) = self.receiver {
+            self.parameters.insert("this".into(), receiver);
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), CppLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(CppLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node.id() != body.id() && cpp_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() != "declaration"
+                || has_storage_class(self.source, node, "extern")
+                || cpp_declaration_is_function(node)
+            {
+                return Ok(WalkControl::Continue);
+            }
+            let Some((scope_start, scope_end)) = cpp_local_scope(node, body) else {
+                return Ok(WalkControl::Continue);
+            };
+            for declarator in cpp_local_declarators(node) {
+                let Some(name_node) = declarator_name_node(declarator) else {
+                    continue;
+                };
+                let Some(name) = nonempty_node_text(self.source, name_node) else {
+                    continue;
+                };
+                let metadata = self.value_mapping(builder, name_node)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                if cpp_declarator_preserves_identity(declarator) {
+                    self.identity_bindings.insert(value);
+                }
+                self.locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: name_node.start_byte(),
+                        visible_from: name_node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| {
+                (
+                    binding.scope_end.saturating_sub(binding.scope_start),
+                    std::cmp::Reverse(binding.visible_from),
+                )
+            })
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        self.locals.get(name)?.iter().find_map(|binding| {
+            (binding.declaration_start == declaration_start).then_some(binding.value)
+        })
+    }
+
+    fn binding_value(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_at(name, byte)
+            .or_else(|| self.parameters.get(name).copied())
+    }
+
+    fn binding_flow_kind(&self, name: &str, byte: usize, value: ValueId) -> ValueFlowKind {
+        if Some(value) == self.receiver {
+            ValueFlowKind::Receiver
+        } else if self.local_at(name, byte) == Some(value) {
+            ValueFlowKind::Local
+        } else {
+            ValueFlowKind::Parameter
+        }
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, CppLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, CppLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), CppLoweringError> {
+        let name = if node.kind() == "this" {
+            "this"
+        } else {
+            let Some(name) = nonempty_node_text(self.source, node) else {
+                return Ok(());
+            };
+            name
+        };
+        let Some(source) = self.binding_value(name, node.start_byte()) else {
+            return Ok(());
+        };
+        if source != target {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind: self.binding_flow_kind(name, node.start_byte(), source),
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_declaration_identity(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+        terminal: ProgramPointId,
+    ) -> Result<bool, CppLoweringError> {
+        let mut emitted = false;
+        for declarator in cpp_local_declarators(declaration) {
+            let Some(name_node) = declarator_name_node(declarator) else {
+                continue;
+            };
+            let Some(name) = nonempty_node_text(self.source, name_node) else {
+                continue;
+            };
+            let Some(target) = self.local_declaration_value(name, name_node.start_byte()) else {
+                continue;
+            };
+            if self.identity_bindings.contains(&target) {
+                if let Some(initializer) = cpp_declarator_initializer(declaration, declarator) {
+                    let source = self.expression_value(
+                        builder,
+                        initializer,
+                        cpp_expression_value_kind(initializer),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        },
+                    )?;
+                    emitted = true;
+                }
+                continue;
+            }
+            if let Some(kind) = cpp_local_allocation_kind(declaration, declarator) {
+                self.session
+                    .add_allocation(builder, terminal, target, kind)?;
+                emitted = true;
+            }
+        }
+        Ok(emitted)
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1473,14 +1792,59 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         builder, node, entry, &values, next, scope, stack,
                     )
                 } else {
-                    self.schedule_expressions(builder, entry, &values, next, scope, stack)
+                    let terminal = if node.kind() == "declaration" {
+                        let terminal = self.point(builder, node, Vec::new())?;
+                        self.emit_declaration_identity(builder, node, terminal)?;
+                        self.edge(builder, terminal, next)?;
+                        Some(terminal)
+                    } else {
+                        None
+                    };
+                    self.schedule_expressions(
+                        builder,
+                        entry,
+                        &values,
+                        terminal.map_or(next, EdgeTarget::normal),
+                        scope,
+                        stack,
+                    )
                 }
             }
             "return_statement" | "co_return_statement" => {
                 let value_node = first_runtime_named_child(node);
                 let terminal = if let Some(value_node) = value_node {
                     let terminal = self.point(builder, node, Vec::new())?;
+                    let source = self.expression_value(
+                        builder,
+                        value_node,
+                        cpp_expression_value_kind(value_node),
+                    )?;
                     let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+                    if node.kind() == "return_statement" && self.return_identity_preserving {
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Return,
+                                source,
+                                target: value,
+                            },
+                        )?;
+                    } else {
+                        self.session.add_gap_with_impacts(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Value(value),
+                            SemanticCapability::Values,
+                            SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                            SemanticGapKind::Unknown,
+                            if node.kind() == "co_return_statement" {
+                                "co_return value transfer is mediated by the coroutine promise"
+                            } else {
+                                "C++ by-value return may construct, convert, copy, or move a distinct result object"
+                            },
+                        )?;
+                    }
                     self.append_effect(
                         builder,
                         terminal,
@@ -2539,6 +2903,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
+        let result = self.expression_value(builder, node, cpp_expression_value_kind(node))?;
+        if matches!(node.kind(), "identifier" | "this") {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
         match node.kind() {
             "call_expression" if is_unevaluated_builtin_call(self.source, node) => {
                 self.add_gap(
@@ -2667,21 +3035,51 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let assignment = self.point(builder, node, Vec::new())?;
-                let target = self.value(builder, assignment, SemanticValueKind::Local)?;
-                let value = self.value(builder, assignment, SemanticValueKind::Temporary)?;
-                self.append_effect(
-                    builder,
-                    assignment,
-                    SemanticEffect::Assignment { target, value },
-                )?;
-                self.add_gap(
-                    builder,
-                    assignment,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Values,
-                    SemanticGapKind::Unknown,
-                    "assignment target/value identity, aliasing, and overloaded assignment require type refinement",
-                )?;
+                let exact_target = (assignment_operator(node) == Some("=")
+                    && left.kind() == "identifier")
+                    .then(|| {
+                        let name = nonempty_node_text(self.source, left)?;
+                        let target = self.binding_value(name, left.start_byte())?;
+                        self.identity_bindings
+                            .contains(&target)
+                            .then_some((name, target))
+                    })
+                    .flatten();
+                if let Some((name, target)) = exact_target {
+                    let value =
+                        self.expression_value(builder, right, cpp_expression_value_kind(right))?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment { target, value },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::ValueFlow {
+                            kind: self.binding_flow_kind(name, left.start_byte(), target),
+                            source: value,
+                            target,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: target,
+                        },
+                    )?;
+                } else {
+                    self.add_gap(
+                        builder,
+                        assignment,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "assignment target/value identity, aliasing, and overloaded assignment require type refinement",
+                    )?;
+                }
                 self.add_gap(
                     builder,
                     assignment,
@@ -2811,6 +3209,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
+            "parenthesized_expression" => {
+                let Some(value_node) = first_runtime_named_child(node) else {
+                    return self.edge(builder, entry, next);
+                };
+                let terminal = self.point(builder, node, Vec::new())?;
+                let value = self.expression_value(
+                    builder,
+                    value_node,
+                    cpp_expression_value_kind(value_node),
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value,
+                    },
+                )?;
+                self.edge(builder, terminal, next)?;
+                stack.push(Work::Expression {
+                    node: value_node,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
+            "compound_literal_expression" => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Object)?;
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
             "binary_expression"
             | "unary_expression"
             | "update_expression"
@@ -2818,8 +3249,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "field_expression"
             | "pointer_expression"
             | "cast_expression"
-            | "compound_literal_expression"
             | "fold_expression" => {
+                if node.kind() == "field_expression" {
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "C++ field-load identity requires structured memory and declared-member refinement",
+                    )?;
+                }
                 if !self.is_c_source() && expression_may_invoke_overload(node) {
                     self.add_implicit_operator_gaps(
                         builder,
@@ -2863,7 +3303,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             "argument_list"
-            | "parenthesized_expression"
             | "field_initializer"
             | "field_initializer_list"
             | "init_declarator" => {
@@ -2913,20 +3352,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
 
         let function = if node.kind() == "new_expression" {
             required_field(node, "type")?
         } else {
             required_field(node, "function")?
         };
+        let callee = self.source_value(builder, function, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, function, SemanticValueKind::Exception)?;
         let receiver_node = cpp_call_receiver(function);
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver| {
+                self.expression_value(builder, receiver, cpp_expression_value_kind(receiver))
+            })
             .transpose()?;
-        let constructor = node.kind() == "new_expression";
+        let constructor = node.kind() == "new_expression" || cpp_direct_constructor_call(function);
         let indirect = !constructor && call_target_requires_dispatch_gap(function);
         let callable_kind = if constructor {
             CallableReferenceKind::Constructor
@@ -2959,7 +3400,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let arguments = call_arguments(node);
         let argument_values = arguments
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(|argument| {
+                self.expression_value(builder, *argument, cpp_expression_value_kind(*argument))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -2967,7 +3410,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: argument_values.into_iter().map(Into::into).collect(),
+                arguments: argument_values
+                    .into_iter()
+                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
+                    .collect(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2975,6 +3421,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if constructor {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -3065,7 +3515,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "setjmp/longjmp-style non-local control and restored execution state are not lowered",
             )?;
         }
-        if constructor {
+        if node.kind() == "new_expression" {
             self.add_gap(
                 builder,
                 invoke,
@@ -3078,6 +3528,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 invoke,
                 "new-expression allocation and partial-construction cleanup",
+            )?;
+        } else if constructor {
+            self.add_implicit_lifetime_call_gaps(
+                builder,
+                invoke,
+                "temporary-object construction and full-expression cleanup",
             )?;
         }
         let evaluations = call_operand_evaluations(node, function);
@@ -3117,7 +3573,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             self.point(builder, node, Vec::new())?
         };
-        let result = self.value(builder, creation, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
         let metadata = self.metadata(creation)?;
         self.append_effect(
             builder,
@@ -3704,6 +4160,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, CppLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(CppLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, CppLoweringError> {
         self.session.metadata(point)
     }
@@ -3777,6 +4243,209 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
+    }
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
+}
+
+fn cpp_formal_name_node<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+    names: &[String],
+) -> Option<Node<'tree>> {
+    let mut stack = vec![declaration];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "identifier" | "field_identifier" | "this")
+            && node_text(source, node).is_some_and(|text| names.iter().any(|name| name == text))
+        {
+            return Some(node);
+        }
+        let children = named_children(node);
+        stack.extend(children.into_iter().rev());
+    }
+    None
+}
+
+fn cpp_nested_execution_boundary(node: Node<'_>) -> bool {
+    matches!(node.kind(), "function_definition" | "lambda_expression")
+}
+
+fn cpp_local_declarators(declaration: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = declaration.walk();
+    let mut declarators = declaration
+        .children_by_field_name("declarator", &mut cursor)
+        .collect::<Vec<_>>();
+    if declarators.is_empty() {
+        declarators.extend(
+            named_children(declaration)
+                .into_iter()
+                .filter(|child| child.kind() == "init_declarator"),
+        );
+    }
+    declarators.sort_unstable_by_key(Node::start_byte);
+    declarators.dedup_by_key(|node| node.id());
+    declarators
+}
+
+fn cpp_declarator_contains_kind(mut node: Node<'_>, expected: &str) -> bool {
+    loop {
+        if node.kind() == expected {
+            return true;
+        }
+        if let Some(inner) = node.child_by_field_name("declarator") {
+            node = inner;
+        } else if matches!(
+            node.kind(),
+            "reference_declarator" | "parenthesized_declarator"
+        ) {
+            let Some(inner) = first_named_child(node) else {
+                return false;
+            };
+            node = inner;
+        } else {
+            return false;
+        }
+    }
+}
+
+fn cpp_declarator_preserves_identity(mut node: Node<'_>) -> bool {
+    loop {
+        if matches!(node.kind(), "pointer_declarator" | "reference_declarator") {
+            return true;
+        }
+        if let Some(inner) = node.child_by_field_name("declarator") {
+            node = inner;
+        } else if node.kind() == "parenthesized_declarator" {
+            let Some(inner) = first_named_child(node) else {
+                return false;
+            };
+            node = inner;
+        } else {
+            return false;
+        }
+    }
+}
+
+fn cpp_declaration_preserves_identity(declaration: Node<'_>) -> bool {
+    cpp_local_declarators(declaration)
+        .into_iter()
+        .any(cpp_declarator_preserves_identity)
+}
+
+fn cpp_callable_return_preserves_identity(callable: Node<'_>) -> bool {
+    callable
+        .child_by_field_name("declarator")
+        .is_some_and(cpp_declarator_preserves_identity)
+}
+
+fn cpp_declaration_is_function(declaration: Node<'_>) -> bool {
+    cpp_local_declarators(declaration)
+        .into_iter()
+        .any(|declarator| cpp_declarator_contains_kind(declarator, "function_declarator"))
+}
+
+fn cpp_local_scope(node: Node<'_>, body: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "compound_statement"
+                | "for_statement"
+                | "for_range_loop"
+                | "if_statement"
+                | "switch_statement"
+                | "while_statement"
+                | "do_statement"
+                | "catch_clause"
+        ) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        if parent.id() == body.id() {
+            return Some((body.start_byte(), body.end_byte()));
+        }
+        current = parent.parent();
+    }
+    (body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte())
+        .then_some((body.start_byte(), body.end_byte()))
+}
+
+fn cpp_declarator_initializer<'tree>(
+    declaration: Node<'tree>,
+    declarator: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if declarator.kind() == "init_declarator" {
+        return declarator.child_by_field_name("value");
+    }
+    let declarators = cpp_local_declarators(declaration);
+    (declarators.len() == 1)
+        .then(|| {
+            declaration
+                .child_by_field_name("value")
+                .or_else(|| declaration.child_by_field_name("default_value"))
+        })
+        .flatten()
+}
+
+fn cpp_local_allocation_kind(
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+) -> Option<AllocationKind> {
+    if cpp_declarator_preserves_identity(declarator) {
+        return None;
+    }
+    let type_node = declaration.child_by_field_name("type")?;
+    if matches!(
+        type_node.kind(),
+        "primitive_type"
+            | "sized_type_specifier"
+            | "placeholder_type_specifier"
+            | "decltype"
+            | "enum_specifier"
+    ) {
+        return None;
+    }
+    Some(
+        if cpp_declarator_contains_kind(declarator, "array_declarator") {
+            AllocationKind::Array
+        } else {
+            AllocationKind::Object
+        },
+    )
+}
+
+fn cpp_expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "number_literal"
+        | "char_literal"
+        | "string_literal"
+        | "raw_string_literal"
+        | "concatenated_string"
+        | "true"
+        | "false"
+        | "null"
+        | "nullptr" => SemanticValueKind::Constant,
+        "lambda_expression" => SemanticValueKind::Callable,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+fn cpp_direct_constructor_call(function: Node<'_>) -> bool {
+    match function.kind() {
+        "type_identifier" | "scoped_type_identifier" | "template_type" => true,
+        "qualified_identifier" => function.child_by_field_name("name").is_some_and(|name| {
+            matches!(
+                name.kind(),
+                "type_identifier" | "scoped_type_identifier" | "template_type"
+            )
+        }),
+        _ => false,
     }
 }
 

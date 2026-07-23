@@ -1,9 +1,11 @@
 use super::*;
+use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CallableArity, CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression,
     CppTemplateMetadata, CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm,
-    ParameterMetadata, Range, SignatureMetadata,
+    DispatchExtensibility, ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
+    StructuredTypeName,
 };
 use regex::Regex;
 use tree_sitter::{Node, Parser, Tree};
@@ -3137,10 +3139,16 @@ fn cpp_signature_metadata(
     function_declarator: Node<'_>,
     source: &str,
 ) -> SignatureMetadata {
+    let dispatch = cpp_callable_dispatch_extensibility(function_declarator);
+    let enrich = |metadata: SignatureMetadata| metadata.with_dispatch_extensibility(dispatch);
     let return_type_text = cpp_callable_return_type_text(function_declarator, source);
+    let return_type_identity = cpp_callable_return_type_identity(function_declarator, source);
     let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new())
-            .with_return_type_text(return_type_text);
+        return enrich(
+            SignatureMetadata::new(signature, Vec::new())
+                .with_return_type_text(return_type_text)
+                .with_return_type_identity(return_type_identity),
+        );
     };
     let callable_arity = cpp_callable_arity(parameters_node, source);
     let parameter_text = normalize_cpp_whitespace(node_text(parameters_node, source));
@@ -3149,9 +3157,12 @@ fn cpp_signature_metadata(
         .get(search_from..)
         .and_then(|suffix| suffix.find(&parameter_text))
     else {
-        return SignatureMetadata::new(signature, Vec::new())
-            .with_callable_arity(callable_arity)
-            .with_return_type_text(return_type_text);
+        return enrich(
+            SignatureMetadata::new(signature, Vec::new())
+                .with_callable_arity(callable_arity)
+                .with_return_type_text(return_type_text)
+                .with_return_type_identity(return_type_identity),
+        );
     };
     let parameters_start = search_from + relative_start;
     let parameters_end = parameters_start + parameter_text.len();
@@ -3171,9 +3182,357 @@ fn cpp_signature_metadata(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
-        .with_callable_arity(callable_arity)
-        .with_return_type_text(return_type_text)
+    enrich(
+        SignatureMetadata::new(signature, parameters)
+            .with_callable_arity(callable_arity)
+            .with_return_type_text(return_type_text)
+            .with_return_type_identity(return_type_identity),
+    )
+}
+
+fn cpp_callable_return_type_identity(
+    function_declarator: Node<'_>,
+    source: &str,
+) -> Option<StructuredTypeIdentity> {
+    let lexical_scope = cpp_callable_lexical_scope(function_declarator, source);
+    let mut cursor = function_declarator.walk();
+    if let Some(trailing) = function_declarator
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "trailing_return_type")
+        && let Some(type_descriptor) = trailing.named_child(0)
+    {
+        return cpp_structured_type_identity(type_descriptor, source, &lexical_scope);
+    }
+
+    let mut current = function_declarator;
+    let mut wrappers = Vec::new();
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "function_definition" | "declaration" | "field_declaration"
+        ) {
+            let type_node = parent.child_by_field_name("type")?;
+            if cpp_export_macro_token(node_text(type_node, source))
+                && (0..parent.named_child_count()).any(|index| {
+                    parent
+                        .named_child(index)
+                        .is_some_and(|child| child.kind() == "ERROR")
+                })
+            {
+                return None;
+            }
+            let mut identity = cpp_structured_type_identity(type_node, source, &lexical_scope)?;
+            for wrapper in wrappers.into_iter().rev() {
+                identity = cpp_wrap_structured_type(identity, wrapper)?;
+            }
+            return Some(identity);
+        }
+        let wraps_current_declarator = parent.child_by_field_name("declarator") == Some(current)
+            || (matches!(
+                parent.kind(),
+                "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
+            ) && parent.named_child_count() == 1
+                && parent.named_child(0) == Some(current));
+        if !wraps_current_declarator {
+            return None;
+        }
+        match parent.kind() {
+            "pointer_declarator" => wrappers.push(CppStructuredTypeWrapper::Pointer),
+            "reference_declarator" => wrappers.push(CppStructuredTypeWrapper::Reference),
+            "array_declarator" => wrappers.push(CppStructuredTypeWrapper::Array),
+            "init_declarator" | "parenthesized_declarator" | "attributed_declarator" => {}
+            _ => return None,
+        }
+        current = parent;
+    }
+    None
+}
+
+fn cpp_structured_type_identity(
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeIdentity> {
+    enum Work<'tree> {
+        Visit(Node<'tree>),
+        Wrap(CppStructuredTypeWrapper),
+        ApplyWrappers(Vec<CppStructuredTypeWrapper>),
+        BuildGeneric { argument_count: usize },
+    }
+
+    let mut work = vec![Work::Visit(node)];
+    let mut values = Vec::new();
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Visit(current) => match current.kind() {
+                "type_descriptor" => {
+                    let type_node = current
+                        .child_by_field_name("type")
+                        .or_else(|| current.named_child(0))?;
+                    let mut wrappers = Vec::new();
+                    let mut cursor = current.walk();
+                    for child in current.named_children(&mut cursor) {
+                        if child.id() != type_node.id() {
+                            wrappers.extend(cpp_structured_declarator_wrappers(child));
+                        }
+                    }
+                    work.push(Work::ApplyWrappers(wrappers));
+                    work.push(Work::Visit(type_node));
+                }
+                "pointer_declarator" | "abstract_pointer_declarator" => {
+                    let child = current
+                        .child_by_field_name("declarator")
+                        .or_else(|| current.named_child(0))?;
+                    work.push(Work::Wrap(CppStructuredTypeWrapper::Pointer));
+                    work.push(Work::Visit(child));
+                }
+                "reference_declarator" => {
+                    let child = current
+                        .child_by_field_name("declarator")
+                        .or_else(|| current.named_child(0))?;
+                    work.push(Work::Wrap(CppStructuredTypeWrapper::Reference));
+                    work.push(Work::Visit(child));
+                }
+                "array_declarator" | "abstract_array_declarator" => {
+                    let child = current
+                        .child_by_field_name("declarator")
+                        .or_else(|| current.named_child(0))?;
+                    work.push(Work::Wrap(CppStructuredTypeWrapper::Array));
+                    work.push(Work::Visit(child));
+                }
+                "template_type" => {
+                    let name_node = current.child_by_field_name("name")?;
+                    let arguments = current
+                        .child_by_field_name("arguments")
+                        .map(|arguments_node| {
+                            let mut cursor = arguments_node.walk();
+                            arguments_node
+                                .named_children(&mut cursor)
+                                .filter(|child| !child.is_extra() && child.kind() != "comment")
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    work.push(Work::BuildGeneric {
+                        argument_count: arguments.len(),
+                    });
+                    work.extend(arguments.into_iter().rev().map(Work::Visit));
+                    work.push(Work::Visit(name_node));
+                }
+                "qualified_identifier"
+                | "scoped_identifier"
+                | "scoped_type_identifier"
+                | "type_identifier"
+                | "identifier"
+                | "namespace_identifier"
+                | "primitive_type" => {
+                    values.push(builder.named(cpp_structured_named_type(
+                        current,
+                        source,
+                        lexical_scope,
+                    )?)?);
+                }
+                _ => {
+                    let child = current.child_by_field_name("type").or_else(|| {
+                        (current.named_child_count() == 1)
+                            .then(|| current.named_child(0))
+                            .flatten()
+                    })?;
+                    work.push(Work::Visit(child));
+                }
+            },
+            Work::Wrap(wrapper) => {
+                let root = values.pop()?;
+                values.push(cpp_wrap_structured_type_node(&mut builder, root, wrapper)?);
+            }
+            Work::ApplyWrappers(wrappers) => {
+                let mut root = values.pop()?;
+                for wrapper in wrappers.into_iter().rev() {
+                    root = cpp_wrap_structured_type_node(&mut builder, root, wrapper)?;
+                }
+                values.push(root);
+            }
+            Work::BuildGeneric { argument_count } => {
+                let value_count = argument_count.checked_add(1)?;
+                let start = values.len().checked_sub(value_count)?;
+                let mut built = values.split_off(start);
+                let base = built.remove(0);
+                values.push(builder.generic(base, built)?);
+            }
+        }
+    }
+    (values.len() == 1)
+        .then(|| values.pop())
+        .flatten()
+        .and_then(|root| builder.finish(root))
+}
+
+fn cpp_structured_named_type(
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeName> {
+    let path = cpp_structured_type_path(node, source)?;
+    let absolute = node.child_by_field_name("scope").is_none()
+        && node.child(0).is_some_and(|child| child.kind() == "::");
+    StructuredTypeName::new(path, lexical_scope.to_vec(), absolute)
+}
+
+#[derive(Clone, Copy)]
+enum CppStructuredTypeWrapper {
+    Pointer,
+    Reference,
+    Array,
+}
+
+fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Vec<CppStructuredTypeWrapper> {
+    let mut wrappers = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "pointer_declarator" | "abstract_pointer_declarator" => {
+                wrappers.push(CppStructuredTypeWrapper::Pointer)
+            }
+            "reference_declarator" => wrappers.push(CppStructuredTypeWrapper::Reference),
+            "array_declarator" | "abstract_array_declarator" => {
+                wrappers.push(CppStructuredTypeWrapper::Array)
+            }
+            _ => break,
+        }
+        let Some(child) = current
+            .child_by_field_name("declarator")
+            .or_else(|| current.named_child(0))
+        else {
+            break;
+        };
+        current = child;
+    }
+    wrappers
+}
+
+fn cpp_wrap_structured_type(
+    identity: StructuredTypeIdentity,
+    wrapper: CppStructuredTypeWrapper,
+) -> Option<StructuredTypeIdentity> {
+    match wrapper {
+        CppStructuredTypeWrapper::Pointer => identity.wrap_pointer(),
+        CppStructuredTypeWrapper::Reference => identity.wrap_reference(),
+        CppStructuredTypeWrapper::Array => identity.wrap_array(),
+    }
+}
+
+fn cpp_wrap_structured_type_node(
+    builder: &mut StructuredTypeIdentityBuilder,
+    inner: crate::analyzer::model::StructuredTypeNodeId,
+    wrapper: CppStructuredTypeWrapper,
+) -> Option<crate::analyzer::model::StructuredTypeNodeId> {
+    match wrapper {
+        CppStructuredTypeWrapper::Pointer => builder.pointer(inner),
+        CppStructuredTypeWrapper::Reference => builder.reference(inner),
+        CppStructuredTypeWrapper::Array => builder.array(inner),
+    }
+}
+
+fn cpp_structured_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "namespace_identifier" | "type_identifier" | "primitive_type" => {
+                let component = node_text(current, source).to_string();
+                if component.is_empty() {
+                    return None;
+                }
+                path.push(component);
+            }
+            "template_type" | "dependent_type" => {
+                stack.push(current.child_by_field_name("name")?);
+            }
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                stack.push(current.child_by_field_name("name")?);
+                if let Some(scope) = current.child_by_field_name("scope") {
+                    stack.push(scope);
+                }
+            }
+            _ => return None,
+        }
+    }
+    (!path.is_empty()).then_some(path)
+}
+
+fn cpp_callable_lexical_scope(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "namespace_definition" | "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && let Some(name_node) = parent.child_by_field_name("name")
+        {
+            if let Some(components) = cpp_structured_type_path(name_node, source)
+                && !components.is_empty()
+            {
+                groups.push(components);
+            }
+        }
+        current = parent.parent();
+    }
+    groups.reverse();
+    groups.into_iter().flatten().collect()
+}
+
+fn cpp_callable_dispatch_extensibility(function_declarator: Node<'_>) -> DispatchExtensibility {
+    let mut declaration = None;
+    let mut current = Some(function_declarator);
+    while let Some(node) = current {
+        match node.kind() {
+            "template_declaration"
+            | "preproc_if"
+            | "preproc_ifdef"
+            | "preproc_else"
+            | "preproc_elif"
+            | "preproc_call"
+            | "ERROR" => return DispatchExtensibility::Open,
+            "declaration" | "field_declaration" | "function_definition" => {
+                declaration.get_or_insert(node);
+            }
+            "translation_unit" => break,
+            _ => {}
+        }
+        current = node.parent();
+    }
+    let Some(declaration) = declaration else {
+        return DispatchExtensibility::Open;
+    };
+
+    let mut saw_virtual_boundary = false;
+    let mut stack = vec![declaration];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "compound_statement" | "field_declaration_list" => continue,
+            "final" | "final_specifier" => return DispatchExtensibility::Closed,
+            "virtual"
+            | "override"
+            | "virtual_specifier"
+            | "pure_virtual_clause"
+            | "template_parameter_list"
+            | "template_method"
+            | "template_function"
+            | "ERROR" => saw_virtual_boundary = true,
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+
+    if saw_virtual_boundary {
+        DispatchExtensibility::Open
+    } else {
+        DispatchExtensibility::Closed
+    }
 }
 
 fn cpp_callable_linkage(declaration: Node<'_>, source: &str) -> CallableLinkage {

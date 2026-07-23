@@ -62,6 +62,9 @@ pub(crate) fn attach_positional_argument_roles<'tree, F>(
         let Some(argument) = arguments.named_child(index) else {
             continue;
         };
+        if !sink.should_continue() {
+            break;
+        }
         attach_argument_role_with_derived_name(sink, argument, name_of);
     }
 }
@@ -72,8 +75,10 @@ pub(crate) fn attach_terminal_callee<'tree>(
     terminal_name: Option<Node<'tree>>,
 ) {
     if let Some(name) = terminal_name {
-        sink.role_named(Role::Callee, name, name);
-        sink.set_name(name);
+        if sink.should_continue() {
+            sink.role_named(Role::Callee, name, name);
+            sink.set_name(name);
+        }
     } else {
         sink.role(Role::Callee, expression);
     }

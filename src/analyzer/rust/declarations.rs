@@ -1,7 +1,9 @@
+use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{
     CodeUnit, DispatchExtensibility, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
+    StructuredTypeIdentity, StructuredTypeName,
 };
 use crate::hash::{HashMap, HashSet};
 use std::path::Path;
@@ -1331,9 +1333,51 @@ fn visit_rust_field(
                 .to_string(),
             Vec::new(),
         )
+        .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
         .with_dispatch_extensibility(DispatchExtensibility::Closed),
     );
     Some(code_unit)
+}
+
+fn rust_enum_variant_owner_identity(
+    variant: Node<'_>,
+    source: &str,
+) -> Option<StructuredTypeIdentity> {
+    if variant.kind() != "enum_variant" {
+        return None;
+    }
+    let mut current = variant.parent()?;
+    while current.kind() != "enum_item" {
+        current = current.parent()?;
+    }
+    let enum_name = current.child_by_field_name("name")?;
+    let enum_name = rust_node_text(enum_name, source).trim();
+    if enum_name.is_empty() {
+        return None;
+    }
+
+    let mut lexical_scope = Vec::new();
+    let mut ancestor = current.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "mod_item" {
+            let name = node.child_by_field_name("name")?;
+            let name = rust_node_text(name, source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            lexical_scope.push(name.to_string());
+        }
+        ancestor = node.parent();
+    }
+    lexical_scope.reverse();
+
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    let root = builder.named(StructuredTypeName::new(
+        vec![enum_name.to_string()],
+        lexical_scope,
+        false,
+    )?)?;
+    builder.finish(root)
 }
 
 fn visit_rust_alias(

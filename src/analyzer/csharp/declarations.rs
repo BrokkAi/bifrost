@@ -1,7 +1,9 @@
+use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
-    SignatureMetadata, csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
+    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
     csharp_type_node_identity, csharp_type_reference_root,
 };
 use crate::hash::HashSet;
@@ -28,6 +30,7 @@ pub(super) fn parse_csharp_file(
 #[derive(Clone)]
 struct CSharpScope {
     package_name: String,
+    lexical_scope: Vec<String>,
     class_unit: Option<CodeUnit>,
 }
 
@@ -54,6 +57,7 @@ impl<'a> CSharpVisitor<'a> {
             node,
             CSharpScope {
                 package_name: package_name.to_string(),
+                lexical_scope: Vec::new(),
                 class_unit,
             },
             &mut stack,
@@ -79,9 +83,14 @@ impl<'a> CSharpVisitor<'a> {
         let mut scoped: Vec<(Node<'tree>, CSharpScope)> = Vec::with_capacity(children.len());
         for child in children {
             if child.kind() == "file_scoped_namespace_declaration" {
-                if let Some(package_name) = self.namespace_scope_name(child, &current) {
+                if let Some(namespace_path) = self.namespace_scope_path(child) {
+                    let package_name =
+                        csharp_join_namespace(&current.package_name, &namespace_path);
+                    let mut lexical_scope = current.lexical_scope.clone();
+                    lexical_scope.extend(namespace_path);
                     current = CSharpScope {
                         package_name,
+                        lexical_scope,
                         class_unit: current.class_unit.clone(),
                     };
                 }
@@ -97,17 +106,9 @@ impl<'a> CSharpVisitor<'a> {
         }
     }
 
-    fn namespace_scope_name(&self, node: Node<'_>, scope: &CSharpScope) -> Option<String> {
+    fn namespace_scope_path(&self, node: Node<'_>) -> Option<Vec<String>> {
         let name_node = node.child_by_field_name("name")?;
-        let raw_name = cs_node_text(name_node, self.source).trim();
-        if raw_name.is_empty() {
-            return None;
-        }
-        Some(if scope.package_name.is_empty() {
-            raw_name.to_string()
-        } else {
-            format!("{}.{}", scope.package_name, raw_name)
-        })
+        csharp_namespace_path(name_node, self.source)
     }
 
     fn visit_node<'tree>(
@@ -153,23 +154,18 @@ impl<'a> CSharpVisitor<'a> {
         scope: &CSharpScope,
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
-        let Some(name_node) = node.child_by_field_name("name") else {
+        let Some(namespace_path) = self.namespace_scope_path(node) else {
             return;
         };
-        let raw_name = cs_node_text(name_node, self.source).trim();
-        if raw_name.is_empty() {
-            return;
-        }
-        let package_name = if scope.package_name.is_empty() {
-            raw_name.to_string()
-        } else {
-            format!("{}.{}", scope.package_name, raw_name)
-        };
+        let package_name = csharp_join_namespace(&scope.package_name, &namespace_path);
+        let mut lexical_scope = scope.lexical_scope.clone();
+        lexical_scope.extend(namespace_path);
         if let Some(body) = cs_namespace_body(node) {
             self.push_children(
                 body,
                 CSharpScope {
                     package_name,
+                    lexical_scope,
                     class_unit: scope.class_unit.clone(),
                 },
                 stack,
@@ -203,7 +199,7 @@ impl<'a> CSharpVisitor<'a> {
         let short_name = if let Some(parent) = &scope.class_unit {
             format!("{}${identity_name}", parent.short_name())
         } else {
-            identity_name
+            identity_name.clone()
         };
         let code_unit = CodeUnit::new(
             self.file.clone(),
@@ -222,14 +218,20 @@ impl<'a> CSharpVisitor<'a> {
             code_unit.clone(),
             extract_csharp_supertypes(node, self.source),
         );
-        self.parsed
-            .add_signature(code_unit.clone(), csharp_type_signature(node, self.source));
+        self.parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
+                .with_type_parameters(csharp_declaration_type_parameters(node, self.source)),
+        );
 
         if let Some(body) = cs_type_body(node) {
+            let mut lexical_scope = scope.lexical_scope.clone();
+            lexical_scope.push(identity_name);
             self.push_children(
                 body,
                 CSharpScope {
                     package_name: scope.package_name.clone(),
+                    lexical_scope,
                     class_unit: Some(code_unit),
                 },
                 stack,
@@ -267,7 +269,7 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_method_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source),
+            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope),
         );
     }
 
@@ -300,7 +302,7 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_constructor_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source),
+            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope),
         );
     }
 
@@ -331,7 +333,7 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_property_signature(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_dispatch_signature_metadata(signature, node, self.source),
+            csharp_dispatch_signature_metadata(signature, node, self.source, &scope.lexical_scope),
         );
     }
 
@@ -347,10 +349,13 @@ impl<'a> CSharpVisitor<'a> {
         };
 
         let prefix = csharp_field_prefix(node, declaration, self.source);
-        let type_text = declaration
-            .child_by_field_name("type")
+        let type_node = declaration.child_by_field_name("type");
+        let type_text = type_node
             .map(|child| normalize_cs_whitespace(cs_node_text(child, self.source)))
             .unwrap_or_default();
+        let return_type_identity = type_node.and_then(|type_node| {
+            csharp_structured_type_identity(type_node, self.source, &scope.lexical_scope)
+        });
         let declaration_text = normalize_cs_whitespace(cs_node_text(node, self.source));
 
         let mut cursor = declaration.walk();
@@ -383,6 +388,8 @@ impl<'a> CSharpVisitor<'a> {
             self.parsed.add_signature_with_metadata(
                 code_unit,
                 SignatureMetadata::new(signature, Vec::new())
+                    .with_return_type_text((!type_text.is_empty()).then(|| type_text.clone()))
+                    .with_return_type_identity(return_type_identity.clone())
                     .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
         }
@@ -544,22 +551,48 @@ fn csharp_dispatch_signature_metadata(
     signature: String,
     node: Node<'_>,
     source: &str,
+    lexical_scope: &[String],
 ) -> SignatureMetadata {
-    SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(
-        super::csharp_callable_dispatch_extensibility(
+    let return_type = csharp_declared_type_node(node);
+    SignatureMetadata::new(signature, Vec::new())
+        .with_return_type_text(
+            return_type
+                .map(|return_type| csharp_type_node_identity(return_type, source))
+                .filter(|return_type| !return_type.is_empty()),
+        )
+        .with_return_type_identity(return_type.and_then(|return_type| {
+            csharp_structured_type_identity(return_type, source, lexical_scope)
+        }))
+        .with_dispatch_extensibility(super::csharp_callable_dispatch_extensibility(
             source,
             node,
             super::csharp_has_modifier(source, node, "static"),
-        ),
-    )
+        ))
 }
 
-fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+fn csharp_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> SignatureMetadata {
     let callable_arity = csharp_callable_arity(node);
     let type_parameters = csharp_method_type_parameters(node, source);
-    let return_type_text = csharp_return_type_text(node, source);
+    let return_type = csharp_declared_type_node(node);
+    let return_type_text = return_type
+        .map(|return_type| csharp_type_node_identity(return_type, source))
+        .filter(|return_type| !return_type.is_empty());
+    let return_type_identity = return_type.and_then(|return_type| {
+        csharp_structured_type_identity(return_type, source, lexical_scope)
+    });
     let bare_return_type_parameter =
         csharp_bare_return_type_parameter(node, source, &type_parameters);
+    let extension_receiver_type_node = csharp_extension_receiver_type_node(node, source);
+    let extension_receiver_type = extension_receiver_type_node
+        .map(|type_node| csharp_type_node_identity(type_node, source))
+        .filter(|receiver_type| !receiver_type.is_empty());
+    let extension_receiver_type_identity = extension_receiver_type_node
+        .and_then(|type_node| csharp_structured_type_identity(type_node, source, lexical_scope));
     let parameter_text = csharp_rendered_parameter_text(node, source);
     let metadata = if let Some(parameters_start) = signature.find(&parameter_text) {
         let parameters_end = parameters_start + parameter_text.len();
@@ -583,13 +616,19 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
             .with_callable_arity(callable_arity)
             .with_type_parameters(type_parameters)
             .with_return_type_text(return_type_text)
+            .with_return_type_identity(return_type_identity)
             .with_bare_return_type_parameter(bare_return_type_parameter)
+            .with_extension_receiver_type(extension_receiver_type)
+            .with_extension_receiver_type_identity(extension_receiver_type_identity)
     } else {
         SignatureMetadata::new(signature, Vec::new())
             .with_callable_arity(callable_arity)
             .with_type_parameters(type_parameters)
             .with_return_type_text(return_type_text)
+            .with_return_type_identity(return_type_identity)
             .with_bare_return_type_parameter(bare_return_type_parameter)
+            .with_extension_receiver_type(extension_receiver_type)
+            .with_extension_receiver_type_identity(extension_receiver_type_identity)
     };
     metadata.with_dispatch_extensibility(super::csharp_callable_dispatch_extensibility(
         source,
@@ -598,11 +637,29 @@ fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) ->
     ))
 }
 
-fn csharp_return_type_text(node: Node<'_>, source: &str) -> Option<String> {
+fn csharp_extension_receiver_type_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut parameters_cursor = parameters.walk();
+    let first_parameter = parameters
+        .named_children(&mut parameters_cursor)
+        .find(|child| child.kind() == "parameter")?;
+    let mut parameter_cursor = first_parameter.walk();
+    let has_this_modifier = first_parameter
+        .named_children(&mut parameter_cursor)
+        .any(|child| child.kind() == "modifier" && cs_node_text(child, source) == "this");
+    if !has_this_modifier {
+        return None;
+    }
+    first_parameter.child_by_field_name("type")
+}
+
+fn csharp_declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("returns")
         .or_else(|| node.child_by_field_name("return_type"))
-        .map(|return_type| csharp_type_node_identity(return_type, source))
-        .filter(|return_type| !return_type.is_empty())
+        .or_else(|| node.child_by_field_name("type"))
 }
 
 fn csharp_bare_return_type_parameter(
@@ -646,6 +703,221 @@ fn csharp_method_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
             (!text.is_empty()).then(|| text.to_string())
         })
         .collect()
+}
+
+fn csharp_declaration_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    csharp_method_type_parameters(node, source)
+}
+
+enum CSharpStructuredTypeFrame<'tree> {
+    Visit(Node<'tree>),
+    WrapReference,
+    WrapPointer,
+    WrapArray,
+    BuildGeneric { argument_count: usize },
+}
+
+/// Persist the parser-proven shape of a C# declared type. The arena builder and
+/// explicit frame stack keep indexing safe even for adversarially deep type
+/// syntax, while the lexical scope preserves the exact nested lookup context
+/// needed by bounded consumers.
+fn csharp_structured_type_identity(
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeIdentity> {
+    let mut frames = vec![CSharpStructuredTypeFrame::Visit(node)];
+    let mut values = Vec::new();
+    let mut builder = StructuredTypeIdentityBuilder::default();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            CSharpStructuredTypeFrame::Visit(node) => match node.kind() {
+                "type" | "simple_base_type" | "primary_constructor_base_type" => {
+                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
+                        node,
+                    )?));
+                }
+                // Nullable reference types retain the same nominal declaration.
+                // Value-type nullable members are library-supplied and therefore
+                // do not publish a workspace member target through this path.
+                "nullable_type" => {
+                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
+                        node,
+                    )?));
+                }
+                "ref_type" => {
+                    frames.push(CSharpStructuredTypeFrame::WrapReference);
+                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
+                        node,
+                    )?));
+                }
+                "pointer_type" => {
+                    frames.push(CSharpStructuredTypeFrame::WrapPointer);
+                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
+                        node,
+                    )?));
+                }
+                "array_type" => {
+                    frames.push(CSharpStructuredTypeFrame::WrapArray);
+                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
+                        node,
+                    )?));
+                }
+                "identifier"
+                | "predefined_type"
+                | "qualified_name"
+                | "alias_qualified_name"
+                | "generic_name" => {
+                    let (name, arguments) =
+                        csharp_structured_named_type(node, source, lexical_scope)?;
+                    values.push(builder.named(name)?);
+                    if !arguments.is_empty() {
+                        frames.push(CSharpStructuredTypeFrame::BuildGeneric {
+                            argument_count: arguments.len(),
+                        });
+                        frames.extend(
+                            arguments
+                                .into_iter()
+                                .rev()
+                                .map(CSharpStructuredTypeFrame::Visit),
+                        );
+                    }
+                }
+                _ => return None,
+            },
+            CSharpStructuredTypeFrame::WrapReference => {
+                let inner = values.pop()?;
+                values.push(builder.reference(inner)?);
+            }
+            CSharpStructuredTypeFrame::WrapPointer => {
+                let inner = values.pop()?;
+                values.push(builder.pointer(inner)?);
+            }
+            CSharpStructuredTypeFrame::WrapArray => {
+                let inner = values.pop()?;
+                values.push(builder.array(inner)?);
+            }
+            CSharpStructuredTypeFrame::BuildGeneric { argument_count } => {
+                let value_count = argument_count.checked_add(1)?;
+                let start = values.len().checked_sub(value_count)?;
+                let mut built = values.split_off(start);
+                let base = built.remove(0);
+                values.push(builder.generic(base, built)?);
+            }
+        }
+    }
+
+    (values.len() == 1)
+        .then(|| values.pop())
+        .flatten()
+        .and_then(|root| builder.finish(root))
+}
+
+fn csharp_structured_named_type<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<(StructuredTypeName, Vec<Node<'tree>>)> {
+    let mut path = Vec::new();
+    let mut arguments = Vec::new();
+    let mut absolute = false;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "predefined_type" => {
+                path.push(csharp_identifier_text(current, source)?);
+            }
+            "generic_name" => {
+                let name = current
+                    .child_by_field_name("name")
+                    .or_else(|| current.named_child(0))?;
+                let type_arguments = current
+                    .child_by_field_name("type_arguments")
+                    .or_else(|| first_named_child_of_kind(current, "type_argument_list"))?;
+                let mut cursor = type_arguments.walk();
+                let generic_arguments = type_arguments
+                    .named_children(&mut cursor)
+                    .collect::<Vec<_>>();
+                let name = csharp_identifier_text(name, source)?;
+                path.push(format!("{name}`{}", generic_arguments.len()));
+                arguments.extend(generic_arguments);
+            }
+            "qualified_name" => {
+                let qualifier = current
+                    .child_by_field_name("qualifier")
+                    .or_else(|| current.named_child(0))?;
+                let name = current
+                    .child_by_field_name("name")
+                    .or_else(|| current.named_child(current.named_child_count().checked_sub(1)?))?;
+                stack.push(name);
+                stack.push(qualifier);
+            }
+            "alias_qualified_name" => {
+                let alias = current
+                    .child_by_field_name("alias")
+                    .or_else(|| current.named_child(0))?;
+                let name = current
+                    .child_by_field_name("name")
+                    .or_else(|| current.named_child(current.named_child_count().checked_sub(1)?))?;
+                let alias = csharp_identifier_text(alias, source)?;
+                if alias == "global" {
+                    absolute = true;
+                } else {
+                    path.push(alias);
+                }
+                stack.push(name);
+            }
+            _ => return None,
+        }
+    }
+    let name = StructuredTypeName::new(path, lexical_scope.to_vec(), absolute)?;
+    Some((name, arguments))
+}
+
+fn csharp_type_wrapper_child(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("type").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).next()
+    })
+}
+
+fn csharp_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = cs_node_text(node, source).trim();
+    let text = text.strip_prefix('@').unwrap_or(text);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn csharp_namespace_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" => path.push(csharp_identifier_text(current, source)?),
+            "qualified_name" => {
+                let qualifier = current
+                    .child_by_field_name("qualifier")
+                    .or_else(|| current.named_child(0))?;
+                let name = current
+                    .child_by_field_name("name")
+                    .or_else(|| current.named_child(current.named_child_count().checked_sub(1)?))?;
+                stack.push(name);
+                stack.push(qualifier);
+            }
+            _ => return None,
+        }
+    }
+    (!path.is_empty()).then_some(path)
+}
+
+fn csharp_join_namespace(prefix: &str, path: &[String]) -> String {
+    if prefix.is_empty() {
+        path.join(".")
+    } else if path.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}.{}", path.join("."))
+    }
 }
 
 fn csharp_callable_arity(node: Node<'_>) -> CallableArity {

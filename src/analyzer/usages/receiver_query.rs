@@ -9,6 +9,7 @@ use crate::analyzer::semantic::{
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::structural::FileFacts;
+use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
@@ -16,11 +17,15 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
     java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
     js_ts::parse_js_ts_tree,
-    parse_tree_for_language, resolve_csharp_bounded, resolve_reference_site_with_line_starts,
+    parse_tree_for_language, resolve_cpp_bounded, resolve_csharp_bounded, resolve_go_bounded,
+    resolve_php_bounded, resolve_python_bounded, resolve_reference_site_with_line_starts,
+    resolve_ruby_bounded, resolve_rust_bounded, resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
-    resolve_csharp_type_bounded,
+    resolve_cpp_type_bounded, resolve_csharp_type_bounded, resolve_go_type_bounded,
+    resolve_php_type_bounded, resolve_python_type_bounded, resolve_ruby_type_bounded,
+    resolve_rust_type_bounded, resolve_scala_type_bounded,
 };
 use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
     JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
@@ -39,8 +44,10 @@ use crate::analyzer::usages::receiver_sites::{
 use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, SourceLocationRequest};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, CSharpAnalyzer, CodeUnit, DispatchExtensibility, IAnalyzer, Language,
-    ProjectFile, Range, WorkspaceAnalyzer, resolve_analyzer,
+    AnalyzerDefinitionLookup, CSharpAnalyzer, CodeUnit, CppAnalyzer, DispatchExtensibility,
+    GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, ProjectFile,
+    PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    WorkspaceAnalyzer, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -201,7 +208,18 @@ enum SemanticReceiverEvidence {
     Incomplete {
         coverage: CandidateCoverage,
         unsupported: Option<SemanticCapability>,
+        origin: SemanticReceiverIncompleteness,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticReceiverIncompleteness {
+    /// The retained candidates are individually proven and complete, but a
+    /// globally incomplete adapter capability keeps the candidate set open.
+    GlobalCapabilitiesWithProvenCandidates,
+    /// Query-local uncertainty, including unproven candidates and disabled or
+    /// truncated call context.
+    Local,
 }
 
 impl SemanticReceiverEvidence {
@@ -215,12 +233,46 @@ impl SemanticReceiverEvidence {
                     SemanticOutcome::Unsupported { capability, .. } => Some(*capability),
                     _ => None,
                 },
+                origin: SemanticReceiverIncompleteness::Local,
             }
         }
     }
 
+    fn from_points_to_outcome(
+        outcome: &SemanticOutcome<SourcePointsToResult>,
+        points_to: &SourcePointsToResult,
+    ) -> Self {
+        let mut evidence = Self::from_outcome(outcome, points_to.coverage());
+        if matches!(
+            evidence,
+            Self::Incomplete {
+                coverage: CandidateCoverage::Open,
+                unsupported: None,
+                ..
+            }
+        ) && points_to.globally_incomplete_with_proven_candidates()
+        {
+            evidence = Self::Incomplete {
+                coverage: CandidateCoverage::Open,
+                unsupported: None,
+                origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+            };
+        }
+        evidence
+    }
+
     const fn supports_precise(self) -> bool {
         matches!(self, Self::ExhaustiveComplete)
+    }
+
+    const fn legacy_provider_can_close(self) -> bool {
+        matches!(
+            self,
+            Self::Incomplete {
+                origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+                ..
+            }
+        )
     }
 
     const fn is_truncated(self) -> bool {
@@ -461,10 +513,22 @@ impl<'a> ReceiverQueryService<'a> {
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         check_cancelled(cancellation)?;
         let language = language_for_file(file);
-        if language == Language::CSharp {
-            return self.analyze_csharp(
+        let structural_receiver_supported = match language {
+            Language::Cpp
+            | Language::CSharp
+            | Language::Go
+            | Language::Php
+            | Language::Python
+            | Language::Ruby
+            | Language::Rust
+            | Language::Scala => true,
+            _ => false,
+        };
+        if structural_receiver_supported {
+            return self.analyze_structural(
                 operation,
                 file,
+                language,
                 range,
                 input,
                 structural_facts,
@@ -806,7 +870,7 @@ impl<'a> ReceiverQueryService<'a> {
             _ => None,
         };
         let evidence = outcome.available_value().map(|points_to| {
-            let evidence = SemanticReceiverEvidence::from_outcome(&outcome, points_to.coverage());
+            let evidence = SemanticReceiverEvidence::from_points_to_outcome(&outcome, points_to);
             if semantic.call_context_disabled
                 && points_to.object_candidates().any(|candidate| {
                     matches!(
@@ -822,6 +886,7 @@ impl<'a> ReceiverQueryService<'a> {
                         CandidateCoverage::Open
                     },
                     unsupported,
+                    origin: SemanticReceiverIncompleteness::Local,
                 }
             } else {
                 evidence
@@ -847,10 +912,11 @@ impl<'a> ReceiverQueryService<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn analyze_csharp(
+    fn analyze_structural(
         &self,
         operation: ReceiverQueryOperation,
         file: &ProjectFile,
+        language: Language,
         range: Range,
         input: ReceiverQueryInput,
         structural_facts: Option<&Arc<FileFacts>>,
@@ -861,7 +927,7 @@ impl<'a> ReceiverQueryService<'a> {
             return Ok(unsupported_report(
                 operation,
                 file,
-                Language::CSharp,
+                language,
                 range,
                 "receiver_semantic_workspace_unavailable",
                 None,
@@ -873,7 +939,7 @@ impl<'a> ReceiverQueryService<'a> {
             return Ok(unsupported_report(
                 operation,
                 file,
-                Language::CSharp,
+                language,
                 range,
                 "receiver_structural_facts_unavailable",
                 None,
@@ -905,31 +971,53 @@ impl<'a> ReceiverQueryService<'a> {
                         return Ok(setup_budget_report(
                             operation,
                             file,
-                            Language::CSharp,
+                            language,
                             range,
                             index.source(),
                             ledger.work(),
                         ));
                     }
-                    let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(self.analyzer) else {
+                    let Some(syntax) = prepared_structural_syntax_limited(
+                        self.analyzer,
+                        language,
+                        file,
+                        index.source().len(),
+                        cancellation,
+                    ) else {
                         let mut report = unsupported_report(
                             operation,
                             file,
-                            Language::CSharp,
+                            language,
                             range,
-                            "csharp_analyzer_unavailable",
+                            "receiver_analyzer_unavailable",
                             Some(index.source()),
                         );
                         report.work = ledger.work();
                         return Ok(report);
                     };
-                    let syntax = match csharp.prepared_syntax_limited(file, index.source().len()) {
-                        Ok(Some(syntax)) if syntax.source() == index.source() => syntax,
-                        Ok(Some(_)) | Err(_) => {
+                    let syntax = match syntax {
+                        StructuralSyntaxLimitedOutcome::Available(syntax) => {
+                            let syntax = syntax.into_inner();
+                            if syntax.source() == index.source() {
+                                syntax
+                            } else {
+                                let mut report = unsupported_report(
+                                    operation,
+                                    file,
+                                    language,
+                                    range,
+                                    "receiver_source_snapshot_mismatch",
+                                    Some(index.source()),
+                                );
+                                report.work = ledger.work();
+                                return Ok(report);
+                            }
+                        }
+                        StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
                             let mut report = unsupported_report(
                                 operation,
                                 file,
-                                Language::CSharp,
+                                language,
                                 range,
                                 "receiver_source_snapshot_mismatch",
                                 Some(index.source()),
@@ -937,13 +1025,16 @@ impl<'a> ReceiverQueryService<'a> {
                             report.work = ledger.work();
                             return Ok(report);
                         }
-                        Ok(None) => {
+                        StructuralSyntaxLimitedOutcome::Cancelled => {
+                            return Err(ReceiverQueryError::Cancelled);
+                        }
+                        StructuralSyntaxLimitedOutcome::Unavailable => {
                             let mut report = unsupported_report(
                                 operation,
                                 file,
-                                Language::CSharp,
+                                language,
                                 range,
-                                "csharp_parse_failed",
+                                "receiver_source_parse_failed",
                                 Some(index.source()),
                             );
                             report.work = ledger.work();
@@ -965,7 +1056,7 @@ impl<'a> ReceiverQueryService<'a> {
                     return Ok(setup_budget_report(
                         operation,
                         file,
-                        Language::CSharp,
+                        language,
                         range,
                         facts.source(),
                         ledger.work(),
@@ -981,7 +1072,7 @@ impl<'a> ReceiverQueryService<'a> {
         let prepared_files = self.prepared_structural_files.borrow();
         let prepared = prepared_files
             .get(file)
-            .expect("C# receiver sites were prepared above");
+            .expect("structural receiver sites were prepared above");
         debug_assert!(prepared.matches(facts));
         let source = prepared.sites.source();
         let selection_mode = match input {
@@ -1010,7 +1101,7 @@ impl<'a> ReceiverQueryService<'a> {
                 return Ok(setup_budget_report(
                     operation,
                     file,
-                    Language::CSharp,
+                    language,
                     range,
                     source,
                     ledger.work(),
@@ -1029,7 +1120,7 @@ impl<'a> ReceiverQueryService<'a> {
                 let mut report = unsupported_report(
                     operation,
                     file,
-                    Language::CSharp,
+                    language,
                     range,
                     "receiver_site_without_receiver",
                     Some(source),
@@ -1046,7 +1137,7 @@ impl<'a> ReceiverQueryService<'a> {
             let mut report = unsupported_report(
                 operation,
                 file,
-                Language::CSharp,
+                language,
                 range,
                 "member_target_site_unsupported",
                 Some(source),
@@ -1064,7 +1155,7 @@ impl<'a> ReceiverQueryService<'a> {
             .map(str::to_string);
         let report_site = site(
             file,
-            Language::CSharp,
+            language,
             query_range,
             source,
             syntax_kind,
@@ -1078,8 +1169,9 @@ impl<'a> ReceiverQueryService<'a> {
             return Ok(budget_report(operation, report_site, ledger.work(), limit));
         }
 
-        let reference_site = csharp_reference_site(file, source, query_range);
-        let resolution = resolve_csharp_type_bounded(
+        let reference_site = structural_reference_site(file, source, query_range);
+        let resolution = resolve_structural_type_bounded(
+            language,
             self.analyzer,
             file,
             source,
@@ -1094,13 +1186,9 @@ impl<'a> ReceiverQueryService<'a> {
                 return Ok(budget_report(operation, report_site, ledger.work(), limit));
             }
         };
-        if type_outcome
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.kind == "csharp_dynamic_receiver_unsupported")
-        {
+        if let Some(reason) = structural_receiver_unsupported_reason(language, &type_outcome) {
             let mut report = unknown_report(operation, report_site, ledger.work(), false);
-            neutral_unsupported(&mut report.analysis, "csharp_dynamic_receiver_unsupported");
+            neutral_unsupported(&mut report.analysis, reason);
             return Ok(report);
         }
         let static_type_reference = type_outcome.target_kind == TypeLookupTargetKind::TypeReference;
@@ -1173,8 +1261,9 @@ impl<'a> ReceiverQueryService<'a> {
 
         if operation == ReceiverQueryOperation::MemberTargets {
             let member_range = member_range.expect("member target range was validated above");
-            let reference_site = csharp_reference_site(file, source, member_range);
-            let resolution = resolve_csharp_bounded(
+            let reference_site = structural_reference_site(file, source, member_range);
+            let resolution = resolve_structural_definition_bounded(
+                language,
                 self.analyzer,
                 file,
                 source,
@@ -1192,14 +1281,20 @@ impl<'a> ReceiverQueryService<'a> {
             let (outcome, resolution_truncated) =
                 definition_outcome(outcome, ledger.remaining_budget().max_targets);
             let mut analysis = ReceiverQueryAnalysis::MemberTargets(outcome);
-            let mut dispatch_supports_precise = true;
-            if analysis_is_precise(&analysis)
+            let statically_bound_data_member =
+                structural_member_is_statically_bound_data_member(language, &analysis);
+            let evidence_supports_precision =
+                evidence.supports_precise() || statically_bound_data_member;
+            let mut dispatch_supports_precise = statically_bound_data_member;
+            if !statically_bound_data_member
+                && analysis_is_precise(&analysis)
                 && evidence.supports_precise()
                 && !resolution_truncated
                 && (!static_type_reference || static_type_resolved)
             {
-                dispatch_supports_precise = match csharp_member_dispatch_supports_precise(
+                dispatch_supports_precise = match structural_member_dispatch_supports_precise(
                     self.analyzer,
+                    language,
                     &analysis,
                     Some(cancellation),
                     &mut ledger,
@@ -1210,7 +1305,7 @@ impl<'a> ReceiverQueryService<'a> {
                     }
                 };
             }
-            if !evidence.supports_precise()
+            if !evidence_supports_precision
                 || resolution_truncated
                 || !dispatch_supports_precise
                 || (static_type_reference && !static_type_resolved)
@@ -1227,8 +1322,8 @@ impl<'a> ReceiverQueryService<'a> {
             });
         }
 
-        let points_to =
-            points_to.expect("non-static C# receiver analysis requires neutral points-to evidence");
+        let points_to = points_to
+            .expect("non-static structural receiver analysis requires neutral points-to evidence");
         let query_node = match java_smallest_named_node_covering(
             prepared.syntax.tree().root_node(),
             query_range.start_byte,
@@ -1241,9 +1336,13 @@ impl<'a> ReceiverQueryService<'a> {
                 return Ok(budget_report(operation, report_site, ledger.work(), limit));
             }
         };
-        let factory = if let Some(factory_node) = query_node.and_then(csharp_factory_name_node) {
-            let factory_site = csharp_reference_site(file, source, node_range(factory_node));
-            let resolution = resolve_csharp_bounded(
+        let factories = if points_to_contains_call_result(&points_to, Some(cancellation))?
+            && let Some(factory_node) =
+                query_node.and_then(|node| structural_factory_name_node(language, node))
+        {
+            let factory_site = structural_reference_site(file, source, node_range(factory_node));
+            let resolution = resolve_structural_definition_bounded(
+                language,
                 self.analyzer,
                 file,
                 source,
@@ -1255,24 +1354,31 @@ impl<'a> ReceiverQueryService<'a> {
             match charge_bounded_resolution(&mut ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome)
                     if outcome.status == DefinitionLookupStatus::Resolved
-                        && outcome.definitions.len() == 1
-                        && outcome.definitions[0].is_function() =>
+                        && !outcome.definitions.is_empty()
+                        && outcome.definitions.iter().all(|definition| {
+                            if language == Language::Cpp {
+                                definition.is_callable()
+                            } else {
+                                definition.is_function()
+                            }
+                        })
+                        && (language == Language::Cpp || outcome.definitions.len() == 1) =>
                 {
-                    outcome.definitions.into_iter().next()
+                    outcome.definitions
                 }
-                CompatibilityOutcome::Complete(_) => None,
+                CompatibilityOutcome::Complete(_) => Vec::new(),
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(operation, report_site, ledger.work(), limit));
                 }
             }
         } else {
-            None
+            Vec::new()
         };
         let values = project_receiver_values(
             workspace,
             &points_to,
             &type_outcome,
-            factory,
+            &factories,
             false,
             Some(cancellation),
             &mut ledger,
@@ -1725,7 +1831,9 @@ impl<'a> ReceiverQueryService<'a> {
             .sum::<usize>()
             > ledger.remaining_budget().max_targets;
 
-        let factory = if let Some(factory_node) = java_factory_name_node(query_node) {
+        let factory = if points_to_contains_call_result(&points_to, cancellation)?
+            && let Some(factory_node) = java_factory_name_node(query_node)
+        {
             let factory_resolution = java_definition_at(
                 self.analyzer,
                 &self.definitions,
@@ -1797,7 +1905,7 @@ impl<'a> ReceiverQueryService<'a> {
                     workspace,
                     &points_to,
                     &type_outcome,
-                    factory,
+                    factory.as_ref().map_or(&[], std::slice::from_ref),
                     type_reference,
                     cancellation,
                     &mut ledger,
@@ -1879,8 +1987,128 @@ fn analysis_is_precise(analysis: &ReceiverQueryAnalysis) -> bool {
     }
 }
 
-fn csharp_member_dispatch_supports_precise(
+fn prepared_structural_syntax_limited(
     analyzer: &dyn IAnalyzer,
+    language: Language,
+    file: &ProjectFile,
+    max_source_bytes: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Option<StructuralSyntaxLimitedOutcome> {
+    analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)
+        .map(|provider| provider.structural_syntax_limited(file, max_source_bytes, cancellation))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_structural_type_bounded(
+    language: Language,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&tree_sitter::Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    match language {
+        Language::Cpp => {
+            resolve_cpp_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::CSharp => {
+            resolve_csharp_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Go => {
+            resolve_go_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Php => {
+            resolve_php_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Python => {
+            resolve_python_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Ruby => {
+            resolve_ruby_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Rust => {
+            resolve_rust_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Scala => {
+            resolve_scala_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        _ => unreachable!("unsupported structural receiver language"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_structural_definition_bounded(
+    language: Language,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&tree_sitter::Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    match language {
+        Language::Cpp => {
+            resolve_cpp_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::CSharp => {
+            resolve_csharp_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Go => {
+            resolve_go_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Php => {
+            resolve_php_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Python => {
+            resolve_python_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Ruby => {
+            resolve_ruby_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Rust => {
+            resolve_rust_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Scala => {
+            resolve_scala_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        _ => unreachable!("unsupported structural receiver language"),
+    }
+}
+
+fn structural_receiver_unsupported_reason(
+    language: Language,
+    outcome: &TypeLookupOutcome,
+) -> Option<&'static str> {
+    match language {
+        Language::Cpp
+            if outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "cpp_c_receiver_unsupported") =>
+        {
+            Some("cpp_c_receiver_unsupported")
+        }
+        Language::CSharp
+            if outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "csharp_dynamic_receiver_unsupported") =>
+        {
+            Some("csharp_dynamic_receiver_unsupported")
+        }
+        _ => None,
+    }
+}
+
+fn structural_member_dispatch_supports_precise(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
     analysis: &ReceiverQueryAnalysis,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
@@ -1893,23 +2121,41 @@ fn csharp_member_dispatch_supports_precise(
         return Ok(CompatibilityOutcome::Complete(false));
     };
     check_cancelled(cancellation)?;
+    if structural_member_is_statically_bound_data_member(language, analysis) {
+        return Ok(CompatibilityOutcome::Complete(true));
+    }
     if let Err(limit) = charge_summary_step(ledger) {
         return Ok(CompatibilityOutcome::Exceeded(limit));
     }
     if let Err(limit) = charge_scope_step(ledger) {
         return Ok(CompatibilityOutcome::Exceeded(limit));
     }
-    let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
+    let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
+    let metadata = match language {
+        Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer)
+            .map(|cpp| cpp.signature_metadata_limited(target, provider_limit)),
+        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
+            .map(|csharp| csharp.signature_metadata_limited(target, provider_limit)),
+        Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
+            .map(|go| go.signature_metadata_limited(target, provider_limit)),
+        Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
+            .map(|php| php.signature_metadata_limited(target, provider_limit)),
+        Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
+            .map(|python| python.signature_metadata_limited(target, provider_limit)),
+        Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer)
+            .map(|ruby| ruby.signature_metadata_limited(target, provider_limit)),
+        Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer)
+            .map(|rust| rust.signature_metadata_limited(target, provider_limit)),
+        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
+            .map(|scala| scala.signature_metadata_limited(target, provider_limit)),
+        _ => None,
+    };
+    let Some(metadata) = metadata else {
         return Ok(CompatibilityOutcome::Exceeded(
             ReceiverBudgetLimit::ScopeNodes,
         ));
     };
-    let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
-    let metadata = match charge_limited_projection(
-        csharp.signature_metadata_limited(target, provider_limit),
-        cancellation,
-        ledger,
-    )? {
+    let metadata = match charge_limited_projection(metadata, cancellation, ledger)? {
         CompatibilityOutcome::Complete(metadata) => metadata,
         CompatibilityOutcome::Exceeded(limit) => {
             return Ok(CompatibilityOutcome::Exceeded(limit));
@@ -1921,6 +2167,18 @@ fn csharp_member_dispatch_supports_precise(
     Ok(CompatibilityOutcome::Complete(metadata.iter().all(
         |metadata| metadata.dispatch_extensibility() == Some(DispatchExtensibility::Closed),
     )))
+}
+
+fn structural_member_is_statically_bound_data_member(
+    language: Language,
+    analysis: &ReceiverQueryAnalysis,
+) -> bool {
+    let ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(targets)) = analysis
+    else {
+        return false;
+    };
+    matches!(targets.as_slice(), [target] if target.is_field())
+        && matches!(language, Language::Cpp | Language::Go)
 }
 
 fn finalize_legacy_report(
@@ -1952,7 +2210,13 @@ fn apply_semantic_gate(
             report.candidates_truncated |= removed;
             report.candidates_truncated |= evidence.is_truncated();
             report.semantic_unsupported = evidence.unsupported_capability();
-            if !evidence.supports_precise() {
+            // The legacy JS/TS provider independently proves closure for its
+            // supported lexical forms. Preserve that proof only when neutral
+            // candidates are themselves proven/complete and openness comes
+            // from the adapter's global capability surface. Query-local
+            // uncertainty (including disabled call context) remains
+            // non-precise.
+            if !evidence.supports_precise() && !evidence.legacy_provider_can_close() {
                 neutral_incomplete(&mut report.analysis);
             }
         }
@@ -2172,8 +2436,7 @@ impl ReceiverSemanticBridge {
             mut nested_entries,
         ] = partition_receiver_limit::<{ Self::SCOPE_DIMENSIONS }>(scope - publication_reserve);
         nested_entries += publication_reserve;
-        let [call_sites, memory_locations, captures] =
-            partition_receiver_limit::<{ Self::SUMMARY_DIMENSIONS }>(summaries);
+        let [call_sites, memory_locations, captures] = partition_receiver_summary_limit(summaries);
         let budget = SemanticBudget::new(SemanticWork {
             source_bytes: text,
             procedures,
@@ -2276,6 +2539,22 @@ fn partition_receiver_limit<const DIMENSIONS: usize>(total: usize) -> [usize; DI
     std::array::from_fn(|index| quotient + usize::from(index < remainder))
 }
 
+fn partition_receiver_summary_limit(total: usize) -> [usize; 3] {
+    debug_assert!(total >= 3);
+    // Receiver queries are call-heavy: factory provenance and bounded
+    // interprocedural flow revisit call sites while memory/capture rows remain
+    // secondary. Keep every dimension positive, reserve half of the remaining
+    // aggregate capacity for calls, then split the rest across memory and
+    // captures. The three limits still sum exactly to the caller's aggregate
+    // summary budget.
+    let remaining = total - 3;
+    let call_extra = remaining.div_ceil(2);
+    let secondary = remaining - call_extra;
+    let memory_extra = secondary.div_ceil(2);
+    let capture_extra = secondary - memory_extra;
+    [1 + call_extra, 1 + memory_extra, 1 + capture_extra]
+}
+
 struct ReceiverValueProjection {
     values: Vec<ReceiverValue>,
     truncated: bool,
@@ -2323,7 +2602,7 @@ fn project_receiver_values(
     workspace: &WorkspaceAnalyzer,
     points_to: &SourcePointsToResult,
     type_outcome: &crate::analyzer::usages::get_type::TypeLookupOutcome,
-    factory: Option<CodeUnit>,
+    factories: &[CodeUnit],
     type_reference: bool,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
@@ -2333,6 +2612,7 @@ fn project_receiver_values(
     let mut allocations_truncated = false;
     let mut current_receiver = false;
     let mut nominal_instance = false;
+    let mut source_value_identity = false;
     let mut call_results = Vec::new();
     let mut identities = Vec::new();
     for candidate in points_to.object_candidates() {
@@ -2364,8 +2644,8 @@ fn project_receiver_values(
                     call_results.push(result.clone());
                 }
             }
-            AbstractObjectIdentity::Value(_)
-            | AbstractObjectIdentity::ProcedurePort(_)
+            AbstractObjectIdentity::Value(_) => source_value_identity = true,
+            AbstractObjectIdentity::ProcedurePort(_)
             | AbstractObjectIdentity::Static(_)
             | AbstractObjectIdentity::LexicalCell(_)
             | AbstractObjectIdentity::CaptureSlot(_)
@@ -2378,36 +2658,65 @@ fn project_receiver_values(
         type_outcome.target_kind,
         crate::analyzer::usages::target_kind::TypeLookupTargetKind::TypeReference
     ) || type_reference;
-    let mut matching_factory_result = false;
-    let mut unmatched_call_result = factory.is_none() && !call_results.is_empty();
-    if let Some(factory) = factory.as_ref() {
-        let factory_ranges =
-            match code_unit_ranges_bounded(workspace.analyzer(), factory, cancellation, ledger)? {
+    let mut factory_ranges = Vec::new();
+    if !call_results.is_empty() {
+        for factory in factories {
+            let ranges = match code_unit_ranges_bounded(
+                workspace.analyzer(),
+                factory,
+                cancellation,
+                ledger,
+            )? {
                 CompatibilityOutcome::Complete(ranges) => ranges,
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(CompatibilityOutcome::Exceeded(limit));
                 }
             };
-        for result in &call_results {
+            factory_ranges.push((factory, ranges));
+        }
+    }
+    let mut matching_factories = Vec::new();
+    let mut unmatched_call_result = factories.is_empty() && !call_results.is_empty();
+    for result in &call_results {
+        let mut matched = None;
+        for (factory, ranges) in &factory_ranges {
             check_cancelled(cancellation)?;
             if let Err(limit) = charge_scope_step(ledger) {
                 return Ok(CompatibilityOutcome::Exceeded(limit));
             }
-            if call_result_matches_factory(result, factory, &factory_ranges) {
-                matching_factory_result = true;
-            } else {
-                unmatched_call_result = true;
+            if call_result_matches_factory(result, factory, ranges) {
+                matched = Some((*factory).clone());
+                break;
             }
         }
+        if let Some(factory) = matched {
+            if !matching_factories.contains(&factory) {
+                matching_factories.push(factory);
+            }
+        } else {
+            unmatched_call_result = true;
+        }
     }
+    // A fully matched call result is the specific public identity for the
+    // exact factory expression. Some lowerers also retain generic source-value
+    // scaffolding at that span; publishing it as a second nominal instance
+    // duplicates the same expression and falsely turns one factory result into
+    // an ambiguous answer. Other symbolic roots and unmatched calls remain
+    // independent candidates.
+    let factory_covers_source_value =
+        !matching_factories.is_empty() && !unmatched_call_result && !call_results.is_empty();
+    let include_nominal_instance =
+        nominal_instance || (source_value_identity && !factory_covers_source_value);
     let projection_kinds = if static_reference {
         1
     } else {
         allocations
             .len()
             .saturating_add(usize::from(current_receiver))
-            .saturating_add(usize::from(nominal_instance || unmatched_call_result))
-            .saturating_add(usize::from(matching_factory_result))
+            .saturating_add(usize::from(
+                include_nominal_instance || unmatched_call_result,
+            ))
+            .saturating_add(matching_factories.len())
     };
     let projected_count = projected_type_definitions(type_outcome)
         .count()
@@ -2465,19 +2774,17 @@ fn project_receiver_values(
                 },
             });
         }
-        if (nominal_instance || unmatched_call_result) && values.len() < limit {
+        if (include_nominal_instance || unmatched_call_result) && values.len() < limit {
             let value = ReceiverValue::InstanceType(definition.clone());
             values.push(value);
         }
-        if matching_factory_result && values.len() < limit {
-            let value = ReceiverValue::InstanceType(definition.clone());
-            values.push(if let Some(factory) = factory.as_ref() {
-                ReceiverValue::FactoryReturn {
-                    factory: factory.clone(),
-                    value: Box::new(value),
-                }
-            } else {
-                value
+        for factory in &matching_factories {
+            if values.len() >= limit {
+                break;
+            }
+            values.push(ReceiverValue::FactoryReturn {
+                factory: factory.clone(),
+                value: Box::new(ReceiverValue::InstanceType(definition.clone())),
             });
         }
         if values.len() >= limit {
@@ -2488,8 +2795,31 @@ fn project_receiver_values(
     Ok(CompatibilityOutcome::Complete(ReceiverValueProjection {
         values,
         truncated: allocations_truncated || projected_count > limit,
-        multiple_identities: identities.len() > 1,
+        multiple_identities: identities
+            .iter()
+            .filter(|identity| {
+                !factory_covers_source_value
+                    || !matches!(identity, AbstractObjectIdentity::Value(_))
+            })
+            .count()
+            > 1,
     }))
+}
+
+fn points_to_contains_call_result(
+    points_to: &SourcePointsToResult,
+    cancellation: Option<&CancellationToken>,
+) -> Result<bool, ReceiverQueryError> {
+    for candidate in points_to.object_candidates() {
+        check_cancelled(cancellation)?;
+        if matches!(
+            candidate.value().identity(),
+            AbstractObjectIdentity::CallResult(_)
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn code_unit_ranges_bounded(
@@ -2502,30 +2832,60 @@ fn code_unit_ranges_bounded(
     if let Err(limit) = charge_summary_step(ledger) {
         return Ok(CompatibilityOutcome::Exceeded(limit));
     }
-    if language_for_file(unit.source()) == Language::CSharp {
+    let language = language_for_file(unit.source());
+    if matches!(
+        language,
+        Language::Cpp
+            | Language::CSharp
+            | Language::Go
+            | Language::Java
+            | Language::JavaScript
+            | Language::Php
+            | Language::Python
+            | Language::Ruby
+            | Language::Rust
+            | Language::Scala
+            | Language::TypeScript
+    ) {
         if let Err(limit) = charge_scope_step(ledger) {
             return Ok(CompatibilityOutcome::Exceeded(limit));
         }
-        let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
+        let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
+        let ranges = match language {
+            Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer)
+                .map(|cpp| cpp.ranges_limited(unit, provider_limit)),
+            Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
+                .map(|csharp| csharp.ranges_limited(unit, provider_limit)),
+            Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
+                .map(|go| go.ranges_limited(unit, provider_limit)),
+            Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer)
+                .map(|java| java.inner().ranges_limited(unit, provider_limit)),
+            Language::JavaScript => resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+                .map(|javascript| javascript.ranges_limited(unit, provider_limit)),
+            Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
+                .map(|php| php.ranges_limited(unit, provider_limit)),
+            Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
+                .map(|python| python.ranges_limited(unit, provider_limit)),
+            Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer)
+                .map(|ruby| ruby.ranges_limited(unit, provider_limit)),
+            Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer)
+                .map(|rust| rust.ranges_limited(unit, provider_limit)),
+            Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
+                .map(|scala| scala.ranges_limited(unit, provider_limit)),
+            Language::TypeScript => resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+                .map(|typescript| typescript.ranges_limited(unit, provider_limit)),
+            _ => unreachable!("language was checked above"),
+        };
+        let Some(ranges) = ranges else {
             return Ok(CompatibilityOutcome::Exceeded(
                 ReceiverBudgetLimit::ScopeNodes,
             ));
         };
-        let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
-        return charge_limited_projection(
-            csharp.ranges_limited(unit, provider_limit),
-            cancellation,
-            ledger,
-        );
+        return charge_limited_projection(ranges, cancellation, ledger);
     }
-    let ranges = analyzer.ranges(unit);
-    for _ in &ranges {
-        check_cancelled(cancellation)?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
-    }
-    Ok(CompatibilityOutcome::Complete(ranges))
+    Ok(CompatibilityOutcome::Exceeded(
+        ReceiverBudgetLimit::ScopeNodes,
+    ))
 }
 
 fn call_result_matches_factory(
@@ -2558,14 +2918,100 @@ fn java_factory_name_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("name")
 }
 
-fn csharp_factory_name_node(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "invocation_expression" {
-        return None;
-    }
-    let function = node.child_by_field_name("function")?;
-    match function.kind() {
-        "member_access_expression" => function.child_by_field_name("name"),
-        "identifier" | "generic_name" => Some(function),
+fn structural_factory_name_node(language: Language, node: Node<'_>) -> Option<Node<'_>> {
+    match language {
+        Language::Cpp => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "field_expression" => function.child_by_field_name("field"),
+                "qualified_identifier" => function.child_by_field_name("name"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::CSharp => {
+            if node.kind() != "invocation_expression" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "member_access_expression" => function.child_by_field_name("name"),
+                "identifier" | "generic_name" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Go => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "selector_expression" => function.child_by_field_name("field"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Php => match node.kind() {
+            "function_call_expression" => node.child_by_field_name("function"),
+            "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "scoped_call_expression" => node.child_by_field_name("name"),
+            _ => None,
+        },
+        Language::Python => {
+            if node.kind() != "call" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "attribute" => function.child_by_field_name("attribute"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Ruby => {
+            if node.kind() != "call" {
+                return None;
+            }
+            node.child_by_field_name("method")
+        }
+        Language::Rust => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "generic_function" {
+                function = function.child_by_field_name("function")?;
+            }
+            match function.kind() {
+                "field_expression" => function.child_by_field_name("field"),
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    function.child_by_field_name("name")
+                }
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Scala => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "call_expression" {
+                function = function.child_by_field_name("function")?;
+            }
+            if function.kind() == "generic_function" {
+                function = function.child_by_field_name("function")?;
+            }
+            match function.kind() {
+                "field_expression" => function.child_by_field_name("field"),
+                "identifier" | "operator_identifier" => Some(function),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -3134,7 +3580,11 @@ fn setup_budget_report(
     )
 }
 
-fn csharp_reference_site(file: &ProjectFile, source: &str, range: Range) -> ResolvedReferenceSite {
+fn structural_reference_site(
+    file: &ProjectFile,
+    source: &str,
+    range: Range,
+) -> ResolvedReferenceSite {
     ResolvedReferenceSite {
         path: rel_path_string(file),
         text: source
@@ -3271,6 +3721,126 @@ export function caller() {
             ),
             "unexpected analysis: {:?}",
             report.analysis
+        );
+    }
+
+    #[test]
+    fn workspace_factory_provenance_fits_the_default_aggregate_budget() {
+        let source = r#"
+class Service {
+  run() {}
+}
+
+class Other {
+  run() {}
+}
+
+function makeService() {
+  return new Service();
+}
+
+function consume(value: Service) {
+  value.run();
+}
+
+export function caller(flag: boolean) {
+  const direct = new Service();
+  direct.run();
+
+  const factory = makeService();
+  factory.run();
+
+  const ambiguous = flag ? new Service() : new Other();
+  ambiguous.run();
+
+  consume(new Service());
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::TypeScript)),
+            AnalyzerConfig::default(),
+        );
+
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let receiver_range = last_marker_range(source, "factory");
+        let gate = service
+            .semantic_receiver_gate(
+                &file,
+                receiver_range,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("workspace semantic gate");
+        let gate_work = gate.work();
+        assert!(matches!(
+            gate,
+            SemanticReceiverGate::Available {
+                evidence: SemanticReceiverEvidence::Incomplete {
+                    origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+                    ..
+                },
+                ..
+            }
+        ));
+        let report = service
+            .analyze(
+                ReceiverQueryOperation::PointsTo,
+                &file,
+                receiver_range,
+                ReceiverQueryInput::Expression,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("workspace receiver query");
+
+        assert!(
+            matches!(
+                &report.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values))
+                    if matches!(
+                        values.as_slice(),
+                        [ReceiverValue::FactoryReturn { factory, value }]
+                            if factory.fq_name().ends_with("makeService")
+                                && matches!(value.as_ref(), ReceiverValue::AllocationSite { ty, .. } if ty.fq_name().ends_with("Service"))
+                    )
+            ),
+            "{report:#?}\nsemantic gate work: {gate_work:#?}"
+        );
+        assert!(
+            report.work.summary_expansions
+                <= ReceiverAnalysisBudget::default().max_summary_expansions,
+            "{report:#?}"
+        );
+
+        let context_disabled = service
+            .analyze(
+                ReceiverQueryOperation::PointsTo,
+                &file,
+                receiver_range,
+                ReceiverQueryInput::Expression,
+                ReceiverAnalysisBudget {
+                    context_depth: 0,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            )
+            .expect("context-disabled workspace receiver query");
+        assert!(
+            matches!(
+                &context_disabled.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(values))
+                    if matches!(
+                        values.as_slice(),
+                        [ReceiverValue::FactoryReturn { factory, value }]
+                            if factory.fq_name().ends_with("makeService")
+                                && matches!(value.as_ref(), ReceiverValue::AllocationSite { ty, .. } if ty.fq_name().ends_with("Service"))
+                    )
+            ),
+            "{context_disabled:#?}"
         );
     }
 
@@ -3739,8 +4309,9 @@ sealed class Service {
             ]));
         let mut dispatch_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
         assert!(matches!(
-            csharp_member_dispatch_supports_precise(
+            structural_member_dispatch_supports_precise(
                 workspace.analyzer(),
+                Language::CSharp,
                 &analysis,
                 None,
                 &mut dispatch_ledger,
@@ -3767,8 +4338,9 @@ sealed class Service {
         };
         let mut tiny_dispatch_ledger = ReceiverWorkLedger::new(tiny_budget);
         assert!(matches!(
-            csharp_member_dispatch_supports_precise(
+            structural_member_dispatch_supports_precise(
                 workspace.analyzer(),
+                Language::CSharp,
                 &analysis,
                 None,
                 &mut tiny_dispatch_ledger,
@@ -3786,6 +4358,173 @@ sealed class Service {
             csharp.full_hydration_count_for_test(),
             0,
             "bounded receiver metadata/range reads must not hydrate persisted FileState"
+        );
+    }
+
+    #[test]
+    fn java_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
+        let source = r#"
+class Service {}
+class Sample {
+    static Service makeService() { return new Service(); }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Sample.java"));
+        file.write(source).expect("write source");
+        let project = Arc::new(TestProject::new(root, Language::Java));
+        {
+            let _cold =
+                WorkspaceAnalyzer::build_persisted(project.clone(), AnalyzerConfig::default())
+                    .expect("cold persisted Java workspace");
+        }
+        let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("warm persisted Java workspace");
+        let factory = workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("Sample.makeService"))
+            .expect("persisted Java factory");
+        let java = resolve_analyzer::<JavaAnalyzer>(workspace.analyzer())
+            .expect("workspace Java analyzer");
+        java.inner().reset_full_hydration_count_for_test();
+
+        let tiny_budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 1,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
+        assert!(matches!(
+            code_unit_ranges_bounded(workspace.analyzer(), &factory, None, &mut tiny_ledger)
+                .expect("tiny Java factory range budget"),
+            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+        ));
+        assert_eq!(tiny_ledger.work().scope_nodes, 1);
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+        assert!(matches!(
+            code_unit_ranges_bounded(
+                workspace.analyzer(),
+                &factory,
+                Some(&cancellation),
+                &mut cancelled_ledger,
+            ),
+            Err(ReceiverQueryError::Cancelled)
+        ));
+        assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
+        assert_eq!(
+            java.inner().full_hydration_count_for_test(),
+            0,
+            "bounded Java factory-range validation must not hydrate persisted FileState"
+        );
+    }
+
+    #[test]
+    fn js_ts_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
+        fn assert_limited_and_cancellable(analyzer: &dyn IAnalyzer, factory: &CodeUnit) {
+            let tiny_budget = ReceiverAnalysisBudget {
+                max_scope_nodes: 1,
+                ..ReceiverAnalysisBudget::default()
+            };
+            let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
+            assert!(matches!(
+                code_unit_ranges_bounded(analyzer, factory, None, &mut tiny_ledger)
+                    .expect("tiny JS/TS factory range budget"),
+                CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+            ));
+            assert_eq!(tiny_ledger.work().scope_nodes, 1);
+
+            let cancellation = CancellationToken::default();
+            cancellation.cancel();
+            let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+            assert!(matches!(
+                code_unit_ranges_bounded(
+                    analyzer,
+                    factory,
+                    Some(&cancellation),
+                    &mut cancelled_ledger,
+                ),
+                Err(ReceiverQueryError::Cancelled)
+            ));
+            assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
+        }
+
+        let typescript_temp = tempfile::tempdir().expect("TypeScript temp dir");
+        let typescript_root = typescript_temp
+            .path()
+            .canonicalize()
+            .expect("canonical TypeScript temp dir");
+        let typescript_file =
+            ProjectFile::new(typescript_root.clone(), PathBuf::from("factory.ts"));
+        typescript_file
+            .write("class Service {}\nfunction makeService() { return new Service(); }\n")
+            .expect("write TypeScript source");
+        let typescript_project = Arc::new(TestProject::new(typescript_root, Language::TypeScript));
+        {
+            let _cold = WorkspaceAnalyzer::build_persisted(
+                typescript_project.clone(),
+                AnalyzerConfig::default(),
+            )
+            .expect("cold persisted TypeScript workspace");
+        }
+        let typescript_workspace =
+            WorkspaceAnalyzer::build_persisted(typescript_project, AnalyzerConfig::default())
+                .expect("warm persisted TypeScript workspace");
+        let typescript_factory = typescript_workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("makeService"))
+            .expect("persisted TypeScript factory");
+        let typescript = resolve_analyzer::<TypescriptAnalyzer>(typescript_workspace.analyzer())
+            .expect("workspace TypeScript analyzer");
+        typescript.reset_full_hydration_count_for_test();
+        assert_limited_and_cancellable(typescript_workspace.analyzer(), &typescript_factory);
+        assert_eq!(
+            typescript.full_hydration_count_for_test(),
+            0,
+            "bounded TypeScript factory-range validation must not hydrate persisted FileState"
+        );
+
+        let javascript_temp = tempfile::tempdir().expect("JavaScript temp dir");
+        let javascript_root = javascript_temp
+            .path()
+            .canonicalize()
+            .expect("canonical JavaScript temp dir");
+        let javascript_file =
+            ProjectFile::new(javascript_root.clone(), PathBuf::from("factory.js"));
+        javascript_file
+            .write("class Service {}\nfunction makeService() { return new Service(); }\n")
+            .expect("write JavaScript source");
+        let javascript_project = Arc::new(TestProject::new(javascript_root, Language::JavaScript));
+        {
+            let _cold = WorkspaceAnalyzer::build_persisted(
+                javascript_project.clone(),
+                AnalyzerConfig::default(),
+            )
+            .expect("cold persisted JavaScript workspace");
+        }
+        let javascript_workspace =
+            WorkspaceAnalyzer::build_persisted(javascript_project, AnalyzerConfig::default())
+                .expect("warm persisted JavaScript workspace");
+        let javascript_factory = javascript_workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("makeService"))
+            .expect("persisted JavaScript factory");
+        let javascript = resolve_analyzer::<JavascriptAnalyzer>(javascript_workspace.analyzer())
+            .expect("workspace JavaScript analyzer");
+        javascript.inner().reset_full_hydration_count_for_test();
+        assert_limited_and_cancellable(javascript_workspace.analyzer(), &javascript_factory);
+        assert_eq!(
+            javascript.inner().full_hydration_count_for_test(),
+            0,
+            "bounded JavaScript factory-range validation must not hydrate persisted FileState"
         );
     }
 
@@ -4065,7 +4804,7 @@ class Caller {
         let source = "value = object.member\n";
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("app.py"));
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.txt"));
         file.write(source).expect("write source");
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
@@ -4081,7 +4820,7 @@ class Caller {
             )
             .expect("unsupported result");
 
-        assert_eq!(report.site.language, Language::Python);
+        assert_eq!(report.site.language, Language::None);
         assert!(matches!(
             report.analysis,
             ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unsupported {
@@ -4606,7 +5345,7 @@ class Sample {
             &workspace,
             &points_to,
             &type_outcome,
-            None,
+            &[],
             false,
             None,
             &mut ledger,
@@ -4725,7 +5464,7 @@ class Sample {
             &cartesian_workspace,
             &cartesian_points_to,
             &cartesian_types,
-            None,
+            &[],
             false,
             None,
             &mut cartesian_ledger,
@@ -4861,7 +5600,9 @@ export function caller() {
         assert_eq!(semantic.procedures, 2);
         assert_eq!(semantic.control_edges, 1);
         assert_eq!(semantic.nested_entries, 4);
-        assert_eq!(semantic.call_sites, 3);
+        assert_eq!(semantic.call_sites, 4);
+        assert_eq!(semantic.memory_locations, 3);
+        assert_eq!(semantic.captures, 2);
         assert_eq!(semantic.source_bytes, 17 * 1_024);
         let aggregate_limits = ReceiverSemanticBridge::receiver_work(semantic);
         assert_eq!(aggregate_limits.scope_nodes, 17);
@@ -4999,6 +5740,10 @@ export function caller() {
                 assert_eq!(
                     evidence.is_truncated(),
                     coverage == CandidateCoverage::Truncated
+                );
+                assert!(
+                    !evidence.legacy_provider_can_close(),
+                    "raw incomplete evidence must not be reclassified as global capability openness"
                 );
             }
         }

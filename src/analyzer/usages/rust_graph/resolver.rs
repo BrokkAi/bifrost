@@ -2,7 +2,7 @@ use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, Range, RustAnalyzer,
-    RustReferenceContext, TypeHierarchyProvider,
+    RustReferenceContext, SignatureMetadata, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -21,12 +21,60 @@ pub(crate) trait RustDefinitionProvider {
         false
     }
 
+    fn scope_step(&self) -> bool {
+        true
+    }
+
+    fn observe_cancellation(&self) -> bool {
+        true
+    }
+
     fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
         analyzer.ranges(unit)
     }
 
+    fn signature_metadata(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Vec<SignatureMetadata> {
+        analyzer.signature_metadata(unit)
+    }
+
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
         self.fqn(&format!("{owner_fqn}.{name}"))
+    }
+}
+
+pub(crate) fn rust_smallest_named_node_covering<'tree>(
+    support: &dyn RustDefinitionProvider,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !support.observe_cancellation()
+        || !support.scope_step()
+        || node.end_byte() < end
+        || node.start_byte() > start
+    {
+        return None;
+    }
+    loop {
+        let mut cursor = node.walk();
+        let mut containing_child = None;
+        for child in node.named_children(&mut cursor) {
+            if !support.scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing_child = Some(child);
+                break;
+            }
+        }
+        match containing_child {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
     }
 }
 

@@ -7,11 +7,12 @@ use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResol
 use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
-    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_return_type,
-    csharp_source_identifier, csharp_type_node_identity, csharp_type_reference_root,
-    csharp_using_directive_is_global, csharp_using_directive_is_static,
-    csharp_using_directive_namespace, csharp_using_directive_target, resolve_analyzer,
+    StructuredTypeIdentity, StructuredTypeName, csharp_callable_arity,
+    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
+    csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
+    csharp_type_node_identity, csharp_type_reference_root, csharp_using_directive_is_global,
+    csharp_using_directive_is_static, csharp_using_directive_namespace,
+    csharp_using_directive_target, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -841,6 +842,63 @@ fn visible_type_candidates_in_session(
     )
 }
 
+fn forward_direct_ancestors_in_session(
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    session: &ResolutionSession,
+) -> Vec<CodeUnit> {
+    if !session.summary_step() {
+        return Vec::new();
+    }
+    let mut parts = session.query_limited_rows(|limit| {
+        csharp.partial_type_parts_limited(owner, limit, || session.observe_cancellation())
+    });
+    if !session.observe_cancellation() {
+        return Vec::new();
+    }
+    if parts.is_empty() {
+        if !session.scope_step() {
+            return Vec::new();
+        }
+        parts.push(owner.clone());
+    }
+
+    let mut ancestors = Vec::new();
+    for part in parts {
+        if !session.scope_step() {
+            return Vec::new();
+        }
+        let raw_supertypes =
+            session.query_limited_rows(|limit| csharp.raw_supertypes_limited(&part, limit));
+        if !session.observe_cancellation() {
+            return Vec::new();
+        }
+        for raw in raw_supertypes {
+            if !session.scope_step() {
+                return Vec::new();
+            }
+            let mut candidates =
+                visible_type_candidates_in_session(csharp, part.source(), &raw, true, session);
+            if !session.observe_cancellation() {
+                return Vec::new();
+            }
+            if csharp.logical_type_count(&candidates) != 1 {
+                continue;
+            }
+            csharp.sort_type_candidates(&mut candidates);
+            let Some(ancestor) = candidates.into_iter().next() else {
+                continue;
+            };
+            if !session.scope_step() {
+                return Vec::new();
+            }
+            ancestors.push(ancestor);
+        }
+    }
+    csharp.sort_dedup_type_candidates(&mut ancestors);
+    ancestors
+}
+
 pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
     csharp: &CSharpAnalyzer,
     _file: &ProjectFile,
@@ -921,26 +979,29 @@ fn member_declared_type_fq_name_inner(
             |limit| csharp.signature_metadata_limited(&unit, limit),
             || csharp.signature_metadata(&unit),
         );
-        let declared_type = metadata
-            .iter()
-            .find_map(|metadata| metadata.return_type_text().map(str::to_string))
-            .or_else(|| {
-                resolution_query(session, || member_declared_type(csharp, &unit)).flatten()
+        let resolved = if let Some(session) = session {
+            let resolved = metadata.iter().find_map(|metadata| {
+                let identity = metadata.return_type_identity()?;
+                resolve_structured_member_type_fq_name_in_session(
+                    csharp,
+                    unit.source(),
+                    owner,
+                    identity,
+                    session,
+                )
             });
-        let Some(declared_type) = declared_type else {
-            continue;
-        };
-        let resolved = match session {
-            Some(session) => resolve_member_type_fq_name_in_session(
-                csharp,
-                unit.source(),
-                owner,
-                &declared_type,
-                session,
-            ),
-            None => {
-                resolve_member_type_fq_name(csharp, unit.source(), owner, &declared_type, usage)
+            if resolved.is_none() {
+                return None;
             }
+            resolved
+        } else {
+            let declared_type = metadata
+                .iter()
+                .find_map(|metadata| metadata.return_type_text().map(str::to_string))
+                .or_else(|| member_declared_type(csharp, &unit));
+            declared_type.and_then(|declared_type| {
+                resolve_member_type_fq_name(csharp, unit.source(), owner, &declared_type, usage)
+            })
         };
         if let Some(resolved) = resolved {
             resolved_types.push(resolved);
@@ -1045,6 +1106,17 @@ fn method_return_type_fq_name_for_arity_inner(
         if !resolution_scope_step(session) {
             return None;
         }
+        if !unit.is_function() {
+            continue;
+        }
+        let Some(callable_arity) =
+            resolution_query(session, || csharp_callable_arity(csharp, &unit))
+        else {
+            return None;
+        };
+        if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
+            continue;
+        }
         if let Some(resolved_type) = callable_return_type_fq_name(
             csharp,
             &unit,
@@ -1054,6 +1126,8 @@ fn method_return_type_fq_name_for_arity_inner(
             session,
         ) {
             resolved.push(resolved_type);
+        } else if session.is_some() {
+            return None;
         }
     }
     resolved.sort();
@@ -1082,35 +1156,36 @@ fn callable_return_type_fq_name(
         |limit| csharp.signature_metadata_limited(unit, limit),
         || csharp.signature_metadata(unit),
     );
-    if let Some(substituted) = (!metadata.is_empty())
-        .then_some(metadata.as_slice())
-        .and_then(|metadata| substituted_method_type_parameter(metadata, explicit_type_arguments))
+    let declaring_owner = resolution_query(session, || csharp.parent_of(unit))
+        .flatten()
+        .unwrap_or_else(|| owner_fallback.clone());
+    if let Some(session) = session {
+        return metadata.iter().find_map(|metadata| {
+            resolve_structured_method_return_type_fq_name_in_session(
+                csharp,
+                unit.source(),
+                &declaring_owner,
+                metadata,
+                explicit_type_arguments,
+                session,
+            )
+        });
+    }
+    if let Some(substituted) = substituted_method_type_parameter(&metadata, explicit_type_arguments)
     {
         return Some(substituted);
     }
     let declared_type = metadata
         .iter()
         .find_map(|metadata| metadata.return_type_text().map(str::to_string))
-        .or_else(|| resolution_query(session, || method_return_type(csharp, unit)).flatten())?;
-    let declaring_owner = resolution_query(session, || csharp.parent_of(unit))
-        .flatten()
-        .unwrap_or_else(|| owner_fallback.clone());
-    match session {
-        Some(session) => resolve_member_type_fq_name_in_session(
-            csharp,
-            unit.source(),
-            &declaring_owner,
-            &declared_type,
-            session,
-        ),
-        None => resolve_member_type_fq_name(
-            csharp,
-            unit.source(),
-            &declaring_owner,
-            &declared_type,
-            usage,
-        ),
-    }
+        .or_else(|| method_return_type(csharp, unit))?;
+    resolve_member_type_fq_name(
+        csharp,
+        unit.source(),
+        &declaring_owner,
+        &declared_type,
+        usage,
+    )
 }
 
 /// Type an invocation whose callee is an extension method by that extension's
@@ -1222,6 +1297,8 @@ fn extension_invocation_return_type_fq_name_inner(
             session,
         ) {
             resolved.push(resolved_type);
+        } else if session.is_some() {
+            return None;
         }
     }
     resolved.sort();
@@ -1296,25 +1373,184 @@ fn resolve_member_type_fq_name(
     })
 }
 
-fn resolve_member_type_fq_name_in_session(
+fn resolve_structured_method_return_type_fq_name_in_session(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     owner: &CodeUnit,
-    type_text: &str,
+    metadata: &crate::analyzer::SignatureMetadata,
+    explicit_type_arguments: Option<&[String]>,
     session: &ResolutionSession,
 ) -> Option<String> {
-    let nested_fq_name = if owner.package_name().is_empty() {
-        format!("{}${type_text}", owner.short_name())
-    } else {
-        format!(
-            "{}.{}${type_text}",
-            owner.package_name(),
-            owner.short_name()
-        )
+    let identity = metadata.return_type_identity()?;
+    let name = identity.nominal_name_with(|| session.scope_step())?;
+    if csharp_structured_name_is_method_type_parameter(name, metadata) {
+        if identity.is_pointer()
+            || identity.is_reference()
+            || identity.generic_argument_count().is_some()
+        {
+            return None;
+        }
+        let arguments = explicit_type_arguments?;
+        let parameter = name.path().first()?;
+        return metadata
+            .type_parameters()
+            .iter()
+            .position(|candidate| candidate == parameter)
+            .and_then(|index| arguments.get(index).cloned());
+    }
+    resolve_structured_member_type_fq_name_in_session(csharp, file, owner, identity, session)
+}
+
+fn resolve_structured_member_type_fq_name_in_session(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    identity: &StructuredTypeIdentity,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let name = identity.nominal_name_with(|| session.scope_step())?;
+    if csharp_owner_chain_declares_type_parameter_in_session(csharp, owner, name, session) {
+        return None;
+    }
+    resolve_structured_type_fq_name_in_session(csharp, file, name, session)
+}
+
+fn csharp_structured_name_is_method_type_parameter(
+    name: &StructuredTypeName,
+    metadata: &crate::analyzer::SignatureMetadata,
+) -> bool {
+    !name.is_absolute()
+        && matches!(name.path(), [parameter] if metadata.type_parameters().contains(parameter))
+}
+
+fn csharp_owner_chain_declares_type_parameter_in_session(
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    name: &StructuredTypeName,
+    session: &ResolutionSession,
+) -> bool {
+    let [candidate] = name.path() else {
+        return false;
     };
-    forward_class_unit_for_fq_name_in_session(csharp, &nested_fq_name, session)
-        .map(|unit| unit.fq_name())
-        .or_else(|| resolve_type_fq_name_in_session(csharp, file, type_text, session))
+    if name.is_absolute() {
+        return false;
+    }
+    let mut current = Some(owner.clone());
+    while let Some(unit) = current {
+        if !unit.is_class() || !session.scope_step() {
+            return false;
+        }
+        let metadata =
+            session.query_limited_rows(|limit| csharp.signature_metadata_limited(&unit, limit));
+        if !session.observe_cancellation() {
+            return false;
+        }
+        if metadata
+            .iter()
+            .any(|metadata| metadata.type_parameters().contains(candidate))
+        {
+            return true;
+        }
+        current = session.query(|| csharp.parent_of(&unit)).flatten();
+        if !session.observe_cancellation() {
+            return false;
+        }
+    }
+    false
+}
+
+fn resolve_structured_type_fq_name_in_session(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    name: &StructuredTypeName,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let path = name.path();
+    let [builtin] = path else {
+        return resolve_non_builtin_structured_type_fq_name_in_session(csharp, file, name, session);
+    };
+    if let Some(canonical) = canonical_builtin_type_identity(builtin) {
+        return Some(canonical.to_string());
+    }
+    resolve_non_builtin_structured_type_fq_name_in_session(csharp, file, name, session)
+}
+
+fn resolve_non_builtin_structured_type_fq_name_in_session(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    name: &StructuredTypeName,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let path = name.path();
+    if path.is_empty() {
+        return None;
+    }
+
+    let alias_qualified = path
+        .first()
+        .and_then(|component| component.strip_suffix("::"));
+    if !name.is_absolute() && alias_qualified.is_none() {
+        for prefix_len in (0..=name.lexical_scope().len()).rev() {
+            if !session.scope_step() {
+                return None;
+            }
+            let candidate =
+                render_csharp_structured_path(&name.lexical_scope()[..prefix_len], path, false);
+            let candidates =
+                forward_type_declarations_for_fq_name_in_session(csharp, &candidate, session);
+            if !session.observe_cancellation() {
+                return None;
+            }
+            if !candidates.is_empty() {
+                return unique_logical_type_fq_name(csharp, &candidates, session);
+            }
+        }
+    }
+
+    let rendered = if let Some(alias) = alias_qualified {
+        let suffix = render_csharp_structured_path(&[], &path[1..], false);
+        if suffix.is_empty() {
+            alias.to_string()
+        } else {
+            format!("{alias}::{suffix}")
+        }
+    } else {
+        render_csharp_structured_path(&[], path, name.is_absolute())
+    };
+    let candidates = if name.is_absolute() {
+        forward_type_declarations_for_fq_name_in_session(csharp, &rendered, session)
+    } else {
+        visible_type_candidates_in_session(csharp, file, &rendered, true, session)
+    };
+    if !session.observe_cancellation() || candidates.is_empty() {
+        return None;
+    }
+    unique_logical_type_fq_name(csharp, &candidates, session)
+}
+
+fn render_csharp_structured_path(prefix: &[String], path: &[String], absolute: bool) -> String {
+    let mut rendered = String::new();
+    if absolute {
+        rendered.push_str("global::");
+    }
+    for component in prefix.iter().chain(path) {
+        if !rendered.is_empty() && !rendered.ends_with("::") {
+            rendered.push('.');
+        }
+        rendered.push_str(component);
+    }
+    rendered
+}
+
+fn unique_logical_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    candidates: &[CodeUnit],
+    session: &ResolutionSession,
+) -> Option<String> {
+    if !session.scope_step() || csharp.logical_type_count(candidates) != 1 {
+        return None;
+    }
+    csharp.first_logical_type_fqn(candidates)
 }
 
 fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<String> {
@@ -1712,46 +1948,77 @@ pub(in crate::analyzer::usages) fn is_extension_method(
     unit: &CodeUnit,
 ) -> bool {
     unit.is_function()
-        && analyzer
-            .signatures(unit)
-            .iter()
-            .any(|signature| extension_receiver_type_from_signature(signature).is_some())
+        && analyzer.signature_metadata(unit).iter().any(|metadata| {
+            metadata.extension_receiver_type_identity().is_some()
+                || metadata.extension_receiver_type().is_some()
+        })
 }
 
 pub(in crate::analyzer::usages) fn extension_method_receiver_type(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Option<String> {
-    extension_method_receiver_type_inner(analyzer, unit, false)
+    extension_method_receiver_type_inner(analyzer, unit, false, None)
 }
 
 fn usage_extension_method_receiver_type(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Option<String> {
-    extension_method_receiver_type_inner(analyzer, unit, true)
+    extension_method_receiver_type_inner(analyzer, unit, true, None)
+}
+
+fn extension_method_receiver_type_in_session(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    session: &ResolutionSession,
+) -> Option<String> {
+    extension_method_receiver_type_inner(analyzer, unit, false, Some(session))
 }
 
 fn extension_method_receiver_type_inner(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     usage: bool,
+    session: Option<&ResolutionSession>,
 ) -> Option<String> {
     if !unit.is_function() {
         return None;
     }
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-    let owner = analyzer.parent_of(unit)?;
-    let receiver_type = analyzer
-        .signatures(unit)
-        .iter()
-        .find_map(|signature| extension_receiver_type_from_signature(signature))?;
-    let resolved =
-        resolve_member_type_fq_name(csharp, unit.source(), &owner, &receiver_type, usage);
-    if usage {
-        resolved
-    } else {
-        resolved.or_else(|| Some(normalize_type_text(&receiver_type)))
+    let owner = resolution_query(session, || analyzer.parent_of(unit)).flatten()?;
+    let metadata = resolution_query_limited_rows(
+        session,
+        |limit| csharp.signature_metadata_limited(unit, limit),
+        || csharp.signature_metadata(unit),
+    );
+    match session {
+        Some(session) => metadata.iter().find_map(|metadata| {
+            let identity = metadata.extension_receiver_type_identity()?;
+            let name = identity.nominal_name_with(|| session.scope_step())?;
+            if csharp_structured_name_is_method_type_parameter(name, metadata) {
+                return None;
+            }
+            resolve_structured_member_type_fq_name_in_session(
+                csharp,
+                unit.source(),
+                &owner,
+                identity,
+                session,
+            )
+        }),
+        None => {
+            let receiver_type = metadata
+                .iter()
+                .find_map(|metadata| metadata.extension_receiver_type())?;
+            let resolved =
+                resolve_member_type_fq_name(csharp, unit.source(), &owner, receiver_type, usage);
+            if usage {
+                resolved
+            } else {
+                resolved.or_else(|| Some(normalize_type_text(receiver_type)))
+            }
+        }
     }
 }
 
@@ -1970,18 +2237,19 @@ fn visible_extension_method_candidates_inner(
             {
                 continue;
             }
-            if !resolution_query(session, || is_extension_method(analyzer, &unit)).unwrap_or(false)
-            {
-                continue;
+            let receiver = if usage {
+                usage_extension_method_receiver_type(analyzer, &unit)
+            } else if let Some(session) = session {
+                extension_method_receiver_type_in_session(analyzer, &unit, session)
+            } else {
+                extension_method_receiver_type(analyzer, &unit)
+            };
+            if session.is_some_and(|session| !session.observe_cancellation()) {
+                return Vec::new();
             }
-            let receiver = resolution_query(session, || {
-                if usage {
-                    usage_extension_method_receiver_type(analyzer, &unit)
-                } else {
-                    extension_method_receiver_type(analyzer, &unit)
-                }
-            })
-            .flatten();
+            let Some(receiver) = receiver else {
+                continue;
+            };
             let matches_receiver = |receiver: String| {
                 let receiver = csharp_normalize_full_name(&receiver);
                 compatible_receiver_types
@@ -1989,9 +2257,9 @@ fn visible_extension_method_candidates_inner(
                     .any(|candidate| type_identity_matches(candidate, &receiver))
             };
             let compatible = if usage {
-                compatible_receiver_types.is_empty() || receiver.is_none_or(matches_receiver)
+                compatible_receiver_types.is_empty() || matches_receiver(receiver)
             } else {
-                receiver.is_some_and(matches_receiver)
+                matches_receiver(receiver)
             };
             if compatible {
                 filtered.push(unit);
@@ -2340,39 +2608,40 @@ fn compatible_receiver_type_names(
                         csharp.usage_direct_ancestors(&ancestor)
                     }));
                 }
-            } else if let Some(provider) = analyzer.type_hierarchy_provider() {
-                let mut stack =
-                    resolution_summary_rows(session, || provider.get_direct_ancestors(&owner));
+            } else if let Some(session) = session {
+                let mut stack = forward_direct_ancestors_in_session(csharp, &owner, session);
+                if !session.observe_cancellation() {
+                    return HashSet::default();
+                }
                 let mut seen = HashSet::default();
                 while let Some(ancestor) = stack.pop() {
-                    if !resolution_scope_step(session) {
+                    if !resolution_scope_step(Some(session)) {
                         return HashSet::default();
                     }
                     if !seen.insert(ancestor.clone()) {
                         continue;
                     }
                     compatible.insert(csharp_normalize_full_name(&ancestor.fq_name()));
-                    stack.extend(resolution_summary_rows(session, || {
-                        provider.get_direct_ancestors(&ancestor)
-                    }));
+                    let direct = forward_direct_ancestors_in_session(csharp, &ancestor, session);
+                    if !session.observe_cancellation() {
+                        return HashSet::default();
+                    }
+                    stack.extend(direct);
+                }
+            } else if let Some(provider) = analyzer.type_hierarchy_provider() {
+                let mut stack = provider.get_direct_ancestors(&owner);
+                let mut seen = HashSet::default();
+                while let Some(ancestor) = stack.pop() {
+                    if !seen.insert(ancestor.clone()) {
+                        continue;
+                    }
+                    compatible.insert(csharp_normalize_full_name(&ancestor.fq_name()));
+                    stack.extend(provider.get_direct_ancestors(&ancestor));
                 }
             }
         }
     }
     compatible
-}
-
-fn extension_receiver_type_from_signature(signature: &str) -> Option<String> {
-    let parameters = signature.split_once('(')?.1;
-    let first_parameter = parameters.split(')').next()?.split(',').next()?.trim();
-    let without_this = first_parameter.strip_prefix("this ")?.trim();
-    let parameter_name = without_this.split_whitespace().last()?;
-    let type_text = without_this
-        .strip_suffix(parameter_name)
-        .unwrap_or(without_this)
-        .trim();
-    let normalized = normalize_type_text(type_text);
-    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn reference_matches_target_fq_name(reference: &str, target: &CodeUnit) -> bool {
@@ -2745,7 +3014,7 @@ fn nearest_member_candidates_for_owner_inner(
         if !members.is_empty() {
             return members;
         }
-        if !usage && hierarchy.is_none() {
+        if !usage && session.is_none() && hierarchy.is_none() {
             hierarchy = analyzer.type_hierarchy_provider();
         }
         let mut next_level = Vec::new();
@@ -2772,30 +3041,37 @@ fn nearest_member_candidates_for_owner_inner(
                     next_level.extend(parts);
                 }
             }
-        } else if let Some(hierarchy) = hierarchy {
+        } else if let Some(session) = session {
             for current in current_level {
-                if !resolution_scope_step(session) {
+                if !session.scope_step() {
                     return Vec::new();
                 }
-                for ancestor in
-                    resolution_summary_rows(session, || hierarchy.get_direct_ancestors(&current))
-                {
-                    if !resolution_scope_step(session) {
+                for ancestor in forward_direct_ancestors_in_session(csharp, &current, session) {
+                    if !session.scope_step() {
                         return Vec::new();
                     }
-                    let mut parts = resolution_query_limited_rows(
-                        session,
-                        |limit| {
-                            csharp.partial_type_parts_limited(&ancestor, limit, || {
-                                session.is_none_or(ResolutionSession::observe_cancellation)
-                            })
-                        },
-                        || csharp.partial_type_parts(&ancestor),
-                    );
+                    let mut parts = session.query_limited_rows(|limit| {
+                        csharp.partial_type_parts_limited(&ancestor, limit, || {
+                            session.observe_cancellation()
+                        })
+                    });
+                    if !session.observe_cancellation() {
+                        return Vec::new();
+                    }
                     if parts.is_empty() {
-                        if !resolution_scope_step(session) {
+                        if !session.scope_step() {
                             return Vec::new();
                         }
+                        parts.push(ancestor);
+                    }
+                    next_level.extend(parts);
+                }
+            }
+        } else if let Some(hierarchy) = hierarchy {
+            for current in current_level {
+                for ancestor in hierarchy.get_direct_ancestors(&current) {
+                    let mut parts = csharp.partial_type_parts(&ancestor);
+                    if parts.is_empty() {
                         parts.push(ancestor);
                     }
                     next_level.extend(parts);
@@ -3135,4 +3411,153 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::analyzer::usages::get_definition::BoundedResolution;
+    use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
+    use crate::cancellation::CancellationToken;
+    use crate::test_support::AnalyzerFixture;
+    use std::fmt::Write;
+
+    fn deep_wide_hierarchy_source(depth: usize, width: usize) -> String {
+        let mut source = String::from("namespace Demo;\n");
+        for index in 0..width {
+            writeln!(source, "public interface IWide{index} {{}}").expect("write interface");
+        }
+        source.push_str("public class Root { public void RootMethod() {} }\n");
+        write!(source, "public class Level0 : Root").expect("write level zero");
+        for index in 0..width {
+            write!(source, ", IWide{index}").expect("write interface base");
+        }
+        source.push_str(" {}\n");
+        for index in 1..=depth {
+            writeln!(
+                source,
+                "public class Level{index} : Level{} {{}}",
+                index - 1
+            )
+            .expect("write hierarchy level");
+        }
+        source
+    }
+
+    fn hierarchy_fixture() -> AnalyzerFixture {
+        let source = deep_wide_hierarchy_source(12, 16);
+        AnalyzerFixture::new_for_language(Language::CSharp, &[("Hierarchy.cs", &source)])
+    }
+
+    fn type_definition(analyzer: &dyn IAnalyzer, fqn: &str) -> CodeUnit {
+        analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .unwrap_or_else(|| panic!("missing type {fqn}"))
+    }
+
+    #[test]
+    fn bounded_receiver_hierarchy_stops_before_materializing_a_wide_walk() {
+        let fixture = hierarchy_fixture();
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let leaf_fqn = "Demo.Level12".to_string();
+
+        let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let compatible = compatible_receiver_type_names(
+            csharp,
+            analyzer,
+            std::slice::from_ref(&leaf_fqn),
+            false,
+            Some(&complete_session),
+        );
+        assert!(compatible.contains("Demo.Root"), "{compatible:#?}");
+        assert!(compatible.contains("Demo.IWide15"), "{compatible:#?}");
+        assert!(matches!(
+            complete_session.finish(()),
+            BoundedResolution::Complete { .. }
+        ));
+
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 48,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let bounded_session = ResolutionSession::bounded(budget, None);
+        let compatible = compatible_receiver_type_names(
+            csharp,
+            analyzer,
+            std::slice::from_ref(&leaf_fqn),
+            false,
+            Some(&bounded_session),
+        );
+        assert!(
+            compatible.is_empty(),
+            "terminal budget exhaustion must discard partial hierarchy evidence"
+        );
+        assert!(matches!(
+            bounded_session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+    }
+
+    #[test]
+    fn bounded_member_hierarchy_observes_mid_walk_cancellation() {
+        let fixture = hierarchy_fixture();
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let leaf = type_definition(analyzer, "Demo.Level12");
+
+        let exact_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let members = nearest_member_candidates_for_owner_inner(
+            analyzer,
+            csharp,
+            &leaf,
+            "RootMethod",
+            None,
+            Some(0),
+            false,
+            Some(&exact_session),
+        );
+        assert!(
+            matches!(members.as_slice(), [member] if member.fq_name() == "Demo.Root.RootMethod"),
+            "{members:#?}"
+        );
+        assert!(matches!(
+            exact_session.finish(()),
+            BoundedResolution::Complete { .. }
+        ));
+
+        let cancelled_work = (16..512).step_by(8).find_map(|checks| {
+            let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+            let session =
+                ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
+            let members = nearest_member_candidates_for_owner_inner(
+                analyzer,
+                csharp,
+                &leaf,
+                "RootMethod",
+                None,
+                Some(0),
+                false,
+                Some(&session),
+            );
+            match session.finish(members) {
+                BoundedResolution::Cancelled { work }
+                    if work.scope_nodes > 0 && work.summary_expansions >= 2 =>
+                {
+                    Some(work)
+                }
+                _ => None,
+            }
+        });
+        assert!(
+            cancelled_work.is_some(),
+            "expected deterministic cancellation after at least two hierarchy expansions"
+        );
+    }
 }

@@ -9,8 +9,12 @@ use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
+const CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
+    crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_SCOPE_NODES * 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CppNavigationKind {
@@ -431,6 +435,1487 @@ pub(super) fn resolve_cpp(
             ),
         ),
     }
+}
+
+pub(crate) struct CppBoundedTypeResolution {
+    pub(crate) fqn: String,
+    pub(crate) candidates: Vec<CodeUnit>,
+    pub(crate) target_kind: TypeLookupTargetKind,
+    pub(crate) ambiguous: bool,
+}
+
+struct CppBoundedProvider<'a> {
+    cpp: &'a CppAnalyzer,
+    session: &'a ResolutionSession,
+}
+
+impl CppBoundedProvider<'_> {
+    fn definitions_named(&self, fqn: &str, terminal_name: &str) -> Vec<CodeUnit> {
+        let exact = self.session.query_limited_rows(|limit| {
+            self.cpp
+                .declaration_candidates_by_fqn_limited(fqn, false, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        if !exact.is_empty() {
+            return exact;
+        }
+        let normalized = self.session.query_limited_rows(|limit| {
+            self.cpp
+                .declaration_candidates_by_fqn_limited(fqn, true, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        if !normalized.is_empty() {
+            return normalized;
+        }
+        // Some live C++ declarations are held in the definition-lookup
+        // projection rather than the persisted-FQN projection. The bounded
+        // identifier query is only a retrieval index: the exact AST-derived
+        // FQN filter below remains the resolution criterion.
+        self.session
+            .query_limited_rows(|limit| {
+                self.cpp
+                    .declaration_candidates_by_identifier_limited(terminal_name, limit, || {
+                        self.session.observe_cancellation()
+                    })
+            })
+            .into_iter()
+            .filter(|candidate| candidate.fq_name() == fqn)
+            .collect()
+    }
+
+    fn members_named(&self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
+        let projected = self.session.query_limited_rows(|limit| {
+            self.cpp
+                .member_candidates_for_owner_limited(&owner.fq_name(), member, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        if !projected.is_empty() {
+            return projected;
+        }
+        let member_fqn = format!("{}.{}", owner.fq_name(), member);
+        self.definitions_named(&member_fqn, member)
+            .into_iter()
+            .filter(|candidate| candidate.identifier() == member)
+            .collect()
+    }
+
+    fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+        self.session
+            .query_limited_rows(|limit| self.cpp.ranges_limited(unit, limit))
+    }
+
+    fn signature_metadata(&self, unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.session
+            .query_limited_rows(|limit| self.cpp.signature_metadata_limited(unit, limit))
+    }
+
+    fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome;
+
+        if !self.session.scope_step() {
+            return None;
+        }
+        match self.cpp.prepared_syntax_limited_cancellable(
+            file,
+            CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
+            self.session.cancellation(),
+        ) {
+            PreparedSyntaxLimitedOutcome::Available(prepared) => {
+                self.session.observe_cancellation().then_some(prepared)
+            }
+            PreparedSyntaxLimitedOutcome::Exceeded(_) => {
+                self.session.mark_scope_incomplete();
+                None
+            }
+            PreparedSyntaxLimitedOutcome::Cancelled => {
+                self.session.observe_cancellation();
+                None
+            }
+            PreparedSyntaxLimitedOutcome::Unavailable => None,
+        }
+    }
+}
+
+pub(crate) fn resolve_cpp_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "cpp_analyzer_unavailable",
+            "C++ analyzer is unavailable",
+        ));
+    };
+    if !CppAnalyzer::receiver_query_supported(file) {
+        return session.finish(no_definition(
+            "cpp_c_receiver_unsupported",
+            "bounded receiver traversal is intentionally unsupported for plain C",
+        ));
+    }
+    let Some(tree) = tree else {
+        return session.finish(no_definition(
+            "cpp_parse_failed",
+            "C++ source could not be parsed",
+        ));
+    };
+    let provider = CppBoundedProvider {
+        cpp,
+        session: &session,
+    };
+    let outcome = resolve_cpp_bounded_in_session(&provider, file, source, tree.root_node(), site);
+    session.finish(outcome)
+}
+
+fn resolve_cpp_bounded_in_session(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let Some(node) = cpp_bounded_smallest_node(
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+        provider.session,
+    ) else {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed C++ definition",
+                site.text
+            ),
+        );
+    };
+    if cpp_bounded_preprocessing_boundary(node, provider.session) {
+        return no_definition(
+            "cpp_preprocessing_receiver_boundary",
+            "C++ receiver resolution cannot prove the active preprocessing branch",
+        );
+    }
+    if let Some(field) = cpp_bounded_enclosing_member_field(node, provider.session) {
+        return resolve_cpp_bounded_member(provider, file, source, root, field);
+    }
+
+    match cpp_bounded_reference_node(node, provider.session) {
+        Some(CppReferenceNode::Field(field)) => {
+            resolve_cpp_bounded_member(provider, file, source, root, field)
+        }
+        Some(CppReferenceNode::Call(call)) => {
+            let Some(function) = call.child_by_field_name("function") else {
+                return no_definition(
+                    "unsupported_cpp_reference_shape",
+                    "C++ call expression has no structured function",
+                );
+            };
+            resolve_cpp_bounded_call_target(provider, file, source, root, function)
+        }
+        Some(CppReferenceNode::Construction(construction)) => {
+            let Some(type_node) = construction
+                .child_by_field_name("type")
+                .or_else(|| cpp_constructor_type_node(construction))
+            else {
+                return no_definition(
+                    "unsupported_cpp_reference_shape",
+                    "C++ construction has no structured type",
+                );
+            };
+            cpp_bounded_type_candidates(provider, file, source, type_node).map_or_else(
+                || {
+                    no_definition(
+                        "no_indexed_definition",
+                        "C++ construction type is not indexed",
+                    )
+                },
+                |resolution| candidates_outcome(resolution.candidates),
+            )
+        }
+        Some(CppReferenceNode::Type(type_node)) => {
+            cpp_bounded_type_candidates(provider, file, source, type_node).map_or_else(
+                || {
+                    no_definition(
+                        "no_indexed_definition",
+                        format!("`{}` did not resolve to an indexed C++ type", site.text),
+                    )
+                },
+                |resolution| candidates_outcome(resolution.candidates),
+            )
+        }
+        Some(CppReferenceNode::Identifier(identifier)) => {
+            resolve_cpp_bounded_callable(provider, source, root, identifier)
+        }
+        None => no_definition(
+            "unsupported_cpp_reference_shape",
+            format!(
+                "`{}` is a C++ `{}` reference shape that bounded receiver resolution does not support",
+                site.text,
+                node.kind()
+            ),
+        ),
+    }
+}
+
+fn cpp_bounded_enclosing_member_field<'tree>(
+    node: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if !session.scope_step() {
+            return None;
+        }
+        if candidate.kind() == "field_expression" {
+            return Some(candidate);
+        }
+        if matches!(
+            candidate.kind(),
+            "compound_statement"
+                | "expression_statement"
+                | "declaration"
+                | "return_statement"
+                | "co_return_statement"
+        ) {
+            return None;
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn cpp_bounded_reference_node<'tree>(
+    node: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<CppReferenceNode<'tree>> {
+    let mut current = node;
+    loop {
+        if !session.scope_step() {
+            return None;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        let extends_reference = (matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("name") == Some(current))
+            || (matches!(
+                parent.kind(),
+                "dependent_name" | "template_function" | "template_method" | "template_type"
+            ) && parent.child_by_field_name("name") == Some(current))
+            || (parent.kind() == "field_expression"
+                && parent.child_by_field_name("field") == Some(current))
+            || (parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(current))
+            || (parent.kind() == "new_expression"
+                && parent.start_byte() <= current.start_byte()
+                && parent.end_byte() >= current.end_byte())
+            || (parent.kind() == "compound_literal_expression"
+                && parent.child_by_field_name("type") == Some(current));
+        if !extends_reference {
+            break;
+        }
+        current = parent;
+    }
+
+    match current.kind() {
+        "new_expression" | "compound_literal_expression" => {
+            Some(CppReferenceNode::Construction(current))
+        }
+        "call_expression" => Some(CppReferenceNode::Call(current)),
+        "field_expression" => Some(CppReferenceNode::Field(current)),
+        "type_identifier"
+        | "namespace_identifier"
+        | "qualified_identifier"
+        | "template_type"
+        | "scoped_type_identifier" => Some(CppReferenceNode::Type(current)),
+        "identifier"
+        | "field_identifier"
+        | "operator_name"
+        | "operator_cast"
+        | "destructor_name"
+        | "literal_operator_name" => Some(CppReferenceNode::Identifier(current)),
+        _ => None,
+    }
+}
+
+fn resolve_cpp_bounded_member(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    field: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(member_node) = field
+        .child_by_field_name("field")
+        .and_then(|node| cpp_bounded_callable_name_node(node, provider.session))
+    else {
+        return no_definition(
+            "no_member_name",
+            "C++ field expression has no supported member name",
+        );
+    };
+    let Some(receiver) = field
+        .child_by_field_name("argument")
+        .or_else(|| field.named_child(0))
+    else {
+        return no_definition("no_member_receiver", "C++ field expression has no receiver");
+    };
+    let member = cpp_node_text(member_node, source);
+    if member.is_empty() {
+        return no_definition("no_member_name", "C++ member name is blank");
+    }
+    let Some(resolution) =
+        cpp_bounded_type_resolution_for_node(provider, file, source, root, receiver)
+    else {
+        return no_definition(
+            "unsupported_cpp_receiver",
+            format!("receiver for C++ member `{member}` is not resolved"),
+        );
+    };
+
+    let callable = field.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(field)
+    });
+    let mut candidates = Vec::new();
+    let mut ambiguous_base_subobject = false;
+    for owner in resolution.candidates {
+        if !provider.session.scope_step() {
+            return no_definition(
+                "cpp_receiver_budget_exhausted",
+                "C++ member resolution exhausted its bounded owner traversal",
+            );
+        }
+        let root_key = CppBoundedBaseSubobjectKey {
+            virtual_root: None,
+            non_virtual_path: vec![owner.clone()],
+        };
+        let mut subobjects = vec![CppBoundedBaseSubobject {
+            owner,
+            key: root_key,
+            parent: None,
+        }];
+        let mut seen = HashSet::default();
+        let mut level = vec![0];
+        while !level.is_empty() {
+            if !provider.session.scope_step() {
+                return no_definition(
+                    "cpp_receiver_budget_exhausted",
+                    "C++ member resolution exhausted its bounded hierarchy traversal",
+                );
+            }
+            let mut level_candidates = Vec::new();
+            let mut candidate_subobjects = HashMap::default();
+            let mut level_subobjects = Vec::new();
+            for subobject_index in level {
+                if !provider.session.scope_step() {
+                    return no_definition(
+                        "cpp_receiver_budget_exhausted",
+                        "C++ member resolution exhausted its bounded hierarchy traversal",
+                    );
+                }
+                let subobject = &subobjects[subobject_index];
+                if !seen.insert(subobject.key.clone()) {
+                    continue;
+                }
+                for candidate in provider
+                    .members_named(&subobject.owner, member)
+                    .into_iter()
+                    .filter(|candidate| !callable || candidate.is_callable())
+                {
+                    if candidate_subobjects
+                        .insert(candidate.clone(), subobject.key.clone())
+                        .is_some_and(|existing| existing != subobject.key)
+                    {
+                        ambiguous_base_subobject = true;
+                    }
+                    level_candidates.push(candidate);
+                }
+                level_subobjects.push(subobject_index);
+            }
+            if !level_candidates.is_empty() {
+                candidates.extend(level_candidates);
+                break;
+            }
+            let mut next_level = Vec::new();
+            for subobject_index in level_subobjects {
+                if !provider.session.scope_step() {
+                    return no_definition(
+                        "cpp_receiver_budget_exhausted",
+                        "C++ member resolution exhausted its bounded hierarchy traversal",
+                    );
+                }
+                let current_owner = subobjects[subobject_index].owner.clone();
+                let current_key = subobjects[subobject_index].key.clone();
+                for edge in cpp_bounded_direct_ancestor_edges(provider, &current_owner) {
+                    let mut ancestor = Some(subobject_index);
+                    let mut cycle = false;
+                    while let Some(ancestor_index) = ancestor {
+                        if !provider.session.scope_step() {
+                            return no_definition(
+                                "cpp_receiver_budget_exhausted",
+                                "C++ member resolution exhausted its bounded hierarchy traversal",
+                            );
+                        }
+                        let ancestor_subobject = &subobjects[ancestor_index];
+                        if ancestor_subobject.owner == edge.target {
+                            cycle = true;
+                            break;
+                        }
+                        ancestor = ancestor_subobject.parent;
+                    }
+                    if cycle {
+                        continue;
+                    }
+                    let key = if edge.is_virtual {
+                        CppBoundedBaseSubobjectKey {
+                            virtual_root: Some(edge.target.clone()),
+                            non_virtual_path: Vec::new(),
+                        }
+                    } else {
+                        let mut key = current_key.clone();
+                        key.non_virtual_path.push(edge.target.clone());
+                        key
+                    };
+                    let next_index = subobjects.len();
+                    subobjects.push(CppBoundedBaseSubobject {
+                        owner: edge.target,
+                        key,
+                        parent: Some(subobject_index),
+                    });
+                    next_level.push(next_index);
+                }
+            }
+            level = next_level;
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!("C++ member `{member}` is not indexed for the resolved receiver"),
+        );
+    }
+    let mut outcome = candidates_outcome(candidates);
+    if ambiguous_base_subobject && outcome.status == DefinitionLookupStatus::Resolved {
+        outcome.status = DefinitionLookupStatus::Ambiguous;
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "cpp_ambiguous_base_subobject".to_string(),
+            message: "C++ member is inherited through multiple non-virtual base subobjects"
+                .to_string(),
+        });
+    }
+    if resolution.ambiguous && outcome.status == DefinitionLookupStatus::Resolved {
+        outcome.status = DefinitionLookupStatus::Ambiguous;
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "cpp_open_receiver_type".to_string(),
+            message:
+                "C++ receiver type crosses a template or otherwise incomplete structured boundary"
+                    .to_string(),
+        });
+    }
+    outcome
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CppBoundedBaseSubobjectKey {
+    virtual_root: Option<CodeUnit>,
+    non_virtual_path: Vec<CodeUnit>,
+}
+
+struct CppBoundedBaseSubobject {
+    owner: CodeUnit,
+    key: CppBoundedBaseSubobjectKey,
+    parent: Option<usize>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CppBoundedBaseEdge {
+    target: CodeUnit,
+    is_virtual: bool,
+}
+
+fn cpp_bounded_direct_ancestor_edges(
+    provider: &CppBoundedProvider<'_>,
+    owner: &CodeUnit,
+) -> Vec<CppBoundedBaseEdge> {
+    if !owner.is_class() {
+        return Vec::new();
+    }
+    let Some(prepared) = provider.prepared_syntax(owner.source()) else {
+        return Vec::new();
+    };
+    let mut edges = Vec::new();
+    for range in provider.ranges(owner) {
+        if !provider.session.scope_step() {
+            return Vec::new();
+        }
+        let Some(declaration) = cpp_bounded_declaration_node_for_range(
+            prepared.tree().root_node(),
+            &range,
+            provider.session,
+        ) else {
+            continue;
+        };
+        let Some(owner_node) = cpp_bounded_class_declaration_node(
+            declaration,
+            owner,
+            prepared.source(),
+            provider.session,
+        ) else {
+            continue;
+        };
+        let mut cursor = owner_node.walk();
+        for child in owner_node.named_children(&mut cursor) {
+            if !provider.session.scope_step() {
+                return Vec::new();
+            }
+            if child.kind() != "base_class_clause" {
+                continue;
+            }
+            let mut is_virtual = false;
+            for index in 0..child.child_count() {
+                if !provider.session.scope_step() {
+                    return Vec::new();
+                }
+                let Some(candidate) = child.child(index) else {
+                    continue;
+                };
+                match candidate.kind() {
+                    "," => {
+                        is_virtual = false;
+                    }
+                    "virtual" => {
+                        is_virtual = true;
+                    }
+                    "type_identifier"
+                    | "qualified_identifier"
+                    | "scoped_type_identifier"
+                    | "template_type" => {
+                        if let Some(resolution) = cpp_bounded_type_candidates(
+                            provider,
+                            owner.source(),
+                            prepared.source(),
+                            candidate,
+                        ) {
+                            edges.extend(
+                                resolution
+                                    .candidates
+                                    .into_iter()
+                                    .map(|target| CppBoundedBaseEdge { target, is_virtual }),
+                            );
+                        }
+                        is_virtual = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    edges.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then(left.is_virtual.cmp(&right.is_virtual))
+    });
+    edges.dedup();
+    edges
+}
+
+fn cpp_bounded_class_declaration_node<'tree>(
+    declaration: Node<'tree>,
+    owner: &CodeUnit,
+    source: &str,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    let mut pending = vec![declaration];
+    while let Some(candidate) = pending.pop() {
+        if !session.scope_step() {
+            return None;
+        }
+        if matches!(
+            candidate.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && candidate
+            .child_by_field_name("name")
+            .is_some_and(|name| cpp_node_text(name, source) == owner.identifier())
+        {
+            return Some(candidate);
+        }
+        for index in (0..candidate.named_child_count()).rev() {
+            if !session.scope_step() {
+                return None;
+            }
+            if let Some(child) = candidate.named_child(index) {
+                pending.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_cpp_bounded_callable(
+    provider: &CppBoundedProvider<'_>,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(name_node) = cpp_bounded_callable_name_node(node, provider.session) else {
+        return no_definition(
+            "unsupported_cpp_reference_shape",
+            format!(
+                "C++ callable `{}` is not an exact named callable",
+                cpp_node_text(node, source)
+            ),
+        );
+    };
+    let name = cpp_node_text(name_node, source);
+    if node.id() == name_node.id()
+        && cpp_bounded_binding_type_node(source, root, name_node, provider.session).is_some()
+    {
+        return no_definition(
+            "local_callable_reference",
+            format!("C++ callable `{name}` is shadowed by a visible local binding"),
+        );
+    }
+    let structured_path = cpp_bounded_structured_type_path(node, source, provider.session);
+    let relative_fqn = structured_path
+        .as_ref()
+        .map(|path| path.fqn.as_str())
+        .unwrap_or(name);
+    let Some(lexical_scopes) = cpp_bounded_lexical_scope_fqns(node, source, provider.session)
+    else {
+        return no_definition(
+            "cpp_receiver_budget_exhausted",
+            "C++ callable resolution exhausted its bounded lexical traversal",
+        );
+    };
+    let mut candidates = Vec::new();
+    if !structured_path
+        .as_ref()
+        .is_some_and(|path| path.is_absolute)
+    {
+        for scope in lexical_scopes.iter().rev() {
+            if !provider.session.scope_step() {
+                return no_definition(
+                    "cpp_receiver_budget_exhausted",
+                    "C++ callable resolution exhausted its bounded lexical traversal",
+                );
+            }
+            let candidate_fqn = format!("{scope}.{relative_fqn}");
+            candidates = provider
+                .definitions_named(&candidate_fqn, name)
+                .into_iter()
+                .filter(CodeUnit::is_callable)
+                .collect();
+            if !candidates.is_empty() {
+                break;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        candidates = provider
+            .definitions_named(relative_fqn, name)
+            .into_iter()
+            .filter(CodeUnit::is_callable)
+            .collect();
+    }
+    if candidates.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!("C++ callable `{name}` is not indexed"),
+        )
+    } else {
+        candidates_outcome(candidates)
+    }
+}
+
+fn resolve_cpp_bounded_call_target(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    function: Node<'_>,
+) -> DefinitionLookupOutcome {
+    if function.kind() == "field_expression" {
+        resolve_cpp_bounded_member(provider, file, source, root, function)
+    } else {
+        resolve_cpp_bounded_callable(provider, source, root, function)
+    }
+}
+
+pub(crate) fn cpp_type_lookup_resolution_in_session(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    session: &ResolutionSession,
+) -> Option<CppBoundedTypeResolution> {
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    if !CppAnalyzer::receiver_query_supported(file) {
+        return None;
+    }
+    let provider = CppBoundedProvider { cpp, session };
+    let node = cpp_bounded_smallest_node(
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+        session,
+    )?;
+    if cpp_bounded_preprocessing_boundary(node, session) {
+        return None;
+    }
+    cpp_bounded_type_resolution_for_node(&provider, file, source, tree.root_node(), node)
+}
+
+fn cpp_bounded_type_resolution_for_node(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    mut node: Node<'_>,
+) -> Option<CppBoundedTypeResolution> {
+    loop {
+        if !provider.session.scope_step() {
+            return None;
+        }
+        node = match node.kind() {
+            "parenthesized_expression" => node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))?,
+            "pointer_expression" => node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))?,
+            "cast_expression" => {
+                let type_node = node.child_by_field_name("type")?;
+                return cpp_bounded_type_candidates(provider, file, source, type_node);
+            }
+            _ => break,
+        };
+    }
+
+    match node.kind() {
+        "this" => cpp_bounded_current_receiver_type(provider, file, source, node),
+        "identifier" | "field_identifier" => {
+            let type_node = cpp_bounded_binding_type_node(source, root, node, provider.session)?;
+            cpp_bounded_type_candidates(provider, file, source, type_node)
+        }
+        "new_expression" | "compound_literal_expression" => {
+            let type_node = node
+                .child_by_field_name("type")
+                .or_else(|| cpp_constructor_type_node(node))?;
+            cpp_bounded_type_candidates(provider, file, source, type_node)
+        }
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if let Some(construction) =
+                cpp_bounded_type_candidates(provider, file, source, function)
+            {
+                return Some(CppBoundedTypeResolution {
+                    target_kind: TypeLookupTargetKind::ValueExpression,
+                    ..construction
+                });
+            }
+            let definitions =
+                resolve_cpp_bounded_call_target(provider, file, source, root, function);
+            if definitions.status != DefinitionLookupStatus::Resolved {
+                return None;
+            }
+            cpp_bounded_callable_return_type(
+                provider,
+                file,
+                source,
+                root,
+                definitions.definitions.as_slice(),
+            )
+        }
+        "field_expression" => {
+            let definitions = resolve_cpp_bounded_member(provider, file, source, root, node);
+            if definitions.status != DefinitionLookupStatus::Resolved {
+                return None;
+            }
+            cpp_bounded_callable_return_type(
+                provider,
+                file,
+                source,
+                root,
+                definitions.definitions.as_slice(),
+            )
+        }
+        "type_identifier"
+        | "namespace_identifier"
+        | "qualified_identifier"
+        | "scoped_type_identifier"
+        | "template_type" => cpp_bounded_type_candidates(provider, file, source, node),
+        _ => None,
+    }
+}
+
+fn cpp_bounded_callable_return_type(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    definitions: &[CodeUnit],
+) -> Option<CppBoundedTypeResolution> {
+    if definitions.is_empty() {
+        return None;
+    }
+
+    let mut resolved = Vec::new();
+    for definition in definitions {
+        if !provider.session.scope_step() {
+            return None;
+        }
+        let metadata = provider.signature_metadata(definition);
+        let mut definition_resolved = Vec::new();
+        for identity in metadata
+            .iter()
+            .filter_map(SignatureMetadata::return_type_identity)
+        {
+            let name = identity.nominal_name_with(|| provider.session.scope_step())?;
+            definition_resolved.push(cpp_bounded_type_candidates_for_name(provider, name)?);
+        }
+
+        if definition_resolved.is_empty() && definition.source() == file {
+            for range in provider.ranges(definition) {
+                if !provider.session.scope_step() {
+                    return None;
+                }
+                let declaration =
+                    cpp_bounded_declaration_node_for_range(root, &range, provider.session)?;
+                let type_node = declaration.child_by_field_name("type").or_else(|| {
+                    provider
+                        .session
+                        .scope_step()
+                        .then(|| declaration.parent()?.child_by_field_name("type"))
+                        .flatten()
+                });
+                if let Some(type_node) = type_node {
+                    definition_resolved.push(cpp_bounded_type_candidates(
+                        provider, file, source, type_node,
+                    )?);
+                }
+            }
+        }
+        if definition_resolved.is_empty() {
+            return None;
+        }
+        resolved.extend(definition_resolved);
+    }
+
+    let first_fqn = resolved.first()?.fqn.clone();
+    if resolved
+        .iter()
+        .any(|resolution| resolution.fqn != first_fqn)
+    {
+        return None;
+    }
+    let ambiguous = resolved.iter().any(|resolution| resolution.ambiguous);
+    let mut candidates = resolved
+        .into_iter()
+        .flat_map(|resolution| resolution.candidates)
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(CppBoundedTypeResolution {
+        fqn: first_fqn,
+        candidates,
+        target_kind: TypeLookupTargetKind::ValueExpression,
+        ambiguous,
+    })
+}
+
+fn cpp_bounded_type_candidates_for_name(
+    provider: &CppBoundedProvider<'_>,
+    name: &StructuredTypeName,
+) -> Option<CppBoundedTypeResolution> {
+    let terminal = name.path().last()?;
+    let mut candidates = Vec::new();
+    let first_scope_depth = if name.is_absolute() {
+        0
+    } else {
+        name.lexical_scope().len()
+    };
+    for scope_depth in (0..=first_scope_depth).rev() {
+        if !provider.session.scope_step() {
+            return None;
+        }
+        let mut components = Vec::with_capacity(scope_depth.saturating_add(name.path().len()));
+        components.extend_from_slice(&name.lexical_scope()[..scope_depth]);
+        components.extend_from_slice(name.path());
+        let fqn = components.join(".");
+        candidates = provider
+            .definitions_named(&fqn, terminal)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
+        if !candidates.is_empty() {
+            break;
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        return None;
+    }
+    let distinct_fqns = candidates
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect::<HashSet<_>>();
+    Some(CppBoundedTypeResolution {
+        fqn: if distinct_fqns.len() == 1 {
+            candidates[0].fq_name()
+        } else {
+            name.path().join(".")
+        },
+        candidates,
+        target_kind: TypeLookupTargetKind::ValueExpression,
+        ambiguous: distinct_fqns.len() != 1,
+    })
+}
+
+fn cpp_bounded_type_candidates(
+    provider: &CppBoundedProvider<'_>,
+    _file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CppBoundedTypeResolution> {
+    let name_node = cpp_bounded_type_name_node(node, provider.session)?;
+    let name = cpp_node_text(name_node, source);
+    if name.is_empty() || matches!(name, "auto" | "decltype") {
+        return None;
+    }
+    let structured_path = cpp_bounded_structured_type_path(node, source, provider.session);
+    let relative_fqn = structured_path
+        .as_ref()
+        .map(|path| path.fqn.as_str())
+        .unwrap_or(name);
+    let lexical_scopes = cpp_bounded_lexical_scope_fqns(node, source, provider.session)?;
+    let mut candidates = Vec::new();
+    if !structured_path
+        .as_ref()
+        .is_some_and(|path| path.is_absolute)
+    {
+        for scope in lexical_scopes.iter().rev() {
+            if !provider.session.scope_step() {
+                return None;
+            }
+            let candidate_fqn = format!("{scope}.{relative_fqn}");
+            candidates = provider
+                .definitions_named(&candidate_fqn, name)
+                .into_iter()
+                .filter(CodeUnit::is_class)
+                .collect();
+            if !candidates.is_empty() {
+                break;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        candidates = provider
+            .definitions_named(relative_fqn, name)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        return None;
+    }
+    let ambiguous = candidates
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect::<HashSet<_>>()
+        .len()
+        != 1
+        || cpp_bounded_template_boundary(node, provider.session);
+    let fqn = if candidates.len() == 1 {
+        candidates[0].fq_name()
+    } else {
+        structured_path
+            .map(|path| path.fqn)
+            .unwrap_or_else(|| name.to_string())
+    };
+    Some(CppBoundedTypeResolution {
+        fqn,
+        candidates,
+        target_kind: if cpp_bounded_type_reference(node, provider.session) {
+            TypeLookupTargetKind::TypeReference
+        } else {
+            TypeLookupTargetKind::ValueExpression
+        },
+        ambiguous,
+    })
+}
+
+fn cpp_bounded_current_receiver_type(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CppBoundedTypeResolution> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if !provider.session.scope_step() {
+            return None;
+        }
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && let Some(name) = parent.child_by_field_name("name")
+        {
+            let mut resolution = cpp_bounded_type_candidates(provider, file, source, name)?;
+            resolution.target_kind = TypeLookupTargetKind::ValueExpression;
+            return Some(resolution);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn cpp_bounded_binding_type_node<'tree>(
+    source: &str,
+    root: Node<'tree>,
+    reference: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    let name = cpp_node_text(reference, source);
+    let callable = cpp_bounded_enclosing_callable(reference, session)?;
+    let mut best: Option<(usize, usize, Node<'tree>)> = None;
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if !session.scope_step() {
+            return None;
+        }
+        if node.start_byte() > reference.start_byte() {
+            continue;
+        }
+        if node.id() != callable.id() && cpp_bounded_nested_callable(node) {
+            continue;
+        }
+        if matches!(node.kind(), "parameter_declaration" | "declaration")
+            && let Some(type_node) = node.child_by_field_name("type")
+        {
+            let scope = if node.kind() == "parameter_declaration" {
+                callable
+            } else {
+                cpp_bounded_enclosing_scope(node, callable, session)?
+            };
+            if scope.start_byte() <= reference.start_byte()
+                && reference.start_byte() < scope.end_byte()
+            {
+                let mut declarators = Vec::new();
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    declarators.push(declarator);
+                }
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if !session.scope_step() {
+                        return None;
+                    }
+                    if child.kind() == "init_declarator" {
+                        declarators.push(child);
+                    }
+                }
+                if declarators.into_iter().any(|declarator| {
+                    cpp_bounded_declarator_name_node(declarator, session)
+                        .is_some_and(|name_node| cpp_node_text(name_node, source) == name)
+                }) {
+                    let candidate = (
+                        scope.end_byte().saturating_sub(scope.start_byte()),
+                        usize::MAX.saturating_sub(node.start_byte()),
+                        type_node,
+                    );
+                    if best
+                        .as_ref()
+                        .is_none_or(|current| (candidate.0, candidate.1) < (current.0, current.1))
+                    {
+                        best = Some(candidate);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        let mut children = Vec::new();
+        for child in node.named_children(&mut cursor) {
+            if !session.scope_step() {
+                return None;
+            }
+            children.push(child);
+        }
+        stack.extend(children.into_iter().rev());
+    }
+    let _ = root;
+    best.map(|(_, _, type_node)| type_node)
+}
+
+fn cpp_bounded_enclosing_callable<'tree>(
+    node: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if !session.scope_step() {
+            return None;
+        }
+        if cpp_bounded_callable_declaration(candidate) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn cpp_bounded_callable_declaration(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition" | "lambda_expression" | "operator_cast_definition"
+    )
+}
+
+fn cpp_bounded_nested_callable(node: Node<'_>) -> bool {
+    cpp_bounded_callable_declaration(node)
+}
+
+fn cpp_bounded_enclosing_scope<'tree>(
+    node: Node<'tree>,
+    fallback: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if !session.scope_step() {
+            return None;
+        }
+        if candidate.kind() == "compound_statement" {
+            return Some(candidate);
+        }
+        if candidate.id() == fallback.id() {
+            break;
+        }
+        current = candidate.parent();
+    }
+    Some(fallback)
+}
+
+fn cpp_bounded_declarator_name_node<'tree>(
+    mut node: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    loop {
+        if !session.scope_step() {
+            return None;
+        }
+        match node.kind() {
+            "identifier" | "field_identifier" => return Some(node),
+            "qualified_identifier" => node = node.child_by_field_name("name")?,
+            "function_declarator"
+            | "pointer_declarator"
+            | "array_declarator"
+            | "init_declarator"
+            | "attributed_declarator" => node = node.child_by_field_name("declarator")?,
+            "reference_declarator" | "parenthesized_declarator" => node = node.named_child(0)?,
+            _ => return None,
+        }
+    }
+}
+
+fn cpp_bounded_callable_name_node<'tree>(
+    mut node: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    loop {
+        if !session.scope_step() {
+            return None;
+        }
+        node = match node.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "namespace_identifier"
+            | "operator_name"
+            | "operator_cast"
+            | "destructor_name"
+            | "literal_operator_name"
+            | "primitive_type" => return Some(node),
+            "dependent_name" | "template_function" | "template_method" | "template_type" => {
+                node.child_by_field_name("name")?
+            }
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                let mut cursor = node.walk();
+                let mut selected = None;
+                for child in node.children_by_field_name("name", &mut cursor) {
+                    if !session.scope_step() {
+                        return None;
+                    }
+                    if child.is_named() {
+                        selected = Some(child);
+                    }
+                }
+                selected?
+            }
+            "field_expression" => node.child_by_field_name("field")?,
+            "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor);
+                let child = children.next()?;
+                if !session.scope_step() || children.next().is_some() {
+                    return None;
+                }
+                child
+            }
+            _ => return None,
+        };
+    }
+}
+
+fn cpp_bounded_type_name_node<'tree>(
+    mut node: Node<'tree>,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    loop {
+        if !session.scope_step() {
+            return None;
+        }
+        match node.kind() {
+            "type_identifier" | "identifier" => return Some(node),
+            "qualified_identifier" | "scoped_type_identifier" => {
+                node = node.child_by_field_name("name")?
+            }
+            "template_type" | "dependent_type" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(0))?
+            }
+            "type_descriptor" | "sized_type_specifier" | "placeholder_type_specifier" => {
+                node = node
+                    .child_by_field_name("type")
+                    .or_else(|| node.named_child(0))?
+            }
+            _ => return None,
+        }
+    }
+}
+
+struct CppBoundedStructuredPath {
+    fqn: String,
+    is_absolute: bool,
+}
+
+fn cpp_bounded_structured_type_path(
+    node: Node<'_>,
+    source: &str,
+    session: &ResolutionSession,
+) -> Option<CppBoundedStructuredPath> {
+    let mut components = Vec::new();
+    let mut pending = vec![node];
+    let mut is_absolute = false;
+    while let Some(candidate) = pending.pop() {
+        if !session.scope_step() {
+            return None;
+        }
+        is_absolute |= candidate.child_by_field_name("scope").is_none()
+            && candidate.child(0).is_some_and(|child| child.kind() == "::");
+        match candidate.kind() {
+            "namespace_identifier"
+            | "type_identifier"
+            | "identifier"
+            | "field_identifier"
+            | "operator_name"
+            | "destructor_name" => {
+                let component = cpp_node_text(candidate, source);
+                if !component.is_empty() {
+                    components.push(component.to_string());
+                }
+            }
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(name) = candidate.child_by_field_name("name") {
+                    pending.push(name);
+                }
+                if let Some(scope) = candidate.child_by_field_name("scope") {
+                    pending.push(scope);
+                }
+            }
+            "template_type" | "template_function" | "template_method" | "dependent_type"
+            | "dependent_name" => {
+                if let Some(name) = candidate.child_by_field_name("name") {
+                    pending.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    (components.len() > 1 || is_absolute).then(|| CppBoundedStructuredPath {
+        fqn: components.join("."),
+        is_absolute,
+    })
+}
+
+fn cpp_bounded_lexical_scope_fqns(
+    node: Node<'_>,
+    source: &str,
+    session: &ResolutionSession,
+) -> Option<Vec<String>> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if !session.scope_step() {
+            return None;
+        }
+        if matches!(
+            candidate.kind(),
+            "namespace_definition" | "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && let Some(name_node) = candidate.child_by_field_name("name")
+            && !(name_node.start_byte() <= node.start_byte()
+                && node.end_byte() <= name_node.end_byte())
+        {
+            let scope = cpp_bounded_structured_type_path(name_node, source, session)
+                .map(|path| path.fqn)
+                .unwrap_or_else(|| cpp_node_text(name_node, source).to_string());
+            if !scope.is_empty() {
+                scopes.push(scope);
+            }
+        }
+        current = candidate.parent();
+    }
+    scopes.reverse();
+    let mut fqns = Vec::with_capacity(scopes.len());
+    let mut prefix = String::new();
+    for scope in scopes {
+        if !session.scope_step() {
+            return None;
+        }
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(&scope);
+        fqns.push(prefix.clone());
+    }
+    Some(fqns)
+}
+
+fn cpp_bounded_type_reference(node: Node<'_>, session: &ResolutionSession) -> bool {
+    if matches!(
+        node.kind(),
+        "type_identifier"
+            | "namespace_identifier"
+            | "qualified_identifier"
+            | "scoped_type_identifier"
+            | "template_type"
+    ) {
+        if !session.scope_step() {
+            return false;
+        }
+        return node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "field_expression" | "qualified_identifier" | "scoped_identifier"
+            )
+        });
+    }
+    false
+}
+
+fn cpp_bounded_template_boundary(node: Node<'_>, session: &ResolutionSession) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if !session.scope_step() {
+            return true;
+        }
+        if matches!(
+            candidate.kind(),
+            "template_type"
+                | "template_method"
+                | "template_function"
+                | "dependent_type"
+                | "dependent_name"
+        ) {
+            return true;
+        }
+        if matches!(
+            candidate.kind(),
+            "statement" | "declaration" | "function_definition" | "translation_unit"
+        ) {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn cpp_bounded_preprocessing_boundary(node: Node<'_>, session: &ResolutionSession) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if !session.scope_step() {
+            return true;
+        }
+        if candidate.kind().starts_with("preproc_") || candidate.kind() == "ERROR" {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn cpp_bounded_smallest_node<'tree>(
+    root: Node<'tree>,
+    start: usize,
+    end: usize,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    if start >= end {
+        return None;
+    }
+    let mut current = root;
+    loop {
+        if !session.scope_step() {
+            return None;
+        }
+        let mut cursor = current.walk();
+        let mut containing = None;
+        for child in current.named_children(&mut cursor) {
+            if !session.scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing = Some(child);
+                break;
+            }
+        }
+        let Some(child) = containing else {
+            return (current.start_byte() <= start && current.end_byte() >= end).then_some(current);
+        };
+        current = child;
+    }
+}
+
+fn cpp_bounded_declaration_node_for_range<'tree>(
+    root: Node<'tree>,
+    range: &Range,
+    session: &ResolutionSession,
+) -> Option<Node<'tree>> {
+    let mut node = cpp_bounded_smallest_node(root, range.start_byte, range.end_byte, session)?;
+    while node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+        if !session.scope_step() {
+            return None;
+        }
+        node = node.parent()?;
+    }
+    Some(node)
 }
 
 pub(super) fn parse_cpp_tree(source: &str) -> Option<Tree> {
@@ -4216,4 +5701,93 @@ fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
     }
     names.reverse();
     (!names.is_empty()).then(|| names.join("::"))
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use crate::path_utils::rel_path_string;
+    use crate::test_support::AnalyzerFixture;
+
+    fn wide_deep_member_fixture() -> (
+        AnalyzerFixture,
+        ProjectFile,
+        String,
+        Tree,
+        ResolvedReferenceSite,
+    ) {
+        let statements = (0..96)
+            .map(|index| format!("    int value{index} = {index};\n"))
+            .collect::<String>();
+        let expression = format!("{}service{}->run()", "(".repeat(24), ")".repeat(24));
+        let source = format!(
+            "struct Service {{ void run() {{}} }};\n\n\
+             void use(Service* service) {{\n{statements}    {expression};\n}}\n"
+        );
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Cpp, &[("receiver.cpp", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "receiver.cpp");
+        let tree = parse_cpp_tree(&source).expect("C++ tree");
+        let expression_start = source.rfind(&expression).expect("C++ member call");
+        let start_byte = expression_start + expression.rfind("run").expect("member name");
+        let end_byte = start_byte + "run".len();
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "run".to_string(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+        };
+        (fixture, file, source, tree, site)
+    }
+
+    #[test]
+    fn bounded_cpp_wide_deep_walk_stops_without_partial_result() {
+        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let outcome = resolve_cpp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::tiny(),
+            None,
+        );
+
+        assert!(matches!(
+            outcome,
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_cpp_wide_deep_walk_honors_mid_walk_cancellation() {
+        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        let outcome = resolve_cpp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+
+        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
 }

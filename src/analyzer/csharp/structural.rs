@@ -135,6 +135,9 @@ fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
 
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     for index in 0..arguments.named_child_count() {
+        if !sink.should_continue() {
+            break;
+        }
         let Some(argument) = arguments.named_child(index) else {
             continue;
         };

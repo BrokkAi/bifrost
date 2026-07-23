@@ -305,13 +305,38 @@ pub(crate) fn scala_package_prefixes_at(
     source: &str,
     reference_byte: usize,
 ) -> Vec<String> {
+    scala_package_prefixes_at_impl(root, source, reference_byte, None)
+        .expect("unbounded Scala package traversal cannot stop")
+}
+
+pub(crate) fn scala_package_prefixes_at_checked(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    inspect: &mut dyn FnMut(Node<'_>) -> bool,
+) -> Option<Vec<String>> {
+    scala_package_prefixes_at_impl(root, source, reference_byte, Some(inspect))
+}
+
+fn scala_package_prefixes_at_impl(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    mut inspect: Option<&mut dyn FnMut(Node<'_>) -> bool>,
+) -> Option<Vec<String>> {
     let mut prefixes = Vec::new();
     let mut segments = Vec::new();
     let mut container = root;
     loop {
+        if !inspect_node(&mut inspect, container) {
+            return None;
+        }
         let mut nested_body = None;
         let mut cursor = container.walk();
         for child in container.named_children(&mut cursor) {
+            if !inspect_node(&mut inspect, child) {
+                return None;
+            }
             if child.start_byte() > reference_byte {
                 break;
             }
@@ -321,6 +346,9 @@ pub(crate) fn scala_package_prefixes_at(
             let Some(name) = child.child_by_field_name("name") else {
                 continue;
             };
+            if !inspect_named_subtree(&mut inspect, name) {
+                return None;
+            }
             let clause_segments = scala_type_lookup_segments(name, source);
             if clause_segments.is_empty() {
                 continue;
@@ -342,5 +370,32 @@ pub(crate) fn scala_package_prefixes_at(
         };
         container = body;
     }
-    prefixes
+    Some(prefixes)
+}
+
+fn inspect_named_subtree(
+    inspect: &mut Option<&mut dyn FnMut(Node<'_>) -> bool>,
+    root: Node<'_>,
+) -> bool {
+    if inspect.is_none() {
+        return true;
+    }
+    if !inspect_node(inspect, root) {
+        return false;
+    }
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if !inspect_node(inspect, child) {
+                return false;
+            }
+            stack.push(child);
+        }
+    }
+    true
+}
+
+fn inspect_node(inspect: &mut Option<&mut dyn FnMut(Node<'_>) -> bool>, node: Node<'_>) -> bool {
+    inspect.as_mut().is_none_or(|inspect| inspect(node))
 }

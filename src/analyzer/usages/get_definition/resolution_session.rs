@@ -194,6 +194,10 @@ impl ResolutionSession {
         state.stop.is_none()
     }
 
+    pub(crate) fn cancellation(&self) -> Option<&CancellationToken> {
+        self.cancellation.as_ref()
+    }
+
     pub(crate) fn mark_scope_incomplete(&self) {
         self.stop(ResolutionStop::Exceeded(ReceiverBudgetLimit::ScopeNodes));
     }

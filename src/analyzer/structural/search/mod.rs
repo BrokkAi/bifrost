@@ -31,7 +31,10 @@ use super::index::{
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
-use super::provider::{StructuralFactsCacheOutcome, StructuralSearchProvider};
+use super::provider::{
+    StructuralFactsCacheOutcome, StructuralFactsLimitedOutcome, StructuralSearchProvider,
+    StructuralSourceLimitedOutcome,
+};
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
@@ -916,6 +919,7 @@ struct QueryExecutionState<'a> {
     indexed_declarations: IndexedDeclarations,
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
+    receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
     import_graph_generations: Option<Box<[u64]>>,
     direct_import_layer: Option<Arc<DerivedLayer>>,
@@ -1285,6 +1289,7 @@ fn execute_internal_with_strategy(
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
+        receiver_facts: HashMap::default(),
         import_graph: None,
         import_graph_generations: None,
         direct_import_layer: None,
@@ -2686,6 +2691,7 @@ fn execute_parallel_seed_union(
                     indexed_declarations: IndexedDeclarations::default(),
                     reference_cache: ReferenceTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
+                    receiver_facts: HashMap::default(),
                     import_graph: None,
                     import_graph_generations: None,
                     direct_import_layer: None,
@@ -3037,10 +3043,19 @@ fn load_seed_facts(
         return provider.structural_facts(file);
     };
     let (facts, outcome) = provider.structural_facts_with_outcome(file);
+    record_structural_facts_cache_outcome(profile, outcome, facts.is_some());
+    facts
+}
+
+fn record_structural_facts_cache_outcome(
+    profile: &mut QueryCacheProfile,
+    outcome: StructuralFactsCacheOutcome,
+    available: bool,
+) {
     match outcome {
-        StructuralFactsCacheOutcome::MemoryHit => profile
-            .seed_structural_facts
-            .record_memory_hit(facts.is_some()),
+        StructuralFactsCacheOutcome::MemoryHit => {
+            profile.seed_structural_facts.record_memory_hit(available)
+        }
         StructuralFactsCacheOutcome::PersistedHydration => {
             profile.seed_structural_facts.record_persisted_hydration()
         }
@@ -3054,7 +3069,6 @@ fn load_seed_facts(
             profile.seed_structural_facts.record_unknown();
         }
     }
-    facts
 }
 
 fn scan_access(
@@ -3571,7 +3585,7 @@ fn execute_seed(
                 cache_complete = cache_complete.map(|_| false);
                 continue;
             };
-            let count = loaded.nodes().len();
+            let count = loaded.work_item_count();
             if let Some(profile) = &mut state.profile {
                 profile.access_path.materialized_files =
                     profile.access_path.materialized_files.saturating_add(1);
@@ -3641,7 +3655,7 @@ fn execute_seed(
                     cache_complete = cache_complete.map(|_| false);
                     continue;
                 };
-                if loaded.nodes().len() != fact_nodes
+                if loaded.work_item_count() != fact_nodes
                     || selected_facts
                         .last()
                         .is_some_and(|id| (*id as usize) >= loaded.nodes().len())
@@ -3665,10 +3679,10 @@ fn execute_seed(
                 if let Some(profile) = &mut state.profile {
                     profile.access_path.materialized_files =
                         profile.access_path.materialized_files.saturating_add(1);
-                    profile.access_path.materialized_fact_nodes = profile
-                        .access_path
-                        .materialized_fact_nodes
-                        .saturating_add(u64::try_from(loaded.nodes().len()).unwrap_or(u64::MAX));
+                    profile.access_path.materialized_fact_nodes =
+                        profile.access_path.materialized_fact_nodes.saturating_add(
+                            u64::try_from(loaded.work_item_count()).unwrap_or(u64::MAX),
+                        );
                 }
                 loaded
             }
@@ -4404,6 +4418,7 @@ fn apply_plan_step(
         Some(&mut state.indexed_declarations),
         &mut state.reference_cache,
         &mut state.call_cache,
+        &mut state.receiver_facts,
         &mut state.budget,
         limits,
         max_step_outputs,
@@ -4695,6 +4710,7 @@ fn apply_pipeline_step(
     indexed_declarations: Option<&mut IndexedDeclarations>,
     reference_cache: &mut ReferenceTraversalCache,
     call_cache: &mut CallTraversalCache,
+    receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: usize,
@@ -5063,45 +5079,51 @@ fn apply_pipeline_step(
                 QueryStep::ReceiverTargets(_)
                 | QueryStep::PointsTo(_)
                 | QueryStep::MemberTargets(_),
-            ) => receiver_analysis_expansions(
+            ) => receiver_analysis_expansions_for_pipeline_row(
+                analyzer,
                 receiver_service
                     .as_ref()
                     .expect("receiver query service exists for receiver steps"),
                 receiver_operation(step),
                 &site.file,
-                coherent_trace_facts_for_file(&row.traces, &site.file),
+                &row.traces,
                 vec![site.range],
                 if matches!(step, QueryStep::PointsTo(_)) {
                     ReceiverQueryInput::Expression
                 } else {
                     ReceiverQueryInput::ContainingSite
                 },
-                None,
+                receiver_facts,
                 budget,
                 limits,
                 receiver_budget_override,
                 max_step_outputs.saturating_sub(output.len()),
                 cancellation,
+                diagnostics,
+                cache_profile,
                 &mut receiver_diagnostics,
                 &mut row_exhausted,
                 &mut receiver_truncated,
             ),
             (PipelineValue::CallSite(site), QueryStep::ReceiverTargets(_)) => {
-                receiver_analysis_expansions(
+                receiver_analysis_expansions_for_pipeline_row(
+                    analyzer,
                     receiver_service
                         .as_ref()
                         .expect("receiver query service exists for receiver steps"),
                     ReceiverQueryOperation::ReceiverTargets,
                     &site.0.file,
-                    coherent_trace_facts_for_file(&row.traces, &site.0.file),
+                    &row.traces,
                     vec![site.0.range],
                     ReceiverQueryInput::ContainingSite,
-                    None,
+                    receiver_facts,
                     budget,
                     limits,
                     receiver_budget_override,
                     max_step_outputs.saturating_sub(output.len()),
                     cancellation,
+                    diagnostics,
+                    cache_profile,
                     &mut receiver_diagnostics,
                     &mut row_exhausted,
                     &mut receiver_truncated,
@@ -5110,21 +5132,24 @@ fn apply_pipeline_step(
             (
                 PipelineValue::ExpressionSite(site),
                 QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_),
-            ) => receiver_analysis_expansions(
+            ) => receiver_analysis_expansions_for_pipeline_row(
+                analyzer,
                 receiver_service
                     .as_ref()
                     .expect("receiver query service exists for receiver steps"),
                 receiver_operation(step),
                 &site.call_site.0.file,
-                coherent_trace_facts_for_file(&row.traces, &site.call_site.0.file),
+                &row.traces,
                 vec![site.range],
                 ReceiverQueryInput::Expression,
-                None,
+                receiver_facts,
                 budget,
                 limits,
                 receiver_budget_override,
                 max_step_outputs.saturating_sub(output.len()),
                 cancellation,
+                diagnostics,
+                cache_profile,
                 &mut receiver_diagnostics,
                 &mut row_exhausted,
                 &mut receiver_truncated,
@@ -5187,7 +5212,12 @@ fn apply_pipeline_step(
     }
     append_semantic_omission_diagnostics(diagnostics, step, semantic_omissions);
     for ((code, language, operation, reason), count) in receiver_diagnostics {
-        let message = if code == CodeQueryDiagnosticCode::ReceiverAnalysisFailed {
+        let message = if reason == RECEIVER_PIPELINE_OUTPUT_CAP_REASON {
+            format!(
+                "{operation} omitted {count} receiver analysis input{} at the pipeline output cap",
+                if count == 1 { "" } else { "s" }
+            )
+        } else if code == CodeQueryDiagnosticCode::ReceiverAnalysisFailed {
             format!(
                 "{operation} failed for {count} analysis input{}: {reason}",
                 if count == 1 { "" } else { "s" }
@@ -5245,6 +5275,7 @@ fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
 
 type ReceiverDiagnostics =
     BTreeMap<(CodeQueryDiagnosticCode, Language, &'static str, String), usize>;
+const RECEIVER_PIPELINE_OUTPUT_CAP_REASON: &str = "pipeline output cap omitted receiver inputs";
 
 fn structural_receiver_ranges(
     seed: &SeedMatch,
@@ -5328,6 +5359,213 @@ fn coherent_trace_facts_for_file<'a>(
     selected
 }
 
+enum PipelineReceiverFacts {
+    Available(Arc<FileFacts>),
+    Unavailable,
+    Halted,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receiver_facts_for_pipeline_row(
+    analyzer: &dyn IAnalyzer,
+    traces: &[PipelineTrace],
+    file: &ProjectFile,
+    receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+) -> PipelineReceiverFacts {
+    if let Some(facts) = coherent_trace_facts_for_file(traces, file) {
+        return PipelineReceiverFacts::Available(Arc::clone(facts));
+    }
+    if let Some(facts) = receiver_facts.get(file) {
+        return PipelineReceiverFacts::Available(Arc::clone(facts));
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return PipelineReceiverFacts::Halted;
+    }
+
+    let language = crate::analyzer::common::language_for_file(file);
+    let Some(provider) = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)
+    else {
+        return PipelineReceiverFacts::Unavailable;
+    };
+    let mut projected = *budget;
+    projected.scanned_files = projected.scanned_files.saturating_add(1);
+    if projected.scanned_files > limits.max_scanned_files {
+        push_budget_diagnostic(diagnostics, &projected);
+        return PipelineReceiverFacts::Halted;
+    }
+    budget.scanned_files = projected.scanned_files;
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return PipelineReceiverFacts::Halted;
+    }
+    let remaining_source_bytes = limits
+        .max_scanned_source_bytes
+        .saturating_sub(budget.scanned_source_bytes);
+    let source =
+        match provider.structural_source_limited(file, remaining_source_bytes, cancellation) {
+            StructuralSourceLimitedOutcome::Available(source) => source,
+            StructuralSourceLimitedOutcome::Exceeded {
+                minimum_source_bytes,
+            } => {
+                projected = *budget;
+                projected.scanned_source_bytes = projected
+                    .scanned_source_bytes
+                    .saturating_add(minimum_source_bytes);
+                push_budget_diagnostic(diagnostics, &projected);
+                return PipelineReceiverFacts::Halted;
+            }
+            StructuralSourceLimitedOutcome::Cancelled => {
+                return PipelineReceiverFacts::Halted;
+            }
+            StructuralSourceLimitedOutcome::Unavailable => {
+                return PipelineReceiverFacts::Unavailable;
+            }
+        };
+    projected = *budget;
+    projected.scanned_source_bytes = projected.scanned_source_bytes.saturating_add(source.len());
+    if projected.scanned_source_bytes > limits.max_scanned_source_bytes {
+        push_budget_diagnostic(diagnostics, &projected);
+        return PipelineReceiverFacts::Halted;
+    }
+    budget.scanned_source_bytes = projected.scanned_source_bytes;
+
+    let remaining_fact_nodes = limits
+        .max_fact_nodes
+        .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references));
+    let facts = match provider.structural_facts_limited(
+        file,
+        source.as_ref(),
+        remaining_fact_nodes,
+        cancellation,
+    ) {
+        StructuralFactsLimitedOutcome::Available {
+            facts,
+            cache_outcome,
+        } => {
+            if let Some(profile) = cache_profile.as_mut() {
+                record_structural_facts_cache_outcome(profile, cache_outcome, true);
+            }
+            facts
+        }
+        StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes } => {
+            projected = *budget;
+            projected.fact_nodes = projected.fact_nodes.saturating_add(minimum_fact_nodes);
+            push_budget_diagnostic(diagnostics, &projected);
+            return PipelineReceiverFacts::Halted;
+        }
+        StructuralFactsLimitedOutcome::Cancelled => {
+            return PipelineReceiverFacts::Halted;
+        }
+        StructuralFactsLimitedOutcome::Unavailable => {
+            if let Some(profile) = cache_profile.as_mut() {
+                record_structural_facts_cache_outcome(
+                    profile,
+                    StructuralFactsCacheOutcome::Unavailable,
+                    false,
+                );
+            }
+            return PipelineReceiverFacts::Unavailable;
+        }
+    };
+    if facts.source() != source.as_ref() {
+        return PipelineReceiverFacts::Unavailable;
+    }
+
+    projected = *budget;
+    projected.fact_nodes = projected.fact_nodes.saturating_add(facts.work_item_count());
+    if projected
+        .fact_nodes
+        .saturating_add(projected.examined_references)
+        > limits.max_fact_nodes
+    {
+        push_budget_diagnostic(diagnostics, &projected);
+        return PipelineReceiverFacts::Halted;
+    }
+    budget.fact_nodes = projected.fact_nodes;
+    receiver_facts.insert(file.clone(), Arc::clone(&facts));
+    PipelineReceiverFacts::Available(facts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receiver_analysis_expansions_for_pipeline_row(
+    analyzer: &dyn IAnalyzer,
+    service: &ReceiverQueryService<'_>,
+    operation: ReceiverQueryOperation,
+    file: &ProjectFile,
+    traces: &[PipelineTrace],
+    ranges: Vec<Range>,
+    input: ReceiverQueryInput,
+    receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    max_outputs: usize,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+    receiver_diagnostics: &mut ReceiverDiagnostics,
+    shared_budget_exhausted: &mut bool,
+    receiver_truncated: &mut bool,
+) -> Vec<PipelineExpansion> {
+    if budget.pipeline_rows >= limits.max_pipeline_rows {
+        *shared_budget_exhausted = true;
+        *receiver_truncated = true;
+        if !ranges.is_empty() {
+            record_receiver_pipeline_output_omission(
+                receiver_diagnostics,
+                file,
+                operation,
+                ranges.len(),
+            );
+        }
+        return Vec::new();
+    }
+    let structural_facts = match receiver_facts_for_pipeline_row(
+        analyzer,
+        traces,
+        file,
+        receiver_facts,
+        budget,
+        limits,
+        cancellation,
+        diagnostics,
+        cache_profile,
+    ) {
+        PipelineReceiverFacts::Available(facts) => Some(facts),
+        PipelineReceiverFacts::Unavailable => None,
+        PipelineReceiverFacts::Halted => {
+            *shared_budget_exhausted = true;
+            *receiver_truncated = true;
+            return Vec::new();
+        }
+    };
+    receiver_analysis_expansions(
+        service,
+        operation,
+        file,
+        structural_facts.as_ref(),
+        ranges,
+        input,
+        None,
+        budget,
+        limits,
+        receiver_budget_override,
+        max_outputs,
+        cancellation,
+        receiver_diagnostics,
+        shared_budget_exhausted,
+        receiver_truncated,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn receiver_analysis_expansions(
     service: &ReceiverQueryService<'_>,
@@ -5348,9 +5586,26 @@ fn receiver_analysis_expansions(
 ) -> Vec<PipelineExpansion> {
     ranges.sort_by_key(primary_range_key);
     ranges.dedup();
+    if ranges.len() > max_outputs {
+        *receiver_truncated = true;
+        let omitted = ranges.len() - max_outputs;
+        record_receiver_pipeline_output_omission(receiver_diagnostics, file, operation, omitted);
+    }
     ranges.truncate(max_outputs);
     let mut expansions = Vec::with_capacity(ranges.len());
-    for range in ranges {
+    let range_count = ranges.len();
+    for (range_index, range) in ranges.into_iter().enumerate() {
+        if budget.pipeline_rows >= limits.max_pipeline_rows {
+            *shared_budget_exhausted = true;
+            *receiver_truncated = true;
+            record_receiver_pipeline_output_omission(
+                receiver_diagnostics,
+                file,
+                operation,
+                range_count - range_index,
+            );
+            break;
+        }
         let remaining_facts = limits
             .max_fact_nodes
             .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references));
@@ -5417,12 +5672,18 @@ fn receiver_analysis_expansions(
             | ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unsupported {
                 reason,
             }) => {
+                let detail = if *reason == "cpp_c_receiver_unsupported" {
+                    "plain C receiver sites are unsupported (cpp_c_receiver_unsupported)"
+                        .to_string()
+                } else {
+                    format!("unsupported provider or shape: {reason}")
+                };
                 *receiver_diagnostics
                     .entry((
                         CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                         language,
                         operation.as_str(),
-                        format!("unsupported provider or shape: {reason}"),
+                        detail,
                     ))
                     .or_default() += 1;
             }
@@ -5486,6 +5747,22 @@ fn receiver_analysis_expansions(
         });
     }
     expansions
+}
+
+fn record_receiver_pipeline_output_omission(
+    diagnostics: &mut ReceiverDiagnostics,
+    file: &ProjectFile,
+    operation: ReceiverQueryOperation,
+    omitted: usize,
+) {
+    *diagnostics
+        .entry((
+            CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+            crate::analyzer::common::language_for_file(file),
+            operation.as_str(),
+            RECEIVER_PIPELINE_OUTPUT_CAP_REASON.to_string(),
+        ))
+        .or_default() += omitted;
 }
 
 fn receiver_budget_for_remaining_work(

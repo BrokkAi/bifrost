@@ -7,11 +7,14 @@
 //! `TreeSitterAnalyzer` as a provider, and `MultiAnalyzer` concatenates its
 //! delegates'. Each provider covers exactly one language.
 
-use super::extract::extract_file_facts;
+use super::extract::{LimitedFileFacts, extract_file_facts, extract_file_facts_limited};
 use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
-use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
+use crate::analyzer::tree_sitter_analyzer::{
+    LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
+};
 use crate::analyzer::{Language, ProjectFile};
+use crate::cancellation::CancellationToken;
 use moka::sync::Cache;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -49,6 +52,40 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// demand instead of retaining every file's source in aggregate state.
     fn structural_source(&self, file: &ProjectFile) -> Option<String>;
 
+    /// Capture one source snapshot without hydrating more than
+    /// `max_source_bytes`. The default is deliberately unavailable so an
+    /// external provider cannot accidentally satisfy a bounded request by
+    /// calling the unbounded [`Self::structural_source`] method.
+    fn structural_source_limited(
+        &self,
+        _file: &ProjectFile,
+        _max_source_bytes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> StructuralSourceLimitedOutcome {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            StructuralSourceLimitedOutcome::Cancelled
+        } else {
+            StructuralSourceLimitedOutcome::Unavailable
+        }
+    }
+
+    /// Prepare syntax from the already-admitted source snapshot with
+    /// cooperative parse cancellation. The default is unavailable so bounded
+    /// receiver analysis cannot silently fall back to an uncancellable parse
+    /// through a third-party provider.
+    fn structural_syntax_limited(
+        &self,
+        _file: &ProjectFile,
+        _max_source_bytes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> StructuralSyntaxLimitedOutcome {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            StructuralSyntaxLimitedOutcome::Cancelled
+        } else {
+            StructuralSyntaxLimitedOutcome::Unavailable
+        }
+    }
+
     /// Normalized facts for one file, served from the facts cache and
     /// extracted from the in-memory source on miss. `None` when the file is
     /// not held by this analyzer, is empty, or the adapter has no structural
@@ -66,6 +103,29 @@ pub trait StructuralSearchProvider: Send + Sync {
             self.structural_facts(file),
             StructuralFactsCacheOutcome::Unknown,
         )
+    }
+
+    /// Materialize one complete facts snapshot without crossing
+    /// `max_fact_nodes` total normalized nodes and semantic role edges, and
+    /// stop cooperatively when `cancellation` fires.
+    ///
+    /// The exact source is supplied by the request so the source-byte
+    /// admission and the normalized facts remain generation-coherent. The
+    /// default is deliberately unavailable: third-party providers must opt
+    /// into a genuinely bounded implementation rather than wrapping an
+    /// unbounded [`Self::structural_facts`] call.
+    fn structural_facts_limited(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+        _max_fact_nodes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> StructuralFactsLimitedOutcome {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            StructuralFactsLimitedOutcome::Cancelled
+        } else {
+            StructuralFactsLimitedOutcome::Unavailable
+        }
     }
 
     /// How many extraction (parse + normalize) runs this provider has
@@ -103,6 +163,51 @@ pub enum StructuralFactsCacheOutcome {
     Extracted,
     Unavailable,
     Unknown,
+}
+
+/// Result of bounded syntax preparation for receiver analysis.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum StructuralSyntaxLimitedOutcome {
+    Available(StructuralPreparedSyntax),
+    Exceeded { minimum_source_bytes: usize },
+    Cancelled,
+    Unavailable,
+}
+
+/// Opaque prepared syntax returned by a structural provider. Its concrete
+/// tree and declaration state remain internal to the analyzer.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StructuralPreparedSyntax {
+    inner: Arc<PreparedSyntaxTree>,
+}
+
+impl StructuralPreparedSyntax {
+    pub(crate) fn into_inner(self) -> Arc<PreparedSyntaxTree> {
+        self.inner
+    }
+}
+
+#[derive(Debug)]
+pub enum StructuralFactsLimitedOutcome {
+    Available {
+        facts: Arc<FileFacts>,
+        cache_outcome: StructuralFactsCacheOutcome,
+    },
+    Exceeded {
+        minimum_fact_nodes: usize,
+    },
+    Cancelled,
+    Unavailable,
+}
+
+#[derive(Debug)]
+pub enum StructuralSourceLimitedOutcome {
+    Available(Arc<str>),
+    Exceeded { minimum_source_bytes: usize },
+    Cancelled,
+    Unavailable,
 }
 
 /// Byte-budgeted facts cache keyed by file and validated by a hash of the
@@ -153,14 +258,8 @@ impl StructuralFactsCache {
         load: impl FnOnce() -> Option<FileFacts>,
         extract: impl FnOnce() -> Option<FileFacts>,
     ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
-        let source_hash = hash_source(source);
-        if let Some(entry) = self.cache.get(file)
-            && entry.source_hash == source_hash
-        {
-            return (
-                Some(Arc::clone(&entry.facts)),
-                StructuralFactsCacheOutcome::MemoryHit,
-            );
+        if let Some(facts) = self.get_complete(file, source) {
+            return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
         }
         let (facts, outcome) = if let Some(facts) = load() {
             self.hydrations.fetch_add(1, Ordering::Relaxed);
@@ -175,14 +274,31 @@ impl StructuralFactsCache {
             };
             (Arc::new(facts), StructuralFactsCacheOutcome::Extracted)
         };
+        self.insert_complete(file, source, Arc::clone(&facts));
+        (Some(facts), outcome)
+    }
+
+    fn get_complete(&self, file: &ProjectFile, source: &str) -> Option<Arc<FileFacts>> {
+        let source_hash = hash_source(source);
+        self.cache.get(file).and_then(|entry| {
+            (entry.source_hash == source_hash && entry.facts.source() == source)
+                .then(|| Arc::clone(&entry.facts))
+        })
+    }
+
+    fn insert_complete(&self, file: &ProjectFile, source: &str, facts: Arc<FileFacts>) {
+        debug_assert_eq!(facts.source(), source);
         self.cache.insert(
             file.clone(),
             Arc::new(CachedFacts {
-                source_hash,
-                facts: Arc::clone(&facts),
+                source_hash: hash_source(source),
+                facts,
             }),
         );
-        (Some(facts), outcome)
+    }
+
+    fn record_extraction(&self) {
+        self.extractions.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn extraction_count(&self) -> u64 {
@@ -205,6 +321,53 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
 
     fn structural_source(&self, file: &ProjectFile) -> Option<String> {
         self.file_source(file)
+    }
+
+    fn structural_source_limited(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> StructuralSourceLimitedOutcome {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return StructuralSourceLimitedOutcome::Cancelled;
+        }
+        let snapshot = match self.source_snapshot_limited(file, max_source_bytes) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return StructuralSourceLimitedOutcome::Unavailable,
+            Err(exceeded) => {
+                return StructuralSourceLimitedOutcome::Exceeded {
+                    minimum_source_bytes: exceeded.minimum_source_bytes(),
+                };
+            }
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            StructuralSourceLimitedOutcome::Cancelled
+        } else {
+            StructuralSourceLimitedOutcome::Available(snapshot.into_source())
+        }
+    }
+
+    fn structural_syntax_limited(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> StructuralSyntaxLimitedOutcome {
+        match self.prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation) {
+            PreparedSyntaxLimitedOutcome::Available(inner) => {
+                StructuralSyntaxLimitedOutcome::Available(StructuralPreparedSyntax { inner })
+            }
+            PreparedSyntaxLimitedOutcome::Exceeded(exceeded) => {
+                StructuralSyntaxLimitedOutcome::Exceeded {
+                    minimum_source_bytes: exceeded.minimum_source_bytes(),
+                }
+            }
+            PreparedSyntaxLimitedOutcome::Cancelled => StructuralSyntaxLimitedOutcome::Cancelled,
+            PreparedSyntaxLimitedOutcome::Unavailable => {
+                StructuralSyntaxLimitedOutcome::Unavailable
+            }
+        }
     }
 
     fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>> {
@@ -249,6 +412,76 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         )
     }
 
+    fn structural_facts_limited(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        max_fact_nodes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> StructuralFactsLimitedOutcome {
+        let Some(spec) = self.adapter().structural_spec() else {
+            return StructuralFactsLimitedOutcome::Unavailable;
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return StructuralFactsLimitedOutcome::Cancelled;
+        }
+        if let Some(facts) = self.structural_cache().get_complete(file, source) {
+            let work_items = facts.work_item_count();
+            return if work_items > max_fact_nodes {
+                StructuralFactsLimitedOutcome::Exceeded {
+                    minimum_fact_nodes: work_items,
+                }
+            } else {
+                StructuralFactsLimitedOutcome::Available {
+                    facts,
+                    cache_outcome: StructuralFactsCacheOutcome::MemoryHit,
+                }
+            };
+        }
+
+        self.structural_cache().record_extraction();
+        let grammar = self.adapter().parser_language_for_file(file);
+        let facts = match extract_file_facts_limited(
+            spec,
+            &grammar,
+            source,
+            max_fact_nodes,
+            cancellation,
+        ) {
+            LimitedFileFacts::Complete(facts) => facts,
+            LimitedFileFacts::Exceeded { minimum_fact_nodes } => {
+                return StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes };
+            }
+            LimitedFileFacts::Cancelled => {
+                return StructuralFactsLimitedOutcome::Cancelled;
+            }
+            LimitedFileFacts::Unavailable => {
+                return StructuralFactsLimitedOutcome::Unavailable;
+            }
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return StructuralFactsLimitedOutcome::Cancelled;
+        }
+
+        let facts = Arc::new(facts);
+        let snapshot_key = self.structural_snapshot_key(file, source);
+        if let Some(key) = snapshot_key.as_ref()
+            && let Ok(payload) = facts.encode_snapshot()
+        {
+            let _ = self.persist_structural_facts_snapshot(
+                key,
+                STRUCTURAL_FACTS_SNAPSHOT_VERSION,
+                &payload,
+            );
+        }
+        self.structural_cache()
+            .insert_complete(file, source, Arc::clone(&facts));
+        StructuralFactsLimitedOutcome::Available {
+            facts,
+            cache_outcome: StructuralFactsCacheOutcome::Extracted,
+        }
+    }
+
     fn structural_extraction_count(&self) -> u64 {
         self.structural_cache().extraction_count()
     }
@@ -281,6 +514,7 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{IAnalyzer, TestProject, TypescriptAnalyzer};
     use crate::compact_graph::CompactRows;
 
     fn empty_facts(source: &str) -> FileFacts {
@@ -335,5 +569,182 @@ mod tests {
         assert_eq!(outcome, StructuralFactsCacheOutcome::Unavailable);
         assert_eq!(unavailable.hydration_count(), 0);
         assert_eq!(unavailable.extraction_count(), 1);
+    }
+
+    #[test]
+    fn limited_source_snapshot_rejects_oversized_input_before_fact_materialization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "app.ts");
+        let source = "export function demo(): void {}\n";
+        file.write(source).expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let provider = analyzer
+            .structural_search_providers()
+            .into_iter()
+            .next()
+            .expect("TypeScript structural provider");
+        let before = provider.structural_extraction_count();
+
+        assert!(matches!(
+            provider.structural_source_limited(&file, source.len() - 1, None),
+            StructuralSourceLimitedOutcome::Exceeded {
+                minimum_source_bytes
+            } if minimum_source_bytes >= source.len()
+        ));
+        assert_eq!(provider.structural_extraction_count(), before);
+
+        let StructuralSourceLimitedOutcome::Available(snapshot) =
+            provider.structural_source_limited(&file, source.len(), None)
+        else {
+            panic!("source should fit its exact byte budget");
+        };
+        assert_eq!(snapshot.as_ref(), source);
+        assert_eq!(provider.structural_extraction_count(), before);
+    }
+
+    #[test]
+    fn limited_materialization_stops_early_and_caches_only_complete_facts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "app.ts");
+        file.write(
+            "class Service { run(): void {} }\n\
+             export function call(service: Service): void { service.run(); }\n",
+        )
+        .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let provider = analyzer
+            .structural_search_providers()
+            .into_iter()
+            .next()
+            .expect("TypeScript structural provider");
+        let source = provider.structural_source(&file).expect("source");
+        let before = provider.structural_extraction_count();
+
+        assert!(matches!(
+            provider.structural_facts_limited(&file, &source, 1, None),
+            StructuralFactsLimitedOutcome::Exceeded {
+                minimum_fact_nodes: 2
+            }
+        ));
+        assert_eq!(provider.structural_extraction_count(), before + 1);
+
+        let complete = provider.structural_facts_limited(&file, &source, usize::MAX, None);
+        let StructuralFactsLimitedOutcome::Available {
+            facts,
+            cache_outcome: StructuralFactsCacheOutcome::Extracted,
+        } = complete
+        else {
+            panic!("expected complete extraction after the capped attempt");
+        };
+        assert!(facts.nodes().len() > 1);
+        assert_eq!(provider.structural_extraction_count(), before + 2);
+
+        assert!(matches!(
+            provider.structural_facts_limited(&file, &source, 1, None),
+            StructuralFactsLimitedOutcome::Exceeded { .. }
+        ));
+        assert_eq!(
+            provider.structural_extraction_count(),
+            before + 2,
+            "the complete retry is cached, while the capped prefix was not"
+        );
+    }
+
+    #[test]
+    fn limited_materialization_caps_role_edges_before_caching() {
+        let arguments = std::iter::repeat_n("this", 256)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "export function f(...args: unknown[]): void {{}}\n\
+             f({arguments});\n"
+        );
+
+        let measured_temp = tempfile::tempdir().expect("measured temp dir");
+        let measured_root = measured_temp.path().canonicalize().expect("measured root");
+        let measured_file = ProjectFile::new(measured_root.clone(), "app.ts");
+        measured_file.write(&source).expect("write measured source");
+        let measured_analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(measured_root, Language::TypeScript));
+        let measured_provider = measured_analyzer
+            .structural_search_providers()
+            .into_iter()
+            .next()
+            .expect("measured TypeScript provider");
+        let StructuralFactsLimitedOutcome::Available {
+            facts: measured, ..
+        } = measured_provider.structural_facts_limited(&measured_file, &source, usize::MAX, None)
+        else {
+            panic!("unbounded measurement should complete");
+        };
+        assert!(
+            measured.role_count() > measured.nodes().len(),
+            "fixture must put most bounded work in raw-span role edges"
+        );
+        let cap = measured.work_item_count() - 1;
+        assert!(
+            measured.nodes().len() <= cap,
+            "the node arena alone must fit so the role cap is exercised"
+        );
+
+        let capped_temp = tempfile::tempdir().expect("capped temp dir");
+        let capped_root = capped_temp.path().canonicalize().expect("capped root");
+        let capped_file = ProjectFile::new(capped_root.clone(), "app.ts");
+        capped_file.write(&source).expect("write capped source");
+        let capped_analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(capped_root, Language::TypeScript));
+        let capped_provider = capped_analyzer
+            .structural_search_providers()
+            .into_iter()
+            .next()
+            .expect("capped TypeScript provider");
+        let before = capped_provider.structural_extraction_count();
+        assert!(matches!(
+            capped_provider.structural_facts_limited(&capped_file, &source, cap, None),
+            StructuralFactsLimitedOutcome::Exceeded {
+                minimum_fact_nodes
+            } if minimum_fact_nodes == cap + 1
+        ));
+        assert_eq!(capped_provider.structural_extraction_count(), before + 1);
+
+        let StructuralFactsLimitedOutcome::Available {
+            facts,
+            cache_outcome: StructuralFactsCacheOutcome::Extracted,
+        } = capped_provider.structural_facts_limited(&capped_file, &source, usize::MAX, None)
+        else {
+            panic!("complete retry should materialize and cache every role edge");
+        };
+        assert_eq!(facts.work_item_count(), measured.work_item_count());
+        assert_eq!(capped_provider.structural_extraction_count(), before + 2);
+    }
+
+    #[test]
+    fn limited_materialization_honors_cancellation_before_work() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "app.ts");
+        file.write("export function call(): void {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let provider = analyzer
+            .structural_search_providers()
+            .into_iter()
+            .next()
+            .expect("TypeScript structural provider");
+        let source = provider.structural_source(&file).expect("source");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let before = provider.structural_extraction_count();
+
+        assert!(matches!(
+            provider.structural_facts_limited(&file, &source, usize::MAX, Some(&cancellation)),
+            StructuralFactsLimitedOutcome::Cancelled
+        ));
+        assert_eq!(provider.structural_extraction_count(), before);
     }
 }

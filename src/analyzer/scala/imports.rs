@@ -614,6 +614,28 @@ pub(crate) fn scala_lexical_scope_path(node: Node<'_>) -> Vec<StructuredImportSc
     scopes
 }
 
+pub(crate) fn scala_lexical_scope_path_checked(
+    node: Node<'_>,
+    mut inspect: impl FnMut(Node<'_>) -> bool,
+) -> Option<Vec<StructuredImportScope>> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if !inspect(parent) {
+            return None;
+        }
+        if is_scala_lexical_scope(parent.kind()) {
+            scopes.push(StructuredImportScope {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
+        }
+        current = parent.parent();
+    }
+    scopes.reverse();
+    Some(scopes)
+}
+
 pub(crate) fn scala_lexical_scope_path_at(
     root: Node<'_>,
     byte: usize,

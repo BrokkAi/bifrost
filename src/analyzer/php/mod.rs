@@ -28,7 +28,8 @@ use tree_sitter::{Node, Parser};
 use adapter::PhpAdapter;
 pub(crate) use adapter::php_signature_return_type_text;
 pub(crate) use aliases::{
-    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpFileContext, php_file_context_from_tree_at, resolve_php_constant, resolve_php_constant_node,
+    resolve_php_function, resolve_php_function_node, resolve_php_type, resolve_php_type_node,
 };
 pub use aliases::{
     PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
@@ -109,15 +110,14 @@ impl PhpAnalyzer {
         Self::new(Arc::new(project))
     }
 
-    pub(crate) fn prepared_syntax_limited(
+    pub(crate) fn prepared_syntax_limited_cancellable(
         &self,
         file: &ProjectFile,
         max_source_bytes: usize,
-    ) -> Result<
-        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
-        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
-    > {
-        self.inner.prepared_syntax_limited(file, max_source_bytes)
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome {
+        self.inner
+            .prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation)
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(

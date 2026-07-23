@@ -2535,25 +2535,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-        if function.kind() == "generic_function" {
+        let generic_call = function.kind() == "generic_function";
+        let dispatch_detail = match (generic_call, receiver_node.is_some()) {
+            (true, true) => Some(
+                "generic Rust method applicability depends on unresolved type arguments and bounds, while dispatch may use a trait implementation after autoderef",
+            ),
+            (true, false) => Some(
+                "generic Rust call applicability depends on unresolved type arguments and bounds",
+            ),
+            (false, true) => Some(
+                "method dispatch may use a trait implementation after autoderef; receiver type and complete implementation coverage require type refinement",
+            ),
+            (false, false) => None,
+        };
+        if let Some(detail) = dispatch_detail {
             self.add_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::DynamicDispatch,
                 SemanticGapKind::Unknown,
-                "generic Rust call applicability depends on unresolved type arguments and bounds",
+                detail,
             )?;
         }
         if receiver_node.is_some() {
-            self.add_gap(
-                builder,
-                invoke,
-                SemanticGapSubject::CallSite(call_site),
-                SemanticCapability::DynamicDispatch,
-                SemanticGapKind::Unknown,
-                "method dispatch may use a trait implementation after autoderef; receiver type and complete implementation coverage require type refinement",
-            )?;
             self.session.add_gap_with_impacts(
                 builder,
                 invoke,

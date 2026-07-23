@@ -5,7 +5,7 @@ description: Learn query_code through executable, per-language structural matchi
 
 These tutorials start from recognizable source code and show the same query in [Rune Query Language](/rune-query-language/) and canonical [JSON `CodeQuery`](/code-query-json/). Their fixtures, queries, and complete expected results are executed by Bifrost's integration tests.
 
-Each page builds from a broad structural query to narrower filters and exclusions. [Import Traversal](./import-traversal/) covers direct project-file edges, [Typed Set Composition](./set-composition/) combines those edges with union, intersection, and subtraction, [Reference Traversal](./reference-traversal/) follows exact indexed declarations to source sites and semantic users, and [Receiver Traversal](./receiver-traversal/) exercises bounded Java, JavaScript, and TypeScript values and exact members. Every language cookbook also executes `supertypes`, `subtypes`, `members`, and `owner`, with bounded and transitive hierarchy examples distributed across the suite. The receiver cookbook does not claim whole-program points-to, general alias, control-flow, taint, or data-flow reasoning.
+Each page builds from a broad structural query to narrower filters and exclusions. [Import Traversal](./import-traversal/) covers direct project-file edges, [Typed Set Composition](./set-composition/) combines those edges with union, intersection, and subtraction, [Reference Traversal](./reference-traversal/) follows exact indexed declarations to source sites and semantic users, and [Receiver Traversal](./receiver-traversal/) exercises bounded values and exact members across the supported receiver adapters. Every language cookbook also executes `supertypes`, `subtypes`, `members`, and `owner`, with bounded and transitive hierarchy examples distributed across the suite. The receiver cookbook does not claim whole-program points-to, general alias, control-flow, taint, or data-flow reasoning.
 
 Hierarchy recipes return only declarations indexed by the fixture's analyzer. Real projects may expose usages of library types whose declarations are not indexed; those library declarations remain outside the query result until library indexing can be targeted explicitly.
 
@@ -16,7 +16,7 @@ All language pages below are marked with the date of their last successful end-t
 - [Import Traversal Across Languages](./import-traversal/)
 - [Typed Set Composition](./set-composition/)
 - [Reference Traversal Across Languages](./reference-traversal/)
-- [Bounded Java/JavaScript/TypeScript Receiver Traversal](./receiver-traversal/)
+- [Bounded Receiver Traversal Across Supported Adapters](./receiver-traversal/)
 - [Python](./python/)
 - [Java](./java/)
 - [JavaScript](./javascript/)

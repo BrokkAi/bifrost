@@ -3944,7 +3944,7 @@ service.run();
 }
 
 #[test]
-fn csharp_cross_file_receiver_step_does_not_cold_materialize_unheld_facts() {
+fn csharp_cross_file_receiver_step_reuses_bounded_reference_facts() {
     let definitions = r#"
 namespace Demo;
 public class Service {
@@ -4000,8 +4000,11 @@ public class Caller {
             [CodeQueryResultItem {
                 value: CodeQueryResultValue::ReceiverAnalysis { value },
                 ..
-            }] if value.outcome == "unsupported"
-                && value.reason == Some("receiver_structural_facts_unavailable")
+            }] if value.outcome == "precise"
+                && matches!(
+                    value.member_targets.as_slice(),
+                    [target] if target.fq_name == "Demo.Service.Run"
+                )
         ),
         "{}",
         result.render_text()

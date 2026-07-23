@@ -78,17 +78,6 @@ impl RustAnalyzer {
         self.inner.prepared_syntax(file)
     }
 
-    pub(crate) fn prepared_syntax_limited(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<
-        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
-        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
-    > {
-        self.inner.prepared_syntax_limited(file, max_source_bytes)
-    }
-
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,

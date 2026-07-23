@@ -28,7 +28,7 @@ pub(crate) use adapter::RubyAdapter;
 use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
 
 pub(crate) use declarations::{
-    RubyFieldScope, extract_name_path, extract_name_segments, parse_ruby_tree,
+    RubyFieldScope, RubyNamePath, extract_name_path, extract_name_segments, parse_ruby_tree,
     ruby_field_short_name, ruby_variable_field_name,
 };
 pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
@@ -171,17 +171,6 @@ impl RubyAnalyzer {
         Self::new(Arc::new(project))
     }
 
-    pub(crate) fn prepared_syntax_limited(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<
-        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
-        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
-    > {
-        self.inner.prepared_syntax_limited(file, max_source_bytes)
-    }
-
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -198,7 +187,11 @@ impl RubyAnalyzer {
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
+        let Some(identifier) = fqn
+            .rsplit(['.', '$'])
+            .next()
+            .filter(|name| !name.is_empty())
+        else {
             return LimitedQueryRows::complete(Vec::new(), 0);
         };
         let mut candidates =
@@ -256,6 +249,14 @@ impl RubyAnalyzer {
         self.inner
             .ruby_method_dispatch_mode(unit)
             .unwrap_or(RubyMethodDispatchMode::Instance)
+    }
+
+    pub(crate) fn method_dispatch_modes_limited(
+        &self,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<RubyMethodDispatchMode> {
+        self.inner.ruby_method_dispatch_modes_limited(unit, limit)
     }
 
     pub(crate) fn forward_raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {

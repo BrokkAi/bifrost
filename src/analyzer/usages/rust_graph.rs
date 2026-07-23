@@ -28,7 +28,7 @@ pub(crate) use resolver::{
     resolve_rust_path_fqn, resolve_rust_token_tree_paths, resolve_scoped_associated_item,
     resolve_scoped_associated_item_matching, resolve_trait_associated_item,
     resolve_trait_associated_item_matching, rust_bare_token_tree_non_reference_role,
-    rust_bare_token_tree_role,
+    rust_bare_token_tree_role, rust_smallest_named_node_covering,
 };
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass

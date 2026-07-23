@@ -1,6 +1,7 @@
 use crate::hash::HashMap;
 use regex::Regex;
 use std::sync::LazyLock;
+use tree_sitter::Node;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhpUseAliases {
@@ -35,6 +36,422 @@ enum PhpUseKind {
     Type,
     Function,
     Const,
+}
+
+/// Builds the PHP namespace/import context visible at `byte` directly from the
+/// parser tree. `step` is invoked before every syntax node inspected so bounded
+/// callers can stop without returning a partially collected alias map.
+pub(crate) fn php_file_context_from_tree_at(
+    root: Node<'_>,
+    source: &str,
+    byte: usize,
+    mut step: impl FnMut() -> bool,
+) -> Option<PhpFileContext> {
+    let mut namespace = String::new();
+    let mut scope = root;
+    let mut scope_start = 0usize;
+    let mut scope_end = byte;
+
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if child.kind() != "namespace_definition" {
+            continue;
+        }
+        let body = child.child_by_field_name("body");
+        if let Some(body) = body
+            && body.start_byte() <= byte
+            && byte < body.end_byte()
+        {
+            namespace = child
+                .child_by_field_name("name")
+                .and_then(|name| php_path_from_node(name, source, &mut step))
+                .unwrap_or_default();
+            scope = body;
+            scope_start = body.start_byte();
+            scope_end = byte;
+            break;
+        }
+        if body.is_none() && child.start_byte() <= byte {
+            namespace = child
+                .child_by_field_name("name")
+                .and_then(|name| php_path_from_node(name, source, &mut step))
+                .unwrap_or_default();
+            scope_start = child.end_byte();
+            scope_end = byte;
+            continue;
+        }
+        if child.start_byte() > byte {
+            scope_end = scope_end.min(child.start_byte());
+            break;
+        }
+    }
+
+    let mut aliases = PhpUseAliases::default();
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if child.start_byte() < scope_start || child.start_byte() >= scope_end {
+            continue;
+        }
+        if child.kind() == "namespace_definition" && scope.id() == root.id() {
+            break;
+        }
+        if child.kind() != "namespace_use_declaration" {
+            continue;
+        }
+        let parsed = php_use_aliases_from_node(child, source, &mut step)?;
+        aliases.extend(parsed);
+    }
+
+    Some(PhpFileContext { namespace, aliases })
+}
+
+fn php_use_aliases_from_node(
+    declaration: Node<'_>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<PhpUseAliases> {
+    if !step() {
+        return None;
+    }
+    let default_kind = php_use_kind(declaration.child_by_field_name("type"), source);
+    let body = declaration.child_by_field_name("body");
+    let prefix = if body.is_some() {
+        let mut cursor = declaration.walk();
+        let mut prefix = None;
+        for child in declaration.named_children(&mut cursor) {
+            if !step() {
+                return None;
+            }
+            if child.kind() == "namespace_name" {
+                prefix = php_path_segments(child, source, step);
+                break;
+            }
+        }
+        prefix.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let clause_parent = body.unwrap_or(declaration);
+    let mut aliases = PhpUseAliases::default();
+    let mut cursor = clause_parent.walk();
+    for clause in clause_parent.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if clause.kind() != "namespace_use_clause" {
+            continue;
+        }
+        php_add_use_clause(clause, source, &prefix, default_kind, &mut aliases, step)?;
+    }
+    Some(aliases)
+}
+
+fn php_add_use_clause(
+    clause: Node<'_>,
+    source: &str,
+    prefix: &[String],
+    default_kind: PhpUseKind,
+    aliases: &mut PhpUseAliases,
+    step: &mut impl FnMut() -> bool,
+) -> Option<()> {
+    let alias_node = clause.child_by_field_name("alias");
+    let mut imported = None;
+    let mut cursor = clause.walk();
+    for child in clause.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if alias_node.is_some_and(|alias| alias.id() == child.id()) {
+            continue;
+        }
+        if matches!(child.kind(), "name" | "qualified_name" | "namespace_name") {
+            imported = php_path_segments(child, source, step);
+            break;
+        }
+    }
+    let mut imported = imported?;
+    if imported.is_empty() {
+        return Some(());
+    }
+    if !prefix.is_empty() {
+        let mut full = Vec::with_capacity(prefix.len() + imported.len());
+        full.extend(prefix.iter().cloned());
+        full.append(&mut imported);
+        imported = full;
+    }
+    let local = if let Some(alias) = alias_node {
+        if !step() {
+            return None;
+        }
+        php_leaf_text(alias, source)?.to_string()
+    } else {
+        imported.last()?.clone()
+    };
+    let imported = imported.join(".");
+    match php_use_kind(clause.child_by_field_name("type"), source) {
+        PhpUseKind::Type if default_kind != PhpUseKind::Type => match default_kind {
+            PhpUseKind::Function => aliases.function_aliases.insert(local, imported),
+            PhpUseKind::Const => aliases.const_aliases.insert(local, imported),
+            PhpUseKind::Type => unreachable!(),
+        },
+        PhpUseKind::Type => aliases.type_aliases.insert(local, imported),
+        PhpUseKind::Function => aliases.function_aliases.insert(local, imported),
+        PhpUseKind::Const => aliases.const_aliases.insert(local, imported),
+    };
+    Some(())
+}
+
+fn php_use_kind(node: Option<Node<'_>>, source: &str) -> PhpUseKind {
+    match node.and_then(|node| node.utf8_text(source.as_bytes()).ok()) {
+        Some(kind) if kind.eq_ignore_ascii_case("function") => PhpUseKind::Function,
+        Some(kind) if kind.eq_ignore_ascii_case("const") => PhpUseKind::Const,
+        _ => PhpUseKind::Type,
+    }
+}
+
+fn php_path_from_node(
+    node: Node<'_>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<String> {
+    php_path_segments(node, source, step).map(|segments| segments.join("."))
+}
+
+fn php_path_segments(
+    node: Node<'_>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if !step() {
+            return None;
+        }
+        if current.kind() == "name" {
+            if let Some(text) = php_leaf_text(current, source)
+                && !text.is_empty()
+            {
+                segments.push(text.to_string());
+            }
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if !step() {
+                return None;
+            }
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(segments)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhpStructuredPath {
+    segments: Vec<String>,
+    absolute: bool,
+    namespace_relative: bool,
+}
+
+/// Resolves one precise nominal PHP type directly from its parser nodes.
+///
+/// This intentionally rejects nullable, union, intersection, DNF, and primitive
+/// types. Those forms describe an open set (or no workspace class at all), so
+/// choosing one arm would manufacture precision for bounded receiver analysis.
+pub(crate) fn resolve_php_type_node(
+    mut node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    mut step: impl FnMut() -> bool,
+) -> Option<String> {
+    loop {
+        if !step() {
+            return None;
+        }
+        match node.kind() {
+            "named_type" => {
+                let child = php_only_named_child(node, &mut step)?;
+                if !matches!(child.kind(), "name" | "qualified_name") {
+                    return None;
+                }
+                node = child;
+            }
+            "name" | "qualified_name" | "namespace_name" | "fully_qualified_name" => break,
+            "optional_type"
+            | "union_type"
+            | "intersection_type"
+            | "disjunctive_normal_form_type"
+            | "primitive_type"
+            | "bottom_type" => return None,
+            _ => return None,
+        }
+    }
+
+    let path = php_structured_path(node, source, &mut step)?;
+    resolve_php_structured_path(path, ctx, &ctx.aliases.type_aliases, &mut step)
+}
+
+/// Resolves one literal PHP function name from parser structure. Dynamic
+/// callable expressions deliberately remain unsupported.
+pub(crate) fn resolve_php_function_node(
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    mut step: impl FnMut() -> bool,
+) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
+    ) {
+        return None;
+    }
+    let path = php_structured_path(node, source, &mut step)?;
+    resolve_php_structured_path(path, ctx, &ctx.aliases.function_aliases, &mut step)
+}
+
+/// Resolves one literal PHP constant name from parser structure and maps the
+/// public namespace path to Bifrost's module-constant declaration identity.
+pub(crate) fn resolve_php_constant_node(
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    mut step: impl FnMut() -> bool,
+) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
+    ) {
+        return None;
+    }
+    let path = php_structured_path(node, source, &mut step)?;
+    let public = resolve_php_structured_path(path, ctx, &ctx.aliases.const_aliases, &mut step)?;
+    step().then(|| module_constant_fq(&public))
+}
+
+fn php_only_named_child<'tree>(
+    node: Node<'tree>,
+    step: &mut impl FnMut() -> bool,
+) -> Option<Node<'tree>> {
+    let mut only = None;
+    for index in 0..node.named_child_count() {
+        if !step() {
+            return None;
+        }
+        let child = node.named_child(index)?;
+        if only.replace(child).is_some() {
+            return None;
+        }
+    }
+    only
+}
+
+fn php_structured_path(
+    node: Node<'_>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<PhpStructuredPath> {
+    if !step() {
+        return None;
+    }
+    let absolute = php_path_has_leading_separator(node, step)?;
+    let segments = php_path_segments(node, source, step)?;
+    if segments.is_empty() {
+        return None;
+    }
+    let namespace_relative =
+        !absolute && segments[0].eq_ignore_ascii_case("namespace") && segments.len() > 1;
+    Some(PhpStructuredPath {
+        segments,
+        absolute,
+        namespace_relative,
+    })
+}
+
+fn php_path_has_leading_separator(
+    mut node: Node<'_>,
+    step: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    loop {
+        if !step() {
+            return None;
+        }
+        let Some(first) = node.child(0) else {
+            return Some(false);
+        };
+        if !step() {
+            return None;
+        }
+        match first.kind() {
+            "\\" => return Some(true),
+            "qualified_name" | "namespace_name" | "fully_qualified_name" => node = first,
+            _ => return Some(false),
+        }
+    }
+}
+
+fn resolve_php_structured_path(
+    path: PhpStructuredPath,
+    ctx: &PhpFileContext,
+    aliases: &HashMap<String, String>,
+    step: &mut impl FnMut() -> bool,
+) -> Option<String> {
+    let segments = if path.namespace_relative {
+        path.segments.get(1..)?
+    } else {
+        path.segments.as_slice()
+    };
+    let first = segments.first()?;
+    if matches!(
+        first.to_ascii_lowercase().as_str(),
+        "self" | "static" | "parent"
+    ) {
+        return None;
+    }
+
+    if path.absolute {
+        return php_join_structured_segments("", segments, step);
+    }
+    if path.namespace_relative {
+        return php_join_structured_segments(&ctx.namespace, segments, step);
+    }
+    if !step() {
+        return None;
+    }
+    if let Some(imported) = aliases.get(first) {
+        return php_join_structured_segments(imported, &segments[1..], step);
+    }
+    php_join_structured_segments(&ctx.namespace, segments, step)
+}
+
+fn php_join_structured_segments(
+    prefix: &str,
+    segments: &[String],
+    step: &mut impl FnMut() -> bool,
+) -> Option<String> {
+    let mut resolved = prefix.to_string();
+    for segment in segments {
+        if !step() {
+            return None;
+        }
+        if !resolved.is_empty() {
+            resolved.push('.');
+        }
+        resolved.push_str(segment);
+    }
+    (!resolved.is_empty()).then_some(resolved)
+}
+
+fn php_leaf_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    node.utf8_text(source.as_bytes()).ok().map(str::trim)
 }
 
 static PHP_USE_RE: LazyLock<Regex> =

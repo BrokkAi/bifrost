@@ -207,7 +207,7 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
 
 Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; version 2 has no separate public `interface` kind.
 
-TypeScript and JavaScript are the only languages whose `query_code` provider currently exposes bounded receiver values. That provider preserves explicit `unknown`, `ambiguous`, `unsupported`, and budget outcomes; it does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.
+TypeScript and JavaScript expose bounded receiver values through the same public `query_code` contract as the other supported receiver adapters. Their provider preserves explicit `unknown`, `ambiguous`, `unsupported`, and budget outcomes; it does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.
 
 ## Traverse Indexed Types And Members
 

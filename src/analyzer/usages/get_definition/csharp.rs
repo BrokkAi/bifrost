@@ -61,13 +61,6 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
     }
 
-    fn query_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
-        match self.session {
-            Some(session) => session.query_rows(query),
-            None => query(),
-        }
-    }
-
     fn signature_metadata(&self, unit: &CodeUnit) -> Vec<crate::analyzer::SignatureMetadata> {
         match self.session {
             Some(session) => session
@@ -825,9 +818,13 @@ fn csharp_structured_receiver_type_names(
     if reference.is_empty() {
         return Vec::new();
     }
-    if let Some(resolved) =
-        definitions.query_optional(|| csharp_resolve_type_fq_name(csharp, file, &reference))
-    {
+    if definitions.session().is_some() {
+        let mut candidates =
+            csharp_logical_visible_type_candidates(csharp, definitions, file, &reference);
+        if candidates.len() == 1 {
+            return vec![candidates.remove(0).fq_name()];
+        }
+    } else if let Some(resolved) = csharp_resolve_type_fq_name(csharp, file, &reference) {
         return vec![resolved];
     }
 
@@ -1291,11 +1288,23 @@ fn csharp_dynamic_binding_is_visible(
             return false;
         }
         let metadata = definitions.signature_metadata(&candidate);
-        if metadata.iter().any(|metadata| {
-            metadata
-                .return_type_text()
-                .is_some_and(csharp_is_dynamic_type_reference)
-        }) {
+        let is_dynamic = if let Some(session) = definitions.session() {
+            metadata.iter().any(|metadata| {
+                metadata
+                    .return_type_identity()
+                    .and_then(|identity| identity.nominal_name_with(|| session.scope_step()))
+                    .is_some_and(|name| {
+                        !name.is_absolute() && matches!(name.path(), [name] if name == "dynamic")
+                    })
+            })
+        } else {
+            metadata.iter().any(|metadata| {
+                metadata
+                    .return_type_text()
+                    .is_some_and(csharp_is_dynamic_type_reference)
+            })
+        };
+        if is_dynamic {
             return true;
         }
     }
@@ -1305,42 +1314,34 @@ fn csharp_dynamic_binding_is_visible(
 fn csharp_seed_dynamic_active_path(
     definitions: &CSharpDefinitionProvider<'_>,
     source: &str,
-    node: Node<'_>,
+    root: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<()>,
 ) {
-    if !definitions.scope_step() || node.start_byte() >= cutoff_start {
-        return;
-    }
-
-    if node.kind() == "local_function_statement"
-        && let Some(name) = node.child_by_field_name("name")
-        && name.start_byte() < cutoff_start
-    {
-        bindings.declare_shadow(csharp_node_text(name, source));
-    }
-
-    let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
-    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
-        return;
-    }
-    if enters_scope {
-        bindings.enter_scope();
-    }
-
-    if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
-        && node.end_byte() <= cutoff_start
-    {
-        csharp_seed_dynamic_binding(definitions, source, node, bindings);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= cutoff_start {
-            break;
+    csharp_visit_bounded_active_path(definitions, root, cutoff_start, |node| {
+        if node.kind() == "local_function_statement"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.start_byte() < cutoff_start
+        {
+            bindings.declare_shadow(csharp_node_text(name, source));
         }
-        csharp_seed_dynamic_active_path(definitions, source, child, cutoff_start, bindings);
-    }
+
+        let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
+        if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+            return false;
+        }
+        if enters_scope {
+            bindings.enter_scope();
+        }
+
+        if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
+            && node.end_byte() <= cutoff_start
+        {
+            csharp_seed_dynamic_binding(definitions, source, node, bindings);
+        }
+
+        true
+    });
 }
 
 fn csharp_seed_dynamic_binding(
@@ -1396,52 +1397,76 @@ fn csharp_seed_type_active_path(
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
-    node: Node<'_>,
+    root: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    csharp_visit_bounded_active_path(definitions, root, cutoff_start, |node| {
+        if node.kind() == "local_function_statement"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.start_byte() < cutoff_start
+        {
+            bindings.declare_shadow(csharp_node_text(name, source));
+        }
+
+        let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
+        if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+            return false;
+        }
+        if enters_scope {
+            bindings.enter_scope();
+        }
+
+        if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
+            && node.end_byte() <= cutoff_start
+        {
+            csharp_seed_type_binding(node, csharp, definitions, file, source, bindings);
+        }
+
+        true
+    });
+}
+
+fn csharp_visit_bounded_active_path<'tree>(
+    definitions: &CSharpDefinitionProvider<'_>,
+    root: Node<'tree>,
+    cutoff_start: usize,
+    mut visit: impl FnMut(Node<'tree>) -> bool,
 ) {
     if !definitions.scope_step() {
         return;
     }
-    if node.start_byte() >= cutoff_start {
-        return;
-    }
 
-    if node.kind() == "local_function_statement"
-        && let Some(name) = node.child_by_field_name("name")
-        && name.start_byte() < cutoff_start
-    {
-        bindings.declare_shadow(csharp_node_text(name, source));
-    }
-
-    let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
-    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
-        return;
-    }
-    if enters_scope {
-        bindings.enter_scope();
-    }
-
-    if (node.kind() == "parameter" || csharp_is_local_variable_declaration(node))
-        && node.end_byte() <= cutoff_start
-    {
-        csharp_seed_type_binding(node, csharp, definitions, file, source, bindings);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= cutoff_start {
-            break;
+    let mut pending = Some(root);
+    let mut parents = Vec::<(Node<'tree>, usize)>::new();
+    loop {
+        if let Some(node) = pending.take()
+            && node.start_byte() < cutoff_start
+            && visit(node)
+        {
+            parents.push((node, 0));
         }
-        csharp_seed_type_active_path(
-            csharp,
-            definitions,
-            file,
-            source,
-            child,
-            cutoff_start,
-            bindings,
-        );
+
+        let child = loop {
+            let Some((parent, next_child)) = parents.last_mut() else {
+                return;
+            };
+            let Some(child) = parent.named_child(*next_child) else {
+                parents.pop();
+                continue;
+            };
+            *next_child += 1;
+            if child.start_byte() >= cutoff_start {
+                parents.pop();
+                continue;
+            }
+            break child;
+        };
+
+        if !definitions.scope_step() {
+            return;
+        }
+        pending = Some(child);
     }
 }
 
@@ -2166,7 +2191,200 @@ fn csharp_filter_candidates_by_generic_arity(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum CSharpReceiverBase<'tree> {
+    Expression(Node<'tree>),
+    EnclosingType { byte: usize },
+}
+
+#[derive(Clone, Copy)]
+enum CSharpReceiverTransition<'tree> {
+    Member {
+        expression: Node<'tree>,
+        name: Node<'tree>,
+    },
+    Invocation {
+        invocation: Node<'tree>,
+        name: Node<'tree>,
+    },
+}
+
+struct CSharpReceiverProgram<'tree> {
+    base: CSharpReceiverBase<'tree>,
+    transitions: Vec<CSharpReceiverTransition<'tree>>,
+}
+
+fn csharp_receiver_program<'tree>(
+    definitions: &CSharpDefinitionProvider<'_>,
+    mut expression: Node<'tree>,
+) -> Option<CSharpReceiverProgram<'tree>> {
+    let mut transitions = Vec::new();
+    let base = loop {
+        if !definitions.scope_step() {
+            return None;
+        }
+        match expression.kind() {
+            "parenthesized_expression" | "checked_expression" => {
+                expression = expression
+                    .child_by_field_name("expression")
+                    .or_else(|| expression.named_child(0))?;
+            }
+            "member_access_expression" => {
+                let receiver = csharp_member_access_receiver(expression)?;
+                let name = csharp_member_access_name(expression)?;
+                transitions.push(CSharpReceiverTransition::Member { expression, name });
+                expression = receiver;
+            }
+            "conditional_access_expression" => {
+                let access = csharp_conditional_member_access(expression)?;
+                transitions.push(CSharpReceiverTransition::Member {
+                    expression,
+                    name: access.name,
+                });
+                expression = access.receiver;
+            }
+            "invocation_expression" => {
+                let function = expression.child_by_field_name("function")?;
+                match function.kind() {
+                    "member_access_expression" => {
+                        let receiver = csharp_member_access_receiver(function)?;
+                        let name = csharp_member_access_name(function)?;
+                        transitions.push(CSharpReceiverTransition::Invocation {
+                            invocation: expression,
+                            name,
+                        });
+                        expression = receiver;
+                    }
+                    "conditional_access_expression" => {
+                        let access = csharp_conditional_member_access(function)?;
+                        transitions.push(CSharpReceiverTransition::Invocation {
+                            invocation: expression,
+                            name: access.name,
+                        });
+                        expression = access.receiver;
+                    }
+                    "identifier" | "generic_name" => {
+                        transitions.push(CSharpReceiverTransition::Invocation {
+                            invocation: expression,
+                            name: function,
+                        });
+                        break CSharpReceiverBase::EnclosingType {
+                            byte: function.start_byte(),
+                        };
+                    }
+                    _ => return None,
+                }
+            }
+            _ => break CSharpReceiverBase::Expression(expression),
+        }
+    };
+    transitions.reverse();
+    Some(CSharpReceiverProgram { base, transitions })
+}
+
 fn csharp_receiver_type_units(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+) -> Vec<CodeUnit> {
+    let Some(program) = csharp_receiver_program(definitions, receiver) else {
+        return Vec::new();
+    };
+    if !definitions.observe_cancellation() {
+        return Vec::new();
+    }
+
+    let mut owners = match program.base {
+        CSharpReceiverBase::Expression(base) => {
+            csharp_receiver_base_type_units(analyzer, csharp, definitions, file, source, root, base)
+        }
+        CSharpReceiverBase::EnclosingType { byte } => {
+            csharp_enclosing_class(analyzer, definitions, file, byte)
+                .into_iter()
+                .collect()
+        }
+    };
+    if !definitions.observe_cancellation() {
+        return Vec::new();
+    }
+
+    let mut first_transition = 0usize;
+    if owners.is_empty()
+        && let CSharpReceiverBase::Expression(base) = program.base
+        && !csharp_receiver_base_is_shadowed(csharp, definitions, file, source, root, base)
+    {
+        if !definitions.scope_step() {
+            return Vec::new();
+        }
+        let expression_type = csharp_reference_type_text(receiver, source);
+        let direct_types =
+            csharp_logical_visible_type_candidates(csharp, definitions, file, &expression_type);
+        if !direct_types.is_empty() {
+            return direct_types;
+        }
+
+        for (index, transition) in program.transitions.iter().enumerate() {
+            if !definitions.scope_step() {
+                return Vec::new();
+            }
+            let CSharpReceiverTransition::Member { expression, .. } = transition else {
+                continue;
+            };
+            let type_name = csharp_reference_type_text(*expression, source);
+            let candidates =
+                csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
+            if !candidates.is_empty() {
+                owners = candidates;
+                first_transition = index + 1;
+                break;
+            }
+        }
+    }
+
+    for transition in &program.transitions[first_transition..] {
+        if owners.is_empty() || !definitions.scope_step() {
+            return Vec::new();
+        }
+        owners = match *transition {
+            CSharpReceiverTransition::Member { name, .. } => {
+                let Some(name) = csharp_member_name(name) else {
+                    return Vec::new();
+                };
+                csharp_nearest_member_type_units(
+                    analyzer,
+                    csharp,
+                    definitions,
+                    file,
+                    owners,
+                    csharp_node_text(name.identifier, source),
+                )
+            }
+            CSharpReceiverTransition::Invocation { invocation, name } => {
+                csharp_invocation_return_type_units_for_owners(
+                    analyzer,
+                    csharp,
+                    definitions,
+                    file,
+                    source,
+                    invocation,
+                    name,
+                    owners,
+                )
+            }
+        };
+        if !definitions.observe_cancellation() {
+            return Vec::new();
+        }
+    }
+    owners
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csharp_receiver_base_type_units(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
@@ -2235,28 +2453,21 @@ fn csharp_receiver_type_units(
                 &csharp_reference_type_text(receiver, source),
             )
         }
-        "predefined_type" => definitions
-            .query_optional(|| {
-                csharp_resolve_type_fq_name(
-                    csharp,
-                    file,
-                    &csharp_reference_type_text(receiver, source),
-                )
-            })
-            .map(|fqn| definitions.fqn(&fqn))
-            .unwrap_or_default(),
-        "member_access_expression" | "conditional_access_expression" => {
-            csharp_member_access_result_type_units(
-                analyzer,
-                csharp,
-                definitions,
-                file,
-                source,
-                root,
-                receiver,
-            )
+        "predefined_type" => {
+            let reference = csharp_reference_type_text(receiver, source);
+            let Some(fqn) = canonical_csharp_predefined_type(&reference) else {
+                return Vec::new();
+            };
+            definitions.fqn(fqn)
         }
-        // `new Foo().Member` — the receiver is typed by the class being constructed.
+        // These are flattened into explicit transitions by
+        // `csharp_receiver_program`; seeing one here means an unsupported shape
+        // interrupted program construction.
+        "member_access_expression"
+        | "conditional_access_expression"
+        | "invocation_expression"
+        | "parenthesized_expression"
+        | "checked_expression" => Vec::new(),
         "object_creation_expression" => receiver
             .child_by_field_name("type")
             .map(|type_node| {
@@ -2266,23 +2477,6 @@ fn csharp_receiver_type_units(
                     file,
                     &csharp_reference_type_text(type_node, source),
                 )
-            })
-            .unwrap_or_default(),
-        // `GetFoo().Member` / `obj.GetFoo().Member` — the receiver is typed by the
-        // called method's declared return type.
-        "invocation_expression" => csharp_invocation_return_type_units(
-            analyzer,
-            csharp,
-            definitions,
-            file,
-            source,
-            root,
-            receiver,
-        ),
-        "parenthesized_expression" | "checked_expression" => receiver
-            .named_child(0)
-            .map(|inner| {
-                csharp_receiver_type_units(analyzer, csharp, definitions, file, source, root, inner)
             })
             .unwrap_or_default(),
         "cast_expression" | "as_expression" => receiver
@@ -2304,59 +2498,15 @@ fn csharp_receiver_type_units(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn csharp_member_access_result_type_units(
-    analyzer: &dyn IAnalyzer,
+fn csharp_receiver_base_is_shadowed(
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-    expression: Node<'_>,
-) -> Vec<CodeUnit> {
-    if !definitions.scope_step() {
-        return Vec::new();
-    }
-    if let Some(access) = csharp_conditional_member_access(expression) {
-        let owners = csharp_receiver_type_units(
-            analyzer,
-            csharp,
-            definitions,
-            file,
-            source,
-            root,
-            access.receiver,
-        );
-        let Some(name) = csharp_member_name(access.name) else {
-            return Vec::new();
-        };
-        return csharp_nearest_member_type_units(
-            analyzer,
-            csharp,
-            definitions,
-            file,
-            owners,
-            csharp_node_text(name.identifier, source),
-        );
-    }
-
-    let mut layers = Vec::new();
-    let mut base = expression;
-    while base.kind() == "member_access_expression" {
-        if !definitions.scope_step() {
-            return Vec::new();
-        }
-        let Some(receiver) = csharp_member_access_receiver(base) else {
-            return Vec::new();
-        };
-        let Some(name) = csharp_member_access_name(base) else {
-            return Vec::new();
-        };
-        layers.push((receiver, name));
-        base = receiver;
-    }
-
-    let base_is_shadowed = if base.kind() == "identifier" {
+    base: Node<'_>,
+) -> bool {
+    if base.kind() == "identifier" {
         let name = csharp_node_text(base, source);
         csharp_type_bindings_before_scoped(
             csharp,
@@ -2369,55 +2519,30 @@ fn csharp_member_access_result_type_units(
         .is_shadowed(name)
     } else {
         false
-    };
-    let mut owners =
-        csharp_receiver_type_units(analyzer, csharp, definitions, file, source, root, base);
-    let first_member = if owners.is_empty() {
-        if base_is_shadowed {
-            return Vec::new();
-        }
-        let expression_type = csharp_reference_type_text(expression, source);
-        let direct_types =
-            csharp_logical_visible_type_candidates(csharp, definitions, file, &expression_type);
-        if !direct_types.is_empty() {
-            return direct_types;
-        }
-
-        let mut type_prefix = None;
-        for (index, (receiver, _)) in layers.iter().enumerate() {
-            if !definitions.scope_step() {
-                return Vec::new();
-            }
-            let type_name = csharp_reference_type_text(*receiver, source);
-            let candidates =
-                csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
-            if !candidates.is_empty() {
-                type_prefix = Some((index, candidates));
-                break;
-            }
-        }
-        let Some((index, candidates)) = type_prefix else {
-            return Vec::new();
-        };
-        owners = candidates;
-        index
-    } else {
-        layers.len().saturating_sub(1)
-    };
-
-    for index in (0..=first_member).rev() {
-        if !definitions.scope_step() {
-            return Vec::new();
-        }
-        let name = csharp_node_text(layers[index].1, source);
-        let member_types =
-            csharp_nearest_member_type_units(analyzer, csharp, definitions, file, owners, name);
-        if member_types.is_empty() {
-            return Vec::new();
-        }
-        owners = member_types;
     }
-    owners
+}
+
+fn canonical_csharp_predefined_type(reference: &str) -> Option<&'static str> {
+    match reference {
+        "bool" => Some("System.Boolean"),
+        "byte" => Some("System.Byte"),
+        "sbyte" => Some("System.SByte"),
+        "char" => Some("System.Char"),
+        "decimal" => Some("System.Decimal"),
+        "double" => Some("System.Double"),
+        "float" => Some("System.Single"),
+        "int" => Some("System.Int32"),
+        "uint" => Some("System.UInt32"),
+        "nint" => Some("System.IntPtr"),
+        "nuint" => Some("System.UIntPtr"),
+        "long" => Some("System.Int64"),
+        "ulong" => Some("System.UInt64"),
+        "short" => Some("System.Int16"),
+        "ushort" => Some("System.UInt16"),
+        "string" => Some("System.String"),
+        "object" => Some("System.Object"),
+        _ => None,
+    }
 }
 
 fn csharp_nearest_member_type_units(
@@ -2477,132 +2602,33 @@ fn csharp_nearest_member_type_units(
     result
 }
 
-/// Type an `invocation_expression` receiver by the callee's declared return
-/// type: resolve the invoked method's owner(s), then resolve the return type of
-/// `owner.Method` (walking the type hierarchy) to a type CodeUnit.
-/// The resolved callee of an `invocation_expression`: the receiver type owners the
-/// invoked name is looked up on, the name itself, its generic arity/type arguments,
-/// and — when the callee has a receiver — the name node that seeds extension-method
-/// visibility scoping if the name turns out to be an extension.
-struct CSharpInvocationCallee<'a> {
-    owners: Vec<CodeUnit>,
-    method: &'a str,
-    explicit_generic_arity: Option<usize>,
-    explicit_type_arguments: Option<Vec<String>>,
-    extension_site: Option<Node<'a>>,
-}
-
-fn csharp_invocation_return_type_units(
+/// Fold one invocation transition over already-resolved owners. Keeping owner
+/// evaluation outside this helper prevents alternating call/member syntax from
+/// recursing through the Rust stack.
+fn csharp_invocation_return_type_units_for_owners(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
-    root: Node<'_>,
     invocation: Node<'_>,
+    name_node: Node<'_>,
+    owners: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
     if !definitions.scope_step() {
         return Vec::new();
     }
-    let Some(function) = invocation.child_by_field_name("function") else {
+    let Some(name) = csharp_member_name(name_node) else {
         return Vec::new();
     };
-    let callee = match function.kind() {
-        // `obj.Method()` — type the sub-receiver, look up `Method` on it.
-        "member_access_expression" | "conditional_access_expression" => {
-            let (sub_receiver, name_node) = match function.kind() {
-                "member_access_expression" => {
-                    let Some(receiver) = csharp_member_access_receiver(function) else {
-                        return Vec::new();
-                    };
-                    let Some(name) = csharp_member_access_name(function) else {
-                        return Vec::new();
-                    };
-                    (receiver, name)
-                }
-                _ => {
-                    let Some(access) = csharp_conditional_member_access(function) else {
-                        return Vec::new();
-                    };
-                    (access.receiver, access.name)
-                }
-            };
-            let Some(name) = csharp_member_name(name_node) else {
-                return Vec::new();
-            };
-            let type_arguments = csharp_resolved_type_arguments(
-                csharp,
-                definitions,
-                file,
-                source,
-                name.type_arguments,
-            );
-            let owners = csharp_receiver_type_units(
-                analyzer,
-                csharp,
-                definitions,
-                file,
-                source,
-                root,
-                sub_receiver,
-            );
-            CSharpInvocationCallee {
-                owners,
-                method: csharp_node_text(name.identifier, source),
-                explicit_generic_arity: name.explicit_generic_arity,
-                explicit_type_arguments: type_arguments,
-                // The name node seeds extension-method visibility scoping when the
-                // callee turns out to be an extension rather than an ordinary member.
-                extension_site: Some(name.identifier),
-            }
-        }
-        // `Method()` — an unqualified call resolves against the enclosing class.
-        "identifier" => {
-            let owners = csharp_enclosing_class(analyzer, definitions, file, function.start_byte())
-                .into_iter()
-                .collect();
-            CSharpInvocationCallee {
-                owners,
-                method: csharp_node_text(function, source),
-                explicit_generic_arity: None,
-                explicit_type_arguments: None,
-                extension_site: None,
-            }
-        }
-        "generic_name" => {
-            let Some(name) = csharp_member_name(function) else {
-                return Vec::new();
-            };
-            let type_arguments = csharp_resolved_type_arguments(
-                csharp,
-                definitions,
-                file,
-                source,
-                name.type_arguments,
-            );
-            let owners = csharp_enclosing_class(analyzer, definitions, file, function.start_byte())
-                .into_iter()
-                .collect();
-            CSharpInvocationCallee {
-                owners,
-                method: csharp_node_text(name.identifier, source),
-                explicit_generic_arity: name.explicit_generic_arity,
-                explicit_type_arguments: type_arguments,
-                extension_site: None,
-            }
-        }
-        _ => return Vec::new(),
-    };
-    let CSharpInvocationCallee {
-        owners,
-        method,
-        explicit_generic_arity,
-        explicit_type_arguments,
-        extension_site,
-    } = callee;
+    let method = csharp_node_text(name.identifier, source);
     if owners.is_empty() || method.is_empty() {
         return Vec::new();
     }
+    let explicit_type_arguments =
+        csharp_resolved_type_arguments(csharp, definitions, file, source, name.type_arguments);
+    let extension_site =
+        (!csharp_is_unqualified_invocation_target(name_node)).then_some(name.identifier);
 
     let receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
     let mut return_type_units = Vec::new();
@@ -2615,20 +2641,20 @@ fn csharp_invocation_return_type_units(
             Some(session) => csharp_method_return_type_fq_name_for_arity_in_session(
                 csharp,
                 file,
-                &owner,
+                owner,
                 method,
                 Some(value_arity),
-                explicit_generic_arity,
+                name.explicit_generic_arity,
                 explicit_type_arguments.as_deref(),
                 session,
             ),
             None => csharp_method_return_type_fq_name_for_arity(
                 csharp,
                 file,
-                &owner,
+                owner,
                 method,
                 Some(value_arity),
-                explicit_generic_arity,
+                name.explicit_generic_arity,
                 explicit_type_arguments.as_deref(),
             ),
         };
@@ -2653,7 +2679,7 @@ fn csharp_invocation_return_type_units(
                 &receiver_type_names,
                 method,
                 Some(value_arity),
-                explicit_generic_arity,
+                name.explicit_generic_arity,
                 explicit_type_arguments.as_deref(),
                 false,
                 session,
@@ -2666,7 +2692,7 @@ fn csharp_invocation_return_type_units(
                 &receiver_type_names,
                 method,
                 Some(value_arity),
-                explicit_generic_arity,
+                name.explicit_generic_arity,
                 explicit_type_arguments.as_deref(),
                 false,
             ),
@@ -2894,7 +2920,7 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
         }
         let child_fqn = format!("{}.{}", enclosing.fq_name(), name);
         if let Some(child) = definitions
-            .query_rows(|| analyzer.definitions(&child_fqn).collect())
+            .fqn(&child_fqn)
             .into_iter()
             .find(CodeUnit::is_class)
         {
@@ -3066,6 +3092,7 @@ mod tests {
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
+    use std::fmt::Write as _;
 
     fn member_fixture() -> (
         AnalyzerFixture,
@@ -3153,6 +3180,71 @@ public class Consumer
                 limit: ReceiverBudgetLimit::ScopeNodes,
                 work,
             } if work.scope_nodes == budget.max_scope_nodes
+        ));
+    }
+
+    #[test]
+    fn very_wide_active_path_stops_before_materializing_siblings() {
+        const SIBLING_COUNT: usize = 25_000;
+
+        let mut statements = String::new();
+        for index in 0..SIBLING_COUNT {
+            writeln!(statements, "Call{index}();").expect("write wide C# statement");
+        }
+        let source = format!("class Wide {{ void Run() {{\n{statements}_ = target;\n}} }}",);
+        let cutoff_start = source.find("_ = target").expect("target expression");
+        let tree = parse_csharp_tree(&source).expect("wide C# tree");
+        let mut block = tree
+            .root_node()
+            .named_descendant_for_byte_range(cutoff_start, cutoff_start + 1)
+            .expect("target node");
+        while block.kind() != "block" {
+            block = block.parent().expect("target must be inside a block");
+        }
+        assert_eq!(
+            block.named_child_count(),
+            SIBLING_COUNT + 1,
+            "fixture must retain the deliberately wide sibling set"
+        );
+
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::CSharp, &[("Provider.cs", "class P {}")]);
+        let csharp =
+            resolve_analyzer::<CSharpAnalyzer>(fixture.analyzer.analyzer()).expect("C# analyzer");
+
+        let budget = ReceiverAnalysisBudget::tiny();
+        let budget_session = ResolutionSession::bounded(budget, None);
+        let budget_definitions = CSharpDefinitionProvider::bounded(csharp, &budget_session);
+        let mut budget_visits = 0usize;
+        csharp_visit_bounded_active_path(&budget_definitions, block, cutoff_start, |_| {
+            budget_visits += 1;
+            true
+        });
+        assert_eq!(budget_visits, 1, "only the charged root may be visited");
+        assert!(matches!(
+            budget_session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == budget.max_scope_nodes
+        ));
+
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+        let cancel_session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
+        let cancel_definitions = CSharpDefinitionProvider::bounded(csharp, &cancel_session);
+        let mut cancel_visits = 0usize;
+        csharp_visit_bounded_active_path(&cancel_definitions, block, cutoff_start, |_| {
+            cancel_visits += 1;
+            true
+        });
+        assert_eq!(
+            cancel_visits, 1,
+            "cancellation must stop before another sibling is pushed"
+        );
+        assert!(matches!(
+            cancel_session.finish(()),
+            BoundedResolution::Cancelled { work } if work.scope_nodes == 1
         ));
     }
 

@@ -34,9 +34,12 @@ Named arguments refer to call-site syntax represented by the normalized `kwargs`
 | --- | --- |
 | Java | Bounded values, allocation/factory provenance, current/static/type values, and exact member declarations with explicit outcomes. |
 | JavaScript and TypeScript | Bounded values, allocation/factory provenance, and exact member declarations with explicit outcomes. |
-| Python, Go, C/C++, Rust, PHP, Scala, C#, and Ruby | An explicit `unsupported` analysis row plus an aggregated capability diagnostic. |
+| C++ and C# | Typed/current receivers, allocation and factory provenance where represented, and exact owner-scoped members; unresolved virtual, overload, template, extension, or other open dispatch remains explicit. |
+| Go and Rust | Named or current receivers, allocations and factory returns, and exact owner-scoped members; unresolved interface, trait, promotion, and autoderef uncertainty remains explicit. |
+| Python, PHP, Ruby, and Scala | Structured typed/current receivers, allocations and returns, and exact owner-scoped members where the adapter can prove them; dynamic dispatch and language-specific metaprogramming remain explicit. |
+| C | Unsupported because class/member receiver semantics do not apply; the query returns an explicit receiver-analysis boundary. |
 
-The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records direct-edge support and the PHP diagnostic boundary, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks Java and JavaScript/TypeScript outcomes and provenance.
+The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records direct-edge support and the PHP diagnostic boundary, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks the shared outcome and provenance contract.
 
 ## Precision And Completeness
 
@@ -60,8 +63,8 @@ Bifrost does not currently provide:
 
 - control-flow graphs or path feasibility;
 - whole-program points-to or complete allocation-site analysis (the receiver-query implementations are bounded and demand-driven);
-- general alias sets or receiver provenance outside the bounded Java, JavaScript, and TypeScript implementations;
+- general alias sets or receiver provenance beyond the structured facts published by each bounded adapter;
 - general interprocedural data-flow or taint tracking; or
 - compiler-complete external dependency indexing.
 
-`call_input` can project the expression written at a resolved call site, and Java, JavaScript, and TypeScript `points_to` can analyze that exact expression under a bounded receiver budget. Neither operation is a general value-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.
+`call_input` can project the expression written at a resolved call site, and a supported adapter's `points_to` step can analyze that exact expression under a bounded receiver budget. Neither operation is a general value-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.

@@ -2,17 +2,20 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{ProjectFile, ScalaAnalyzer};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
+};
+use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"scala-cfg-v2";
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v3";
 
 impl_program_semantics_provider!(ScalaAnalyzer, ScalaSemanticLowerer);
 
@@ -93,6 +96,15 @@ fn scala_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::FieldMemory,
+        SemanticCapability::StaticMemory,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::Captures,
         SemanticCapability::DeferredExecution,
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::NonLocalControl,
@@ -452,6 +464,28 @@ fn callable_shape<'tree>(
         }
         _ => return None,
     };
+    let enclosing_template = enclosing_template_kind(node);
+    let object_member = enclosing_template == Some("object_definition");
+    let is_static = matches!(
+        kind,
+        ProcedureKind::Function
+            | ProcedureKind::LocalFunction
+            | ProcedureKind::Lambda
+            | ProcedureKind::Closure
+    ) || object_member;
+    let dispatch_extensibility = if matches!(
+        kind,
+        ProcedureKind::Constructor
+            | ProcedureKind::Function
+            | ProcedureKind::LocalFunction
+            | ProcedureKind::Lambda
+            | ProcedureKind::Closure
+    ) || object_member
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    };
     Some((
         kind,
         segment_kind,
@@ -459,13 +493,27 @@ fn callable_shape<'tree>(
         ProcedureProperties {
             is_async: false,
             is_generator: false,
-            is_static: false,
+            is_static,
             is_synthetic: synthetic,
             invocation,
-            ..ProcedureProperties::default()
+            dispatch_extensibility,
         },
         attach_lexical_parent,
     ))
+}
+
+fn enclosing_template_kind(mut node: Node<'_>) -> Option<&'static str> {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "class_definition" => return Some("class_definition"),
+            "object_definition" => return Some("object_definition"),
+            "trait_definition" => return Some("trait_definition"),
+            "enum_definition" => return Some("enum_definition"),
+            "function_definition" | "lambda_expression" | "case_block" => return None,
+            _ => node = parent,
+        }
+    }
+    None
 }
 
 fn case_block_is_partial_function(node: Node<'_>) -> bool {
@@ -530,11 +578,24 @@ struct CleanupRegion<'tree> {
 }
 
 struct LoweringContext<'tree, 'targets> {
-    source: &'tree str,
+    prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
+    callable: Node<'tree>,
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
+}
+
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
 }
 
 fn lower_procedure<'tree>(
@@ -561,12 +622,19 @@ fn lower_procedure<'tree>(
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
-        source: prepared.source(),
+        prepared,
         session,
+        callable: spec.callable,
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
         cleanups: Vec::new(),
     };
+    context.emit_procedure_inputs(&mut builder, entry, spec.callable, spec.kind)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
 
     if callable_has_by_name_parameter(spec.callable) {
         context.add_gap(
@@ -639,7 +707,40 @@ fn lower_procedure<'tree>(
         EdgeTarget::normal(normal_exit)
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let result_node = implicit_result_node(spec.body);
+        let result = result_node
+            .map(|node| context.expression_value(&mut builder, node, expression_value_kind(node)))
+            .transpose()?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        if let Some(result) = result
+            && result_node.is_some_and(|node| {
+                callable_result_has_identity_conversion(
+                    spec.callable,
+                    node,
+                    context.prepared.source(),
+                )
+            })
+        {
+            context.append_effect(
+                &mut builder,
+                implicit_return,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source: result,
+                    target: value,
+                },
+            )?;
+        } else if result.is_some() {
+            context.session.add_gap_with_impacts(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Value(value),
+                SemanticCapability::Values,
+                SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                SemanticGapKind::Unknown,
+                "Scala result adaptation may apply an implicit conversion before the method returns",
+            )?;
+        }
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -719,6 +820,250 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        callable: Node<'tree>,
+        procedure_kind: ProcedureKind,
+    ) -> Result<(), ScalaLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Scala,
+            callable,
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(ScalaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let node = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let metadata = self.value_mapping(builder, node)?;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    ScalaLoweringError::Invalid("too many formal parameters".into())
+                })?;
+                value
+            };
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+            if contains_token(node, "using") || contains_token(node, "implicit") {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unsupported,
+                    "Scala contextual parameter binding requires implicit or given resolution",
+                )?;
+            }
+        }
+
+        if self.receiver.is_none()
+            && matches!(
+                procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Initializer
+            )
+        {
+            let metadata = self.value_mapping(builder, callable)?;
+            self.receiver = Some(self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?);
+        }
+        if let Some(receiver) = self.receiver {
+            self.parameters.insert("this".into(), receiver);
+            self.parameters.insert("super".into(), receiver);
+        }
+
+        if enclosing_extension_definition(callable).is_some() {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::ParameterFlow,
+                SemanticGapKind::Unsupported,
+                "Scala extension receiver and contextual argument binding require extension resolution",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), ScalaLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(ScalaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node.id() != body.id() && is_scala_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if matches!(node.kind(), "val_definition" | "var_definition")
+                && let Some(pattern) = node.child_by_field_name("pattern")
+                && pattern.kind() == "identifier"
+                && let Some(name) = node_text(self.prepared.source(), pattern)
+                && let Some((scope_start, scope_end)) = scala_local_scope(node, body)
+            {
+                let metadata = self.value_mapping(builder, pattern)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: pattern.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| binding.scope_end - binding.scope_start)
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .find(|binding| binding.declaration_start == declaration_start)
+            .map(|binding| binding.value)
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ScalaLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ScalaLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), ScalaLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let (source, kind) =
+            if matches!(node.kind(), "this" | "super") || matches!(name, "this" | "super") {
+                (self.receiver, ValueFlowKind::Receiver)
+            } else if node.kind() == "identifier" {
+                if let Some(local) = self.local_at(name, node.start_byte()) {
+                    (Some(local), ValueFlowKind::Local)
+                } else {
+                    (self.parameters.get(name).copied(), ValueFlowKind::Parameter)
+                }
+            } else {
+                (None, ValueFlowKind::Local)
+            };
+        if let Some(source) = source
+            && source != target
+        {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn leaf_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), ScalaLoweringError> {
+        let value = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.emit_lexical_input_flow(builder, node, entry, value)?;
+        self.edge(builder, entry, next)
+    }
+
+    fn identifier_is_lexical(&self, node: Node<'tree>) -> bool {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return false;
+        };
+        self.local_at(name, node.start_byte()).is_some() || self.parameters.contains_key(name)
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -762,7 +1107,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), ScalaLoweringError> {
-        match (node.kind(), infix_operator(self.source, node)) {
+        match (node.kind(), infix_operator(self.prepared.source(), node)) {
             ("infix_expression", Some("&&")) => {
                 let left = required_field(node, "left")?;
                 let right = required_runtime_field(node, "right")?;
@@ -955,24 +1300,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "function_definition" | "lambda_expression" => {
                 self.callable_value(builder, entry, next)
             }
-            "parenthesized_expression" | "typed_expression" => {
+            "parenthesized_expression" => {
                 if let Some(value) = first_runtime_named_child(node) {
-                    stack.push(Work::Expression {
-                        node: value,
-                        entry,
-                        next,
-                        scope,
-                    });
-                    Ok(())
+                    self.transparent_expression(builder, node, value, entry, next, scope, stack)
                 } else {
                     self.edge(builder, entry, next)
                 }
             }
+            "typed_expression" => {
+                let value =
+                    first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                let terminal = self.point(builder, node, Vec::new())?;
+                let target = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "Scala type ascription may require value adaptation or an implicit conversion",
+                )?;
+                self.edge(builder, terminal, next)?;
+                stack.push(Work::Expression {
+                    node: value,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
+            "assignment_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
             "field_expression" => {
+                let result = self.expression_value(builder, node, expression_value_kind(node))?;
                 self.add_gap(
                     builder,
                     entry,
-                    SemanticGapSubject::Point,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "Scala selection result identity requires exact member or extension resolution",
+                )?;
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
                     SemanticCapability::Calls,
                     SemanticGapKind::Unknown,
                     "selection may denote a parameterless method or require an implicit conversion",
@@ -980,7 +1353,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.add_gap(
                     builder,
                     entry,
-                    SemanticGapSubject::Point,
+                    SemanticGapSubject::Value(result),
                     SemanticCapability::ExceptionalControlFlow,
                     SemanticGapKind::Unknown,
                     "parameterless method selection or an implicit conversion may complete exceptionally",
@@ -1020,7 +1393,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             "infix_expression" => {
-                if matches!(infix_operator(self.source, node), Some("&&" | "||")) {
+                if matches!(
+                    infix_operator(self.prepared.source(), node),
+                    Some("&&" | "||")
+                ) {
                     let right = required_runtime_field(node, "right")?;
                     let right_entry = self.point(builder, right, Vec::new())?;
                     stack.push(Work::Expression {
@@ -1029,30 +1405,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         next,
                         scope,
                     });
-                    let (when_true, when_false) = if infix_operator(self.source, node) == Some("&&")
-                    {
-                        (
-                            EdgeTarget {
-                                point: right_entry,
-                                kind: ControlEdgeKind::ConditionalTrue,
-                            },
-                            EdgeTarget {
-                                point: next.point,
-                                kind: ControlEdgeKind::ConditionalFalse,
-                            },
-                        )
-                    } else {
-                        (
-                            EdgeTarget {
-                                point: next.point,
-                                kind: ControlEdgeKind::ConditionalTrue,
-                            },
-                            EdgeTarget {
-                                point: right_entry,
-                                kind: ControlEdgeKind::ConditionalFalse,
-                            },
-                        )
-                    };
+                    let (when_true, when_false) =
+                        if infix_operator(self.prepared.source(), node) == Some("&&") {
+                            (
+                                EdgeTarget {
+                                    point: right_entry,
+                                    kind: ControlEdgeKind::ConditionalTrue,
+                                },
+                                EdgeTarget {
+                                    point: next.point,
+                                    kind: ControlEdgeKind::ConditionalFalse,
+                                },
+                            )
+                        } else {
+                            (
+                                EdgeTarget {
+                                    point: next.point,
+                                    kind: ControlEdgeKind::ConditionalTrue,
+                                },
+                                EdgeTarget {
+                                    point: right_entry,
+                                    kind: ControlEdgeKind::ConditionalFalse,
+                                },
+                            )
+                        };
                     stack.push(Work::Condition {
                         node: required_field(node, "left")?,
                         entry,
@@ -1065,7 +1441,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.infix_expression(builder, node, entry, next, scope, stack)
                 }
             }
-            "identifier" if identifier_has_auto_application_ambiguity(node) => {
+            "identifier"
+                if identifier_has_auto_application_ambiguity(node)
+                    && !self.identifier_is_lexical(node) =>
+            {
                 for (capability, detail) in [
                     (
                         SemanticCapability::Calls,
@@ -1089,9 +1468,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         detail,
                     )?;
                 }
-                self.edge(builder, entry, next)
+                self.leaf_expression(builder, node, entry, next)
             }
-            kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
+            kind if is_runtime_leaf(kind) => self.leaf_expression(builder, node, entry, next),
             _ => self.unsupported_expression(
                 builder,
                 node,
@@ -1638,7 +2017,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return self.edge(builder, entry, next);
         }
         let pattern = node.child_by_field_name("pattern");
-        if pattern.is_some_and(|pattern| !matches!(pattern.kind(), "identifier" | "identifiers")) {
+        if pattern.is_some_and(|pattern| pattern.kind() != "identifier") {
             self.add_gap(
                 builder,
                 entry,
@@ -1648,10 +2027,145 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "destructuring definition bindings are not represented in value flow",
             )?;
         }
+        let terminal = self.point(builder, node, Vec::new())?;
+        if let Some(pattern) = pattern.filter(|pattern| pattern.kind() == "identifier")
+            && let Some(name) = node_text(self.prepared.source(), pattern)
+            && let Some(target) = self.local_declaration_value(name, pattern.start_byte())
+        {
+            let source = self.expression_value(builder, value, expression_value_kind(value))?;
+            if scala_definition_has_identity_initializer(node, value, self.prepared.source()) {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target,
+                    },
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "Scala typed value initialization may apply an implicit conversion",
+                )?;
+            }
+        }
+        if contains_token(node, "implicit") || contains_token(node, "given") {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "implicit or given value selection requires contextual resolution",
+            )?;
+        }
+        self.edge(builder, terminal, next)?;
         stack.push(Work::Expression {
             node: value,
             entry,
-            next,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let left = required_field(node, "left").or_else(|_| required_field(node, "target"))?;
+        let right = required_field(node, "right").or_else(|_| required_field(node, "value"))?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "Scala assignment identity requires the declared target type and implicit conversion resolution",
+        )?;
+        if left.kind() == "identifier"
+            && let Some(name) = node_text(self.prepared.source(), left)
+            && let Some(target) = self
+                .local_at(name, left.start_byte())
+                .or_else(|| self.parameters.get(name).copied())
+        {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(target),
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "Scala variable reassignment is retained without assuming identity-preserving adaptation",
+            )?;
+        } else {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "Scala member, index, update, or destructuring assignment is not lowered into memory flow",
+            )?;
+        }
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[left, right],
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transparent_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        value: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let source = self.expression_value(builder, value, expression_value_kind(value))?;
+        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        self.edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
             scope,
         });
         Ok(())
@@ -1693,7 +2207,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         } else {
             let value = argument
-                .map(|_| self.value(builder, terminal, SemanticValueKind::Return))
+                .map(|argument| {
+                    let source =
+                        self.expression_value(builder, argument, expression_value_kind(argument))?;
+                    let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+                    if callable_result_has_identity_conversion(
+                        self.callable,
+                        argument,
+                        self.prepared.source(),
+                    ) {
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Return,
+                                source,
+                                target: value,
+                            },
+                        )?;
+                    } else {
+                        self.session.add_gap_with_impacts(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Value(value),
+                            SemanticCapability::Values,
+                            SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                            SemanticGapKind::Unknown,
+                            "Scala explicit return may apply an implicit conversion to the declared result type",
+                        )?;
+                    }
+                    Ok::<_, ScalaLoweringError>(value)
+                })
                 .transpose()?;
             self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
             self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
@@ -1720,7 +2264,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let argument = first_runtime_named_child(node)
             .ok_or_else(|| missing_field(node, "exception expression"))?;
         let terminal = self.point(builder, node, Vec::new())?;
+        let source = self.expression_value(builder, argument, expression_value_kind(argument))?;
         let value = self.value(builder, terminal, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: value,
+                value: source,
+            },
+        )?;
         self.append_effect(
             builder,
             terminal,
@@ -1768,16 +2321,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
-        let receiver = (!constructor_application
-            && matches!(
-                callable.kind(),
-                "field_expression" | "infix_expression" | "postfix_expression"
-            ))
-        .then(|| self.value(builder, invoke, SemanticValueKind::Receiver))
-        .transpose()?;
+        let callee = self.source_value(builder, callable, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, callable, SemanticValueKind::Exception)?;
+        let receiver_node = (!constructor_application)
+            .then(|| scala_bound_receiver(callable))
+            .flatten();
+        let receiver = receiver_node
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
+            .transpose()?;
         let callable_kind = if constructor_application {
             CallableReferenceKind::Constructor
         } else if receiver.is_some() {
@@ -1803,7 +2357,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         let arguments = argument_nodes
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(|argument| {
+                self.expression_value(builder, *argument, expression_value_kind(*argument))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -1811,7 +2367,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: arguments.into_iter().map(Into::into).collect(),
+                arguments: arguments
+                    .into_iter()
+                    .map(|value| {
+                        if has_implicit_arguments {
+                            SemanticCallArgument::unclassified(value)
+                        } else {
+                            SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                        }
+                    })
+                    .collect(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -1819,6 +2384,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if constructor_application {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -1889,7 +2458,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
         }
-        if is_future_like_call(self.source, callable) {
+        if is_future_like_call(self.prepared.source(), callable) {
             self.add_gap(
                 builder,
                 invoke,
@@ -2001,7 +2570,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let operator = required_field(node, "operator")?;
         let right_associative =
-            node_text(self.source, operator).is_some_and(|name| name.ends_with(':'));
+            node_text(self.prepared.source(), operator).is_some_and(|name| name.ends_with(':'));
         let arguments = if right_associative {
             vec![left]
         } else {
@@ -2086,7 +2655,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        _function: Node<'tree>,
+        function: Node<'tree>,
         callable_kind: CallableReferenceKind,
         argument_nodes: &[Node<'tree>],
         evaluations: &[Node<'tree>],
@@ -2095,11 +2664,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, source_node, Vec::new())?;
         let normal = self.point(builder, source_node, Vec::new())?;
         let exceptional = self.point(builder, source_node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
-        let receiver = (callable_kind == CallableReferenceKind::BoundMethod)
-            .then(|| self.value(builder, invoke, SemanticValueKind::Receiver))
+        let callee = self.source_value(builder, function, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, source_node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, function, SemanticValueKind::Exception)?;
+        let receiver_node = (callable_kind == CallableReferenceKind::BoundMethod)
+            .then(|| scala_call_like_receiver(source_node, function, self.prepared.source()))
+            .flatten();
+        let receiver = receiver_node
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
             .transpose()?;
         let resolution = CallableTargetResolution::Unknown;
         let metadata = self.metadata(invoke)?;
@@ -2119,7 +2693,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         let arguments = argument_nodes
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(|argument| {
+                self.expression_value(builder, *argument, expression_value_kind(*argument))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -2127,7 +2703,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: arguments.into_iter().map(Into::into).collect(),
+                arguments: arguments
+                    .into_iter()
+                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
+                    .collect(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2135,6 +2714,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if callable_kind == CallableReferenceKind::Constructor {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -2440,6 +3023,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, ScalaLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(ScalaLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, ScalaLoweringError> {
         self.session.metadata(point)
     }
@@ -2484,6 +3077,199 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), ScalaLoweringError> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
+    }
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
+}
+
+fn is_scala_nested_execution_boundary(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "lambda_expression"
+            | "case_block"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "given_definition"
+    )
+}
+
+fn scala_local_scope(node: Node<'_>, procedure_body: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "block"
+                | "indented_block"
+                | "case_clause"
+                | "catch_clause"
+                | "for_expression"
+                | "while_expression"
+                | "do_while_expression"
+        ) || parent.id() == procedure_body.id()
+        {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        if is_scala_nested_execution_boundary(parent) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn enclosing_extension_definition(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "extension_definition" => return Some(parent),
+            "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "function_definition"
+            | "lambda_expression" => return None,
+            _ => node = parent,
+        }
+    }
+    None
+}
+
+fn implicit_result_node(mut body: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if !matches!(
+            body.kind(),
+            "block" | "indented_block" | "template_body" | "with_template_body"
+        ) {
+            return Some(body);
+        }
+        body = runtime_statement_children(body).into_iter().next_back()?;
+    }
+}
+
+fn scala_constructed_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let instance = match node.kind() {
+        "instance_expression" => node,
+        "call_expression" => node
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "instance_expression")?,
+        _ => return None,
+    };
+    instance.child_by_field_name("type").or_else(|| {
+        named_children(instance).into_iter().find(|child| {
+            !matches!(
+                child.kind(),
+                "arguments" | "template_body" | "block" | "indented_block"
+            )
+        })
+    })
+}
+
+fn scala_type_nodes_have_same_identity(left: Node<'_>, right: Node<'_>, source: &str) -> bool {
+    let left = super::scala_type_lookup_segments(left, source);
+    !left.is_empty() && left == super::scala_type_lookup_segments(right, source)
+}
+
+fn callable_result_has_identity_conversion(
+    callable: Node<'_>,
+    result: Node<'_>,
+    source: &str,
+) -> bool {
+    let Some(declared) = callable.child_by_field_name("return_type") else {
+        return true;
+    };
+    scala_constructed_type_node(result).is_some_and(|constructed| {
+        scala_type_nodes_have_same_identity(declared, constructed, source)
+    }) || scala_literal_has_declared_identity_type(declared, result, source)
+}
+
+fn scala_literal_has_declared_identity_type(
+    declared: Node<'_>,
+    expression: Node<'_>,
+    source: &str,
+) -> bool {
+    let expected = match expression.kind() {
+        "integer_literal" => "Int",
+        "floating_point_literal" => "Double",
+        "boolean_literal" => "Boolean",
+        "character_literal" => "Char",
+        "string" | "string_literal" => "String",
+        "unit" => "Unit",
+        _ => return false,
+    };
+    super::scala_type_lookup_segments(declared, source)
+        .last()
+        .is_some_and(|segment| segment == expected)
+}
+
+fn scala_definition_has_identity_initializer(
+    definition: Node<'_>,
+    initializer: Node<'_>,
+    source: &str,
+) -> bool {
+    let Some(declared) = definition.child_by_field_name("type") else {
+        return true;
+    };
+    scala_constructed_type_node(initializer).is_some_and(|constructed| {
+        scala_type_nodes_have_same_identity(declared, constructed, source)
+    })
+}
+
+fn scala_bound_receiver(callable: Node<'_>) -> Option<Node<'_>> {
+    (callable.kind() == "field_expression")
+        .then(|| callable.child_by_field_name("value"))
+        .flatten()
+}
+
+fn scala_call_like_receiver<'tree>(
+    source_node: Node<'tree>,
+    function: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if let Some(receiver) = scala_bound_receiver(function) {
+        return Some(receiver);
+    }
+    match source_node.kind() {
+        "infix_expression" => {
+            let field =
+                if infix_operator(source, source_node).is_some_and(|name| name.ends_with(':')) {
+                    "right"
+                } else {
+                    "left"
+                };
+            source_node.child_by_field_name(field)
+        }
+        "postfix_expression" => {
+            let mut cursor = source_node.walk();
+            source_node
+                .named_children(&mut cursor)
+                .find(|child| child.end_byte() <= function.start_byte())
+        }
+        "prefix_expression" => first_runtime_named_child(source_node),
+        _ => None,
+    }
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "function_definition" | "lambda_expression" | "case_block" => SemanticValueKind::Callable,
+        "integer_literal"
+        | "floating_point_literal"
+        | "boolean_literal"
+        | "character_literal"
+        | "string"
+        | "symbol_literal"
+        | "null_literal"
+        | "unit" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
     }
 }
 

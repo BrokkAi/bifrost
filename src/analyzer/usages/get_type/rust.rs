@@ -5,10 +5,10 @@ use crate::analyzer::usages::get_definition::{
     rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-use crate::analyzer::usages::reference_site::{
-    ResolvedReferenceSite, smallest_named_node_covering,
+use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::rust_graph::{
+    RustDefinitionProvider, rust_smallest_named_node_covering,
 };
-use crate::analyzer::usages::rust_graph::RustDefinitionProvider;
 use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Node, Tree};
@@ -45,7 +45,7 @@ pub(crate) fn resolve_rust_type_bounded(
         ));
     };
     let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
-    let mut cache = RustTypeLookupCache::bounded_for_query(file, source, tree);
+    let mut cache = RustTypeLookupCache::bounded_for_query();
     let outcome =
         resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
     session.finish(outcome)
@@ -64,15 +64,18 @@ fn resolve_rust_type_with_provider(
     let Some(tree) = tree else {
         return no_type("rust_parse_failed", "Rust source could not be parsed");
     };
-    let Some(node) =
-        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
-    else {
+    let Some(node) = rust_smallest_named_node_covering(
+        support,
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
         return no_type(
             "no_reference_node",
             "no Rust syntax node at reference location",
         );
     };
-    if rust_is_type_reference_position(node) {
+    if rust_is_type_reference_position(support, node) {
         let Some(fqn) = rust_resolve_type_node_fqn(
             analyzer,
             support,
@@ -103,7 +106,12 @@ fn resolve_rust_type_with_provider(
         return type_reference_outcome(fqn, candidates);
     }
 
-    let expression = rust_type_lookup_expression(node);
+    let Some(expression) = rust_type_lookup_expression(support, node) else {
+        return no_type(
+            "resolution_stopped",
+            "bounded Rust type resolution stopped before reaching the expression",
+        );
+    };
     let Some(fqn) = rust_expression_type_definition_fqn_cached(
         analyzer,
         support,
@@ -136,10 +144,16 @@ fn resolve_rust_type_with_provider(
     candidates_outcome(fqn, candidates)
 }
 
-fn rust_type_lookup_expression(mut node: Node<'_>) -> Node<'_> {
+fn rust_type_lookup_expression<'tree>(
+    support: &dyn RustDefinitionProvider,
+    mut node: Node<'tree>,
+) -> Option<Node<'tree>> {
     loop {
+        if !support.scope_step() {
+            return None;
+        }
         let Some(parent) = node.parent() else {
-            return node;
+            return Some(node);
         };
         let node_id = node.id();
         let parent_is_semantic_expression = match parent.kind() {
@@ -159,14 +173,20 @@ fn rust_type_lookup_expression(mut node: Node<'_>) -> Node<'_> {
             _ => false,
         };
         if !parent_is_semantic_expression {
-            return node;
+            return Some(node);
         }
         node = parent;
     }
 }
 
-fn rust_is_type_reference_position(mut node: Node<'_>) -> bool {
+fn rust_is_type_reference_position(
+    support: &dyn RustDefinitionProvider,
+    mut node: Node<'_>,
+) -> bool {
     while let Some(parent) = node.parent() {
+        if !support.scope_step() {
+            return false;
+        }
         if parent.child_by_field_name("type") == Some(node)
             || parent.child_by_field_name("trait") == Some(node)
         {

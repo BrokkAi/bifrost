@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser, Tree};
 
 // `FileState` holds the full parsed source (`source: String`) plus every
 // declaration-shaped collection derived from it (imports, signatures,
@@ -75,19 +75,24 @@ fn projection_rows_for_unit<'a, T>(
     rows: &'a HashMap<CodeUnit, Vec<T>>,
     unit: &CodeUnit,
 ) -> Option<&'a [T]> {
-    rows.get(unit)
-        .or_else(|| {
-            rows.iter()
-                .find(|(candidate, _)| {
-                    candidate.kind() == unit.kind()
-                        && candidate.fq_name() == unit.fq_name()
-                        && candidate.short_name() == unit.short_name()
-                        && candidate.signature() == unit.signature()
-                        && candidate.is_synthetic() == unit.is_synthetic()
-                })
-                .map(|(_, rows)| rows)
-        })
-        .map(Vec::as_slice)
+    projection_value_for_unit(rows, unit).map(Vec::as_slice)
+}
+
+fn projection_value_for_unit<'a, T>(
+    rows: &'a HashMap<CodeUnit, T>,
+    unit: &CodeUnit,
+) -> Option<&'a T> {
+    rows.get(unit).or_else(|| {
+        rows.iter()
+            .find(|(candidate, _)| {
+                candidate.kind() == unit.kind()
+                    && candidate.fq_name() == unit.fq_name()
+                    && candidate.short_name() == unit.short_name()
+                    && candidate.signature() == unit.signature()
+                    && candidate.is_synthetic() == unit.is_synthetic()
+            })
+            .map(|(_, rows)| rows)
+    })
 }
 
 #[cfg(test)]
@@ -234,19 +239,32 @@ pub(crate) fn try_walk_named_tree_preorder<'tree, Error>(
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> Result<WalkControl, Error>,
 ) -> Result<(), Error> {
-    let mut stack = vec![(root, true)];
-    while let Some((node, is_root)) = stack.pop() {
-        if node.is_named() && (include_root || !is_root) {
-            match visit(node)? {
-                WalkControl::Continue => {}
-                WalkControl::SkipChildren => continue,
-                WalkControl::Break => return Ok(()),
-            }
-        }
+    enum Frame<'tree> {
+        Enter(Node<'tree>, bool),
+        NextChild(Node<'tree>, usize),
+    }
 
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push((child, false));
+    let mut stack = vec![Frame::Enter(root, true)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter(node, is_root) => {
+                if node.is_named() && (include_root || !is_root) {
+                    match visit(node)? {
+                        WalkControl::Continue => {}
+                        WalkControl::SkipChildren => continue,
+                        WalkControl::Break => return Ok(()),
+                    }
+                }
+                stack.push(Frame::NextChild(node, 0));
+            }
+            Frame::NextChild(node, index) => {
+                if index >= node.named_child_count() {
+                    continue;
+                }
+                stack.push(Frame::NextChild(node, index + 1));
+                if let Some(child) = node.named_child(index) {
+                    stack.push(Frame::Enter(child, false));
+                }
             }
         }
     }
@@ -511,12 +529,40 @@ pub struct FileState {
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
-/// Immutable syntax prepared from the exact source snapshot owned by a
-/// request-scoped [`FileState`]. Keeping the state alive prevents the source
-/// bytes and tree from drifting apart while concurrent usage queries reuse it.
+/// Source backing for an immutable prepared syntax tree.
+///
+/// Ordinary unbounded queries retain the indexed [`FileState`] needed by
+/// declaration-oriented helpers. Bounded syntax-only queries retain just the
+/// exact admitted source snapshot, avoiding analyzer hydration and store
+/// writes before their cancellable parse.
+#[derive(Debug)]
+enum PreparedSyntaxSource {
+    Indexed(Arc<FileState>),
+    Exact(Arc<str>),
+}
+
+impl PreparedSyntaxSource {
+    fn source(&self) -> &str {
+        match self {
+            Self::Indexed(file_state) => &file_state.source,
+            Self::Exact(source) => source,
+        }
+    }
+
+    fn file_state(&self) -> Option<&FileState> {
+        match self {
+            Self::Indexed(file_state) => Some(file_state),
+            Self::Exact(_) => None,
+        }
+    }
+}
+
+/// Immutable syntax prepared from one exact source snapshot. Keeping the
+/// backing alive prevents the source bytes and tree from drifting apart while
+/// concurrent queries reuse it.
 #[derive(Debug)]
 pub(crate) struct PreparedSyntaxTree {
-    file_state: Arc<FileState>,
+    source: PreparedSyntaxSource,
     tree: Tree,
     line_starts: Vec<usize>,
     dialect: LanguageDialect,
@@ -526,7 +572,7 @@ pub(crate) struct PreparedSyntaxTree {
 
 impl PreparedSyntaxTree {
     pub(crate) fn source(&self) -> &str {
-        &self.file_state.source
+        self.source.source()
     }
 
     pub(crate) fn tree(&self) -> &Tree {
@@ -534,16 +580,16 @@ impl PreparedSyntaxTree {
     }
 
     pub(crate) fn declaration_node(&self, code_unit: &CodeUnit) -> Option<Node<'_>> {
-        let range = self.file_state.ranges.get(code_unit)?.first()?;
+        let range = self.source.file_state()?.ranges.get(code_unit)?.first()?;
         self.tree
             .root_node()
             .descendant_for_byte_range(range.start_byte, range.end_byte)
     }
 
     pub(crate) fn direct_children(&self, owner: &CodeUnit) -> &[CodeUnit] {
-        self.file_state
-            .children
-            .get(owner)
+        self.source
+            .file_state()
+            .and_then(|file_state| file_state.children.get(owner))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -585,6 +631,19 @@ impl PreparedSyntaxLimitExceeded {
     pub(crate) const fn minimum_source_bytes(self) -> usize {
         self.minimum_source_bytes
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparedSyntaxLimitedOutcome {
+    Available(Arc<PreparedSyntaxTree>),
+    Exceeded(PreparedSyntaxLimitExceeded),
+    Cancelled,
+    Unavailable,
+}
+
+enum PreparedSyntaxPreparation {
+    Complete(Option<Arc<PreparedSyntaxTree>>),
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -746,6 +805,13 @@ struct PreparedSyntaxCacheKey {
     file_state: FileStateCacheKey,
     origin: PreparedSourceOrigin,
     overlay_revision: Option<OverlayRevision>,
+    flavor: PreparedSyntaxCacheFlavor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PreparedSyntaxCacheFlavor {
+    Indexed,
+    ExactSource,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3131,7 +3197,7 @@ where
     }
 
     pub(crate) fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
-        self.prepared_syntax_with_limit(file, None).ok().flatten()
+        self.prepared_indexed_syntax(file)
     }
 
     /// Capture the same request-scoped atomic source used by syntax
@@ -3153,17 +3219,34 @@ where
         file: &ProjectFile,
         max_source_bytes: usize,
     ) -> Result<Option<Arc<PreparedSyntaxTree>>, PreparedSyntaxLimitExceeded> {
-        self.prepared_syntax_with_limit(file, Some(max_source_bytes))
+        match self.prepared_syntax_limited_cancellable(file, max_source_bytes, None) {
+            PreparedSyntaxLimitedOutcome::Available(prepared) => Ok(Some(prepared)),
+            PreparedSyntaxLimitedOutcome::Exceeded(exceeded) => Err(exceeded),
+            PreparedSyntaxLimitedOutcome::Cancelled => {
+                unreachable!("no cancellation token supplied")
+            }
+            PreparedSyntaxLimitedOutcome::Unavailable => Ok(None),
+        }
     }
 
-    fn prepared_syntax_with_limit(
+    pub(crate) fn prepared_syntax_limited_cancellable(
         &self,
         file: &ProjectFile,
-        max_source_bytes: Option<usize>,
-    ) -> Result<Option<Arc<PreparedSyntaxTree>>, PreparedSyntaxLimitExceeded> {
-        let Some(resolved) = self.resolve_prepared_source(file, max_source_bytes)? else {
-            return Ok(None);
+        max_source_bytes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> PreparedSyntaxLimitedOutcome {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PreparedSyntaxLimitedOutcome::Cancelled;
+        }
+        let resolved = match self.resolve_prepared_source(file, Some(max_source_bytes)) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return PreparedSyntaxLimitedOutcome::Unavailable,
+            Err(exceeded) => return PreparedSyntaxLimitedOutcome::Exceeded(exceeded),
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PreparedSyntaxLimitedOutcome::Cancelled;
+        }
+
         let key = Self::transient_cache_key(resolved.oid, file);
         let (origin, overlay_revision) = match resolved.snapshot.origin() {
             ProjectSourceOrigin::Disk => (PreparedSourceOrigin::Disk, None),
@@ -3175,6 +3258,76 @@ where
             file_state: key.clone(),
             origin,
             overlay_revision,
+            flavor: PreparedSyntaxCacheFlavor::ExactSource,
+        };
+        let cell = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
+            .prepared_syntax_cell(prepared_key);
+        if let Some(cached) = cell.as_ref().and_then(|cell| cell.get()).cloned() {
+            return cached.map_or(
+                PreparedSyntaxLimitedOutcome::Unavailable,
+                PreparedSyntaxLimitedOutcome::Available,
+            );
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PreparedSyntaxLimitedOutcome::Cancelled;
+        }
+
+        #[cfg(test)]
+        {
+            let mut counts = self
+                .prepared_syntax_parse_counts
+                .lock()
+                .expect("prepared syntax parse count mutex poisoned");
+            *counts.entry(key.clone()).or_default() += 1;
+        }
+        let prepared = match self.prepare_exact_syntax_cancellable(
+            file,
+            origin,
+            overlay_revision,
+            resolved.snapshot.into_source(),
+            cancellation,
+        ) {
+            PreparedSyntaxPreparation::Complete(prepared) => prepared,
+            PreparedSyntaxPreparation::Cancelled => {
+                return PreparedSyntaxLimitedOutcome::Cancelled;
+            }
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PreparedSyntaxLimitedOutcome::Cancelled;
+        }
+
+        // A cancelled parse is deliberately never stored. Completed parse
+        // failures retain the existing negative-cache behavior. If another
+        // request won the race, its coherent result is authoritative.
+        let prepared = if let Some(cell) = cell {
+            let _ = cell.set(prepared.clone());
+            cell.get().cloned().unwrap_or(prepared)
+        } else {
+            prepared
+        };
+        prepared.map_or(
+            PreparedSyntaxLimitedOutcome::Unavailable,
+            PreparedSyntaxLimitedOutcome::Available,
+        )
+    }
+
+    fn prepared_indexed_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
+        let resolved = self.resolve_prepared_source(file, None).ok().flatten()?;
+        let key = Self::transient_cache_key(resolved.oid, file);
+        let (origin, overlay_revision) = match resolved.snapshot.origin() {
+            ProjectSourceOrigin::Disk => (PreparedSourceOrigin::Disk, None),
+            ProjectSourceOrigin::Overlay(revision) => {
+                (PreparedSourceOrigin::Overlay, Some(revision))
+            }
+        };
+        let prepared_key = PreparedSyntaxCacheKey {
+            file_state: key.clone(),
+            origin,
+            overlay_revision,
+            flavor: PreparedSyntaxCacheFlavor::Indexed,
         };
         let cell = self
             .query_read_cache
@@ -3182,33 +3335,32 @@ where
             .expect("query read cache mutex poisoned")
             .prepared_syntax_cell(prepared_key);
         let Some(cell) = cell else {
-            return Ok(self.prepare_syntax_for_key(
+            return self.prepare_syntax_for_key(
                 file,
                 &key,
                 origin,
                 overlay_revision,
                 resolved.snapshot.source(),
-            ));
+            );
         };
-        Ok(cell
-            .get_or_init(|| {
-                #[cfg(test)]
-                {
-                    let mut counts = self
-                        .prepared_syntax_parse_counts
-                        .lock()
-                        .expect("prepared syntax parse count mutex poisoned");
-                    *counts.entry(key.clone()).or_default() += 1;
-                }
-                self.prepare_syntax_for_key(
-                    file,
-                    &key,
-                    origin,
-                    overlay_revision,
-                    resolved.snapshot.source(),
-                )
-            })
-            .clone())
+        cell.get_or_init(|| {
+            #[cfg(test)]
+            {
+                let mut counts = self
+                    .prepared_syntax_parse_counts
+                    .lock()
+                    .expect("prepared syntax parse count mutex poisoned");
+                *counts.entry(key.clone()).or_default() += 1;
+            }
+            self.prepare_syntax_for_key(
+                file,
+                &key,
+                origin,
+                overlay_revision,
+                resolved.snapshot.source(),
+            )
+        })
+        .clone()
     }
 
     fn prepare_syntax_for_key(
@@ -3221,20 +3373,84 @@ where
     ) -> Option<Arc<PreparedSyntaxTree>> {
         let file_state =
             self.fetch_file_state_for_key_with_source(file, key, Some(exact_source))?;
+        match self.prepare_syntax_from_source_cancellable(
+            file,
+            PreparedSyntaxSource::Indexed(file_state),
+            origin,
+            overlay_revision,
+            None,
+        ) {
+            PreparedSyntaxPreparation::Complete(prepared) => prepared,
+            PreparedSyntaxPreparation::Cancelled => unreachable!("no cancellation token supplied"),
+        }
+    }
+
+    fn prepare_exact_syntax_cancellable(
+        &self,
+        file: &ProjectFile,
+        origin: PreparedSourceOrigin,
+        overlay_revision: Option<OverlayRevision>,
+        exact_source: Arc<str>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PreparedSyntaxPreparation {
+        self.prepare_syntax_from_source_cancellable(
+            file,
+            PreparedSyntaxSource::Exact(exact_source),
+            origin,
+            overlay_revision,
+            cancellation,
+        )
+    }
+
+    fn prepare_syntax_from_source_cancellable(
+        &self,
+        file: &ProjectFile,
+        source: PreparedSyntaxSource,
+        origin: PreparedSourceOrigin,
+        overlay_revision: Option<OverlayRevision>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PreparedSyntaxPreparation {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PreparedSyntaxPreparation::Cancelled;
+        }
         let mut parser = Parser::new();
-        parser
+        if parser
             .set_language(&self.adapter.parser_language_for_file(file))
-            .ok()?;
-        let tree = parser.parse(file_state.source.as_str(), None)?;
-        let line_starts = compute_line_starts(&file_state.source);
-        Some(Arc::new(PreparedSyntaxTree {
-            file_state,
+            .is_err()
+        {
+            return PreparedSyntaxPreparation::Complete(None);
+        }
+        let exact_source = source.source();
+        let tree = if let Some(cancellation) = cancellation {
+            let mut read = |offset: usize, _| &exact_source.as_bytes()[offset..];
+            let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
+            parser.parse_with_options(
+                &mut read,
+                None,
+                Some(ParseOptions::new().progress_callback(&mut progress)),
+            )
+        } else {
+            parser.parse(exact_source, None)
+        };
+        let Some(tree) = tree else {
+            return if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                PreparedSyntaxPreparation::Cancelled
+            } else {
+                PreparedSyntaxPreparation::Complete(None)
+            };
+        };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PreparedSyntaxPreparation::Cancelled;
+        }
+        let line_starts = compute_line_starts(exact_source);
+        PreparedSyntaxPreparation::Complete(Some(Arc::new(PreparedSyntaxTree {
+            source,
             tree,
             line_starts,
             dialect: LanguageDialect::for_path(self.adapter.language(), file.rel_path()),
             origin,
             overlay_revision,
-        }))
+        })))
     }
 
     #[cfg(test)]
@@ -3997,14 +4213,26 @@ where
         }
 
         let snapshot = self.live_snapshot();
-        let dirty = self.state.dirty_snapshot();
+        if !continue_query() {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let dirty = self
+            .state
+            .dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned");
         let mut rows = Vec::new();
         let mut inspected = 0usize;
-        for (key, dirty) in dirty {
-            if !continue_query() {
+        for (key, dirty) in dirty.iter() {
+            // Scanning a dirty-state entry is real provider work even when the
+            // entry belongs to another language or no longer matches the live
+            // OID. Charge it so a small caller limit cannot hide an unbounded
+            // workspace-wide map walk.
+            if inspected == limit || !continue_query() {
                 return LimitedQueryRows::incomplete(rows, inspected);
             }
-            let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path);
+            inspected += 1;
+            let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
             if crate::analyzer::common::language_for_file(&file) != self.adapter.language()
                 || snapshot.validated_oid_for_path(&file) != Some(key.oid)
             {
@@ -4858,7 +5086,7 @@ where
                     ),
                 format!("querying bounded declarations by identifier `{identifier}`"),
             )
-            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
         self.finish_limited_declaration_lookup(
             persisted,
             true,
@@ -4888,7 +5116,7 @@ where
                     ),
                 format!("querying bounded non-module declarations by identifier `{identifier}`"),
             )
-            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
         self.finish_limited_declaration_lookup(
             persisted,
             true,
@@ -4982,7 +5210,7 @@ where
                     ),
                 format!("querying bounded declarations by persisted name `{lookup}`"),
             )
-            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
         self.finish_limited_declaration_lookup(
             persisted,
             false,
@@ -5091,7 +5319,7 @@ where
                     ),
                 format!("querying bounded members named `{name}` for `{owner_fqn}`"),
             )
-            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
         let exact_member = format!("{owner_fqn}.{name}");
         let exact = self.finish_limited_declaration_lookup(
             exact_persisted,
@@ -5124,7 +5352,7 @@ where
                     ),
                 format!("querying bounded normalized members named `{name}` for `{owner_fqn}`"),
             )
-            .unwrap_or_else(|| LimitedQueryRows::complete(Vec::new(), 0));
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
         let normalized_member = self
             .adapter
             .normalize_full_name(&format!("{owner_fqn}.{name}"));
@@ -5448,6 +5676,52 @@ where
             .and_then(|state| state.ruby_method_dispatch_modes.get(code_unit).copied())
     }
 
+    pub(crate) fn ruby_method_dispatch_modes_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<RubyMethodDispatchMode> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_value_for_unit(&state.ruby_method_dispatch_modes, code_unit)
+                    .map(std::slice::from_ref),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_value_for_unit(&state.ruby_method_dispatch_modes, code_unit)
+                    .map(std::slice::from_ref),
+                limit,
+            );
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context
+                .store
+                .ruby_method_dispatch_modes_for_unit_limited(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    code_unit,
+                    limit,
+                ),
+            format!(
+                "querying Ruby method dispatch mode for `{}`",
+                code_unit.fq_name()
+            ),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
+    }
+
     pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return Vec::new();
@@ -5609,6 +5883,50 @@ where
                 limit,
             ),
             format!("querying raw supertypes for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
+    }
+
+    pub(crate) fn supertype_lookup_paths_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.supertype_lookup_paths, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.supertype_lookup_paths, code_unit),
+                limit,
+            );
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context
+                .store
+                .supertype_lookup_paths_for_unit_limited(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    code_unit,
+                    limit,
+                ),
+            format!(
+                "querying structured supertype lookup paths for `{}`",
+                code_unit.fq_name()
+            ),
         )
         .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
@@ -7678,7 +7996,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_file_state_is_authoritative_for_symbol_reads() {
+    fn bounded_regression_dirty_file_state_is_authoritative_for_symbol_reads() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("pkg")).unwrap();
@@ -7761,6 +8079,23 @@ mod tests {
                 .iter()
                 .any(|unit| unit.is_module() && unit.fq_name() == "pkg.dirty"),
             "exact identifier candidates must retain non-persisted path modules"
+        );
+
+        let exhausted =
+            analyzer.lookup_non_module_declarations_by_identifier_limited("Dirty", 1, || true);
+        assert!(
+            !exhausted.complete && exhausted.rows.is_empty(),
+            "the dirty-state entry itself must consume bounded provider work before declarations"
+        );
+        let bounded =
+            analyzer.lookup_non_module_declarations_by_identifier_limited("Dirty", 64, || true);
+        assert!(bounded.complete);
+        assert!(
+            bounded
+                .rows
+                .iter()
+                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty"),
+            "a sufficient bounded lookup must retain dirty declarations"
         );
     }
 
@@ -8258,6 +8593,46 @@ mod tests {
     }
 
     #[test]
+    fn bounded_regression_stale_candidate_queries_never_report_complete_misses() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::write(root.join("Model.java"), "class Model { void work() {} }\n").unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        analyzer
+            .store_context
+            .store
+            .ensure_language_epoch_value("java", "cutover-before-bounded-candidate-read")
+            .unwrap();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&context);
+
+        let by_identifier =
+            analyzer.lookup_declarations_by_identifier_limited("Model", 16, || true);
+        let non_module =
+            analyzer.lookup_non_module_declarations_by_identifier_limited("Model", 16, || true);
+        let by_fqn =
+            analyzer.lookup_declarations_by_persisted_fqn_limited("Model", false, 16, || true);
+        let members = analyzer.lookup_members_for_owner_name_limited("Model", "work", 16, || true);
+
+        for batch in [by_identifier, non_module, by_fqn, members] {
+            assert!(
+                !batch.complete,
+                "a failed bounded store read must not become an authoritative miss"
+            );
+            assert!(batch.rows.is_empty());
+        }
+        assert!(
+            context
+                .store_error()
+                .expect("stale bounded reads should record their store error")
+                .to_string()
+                .contains("stale analyzer generation")
+        );
+        analyzer.end_query(&context);
+    }
+
+    #[test]
     fn shared_usage_indices_reuse_generation_allocations_and_reset_on_update() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -8409,6 +8784,7 @@ mod tests {
             },
             origin: PreparedSourceOrigin::Disk,
             overlay_revision: None,
+            flavor: PreparedSyntaxCacheFlavor::Indexed,
         };
         let second = PreparedSyntaxCacheKey {
             file_state: FileStateCacheKey {
@@ -8417,6 +8793,7 @@ mod tests {
             },
             origin: PreparedSourceOrigin::Disk,
             overlay_revision: None,
+            flavor: PreparedSyntaxCacheFlavor::Indexed,
         };
 
         let first_cell = cache
@@ -8655,6 +9032,77 @@ mod tests {
             .expect("bounded source should prepare");
         assert_eq!(prepared.source(), source);
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn cancelled_cold_overlay_syntax_does_not_hydrate_or_initialize_cache() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn disk() {}\n").expect("rust source");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let overlay = Arc::new(OverlayProject::new(base));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&overlay) as Arc<dyn Project>, RustAdapter);
+        let source = (0..20_000)
+            .map(|index| format!("fn target_{index}() {{}}\n"))
+            .collect::<String>();
+        assert!(overlay.set(file.abs_path(), source.clone()));
+        analyzer.reset_full_hydration_count_for_test();
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(6);
+
+        assert!(matches!(
+            analyzer.prepared_syntax_limited_cancellable(&file, source.len(), Some(&cancellation)),
+            PreparedSyntaxLimitedOutcome::Cancelled
+        ));
+        assert_eq!(
+            analyzer.prepared_syntax_parse_count_for_test(&file),
+            1,
+            "the cancellation should interrupt an admitted parse attempt"
+        );
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "bounded cancellation must not hydrate or analyze the cold overlay revision"
+        );
+
+        let prepared = analyzer.prepared_syntax_limited_cancellable(&file, source.len(), None);
+        let PreparedSyntaxLimitedOutcome::Available(prepared) = prepared else {
+            panic!("a later uncancelled request must retry instead of reading cached failure");
+        };
+        assert_eq!(prepared.source(), source);
+        assert_eq!(prepared.origin(), PreparedSourceOrigin::Overlay);
+        assert!(prepared.overlay_revision().is_some());
+        assert!(matches!(&prepared.source, PreparedSyntaxSource::Exact(_)));
+        assert_eq!(
+            analyzer.prepared_syntax_parse_count_for_test(&file),
+            2,
+            "cancelled preparation must not initialize the syntax cache"
+        );
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "successful bounded preparation must remain syntax-only"
+        );
+
+        let indexed = analyzer
+            .prepared_syntax(&file)
+            .expect("ordinary preparation should remain indexed");
+        assert_eq!(indexed.source(), source);
+        assert_eq!(indexed.origin(), prepared.origin());
+        assert_eq!(indexed.overlay_revision(), prepared.overlay_revision());
+        assert!(matches!(&indexed.source, PreparedSyntaxSource::Indexed(_)));
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            1,
+            "ordinary preparation must not reuse the syntax-only cache entry"
+        );
+        assert_eq!(
+            analyzer.prepared_syntax_parse_count_for_test(&file),
+            3,
+            "indexed and syntax-only cache entries are intentionally distinct"
+        );
     }
 
     #[test]

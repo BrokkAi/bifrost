@@ -1,7 +1,9 @@
+use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, DispatchExtensibility, GO_MODULE_SCOPE_SEGMENT, ImportInfo,
-    ParameterMetadata, ProjectFile, SignatureMetadata,
+    ParameterMetadata, ProjectFile, SignatureMetadata, StructuredImportPath,
+    StructuredImportPathKind, StructuredTypeIdentity, StructuredTypeName,
 };
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -138,7 +140,13 @@ fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
         is_wildcard: false,
         identifier,
         alias,
-        path: None,
+        path: Some(StructuredImportPath {
+            segments: vec![path],
+            kind: Some(StructuredImportPathKind::Namespace),
+            lexical_prefixes: Vec::new(),
+            lexical_scopes: Vec::new(),
+            declaration_start_byte: node.start_byte(),
+        }),
     })
 }
 
@@ -307,6 +315,21 @@ fn visit_go_type_spec(
     );
     parsed.add_signature(code_unit.clone(), go_type_signature(node, source));
     parsed.add_raw_supertypes(code_unit.clone(), go_embedded_type_texts(type_node, source));
+    for embedded in go_embedded_type_nodes(type_node) {
+        let label = go_node_text(embedded, source).trim().to_string();
+        let Some(identity) = go_embedded_type_identity(embedded, source) else {
+            continue;
+        };
+        let metadata =
+            SignatureMetadata::new(label, Vec::new()).with_return_type_identity(Some(identity));
+        let entries = parsed
+            .signature_metadata
+            .entry(code_unit.clone())
+            .or_default();
+        if !entries.contains(&metadata) {
+            entries.push(metadata);
+        }
+    }
 
     match type_node.kind() {
         "struct_type" => visit_go_struct_fields(
@@ -423,7 +446,10 @@ fn visit_go_struct_fields(
                     parsed.add_signature_with_metadata(
                         code_unit,
                         SignatureMetadata::new(type_text.clone(), Vec::new())
-                            .with_return_type_text(Some(type_text)),
+                            .with_return_type_text(Some(type_text))
+                            .with_return_type_identity(go_embedded_type_identity(
+                                type_node, source,
+                            )),
                     );
                 }
                 continue;
@@ -454,14 +480,17 @@ fn visit_go_struct_fields(
                         Some(parent.clone()),
                     );
                 }
-                let type_text = field
-                    .child_by_field_name("type")
+                let type_node = field.child_by_field_name("type");
+                let type_text = type_node
                     .map(|type_node| go_node_text(type_node, source).trim().to_string())
                     .filter(|type_text| !type_text.is_empty());
                 parsed.add_signature_with_metadata(
                     code_unit,
                     SignatureMetadata::new(format!("{field_name}{suffix}"), Vec::new())
-                        .with_return_type_text(type_text),
+                        .with_return_type_text(type_text)
+                        .with_return_type_identity(
+                            type_node.and_then(|node| go_structured_type_identity(node, source)),
+                        ),
                 );
                 if let Some(nested_type) = go_field_inline_container_type(field) {
                     let nested_has_source_range = record_ranges && index == 0;
@@ -710,8 +739,18 @@ fn go_signature_metadata(
     parameter_text: &str,
 ) -> SignatureMetadata {
     let enrich = |metadata: SignatureMetadata| {
+        let return_type = node
+            .child_by_field_name("result")
+            .filter(|result| result.kind() != "parameter_list");
+        let receiver_type = go_method_receiver_type_node(node);
         metadata
             .with_return_type_text(go_callable_return_type_text(node, source))
+            .with_return_type_identity(
+                return_type.and_then(|result| go_structured_type_identity(result, source)),
+            )
+            .with_extension_receiver_type_identity(
+                receiver_type.and_then(|receiver| go_structured_type_identity(receiver, source)),
+            )
             .with_dispatch_extensibility(if node.kind() == "method_elem" {
                 DispatchExtensibility::Open
             } else {
@@ -750,6 +789,19 @@ fn go_signature_metadata(
     enrich(SignatureMetadata::new(signature, parameters))
 }
 
+fn go_method_receiver_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let mut parameters = receiver
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "parameter_declaration");
+    let parameter = parameters.next()?;
+    if parameters.next().is_some() {
+        return None;
+    }
+    parameter.child_by_field_name("type")
+}
+
 fn go_callable_return_type_text(node: Node<'_>, source: &str) -> Option<String> {
     node.child_by_field_name("result")
         .filter(|result| result.kind() != "parameter_list")
@@ -757,8 +809,213 @@ fn go_callable_return_type_text(node: Node<'_>, source: &str) -> Option<String> 
         .filter(|result| !result.is_empty())
 }
 
+enum GoStructuredTypeFrame<'tree> {
+    Visit(Node<'tree>),
+    Pointer,
+    Array,
+    Slice,
+    Map,
+    Generic { argument_count: usize },
+}
+
+/// Preserve the parser-proven shape of a Go type without asking bounded
+/// consumers to reconstruct it from the rendered declaration signature.
+///
+/// This is deliberately iterative: source can contain arbitrarily nested
+/// pointer, container and generic wrappers, and indexing such a file must not
+/// consume the Rust call stack.
+pub(crate) fn go_structured_type_identity(
+    node: Node<'_>,
+    source: &str,
+) -> Option<StructuredTypeIdentity> {
+    go_structured_type_identity_with(node, source, || true)
+}
+
+pub(crate) fn go_structured_type_identity_bounded(
+    node: Node<'_>,
+    source: &str,
+    visit: impl FnMut() -> bool,
+) -> Option<StructuredTypeIdentity> {
+    go_structured_type_identity_with(node, source, visit)
+}
+
+fn go_structured_type_identity_with(
+    node: Node<'_>,
+    source: &str,
+    mut visit: impl FnMut() -> bool,
+) -> Option<StructuredTypeIdentity> {
+    let mut frames = vec![GoStructuredTypeFrame::Visit(node)];
+    let mut values = Vec::new();
+    let mut builder = StructuredTypeIdentityBuilder::default();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            GoStructuredTypeFrame::Visit(node) => {
+                if !visit() {
+                    return None;
+                }
+                match node.kind() {
+                    "type_identifier" | "identifier" => {
+                        let name = go_node_text(node, source).trim();
+                        values.push(builder.named(StructuredTypeName::new(
+                            vec![name.to_string()],
+                            Vec::new(),
+                            false,
+                        )?)?);
+                    }
+                    "qualified_type" => {
+                        let package = node.child_by_field_name("package")?;
+                        let name = node.child_by_field_name("name")?;
+                        let package = go_node_text(package, source).trim();
+                        let name = go_node_text(name, source).trim();
+                        values.push(builder.named(StructuredTypeName::new(
+                            vec![package.to_string(), name.to_string()],
+                            Vec::new(),
+                            false,
+                        )?)?);
+                    }
+                    "pointer_type" => {
+                        frames.push(GoStructuredTypeFrame::Pointer);
+                        frames.push(GoStructuredTypeFrame::Visit(go_type_wrapper_child(node)?));
+                    }
+                    "array_type" | "implicit_length_array_type" => {
+                        frames.push(GoStructuredTypeFrame::Array);
+                        frames.push(GoStructuredTypeFrame::Visit(
+                            node.child_by_field_name("element")
+                                .or_else(|| go_last_named_type_child(node))?,
+                        ));
+                    }
+                    "slice_type" => {
+                        frames.push(GoStructuredTypeFrame::Slice);
+                        frames.push(GoStructuredTypeFrame::Visit(
+                            node.child_by_field_name("element")
+                                .or_else(|| go_last_named_type_child(node))?,
+                        ));
+                    }
+                    "map_type" => {
+                        let key = node.child_by_field_name("key")?;
+                        let value = node.child_by_field_name("value")?;
+                        frames.push(GoStructuredTypeFrame::Map);
+                        frames.push(GoStructuredTypeFrame::Visit(value));
+                        frames.push(GoStructuredTypeFrame::Visit(key));
+                    }
+                    "generic_type" => {
+                        let base = node
+                            .child_by_field_name("type")
+                            .or_else(|| node.child_by_field_name("name"))
+                            .or_else(|| node.named_child(0))?;
+                        let arguments =
+                            node.child_by_field_name("type_arguments").or_else(|| {
+                                let mut cursor = node.walk();
+                                node.named_children(&mut cursor)
+                                    .find(|child| child.kind() == "type_arguments")
+                            })?;
+                        let mut argument_nodes = Vec::new();
+                        let mut cursor = arguments.walk();
+                        for argument in arguments.named_children(&mut cursor) {
+                            argument_nodes.push(argument);
+                        }
+                        frames.push(GoStructuredTypeFrame::Generic {
+                            argument_count: argument_nodes.len(),
+                        });
+                        for argument in argument_nodes.into_iter().rev() {
+                            frames.push(GoStructuredTypeFrame::Visit(argument));
+                        }
+                        frames.push(GoStructuredTypeFrame::Visit(base));
+                    }
+                    "parenthesized_type" | "negated_type" => {
+                        frames.push(GoStructuredTypeFrame::Visit(go_type_wrapper_child(node)?));
+                    }
+                    "type_elem" => {
+                        let mut cursor = node.walk();
+                        let mut children = node.named_children(&mut cursor);
+                        let child = children.next()?;
+                        if children.next().is_some() {
+                            return None;
+                        }
+                        frames.push(GoStructuredTypeFrame::Visit(child));
+                    }
+                    _ => return None,
+                }
+            }
+            GoStructuredTypeFrame::Pointer => {
+                let inner = values.pop()?;
+                values.push(builder.pointer(inner)?);
+            }
+            GoStructuredTypeFrame::Array => {
+                let inner = values.pop()?;
+                values.push(builder.array(inner)?);
+            }
+            GoStructuredTypeFrame::Slice => {
+                let inner = values.pop()?;
+                values.push(builder.slice(inner)?);
+            }
+            GoStructuredTypeFrame::Map => {
+                let value = values.pop()?;
+                let key = values.pop()?;
+                values.push(builder.map(key, value)?);
+            }
+            GoStructuredTypeFrame::Generic { argument_count } => {
+                if values.len() < argument_count + 1 {
+                    return None;
+                }
+                let arguments = values.split_off(values.len() - argument_count);
+                let base = values.pop()?;
+                values.push(builder.generic(base, arguments)?);
+            }
+        }
+    }
+
+    (values.len() == 1)
+        .then(|| values.pop())
+        .flatten()
+        .and_then(|root| builder.finish(root))
+}
+
+fn go_type_wrapper_child(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("type").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).next()
+    })
+}
+
+fn go_last_named_type_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).last()
+}
+
 fn go_embedded_type_texts(node: Node<'_>, source: &str) -> Vec<String> {
-    let candidates = match node.kind() {
+    let mut embedded = go_embedded_type_nodes(node)
+        .into_iter()
+        .map(|candidate| go_node_text(candidate, source).trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+        .collect::<Vec<_>>();
+    embedded.sort();
+    embedded.dedup();
+    embedded
+}
+
+fn go_embedded_type_identity(type_node: Node<'_>, source: &str) -> Option<StructuredTypeIdentity> {
+    let mut identity = go_structured_type_identity(type_node, source)?;
+    let Some(field) = type_node
+        .parent()
+        .filter(|parent| parent.kind() == "field_declaration")
+    else {
+        return Some(identity);
+    };
+    let pointer = (0..field.child_count()).any(|index| {
+        field
+            .child(index)
+            .is_some_and(|child| !child.is_named() && child.kind() == "*")
+    });
+    if pointer {
+        identity = identity.wrap_pointer()?;
+    }
+    Some(identity)
+}
+
+fn go_embedded_type_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
         "struct_type" => {
             let Some(fields) = named_children_of_kind(node, "field_declaration_list")
                 .into_iter()
@@ -783,15 +1040,7 @@ fn go_embedded_type_texts(node: Node<'_>, source: &str) -> Vec<String> {
             })
             .collect(),
         _ => Vec::new(),
-    };
-    let mut embedded = candidates
-        .into_iter()
-        .map(|candidate| go_node_text(candidate, source).trim().to_string())
-        .filter(|candidate| !candidate.is_empty())
-        .collect::<Vec<_>>();
-    embedded.sort();
-    embedded.dedup();
-    embedded
+    }
 }
 
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {

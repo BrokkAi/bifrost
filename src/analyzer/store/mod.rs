@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bincode::Options;
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{
@@ -19,6 +20,7 @@ use rusqlite::{
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
+use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, Range,
@@ -1603,6 +1605,42 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// Read at most `limit` Ruby dispatch-mode rows for one persisted code
+    /// unit without hydrating the owning file state.
+    pub(crate) fn ruby_method_dispatch_modes_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<RubyMethodDispatchMode>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = ruby_method_dispatch_modes_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Read at most `limit` direct declaration children for one persisted
+    /// code unit without hydrating the owning file state.
+    pub(crate) fn direct_children_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<CandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = direct_children_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn raw_supertypes_for_unit_limited(
         &self,
         oid: Oid,
@@ -1615,6 +1653,22 @@ impl AnalyzerStore {
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let result = raw_supertypes_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn supertype_lookup_paths_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<String>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = supertype_lookup_paths_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
         tx.commit()?;
         Ok(result)
     }
@@ -3142,7 +3196,8 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             continue;
         };
         for (ordinal, metadata) in entries.iter().enumerate() {
-            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, serialize_blob(metadata)?));
+            let metadata = serialize_signature_metadata_blob(metadata)?;
+            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, metadata));
         }
     }
     let mut cpp_template_metadata = Vec::new();
@@ -3742,13 +3797,8 @@ fn insert_unit_signature_metadata(
             continue;
         };
         for (ordinal, entry) in entries.iter().enumerate() {
-            stmt.execute(params![
-                oid,
-                lang,
-                unit_key,
-                usize_to_i64(ordinal)?,
-                serialize_blob(entry)?,
-            ])?;
+            let entry = serialize_signature_metadata_blob(entry)?;
+            stmt.execute(params![oid, lang, unit_key, usize_to_i64(ordinal)?, entry,])?;
             count += 1;
         }
     }
@@ -4886,7 +4936,14 @@ fn read_signature_metadata_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, metadata FROM unit_signature_metadata
+            "SELECT blob_oid,
+                    unit_key,
+                    CASE
+                        WHEN length(metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
+                        THEN metadata
+                        ELSE NULL
+                    END
+             FROM unit_signature_metadata
              WHERE lang = ? AND blob_oid IN ({placeholders})
              ORDER BY blob_oid, unit_key, ordinal"
         );
@@ -4896,12 +4953,14 @@ fn read_signature_metadata_bulk(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
             ))
         })?;
         for row in rows {
             let (oid, key, value) = row?;
-            out.entry(oid).or_default().push((key, value));
+            if let Some(value) = value {
+                out.entry(oid).or_default().push((key, value));
+            }
         }
     }
     Ok(out)
@@ -5094,7 +5153,7 @@ fn signature_metadata_map_for_file(
         if let Some(unit) = by_key.get(key) {
             out.entry(unit.unit.clone())
                 .or_default()
-                .push(deserialize_blob(value)?);
+                .push(deserialize_signature_metadata_blob(value)?);
         }
     }
     Ok(out)
@@ -5315,9 +5374,20 @@ where
 }
 
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
+    let metadata_len = row.get::<_, Option<i64>>(13)?;
+    if metadata_len
+        .map(i64_to_usize)
+        .transpose()
+        .map_err(rusqlite_error_from_store)?
+        .is_some_and(|len| len > MAX_SIGNATURE_METADATA_BLOB_BYTES)
+    {
+        return Err(rusqlite_error_from_store(StoreError::new(format!(
+            "signature metadata blob exceeds the {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
+        ))));
+    }
     let metadata = row
-        .get::<_, Option<Vec<u8>>>(13)?
-        .map(|bytes| deserialize_blob(&bytes).map_err(rusqlite_error_from_store))
+        .get::<_, Option<Vec<u8>>>(14)?
+        .map(|bytes| deserialize_signature_metadata_blob(&bytes).map_err(rusqlite_error_from_store))
         .transpose()?;
     Ok(UsageFactRow {
         candidate: candidate_row_from_row(row)?,
@@ -5417,7 +5487,13 @@ fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<Usa
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, signature.text, metadata.metadata
+                units.in_definition_lookup, signature.text,
+                length(metadata.metadata),
+                CASE
+                    WHEN length(metadata.metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
+                    THEN metadata.metadata
+                    ELSE NULL
+                END
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -5740,23 +5816,93 @@ fn read_signature_metadata(
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<SignatureMetadata>>> {
     let mut stmt = conn.prepare(
-        "SELECT unit_key, metadata FROM unit_signature_metadata
+        "SELECT unit_key,
+                CASE
+                    WHEN length(metadata) <= ?3 THEN metadata
+                    ELSE NULL
+                END
+         FROM unit_signature_metadata
          WHERE blob_oid = ?1 AND lang = ?2
          ORDER BY unit_key, ordinal",
     )?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
+    let rows = stmt.query_map(
+        params![oid, lang, usize_to_i64(MAX_SIGNATURE_METADATA_BLOB_BYTES)?],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+    )?;
     let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
     for row in rows {
         let (key, metadata) = row?;
+        let Some(metadata) = metadata else {
+            continue;
+        };
         if let Some(unit) = by_key.get(&key) {
             out.entry(unit.unit.clone())
                 .or_default()
-                .push(deserialize_blob(&metadata)?);
+                .push(deserialize_signature_metadata_blob(&metadata)?);
         }
     }
     Ok(out)
+}
+
+fn direct_children_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<CandidateRow>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = candidate_rows_sql_with_membership(
+        "child",
+        "FROM code_units AS owner
+         JOIN unit_children AS edge
+           ON edge.blob_oid = owner.blob_oid
+          AND edge.lang = owner.lang
+          AND edge.parent_key = owner.unit_key
+         JOIN code_units AS child
+           ON child.blob_oid = edge.blob_oid
+          AND child.lang = edge.lang
+          AND child.unit_key = edge.child_key
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = child.blob_oid
+          AND meta.lang = child.lang",
+        "owner.blob_oid = ?1
+         AND owner.lang = ?2
+         AND (owner.exact_fqn = ?3 OR owner.exact_fqn IS NULL)
+         AND owner.kind = ?4
+         AND owner.short_name = ?5
+         AND owner.signature IS ?6
+         AND owner.synthetic = ?7",
+        "owner.in_declarations = 1 AND child.in_declarations = 1",
+        "edge.ordinal, child.unit_key",
+    );
+    let sql = format!("{sql} LIMIT ?8");
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let rows = collect_candidate_rows(statement.query_map(
+        params![
+            oid,
+            lang,
+            unit.fq_name(),
+            kind,
+            unit.short_name(),
+            unit.signature(),
+            synthetic,
+            sql_limit,
+        ],
+        candidate_row_from_row,
+    )?)?;
+    let inspected = rows.len();
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
 }
 
 fn signature_metadata_for_unit_limited_conn(
@@ -5770,7 +5916,11 @@ fn signature_metadata_for_unit_limited_conn(
         return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
     }
     let sql = format!(
-        "SELECT metadata.metadata
+        "SELECT length(metadata.metadata),
+                CASE
+                    WHEN length(metadata.metadata) <= ?9 THEN metadata.metadata
+                    ELSE NULL
+                END
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -5780,7 +5930,7 @@ fn signature_metadata_for_unit_limited_conn(
           AND metadata.unit_key = units.unit_key
          WHERE units.blob_oid = ?1
            AND units.lang = ?2
-           AND units.exact_fqn = ?3
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
            AND units.signature IS ?6
@@ -5804,12 +5954,82 @@ fn signature_metadata_for_unit_limited_conn(
             unit.signature(),
             synthetic,
             sql_limit,
+            usize_to_i64(MAX_SIGNATURE_METADATA_BLOB_BYTES)?,
         ],
-        |row| row.get::<_, Vec<u8>>(0),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
     )?;
     let mut rows = Vec::new();
-    for bytes in mapped {
-        rows.push(deserialize_blob(&bytes?)?);
+    let mut inspected = 0usize;
+    for row in mapped {
+        inspected = inspected.saturating_add(1);
+        let (byte_len, bytes) = row?;
+        if i64_to_usize(byte_len)? > MAX_SIGNATURE_METADATA_BLOB_BYTES {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        }
+        let Some(bytes) = bytes else {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        };
+        rows.push(deserialize_signature_metadata_blob(&bytes)?);
+    }
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
+}
+
+fn ruby_method_dispatch_modes_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<RubyMethodDispatchMode>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT modes.mode
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN ruby_method_dispatch_modes AS modes
+           ON modes.blob_oid = units.blob_oid
+          AND modes.lang = units.lang
+          AND modes.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.unit_key
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mapped = statement.query_map(
+        params![
+            oid,
+            lang,
+            unit.fq_name(),
+            kind,
+            unit.short_name(),
+            unit.signature(),
+            synthetic,
+            sql_limit,
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut rows = Vec::new();
+    for raw_mode in mapped {
+        rows.push(ruby_dispatch_mode_from_i64(raw_mode?)?);
     }
     let inspected = rows.len();
     if inspected == limit {
@@ -5840,7 +6060,65 @@ fn raw_supertypes_for_unit_limited_conn(
           AND supertypes.unit_key = units.unit_key
          WHERE units.blob_oid = ?1
            AND units.lang = ?2
-           AND units.exact_fqn = ?3
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY supertypes.ordinal
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let rows = statement
+        .query_map(
+            params![
+                oid,
+                lang,
+                unit.fq_name(),
+                kind,
+                unit.short_name(),
+                unit.signature(),
+                synthetic,
+                sql_limit,
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let inspected = rows.len();
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
+}
+
+fn supertype_lookup_paths_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<String>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT supertypes.lookup_path
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_supertypes AS supertypes
+           ON supertypes.blob_oid = units.blob_oid
+          AND supertypes.lang = units.lang
+          AND supertypes.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
            AND units.signature IS ?6
@@ -5922,7 +6200,7 @@ fn ranges_for_unit_limited_conn(
           AND ranges.unit_key = units.unit_key
          WHERE units.blob_oid = ?1
            AND units.lang = ?2
-           AND units.exact_fqn = ?3
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
            AND units.signature IS ?6
@@ -6567,6 +6845,38 @@ fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|err| StoreError::new(format!("analyzer store serialization error: {err}")))
 }
 
+fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {
+    let serialized_size = usize::try_from(bincode::serialized_size(value).map_err(|err| {
+        StoreError::new(format!("analyzer store serialization size error: {err}"))
+    })?)
+    .map_err(|_| StoreError::new("signature metadata size does not fit in usize"))?;
+    if serialized_size > MAX_SIGNATURE_METADATA_BLOB_BYTES {
+        return Err(StoreError::new(format!(
+            "signature metadata blob requires {serialized_size} bytes, exceeding the \
+             {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
+        )));
+    }
+    let bytes = serialize_blob(value)?;
+    debug_assert_eq!(bytes.len(), serialized_size);
+    Ok(bytes)
+}
+
+fn deserialize_signature_metadata_blob(bytes: &[u8]) -> Result<SignatureMetadata> {
+    if bytes.len() > MAX_SIGNATURE_METADATA_BLOB_BYTES {
+        return Err(StoreError::new(format!(
+            "signature metadata blob exceeds the {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
+        )));
+    }
+    let byte_limit = u64::try_from(bytes.len())
+        .map_err(|_| StoreError::new("signature metadata blob length does not fit in u64"))?;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(byte_limit)
+        .deserialize(bytes)
+        .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
+}
+
 fn deserialize_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     bincode::deserialize(bytes)
         .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
@@ -6646,6 +6956,209 @@ mod tests {
     use crate::gitblob::tests::{commit_all, init_repo};
     use git2::ObjectType;
     use tree_sitter::Parser;
+
+    #[test]
+    fn signature_metadata_blob_admission_has_a_fixed_byte_cap() {
+        let ordinary = SignatureMetadata::new("fn make() -> Service", Vec::new());
+        assert!(
+            !serialize_signature_metadata_blob(&ordinary)
+                .expect("serialize ordinary metadata")
+                .is_empty()
+        );
+
+        let oversized =
+            SignatureMetadata::new("x".repeat(MAX_SIGNATURE_METADATA_BLOB_BYTES), Vec::new());
+        assert!(
+            serialize_signature_metadata_blob(&oversized)
+                .expect_err("oversized metadata must fail before allocation")
+                .to_string()
+                .contains("exceeding"),
+            "oversized signature metadata must fail the non-allocating size preflight"
+        );
+    }
+
+    #[test]
+    fn bounded_regression_oversized_signature_metadata_cannot_publish_a_complete_blob() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "factory.rb",
+            "class Factory\n  def make(value)\n    value\n  end\nend\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let mut state = parse_state(&RubyAdapter, &file);
+        let target = state
+            .signature_metadata
+            .keys()
+            .next()
+            .cloned()
+            .expect("fixture should produce signature metadata");
+        state.signature_metadata.insert(
+            target,
+            vec![SignatureMetadata::new(
+                "x".repeat(MAX_SIGNATURE_METADATA_BLOB_BYTES),
+                Vec::new(),
+            )],
+        );
+        let state = Arc::new(state);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("ruby", "oversized-signature-metadata-write-v1")
+            .unwrap();
+
+        let prepare_error = AnalyzerStore::prepare_parsed_blob(
+            oid,
+            "ruby",
+            generation,
+            &RubyAdapter,
+            Arc::clone(&state),
+        )
+        .expect_err("preparation must reject oversized signature metadata");
+        assert!(prepare_error.to_string().contains("exceeding"));
+
+        let write_error = store
+            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, state.as_ref())
+            .expect_err("direct persistence must reject oversized signature metadata");
+        assert!(write_error.to_string().contains("exceeding"));
+        assert!(
+            !store
+                .contains_parsed_blob_at_generation(oid, "ruby", generation)
+                .unwrap(),
+            "a rejected metadata row must roll back instead of publishing a complete omission"
+        );
+    }
+
+    #[test]
+    fn resource_bound_oversized_current_epoch_signature_metadata_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "factory.rb",
+            "class Service\nend\nclass Factory\n  def make(value)\n    Service.new\n  end\nend\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let state = parse_state(&RubyAdapter, &file);
+        let target = state
+            .signature_metadata
+            .iter()
+            .find(|(_, metadata)| !metadata.is_empty())
+            .map(|(unit, _)| unit.clone())
+            .expect("fixture should produce signature metadata");
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("ruby", "oversized-signature-metadata-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .unwrap();
+
+        let oversized_len = MAX_SIGNATURE_METADATA_BLOB_BYTES + 1;
+        {
+            let conn = store.conn.lock().unwrap();
+            let unit_key: i64 = conn
+                .query_row(
+                    "SELECT metadata.unit_key
+                     FROM unit_signature_metadata AS metadata
+                     JOIN code_units AS units
+                       ON units.blob_oid = metadata.blob_oid
+                      AND units.lang = metadata.lang
+                     AND units.unit_key = metadata.unit_key
+                     WHERE units.blob_oid = ?1
+                       AND units.lang = 'ruby'
+                       AND units.exact_fqn = ?2
+                       AND units.kind = ?3
+                       AND units.short_name = ?4
+                       AND units.signature IS ?5
+                       AND units.synthetic = ?6
+                     ORDER BY metadata.ordinal
+                     LIMIT 1",
+                    params![
+                        oid.to_string(),
+                        target.fq_name(),
+                        code_unit_kind_to_i64(target.kind()),
+                        target.short_name(),
+                        target.signature(),
+                        bool_to_i64(target.is_synthetic()),
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE unit_signature_metadata
+                     SET metadata = zeroblob(?3)
+                     WHERE blob_oid = ?1
+                       AND lang = 'ruby'
+                       AND unit_key = ?2
+                       AND ordinal = 0",
+                    params![
+                        oid.to_string(),
+                        unit_key,
+                        i64::try_from(oversized_len).unwrap()
+                    ],
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT length(metadata)
+                     FROM unit_signature_metadata
+                     WHERE blob_oid = ?1
+                       AND lang = 'ruby'
+                       AND unit_key = ?2
+                       AND ordinal = 0",
+                    params![oid.to_string(), unit_key],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+                oversized_len
+            );
+        }
+
+        assert!(
+            store
+                .usage_fact_rows_by_lang("ruby")
+                .unwrap_err()
+                .to_string()
+                .contains("signature metadata blob exceeds"),
+            "usage-fact projection must reject the oversized row without materializing it"
+        );
+        assert!(
+            store
+                .hydrate_file_state_with_source(
+                    oid,
+                    "ruby",
+                    generation,
+                    &RubyAdapter,
+                    &file,
+                    &source,
+                )
+                .unwrap()
+                .is_none(),
+            "full hydration must skip the oversized row and fail its side-table count"
+        );
+        assert!(
+            !store
+                .hydrate_file_states(
+                    &[(file.clone(), oid)],
+                    "ruby",
+                    &RubyAdapter,
+                    &HashMap::from_iter([(file.clone(), source)]),
+                )
+                .unwrap()
+                .contains_key(&file),
+            "bulk hydration must skip the oversized row and fail its side-table count"
+        );
+        let limited = store
+            .signature_metadata_for_unit_limited(oid, "ruby", generation, &target, usize::MAX)
+            .unwrap();
+        assert!(!limited.complete);
+        assert!(limited.rows.is_empty());
+        assert_eq!(limited.inspected, 1);
+    }
 
     #[test]
     fn non_git_root_uses_in_memory_store_and_roundtrips_registry() {

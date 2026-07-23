@@ -1,5 +1,7 @@
+use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
+    CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
+    Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
@@ -441,7 +443,8 @@ impl<'a> ScalaVisitor<'a> {
             let signature = scala_primary_constructor_signature(node, self.source);
             self.parsed.add_signature_with_metadata(
                 constructor,
-                scala_class_signature_metadata(signature, node, self.source),
+                scala_class_signature_metadata(signature, node, self.source)
+                    .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
             self.visit_class_parameter_fields(node, package_name, &code_unit);
         }
@@ -667,7 +670,7 @@ impl<'a> ScalaVisitor<'a> {
     }
 
     fn visit_function(&mut self, node: Node<'_>, package_name: &str, parent: Option<CodeUnit>) {
-        self.visit_function_with_signature(node, package_name, parent, None);
+        self.visit_function_with_signature(node, package_name, parent, None, None);
     }
 
     fn visit_extension_function(
@@ -677,6 +680,7 @@ impl<'a> ScalaVisitor<'a> {
         package_name: &str,
         parent: Option<CodeUnit>,
     ) {
+        let receiver_type = scala_extension_receiver_type_node(receiver_parameters);
         self.visit_function_with_signature(
             node,
             package_name,
@@ -686,6 +690,7 @@ impl<'a> ScalaVisitor<'a> {
                 receiver_parameters,
                 self.source,
             )),
+            receiver_type,
         );
     }
 
@@ -695,6 +700,7 @@ impl<'a> ScalaVisitor<'a> {
         package_name: &str,
         parent: Option<CodeUnit>,
         signature: Option<String>,
+        extension_receiver_type: Option<Node<'_>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -724,13 +730,24 @@ impl<'a> ScalaVisitor<'a> {
             package_name.to_string(),
             short_name,
         );
+        let dispatch_extensibility =
+            scala_callable_dispatch_extensibility(parent.as_ref(), raw_name);
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
         let signature = signature.unwrap_or_else(|| scala_function_signature(node, self.source));
-        self.parsed.add_signature_with_metadata(
-            code_unit,
-            scala_function_signature_metadata(signature, node, self.source),
-        );
+        let metadata =
+            scala_function_signature_metadata(signature, node, self.source, dispatch_extensibility)
+                .with_extension_receiver_type(extension_receiver_type.map(|receiver_type| {
+                    scala_node_text(receiver_type, self.source)
+                        .trim()
+                        .to_string()
+                }))
+                .with_extension_receiver_type_identity(extension_receiver_type.and_then(
+                    |receiver_type| {
+                        scala_structured_type_identity(receiver_type, self.source, node)
+                    },
+                ));
+        self.parsed.add_signature_with_metadata(code_unit, metadata);
     }
 
     fn visit_field_declaration(
@@ -992,10 +1009,24 @@ fn scala_extension_function_signature(
     )
 }
 
+fn scala_extension_receiver_type_node(receiver_parameters: Option<Node<'_>>) -> Option<Node<'_>> {
+    let receiver_parameters = receiver_parameters?;
+    let mut cursor = receiver_parameters.walk();
+    let mut receivers = receiver_parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"));
+    let receiver = receivers.next()?;
+    if receivers.next().is_some() {
+        return None;
+    }
+    receiver.child_by_field_name("type")
+}
+
 fn scala_function_signature_metadata(
     signature: String,
     node: Node<'_>,
     source: &str,
+    dispatch_extensibility: DispatchExtensibility,
 ) -> SignatureMetadata {
     let mut parameter_nodes = Vec::new();
     let mut cursor = node.walk();
@@ -1004,7 +1035,235 @@ fn scala_function_signature_metadata(
             parameter_nodes.push(child);
         }
     }
+    let return_type = node
+        .child_by_field_name("return_type")
+        .map(|return_type| scala_node_text(return_type, source).trim().to_string());
+    let type_parameters = scala_callable_type_parameters(node, source);
+    let return_type_identity = node
+        .child_by_field_name("return_type")
+        .and_then(|return_type| scala_structured_type_identity(return_type, source, node));
+    let bare_return_type_parameter = return_type_identity
+        .as_ref()
+        .and_then(StructuredTypeIdentity::nominal_name)
+        .filter(|name| {
+            name.path().len() == 1
+                && type_parameters
+                    .iter()
+                    .any(|parameter| parameter == &name.path()[0])
+        })
+        .map(|name| name.path()[0].clone());
     scala_signature_metadata_for_parameter_nodes(signature, &parameter_nodes, source)
+        .with_return_type_text(return_type)
+        .with_return_type_identity(return_type_identity)
+        .with_type_parameters(type_parameters)
+        .with_bare_return_type_parameter(bare_return_type_parameter)
+        .with_dispatch_extensibility(dispatch_extensibility)
+}
+
+enum ScalaStructuredTypeFrame<'tree> {
+    Visit(Node<'tree>),
+    Generic { argument_count: usize },
+}
+
+/// Preserve the parser-proven nominal shape of a Scala callable return type.
+///
+/// The flat builder keeps indexing stack-safe for deeply nested generic types.
+/// Types whose nominal receiver identity depends on a value path, wildcard,
+/// refinement, match, function, tuple or infix interpretation are deliberately
+/// left unmodelled so bounded consumers cannot promote them to precision.
+fn scala_structured_type_identity(
+    node: Node<'_>,
+    source: &str,
+    callable: Node<'_>,
+) -> Option<StructuredTypeIdentity> {
+    let lexical_scope = scala_callable_lexical_scope(callable, source)?;
+    let mut frames = vec![ScalaStructuredTypeFrame::Visit(node)];
+    let mut values = Vec::new();
+    let mut builder = StructuredTypeIdentityBuilder::default();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ScalaStructuredTypeFrame::Visit(current) => match current.kind() {
+                "type_identifier" | "stable_type_identifier" => {
+                    values.push(builder.named(scala_structured_named_type(
+                        current,
+                        source,
+                        &lexical_scope,
+                    )?)?);
+                }
+                "generic_type" => {
+                    let base = current.child_by_field_name("type")?;
+                    let arguments = current.child_by_field_name("type_arguments")?;
+                    let mut cursor = arguments.walk();
+                    let argument_nodes = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+                    if argument_nodes.is_empty() {
+                        return None;
+                    }
+                    frames.push(ScalaStructuredTypeFrame::Generic {
+                        argument_count: argument_nodes.len(),
+                    });
+                    frames.extend(
+                        argument_nodes
+                            .into_iter()
+                            .rev()
+                            .map(ScalaStructuredTypeFrame::Visit),
+                    );
+                    frames.push(ScalaStructuredTypeFrame::Visit(base));
+                }
+                // An annotation does not change the nominal receiver type.
+                "annotated_type" => {
+                    let mut cursor = current.walk();
+                    let mut types = current
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() != "annotation");
+                    let base = types.next()?;
+                    if types.next().is_some() {
+                        return None;
+                    }
+                    frames.push(ScalaStructuredTypeFrame::Visit(base));
+                }
+                _ => return None,
+            },
+            ScalaStructuredTypeFrame::Generic { argument_count } => {
+                let value_count = argument_count.checked_add(1)?;
+                let start = values.len().checked_sub(value_count)?;
+                let mut built = values.split_off(start);
+                let base = built.remove(0);
+                values.push(builder.generic(base, built)?);
+            }
+        }
+    }
+
+    (values.len() == 1)
+        .then(|| values.pop())
+        .flatten()
+        .and_then(|root| builder.finish(root))
+}
+
+fn scala_structured_named_type(
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeName> {
+    let mut path = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                let segment = scala_node_text(current, source).trim();
+                if segment.is_empty() {
+                    return None;
+                }
+                path.push(segment.to_string());
+            }
+            "stable_identifier" | "stable_type_identifier" => {
+                let mut cursor = current.walk();
+                let mut children = current.named_children(&mut cursor).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
+            _ => return None,
+        }
+    }
+    let absolute = path.first().is_some_and(|segment| segment == "_root_");
+    if absolute {
+        path.remove(0);
+    }
+    StructuredTypeName::new(path, lexical_scope.to_vec(), absolute)
+}
+
+fn scala_callable_lexical_scope(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut scope = Vec::new();
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "class_definition"
+                | "object_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "full_enum_case"
+        ) {
+            let name = ancestor
+                .child_by_field_name("name")
+                .filter(|name| name.parent() == Some(ancestor))
+                .or_else(|| scala_type_declaration_name_node(ancestor))?;
+            let name = scala_node_text(name, source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            scope.push(if ancestor.kind() == "object_definition" {
+                format!("{name}$")
+            } else {
+                name.to_string()
+            });
+        }
+        current = ancestor.parent();
+    }
+    scope.reverse();
+    Some(scope)
+}
+
+fn scala_callable_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut parameters = Vec::new();
+    let mut current = Some(node);
+    while let Some(scope) = current {
+        if matches!(
+            scope.kind(),
+            "function_definition"
+                | "function_declaration"
+                | "extension_definition"
+                | "class_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "full_enum_case"
+        ) {
+            let mut cursor = scope.walk();
+            for type_parameters in scope
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "type_parameters")
+            {
+                let mut stack = vec![type_parameters];
+                while let Some(current) = stack.pop() {
+                    let mut name_cursor = current.walk();
+                    for name in current.children_by_field_name("name", &mut name_cursor) {
+                        let name = scala_node_text(name, source).trim();
+                        if name != "_" && !name.is_empty() {
+                            parameters.push(name.to_string());
+                        }
+                    }
+                    let mut child_cursor = current.walk();
+                    stack.extend(current.named_children(&mut child_cursor).filter(|child| {
+                        matches!(
+                            child.kind(),
+                            "covariant_type_parameter"
+                                | "contravariant_type_parameter"
+                                | "type_parameters"
+                                | "type_lambda"
+                        )
+                    }));
+                }
+            }
+        }
+        current = scope.parent();
+    }
+    parameters.sort();
+    parameters.dedup();
+    parameters
+}
+
+fn scala_callable_dispatch_extensibility(
+    parent: Option<&CodeUnit>,
+    raw_name: &str,
+) -> DispatchExtensibility {
+    if raw_name == "this"
+        || parent.is_none()
+        || parent.is_some_and(|owner| owner.short_name().ends_with('$'))
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    }
 }
 
 fn scala_signature_metadata_for_parameter_nodes(

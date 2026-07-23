@@ -10,14 +10,25 @@ use crate::path_utils::rel_path_string;
 use std::sync::Arc;
 use tree_sitter::Tree;
 
+mod cpp;
 mod csharp;
 mod go;
 pub(crate) mod java;
 mod js_ts;
+mod php;
+mod python;
+mod ruby;
 mod rust;
 mod scala;
 
+pub(crate) use cpp::resolve_cpp_type_bounded;
 pub(crate) use csharp::resolve_csharp_type_bounded;
+pub(crate) use go::resolve_go_type_bounded;
+pub(crate) use php::resolve_php_type_bounded;
+pub(crate) use python::resolve_python_type_bounded;
+pub(crate) use ruby::resolve_ruby_type_bounded;
+pub(crate) use rust::resolve_rust_type_bounded;
+pub(crate) use scala::resolve_scala_type_bounded;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TypeLookupRequest {

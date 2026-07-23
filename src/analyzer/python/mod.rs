@@ -64,17 +64,6 @@ pub struct PythonAnalyzer {
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
 
 impl PythonAnalyzer {
-    pub(crate) fn prepared_syntax_limited(
-        &self,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) -> Result<
-        Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>>,
-        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitExceeded,
-    > {
-        self.inner.prepared_syntax_limited(file, max_source_bytes)
-    }
-
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -82,11 +71,7 @@ impl PythonAnalyzer {
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         self.inner
-            .lookup_non_module_declarations_by_identifier_limited(
-                identifier,
-                limit,
-                continue_query,
-            )
+            .lookup_non_module_declarations_by_identifier_limited(identifier, limit, continue_query)
     }
 
     pub(crate) fn declaration_candidates_by_fqn_limited(
@@ -98,13 +83,13 @@ impl PythonAnalyzer {
         let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
             return LimitedQueryRows::complete(Vec::new(), 0);
         };
-        let mut candidates =
-            self.inner
-                .lookup_non_module_declarations_by_identifier_limited(
-                    identifier,
-                    limit,
-                    continue_query,
-                );
+        let mut candidates = self
+            .inner
+            .lookup_non_module_declarations_by_identifier_limited(
+                identifier,
+                limit,
+                continue_query,
+            );
         if candidates.complete {
             candidates
                 .rows
@@ -121,13 +106,9 @@ impl PythonAnalyzer {
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let exact_fqn = format!("{owner_fqn}.{name}");
-        let mut candidates =
-            self.inner
-                .lookup_non_module_declarations_by_identifier_limited(
-                    name,
-                    limit,
-                    continue_query,
-                );
+        let mut candidates = self
+            .inner
+            .lookup_non_module_declarations_by_identifier_limited(name, limit, continue_query);
         if candidates.complete {
             candidates
                 .rows

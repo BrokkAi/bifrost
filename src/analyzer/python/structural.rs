@@ -123,6 +123,9 @@ impl StructuralSpec for PythonStructuralSpec {
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
                     for index in 0..arguments.named_child_count() {
+                        if !sink.should_continue() {
+                            break;
+                        }
                         let Some(argument) = arguments.named_child(index) else {
                             continue;
                         };
@@ -176,6 +179,9 @@ impl StructuralSpec for PythonStructuralSpec {
                 }
                 _ => {
                     for index in 0..node.named_child_count() {
+                        if !sink.should_continue() {
+                            break;
+                        }
                         let Some(child) = node.named_child(index) else {
                             continue;
                         };

@@ -153,8 +153,16 @@ fn csharp_expand_logical_type_parts(
         if !session.scope_step() {
             return Vec::new();
         }
-        let parts = session.query_rows(|| csharp.partial_type_parts(&candidate));
+        let parts = session.query_limited_rows(|limit| {
+            csharp.partial_type_parts_limited(&candidate, limit, || session.observe_cancellation())
+        });
+        if !session.observe_cancellation() {
+            return Vec::new();
+        }
         if parts.is_empty() {
+            if !session.scope_step() {
+                return Vec::new();
+            }
             expanded.push(candidate);
         } else {
             expanded.extend(parts);
@@ -172,6 +180,7 @@ mod tests {
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
+    use std::thread;
 
     fn full_expression_site(
         file: &ProjectFile,
@@ -204,6 +213,28 @@ mod tests {
             focus_start_byte: start_byte,
             focus_end_byte: end_byte,
         }
+    }
+
+    fn bounded_expression_lookup(
+        file_name: &str,
+        source: &str,
+        expression: &str,
+        budget: ReceiverAnalysisBudget,
+        cancel_after_checks: Option<usize>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &[(file_name, source)]);
+        let file = ProjectFile::new(fixture.project_root(), file_name);
+        let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
+        let cancellation = cancel_after_checks.map(CancellationToken::cancel_after_checks_for_test);
+        resolve_csharp_type_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &full_expression_site(&file, source, expression),
+            budget,
+            cancellation.as_ref(),
+        )
     }
 
     #[test]
@@ -272,6 +303,386 @@ public class Consumer
                 "{expression}: {outcome:#?}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_cross_file_return_and_member_types_use_structured_metadata() {
+        let caller = r#"
+using Demo.Models;
+
+namespace Demo.App;
+
+public class Caller
+{
+    public void Run(Factory factory)
+    {
+        Product fromCall = factory.Create();
+        Product fromMember = factory.Value;
+    }
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[
+                (
+                    "Models.cs",
+                    r#"
+namespace Demo.Models;
+public class Product {}
+public class Factory
+{
+    public Product Value { get; }
+    public Product Create() => null;
+}
+"#,
+                ),
+                ("Caller.cs", caller),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "Caller.cs");
+        let tree = parse_tree_for_language(&file, Language::CSharp, caller).expect("C# tree");
+
+        for expression in ["factory.Create()", "factory.Value"] {
+            let outcome = resolve_csharp_type_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                caller,
+                Some(&tree),
+                &full_expression_site(&file, caller, expression),
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, work } = outcome else {
+                panic!("{expression} should complete");
+            };
+            assert!(work.scope_nodes > 0, "{expression}: {work:#?}");
+            assert_eq!(
+                value.status,
+                TypeLookupStatus::Resolved,
+                "{expression}: {value:#?}"
+            );
+            assert_eq!(
+                value.types[0].fqn, "Demo.Models.Product",
+                "{expression}: {value:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_return_type_prefers_exact_nested_lexical_scope_over_same_name_decoy() {
+        let source = r#"
+namespace Demo;
+
+public class Product {}
+
+public class Outer
+{
+    public class Product {}
+
+    public class Factory
+    {
+        public Product Create() => null;
+    }
+
+    public void Run(Outer.Factory factory)
+    {
+        Outer.Product product = factory.Create();
+    }
+}
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::CSharp, &[("NestedReturn.cs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "NestedReturn.cs");
+        let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
+        let expression = "factory.Create()";
+        let outcome = resolve_csharp_type_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &full_expression_site(&file, source, expression),
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("{expression} should complete");
+        };
+        assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:#?}");
+        assert_eq!(value.types[0].fqn, "Demo.Outer$Product", "{value:#?}");
+        assert_ne!(value.types[0].fqn, "Demo.Product", "{value:#?}");
+    }
+
+    #[test]
+    fn bounded_generic_type_parameters_never_resolve_to_same_named_classes() {
+        let source = r#"
+namespace Demo;
+
+public class T
+{
+    public void WrongTarget() {}
+}
+
+public class TResult
+{
+    public void WrongTarget() {}
+}
+
+public class Service
+{
+    public void RightTarget() {}
+}
+
+public class Factory<T>
+{
+    public T Value;
+    public T Create() => default;
+}
+
+public class MethodFactory
+{
+    public TResult Create<TResult>() => default;
+}
+
+public class Caller
+{
+    public void Run(Factory<Service> factory, MethodFactory methods)
+    {
+        factory.Create().RightTarget();
+        factory.Value.RightTarget();
+        methods.Create().RightTarget();
+        methods.Create<Service>().RightTarget();
+    }
+}
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::CSharp, &[("TypeParameters.cs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "TypeParameters.cs");
+        let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
+
+        for expression in ["factory.Create()", "factory.Value", "methods.Create()"] {
+            let outcome = resolve_csharp_type_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &full_expression_site(&file, source, expression),
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{expression} should complete conservatively");
+            };
+            assert_eq!(
+                value.status,
+                TypeLookupStatus::NoType,
+                "{expression} must not resolve to the unrelated Demo.T: {value:#?}"
+            );
+            assert!(value.types.is_empty(), "{expression}: {value:#?}");
+        }
+
+        let expression = "methods.Create<Service>()";
+        let outcome = resolve_csharp_type_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &full_expression_site(&file, source, expression),
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("{expression} should complete");
+        };
+        assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:#?}");
+        assert_eq!(value.types[0].fqn, "Demo.Service", "{value:#?}");
+    }
+
+    #[test]
+    fn deeply_parenthesized_receiver_is_stack_safe_exact_and_interruptible() {
+        let expression = format!("{}factory{}.Create()", "(".repeat(3_000), ")".repeat(3_000));
+        let source = format!(
+            r#"
+namespace Demo;
+public class Product {{}}
+public class Factory {{ public Product Create() => null; }}
+public class Caller
+{{
+    public void Run(Factory factory) {{ _ = {expression}; }}
+}}
+"#
+        );
+
+        let thread_source = source.clone();
+        let thread_expression = expression.clone();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[("DeepParentheses.cs", &thread_source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "DeepParentheses.cs");
+        let tree =
+            parse_tree_for_language(&file, Language::CSharp, &thread_source).expect("deep C# tree");
+        let site = full_expression_site(&file, &thread_source, &thread_expression);
+        let run = move || {
+            resolve_csharp_type_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                &thread_source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+        };
+        let first = thread::Builder::new()
+            .name("csharp-deep-parentheses".to_string())
+            .stack_size(512 * 1024)
+            .spawn(run)
+            .expect("spawn small-stack C# lookup")
+            .join()
+            .expect("deep C# lookup must not overflow");
+        let second = bounded_expression_lookup(
+            "DeepParentheses.cs",
+            &source,
+            &expression,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let (
+            BoundedResolution::Complete {
+                value: first_value,
+                work: first_work,
+            },
+            BoundedResolution::Complete {
+                value: second_value,
+                work: second_work,
+            },
+        ) = (first, second)
+        else {
+            panic!("deep C# lookup should complete");
+        };
+        assert_eq!(first_value.status, TypeLookupStatus::Resolved);
+        assert_eq!(first_value.types[0].fqn, "Demo.Product");
+        assert_eq!(second_value.status, TypeLookupStatus::Resolved);
+        assert_eq!(first_work, second_work, "work accounting must be exact");
+
+        assert!(matches!(
+            bounded_expression_lookup(
+                "DeepParentheses.cs",
+                &source,
+                &expression,
+                ReceiverAnalysisBudget::tiny(),
+                None,
+            ),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == ReceiverAnalysisBudget::tiny().max_scope_nodes
+        ));
+        assert!(matches!(
+            bounded_expression_lookup(
+                "DeepParentheses.cs",
+                &source,
+                &expression,
+                ReceiverAnalysisBudget::default(),
+                Some(64),
+            ),
+            BoundedResolution::Cancelled { work } if work.scope_nodes > 0
+        ));
+    }
+
+    #[test]
+    fn alternating_call_member_chain_is_stack_safe_and_budgeted() {
+        let mut expression = "link".to_string();
+        for index in 0..256 {
+            if index % 2 == 0 {
+                expression.push_str(".Next()");
+            } else {
+                expression.push_str(".Value");
+            }
+        }
+        let source = format!(
+            r#"
+namespace Demo;
+public class Link
+{{
+    public Link Value => this;
+    public Link Next() => this;
+}}
+public class Caller
+{{
+    public void Run(Link link) {{ _ = {expression}; }}
+}}
+"#
+        );
+        let thread_source = source.clone();
+        let thread_expression = expression.clone();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[("Alternating.cs", &thread_source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "Alternating.cs");
+        let tree = parse_tree_for_language(&file, Language::CSharp, &thread_source)
+            .expect("alternating C# tree");
+        let site = full_expression_site(&file, &thread_source, &thread_expression);
+        let deep_budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 200_000,
+            max_summary_expansions: 1_024,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let outcome = thread::Builder::new()
+            .name("csharp-alternating-chain".to_string())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                resolve_csharp_type_bounded(
+                    fixture.analyzer.analyzer(),
+                    &file,
+                    &thread_source,
+                    Some(&tree),
+                    &site,
+                    deep_budget,
+                    None,
+                )
+            })
+            .expect("spawn small-stack C# chain lookup")
+            .join()
+            .expect("alternating C# chain must not overflow");
+        let (value, work) = match outcome {
+            BoundedResolution::Complete { value, work } => (value, work),
+            other => panic!("alternating chain should complete: {other:#?}"),
+        };
+        assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:#?}");
+        assert_eq!(value.types[0].fqn, "Demo.Link", "{value:#?}");
+        assert!(
+            work.scope_nodes > expression.matches('.').count(),
+            "{work:#?}"
+        );
+
+        assert!(matches!(
+            bounded_expression_lookup(
+                "Alternating.cs",
+                &source,
+                &expression,
+                ReceiverAnalysisBudget {
+                    max_scope_nodes: 128,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            ),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work,
+            } if work.scope_nodes == 128
+        ));
+        assert!(matches!(
+            bounded_expression_lookup(
+                "Alternating.cs",
+                &source,
+                &expression,
+                deep_budget,
+                Some(96),
+            ),
+            BoundedResolution::Cancelled { work } if work.scope_nodes > 0
+        ));
     }
 
     #[test]

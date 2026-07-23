@@ -289,10 +289,7 @@ fn traced_gap_affects_value(
             // receiver, or argument evaluation is itself incomplete.
             if call.result == Some(value) || call.thrown == Some(value) {
                 true
-            } else if gap
-                .impacts
-                .contains(SemanticGapImpact::CallEvaluation)
-            {
+            } else if gap.impacts.contains(SemanticGapImpact::CallEvaluation) {
                 if call.callee == value || call.receiver == Some(value) {
                     return Ok(true);
                 }
@@ -336,6 +333,22 @@ fn points_to_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
     ]
     .into_iter()
     .any(|capability| !capabilities.is_available(capability))
+}
+
+pub(super) fn points_to_capability_surface_is_incomplete(procedure: &ProcedureHandle) -> bool {
+    let capabilities = procedure.artifact().capabilities();
+    [
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+        SemanticCapability::Captures,
+    ]
+    .into_iter()
+    .any(|capability| !capabilities.is_complete(capability))
 }
 
 fn location_capabilities_are_open(access: &AccessPathAtPoint) -> bool {
