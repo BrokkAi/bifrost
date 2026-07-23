@@ -1,4 +1,4 @@
-use super::syntax::body_contains_free_this;
+use super::syntax::{body_contains_free_this, class_definition_expressions};
 use super::*;
 
 #[test]
@@ -30,6 +30,44 @@ fn free_this_scan_honors_cancellation() {
     let cancellation = CancellationToken::cancel_after_checks_for_test(2);
     assert_eq!(
         body_contains_free_this(body.expect("function body"), &cancellation),
+        Err(LoweringCancelled)
+    );
+}
+
+#[test]
+fn class_definition_expression_collection_honors_cancellation() {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .expect("TypeScript grammar must load");
+    let tree = parser
+        .parse(
+            r#"
+                class Nested extends base() {
+                    [first()] = value();
+                    [second()]() {}
+                }
+            "#,
+            None,
+        )
+        .expect("TypeScript source must parse");
+    let mut class = None;
+    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+        tree.root_node(),
+        true,
+        |node| {
+            if node.kind() == "class_declaration" {
+                class = Some(node);
+                WalkControl::Break
+            } else {
+                WalkControl::Continue
+            }
+        },
+    );
+
+    let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+    assert_eq!(
+        class_definition_expressions(class.expect("class declaration"), &cancellation),
         Err(LoweringCancelled)
     );
 }

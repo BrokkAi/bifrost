@@ -15,7 +15,7 @@ After this change, semantic artifacts for JavaScript, JSX, TypeScript, and TSX w
 - [x] (2026-07-23 08:16+02:00) Confirmed issue requirements, diagnosed the adapter, and fast-forwarded the existing issue branch to `origin/master` at `fb268ff7`.
 - [x] (2026-07-23 08:16+02:00) Created this self-contained ExecPlan.
 - [x] (2026-07-23 08:23+02:00) Milestone 1: materialized initialized fields, split class-member child ownership and declaration paths, and passed focused JS/JSX/TS/TSX conformance plus the pre-existing class-field-arrow regression.
-- [ ] Milestone 2: publish initializer receivers, lower initializer expressions, and model surrounding class-definition evaluation.
+- [x] (2026-07-23 08:33+02:00) Milestone 2: published instance/static initializer receivers, lowered initializer expressions without return effects, modeled heritage/computed-name class evaluation, bumped adapter fingerprints, and passed focused receiver/CFG/cancellation/deep-control tests.
 - [ ] Milestone 3: run complete validation, conduct specialist review, address findings, and record the final outcome.
 
 ## Surprises & Discoveries
@@ -28,6 +28,9 @@ After this change, semantic artifacts for JavaScript, JSX, TypeScript, and TSX w
 
 - Observation: a correct fix must split both lexical parent and declaration path for children of fields and methods.
   Evidence: field values execute under an initializer while computed field names execute outside it; method bodies and parameters execute under the method while computed method names execute outside it. Changing only `lexical_parent` would still place a computed-name arrow under the wrong declaration path.
+
+- Observation: once fields became procedures, the existing class-field-arrow selector matched both the initializer entry and nested lambda entry.
+  Evidence: the focused pre-existing regression reported both `type:Worker::initializer:run` and `type:Worker::initializer:run::lambda:run`; selecting the complete lambda declaration path preserves the original assertion without hiding the new boundary.
 
 ## Decision Log
 
@@ -49,7 +52,9 @@ After this change, semantic artifacts for JavaScript, JSX, TypeScript, and TSX w
 
 ## Outcomes & Retrospective
 
-Milestone 1 now publishes initialized fields as source-backed initializer procedures in all four JS/TS parser flavors. Named and static identities, anonymous computed-field ordinals, and exact value-versus-computed-name arrow parenting are covered by `javascript_typescript_class_field_initializers_are_source_backed`. The pre-existing `javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed` test was tightened to select the nested lambda by its complete declaration path now that the field initializer is itself executable.
+Milestone 1 publishes initialized fields as source-backed initializer procedures in all four JS/TS parser flavors. Named and static identities, anonymous computed-field ordinals, and exact value-versus-computed-name arrow parenting are covered by `javascript_typescript_class_field_initializers_are_source_backed`. The pre-existing `javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed` test was tightened to select the nested lambda by its complete declaration path now that the field initializer is itself executable.
+
+Milestone 2 makes every initializer receiver-owning, including static fields and blocks, while preserving the old non-static method/function policy. `javascript_typescript_class_initializers_own_receivers` proves direct receiver flow and immediate-parent arrow captures for instance fields, static fields, static blocks, heritage, and computed names in both languages. `typescript_class_definition_and_initializer_execution_stay_separate` proves source-ordered outer evaluation, isolated field/method/static-block call sites, deterministic rendering, no manufactured return rows, and explicit deferred-scheduling gaps. The new AST collection is cancellation-polled, and the existing deep-control and nested-type boundary regressions remain green.
 
 ## Context and Orientation
 
@@ -142,4 +147,4 @@ The only durable identity changes are:
     JAVASCRIPT_ADAPTER_VERSION = b"javascript-value-semantics-v7"
     TYPESCRIPT_ADAPTER_VERSION = b"typescript-value-semantics-v8"
 
-Revision note (2026-07-23): Created the initial self-contained implementation plan after confirming the current decomposed lowerer layout and synchronizing the issue branch with `origin/master`. Updated after Milestone 1 to record discovery/identity behavior and focused validation.
+Revision note (2026-07-23): Created the initial self-contained implementation plan after confirming the current decomposed lowerer layout and synchronizing the issue branch with `origin/master`. Updated after Milestone 1 to record discovery/identity behavior and focused validation. Updated after Milestone 2 with receiver, CFG, cancellation, deterministic-render, and adjacent-regression evidence.

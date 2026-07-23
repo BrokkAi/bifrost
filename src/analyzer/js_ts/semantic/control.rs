@@ -51,19 +51,39 @@ pub(super) fn lower_procedure<'tree, 'targets>(
             "generator suspension is not yet lowered",
         )?;
     }
-    if spec.callable.kind() == "class_static_block" {
-        context.add_gap(
-            &mut builder,
-            entry,
-            SemanticGapSubject::Procedure,
-            SemanticCapability::DeferredExecution,
-            SemanticGapKind::Unsupported,
-            "class static block scheduling during class evaluation is not yet modeled",
-        )?;
+    match spec.callable.kind() {
+        "class_static_block" => {
+            context.add_gap(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::DeferredExecution,
+                SemanticGapKind::Unsupported,
+                "class static block scheduling during class evaluation is not yet modeled",
+            )?;
+        }
+        "field_definition" | "public_field_definition" => {
+            context.add_gap(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::DeferredExecution,
+                SemanticGapKind::Unsupported,
+                "class field initializer scheduling during construction or class evaluation is not yet modeled",
+            )?;
+        }
+        _ => {}
     }
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
     let initial = if spec.body.kind() == "statement_block" {
         Work::Statement {
+            node: spec.body,
+            entry: body_entry,
+            next: EdgeTarget::normal(normal_exit),
+            scope: function_scope,
+        }
+    } else if spec.kind == ProcedureKind::Initializer {
+        Work::Expression {
             node: spec.body,
             entry: body_entry,
             next: EdgeTarget::normal(normal_exit),
@@ -922,6 +942,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "function_expression"
             | "generator_function"
             | "arrow_function" => self.callable_expression(builder, node, entry, next),
+            "class_declaration" | "abstract_class_declaration" => {
+                self.class_definition(builder, node, entry, next, scope, stack)
+            }
             "method_definition"
             | "empty_statement"
             | "debugger_statement"
@@ -994,6 +1017,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "call_expression" | "new_expression" => {
                 self.call_expression(builder, node, entry, next, scope, chain_skip, stack)
             }
+            "class" => self.class_definition(builder, node, entry, next, scope, stack),
             "ternary_expression" => {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
@@ -1227,6 +1251,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         }
+    }
+
+    fn class_definition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let expressions = class_definition_expressions(node, self.session.cancellation()).map_err(
+            |LoweringCancelled| TsLoweringError::Cancelled(Box::new(builder.prospective_work())),
+        )?;
+        self.schedule_expressions(builder, entry, &expressions, next, scope, stack)
     }
 
     #[allow(clippy::too_many_arguments)]

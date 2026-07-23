@@ -100,6 +100,32 @@ fn event(effect: SemanticEffect) -> SemanticEvent {
     SemanticEvent::new(effect, SOURCE, EVIDENCE)
 }
 
+fn mapped_cfg_source<'source>(
+    procedure: &ProcedureSemantics,
+    source: &'source str,
+    mapping: SourceMappingId,
+) -> &'source str {
+    let span = procedure
+        .source_mapping(mapping)
+        .expect("semantic row must retain a source mapping")
+        .locator
+        .anchor()
+        .span();
+    source
+        .get(span.start_byte() as usize..span.end_byte() as usize)
+        .expect("semantic source span must index the fixture")
+}
+
+fn cfg_procedure_source<'source>(
+    procedure: &ProcedureSemantics,
+    source: &'source str,
+) -> &'source str {
+    let span = procedure.locator().anchor().span();
+    source
+        .get(span.start_byte() as usize..span.end_byte() as usize)
+        .expect("procedure locator must index the fixture")
+}
+
 fn edge(
     source_point: ProgramPointId,
     target_point: ProgramPointId,
@@ -1437,6 +1463,199 @@ fn typescript_class_static_blocks_are_deferred_initializer_procedures() {
             && gap.detail.contains("class static block scheduling")
     }));
     graph.assert_reachable("static_entry", "static_invoke");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn typescript_class_definition_and_initializer_execution_stay_separate() {
+    const SOURCE: &str = r#"
+function build(): void {
+    class Nested extends heritage() {
+        [firstKey()] = fieldValue();
+        static staticField = staticValue();
+        [secondKey()]() {
+            methodBody();
+        }
+        static {
+            staticBody();
+        }
+    }
+    after();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/class-execution.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/class-execution.ts");
+    let repeat = SemanticGraph::materialize(&project, &analyzer, "src/class-execution.ts");
+    assert_eq!(
+        graph.render_topology(),
+        repeat.render_topology(),
+        "class-definition and initializer topology should render deterministically"
+    );
+
+    graph
+        .bind(
+            "build_entry",
+            PointSelector::new("function build")
+                .procedure("build")
+                .effect("entry"),
+        )
+        .bind(
+            "heritage",
+            PointSelector::new("heritage()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "first_key",
+            PointSelector::new("firstKey()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "second_key",
+            PointSelector::new("secondKey()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "after",
+            PointSelector::new("after()")
+                .procedure("build")
+                .effect("invoke"),
+        )
+        .bind(
+            "field_initializer_entry",
+            PointSelector::new("[firstKey()] = fieldValue()").effect("entry"),
+        )
+        .bind(
+            "field_value",
+            PointSelector::new("fieldValue()").effect("invoke"),
+        )
+        .bind(
+            "field_initializer_exit",
+            PointSelector::new("[firstKey()] = fieldValue()").effect("normal_exit"),
+        )
+        .bind(
+            "static_value",
+            PointSelector::new("staticValue()").effect("invoke"),
+        )
+        .bind(
+            "method_body",
+            PointSelector::new("methodBody()").effect("invoke"),
+        )
+        .bind(
+            "static_body",
+            PointSelector::new("staticBody()").effect("invoke"),
+        );
+
+    graph.assert_reachable("build_entry", "heritage");
+    graph.assert_reachable("heritage", "first_key");
+    graph.assert_reachable("first_key", "second_key");
+    graph.assert_reachable("second_key", "after");
+    graph.assert_reachable("field_initializer_entry", "field_value");
+    graph.assert_reachable("field_value", "field_initializer_exit");
+
+    let procedures = graph.artifact().procedures();
+    let build = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Function
+                && procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("build")
+        })
+        .expect("build procedure");
+    let call_sources = |procedure: &ProcedureSemantics| {
+        procedure
+            .call_sites()
+            .iter()
+            .map(|call| mapped_cfg_source(procedure, SOURCE, call.source).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        call_sources(build),
+        ["heritage()", "firstKey()", "secondKey()", "after()"],
+        "outer class evaluation must exclude field values, method bodies, and static blocks"
+    );
+
+    let initializers = procedures
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Initializer)
+        .collect::<Vec<_>>();
+    assert_eq!(initializers.len(), 3);
+    let field_initializer = initializers
+        .iter()
+        .copied()
+        .find(|procedure| cfg_procedure_source(procedure, SOURCE).contains("fieldValue()"))
+        .expect("computed field initializer");
+    let static_initializer = initializers
+        .iter()
+        .copied()
+        .find(|procedure| cfg_procedure_source(procedure, SOURCE).contains("staticValue()"))
+        .expect("static field initializer");
+    let static_block = initializers
+        .iter()
+        .copied()
+        .find(|procedure| cfg_procedure_source(procedure, SOURCE).contains("staticBody()"))
+        .expect("static block initializer");
+    assert_eq!(call_sources(field_initializer), ["fieldValue()"]);
+    assert_eq!(call_sources(static_initializer), ["staticValue()"]);
+    assert_eq!(call_sources(static_block), ["staticBody()"]);
+
+    let computed_method = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Method
+                && cfg_procedure_source(procedure, SOURCE).contains("methodBody()")
+        })
+        .expect("computed method procedure");
+    assert_eq!(call_sources(computed_method), ["methodBody()"]);
+
+    for initializer in initializers {
+        assert!(
+            initializer
+                .values()
+                .iter()
+                .all(|value| value.kind != SemanticValueKind::Return),
+            "initializer expressions must not manufacture return values"
+        );
+        assert!(
+            initializer
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| {
+                    !matches!(
+                        event.effect,
+                        SemanticEffect::ProcedureReturn { .. }
+                            | SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Return,
+                                ..
+                            }
+                    )
+                }),
+            "initializer expressions must complete normally without return effects"
+        );
+        assert!(initializer.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Procedure
+                && gap.capability == SemanticCapability::DeferredExecution
+                && gap.kind == SemanticGapKind::Unsupported
+        }));
+    }
+    assert!(
+        field_initializer.gaps().iter().any(|gap| {
+            gap.detail
+                .contains("class field initializer scheduling during construction")
+        }),
+        "field initializer must surface the remaining scheduling gap"
+    );
     graph.assert_adjacency_symmetric();
 }
 

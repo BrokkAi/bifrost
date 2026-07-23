@@ -15,8 +15,8 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v6";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v7";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v7";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v8";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -136,14 +136,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 .lexical_parent
                 .and_then(|parent| specs.get(parent.index()));
             let can_capture_receiver = parent.is_some_and(|parent| {
-                parent.captures_receiver
-                    || (!parent.properties.is_static
-                        && matches!(
-                            parent.kind,
-                            ProcedureKind::Method
-                                | ProcedureKind::Constructor
-                                | ProcedureKind::Function
-                        ))
+                parent.captures_receiver || procedure_owns_receiver(parent.kind, parent.properties)
             });
             specs[index].captures_receiver &= can_capture_receiver;
         }
@@ -189,6 +182,15 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
             },
         )
     }
+}
+
+const fn procedure_owns_receiver(kind: ProcedureKind, properties: ProcedureProperties) -> bool {
+    matches!(kind, ProcedureKind::Initializer)
+        || (!properties.is_static
+            && matches!(
+                kind,
+                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Function
+            ))
 }
 
 fn js_ts_capabilities() -> SemanticCapabilities {

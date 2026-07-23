@@ -135,13 +135,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
 
-        if self.receiver.is_none()
-            && !properties.is_static
-            && matches!(
-                procedure_kind,
-                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Function
-            )
-        {
+        if self.receiver.is_none() && procedure_owns_receiver(procedure_kind, properties) {
             let metadata = self.value_mapping(builder, callable)?;
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,

@@ -215,6 +215,56 @@ pub(super) fn callable_child_belongs_to_procedure(callable: Node<'_>, child: Nod
     }
 }
 
+pub(super) fn class_definition_expressions<'tree>(
+    class: Node<'tree>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Node<'tree>>, LoweringCancelled> {
+    let mut expressions = Vec::new();
+    let mut cursor = class.walk();
+    for child in class.named_children(&mut cursor) {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        match child.kind() {
+            "class_heritage" => {
+                let heritage_children = named_children(child);
+                if heritage_children
+                    .iter()
+                    .any(|heritage| heritage.kind() == "extends_clause")
+                {
+                    for extends_clause in heritage_children
+                        .into_iter()
+                        .filter(|heritage| heritage.kind() == "extends_clause")
+                    {
+                        if cancellation.is_cancelled() {
+                            return Err(LoweringCancelled);
+                        }
+                        expressions.extend(children_by_field_name(extends_clause, "value"));
+                    }
+                } else if let Some(value) = heritage_children.into_iter().next() {
+                    expressions.push(value);
+                }
+            }
+            "class_body" => {
+                for member in named_children(child) {
+                    if cancellation.is_cancelled() {
+                        return Err(LoweringCancelled);
+                    }
+                    let name = member
+                        .child_by_field_name("name")
+                        .or_else(|| member.child_by_field_name("property"));
+                    if let Some(name) = name.filter(|name| name.kind() == "computed_property_name")
+                    {
+                        expressions.push(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(expressions)
+}
+
 pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
