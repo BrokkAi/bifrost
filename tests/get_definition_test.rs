@@ -3251,6 +3251,31 @@ fn csharp_dotted_type_lookup_allows_imported_nested_type() {
     );
 }
 
+// A nested type is visible from a sibling nested type's member type position:
+// the enclosing class scopes the lookup even though the member's own nested
+// class carries a `$`-joined fq (#1105 — the scope walk must not skip the
+// enclosing class, and the failure must not claim a using boundary for a
+// type indexed in the same file).
+#[test]
+fn csharp_nested_sibling_type_resolves_from_property_type_position() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Config/DeepClonerTests.cs",
+            "using Xunit;\n\nnamespace ConfigurationTests;\n\npublic class DeepClonerTests\n{\n    private class SimpleReferenceType\n    {\n        public int Value { get; init; }\n    }\n\n    private class NestedObject\n    {\n        public SimpleReferenceType? Inner { get; init; }\n    }\n}\n",
+        )
+        .build();
+    let value = lookup_reference(
+        project.root(),
+        r#"{"references":[{"path":"Config/DeepClonerTests.cs","symbol":"NestedObject","context":"        public SimpleReferenceType? Inner { get; init; }","target":"SimpleReferenceType"}]}"#,
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ConfigurationTests.DeepClonerTests$SimpleReferenceType",
+        "{value}"
+    );
+}
+
 #[test]
 fn csharp_dotted_type_lookup_does_not_import_child_namespace() {
     let project = InlineTestProject::with_language(Language::CSharp)

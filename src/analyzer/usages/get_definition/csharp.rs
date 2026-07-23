@@ -124,7 +124,14 @@ pub(super) fn resolve_csharp(
             ) {
                 return candidates_outcome(vec![unit]);
             }
-            csharp_type_outcome(csharp, definitions, file, &reference)
+            csharp_type_outcome(
+                analyzer,
+                csharp,
+                definitions,
+                file,
+                &reference,
+                type_node.start_byte(),
+            )
         }
         Some(CSharpReferenceNode::Constructor(creation)) => {
             resolve_csharp_constructor(analyzer, csharp, definitions, file, source, creation)
@@ -282,7 +289,14 @@ pub(super) fn resolve_csharp(
             );
             if csharp_is_type_reference_node(identifier) {
                 let reference = csharp_reference_type_text(identifier, source);
-                return csharp_type_outcome(csharp, definitions, file, &reference);
+                return csharp_type_outcome(
+                    analyzer,
+                    csharp,
+                    definitions,
+                    file,
+                    &reference,
+                    identifier.start_byte(),
+                );
             }
             if !bindings.is_shadowed(text) {
                 if csharp_is_unqualified_member_reference(identifier)
@@ -302,7 +316,14 @@ pub(super) fn resolve_csharp(
                         return outcome;
                     }
                 }
-                let outcome = csharp_type_outcome(csharp, definitions, file, text);
+                let outcome = csharp_type_outcome(
+                    analyzer,
+                    csharp,
+                    definitions,
+                    file,
+                    text,
+                    identifier.start_byte(),
+                );
                 if outcome.status != DefinitionLookupStatus::NoDefinition {
                     return outcome;
                 }
@@ -952,7 +973,14 @@ fn resolve_csharp_constructor(
         return candidates_outcome(vec![unit]);
     }
     if csharp.using_aliases_of(file).contains_key(&reference) {
-        return csharp_type_outcome(csharp, definitions, file, &reference);
+        return csharp_type_outcome(
+            analyzer,
+            csharp,
+            definitions,
+            file,
+            &reference,
+            type_node.start_byte(),
+        );
     }
     let owners = csharp_logical_visible_type_candidates(csharp, definitions, file, &reference);
     let mut constructors = Vec::new();
@@ -975,14 +1003,23 @@ fn resolve_csharp_constructor(
     if !constructors.is_empty() {
         return candidates_outcome(constructors);
     }
-    csharp_type_outcome(csharp, definitions, file, &reference)
+    csharp_type_outcome(
+        analyzer,
+        csharp,
+        definitions,
+        file,
+        &reference,
+        type_node.start_byte(),
+    )
 }
 
 fn csharp_type_outcome(
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     reference: &str,
+    byte: usize,
 ) -> DefinitionLookupOutcome {
     let mut candidates =
         csharp_visible_type_output_candidates(csharp, definitions, file, reference);
@@ -991,6 +1028,18 @@ fn csharp_type_outcome(
     }
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
+    }
+    // A type nested in an enclosing class is visible from member type
+    // positions inside sibling nested types. The namespace-style walks above
+    // miss it because C# nested-type fq segments join with `$`, which their
+    // `.`-joined candidate keys never try — and the miss then drew a
+    // dishonest using-boundary claim for a type indexed in the very same
+    // file (#1105). Runs after the scope-blind resolvers so currently
+    // resolving lookups are unaffected.
+    if let Some(unit) =
+        resolve_csharp_nested_type_in_enclosing_classes(analyzer, file, reference, byte)
+    {
+        return candidates_outcome(vec![unit]);
     }
     if csharp_import_boundary_for_type(csharp, definitions, file, reference) {
         return boundary(format!(
