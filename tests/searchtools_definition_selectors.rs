@@ -3062,3 +3062,144 @@ fn definition_lookup_only_locale_fields_do_not_leak_into_listings() {
         "search_symbols must not list the definition-lookup-only bare twin: {search}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1075: a bare Rust field name with two indexed candidates (e.g.
+// `empty` on both `Repr` and `Settings` in uutils/coreutils' join.rs) must
+// ambiguate with candidates and guidance exactly like the anchored spelling,
+// never fall through to a note-less, candidate-less `not_found` refusal
+// (I5). By the time this issue was filed, #1057/#1087/#1088 had already
+// widened bare-name resolution to see identifier-indexed members, so this
+// pins the fix as a permanent regression rather than reproducing a live bug.
+// ---------------------------------------------------------------------------
+
+fn issue_1075_join_rs_project() -> common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/uu/join/src/join.rs",
+            "struct Repr {\n    empty: String,\n}\n\nstruct Settings {\n    empty: Option<String>,\n}\n\nfn unrelated() -> i32 {\n    42\n}\n",
+        )
+        .build()
+}
+
+#[test]
+fn issue_1075_bare_rust_field_ambiguates_like_anchored_and_fq_spellings() {
+    let project = issue_1075_join_rs_project();
+
+    let bare = call_tool(&project, "get_symbol_sources", r#"{"symbols":["empty"]}"#);
+    let anchored = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["src/uu/join/src/join.rs#empty"]}"#,
+    );
+
+    // Neither spelling may produce an empty refusal: both must ambiguate
+    // with the same two candidates and a non-empty corrective note.
+    assert_eq!(0, bare["not_found"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(1, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    let bare_matches = string_array(&bare["ambiguous"][0]["matches"]);
+    assert_eq!(
+        vec![
+            "src.uu.join.src.join.Repr.empty".to_string(),
+            "src.uu.join.src.join.Settings.empty".to_string(),
+        ],
+        bare_matches,
+        "{bare}"
+    );
+    assert!(
+        !string_value(&bare["ambiguous"][0]["note"]).is_empty(),
+        "{bare}"
+    );
+    assert_eq!(
+        bare["ambiguous"][0]["matches"], anchored["ambiguous"][0]["matches"],
+        "bare: {bare}, anchored: {anchored}"
+    );
+
+    // Each fq selector offered by the ambiguity resolves to its own field.
+    for (selector, expected_snippet) in [
+        ("src.uu.join.src.join.Repr.empty", "empty: String"),
+        (
+            "src.uu.join.src.join.Settings.empty",
+            "empty: Option<String>",
+        ),
+    ] {
+        let resolved = call_tool(
+            &project,
+            "get_symbol_sources",
+            &serde_json::json!({ "symbols": [selector] }).to_string(),
+        );
+        assert_eq!(
+            0,
+            resolved["not_found"].as_array().unwrap().len(),
+            "{resolved}"
+        );
+        assert_eq!(
+            0,
+            resolved["ambiguous"].as_array().unwrap().len(),
+            "{resolved}"
+        );
+        assert!(
+            resolved["sources"][0]["text"]
+                .as_str()
+                .expect("source text")
+                .contains(expected_snippet),
+            "{resolved}"
+        );
+    }
+}
+
+#[test]
+fn issue_1075_genuinely_unmatched_rust_symbol_still_carries_corrective_note() {
+    let project = issue_1075_join_rs_project();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["totally_unmatched_symbol_xyz"]}"#,
+    );
+    assert_eq!(0, result["ambiguous"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(
+        "totally_unmatched_symbol_xyz",
+        not_found_input(&result["not_found"][0]),
+        "{result}"
+    );
+    assert!(
+        !not_found_note(&result["not_found"][0]).is_empty(),
+        "a not_found response must always carry a corrective note (I5): {result}"
+    );
+}
+
+#[test]
+fn issue_1075_get_definitions_by_reference_agrees_on_bare_and_fq_rust_field_owner() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/uu/join/src/join.rs",
+            "struct Repr {\n    empty: String,\n}\n\nimpl Repr {\n    fn get_empty(&self) -> &str {\n        &self.empty\n    }\n}\n\nstruct Settings {\n    empty: Option<String>,\n}\n",
+        )
+        .build();
+
+    // I2: the same (context, target) reference must resolve identically
+    // whether the enclosing `symbol` is spelled bare or fully qualified.
+    let bare = call_tool(
+        &project,
+        "get_definitions_by_reference",
+        r#"{"references":[{"symbol":"get_empty","context":"&self.empty","target":"empty"}]}"#,
+    );
+    let fq = call_tool(
+        &project,
+        "get_definitions_by_reference",
+        r#"{"references":[{"symbol":"src.uu.join.src.join.Repr.get_empty","context":"&self.empty","target":"empty"}]}"#,
+    );
+
+    for (label, result) in [("bare", &bare), ("fq", &fq)] {
+        assert_eq!(
+            "resolved", result["results"][0]["status"],
+            "{label}: {result}"
+        );
+        assert_eq!(
+            "src.uu.join.src.join.Repr.empty", result["results"][0]["definitions"][0]["fqn"],
+            "{label}: {result}"
+        );
+    }
+}
