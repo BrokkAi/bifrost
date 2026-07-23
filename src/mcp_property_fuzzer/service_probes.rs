@@ -756,6 +756,11 @@ fn generate_probes(
                 break;
             }
             let symbol = &input.symbols[index];
+            // Constructor spellings reduce to the qualified pair (see
+            // spelling_set); batching them adds no signal.
+            if symbol.aux_constructor {
+                continue;
+            }
             let path = input.files[symbol.file_index].path.as_str();
             let Some((context, target)) = definition_context(input, symbol) else {
                 continue;
@@ -848,12 +853,22 @@ fn generate_probes(
 /// from that candidate list; probing the companion through the stripped
 /// spelling would resolve to its class — a different unit — and every
 /// derived expectation would be meaningless.
+///
+/// Constructors (the `aux_constructor` convention: a callable carrying its
+/// class's display identifier, e.g. C# `TestRunnable.TestRunnable`) only
+/// get the qualified spellings: their bare and path-anchored terminal
+/// spellings legitimately resolve to the *type* declaration, so comparing
+/// them against the constructor's qualified resolution fires a false
+/// spelling-resolves-to-different-declaration (Terminal.Gui triage).
 fn spelling_set(symbol: &SymbolFacts, path: &str) -> Vec<String> {
     let qualified = if symbol.fq_name.ends_with('$') {
         &symbol.fq_name
     } else {
         &symbol.display_fq
     };
+    if symbol.aux_constructor {
+        return vec![qualified.clone(), format!("{path}#{qualified}")];
+    }
     vec![
         symbol.identifier.clone(),
         qualified.clone(),

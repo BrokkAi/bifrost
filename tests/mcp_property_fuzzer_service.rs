@@ -1328,6 +1328,34 @@ fn ts_module_units_are_excluded_from_spelling_probes() {
     assert!(report.violations.is_empty(), "{:?}", report.violations);
 }
 
+// A constructor carries its class's display identifier, so the bare and
+// path-anchored terminal spellings legitimately resolve to the *type*
+// declaration; only the qualified spellings name the constructor. I2 must
+// not compare the two families (the Terminal.Gui `TestRunnable` /
+// `AnsiSnapshotException` false different-declaration fires).
+#[test]
+fn csharp_constructor_spelling_probes_skip_bare_terminal() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Widget.cs",
+            "namespace Ns {\n    public class Widget {\n        public int Value;\n        public Widget(int value) { Value = value; }\n    }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("csharp"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
 // A 0-byte `__init__.py` yields an all-empty (valid) summaries response;
 // probing it must not fire I5's empty-refusal (the celery/freqtrade shape).
 #[test]
