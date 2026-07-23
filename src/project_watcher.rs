@@ -76,6 +76,18 @@ impl ProjectChangeWatcher {
             requires_full_refresh: mem::take(&mut pending.requires_full_refresh),
         }
     }
+
+    /// Cheap peek at whether a subsequent `take_changed_files` would return a
+    /// non-empty delta, without draining it. Locks only the watcher's own
+    /// pending-state mutex, never the caller's session lock, so callers can
+    /// decide whether an exclusive lock is worth taking before acquiring one.
+    pub fn has_pending(&self) -> bool {
+        let pending = self
+            .pending
+            .lock()
+            .expect("project watcher pending state poisoned");
+        pending.requires_full_refresh || !pending.files.is_empty()
+    }
 }
 
 fn event_handler(

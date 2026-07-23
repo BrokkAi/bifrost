@@ -13,7 +13,9 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn fixture_root() -> PathBuf {
@@ -113,6 +115,119 @@ fn service_allows_concurrent_read_only_calls() {
         let value = handle.join().unwrap();
         assert!(value.is_object(), "payload: {value}");
     }
+}
+
+/// Regression for M2's read-first `snapshot_for_query`: a change reported by
+/// the production file watcher (not an explicit `update_paths` call) must
+/// still be visible on the very next tool call, exactly as it was when every
+/// call took an exclusive session write lock unconditionally.
+#[test]
+fn watcher_reported_change_is_applied_by_next_call() {
+    let temp = TempDir::new().unwrap();
+    let file_path = temp.path().join("Watched.java");
+    fs::write(&file_path, "public class Watched { void first() {} }\n").unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+
+    let baseline = service
+        .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+        .unwrap();
+    assert!(baseline.contains("first"), "payload: {baseline}");
+    assert!(!baseline.contains("second"), "payload: {baseline}");
+
+    fs::write(
+        &file_path,
+        "public class Watched { void first() {} void second() {} }\n",
+    )
+    .unwrap();
+
+    let mut observed = None;
+    for _ in 0..250 {
+        let payload = service
+            .call_tool_json("get_summaries", r#"{"targets":["Watched.java"]}"#)
+            .unwrap();
+        if payload.contains("second") {
+            observed = Some(payload);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let payload = observed.unwrap_or_else(|| {
+        panic!("watcher-reported change to Watched.java was never applied by a later call")
+    });
+    assert!(payload.contains("second"), "payload: {payload}");
+}
+
+/// Concurrency smoke for M2: many threads issue read-only calls against one
+/// service while a file change lands on disk mid-stream. Every call must
+/// succeed (the read-first peek must never deadlock or error against a
+/// concurrently-mutating session), and calls made after the change is
+/// observable must see it.
+#[test]
+fn concurrent_read_only_calls_survive_a_mid_stream_watcher_change() {
+    let temp = TempDir::new().unwrap();
+    let file_path = temp.path().join("Live.java");
+    fs::write(&file_path, "public class Live { void before() {} }\n").unwrap();
+
+    let service = Arc::new(
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let saw_error = Arc::new(AtomicBool::new(false));
+
+    let reader_handles: Vec<_> = (0..8)
+        .map(|_| {
+            let service = Arc::clone(&service);
+            let stop = Arc::clone(&stop);
+            let saw_error = Arc::clone(&saw_error);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if service
+                        .call_tool_json("get_summaries", r#"{"targets":["Live.java"]}"#)
+                        .is_err()
+                    {
+                        saw_error.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Give the reader threads a head start, then land a change mid-stream.
+    thread::sleep(Duration::from_millis(50));
+    fs::write(
+        &file_path,
+        "public class Live { void before() {} void after() {} }\n",
+    )
+    .unwrap();
+
+    let mut observed_after = false;
+    for _ in 0..250 {
+        let payload = service
+            .call_tool_json("get_summaries", r#"{"targets":["Live.java"]}"#)
+            .unwrap();
+        if payload.contains("after") {
+            observed_after = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for handle in reader_handles {
+        handle.join().unwrap();
+    }
+
+    assert!(
+        !saw_error.load(Ordering::Relaxed),
+        "a concurrent read-only call failed while a file change landed mid-stream"
+    );
+    assert!(
+        observed_after,
+        "post-change calls never observed the watcher-applied update"
+    );
 }
 
 #[test]
