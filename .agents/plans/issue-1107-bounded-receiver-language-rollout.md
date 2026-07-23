@@ -41,7 +41,9 @@ Each language remains a separately reviewable implementation and validation mile
 - [x] (2026-07-23) Completed the final independent architecture, Rust-quality, repository-policy, and strict acceptance audits. Fixed Go promoted-path ambiguity, C++ virtual/non-virtual diamond identity, exact Go/C++ data-field precision, role-edge work accounting, structured-type DAG hashing/equality, oversized metadata persistence, bounded-store error completeness, and dirty-state pre-cloning.
 - [x] (2026-07-23) Added a seven-language strict public acceptance matrix for exact structured points-to identity/provenance and `call_input -> points_to` composition. C++, Go, PHP, Ruby, Rust, and Scala also hit the public four-of-five `max_targets` cap; Python's five-way structured flow truthfully exhausts `scope_nodes` before reaching that separate cap and remains covered by shared target-cap plus language-specific budget tests.
 - [x] (2026-07-23) Ran the post-audit aggregate checkpoint gate: formatting and diff checks, warning-free `cargo check --lib`, 308 focused integration tests, 132-language semantic conformance cases within that set, four bounded-regression tests, three limited-materialization tests, and four hostile resource-bound tests all pass.
-- [ ] Checkpoint the final sweep, rebase onto current `origin/master`, run the isolated CI-equivalent gates, open one pull request that closes #1107 and #1108 through #1115, wait for green CI, and squash-merge it.
+- [x] (2026-07-23) Checkpointed the final sweep at `c4bc8f97`, fetched `origin/master` through `5e6e6f08`, and rebased all eight branch commits. The two C# conflicts preserve upstream chained-extension and initializer fixes inside the bounded stack-safe receiver program.
+- [x] (2026-07-23) Ran the upstream 73-test C# definition/type slice after the rebase. It exposed one normalized persisted lookup that crossed generic arity; the provider now preserves the requested arity before returning normalized candidates, and all 73 C# tests plus 151 focused receiver/pipeline tests pass.
+- [ ] Commit the post-rebase arity fix, run the isolated CI-equivalent gates, open one pull request that closes #1107 and #1108 through #1115, wait for green CI, and squash-merge it.
 - [ ] Verify #1107 and #1108 through #1115 are closed, `origin/master` contains the consolidated squash merge, all final validation gates pass, and build artifacts have been cleaned.
 
 ## Surprises & Discoveries
@@ -202,6 +204,10 @@ Each language remains a separately reviewable implementation and validation mile
 
 - Decision: Treat one exact Go or C++ data-field declaration as statically bound, while retaining semantic and dispatch closure gates for callables.
   Rationale: Ordinary data fields do not participate in virtual/callable dispatch. Requiring closed runtime receiver evidence turned an exact structured field into an ambiguous result, while applying the exception only after exact singleton field resolution preserves uncertainty for promoted, overloaded, and callable members.
+  Date/Author: 2026-07-23 / Codex
+
+- Decision: Preserve C# generic arity when a bounded exact-FQN lookup falls through to the normalized persisted index.
+  Rationale: Normalization may reconcile alias and nested-type spelling, but it must not turn an exact `Box` arity-zero miss into `Box<T>`. Filtering the bounded provider batch by the same arity-preserving key used by the live usage index retains upstream #1093 behavior without hydrating the workspace.
   Date/Author: 2026-07-23 / Codex
 
 ## Outcomes & Retrospective

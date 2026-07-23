@@ -311,8 +311,19 @@ impl CSharpAnalyzer {
         fqn: &str,
         normalized: bool,
     ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_persisted_fqn(fqn, normalized)
+        let candidates = self
+            .inner
+            .lookup_declarations_by_persisted_fqn(fqn, normalized);
+        if !normalized {
+            return candidates;
+        }
+        let arity_key = csharp_arity_preserving_full_name(fqn);
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key
+            })
+            .collect()
     }
 
     pub(crate) fn declaration_candidates_by_fqn_limited(
@@ -322,12 +333,19 @@ impl CSharpAnalyzer {
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        self.inner.lookup_declarations_by_persisted_fqn_limited(
+        let mut batch = self.inner.lookup_declarations_by_persisted_fqn_limited(
             fqn,
             normalized,
             limit,
             continue_query,
-        )
+        );
+        if normalized {
+            let arity_key = csharp_arity_preserving_full_name(fqn);
+            batch.rows.retain(|candidate| {
+                csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key
+            });
+        }
+        batch
     }
 
     pub(crate) fn member_candidates_for_owner(
