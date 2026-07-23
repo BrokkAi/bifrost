@@ -2,7 +2,7 @@
 
 use crate::analyzer::semantic::IcfgNodeId;
 
-use super::{DataflowEdge, DataflowSeed, DistributiveDataflowProblem};
+use super::{DataflowEdge, DataflowOutput, DataflowSeed, DistributiveDataflowProblem};
 
 /// The sole fact in [`DirectFlowProblem`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,27 +32,44 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
         DirectFact
     }
 
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>) {
-        out.extend(
-            self.seed_nodes
-                .iter()
-                .copied()
-                .map(|node| DataflowSeed::new(node, DirectFact)),
-        );
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for node in self.seed_nodes.iter().copied() {
+            if !out.emit(DataflowSeed::new(node, DirectFact)) {
+                break;
+            }
+        }
     }
 
     // `DirectFact` is the distinguished zero fact, which the kernel preserves.
-    fn normal_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
 
-    fn return_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
 
     fn call_to_return_flow(
         &self,
         _edge: DataflowEdge<'_>,
         _fact: Self::Fact,
-        _out: &mut Vec<Self::Fact>,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
     }
 
@@ -60,7 +77,7 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
         &self,
         _edge: DataflowEdge<'_>,
         _fact: Self::Fact,
-        _out: &mut Vec<Self::Fact>,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
     }
 }

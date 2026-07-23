@@ -23,6 +23,7 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - [x] (2026-07-23 15:50Z) Ran formatting, focused tests, strict all-target/all-feature Clippy, and the complete `nlp,python` regression suite. The final unrestricted all-feature pass was green across library, binary, integration, and doc-test targets.
 - [x] (2026-07-23 15:50Z) Completed architecture, security/resource, test/intent, API/scope, and duplication reviews. Fixed both high-risk architecture findings, added the missing behavior regressions, and retained only two low-value test-helper duplication notes.
 - [x] (2026-07-23 16:19Z) Simplified the unmerged child after three focused audits: collapsed solver finalization, reused transfer buffers, stopped staging dominated frontiers, tightened solver-only API, made the direct client rely on kernel-owned zero propagation, and removed the two test-helper duplications. The focused 45-test dataflow/ICFG gate remains green.
+- [x] (2026-07-23 17:15Z) Fixed all seven guided-review findings: bounded callback emission, shared budget and dense-ID machinery, non-fabricable fact IDs, snapshot-owned invariant validation, cohesive dataflow contract modules, and shared source-backed fixtures. The expanded focused gate passes 12 client, 10 tabulation, and 25 ICFG contract tests.
 
 ## Surprises & Discoveries
 
@@ -47,8 +48,8 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - Observation: an independent integration-test reference runner cannot invoke the same public transfer contract if `DataflowEdge` is constructible only inside the crate.
   Evidence: the initial descriptor constructor was crate-private. The final API adds `DataflowEdge::from_snapshot`, which resolves the edge and both endpoints from one immutable snapshot and rejects mismatched or invalid rows.
 
-- Observation: solver budgets cannot preempt arbitrary work performed inside a client callback that has not returned.
-  Evidence: seeds and transfer outputs enter client-owned `Vec` callbacks before the kernel can sort, deduplicate, charge, or observe cancellation. This first-party slice therefore documents finite, repeatable, cooperatively returning callbacks; its four dimensions atomically bound work admitted by the kernel, not hostile client execution. A bounded output-sink contract remains a possible later hardening if untrusted clients are introduced.
+- Observation: a post-callback charge is too late to bound the kernel-owned callback buffer, even when callbacks are finite and cooperative.
+  Evidence: the guided review showed that the original `Vec` contract could accumulate arbitrary duplicate or over-budget rows before canonicalization. The replacement `DataflowOutput` contract deduplicates before allocation growth and preflights the next unique seed or transfer fact against `reached_states` or `propagated_outputs`. It returns `false` at the first rejected row and retains cancellation precedence. Clients must still return cooperatively because no Rust callback interface can preempt arbitrary client CPU work.
 
 - Observation: current source-backed ICFG adapters do not expose a stable unproven-complete edge topology for an end-to-end incomparable-path-frontier fixture.
   Evidence: local edges are proven-complete; currently unproven dispatch edges also carry partial completeness; return gaps downgrade both axes; and C++ virtual open-world uncertainty is retained as a separate boundary rather than an unproven edge. The frontier and edge-conjunction algebra therefore have focused unit regressions, while solver-level frontier requeue remains a later test when a contract-backed topology exists. No synthetic production snapshot constructor was added only for testing.
@@ -88,8 +89,16 @@ This first child deliberately stops before reusable procedure summaries, recursi
   Rationale: a proven path can support a may finding while another reachable partial edge or boundary prevents a complete absence claim. Cancellation or a solver budget is a run termination cause, not a rewrite of the provider's input status.
   Date/Author: 2026-07-23 / Codex
 
-- Decision: use four independently charged solver dimensions: interned facts, reached states, flow evaluations, and propagated outputs.
-  Rationale: these are the first slice's distinct sources of finite growth. Each failed charge can be tested and reported with dimension, limit, and attempted work. Summary and witness budgets do not exist until those tables exist.
+- Decision: use four independently charged solver dimensions—interned facts, reached states, flow evaluations, and propagated outputs—and use those same limits to preflight callback sinks.
+  Rationale: these are the first slice's distinct sources of retained growth. A unique seed necessarily implies at least one reached state, and a unique transfer fact is exactly one propagated output, so the existing dimensions bound temporary callback storage without adding a second accounting vocabulary. Duplicate rows are suppressed before growth, failed callbacks publish nothing, and the existing atomic publication charge remains the authoritative successful work record.
+  Date/Author: 2026-07-23 / Codex
+
+- Decision: share fixed-width dense-ID generation and multidimensional atomic budget accounting as private analyzer infrastructure.
+  Rationale: semantic materialization and data-flow solving need the same overflow-safe mechanics but retain different public IDs, work fields, defaults, validation rules, and error text. Private generators and a generic ledger remove policy-free duplication while preserving those domain contracts. `FactId` intentionally omits `Default` and public construction so clients cannot fabricate the run-local zero ID.
+  Date/Author: 2026-07-23 / Codex
+
+- Decision: enforce all `IcfgSnapshot` edge invariants while the private builder seals the snapshot, not on every solve.
+  Rationale: snapshot fields and constructors are sealed, so source/target validity and interprocedural call origins can be checked once before publication. Cloning preserves those invariants; rescanning an immutable snapshot in every solver run duplicated work and exposed unreachable dataflow errors.
   Date/Author: 2026-07-23 / Codex
 
 - Decision: preserve `ControlEdgeKind::Cleanup` as an ordinary intraprocedural callback while routing only `Exceptional` and `AsyncExceptional` local edges through `exceptional_flow`.

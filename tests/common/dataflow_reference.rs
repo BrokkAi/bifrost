@@ -10,7 +10,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use brokk_bifrost::analyzer::dataflow::{DataflowEdge, DataflowSeed, DistributiveDataflowProblem};
+use brokk_bifrost::analyzer::dataflow::{
+    DataflowEdge, DataflowOutput, DataflowSeed, DistributiveDataflowProblem,
+};
 use brokk_bifrost::analyzer::semantic::{
     ControlEdgeKind, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
 };
@@ -49,6 +51,15 @@ impl fmt::Display for ReferenceDataflowError {
 
 impl std::error::Error for ReferenceDataflowError {}
 
+struct VecOutput<'a, Value>(&'a mut Vec<Value>);
+
+impl<Value> DataflowOutput<Value> for VecOutput<'_, Value> {
+    fn emit(&mut self, value: Value) -> bool {
+        self.0.push(value);
+        true
+    }
+}
+
 /// Compute a may fixed point by repeatedly scanning every ICFG edge.
 pub fn reference_solve<P>(
     snapshot: &IcfgSnapshot,
@@ -58,7 +69,7 @@ where
     P: DistributiveDataflowProblem,
 {
     let mut seeds = Vec::<DataflowSeed<P::Fact>>::new();
-    problem.seeds(&mut seeds);
+    problem.seeds(&mut VecOutput(&mut seeds));
     seeds.sort_unstable();
     seeds.dedup();
 
@@ -88,7 +99,13 @@ where
 
                 for fact in source_facts.iter().copied() {
                     let mut outputs = Vec::new();
-                    apply_transfer(problem, descriptor, edge.kind, fact, &mut outputs);
+                    apply_transfer(
+                        problem,
+                        descriptor,
+                        edge.kind,
+                        fact,
+                        &mut VecOutput(&mut outputs),
+                    );
                     if fact == zero {
                         outputs.push(zero);
                     }
@@ -115,7 +132,7 @@ fn apply_transfer<P: DistributiveDataflowProblem>(
     edge: DataflowEdge<'_>,
     kind: IcfgEdgeKind,
     fact: P::Fact,
-    out: &mut Vec<P::Fact>,
+    out: &mut dyn DataflowOutput<P::Fact>,
 ) {
     match kind {
         IcfgEdgeKind::Intraprocedural(

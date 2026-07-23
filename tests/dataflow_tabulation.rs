@@ -1,10 +1,12 @@
 mod common;
+#[path = "common/dataflow_fixtures.rs"]
+mod dataflow_fixtures;
 
 use std::collections::BTreeSet;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowError, DataflowRequest, DataflowResult, DataflowSeed, DirectFlowProblem,
-    DistributiveDataflowProblem, IcfgSolveInput, SolverBudget, solve,
+    DataflowEdge, DataflowError, DataflowOutput, DataflowRequest, DataflowResult, DataflowSeed,
+    DirectFlowProblem, DistributiveDataflowProblem, IcfgSolveInput, SolverBudget, solve,
 };
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, ControlEdgeKind, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
@@ -16,6 +18,7 @@ use common::{
     dataflow_reference::reference_solve,
     semantic_graph::{CallContextSelector, IcfgGraph, PointSelector},
 };
+use dataflow_fixtures::{rust_choose_icfg, rust_deferred_call_icfg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum MarkerFact {
@@ -37,8 +40,10 @@ struct MarkerProblem {
 }
 
 impl MarkerProblem {
-    fn emit(fact: MarkerFact, marker: MarkerFact, out: &mut Vec<MarkerFact>) {
-        out.extend([fact, marker]);
+    fn emit(fact: MarkerFact, marker: MarkerFact, out: &mut dyn DataflowOutput<MarkerFact>) {
+        if out.emit(fact) {
+            let _ = out.emit(marker);
+        }
     }
 }
 
@@ -49,11 +54,16 @@ impl DistributiveDataflowProblem for MarkerProblem {
         MarkerFact::Zero
     }
 
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>) {
-        out.push(DataflowSeed::new(self.seed, MarkerFact::Seed));
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, MarkerFact::Seed));
     }
 
-    fn normal_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn normal_flow(
+        &self,
+        edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         let marker = match edge.edge().kind {
             IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Cleanup) => MarkerFact::CleanupNormal,
             _ => MarkerFact::Normal,
@@ -61,11 +71,21 @@ impl DistributiveDataflowProblem for MarkerProblem {
         Self::emit(fact, marker, out);
     }
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         Self::emit(fact, MarkerFact::Call, out);
     }
 
-    fn return_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn return_flow(
+        &self,
+        edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         let marker = match edge.edge().kind {
             IcfgEdgeKind::NormalReturn => MarkerFact::NormalReturn,
             IcfgEdgeKind::ExceptionalReturn => MarkerFact::ExceptionalReturn,
@@ -78,7 +98,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
         &self,
         edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         let marker = match edge.edge().kind {
             IcfgEdgeKind::CallToNormalContinuation => MarkerFact::CallToNormalReturn,
@@ -92,7 +112,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
         &self,
         edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         let marker = match edge.edge().kind {
             IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Cleanup) => {
@@ -121,21 +141,39 @@ impl DistributiveDataflowProblem for KillProblem {
         KillFact::Zero
     }
 
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>) {
-        out.push(DataflowSeed::new(self.seed, KillFact::Live));
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, KillFact::Live));
     }
 
-    fn normal_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
 
-    fn return_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, _out: &mut Vec<Self::Fact>) {}
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
 
     fn call_to_return_flow(
         &self,
         _edge: DataflowEdge<'_>,
         _fact: Self::Fact,
-        _out: &mut Vec<Self::Fact>,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
     }
 
@@ -143,7 +181,7 @@ impl DistributiveDataflowProblem for KillProblem {
         &self,
         _edge: DataflowEdge<'_>,
         _fact: Self::Fact,
-        _out: &mut Vec<Self::Fact>,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
     }
 }
@@ -162,12 +200,16 @@ struct PermutedProblem {
 }
 
 impl PermutedProblem {
-    fn transfer(&self, fact: PermutedFact, out: &mut Vec<PermutedFact>) {
+    fn transfer(&self, fact: PermutedFact, out: &mut dyn DataflowOutput<PermutedFact>) {
         let mut outputs = vec![fact, PermutedFact::Alpha, PermutedFact::Beta];
         if self.reverse_outputs {
             outputs.reverse();
         }
-        out.extend(outputs);
+        for output in outputs {
+            if !out.emit(output) {
+                break;
+            }
+        }
     }
 }
 
@@ -178,19 +220,38 @@ impl DistributiveDataflowProblem for PermutedProblem {
         PermutedFact::Zero
     }
 
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>) {
-        out.extend(self.seeds.iter().copied());
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for seed in self.seeds.iter().copied() {
+            if !out.emit(seed) {
+                break;
+            }
+        }
     }
 
-    fn normal_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         self.transfer(fact, out);
     }
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         self.transfer(fact, out);
     }
 
-    fn return_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         self.transfer(fact, out);
     }
 
@@ -198,7 +259,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
         &self,
         _edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         self.transfer(fact, out);
     }
@@ -207,7 +268,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
         &self,
         _edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         self.transfer(fact, out);
     }
@@ -339,44 +400,7 @@ fn worklist_matches_reference_across_call_return_and_exceptional_edges() {
 
 #[test]
 fn worklist_matches_reference_for_deferred_call_to_return_edges() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "leaf.rs",
-            r#"
-                pub async fn async_leaf() -> i32 {
-                    7
-                }
-            "#,
-        )
-        .file(
-            "lib.rs",
-            r#"
-                mod leaf;
-                use crate::leaf::async_leaf;
-
-                pub fn make_future() {
-                    let _pending = async_leaf();
-                }
-            "#,
-        )
-        .build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let mut graph = IcfgGraph::materialize(
-        &project,
-        &analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn make_future()")
-            .procedure("make_future")
-            .effect("entry"),
-    );
-    graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn make_future()")
-            .procedure("make_future")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let graph = rust_deferred_call_icfg();
 
     assert!(edge_is(
         graph.snapshot(),
@@ -456,33 +480,7 @@ fn cleanup_edges_use_normal_flow_and_loops_reach_a_reference_fixed_point() {
 
 #[test]
 fn seed_and_transfer_output_permutations_have_identical_results() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "lib.rs",
-            r#"
-                pub fn choose(flag: bool) -> i32 {
-                    if flag { 1 } else { 2 }
-                }
-            "#,
-        )
-        .build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let mut graph = IcfgGraph::materialize(
-        &project,
-        &analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-    );
-    graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let graph = rust_choose_icfg();
 
     let root = graph.node("root");
     let second = graph
@@ -515,33 +513,7 @@ fn seed_and_transfer_output_permutations_have_identical_results() {
 
 #[test]
 fn nonzero_facts_can_be_killed_while_zero_remains_on_every_path() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "lib.rs",
-            r#"
-                pub fn choose(flag: bool) -> i32 {
-                    if flag { 1 } else { 2 }
-                }
-            "#,
-        )
-        .build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let mut graph = IcfgGraph::materialize(
-        &project,
-        &analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-    );
-    graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let graph = rust_choose_icfg();
 
     let root = graph.node("root");
     let result = assert_matches_reference(&graph, &KillProblem { seed: root });

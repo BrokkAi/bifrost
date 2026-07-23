@@ -1,38 +1,21 @@
 //! Client contracts for bounded distributive data-flow problems.
 
-use std::fmt;
 use std::hash::Hash;
 
+use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::semantic::{IcfgEdge, IcfgEdgeId, IcfgNodeId, IcfgNodeKey, IcfgSnapshot};
 
-/// A run-local dense identifier for one client fact.
-///
-/// Fact IDs are assigned deterministically by the solver and are meaningful
-/// only within the result of that solver run.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FactId(u32);
-
-impl FactId {
-    pub(crate) const fn new(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-
-    pub(crate) const fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    pub(crate) fn try_from_index(index: usize) -> Option<Self> {
-        u32::try_from(index).ok().map(Self)
-    }
-}
-
-impl fmt::Display for FactId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+define_dense_id! {
+    /// A run-local dense identifier for one client fact.
+    ///
+    /// Fact IDs are assigned deterministically by the solver and are meaningful
+    /// only within the result of that solver run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct FactId {
+        new: pub(crate),
+        get: pub,
+        index: pub(crate),
+        try_from_index: pub(crate),
     }
 }
 
@@ -47,6 +30,18 @@ impl<F> DataflowSeed<F> {
     pub const fn new(node: IcfgNodeId, fact: F) -> Self {
         Self { node, fact }
     }
+}
+
+/// Kernel-controlled output for seeds and transfer facts.
+///
+/// [`DataflowOutput::emit`] returns `false` when cancellation or a work limit
+/// asks the callback to stop. The kernel will not retain additional rows even
+/// if a callback ignores that signal, but clients must return cooperatively to
+/// keep their own CPU work bounded.
+pub trait DataflowOutput<T> {
+    /// Emit one row, returning whether the callback may continue.
+    #[must_use]
+    fn emit(&mut self, value: T) -> bool;
 }
 
 /// Borrowed topology for one transfer-function evaluation.
@@ -128,23 +123,38 @@ pub trait DistributiveDataflowProblem {
     /// Append every explicit, context-specific seed for this run.
     ///
     /// Seed production, like transfer evaluation, must be finite, repeatable,
-    /// and cooperatively returning; the kernel validates and charges the
-    /// canonicalized rows only after this callback returns.
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>);
+    /// and cooperatively returning. The kernel deduplicates and preflights
+    /// retained rows before allowing its callback buffer to grow.
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>);
 
     /// Transfer over an ordinary intraprocedural edge.
     ///
     /// This includes branch, loop, cleanup, and async-normal edges. Cleanup
     /// remains visible through the original `IcfgEdgeKind`.
-    fn normal_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
+    fn normal_flow(
+        &self,
+        edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    );
 
     /// Transfer from a call site to a materialized callee entry.
-    fn call_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
+    fn call_flow(
+        &self,
+        edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    );
 
     /// Transfer from a callee exit to its matched caller continuation.
     ///
     /// The original edge distinguishes normal from exceptional return.
-    fn return_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
+    fn return_flow(
+        &self,
+        edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    );
 
     /// Transfer along an ICFG-provided call-to-continuation edge.
     ///
@@ -155,9 +165,14 @@ pub trait DistributiveDataflowProblem {
         &self,
         edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     );
 
     /// Transfer over local exceptional or async-exceptional control flow.
-    fn exceptional_flow(&self, edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>);
+    fn exceptional_flow(
+        &self,
+        edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    );
 }

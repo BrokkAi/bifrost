@@ -1,11 +1,14 @@
 mod common;
+#[path = "common/dataflow_fixtures.rs"]
+mod dataflow_fixtures;
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowError, DataflowRequest, DataflowResult, DataflowSeed, DirectFact,
-    DirectFlowProblem, DistributiveDataflowProblem, IcfgInputStatus, IcfgSolveInput, SolverBudget,
-    SolverBudgetDimension, SolverTermination, SolverWork, solve,
+    DataflowEdge, DataflowError, DataflowOutput, DataflowRequest, DataflowResult, DataflowSeed,
+    DirectFact, DirectFlowProblem, DistributiveDataflowProblem, IcfgInputStatus, IcfgSolveInput,
+    SolverBudget, SolverBudgetDimension, SolverTermination, SolverWork, solve,
 };
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, IcfgLimitKind, IcfgNodeId, IcfgSnapshot, IcfgSnapshotLimits, SemanticBudget,
@@ -21,6 +24,7 @@ use common::{
         PointSelector, reachable_icfg_nodes,
     },
 };
+use dataflow_fixtures::{rust_choose_icfg, rust_deferred_call_icfg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum GeneratingFact {
@@ -33,10 +37,11 @@ struct GeneratingProblem {
 }
 
 impl GeneratingProblem {
-    fn transfer(fact: GeneratingFact, out: &mut Vec<GeneratingFact>) {
+    fn transfer(fact: GeneratingFact, out: &mut dyn DataflowOutput<GeneratingFact>) {
         match fact {
-            GeneratingFact::Seed => out.push(GeneratingFact::Generated),
-            GeneratingFact::Generated => out.push(GeneratingFact::Generated),
+            GeneratingFact::Seed | GeneratingFact::Generated => {
+                let _ = out.emit(GeneratingFact::Generated);
+            }
         }
     }
 }
@@ -48,19 +53,34 @@ impl DistributiveDataflowProblem for GeneratingProblem {
         GeneratingFact::Seed
     }
 
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>) {
-        out.push(DataflowSeed::new(self.seed, GeneratingFact::Seed));
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, GeneratingFact::Seed));
     }
 
-    fn normal_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         Self::transfer(fact, out);
     }
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         Self::transfer(fact, out);
     }
 
-    fn return_flow(&self, _edge: DataflowEdge<'_>, fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         Self::transfer(fact, out);
     }
 
@@ -68,7 +88,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
         &self,
         _edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         Self::transfer(fact, out);
     }
@@ -77,7 +97,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
         &self,
         _edge: DataflowEdge<'_>,
         fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         Self::transfer(fact, out);
     }
@@ -89,9 +109,9 @@ struct CancelOnTransferProblem {
 }
 
 impl CancelOnTransferProblem {
-    fn transfer(&self, out: &mut Vec<GeneratingFact>) {
+    fn transfer(&self, out: &mut dyn DataflowOutput<GeneratingFact>) {
         self.cancellation.cancel();
-        out.push(GeneratingFact::Generated);
+        let _ = out.emit(GeneratingFact::Generated);
     }
 }
 
@@ -102,19 +122,34 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
         GeneratingFact::Seed
     }
 
-    fn seeds(&self, out: &mut Vec<DataflowSeed<Self::Fact>>) {
-        out.push(DataflowSeed::new(self.seed, GeneratingFact::Seed));
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, GeneratingFact::Seed));
     }
 
-    fn normal_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         self.transfer(out);
     }
 
-    fn call_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         self.transfer(out);
     }
 
-    fn return_flow(&self, _edge: DataflowEdge<'_>, _fact: Self::Fact, out: &mut Vec<Self::Fact>) {
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
         self.transfer(out);
     }
 
@@ -122,7 +157,7 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
         &self,
         _edge: DataflowEdge<'_>,
         _fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         self.transfer(out);
     }
@@ -131,7 +166,146 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
         &self,
         _edge: DataflowEdge<'_>,
         _fact: Self::Fact,
-        out: &mut Vec<Self::Fact>,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(out);
+    }
+}
+
+struct SeedBurstProblem {
+    seed: IcfgNodeId,
+    attempts: Cell<usize>,
+}
+
+impl DistributiveDataflowProblem for SeedBurstProblem {
+    type Fact = u32;
+
+    fn zero_fact(&self) -> Self::Fact {
+        0
+    }
+
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for fact in 1..=10 {
+            self.attempts.set(self.attempts.get() + 1);
+            if !out.emit(DataflowSeed::new(self.seed, fact)) {
+                break;
+            }
+        }
+    }
+
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
+
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
+
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
+
+    fn call_to_return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
+
+    fn exceptional_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        _out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+    }
+}
+
+struct TransferBurstProblem {
+    seed: IcfgNodeId,
+    attempts: Cell<usize>,
+    cancel_on_stop: Option<CancellationToken>,
+}
+
+impl TransferBurstProblem {
+    fn transfer(&self, out: &mut dyn DataflowOutput<u32>) {
+        for fact in 1..=10 {
+            self.attempts.set(self.attempts.get() + 1);
+            if !out.emit(fact) {
+                if let Some(cancellation) = &self.cancel_on_stop {
+                    cancellation.cancel();
+                }
+                break;
+            }
+        }
+    }
+}
+
+impl DistributiveDataflowProblem for TransferBurstProblem {
+    type Fact = u32;
+
+    fn zero_fact(&self) -> Self::Fact {
+        0
+    }
+
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        let _ = out.emit(DataflowSeed::new(self.seed, 0));
+    }
+
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(out);
+    }
+
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(out);
+    }
+
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(out);
+    }
+
+    fn call_to_return_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(out);
+    }
+
+    fn exceptional_flow(
+        &self,
+        _edge: DataflowEdge<'_>,
+        _fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         self.transfer(out);
     }
@@ -376,33 +550,7 @@ fn icfg_input_conversion_preserves_budget_exhaustion_and_rejects_missing_snapsho
 
 #[test]
 fn completeness_keeps_input_edge_and_boundary_uncertainty_separate() {
-    let complete_project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "lib.rs",
-            r#"
-                pub fn choose(flag: bool) -> i32 {
-                    if flag { 1 } else { 2 }
-                }
-            "#,
-        )
-        .build();
-    let complete_analyzer = complete_project.workspace_analyzer(AnalyzerConfig::default());
-    let mut complete_graph = IcfgGraph::materialize(
-        &complete_project,
-        &complete_analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-    );
-    complete_graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let complete_graph = rust_choose_icfg();
     let root = complete_graph.node("root");
     let complete_result = solve_direct(complete_graph.solve_input(), root);
     assert!(complete_result.is_complete(), "{complete_result:#?}");
@@ -470,44 +618,7 @@ fn completeness_keeps_input_edge_and_boundary_uncertainty_separate() {
     );
     assert!(!partial_result.is_complete());
 
-    let boundary_project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "leaf.rs",
-            r#"
-                pub async fn async_leaf() -> i32 {
-                    7
-                }
-            "#,
-        )
-        .file(
-            "lib.rs",
-            r#"
-                mod leaf;
-                use crate::leaf::async_leaf;
-
-                pub fn make_future() {
-                    let _pending = async_leaf();
-                }
-            "#,
-        )
-        .build();
-    let boundary_analyzer = boundary_project.workspace_analyzer(AnalyzerConfig::default());
-    let mut boundary_graph = IcfgGraph::materialize(
-        &boundary_project,
-        &boundary_analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn make_future")
-            .procedure("make_future")
-            .effect("entry"),
-    );
-    boundary_graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn make_future")
-            .procedure("make_future")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let boundary_graph = rust_deferred_call_icfg();
     let boundary_result = solve_direct(boundary_graph.solve_input(), boundary_graph.node("root"));
     assert_eq!(
         boundary_result.coverage().input_status(),
@@ -519,33 +630,7 @@ fn completeness_keeps_input_edge_and_boundary_uncertainty_separate() {
 
 #[test]
 fn cancellation_before_and_during_transfer_publishes_no_cancelled_output() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "lib.rs",
-            r#"
-                pub fn choose(flag: bool) -> i32 {
-                    if flag { 1 } else { 2 }
-                }
-            "#,
-        )
-        .build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let mut graph = IcfgGraph::materialize(
-        &project,
-        &analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-    );
-    graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let graph = rust_choose_icfg();
     let root = graph.node("root");
 
     let cancelled = CancellationToken::default();
@@ -581,33 +666,7 @@ fn cancellation_before_and_during_transfer_publishes_no_cancelled_output() {
 
 #[test]
 fn each_budget_dimension_stops_atomically_before_output_publication() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "lib.rs",
-            r#"
-                pub fn choose(flag: bool) -> i32 {
-                    if flag { 1 } else { 2 }
-                }
-            "#,
-        )
-        .build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let mut graph = IcfgGraph::materialize(
-        &project,
-        &analyzer,
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-    );
-    graph.bind_node(
-        "root",
-        "lib.rs",
-        PointSelector::new("pub fn choose")
-            .procedure("choose")
-            .effect("entry"),
-        CallContextSelector::root(),
-    );
+    let graph = rust_choose_icfg();
     let root = graph.node("root");
     let problem = GeneratingProblem { seed: root };
 
@@ -630,7 +689,7 @@ fn each_budget_dimension_stops_atomically_before_output_publication() {
         (SolverBudgetDimension::InternedFacts, 1, 2),
         (SolverBudgetDimension::ReachedStates, 1, 3),
         (SolverBudgetDimension::FlowEvaluations, 0, 1),
-        (SolverBudgetDimension::PropagatedOutputs, 0, 2),
+        (SolverBudgetDimension::PropagatedOutputs, 0, 1),
     ] {
         let cancellation = CancellationToken::default();
         let mut budget = budget_with_limit(dimension, limit);
@@ -655,4 +714,90 @@ fn each_budget_dimension_stops_atomically_before_output_publication() {
         assert_eq!(result_nodes(&result), BTreeSet::from([root]));
         assert_eq!(budget.used(), result.work());
     }
+}
+
+#[test]
+fn callback_sinks_bound_seed_and_transfer_buffers_before_publication() {
+    let graph = rust_choose_icfg();
+    let root = graph.node("root");
+
+    let seed_problem = SeedBurstProblem {
+        seed: root,
+        attempts: Cell::new(0),
+    };
+    let cancellation = CancellationToken::default();
+    let mut seed_budget = budget_with_limit(SolverBudgetDimension::ReachedStates, 3);
+    let seed_result = solve(
+        graph.solve_input(),
+        &seed_problem,
+        &mut DataflowRequest::new(&mut seed_budget, &cancellation),
+    )
+    .expect("seed output exhaustion is a normal result");
+    let seed_exceeded = seed_result
+        .termination()
+        .budget_exceeded()
+        .expect("seed sink must stop");
+    assert_eq!(
+        (
+            seed_exceeded.dimension(),
+            seed_exceeded.limit(),
+            seed_exceeded.attempted(),
+        ),
+        (SolverBudgetDimension::ReachedStates, 3, 4)
+    );
+    assert_eq!(seed_problem.attempts.get(), 4);
+    assert!(seed_result.facts().is_empty());
+    assert!(seed_result.reached().is_empty());
+    assert_eq!(seed_budget.used(), SolverWork::default());
+
+    let transfer_problem = TransferBurstProblem {
+        seed: root,
+        attempts: Cell::new(0),
+        cancel_on_stop: None,
+    };
+    let mut transfer_budget = budget_with_limit(SolverBudgetDimension::PropagatedOutputs, 3);
+    let transfer_result = solve(
+        graph.solve_input(),
+        &transfer_problem,
+        &mut DataflowRequest::new(&mut transfer_budget, &cancellation),
+    )
+    .expect("transfer output exhaustion is a normal result");
+    let transfer_exceeded = transfer_result
+        .termination()
+        .budget_exceeded()
+        .expect("transfer sink must stop");
+    assert_eq!(
+        (
+            transfer_exceeded.dimension(),
+            transfer_exceeded.limit(),
+            transfer_exceeded.attempted(),
+        ),
+        (SolverBudgetDimension::PropagatedOutputs, 3, 4)
+    );
+    assert_eq!(transfer_problem.attempts.get(), 4);
+    assert_eq!(transfer_result.facts(), &[0]);
+    assert_eq!(result_nodes(&transfer_result), BTreeSet::from([root]));
+    assert_eq!(transfer_result.work().propagated_outputs, 0);
+}
+
+#[test]
+fn cancellation_after_sink_exhaustion_takes_precedence() {
+    let graph = rust_choose_icfg();
+    let cancellation = CancellationToken::default();
+    let problem = TransferBurstProblem {
+        seed: graph.node("root"),
+        attempts: Cell::new(0),
+        cancel_on_stop: Some(cancellation.clone()),
+    };
+    let mut budget = budget_with_limit(SolverBudgetDimension::PropagatedOutputs, 3);
+    let result = solve(
+        graph.solve_input(),
+        &problem,
+        &mut DataflowRequest::new(&mut budget, &cancellation),
+    )
+    .expect("cancellation is a normal partial result");
+
+    assert_eq!(problem.attempts.get(), 4);
+    assert_eq!(result.termination(), SolverTermination::Cancelled);
+    assert_eq!(result.work().propagated_outputs, 0);
 }

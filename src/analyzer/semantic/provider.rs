@@ -9,91 +9,16 @@ use crate::cancellation::CancellationToken;
 use super::capabilities::SemanticCapability;
 use super::ids::SemanticArtifactKey;
 use super::ir::{SemanticArtifact, SemanticIrError};
+use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
-/// Declare every independently bounded semantic-materialization dimension once.
-///
-/// The registry generates the public dimension enum and its stable order together
-/// with every field-wise [`SemanticWork`] operation, preventing a newly added
-/// dimension from silently escaping validation, accounting, or remaining-work
-/// calculations.
-macro_rules! semantic_budget_dimensions {
-    ($($dimension:ident => $field:ident = $default_limit:expr),+ $(,)?) => {
-        #[repr(u8)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub enum SemanticBudgetDimension {
-            $($dimension),+
-        }
-
-        impl SemanticBudgetDimension {
-            pub const ALL: [Self; count_idents!($($dimension),+)] = [
-                $(Self::$dimension),+
-            ];
-
-            pub const fn label(self) -> &'static str {
-                match self {
-                    $(Self::$dimension => stringify!($field)),+
-                }
-            }
-        }
-
-        /// Work performed or limits applied while materializing semantic facts.
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-        pub struct SemanticWork {
-            $(pub $field: usize),+
-        }
-
-        impl SemanticWork {
-            pub const fn uniform(value: usize) -> Self {
-                Self {
-                    $($field: value),+
-                }
-            }
-
-            pub const fn get(self, dimension: SemanticBudgetDimension) -> usize {
-                match dimension {
-                    $(SemanticBudgetDimension::$dimension => self.$field),+
-                }
-            }
-
-            const fn default_limits() -> Self {
-                Self {
-                    $($field: $default_limit),+
-                }
-            }
-
-            pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
-                Some(Self {
-                    $($field: self.$field.checked_add(other.$field)?),+
-                })
-            }
-
-            /// Add work conservatively, using a uniformly maximal sentinel if
-            /// any dimension overflows.
-            ///
-            /// Budget accounting treats overflow as an unconditional stop. A
-            /// single shared operation keeps that policy consistent across
-            /// lowering, CFG/ICFG construction, and oracle materialization.
-            pub(crate) fn conservative_add(self, other: Self) -> Self {
-                self.checked_add(other)
-                    .unwrap_or_else(|| Self::uniform(usize::MAX))
-            }
-
-            pub(crate) fn component_max(self, other: Self) -> Self {
-                Self {
-                    $($field: self.$field.max(other.$field)),+
-                }
-            }
-
-            fn saturating_sub(self, other: Self) -> Self {
-                Self {
-                    $($field: self.$field.saturating_sub(other.$field)),+
-                }
-            }
-        }
-    };
-}
-
-semantic_budget_dimensions! {
+define_work_dimensions! {
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum SemanticBudgetDimension;
+    /// Work performed or limits applied while materializing semantic facts.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct SemanticWork;
+    all: pub [16];
     SourceBytes => source_bytes = 16 * 1024 * 1024,
     Procedures => procedures = 10_000,
     Blocks => blocks = 100_000,
@@ -112,11 +37,40 @@ semantic_budget_dimensions! {
     OwnedTextBytes => owned_text_bytes = 32 * 1024 * 1024,
 }
 
+impl SemanticWork {
+    /// Add work conservatively, using a uniformly maximal sentinel if any
+    /// dimension overflows.
+    pub(crate) fn conservative_add(self, other: Self) -> Self {
+        self.checked_add(other)
+            .unwrap_or_else(|| Self::uniform(usize::MAX))
+    }
+
+    pub(crate) fn component_max(self, other: Self) -> Self {
+        Self {
+            source_bytes: self.source_bytes.max(other.source_bytes),
+            procedures: self.procedures.max(other.procedures),
+            blocks: self.blocks.max(other.blocks),
+            program_points: self.program_points.max(other.program_points),
+            values: self.values.max(other.values),
+            allocations: self.allocations.max(other.allocations),
+            call_sites: self.call_sites.max(other.call_sites),
+            memory_locations: self.memory_locations.max(other.memory_locations),
+            captures: self.captures.max(other.captures),
+            source_mappings: self.source_mappings.max(other.source_mappings),
+            evidence: self.evidence.max(other.evidence),
+            gaps: self.gaps.max(other.gaps),
+            events: self.events.max(other.events),
+            control_edges: self.control_edges.max(other.control_edges),
+            nested_entries: self.nested_entries.max(other.nested_entries),
+            owned_text_bytes: self.owned_text_bytes.max(other.owned_text_bytes),
+        }
+    }
+}
+
 /// A positive finite set of semantic materialization limits and its used work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticBudget {
-    limits: SemanticWork,
-    used: SemanticWork,
+    ledger: BudgetLedger<SemanticWork>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +131,16 @@ impl fmt::Display for SemanticBudgetExceeded {
 
 impl std::error::Error for SemanticBudgetExceeded {}
 
+impl From<WorkBudgetExceeded<SemanticBudgetDimension>> for SemanticBudgetExceeded {
+    fn from(exceeded: WorkBudgetExceeded<SemanticBudgetDimension>) -> Self {
+        Self {
+            dimension: exceeded.dimension(),
+            limit: exceeded.limit(),
+            attempted: exceeded.attempted(),
+        }
+    }
+}
+
 impl SemanticBudget {
     pub fn new(limits: SemanticWork) -> Result<Self, InvalidSemanticBudget> {
         for dimension in SemanticBudgetDimension::ALL {
@@ -185,8 +149,7 @@ impl SemanticBudget {
             }
         }
         Ok(Self {
-            limits,
-            used: SemanticWork::default(),
+            ledger: BudgetLedger::new(limits, SemanticWork::default()),
         })
     }
 
@@ -195,47 +158,25 @@ impl SemanticBudget {
     }
 
     pub const fn limits(&self) -> SemanticWork {
-        self.limits
+        self.ledger.limits()
     }
 
     pub const fn used(&self) -> SemanticWork {
-        self.used
+        self.ledger.used()
     }
 
-    pub fn remaining(&self) -> SemanticWork {
-        self.limits.saturating_sub(self.used)
+    pub const fn remaining(&self) -> SemanticWork {
+        self.limits().saturating_sub(self.used())
     }
 
     /// Check one atomic charge without mutating this budget.
     pub fn check(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
-        for dimension in SemanticBudgetDimension::ALL {
-            let limit = self.limits.get(dimension);
-            let Some(attempted) = self.used.get(dimension).checked_add(work.get(dimension)) else {
-                return Err(SemanticBudgetExceeded {
-                    dimension,
-                    limit,
-                    attempted: usize::MAX,
-                });
-            };
-            if attempted > limit {
-                return Err(SemanticBudgetExceeded {
-                    dimension,
-                    limit,
-                    attempted,
-                });
-            }
-        }
-        Ok(())
+        self.ledger.check(work).map_err(Into::into)
     }
 
     /// Atomically charge work; a failed charge leaves the budget unchanged.
     pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
-        self.check(work)?;
-        self.used = self
-            .used
-            .checked_add(work)
-            .expect("validated semantic budget charge cannot overflow");
-        Ok(())
+        self.ledger.charge(work).map_err(Into::into)
     }
 }
 

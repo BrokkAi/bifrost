@@ -7,16 +7,22 @@
 //! witnesses, IDE edge functions, and domain-specific clients remain separate
 //! follow-up work.
 
+mod budget;
 mod direct;
-mod outcome;
+mod input;
 mod problem;
+mod quality;
+mod result;
 mod tabulation;
 
-pub use direct::{DirectFact, DirectFlowProblem};
-pub use outcome::{
-    DataflowCoverage, DataflowError, DataflowRequest, DataflowResult, IcfgInputStatus,
-    IcfgSolveInput, PathQuality, PathQualityFrontier, ReachedFact, SolverBudget,
-    SolverBudgetDimension, SolverBudgetExceeded, SolverTermination, SolverWork,
+pub use budget::{
+    DataflowRequest, SolverBudget, SolverBudgetDimension, SolverBudgetExceeded, SolverWork,
 };
-pub use problem::{DataflowEdge, DataflowSeed, DistributiveDataflowProblem, FactId};
+pub use direct::{DirectFact, DirectFlowProblem};
+pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput};
+pub use problem::{
+    DataflowEdge, DataflowOutput, DataflowSeed, DistributiveDataflowProblem, FactId,
+};
+pub use quality::{PathQuality, PathQualityFrontier};
+pub use result::{DataflowCoverage, DataflowResult, ReachedFact, SolverTermination};
 pub use tabulation::solve;

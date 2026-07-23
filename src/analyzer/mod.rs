@@ -11,6 +11,7 @@ mod cpp;
 mod csharp;
 pub mod dataflow;
 pub(crate) mod declaration_range;
+mod dense_id;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
@@ -41,6 +42,7 @@ pub(crate) mod type_relations;
 mod typescript;
 mod usage_facts;
 pub mod usages;
+mod work_budget;
 mod workspace;
 
 pub use capabilities::{
