@@ -450,10 +450,10 @@ impl SearchToolsService {
         let root = project.root().to_path_buf();
         let watcher_starter = production_watcher_starter();
         let workspace = if persisted {
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config)
+            WorkspaceAnalyzer::build_persisted_for_service(Arc::clone(&project), config)
                 .map_err(|error| format!("Failed to build persisted workspace: {error}"))?
         } else {
-            WorkspaceAnalyzer::build(Arc::clone(&project), config)
+            WorkspaceAnalyzer::build_for_service(Arc::clone(&project), config)
         };
         let session = assemble_session(
             project,
@@ -1997,9 +1997,11 @@ fn build_persisted_workspace(
     root: PathBuf,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
-    let workspace =
-        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    let workspace = WorkspaceAnalyzer::build_persisted_for_service(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+    )
+    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
     Ok((project, workspace))
 }
 
@@ -2013,7 +2015,7 @@ fn build_persisted_workspace_at(
     db_path: &Path,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
-    let workspace = WorkspaceAnalyzer::build_persisted_at(
+    let workspace = WorkspaceAnalyzer::build_persisted_at_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
         db_path,
@@ -2026,7 +2028,8 @@ fn build_transient_workspace(
     root: PathBuf,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
-    let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+    let workspace =
+        WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
 }
 

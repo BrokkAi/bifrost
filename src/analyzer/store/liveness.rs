@@ -239,8 +239,8 @@ impl LivePathEntry {
     }
 }
 
-#[derive(Default)]
 pub struct LivePathMap {
+    revalidate_filesystem: bool,
     state: Mutex<LivePathMapState>,
 }
 
@@ -256,10 +256,27 @@ struct MemoizedLivePathMapSnapshot {
     snapshot: Arc<LiveSnapshot>,
 }
 
+impl Default for LivePathMap {
+    fn default() -> Self {
+        Self {
+            revalidate_filesystem: true,
+            state: Mutex::new(LivePathMapState::default()),
+        }
+    }
+}
+
 impl LivePathMap {
+    pub fn trust_filesystem_generation() -> Self {
+        Self {
+            revalidate_filesystem: false,
+            state: Mutex::new(LivePathMapState::default()),
+        }
+    }
+
     pub fn fork(&self) -> Self {
         let guard = self.state.lock().expect("live path map mutex poisoned");
         Self {
+            revalidate_filesystem: self.revalidate_filesystem,
             state: Mutex::new(LivePathMapState {
                 generation: guard.generation,
                 paths: guard.paths.clone(),
@@ -322,7 +339,10 @@ impl LivePathMap {
         {
             return Arc::clone(&memoized.snapshot);
         }
-        let snapshot = Arc::new(snapshot_from_path_states(&guard.paths));
+        let snapshot = Arc::new(snapshot_from_path_states(
+            &guard.paths,
+            self.revalidate_filesystem,
+        ));
         guard.snapshot = Some(MemoizedLivePathMapSnapshot {
             generation: guard.generation,
             snapshot: Arc::clone(&snapshot),
@@ -454,7 +474,10 @@ fn build_snapshot(
     })
 }
 
-fn snapshot_from_path_states(path_to_state: &HashMap<ProjectFile, PathState>) -> LiveSnapshot {
+fn snapshot_from_path_states(
+    path_to_state: &HashMap<ProjectFile, PathState>,
+    revalidate_filesystem: bool,
+) -> LiveSnapshot {
     let mut oid_to_paths: HashMap<Oid, Vec<ProjectFile>> = HashMap::default();
     let mut live_states = HashMap::default();
     for (file, state) in path_to_state {
@@ -470,7 +493,7 @@ fn snapshot_from_path_states(path_to_state: &HashMap<ProjectFile, PathState>) ->
             .or_default()
             .push(file.clone());
         let mut live_state = state.clone();
-        live_state.validated = state.stat.is_none();
+        live_state.validated = state.stat.is_none() || !revalidate_filesystem;
         live_states.insert(file.clone(), live_state);
     }
     LiveSnapshot {
