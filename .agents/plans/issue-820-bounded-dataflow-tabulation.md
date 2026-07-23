@@ -17,8 +17,8 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - [x] (2026-07-23 11:25Z) Verified live issue #820 and synchronized the detached worktree to `origin/master` at `447638f1`.
 - [x] (2026-07-23 11:50Z) Audited the current `IcfgSnapshot`, semantic outcome, cancellation, budget, receiver-analysis, fixed-point, compact-graph, and test-harness seams with parallel specialists.
 - [x] (2026-07-23 12:15Z) Froze the bounded first-child scope and created this issue-specific ExecPlan.
-- [ ] Implement the public problem, input, budget, outcome, and direct-flow contracts under `src/analyzer/dataflow/`.
-- [ ] Implement deterministic iterative propagation and path/input completeness accounting.
+- [x] (2026-07-23 14:46Z) Implemented the public problem, input, budget, outcome, and direct-flow contracts under `src/analyzer/dataflow/`.
+- [x] (2026-07-23 14:46Z) Implemented deterministic iterative propagation and path/input completeness accounting; `cargo check --lib` passes.
 - [ ] Add the independent repeated-scan reference and behavior-focused direct/differential tests.
 - [ ] Run formatting, focused tests, strict all-target/all-feature Clippy, and the feature-enabled regression suite.
 - [ ] Run specialist review, resolve findings, and record final outcomes and validation evidence.
@@ -43,6 +43,12 @@ This first child deliberately stops before reusable procedure summaries, recursi
 - Observation: Bifrost symbol search does not currently return macro-generated dense semantic ID definitions such as `ProgramPointId`, `CallSiteId`, `ControlEdgeId`, and `BlockId`.
   Evidence: `search_symbols` returned no definitions; `rg` located the generating macro invocation in `src/analyzer/semantic/ids.rs`. This is a tooling follow-up candidate and does not require a workaround in the solver.
 
+- Observation: an independent integration-test reference runner cannot invoke the same public transfer contract if `DataflowEdge` is constructible only inside the crate.
+  Evidence: the initial descriptor constructor was crate-private. The final API adds `DataflowEdge::from_snapshot`, which resolves the edge and both endpoints from one immutable snapshot and rejects mismatched or invalid rows.
+
+- Observation: solver budgets cannot preempt arbitrary work performed inside a client callback that has not returned.
+  Evidence: seeds and transfer outputs enter client-owned `Vec` callbacks before the kernel can sort, deduplicate, charge, or observe cancellation. This first-party slice therefore documents finite, repeatable, cooperatively returning callbacks; its four dimensions atomically bound work admitted by the kernel, not hostile client execution. A bounded output-sink contract remains a possible later hardening if untrusted clients are introduced.
+
 ## Decision Log
 
 - Decision: implement a bounded snapshot solver as the first #820 child and explicitly defer end-summary recursion, reusable summaries, witnesses, and IDE edge functions.
@@ -62,7 +68,7 @@ This first child deliberately stops before reusable procedure summaries, recursi
   Date/Author: 2026-07-23 / Codex
 
 - Decision: intern orderable run-local client facts inside the kernel, with the distinguished zero fact interned first.
-  Rationale: dense `FactId` values make hot reached-state keys compact. Sorting and deduplicating seeds and transfer outputs before interning makes IDs and result order deterministic without using sorted maps in the worklist.
+  Rationale: dense `FactId` values make hot reached-state keys compact. The kernel injects zero at every explicit seed node and preserves it across every edge after invoking the client callback, which supplies the standard zeroed-flow control carrier even when a client kills all domain facts. Sorting and deduplicating seeds and transfer outputs before interning makes IDs and result order deterministic without using sorted maps in the worklist.
   Date/Author: 2026-07-23 / Codex
 
 - Decision: keep input quality, solver termination, per-state path quality, and global coverage separate.
@@ -77,9 +83,13 @@ This first child deliberately stops before reusable procedure summaries, recursi
   Rationale: cleanup is a distinct semantic edge and must remain visible through the edge descriptor; treating every cleanup edge as exceptional would invent a control interpretation.
   Date/Author: 2026-07-23 / Codex
 
+- Decision: retain the component-wise nondominated frontier of concrete path qualities per reached state.
+  Rationale: joining proof and completeness component-wise could fabricate a proven-complete quality from two different paths when neither individual path established both. Conversely, a proof-first total order is not preserved by conjunction with later edge quality: a discarded unproven-complete path can become stronger after a later unproven edge. The frontier contains at most the two incomparable proven-partial and unproven-complete profiles, queues each newly admitted profile independently, and discards only component-wise dominated paths.
+  Date/Author: 2026-07-23 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation has not started. The principal design outcome so far is an honest boundary: this child can establish deterministic context-respecting propagation over the bounded ICFG, but it cannot establish the epic's later summary-driven recursion or reusable procedure-summary claims.
+The additive production module now compiles. It contains the finite unary problem contract, run-local deterministic fact interning, explicit input and path quality, four-dimensional atomic budgeting, cancellation checkpoints, direct-flow client, and a FIFO worklist over every current ICFG edge family. Behavior-focused and differential fixture validation is in progress. The scope boundary remains unchanged: this child establishes context-respecting propagation over a bounded ICFG, not the epic's later summary-driven recursion or reusable procedure-summary claims.
 
 ## Context and Orientation
 
@@ -97,9 +107,9 @@ Path quality describes the strongest individual path retained for one reached st
 
 Create `src/analyzer/dataflow/problem.rs`. Define the dense `FactId`, typed `DataflowSeed<Fact>`, and a borrowed `DataflowEdge` descriptor containing the edge ID, edge, and source/target node keys. Define `DistributiveDataflowProblem` with an orderable, copyable, hashable associated `Fact`, a distinguished `zero_fact`, an explicit seed producer, and separate `normal_flow`, `call_flow`, `return_flow`, `call_to_return_flow`, and `exceptional_flow` callbacks. Every callback receives the original edge descriptor so normal and exceptional return channels remain distinguishable. No callback receives the whole reached set or a protocol type.
 
-Create `src/analyzer/dataflow/outcome.rs`. Define `IcfgInputStatus` mirroring every `SemanticOutcome<IcfgSnapshot>` quality and `IcfgSolveInput` with checked outcome conversion. Define `SolverWork`, `SolverBudgetDimension`, `SolverBudget`, `SolverBudgetExceeded`, and `DataflowRequest` following the atomic check-and-charge pattern in `SemanticBudget`. Define solver termination, path quality, global coverage, reached rows, result accessors, and stable graph/seed errors. A result is globally complete only when its input status is complete, termination reached a fixed point, and no reachable unproven edge, partial edge, or ICFG boundary was observed.
+Create `src/analyzer/dataflow/outcome.rs`. Define `IcfgInputStatus` mirroring every `SemanticOutcome<IcfgSnapshot>` quality and `IcfgSolveInput` with checked outcome conversion. Define `SolverWork`, `SolverBudgetDimension`, `SolverBudget`, `SolverBudgetExceeded`, and `DataflowRequest` following the atomic check-and-charge pattern in `SemanticBudget`. Define solver termination, concrete path quality and its nondominated frontier, global coverage, reached rows, result accessors, and stable graph/seed errors. A result is globally complete only when its input status is complete, termination reached a fixed point, and no reachable unproven edge, partial edge, or ICFG boundary was observed.
 
-Create `src/analyzer/dataflow/tabulation.rs`. Validate interprocedural edge origins and every seed node before propagation. Intern the zero fact first, canonicalize seeds by `(node, fact)`, and use a FIFO `VecDeque` plus hash-backed reached/interner tables. Never iterate a hash table to schedule work. For each current state, traverse the already canonical successor row, invoke exactly one transfer family, sort and deduplicate its outputs, check cancellation, stage all work charges, then publish fact IDs and new or quality-improved states atomically. Requeue a state only when it is newly reached or gains a strictly stronger path quality. Freeze facts and reached rows deterministically.
+Create `src/analyzer/dataflow/tabulation.rs`. Validate interprocedural edge origins and every seed node before propagation. Intern the zero fact first, inject it beside every explicit seed, canonicalize seeds by `(node, fact)`, and use a FIFO `VecDeque` plus hash-backed reached/interner tables. Never iterate a hash table to schedule work. For each current state and nondominated path-quality profile, traverse the already canonical successor row, invoke exactly one transfer family, preserve zero automatically, sort and deduplicate outputs, check cancellation, stage all work charges, then publish fact IDs and new or quality-improved states atomically. Requeue a profile only when it is newly admitted to a state's frontier. Freeze facts and reached rows deterministically.
 
 Create `src/analyzer/dataflow/direct.rs`. Implement a one-fact `DirectFlowProblem` whose five callbacks preserve that fact. Its constructor accepts explicit seed node IDs; it never assumes that dense node zero is the analysis root. This is a small real client rather than a typestate-shaped test double.
 
@@ -163,7 +173,7 @@ Expected: all enabled library and integration tests pass, with only repository-d
 
 The problem contract is accepted when a client can supply a finite ordered fact type, a distinguished zero fact, explicit context-specific seeds, and all five unary transfer families without importing typestate, taint, heap, policy, or language-adapter types.
 
-The kernel is accepted when direct, call, return, call-to-return, and local exceptional edges each invoke exactly one matching callback; `Cleanup` stays visible as its original control kind; invalid seeds fail rather than appearing as isolated nodes; and matched returns never cross call contexts.
+The kernel is accepted when direct, call, return, call-to-return, and local exceptional edges each invoke exactly one matching callback; zero is injected at every seed and survives every edge without preventing callbacks from generating facts; `Cleanup` stays visible as its original control kind; invalid seeds fail rather than appearing as isolated nodes; and matched returns never cross call contexts.
 
 Determinism is accepted when seed and output permutations produce byte-for-byte equal typed results, work reports, coverage rows, fact IDs, and reached ordering. Internal hash iteration must not influence scheduling or output.
 

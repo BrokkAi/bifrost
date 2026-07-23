@@ -9,6 +9,7 @@ mod complete_value_cache;
 mod config;
 mod cpp;
 mod csharp;
+pub mod dataflow;
 pub(crate) mod declaration_range;
 mod global_usage_definition_index;
 mod go;
