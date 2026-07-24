@@ -453,6 +453,62 @@ fn warm_csharp_factory_return_receiver_query_is_candidate_bounded() {
 }
 
 #[test]
+fn warm_csharp_unconstrained_extension_receiver_metadata_survives_store_roundtrip() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "Extensions.cs",
+        r#"
+namespace Demo;
+
+public interface IMarked {}
+
+public static class Extensions
+{
+    public static T Echo<T>(this T value) => value;
+    public static T Restricted<T>(this T value) where T : IMarked => value;
+}
+"#,
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "generic extension metadata");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(
+        root.canonicalize().unwrap(),
+        Language::CSharp,
+    ));
+
+    let cold = build_persisted(project.clone(), AnalyzerConfig::default());
+    drop(cold);
+    let warm = build_persisted(project, AnalyzerConfig::default());
+    let declarations = warm.analyzer().get_all_declarations();
+
+    for (name, expected_unconstrained) in [("Echo", true), ("Restricted", false)] {
+        let extension = declarations
+            .iter()
+            .find(|unit| {
+                unit.identifier() == name
+                    && warm
+                        .analyzer()
+                        .parent_of(unit)
+                        .is_some_and(|owner| owner.fq_name() == "Demo.Extensions")
+            })
+            .unwrap_or_else(|| panic!("missing warm Demo.Extensions.{name}: {declarations:#?}"));
+        let metadata = warm
+            .analyzer()
+            .signature_metadata(extension)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing warm signature metadata for {name}"));
+        assert_eq!(
+            metadata.extension_receiver_is_unconstrained_type_parameter(),
+            expected_unconstrained,
+            "{name}: {metadata:#?}"
+        );
+    }
+}
+
+#[test]
 fn warm_multilanguage_rust_definition_query_does_not_build_full_definition_index() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

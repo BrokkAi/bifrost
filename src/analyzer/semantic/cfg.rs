@@ -84,6 +84,15 @@ impl ProcedureCfgBuilder {
         self.prospective_work
     }
 
+    /// Charge one adapter-owned bounded traversal step that is not otherwise
+    /// represented by a retained CFG row.
+    pub(crate) fn descend_nested_entry(&mut self) -> Result<(), SemanticBudgetExceeded> {
+        self.reserve(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })
+    }
+
     pub(crate) fn add_source_mapping(
         &mut self,
         mapping: SourceMapping,

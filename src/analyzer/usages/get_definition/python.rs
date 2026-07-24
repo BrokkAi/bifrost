@@ -3,6 +3,10 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::lexical_definitions::{
     PythonMethodBinding, formal_parameter_slots_for_owner_bounded,
 };
+use crate::analyzer::python::bindings::{
+    PythonLexicalNameResolution, PythonLexicalScopeInventory,
+    python_unambiguous_module_class_binding_bounded,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -188,7 +192,7 @@ pub(crate) fn python_type_lookup_resolution_bounded(
         site.focus_end_byte,
     )?;
     let target_kind = if node.kind() == "identifier"
-        && !python_is_bound_value_identifier(support, node, source)
+        && !python_has_lexical_binding_bounded(support, node, source)
         && python_class_candidate_for_name(support, file, source, node, python_slice(node, source))
             .is_some()
     {
@@ -329,29 +333,40 @@ fn python_type_for_expression_bounded(
     match node.kind() {
         "identifier" => {
             let name = python_slice(node, source);
-            python_current_receiver_class(support, file, source, node, name)
-                .or_else(|| {
-                    python_bound_type_for_identifier(
-                        support,
-                        file,
-                        source,
-                        root,
-                        node,
-                        name,
-                        depth + 1,
-                    )
-                })
-                .or_else(|| python_class_candidate_for_name(support, file, source, node, name))
+            if let Some(receiver) = python_current_receiver_class(support, file, source, node, name)
+            {
+                Some(receiver)
+            } else if python_has_lexical_binding_bounded(support, node, source) {
+                python_bound_type_for_identifier(support, file, source, root, node, name, depth + 1)
+            } else {
+                python_class_candidate_for_name(support, file, source, node, name)
+            }
         }
         "call" => {
             let function = node.child_by_field_name("function")?;
             let callable = match function.kind() {
                 "identifier" => {
                     let name = python_slice(function, source);
-                    if let Some(class) =
-                        python_class_candidate_for_name(support, file, source, function, name)
-                    {
-                        return Some(class);
+                    let lexical_binding = python_lexical_binding_bounded(support, function, source);
+                    match lexical_binding {
+                        PythonLexicalBinding::Other => return None,
+                        PythonLexicalBinding::LocalFunction(declaration) => {
+                            return python_function_return_type_from_node_bounded(
+                                support,
+                                file,
+                                source,
+                                root,
+                                declaration,
+                                depth + 1,
+                            );
+                        }
+                        PythonLexicalBinding::UnboundOrGlobal => {
+                            if let Some(class) = python_class_candidate_for_name(
+                                support, file, source, function, name,
+                            ) {
+                                return Some(class);
+                            }
+                        }
                     }
                     unique_python_candidate(
                         support
@@ -462,13 +477,28 @@ fn python_same_file_class_visible_at(
         return Some(false);
     }
     let declaration_scope = python_class_declaration_scope_bounded(support, declaration)?;
-    Some(match declaration_scope {
-        PythonClassDeclarationScope::Module => true,
+    let visible = match declaration_scope {
+        PythonClassDeclarationScope::Module => {
+            let mut root = site;
+            while let Some(parent) = root.parent() {
+                if !support.scope_step() {
+                    return None;
+                }
+                root = parent;
+            }
+            python_unambiguous_module_class_binding_bounded(
+                root,
+                source,
+                candidate.identifier(),
+                || support.scope_step(),
+            )?
+        }
         PythonClassDeclarationScope::Class(scope) => visibility
             .class_scope
             .is_some_and(|visible| visible == scope),
         PythonClassDeclarationScope::Other => false,
-    })
+    };
+    Some(visible)
 }
 
 fn python_reference_visibility_bounded<'tree>(
@@ -938,6 +968,17 @@ fn python_callable_return_type_in_tree(
         stack.extend(children.into_iter().rev());
     }
     let function = (functions.len() == 1).then(|| functions.remove(0))?;
+    python_function_return_type_from_node_bounded(support, file, source, root, function, depth)
+}
+
+fn python_function_return_type_from_node_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    function: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
     if let Some(annotation) = function.child_by_field_name("return_type") {
         return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
     }
@@ -988,66 +1029,112 @@ fn python_enclosing_callable_bounded<'tree>(
     None
 }
 
-fn python_is_bound_value_identifier(
+fn python_has_lexical_binding_bounded(
     support: &PythonDefinitionProvider<'_>,
     identifier: Node<'_>,
     source: &str,
 ) -> bool {
+    !matches!(
+        python_lexical_binding_bounded(support, identifier, source),
+        PythonLexicalBinding::UnboundOrGlobal
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PythonLexicalBinding<'tree> {
+    UnboundOrGlobal,
+    LocalFunction(Node<'tree>),
+    Other,
+}
+
+fn python_lexical_binding_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    identifier: Node<'tree>,
+    source: &str,
+) -> PythonLexicalBinding<'tree> {
     let name = python_slice(identifier, source);
-    if matches!(name, "self" | "cls") {
-        return true;
-    }
-    let Some(function) = python_enclosing_callable_bounded(support, identifier) else {
-        return false;
-    };
-    if let Some(parameters) = function.child_by_field_name("parameters") {
-        let mut stack = vec![parameters];
-        while let Some(node) = stack.pop() {
-            if !support.scope_step() {
-                return true;
-            }
-            if node.kind() == "identifier" && python_slice(node, source) == name {
-                return true;
-            }
-            let Some(children) = python_named_children_bounded(support, node) else {
-                return true;
-            };
-            stack.extend(children.into_iter().rev());
-        }
-    }
-    let Some(body) = function.child_by_field_name("body") else {
-        return false;
-    };
-    let mut stack = vec![body];
-    while let Some(node) = stack.pop() {
+    let reference_start = identifier.start_byte();
+    let reference_end = identifier.end_byte();
+    let mut current = identifier;
+    let mut unresolved_nonlocal = false;
+    while let Some(candidate) = current.parent() {
         if !support.scope_step() {
-            return true;
+            // Exhausted or cancelled binding discovery must never reopen the
+            // module-level class fallback.
+            return PythonLexicalBinding::Other;
         }
-        if node != body
-            && matches!(
-                node.kind(),
-                "function_definition" | "lambda" | "class_definition"
-            )
+        if matches!(candidate.kind(), "function_definition" | "lambda")
+            && candidate.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= reference_start && reference_end <= body.end_byte()
+            })
         {
-            continue;
+            let Some(inventory) =
+                PythonLexicalScopeInventory::collect_bounded(candidate, source, || {
+                    support.scope_step()
+                })
+            else {
+                return PythonLexicalBinding::Other;
+            };
+            match inventory.name_resolution_at(name, identifier) {
+                PythonLexicalNameResolution::Local => {
+                    let Some(declaration) = inventory.local_function_declaration(name, identifier)
+                    else {
+                        return PythonLexicalBinding::Other;
+                    };
+                    let Some(PythonFunctionDeclarationScope::Function(owner)) =
+                        python_function_declaration_scope_bounded(support, declaration)
+                    else {
+                        return PythonLexicalBinding::Other;
+                    };
+                    let Some(nearest) = python_enclosing_body_callable_bounded(support, identifier)
+                    else {
+                        return PythonLexicalBinding::Other;
+                    };
+                    return if owner == candidate
+                        && (nearest != owner || declaration.start_byte() <= identifier.start_byte())
+                    {
+                        PythonLexicalBinding::LocalFunction(declaration)
+                    } else {
+                        PythonLexicalBinding::Other
+                    };
+                }
+                PythonLexicalNameResolution::Nonlocal => unresolved_nonlocal = true,
+                PythonLexicalNameResolution::Global => {
+                    return PythonLexicalBinding::UnboundOrGlobal;
+                }
+                PythonLexicalNameResolution::Unbound => {}
+            }
         }
-        let binding = match node.kind() {
-            "assignment" => node.child_by_field_name("left"),
-            "named_expression" => node.child_by_field_name("name"),
-            "for_statement" | "for_in_clause" => node.child_by_field_name("left"),
-            _ => None,
-        };
-        if binding.is_some_and(|binding| {
-            binding.kind() == "identifier" && python_slice(binding, source) == name
-        }) {
-            return true;
-        }
-        let Some(children) = python_named_children_bounded(support, node) else {
-            return true;
-        };
-        stack.extend(children.into_iter().rev());
+        current = candidate;
     }
-    false
+    if unresolved_nonlocal {
+        PythonLexicalBinding::Other
+    } else {
+        PythonLexicalBinding::UnboundOrGlobal
+    }
+}
+
+fn python_enclosing_body_callable_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let reference_start = node.start_byte();
+    let reference_end = node.end_byte();
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if !support.scope_step() {
+            return None;
+        }
+        if matches!(candidate.kind(), "function_definition" | "lambda")
+            && candidate.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= reference_start && reference_end <= body.end_byte()
+            })
+        {
+            return Some(candidate);
+        }
+        parent = candidate.parent();
+    }
+    None
 }
 
 pub(super) fn resolve_python(
@@ -2248,5 +2335,151 @@ mod bounded_tests {
         );
 
         assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
+
+    #[test]
+    fn bounded_python_local_function_call_retains_its_return_type() {
+        let source = r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller() -> None:
+    def make() -> Product:
+        return Product()
+
+    value = make()
+    value.run()
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Python, &[("local_factory.py", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "local_factory.py");
+        let tree = parse_python_tree(source).expect("Python tree");
+        let start_byte = source.rfind("run").expect("member name");
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "run".to_string(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "run".len(),
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "run".len(),
+        };
+        let outcome = resolve_python_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("local factory lookup did not complete: {outcome:#?}");
+        };
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name().ends_with("Product.run")),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_python_local_function_requires_definite_visibility() {
+        for (path, source) in [
+            (
+                "forward_local_factory.py",
+                r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller() -> None:
+    value = make()
+    value.run()
+
+    def make() -> Product:
+        return Product()
+"#,
+            ),
+            (
+                "conditional_local_factory.py",
+                r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller(flag) -> None:
+    if flag:
+        def make() -> Product:
+            return Product()
+
+    value = make()
+    value.run()
+"#,
+            ),
+            (
+                "header_forward_local_factory.py",
+                r#"class Product:
+    def run(self) -> None:
+        pass
+
+def outer() -> None:
+    def nested(argument=make().run()) -> None:
+        pass
+
+    def make() -> Product:
+        return Product()
+"#,
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Python, &[(path, source)]);
+            let file = ProjectFile::new(fixture.project_root(), path);
+            let tree = parse_python_tree(source).expect("Python tree");
+            let start_byte = source.rfind("run").expect("member name");
+            let start_line = source[..start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let site = ResolvedReferenceSite {
+                path: rel_path_string(&file),
+                text: "run".to_string(),
+                range: Range {
+                    start_byte,
+                    end_byte: start_byte + "run".len(),
+                    start_line,
+                    end_line: start_line,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: start_byte + "run".len(),
+            };
+            let outcome = resolve_python_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{path} lookup did not complete: {outcome:#?}");
+            };
+            assert!(
+                value
+                    .definitions
+                    .iter()
+                    .all(|definition| !definition.fq_name().ends_with("Product.run")),
+                "{path}: {value:#?}"
+            );
+        }
     }
 }

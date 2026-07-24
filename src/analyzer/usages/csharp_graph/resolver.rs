@@ -1950,14 +1950,14 @@ pub(in crate::analyzer::usages) fn is_extension_method(
 pub(in crate::analyzer::usages) fn extension_method_receiver_type(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
-) -> Option<String> {
+) -> Option<CSharpExtensionReceiver> {
     extension_method_receiver_type_inner(analyzer, unit, false, None)
 }
 
 fn usage_extension_method_receiver_type(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
-) -> Option<String> {
+) -> Option<CSharpExtensionReceiver> {
     extension_method_receiver_type_inner(analyzer, unit, true, None)
 }
 
@@ -1965,8 +1965,13 @@ fn extension_method_receiver_type_in_session(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     session: &ResolutionSession,
-) -> Option<String> {
+) -> Option<CSharpExtensionReceiver> {
     extension_method_receiver_type_inner(analyzer, unit, false, Some(session))
+}
+
+pub(in crate::analyzer::usages) enum CSharpExtensionReceiver {
+    Any,
+    Exact(String),
 }
 
 fn extension_method_receiver_type_inner(
@@ -1974,7 +1979,7 @@ fn extension_method_receiver_type_inner(
     unit: &CodeUnit,
     usage: bool,
     session: Option<&ResolutionSession>,
-) -> Option<String> {
+) -> Option<CSharpExtensionReceiver> {
     if !unit.is_function() {
         return None;
     }
@@ -1987,6 +1992,9 @@ fn extension_method_receiver_type_inner(
     );
     match session {
         Some(session) => metadata.iter().find_map(|metadata| {
+            if metadata.extension_receiver_is_unconstrained_type_parameter() {
+                return Some(CSharpExtensionReceiver::Any);
+            }
             let identity = metadata.extension_receiver_type_identity()?;
             let name = identity.nominal_name_with(|| session.scope_step())?;
             if csharp_structured_name_is_method_type_parameter(name, metadata) {
@@ -1999,17 +2007,26 @@ fn extension_method_receiver_type_inner(
                 identity,
                 session,
             )
+            .map(CSharpExtensionReceiver::Exact)
         }),
         None => {
+            if metadata
+                .iter()
+                .any(crate::analyzer::SignatureMetadata::extension_receiver_is_unconstrained_type_parameter)
+            {
+                return Some(CSharpExtensionReceiver::Any);
+            }
             let receiver_type = metadata
                 .iter()
                 .find_map(|metadata| metadata.extension_receiver_type())?;
             let resolved =
                 resolve_member_type_fq_name(csharp, unit.source(), &owner, receiver_type, usage);
             if usage {
-                resolved
+                resolved.map(CSharpExtensionReceiver::Exact)
             } else {
-                resolved.or_else(|| Some(normalize_type_text(receiver_type)))
+                resolved
+                    .or_else(|| Some(normalize_type_text(receiver_type)))
+                    .map(CSharpExtensionReceiver::Exact)
             }
         }
     }
@@ -2243,16 +2260,17 @@ fn visible_extension_method_candidates_inner(
             let Some(receiver) = receiver else {
                 continue;
             };
-            let matches_receiver = |receiver: String| {
-                let receiver = csharp_normalize_full_name(&receiver);
+            let matches_receiver = |receiver: &str| {
+                let receiver = csharp_normalize_full_name(receiver);
                 compatible_receiver_types
                     .iter()
                     .any(|candidate| type_identity_matches(candidate, &receiver))
             };
-            let compatible = if usage {
-                compatible_receiver_types.is_empty() || matches_receiver(receiver)
-            } else {
-                matches_receiver(receiver)
+            let compatible = match receiver {
+                CSharpExtensionReceiver::Any => true,
+                CSharpExtensionReceiver::Exact(receiver) => {
+                    (usage && compatible_receiver_types.is_empty()) || matches_receiver(&receiver)
+                }
             };
             if compatible {
                 filtered.push(unit);

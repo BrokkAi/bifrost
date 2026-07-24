@@ -593,6 +593,15 @@ fn csharp_signature_metadata(
         .filter(|receiver_type| !receiver_type.is_empty());
     let extension_receiver_type_identity = extension_receiver_type_node
         .and_then(|type_node| csharp_structured_type_identity(type_node, source, lexical_scope));
+    let extension_receiver_is_unconstrained_type_parameter = extension_receiver_type_node
+        .is_some_and(|type_node| {
+            let receiver = cs_node_text(type_node, source).trim();
+            type_node.kind() == "identifier"
+                && type_parameters
+                    .iter()
+                    .any(|parameter| parameter == receiver)
+                && !csharp_method_type_parameter_has_constraints(node, source, receiver)
+        });
     let parameter_text = csharp_rendered_parameter_text(node, source);
     let metadata = if let Some(parameters_start) = signature.find(&parameter_text) {
         let parameters_end = parameters_start + parameter_text.len();
@@ -620,6 +629,9 @@ fn csharp_signature_metadata(
             .with_bare_return_type_parameter(bare_return_type_parameter)
             .with_extension_receiver_type(extension_receiver_type)
             .with_extension_receiver_type_identity(extension_receiver_type_identity)
+            .with_extension_receiver_is_unconstrained_type_parameter(
+                extension_receiver_is_unconstrained_type_parameter,
+            )
     } else {
         SignatureMetadata::new(signature, Vec::new())
             .with_callable_arity(callable_arity)
@@ -629,6 +641,9 @@ fn csharp_signature_metadata(
             .with_bare_return_type_parameter(bare_return_type_parameter)
             .with_extension_receiver_type(extension_receiver_type)
             .with_extension_receiver_type_identity(extension_receiver_type_identity)
+            .with_extension_receiver_is_unconstrained_type_parameter(
+                extension_receiver_is_unconstrained_type_parameter,
+            )
     };
     metadata.with_dispatch_extensibility(super::csharp_callable_dispatch_extensibility(
         source,
@@ -703,6 +718,22 @@ fn csharp_method_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
             (!text.is_empty()).then(|| text.to_string())
         })
         .collect()
+}
+
+fn csharp_method_type_parameter_has_constraints(
+    node: Node<'_>,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_parameter_constraints_clause")
+        .any(|clause| {
+            let mut clause_cursor = clause.walk();
+            clause.named_children(&mut clause_cursor).any(|child| {
+                child.kind() == "identifier" && cs_node_text(child, source).trim() == parameter_name
+            })
+        })
 }
 
 fn csharp_declaration_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {

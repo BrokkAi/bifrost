@@ -464,16 +464,10 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         }
 
         let facts = Arc::new(facts);
-        let snapshot_key = self.structural_snapshot_key(file, source);
-        if let Some(key) = snapshot_key.as_ref()
-            && let Ok(payload) = facts.encode_snapshot()
-        {
-            let _ = self.persist_structural_facts_snapshot(
-                key,
-                STRUCTURAL_FACTS_SNAPSHOT_VERSION,
-                &payload,
-            );
-        }
+        // The bounded query path must remain promptly cancellable. Durable snapshot encoding
+        // clones every normalized node and role edge before serialization, so leave that
+        // optional optimization to the ordinary materialization path rather than performing
+        // an unmetered post-extraction traversal here.
         self.structural_cache()
             .insert_complete(file, source, Arc::clone(&facts));
         StructuralFactsLimitedOutcome::Available {

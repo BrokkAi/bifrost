@@ -201,3 +201,94 @@ public class Caller
         "{value}"
     );
 }
+
+#[test]
+fn csharp_unconstrained_generic_extension_is_exact_but_constrained_applicability_stays_open() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "GenericExtensions.cs",
+            r#"
+namespace Demo;
+
+public interface IMarked {}
+public sealed class Registered {}
+
+public static class Extensions
+{
+    public static T Echo<T>(this T value) => value;
+    public static T Restricted<T>(this T value) where T : IMarked => value;
+}
+
+public static class Caller
+{
+    public static void Call()
+    {
+        var value = new Registered();
+        value.Echo();
+        value.Restricted();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    let echo = member_function(&analyzer, "Demo.Extensions", "Echo");
+    let restricted = member_function(&analyzer, "Demo.Extensions", "Restricted");
+
+    let echo_metadata = analyzer
+        .signature_metadata(&echo)
+        .into_iter()
+        .next()
+        .expect("generic extension metadata");
+    assert!(
+        echo_metadata.extension_receiver_is_unconstrained_type_parameter(),
+        "{echo_metadata:#?}"
+    );
+    let restricted_metadata = analyzer
+        .signature_metadata(&restricted)
+        .into_iter()
+        .next()
+        .expect("constrained extension metadata");
+    assert!(
+        !restricted_metadata.extension_receiver_is_unconstrained_type_parameter(),
+        "{restricted_metadata:#?}"
+    );
+
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let member_targets = |member: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["csharp"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": member },
+                "receiver": { "name": "value" }
+            },
+            "steps": [{ "op": "member_targets" }]
+        }))
+        .expect("generic extension receiver query");
+        let result = execute_workspace(&workspace, &query);
+        serde_json::to_value(result).expect("serialize generic extension query")
+    };
+
+    let echo_value = member_targets("Echo");
+    assert_eq!(
+        echo_value["results"][0]["outcome"], "precise",
+        "{echo_value}"
+    );
+    assert_eq!(
+        echo_value["results"][0]["member_targets"][0]["fq_name"], "Demo.Extensions.Echo",
+        "{echo_value}"
+    );
+
+    let restricted_value = member_targets("Restricted");
+    assert_ne!(
+        restricted_value["results"][0]["outcome"], "precise",
+        "{restricted_value}"
+    );
+    assert!(
+        restricted_value["results"][0]["member_targets"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{restricted_value}"
+    );
+}

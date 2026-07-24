@@ -414,17 +414,15 @@ fn callable_shape<'tree>(
         _ => return None,
     };
     let is_generator = body_contains_yield(body);
-    let dispatch_extensibility = if is_static
-        || matches!(
-            kind,
-            ProcedureKind::Constructor
-                | ProcedureKind::Function
-                | ProcedureKind::LocalFunction
-                | ProcedureKind::Closure
-                | ProcedureKind::Lambda
-        )
-        || has_direct_named_child(node, "final_modifier")
+    let dispatch_extensibility = if matches!(
+        kind,
+        ProcedureKind::Function
+            | ProcedureKind::LocalFunction
+            | ProcedureKind::Closure
+            | ProcedureKind::Lambda
+    ) || has_direct_named_child(node, "final_modifier")
         || has_private_visibility(node, source)
+        || enclosing_type_closes_dispatch(node)
     {
         DispatchExtensibility::Closed
     } else {
@@ -455,6 +453,22 @@ fn has_private_visibility(node: Node<'_>, source: &str) -> bool {
         child.kind() == "visibility_modifier"
             && node_text(source, child).is_some_and(|text| text.eq_ignore_ascii_case("private"))
     })
+}
+
+fn enclosing_type_closes_dispatch(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "class_declaration" => {
+                return has_direct_named_child(parent, "final_modifier");
+            }
+            // PHP enums and anonymous classes cannot be subclassed, so their
+            // methods and constructors have no overriding dispatch arm.
+            "enum_declaration" | "anonymous_class" => return true,
+            "interface_declaration" | "trait_declaration" => return false,
+            _ => node = parent,
+        }
+    }
+    false
 }
 
 fn enclosing_trait(mut node: Node<'_>) -> bool {

@@ -274,6 +274,57 @@ impl LocalTrait for Self {
 }
 
 #[test]
+fn rust_inline_module_impl_before_type_uses_the_declared_owner_identity() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+mod child {
+    impl Local {
+        fn build() -> Self {
+            Self
+        }
+    }
+
+    struct Local;
+
+    impl super::other::Sibling {
+        fn sibling() -> Self {
+            Self
+        }
+    }
+}
+
+mod other {
+    pub(super) struct Sibling;
+}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let owner = definition(&analyzer, "child.Local");
+    let method = definition(&analyzer, "child.Local.build");
+    assert!(
+        analyzer
+            .get_direct_children(&owner)
+            .iter()
+            .any(|child| child == &method),
+        "the early impl member must attach to the later declaration, not an equal-FQN orphan"
+    );
+
+    let sibling = definition(&analyzer, "other.Sibling");
+    let sibling_method = definition(&analyzer, "other.Sibling.sibling");
+    assert!(
+        analyzer
+            .get_direct_children(&sibling)
+            .iter()
+            .any(|child| child == &sibling_method),
+        "a qualified early impl must use the later sibling-module declaration identity"
+    );
+}
+
+#[test]
 fn test_impl_for_self_type() {
     let analyzer = RustAnalyzer::from_project(rust_project(&[(
         "lib.rs",

@@ -895,6 +895,13 @@ fn apply_dispatch_outcome(
 
     definitions.sort();
     definitions.dedup();
+    if status == DefinitionLookupStatus::Ambiguous {
+        // Definition lookup may retain the declarations that explain an
+        // ambiguity (for example, competing Go promoted members). They are
+        // evidence for why dispatch is unresolved, not executable call
+        // targets: the source program has no selected callable in this state.
+        definitions.clear();
+    }
     if definitions.len() > max_targets {
         definitions.truncate(max_targets);
         lookup.truncated = true;
@@ -1810,7 +1817,7 @@ object Calls {
     }
 
     #[test]
-    fn dispatch_mapping_preserves_status_boundaries_and_partial_candidates() {
+    fn dispatch_mapping_preserves_status_boundaries_without_ambiguous_targets() {
         let root = std::env::temp_dir();
         let file = ProjectFile::new(root, "dispatch.ts");
         let first = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "first");
@@ -1831,14 +1838,17 @@ object Calls {
             1,
         );
         assert_eq!(ambiguous.status, Some(DefinitionLookupStatus::Ambiguous));
-        assert_eq!(ambiguous.targets.len(), 1);
-        assert_eq!(ambiguous.targets[0].proof, UsageProof::Unproven);
-        assert!(ambiguous.truncated);
-        assert!(ambiguous.budget_exhausted);
         assert!(
-            ambiguous
-                .boundaries
-                .contains(&CallDispatchBoundaryKind::Truncated)
+            ambiguous.targets.is_empty(),
+            "ambiguous definitions explain the unresolved lookup but are not executable targets"
+        );
+        assert!(!ambiguous.truncated);
+        assert!(!ambiguous.budget_exhausted);
+        assert_eq!(
+            ambiguous.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::Ambiguous
+            )]
         );
 
         let mut empty_ambiguous = CallDispatchLookup::default();

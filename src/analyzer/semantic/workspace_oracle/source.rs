@@ -577,7 +577,7 @@ fn append_observations(
         if procedure
             .semantics()
             .call_phase_points(candidates[*index].value.id())
-            .is_some_and(|points| !points.contains(&point.id()))
+            .is_some_and(|points| points.binary_search(&point.id()).is_err())
         {
             continue;
         }

@@ -1382,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_batch_context_reuses_parsed_declaration_source_for_repeated_field_lookups() {
+    fn rust_batch_context_reuses_supplied_syntax_for_repeated_field_lookups() {
         let source = "struct Inner { value: i32 }\nstruct Outer { inner: Inner }\nfn first(outer: Outer) -> i32 { outer.inner.value }\nfn second(outer: Outer) -> i32 { outer.inner.value }\n";
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
@@ -1413,8 +1413,8 @@ mod tests {
             context
                 .rust_type_cache
                 .parsed_declaration_source_count_for_test(),
-            1,
-            "one definition batch should parse each Rust declaration source once"
+            0,
+            "same-file definition lookup should reuse the batch's supplied syntax without reparsing"
         );
     }
 

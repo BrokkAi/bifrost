@@ -955,16 +955,16 @@ impl<'a> ReceiverQueryService<'a> {
             match build_receiver_site_index(
                 Arc::clone(facts),
                 ReceiverSiteIndexLimit {
-                    max_inspected_nodes: ledger.remaining_budget().max_scope_nodes,
+                    max_work_items: ledger.remaining_budget().max_scope_nodes,
                 },
                 cancellation,
             ) {
                 ReceiverSiteIndexBuild::Complete {
                     index,
-                    inspected_nodes,
+                    inspected_work,
                 } => {
                     ledger
-                        .charge_setup(inspected_nodes)
+                        .charge_setup(inspected_work)
                         .expect("completed site indexing fits its supplied receiver budget");
                     check_cancelled(cancellation)?;
                     let syntax_nodes = index.source().len().div_ceil(256).max(1);
@@ -1052,8 +1052,8 @@ impl<'a> ReceiverQueryService<'a> {
                         },
                     );
                 }
-                ReceiverSiteIndexBuild::Exceeded { inspected_nodes } => {
-                    let _ = ledger.charge_setup(inspected_nodes);
+                ReceiverSiteIndexBuild::Exceeded { inspected_work } => {
+                    let _ = ledger.charge_setup(inspected_work);
                     return Ok(setup_budget_report(
                         operation,
                         file,
@@ -1063,8 +1063,8 @@ impl<'a> ReceiverQueryService<'a> {
                         ledger.work(),
                     ));
                 }
-                ReceiverSiteIndexBuild::Cancelled { inspected_nodes } => {
-                    let _ = ledger.charge_setup(inspected_nodes);
+                ReceiverSiteIndexBuild::Cancelled { inspected_work } => {
+                    let _ = ledger.charge_setup(inspected_work);
                     return Err(ReceiverQueryError::Cancelled);
                 }
             }

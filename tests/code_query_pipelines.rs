@@ -928,6 +928,423 @@ def caller() -> None:
 }
 
 #[test]
+fn python_receiver_local_factory_function_preserves_its_return_type() {
+    let members = serialized(&run(
+        &[(
+            "local_factory.py",
+            r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller() -> None:
+    def make() -> Product:
+        return Product()
+
+    value = make()
+    value.run()
+"#,
+        )],
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "value" }
+            },
+            "inside": { "kind": "function", "name": "caller" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    let targets = members["results"][0]["member_targets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("local factory member targets: {members}"));
+    assert_eq!(targets.len(), 1, "{members}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("Product.run")),
+        "the local function binding must retain its structured return type: {members}"
+    );
+}
+
+#[test]
+fn python_receiver_module_class_inventory_rejects_hidden_and_rebound_classes() {
+    let hidden = serialized(&run(
+        &[(
+            "hidden_function_class.py",
+            r#"def hidden() -> None:
+    class Service:
+        def run(self) -> None:
+            pass
+
+def caller() -> None:
+    value = Service()
+    value.run()
+"#,
+        )],
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "value", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "caller" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert!(
+        hidden["results"][0]["values"]
+            .as_array()
+            .is_none_or(|values| values.iter().all(|value| {
+                value["receiver_value_kind"] != "allocation_site"
+                    && !value.to_string().contains("Service")
+            })),
+        "a class hidden in an unrelated function must not create a module allocation: {hidden}"
+    );
+
+    let rebound = [(
+        "rebound_module_class.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+Service = lambda: object()
+
+def caller() -> None:
+    value = Service()
+    value.run()
+"#,
+    )];
+    assert_python_module_service_shadowed(&rebound, "caller");
+}
+
+fn assert_python_module_service_shadowed(files: &[(&str, &str)], function: &str) {
+    let members = serialized(&run(
+        files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "value" }
+            },
+            "inside": { "kind": "function", "name": function },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(members["results"].as_array().unwrap().len(), 1, "{members}");
+    assert!(
+        members["results"][0]["member_targets"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a lexical `{function}` binding must suppress the module Service class: {members}"
+    );
+    assert!(
+        !members["results"][0].to_string().contains("Service.run"),
+        "{members}"
+    );
+
+    let receivers = serialized(&run(
+        files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "value", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": function },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert_eq!(
+        receivers["results"].as_array().unwrap().len(),
+        1,
+        "{receivers}"
+    );
+    assert!(
+        receivers["results"][0]["values"]
+            .as_array()
+            .is_none_or(|values| values.iter().all(|value| {
+                value["receiver_value_kind"] != "allocation_site"
+                    && !value.to_string().contains("Service")
+            })),
+        "an unresolved lexical `{function}` call must stay unknown: {receivers}"
+    );
+}
+
+fn assert_python_module_service_visible(files: &[(&str, &str)], function: &str) {
+    let members = serialized(&run(
+        files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "value" }
+            },
+            "inside": { "kind": "function", "name": function },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    let targets = members["results"][0]["member_targets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("module Service targets for {function}: {members}"));
+    assert_eq!(targets.len(), 1, "{members}");
+    assert!(
+        targets[0]["fq_name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("Service.run")),
+        "the module Service class must remain visible in `{function}`: {members}"
+    );
+
+    let receivers = serialized(&run(
+        files,
+        json!({
+            "languages": ["python"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "value", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": function },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    ));
+    assert!(
+        receivers["results"][0]["values"]
+            .to_string()
+            .contains("Service"),
+        "the module Service allocation must remain visible in `{function}`: {receivers}"
+    );
+}
+
+#[test]
+fn python_receiver_module_class_is_blocked_by_ordinary_lexical_shadowing() {
+    let files = [(
+        "ordinary_shadowed.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def parameter_shadow(Service) -> None:
+    value = Service()
+    value.run()
+
+def assignment_shadow() -> None:
+    Service = lambda: object()
+    value = Service()
+    value.run()
+
+def destructured_shadow() -> None:
+    Service, unused = (lambda: object(), None)
+    value = Service()
+    value.run()
+
+def function_shadow() -> None:
+    def Service():
+        return object()
+    value = Service()
+    value.run()
+
+def header_walrus_shadow() -> None:
+    def nested(argument=(Service := lambda: object())):
+        return argument
+    value = Service()
+    value.run()
+"#,
+    )];
+
+    for function in [
+        "parameter_shadow",
+        "assignment_shadow",
+        "destructured_shadow",
+        "function_shadow",
+        "header_walrus_shadow",
+    ] {
+        assert_python_module_service_shadowed(&files, function);
+    }
+}
+
+#[test]
+fn python_receiver_nested_scope_headers_bind_but_bodies_do_not_leak() {
+    let shadowed_files = [(
+        "nested_headers.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def class_header_walrus_shadow() -> None:
+    class Nested((Service := lambda: object())):
+        pass
+    value = Service()
+    value.run()
+
+def lambda_header_walrus_shadow() -> None:
+    nested = lambda argument=(Service := lambda: object()): argument
+    value = Service()
+    value.run()
+"#,
+    )];
+    for function in ["class_header_walrus_shadow", "lambda_header_walrus_shadow"] {
+        assert_python_module_service_shadowed(&shadowed_files, function);
+    }
+
+    let visible_files = [(
+        "nested_bodies.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def nested_function_body_is_pruned() -> None:
+    def nested() -> None:
+        Service = lambda: object()
+
+    class Nested:
+        Service = lambda: object()
+
+    nested = lambda: (Service := object())
+    value = Service()
+    value.run()
+"#,
+    )];
+    assert_python_module_service_visible(&visible_files, "nested_function_body_is_pruned");
+}
+
+#[test]
+fn python_receiver_module_class_is_blocked_by_structured_binding_forms() {
+    let files = [(
+        "structured_shadowed.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def import_alias_shadow() -> None:
+    import package as Service
+    value = Service()
+    value.run()
+
+def direct_import_shadow() -> None:
+    from package import Service
+    value = Service()
+    value.run()
+
+def with_shadow(manager) -> None:
+    with manager as Service:
+        value = Service()
+        value.run()
+
+def except_shadow() -> None:
+    try:
+        raise RuntimeError()
+    except RuntimeError as Service:
+        value = Service()
+        value.run()
+
+def pattern_shadow(subject) -> None:
+    match subject:
+        case Service:
+            value = Service()
+            value.run()
+
+def delete_shadow() -> None:
+    del Service
+    value = Service()
+    value.run()
+"#,
+    )];
+
+    for function in [
+        "import_alias_shadow",
+        "direct_import_shadow",
+        "with_shadow",
+        "except_shadow",
+        "pattern_shadow",
+        "delete_shadow",
+    ] {
+        assert_python_module_service_shadowed(&files, function);
+    }
+}
+
+#[test]
+fn python_receiver_comprehension_walrus_and_nonlocal_suppress_module_fallback() {
+    let files = [(
+        "scoped_shadowed.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def comprehension_walrus_shadow(items) -> None:
+    [(Service := item) for item in items]
+    value = Service()
+    value.run()
+
+def nonlocal_outer() -> None:
+    Service = lambda: object()
+
+    def nonlocal_shadow() -> None:
+        nonlocal Service
+        value = Service()
+        value.run()
+
+    nonlocal_shadow()
+
+def captured_outer() -> None:
+    Service = lambda: object()
+
+    def captured_shadow() -> None:
+        value = Service()
+        value.run()
+
+    captured_shadow()
+"#,
+    )];
+
+    for function in [
+        "comprehension_walrus_shadow",
+        "nonlocal_shadow",
+        "captured_shadow",
+    ] {
+        assert_python_module_service_shadowed(&files, function);
+    }
+}
+
+#[test]
+fn python_receiver_comprehension_target_does_not_leak() {
+    let files = [(
+        "comprehension_scope.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def comprehension_target_does_not_leak(items) -> None:
+    [Service for Service in items]
+    value = Service()
+    value.run()
+"#,
+    )];
+    assert_python_module_service_visible(&files, "comprehension_target_does_not_leak");
+}
+
+#[test]
+fn python_receiver_global_directive_permits_module_fallback() {
+    let files = [(
+        "global_scope.py",
+        r#"class Service:
+    def run(self) -> None:
+        pass
+
+def global_binding() -> None:
+    global Service
+    value = Service()
+    value.run()
+"#,
+    )];
+    assert_python_module_service_visible(&files, "global_binding");
+}
+
+#[test]
 fn php_receiver_traversal_uses_neutral_values_and_exact_members() {
     let files = [(
         "receiver.php",

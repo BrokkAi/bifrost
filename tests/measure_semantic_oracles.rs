@@ -25,6 +25,7 @@ use brokk_bifrost::analyzer::semantic::{
     CancellationToken, CandidateCoverage, HeapOracle, ObservationPhase, OracleCallContext,
     SemanticBudget, SemanticEffect, SemanticOutcome, SemanticProviderError, SemanticRequest,
     SemanticValueKind, StableDigest, ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle,
+    ValueFlowRelationKind,
 };
 use brokk_bifrost::analyzer::structural::{CodeQuery, execute_workspace};
 use brokk_bifrost::{
@@ -879,6 +880,7 @@ fn rust_control_adapter_stays_behind_the_neutral_oracle_boundary() {
     let oracle = workspace.semantic_oracle_provider();
     let cancellation = CancellationToken::default();
     let mut heap_queries = 0usize;
+    let mut value_relations = 0usize;
     for procedure in artifact.procedures() {
         let handle = artifact
             .procedure_handle(procedure.id())
@@ -894,7 +896,18 @@ fn rust_control_adapter_stays_behind_the_neutral_oracle_boundary() {
         let snapshot = outcome
             .available_value()
             .expect("Rust control artifact keeps an explicit partial value-flow answer");
-        assert!(snapshot.relations().is_empty());
+        for relation in snapshot.relations() {
+            assert_ne!(
+                relation.kind,
+                ValueFlowRelationKind::LanguageDefined,
+                "Rust value flow must stay behind the neutral oracle relation contract"
+            );
+            assert!(
+                relation.is_proven_complete(),
+                "retained Rust value-flow evidence must be proven and complete: {relation:#?}"
+            );
+            value_relations += 1;
+        }
         assert_eq!(snapshot.coverage(), CandidateCoverage::Open);
 
         if let Some(value) = procedure.values().first() {
@@ -915,13 +928,14 @@ fn rust_control_adapter_stays_behind_the_neutral_oracle_boundary() {
                     &mut SemanticRequest::new(&mut budget, &cancellation),
                 )
                 .expect("generic points-to query on Rust control artifact");
-            assert_eq!(
-                outcome
-                    .available_value()
-                    .expect("Rust points-to answer retains an explicit partial set")
-                    .objects()
-                    .coverage(),
-                CandidateCoverage::Open
+            let coverage = outcome
+                .available_value()
+                .expect("Rust points-to answer retains an explicit bounded set")
+                .objects()
+                .coverage();
+            assert!(
+                !coverage.is_truncated(),
+                "default-budget Rust points-to pressure queries must not truncate"
             );
             heap_queries += 1;
         }
@@ -929,6 +943,10 @@ fn rust_control_adapter_stays_behind_the_neutral_oracle_boundary() {
     assert!(
         heap_queries > 0,
         "Rust fixture must pressure-test heap coverage"
+    );
+    assert!(
+        value_relations > 0,
+        "Rust fixture must pressure-test neutral value-flow projection"
     );
 }
 

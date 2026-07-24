@@ -106,7 +106,10 @@ fn collect_go_import_infos_from_declaration(
     }
 }
 
-fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
+fn go_import_spec_parts<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<(&'source str, Option<&'source str>)> {
     let path_node = node.child_by_field_name("path").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor)
@@ -116,24 +119,38 @@ fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
     let path = raw_path
         .trim_matches('"')
         .trim_matches('`')
-        .trim_matches('\'')
-        .to_string();
+        .trim_matches('\'');
     if path.is_empty() {
         return None;
     }
 
     let alias = node
         .child_by_field_name("name")
-        .map(|alias| go_node_text(alias, source).trim().to_string());
+        .map(|alias| go_node_text(alias, source).trim());
+    Some((path, alias))
+}
+
+pub(crate) fn go_import_spec_binding_name<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let (path, alias) = go_import_spec_parts(node, source)?;
+    Some(alias.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path)))
+}
+
+fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
+    let (path, alias) = go_import_spec_parts(node, source)?;
+    let identifier = Some(
+        alias
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path))
+            .to_string(),
+    );
+    let path = path.to_string();
+    let alias = alias.map(str::to_string);
     let raw_snippet = match alias.as_deref() {
         Some(alias) => format!("import {alias} \"{path}\""),
         None => format!("import \"{path}\""),
     };
-    let identifier = Some(
-        alias
-            .clone()
-            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path.as_str()).to_string()),
-    );
 
     Some(ImportInfo {
         raw_snippet,

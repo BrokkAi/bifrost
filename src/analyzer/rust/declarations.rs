@@ -154,6 +154,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     file,
                     source,
                     child,
+                    None,
                     &parsed.package_name.clone(),
                     &impl_import_binder,
                     false,
@@ -331,6 +332,21 @@ fn visit_rust_module(
     parsed.add_signature(code_unit.clone(), format!("mod {name} {{"));
 
     if let Some(body) = node.child_by_field_name("body") {
+        let mut impl_import_binder = ImportBinder::empty();
+        for index in 0..body.named_child_count() {
+            let Some(child) = body.named_child(index) else {
+                continue;
+            };
+            if child.kind() == "use_declaration" {
+                for import in rust_imports_from_use_declaration(child, source) {
+                    super::lexical_scope::insert_rust_import_binding(
+                        &mut impl_import_binder,
+                        &import,
+                    );
+                }
+            }
+        }
+
         for index in 0..body.named_child_count() {
             let Some(child) = body.named_child(index) else {
                 continue;
@@ -366,6 +382,18 @@ fn visit_rust_module(
                         Some(&code_unit),
                         package_name,
                         item_macro_definitions,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "impl_item" => {
+                    visit_rust_impl(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        &impl_import_binder,
                         in_test_region,
                         parsed,
                     );
@@ -800,6 +828,7 @@ fn visit_rust_macro_item(
                 file,
                 source,
                 child,
+                parent,
                 package_name,
                 impl_binder,
                 in_test_region,
@@ -1425,10 +1454,12 @@ fn visit_rust_alias(
     Some(code_unit)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_rust_impl(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
+    lexical_parent: Option<&CodeUnit>,
     package_name: &str,
     import_binder: &ImportBinder,
     parent_in_test_region: bool,
@@ -1437,9 +1468,15 @@ fn visit_rust_impl(
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    let Some(parent) =
-        rust_impl_owner(file, source, type_node, package_name, import_binder, parsed)
-    else {
+    let Some(parent) = rust_impl_owner(
+        file,
+        source,
+        type_node,
+        lexical_parent,
+        package_name,
+        import_binder,
+        parsed,
+    ) else {
         return;
     };
 
@@ -1504,13 +1541,19 @@ fn rust_impl_owner(
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
+    lexical_parent: Option<&CodeUnit>,
     package_name: &str,
     import_binder: &ImportBinder,
     parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
     let target_path = rust_nominal_type_path(type_node, source)?;
+    let lexical_package = match lexical_parent {
+        Some(parent) if package_name.is_empty() => parent.short_name().to_string(),
+        Some(parent) => format!("{package_name}.{}", parent.short_name()),
+        None => package_name.to_string(),
+    };
     let local_identity = RustImplOwnerIdentity {
-        package_name: package_name.to_string(),
+        package_name: lexical_package.clone(),
         short_name: target_path.join("."),
     };
     if let Some(owner) = rust_declared_impl_owner(parsed, &local_identity) {
@@ -1524,7 +1567,7 @@ fn rust_impl_owner(
         {
             let imported_name = binding.imported_name.as_ref()?;
             let resolved_package = super::imports::resolve_rust_module_path_with_crate(
-                package_name,
+                &lexical_package,
                 &super::imports::rust_crate_root_package(file),
                 &binding.module_specifier,
             )?;
@@ -1539,15 +1582,34 @@ fn rust_impl_owner(
             local_identity
         }
     } else {
-        rust_impl_owner_identity_from_path(file, package_name, &target_path, import_binder)?
+        rust_impl_owner_identity_from_path(file, &lexical_package, &target_path, import_binder)?
     };
 
     rust_declared_impl_owner(parsed, &identity).or_else(|| {
+        let expected_fqn = if identity.package_name.is_empty() {
+            identity.short_name.clone()
+        } else {
+            format!("{}.{}", identity.package_name, identity.short_name)
+        };
+        let local_short_name = if package_name.is_empty() {
+            Some(expected_fqn)
+        } else if identity.package_name == package_name {
+            Some(identity.short_name.clone())
+        } else {
+            identity
+                .package_name
+                .strip_prefix(package_name)
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .map(|suffix| format!("{suffix}.{}", identity.short_name))
+        };
+        let (owner_package, owner_short_name) = local_short_name
+            .map(|short_name| (package_name.to_string(), short_name))
+            .unwrap_or((identity.package_name, identity.short_name));
         Some(CodeUnit::new(
             file.clone(),
             crate::analyzer::CodeUnitType::Class,
-            identity.package_name,
-            identity.short_name,
+            owner_package,
+            owner_short_name,
         ))
     })
 }
@@ -1556,14 +1618,20 @@ fn rust_declared_impl_owner(
     parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     identity: &RustImplOwnerIdentity,
 ) -> Option<CodeUnit> {
+    let expected_fqn = if identity.package_name.is_empty() {
+        identity.short_name.clone()
+    } else {
+        format!("{}.{}", identity.package_name, identity.short_name)
+    };
     parsed
         .declarations()
         .iter()
         .find(|unit| {
             (unit.kind() == crate::analyzer::CodeUnitType::Class
                 || parsed.type_aliases.contains(*unit))
-                && unit.package_name() == identity.package_name
-                && unit.short_name() == identity.short_name
+                && ((unit.package_name() == identity.package_name
+                    && unit.short_name() == identity.short_name)
+                    || unit.fq_name() == expected_fqn)
         })
         .cloned()
 }

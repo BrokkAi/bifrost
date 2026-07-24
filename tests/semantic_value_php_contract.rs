@@ -75,6 +75,27 @@ class Sample {
         DispatchExtensibility::Open,
         "ordinary PHP methods retain an open inheritance and runtime-dispatch boundary"
     );
+    assert_eq!(
+        procedure_named(&graph, "factory", ProcedureKind::Method)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Open,
+        "static PHP methods remain overrideable for late-static dispatch"
+    );
+    assert_eq!(
+        procedure_named(&graph, "__construct", ProcedureKind::Constructor)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Closed,
+        "constructors declared by final PHP classes have closed dispatch"
+    );
+    assert_eq!(
+        procedure_named(&graph, "sink", ProcedureKind::Method)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Closed,
+        "private PHP methods have closed dispatch"
+    );
     let formal_receiver = instance
         .values()
         .iter()

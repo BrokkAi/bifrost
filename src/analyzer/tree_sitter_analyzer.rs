@@ -5611,7 +5611,12 @@ where
                 return LimitedQueryRows::complete(vec![state.package_name.clone()], 1);
             }
             let mut inspected = 1usize;
-            for unit in &state.declarations {
+            // `declarations` is a HashSet, so stopping at its first qualified
+            // unit makes bounded work depend on randomized iteration order.
+            // Top-level declarations retain source order and are sufficient
+            // to recover a file-level namespace when the adapter did not
+            // populate `package_name` directly.
+            for unit in &state.top_level_declarations {
                 if inspected == limit {
                     return LimitedQueryRows::incomplete(Vec::new(), inspected);
                 }
@@ -5644,28 +5649,53 @@ where
         let content_qualifier = self.store_query_or_record(
             self.store_context
                 .store
-                .content_package(oid, &storage_key, generation),
+                .content_package_limited(oid, &storage_key, generation, limit),
             format!("querying the bounded namespace qualifier for `{file}`"),
         );
-        let Some(Some(content_qualifier)) = content_qualifier else {
+        let Some(content_qualifier) = content_qualifier else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if !content_qualifier.is_empty() {
-            return LimitedQueryRows::complete(vec![content_qualifier], 1);
+        if !content_qualifier.complete {
+            return LimitedQueryRows::incomplete(Vec::new(), content_qualifier.inspected);
         }
-        if limit == 1 {
-            return LimitedQueryRows::incomplete(Vec::new(), 1);
+        let inspected = content_qualifier.inspected;
+        let Some(content_qualifier) = content_qualifier.rows.into_iter().next() else {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        };
+        if !content_qualifier.is_empty() {
+            return LimitedQueryRows::complete(vec![content_qualifier], inspected);
+        }
+        if inspected >= limit {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
         let declaration_qualifier = self.store_query_or_record(
             self.store_context
                 .store
-                .first_declaration_content_qualifier_for_key(oid, &storage_key, generation),
+                .first_declaration_content_qualifier_for_key_limited(
+                    oid,
+                    &storage_key,
+                    generation,
+                    limit - inspected,
+                ),
             format!("querying a bounded declaration namespace for `{file}`"),
         );
-        match declaration_qualifier {
-            Some(qualifier) => LimitedQueryRows::complete(vec![qualifier.unwrap_or_default()], 2),
-            None => LimitedQueryRows::incomplete(Vec::new(), 1),
+        let Some(declaration_qualifier) = declaration_qualifier else {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        };
+        let inspected = inspected.saturating_add(declaration_qualifier.inspected.max(1));
+        if !declaration_qualifier.complete {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
+        LimitedQueryRows::complete(
+            vec![
+                declaration_qualifier
+                    .rows
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default(),
+            ],
+            inspected,
+        )
     }
 
     pub(crate) fn ruby_method_dispatch_mode(

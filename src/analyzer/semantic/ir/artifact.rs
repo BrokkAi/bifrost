@@ -536,6 +536,7 @@ impl ProcedureSemantics {
         &self.call_sites
     }
 
+    /// Sorted call-phase points for logarithmic exact-membership checks.
     pub(crate) fn call_phase_points(&self, value: ValueId) -> Option<&[ProgramPointId]> {
         self.call_phase_points.get(&value).map(Box::as_ref)
     }
@@ -688,7 +689,10 @@ fn index_call_phases(
     }
     let phase_points = indexed
         .into_iter()
-        .map(|(value, points)| (value, points.into_boxed_slice()))
+        .map(|(value, mut points)| {
+            points.sort_unstable();
+            (value, points.into_boxed_slice())
+        })
         .collect();
     let result_sites = result_sites
         .into_iter()
@@ -992,6 +996,21 @@ mod tests {
                 .get(&(ValueId::new(7), ProgramPointId::new(11)))
                 .map(Box::as_ref),
             Some([CallSiteId::new(0), CallSiteId::new(1)].as_slice())
+        );
+    }
+
+    #[test]
+    fn call_phase_index_sorts_shared_value_points_for_bounded_membership() {
+        let mut later = call_with_shared_result(12);
+        later.callee = ValueId::new(9);
+        let mut earlier = call_with_shared_result(3);
+        earlier.callee = ValueId::new(9);
+
+        let (phase_points, _) = index_call_phases(&[later, earlier]);
+
+        assert_eq!(
+            phase_points.get(&ValueId::new(9)).map(Box::as_ref),
+            Some([ProgramPointId::new(3), ProgramPointId::new(12)].as_slice())
         );
     }
 }

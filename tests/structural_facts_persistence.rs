@@ -117,6 +117,74 @@ fn materialize(workspace: &WorkspaceAnalyzer) -> MaterializedFacts {
 }
 
 #[test]
+fn limited_materialization_keeps_durable_snapshot_work_outside_the_query() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source = "export const value = service.run();\n";
+    write_file(root, ".gitignore", ".brokk/\n");
+    write_file(root, "app.ts", source);
+    let repository = init_git_repo(root);
+    commit_all(&repository, "limited structural fixture");
+    let project = typescript_project(root);
+    let database = root.join(".brokk/bifrost_cache.db");
+
+    let limited =
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+            .expect("persisted analyzer should build");
+    let provider = limited
+        .analyzer()
+        .structural_search_providers()
+        .into_iter()
+        .next()
+        .expect("TypeScript structural provider");
+    let file = provider
+        .structural_files()
+        .into_iter()
+        .next()
+        .expect("fixture file");
+    let before = provider.structural_extraction_count();
+    let _ = provider.structural_facts_limited(&file, source, usize::MAX, None);
+    assert_eq!(provider.structural_extraction_count(), before + 1);
+    let _ = provider.structural_facts_limited(&file, source, usize::MAX, None);
+    assert_eq!(
+        provider.structural_extraction_count(),
+        before + 1,
+        "complete bounded facts should still be reusable from memory"
+    );
+    drop(limited);
+
+    let snapshot_rows: usize = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM structural_facts_snapshots",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        snapshot_rows, 0,
+        "a cancellable bounded query must not enter synchronous snapshot encoding"
+    );
+
+    let ordinary = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+        .expect("persisted analyzer should reopen");
+    let materialized = materialize(&ordinary);
+    assert_eq!((materialized.extractions, materialized.hydrations), (1, 0));
+    let snapshot_rows: usize = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM structural_facts_snapshots",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        snapshot_rows, 1,
+        "ordinary materialization retains the durable optimization"
+    );
+}
+
+#[test]
 fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

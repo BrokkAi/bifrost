@@ -299,6 +299,8 @@ pub struct SignatureMetadata {
     extension_receiver_type: Option<String>,
     #[serde(default)]
     extension_receiver_type_identity: Option<StructuredTypeIdentity>,
+    #[serde(default)]
+    extension_receiver_is_unconstrained_type_parameter: bool,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1473,6 +1475,7 @@ impl SignatureMetadata {
             dispatch_extensibility: None,
             extension_receiver_type: None,
             extension_receiver_type_identity: None,
+            extension_receiver_is_unconstrained_type_parameter: false,
         }
     }
 
@@ -1517,6 +1520,7 @@ impl SignatureMetadata {
             dispatch_extensibility: None,
             extension_receiver_type: None,
             extension_receiver_type_identity: None,
+            extension_receiver_is_unconstrained_type_parameter: false,
         }
     }
 
@@ -1594,6 +1598,15 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_extension_receiver_is_unconstrained_type_parameter(
+        mut self,
+        extension_receiver_is_unconstrained_type_parameter: bool,
+    ) -> Self {
+        self.extension_receiver_is_unconstrained_type_parameter =
+            extension_receiver_is_unconstrained_type_parameter;
+        self
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -1644,6 +1657,10 @@ impl SignatureMetadata {
 
     pub fn extension_receiver_type_identity(&self) -> Option<&StructuredTypeIdentity> {
         self.extension_receiver_type_identity.as_ref()
+    }
+
+    pub const fn extension_receiver_is_unconstrained_type_parameter(&self) -> bool {
+        self.extension_receiver_is_unconstrained_type_parameter
     }
 }
 

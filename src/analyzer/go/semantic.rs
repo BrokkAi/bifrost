@@ -48,30 +48,41 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (specs, package_new_shadowed, traversal_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    specs,
+                    package_new_shadowed,
+                    traversal_work,
+                } => (specs, package_new_shadowed, traversal_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            traversal_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(
+                    prepared,
+                    spec,
+                    package_new_shadowed,
+                    staged_budget,
+                    cancellation,
+                )
             },
         )
     }
@@ -124,21 +135,31 @@ struct ProcedureSpec<'tree> {
     lexical_parent: Option<ProcedureId>,
     kind: ProcedureKind,
     properties: ProcedureProperties,
+    result_new_shadowed: bool,
 }
 
 enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
+    Complete {
+        specs: Vec<ProcedureSpec<'tree>>,
+        package_new_shadowed: bool,
+        traversal_work: SemanticWork,
+    },
     ExceededBudget {
         exceeded: SemanticBudgetExceeded,
         work: SemanticWork,
     },
-    Cancelled,
+    Cancelled {
+        work: SemanticWork,
+    },
 }
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
     lexical_parent: Option<ProcedureId>,
     declaration_path: usize,
+    package_binding_context: bool,
+    named_result_owner: Option<ProcedureId>,
+    entry_precharged: bool,
 }
 
 fn enumerate_procedures<'tree>(
@@ -163,26 +184,110 @@ fn enumerate_procedures<'tree>(
             .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
 
     type SiblingKey = (usize, DeclarationSegmentKind, Option<Box<str>>);
-    let mut specs = Vec::new();
+    let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
     let mut siblings: HashMap<SiblingKey, u32> = HashMap::default();
     let mut declaration_paths = vec![DeclarationPathEntry {
         parent: None,
         segment: file_segment,
     }];
     let mut preflight = SemanticWork::default();
+    let mut traversal_work = SemanticWork::default();
+    let mut package_new_shadowed = false;
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
         declaration_path: 0,
+        package_binding_context: false,
+        named_result_owner: None,
+        entry_precharged: false,
     }];
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(ProcedureEnumeration::Cancelled {
+                work: sum_lowering_work(preflight, traversal_work),
+            });
+        }
+        if !frame.entry_precharged {
+            let traversal_candidate = sum_lowering_work(
+                traversal_work,
+                SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                },
+            );
+            let enumeration_candidate = sum_lowering_work(preflight, traversal_candidate);
+            if let Err(exceeded) = budget.check(enumeration_candidate) {
+                return Ok(ProcedureEnumeration::ExceededBudget {
+                    exceeded,
+                    work: enumeration_candidate,
+                });
+            }
+            traversal_work = traversal_candidate;
+        }
+
+        if frame.package_binding_context
+            && go_package_binding_node_shadows_new(frame.node, prepared.source())
+        {
+            package_new_shadowed = true;
+        }
+        let prescanned_children = if matches!(frame.node.kind(), "var_spec" | "const_spec") {
+            let mut children = Vec::new();
+            for child_index in 0..frame.node.child_count() {
+                if cancellation.is_cancelled() {
+                    return Ok(ProcedureEnumeration::Cancelled {
+                        work: sum_lowering_work(preflight, traversal_work),
+                    });
+                }
+                let Some(child) = frame
+                    .node
+                    .child(child_index)
+                    .filter(|child| child.is_named())
+                else {
+                    continue;
+                };
+                let candidate = sum_lowering_work(
+                    traversal_work,
+                    SemanticWork {
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    },
+                );
+                let candidate_with_preflight = sum_lowering_work(preflight, candidate);
+                if let Err(exceeded) = budget.check(candidate_with_preflight) {
+                    return Ok(ProcedureEnumeration::ExceededBudget {
+                        exceeded,
+                        work: candidate_with_preflight,
+                    });
+                }
+                traversal_work = candidate;
+                if frame.node.field_name_for_child(child_index as u32) == Some("name") {
+                    if frame.package_binding_context
+                        && node_text(prepared.source(), child) == Some("new")
+                    {
+                        package_new_shadowed = true;
+                    }
+                } else if child.kind() != "comment" {
+                    children.push(child);
+                }
+            }
+            Some(children)
+        } else {
+            None
+        };
+        if frame.named_result_owner.is_some()
+            && frame.node.kind() == "identifier"
+            && node_text(prepared.source(), frame.node) == Some("new")
+            && let Some(spec) = frame
+                .named_result_owner
+                .and_then(|owner| specs.get_mut(owner.index()))
+        {
+            spec.result_new_shadowed = true;
         }
         let child_path = frame.declaration_path;
 
         let mut callable_body_scope = None;
+        let mut callable_result_scope = None;
         if let Some((kind, segment_kind, body, properties)) =
             callable_shape(frame.node, frame.lexical_parent)
         {
@@ -208,10 +313,11 @@ fn enumerate_procedures<'tree>(
                 anchor,
             );
             let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
+            let candidate_with_traversal = sum_lowering_work(candidate, traversal_work);
+            if let Err(exceeded) = budget.check(candidate_with_traversal) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
-                    work: candidate,
+                    work: candidate_with_traversal,
                 });
             }
             preflight = candidate;
@@ -223,27 +329,87 @@ fn enumerate_procedures<'tree>(
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
+                result_new_shadowed: false,
             });
             let callable_path = push_declaration_path(&mut declaration_paths, child_path, segment);
             callable_body_scope = Some((body.id(), id, callable_path));
+            callable_result_scope = frame
+                .node
+                .child_by_field_name("result")
+                .filter(|result| result.kind() == "parameter_list")
+                .map(|result| (result.id(), id));
         }
 
-        let mut cursor = frame.node.walk();
-        let children = frame.node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
+        let children = if let Some(children) = prescanned_children {
+            children
+                .into_iter()
+                .map(|child| (child, false, true))
+                .collect::<Vec<_>>()
+        } else {
+            let mut children = Vec::new();
+            for child_index in 0..frame.node.child_count() {
+                if cancellation.is_cancelled() {
+                    return Ok(ProcedureEnumeration::Cancelled {
+                        work: sum_lowering_work(preflight, traversal_work),
+                    });
+                }
+                let Some(child) = frame
+                    .node
+                    .child(child_index)
+                    .filter(|child| child.is_named())
+                else {
+                    continue;
+                };
+                let candidate = sum_lowering_work(
+                    traversal_work,
+                    SemanticWork {
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    },
+                );
+                let candidate_with_preflight = sum_lowering_work(preflight, candidate);
+                if let Err(exceeded) = budget.check(candidate_with_preflight) {
+                    return Ok(ProcedureEnumeration::ExceededBudget {
+                        exceeded,
+                        work: candidate_with_preflight,
+                    });
+                }
+                traversal_work = candidate;
+                let package_binding_context = match frame.node.kind() {
+                    "source_file" => true,
+                    "import_declaration" | "import_spec_list" | "type_declaration"
+                    | "var_declaration" | "const_declaration" => frame.package_binding_context,
+                    _ => false,
+                };
+                children.push((child, package_binding_context, true));
+            }
+            children
+        };
+        for (child, package_binding_context, entry_precharged) in children.into_iter().rev() {
             let (lexical_parent, declaration_path) = callable_body_scope
                 .filter(|(body_id, _, _)| *body_id == child.id())
                 .map(|(_, procedure, path)| (Some(procedure), path))
                 .unwrap_or((frame.lexical_parent, child_path));
+            let named_result_owner = callable_result_scope
+                .filter(|(result_id, _)| *result_id == child.id())
+                .map(|(_, procedure)| procedure)
+                .or(frame.named_result_owner);
             stack.push(ProcedureEnumerationFrame {
                 node: child,
                 lexical_parent,
                 declaration_path,
+                package_binding_context,
+                named_result_owner,
+                entry_precharged,
             });
         }
     }
 
-    Ok(ProcedureEnumeration::Complete(specs))
+    Ok(ProcedureEnumeration::Complete {
+        specs,
+        package_new_shadowed,
+        traversal_work,
+    })
 }
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -424,6 +590,7 @@ struct GoTypeIdentity {
 fn lower_procedure<'tree>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    package_new_shadowed: bool,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), GoLoweringError> {
@@ -456,11 +623,9 @@ fn lower_procedure<'tree>(
             .callable
             .child_by_field_name("result")
             .is_some_and(|result| result.kind() != "parameter_list"),
-        package_new_shadowed: go_package_binding_shadows_new(
-            prepared.tree().root_node(),
-            prepared.source(),
-        ) || spec.lexical_parent.is_some()
-            || go_callable_result_shadows_new(spec.callable, prepared.source()),
+        package_new_shadowed: package_new_shadowed
+            || spec.lexical_parent.is_some()
+            || spec.result_new_shadowed,
     };
     context.emit_procedure_inputs(&mut builder, spec.callable)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
@@ -3221,60 +3386,19 @@ fn names_len_matches_values(left: Node<'_>, right: Node<'_>) -> bool {
     expression_sequence(left).len() == expression_sequence(right).len()
 }
 
-fn go_package_binding_shadows_new(root: Node<'_>, source: &str) -> bool {
-    if super::declarations::collect_go_import_infos(root, source)
-        .into_iter()
-        .any(|import| {
-            import.identifier.as_deref() == Some("new")
-                && !matches!(import.alias.as_deref(), Some("_" | "."))
-        })
-    {
-        return true;
-    }
-    let mut stack = named_children(root);
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "function_declaration" | "type_spec" | "type_alias" => {
-                if node
-                    .child_by_field_name("name")
-                    .and_then(|name| node_text(source, name))
-                    == Some("new")
-                {
-                    return true;
-                }
-            }
-            "var_spec" | "const_spec" => {
-                if children_by_field_name(node, "name")
-                    .into_iter()
-                    .any(|name| node_text(source, name) == Some("new"))
-                {
-                    return true;
-                }
-            }
-            "import_declaration" | "type_declaration" | "var_declaration" | "const_declaration" => {
-                stack.extend(named_children(node))
-            }
-            _ => {}
+fn go_package_binding_node_shadows_new(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "identifier" => node_text(source, node) == Some("new"),
+        "import_spec" => {
+            super::declarations::go_import_spec_binding_name(node, source) == Some("new")
         }
-    }
-    false
-}
-
-fn go_callable_result_shadows_new(callable: Node<'_>, source: &str) -> bool {
-    let Some(result) = callable
-        .child_by_field_name("result")
-        .filter(|result| result.kind() == "parameter_list")
-    else {
-        return false;
-    };
-    let mut stack = vec![result];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" && node_text(source, node) == Some("new") {
-            return true;
+        "function_declaration" | "type_spec" | "type_alias" => {
+            node.child_by_field_name("name")
+                .and_then(|name| node_text(source, name))
+                == Some("new")
         }
-        stack.extend(named_children(node));
+        _ => false,
     }
-    false
 }
 
 const fn completion_label(kind: CompletionKind) -> &'static str {

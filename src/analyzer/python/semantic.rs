@@ -6,6 +6,10 @@
 
 use tree_sitter::Node;
 
+use super::bindings::{
+    PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
+    python_direct_scope_bindings_bounded,
+};
 use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
@@ -17,7 +21,7 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{Language, ProjectFile, PythonAnalyzer, Range};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v2";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v3";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -46,30 +50,35 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
+        let (specs, class_names, enumeration_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    specs,
+                    class_names,
                     work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+                } => (specs, class_names, work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            enumeration_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(prepared, spec, &class_names, staged_budget, cancellation)
             },
         )
     }
@@ -126,18 +135,25 @@ struct ProcedureSpec<'tree> {
 }
 
 enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
+    Complete {
+        specs: Vec<ProcedureSpec<'tree>>,
+        class_names: HashSet<Box<str>>,
+        work: SemanticWork,
+    },
     ExceededBudget {
         exceeded: SemanticBudgetExceeded,
         work: SemanticWork,
     },
-    Cancelled,
+    Cancelled {
+        work: SemanticWork,
+    },
 }
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
     lexical_parent: Option<ProcedureId>,
     declaration_path: usize,
+    entry_precharged: bool,
 }
 
 fn enumerate_procedures<'tree>(
@@ -169,16 +185,106 @@ fn enumerate_procedures<'tree>(
         segment: file_segment,
     }];
     let mut preflight = SemanticWork::default();
+    let mut traversal_work = SemanticWork::default();
+    let mut module_bindings: HashMap<Box<str>, PythonDirectScopeBindingKind> = HashMap::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
         declaration_path: 0,
+        entry_precharged: false,
     }];
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(ProcedureEnumeration::Cancelled {
+                work: sum_lowering_work(preflight, traversal_work),
+            });
         }
+        if !frame.entry_precharged {
+            let traversal = sum_lowering_work(
+                traversal_work,
+                SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                },
+            );
+            let traversal_candidate = sum_lowering_work(preflight, traversal);
+            if let Err(exceeded) = budget.check(traversal_candidate) {
+                return Ok(ProcedureEnumeration::ExceededBudget {
+                    exceeded,
+                    work: traversal_candidate,
+                });
+            }
+            traversal_work = traversal;
+        }
+
+        if frame.lexical_parent.is_none() && frame.declaration_path == 0 {
+            let mut binding_scan_cancelled = false;
+            let mut binding_scan_exceeded = None;
+            let bindings =
+                python_direct_scope_bindings_bounded(frame.node, prepared.source(), || {
+                    if cancellation.is_cancelled() {
+                        binding_scan_cancelled = true;
+                        return false;
+                    }
+                    let next = sum_lowering_work(
+                        traversal_work,
+                        SemanticWork {
+                            nested_entries: 1,
+                            ..SemanticWork::default()
+                        },
+                    );
+                    let candidate = sum_lowering_work(preflight, next);
+                    match budget.check(candidate) {
+                        Ok(()) => {
+                            traversal_work = next;
+                            true
+                        }
+                        Err(exceeded) => {
+                            binding_scan_exceeded = Some((exceeded, candidate));
+                            false
+                        }
+                    }
+                });
+            let Some(bindings) = bindings else {
+                if binding_scan_cancelled {
+                    return Ok(ProcedureEnumeration::Cancelled {
+                        work: sum_lowering_work(preflight, traversal_work),
+                    });
+                }
+                let (exceeded, work) =
+                    binding_scan_exceeded.expect("bounded binding scan stopped without a cause");
+                return Ok(ProcedureEnumeration::ExceededBudget { exceeded, work });
+            };
+            for binding in bindings {
+                let Some(name) = node_text(prepared.source(), binding.declaration) else {
+                    continue;
+                };
+                if let Some(existing) = module_bindings.get_mut(name) {
+                    // Multiple module bindings are not a proven class identity,
+                    // even when more than one of them is a class declaration.
+                    *existing = PythonDirectScopeBindingKind::Other;
+                    continue;
+                }
+                let inventory = sum_lowering_work(
+                    traversal_work,
+                    SemanticWork {
+                        owned_text_bytes: name.len(),
+                        ..SemanticWork::default()
+                    },
+                );
+                let inventory_candidate = sum_lowering_work(preflight, inventory);
+                if let Err(exceeded) = budget.check(inventory_candidate) {
+                    return Ok(ProcedureEnumeration::ExceededBudget {
+                        exceeded,
+                        work: inventory_candidate,
+                    });
+                }
+                traversal_work = inventory;
+                module_bindings.insert(name.into(), binding.kind);
+            }
+        }
+
         let child_path = frame.declaration_path;
         let mut container_body_scope = None;
         if let Some(segment_kind) = declaration_container_kind(frame.node) {
@@ -226,10 +332,11 @@ fn enumerate_procedures<'tree>(
                 anchor,
             );
             let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
+            let candidate_with_traversal = sum_lowering_work(candidate, traversal_work);
+            if let Err(exceeded) = budget.check(candidate_with_traversal) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
-                    work: candidate,
+                    work: candidate_with_traversal,
                 });
             }
             preflight = candidate;
@@ -246,9 +353,34 @@ fn enumerate_procedures<'tree>(
             callable_body_scope = Some((body.id(), id, callable_path));
         }
 
-        let mut cursor = frame.node.walk();
-        let children = frame.node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
+        for child_index in (0..frame.node.child_count()).rev() {
+            if cancellation.is_cancelled() {
+                return Ok(ProcedureEnumeration::Cancelled {
+                    work: sum_lowering_work(preflight, traversal_work),
+                });
+            }
+            let Some(child) = frame
+                .node
+                .child(child_index)
+                .filter(|child| child.is_named())
+            else {
+                continue;
+            };
+            let traversal = sum_lowering_work(
+                traversal_work,
+                SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                },
+            );
+            let traversal_candidate = sum_lowering_work(preflight, traversal);
+            if let Err(exceeded) = budget.check(traversal_candidate) {
+                return Ok(ProcedureEnumeration::ExceededBudget {
+                    exceeded,
+                    work: traversal_candidate,
+                });
+            }
+            traversal_work = traversal;
             let child_path = container_body_scope
                 .filter(|(body_id, _)| *body_id == child.id())
                 .map(|(_, path)| path)
@@ -261,11 +393,24 @@ fn enumerate_procedures<'tree>(
                 node: child,
                 lexical_parent,
                 declaration_path,
+                entry_precharged: true,
             });
         }
     }
 
-    Ok(ProcedureEnumeration::Complete(specs))
+    let class_names = module_bindings
+        .into_iter()
+        .filter_map(|(name, kind)| {
+            (kind == PythonDirectScopeBindingKind::ClassDeclaration).then_some(name)
+        })
+        .collect();
+    Ok(ProcedureEnumeration::Complete {
+        specs,
+        class_names,
+        // Procedure lowering accounts retained locator identity. Seed only the
+        // one-time file inventory to avoid charging that identity twice.
+        work: traversal_work,
+    })
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -468,20 +613,23 @@ impl<'tree> CleanupBody<'tree> {
 
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
+    callable: Node<'tree>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
     receiver: Option<ValueId>,
-    class_names: HashSet<Box<str>>,
+    class_names: &'targets HashSet<Box<str>>,
+    bindings: PythonLexicalScopeInventory<'tree>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
 
-fn lower_procedure<'tree>(
+fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    class_names: &'targets HashSet<Box<str>>,
     budget: &SemanticBudget,
-    cancellation: &CancellationToken,
+    cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -500,18 +648,26 @@ fn lower_procedure<'tree>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    let bindings = collect_semantic_binding_inventory(
+        spec.callable,
+        prepared.source(),
+        &mut builder,
+        cancellation,
+    )?;
     let mut context = LoweringContext {
         prepared,
+        callable: spec.callable,
         session,
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
         receiver: None,
-        class_names: python_class_names(prepared.tree().root_node(), prepared.source()),
+        class_names,
+        bindings,
         cleanups: Vec::new(),
     };
     context.emit_procedure_inputs(&mut builder, spec)?;
-    context.emit_local_bindings(&mut builder, spec.body)?;
+    context.emit_local_bindings(&mut builder)?;
 
     if spec.properties.is_async {
         context.add_gap(
@@ -636,6 +792,51 @@ fn lower_procedure<'tree>(
         .map_err(|error| PythonLoweringError::Budget(error, Box::new(work_before_freeze)))
 }
 
+fn collect_semantic_binding_inventory<'tree>(
+    callable: Node<'tree>,
+    source: &str,
+    builder: &mut ProcedureCfgBuilder,
+    cancellation: &CancellationToken,
+) -> Result<PythonLexicalScopeInventory<'tree>, PythonLoweringError> {
+    let mut stop = None;
+    let inventory = PythonLexicalScopeInventory::collect_bounded(callable, source, || {
+        match charge_python_binding_step(builder, cancellation) {
+            Ok(()) => true,
+            Err(error) => {
+                stop = Some(error);
+                false
+            }
+        }
+    });
+    if let Some(error) = stop {
+        return Err(error);
+    }
+    inventory.ok_or_else(|| {
+        PythonLoweringError::Invalid("Python callable binding inventory was unavailable".into())
+    })
+}
+
+fn charge_python_binding_step(
+    builder: &mut ProcedureCfgBuilder,
+    cancellation: &CancellationToken,
+) -> Result<(), PythonLoweringError> {
+    if cancellation.is_cancelled() {
+        return Err(PythonLoweringError::Cancelled(Box::new(
+            builder.prospective_work(),
+        )));
+    }
+    let candidate = sum_lowering_work(
+        builder.prospective_work(),
+        SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        },
+    );
+    builder
+        .descend_nested_entry()
+        .map_err(|exceeded| PythonLoweringError::Budget(exceeded, Box::new(candidate)))
+}
+
 fn callable_returns_value(_source: &str, spec: &ProcedureSpec<'_>) -> bool {
     spec.kind == ProcedureKind::Lambda
 }
@@ -711,45 +912,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn emit_local_bindings(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        body: Node<'tree>,
     ) -> Result<(), PythonLoweringError> {
-        let mut stack = vec![body];
-        while let Some(node) = stack.pop() {
+        let bindings = self
+            .bindings
+            .local_bindings()
+            .map(|(name, declaration)| (Box::<str>::from(name), declaration))
+            .collect::<Vec<_>>();
+        for (name, declaration) in bindings {
             if self.session.cancellation().is_cancelled() {
                 return Err(PythonLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            if node != body
-                && matches!(
-                    node.kind(),
-                    "function_definition" | "lambda" | "class_definition"
-                )
+            if self.parameters.contains_key(name.as_ref())
+                || self.locals.contains_key(name.as_ref())
             {
                 continue;
             }
-            let binding = match node.kind() {
-                "assignment" => node.child_by_field_name("left"),
-                "named_expression" => node.child_by_field_name("name"),
-                _ => None,
-            };
-            if let Some(binding) = binding
-                && binding.kind() == "identifier"
-                && let Some(name) = node_text(self.prepared.source(), binding)
-                && !self.parameters.contains_key(name)
-                && !self.locals.contains_key(name)
-            {
-                let metadata = self.value_mapping(builder, binding)?;
-                let value = self.session.add_value_with_metadata(
-                    builder,
-                    metadata,
-                    SemanticValueKind::Local,
-                )?;
-                self.locals.insert(name.into(), value);
-            }
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            stack.extend(children.into_iter().rev());
+            let metadata = self.value_mapping(builder, declaration)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            self.locals.insert(name, value);
         }
         Ok(())
     }
@@ -759,6 +945,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .get(name)
             .copied()
             .or_else(|| self.parameters.get(name).copied())
+    }
+
+    fn module_class_fallback_allowed(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        reference: Node<'tree>,
+    ) -> Result<bool, PythonLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), reference) else {
+            return Ok(false);
+        };
+        if self.binding_value(name).is_some() || !self.class_names.contains(name) {
+            return Ok(false);
+        }
+        match self.bindings.name_resolution_at(name, reference) {
+            PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                return Ok(false);
+            }
+            PythonLexicalNameResolution::Global => return Ok(true),
+            PythonLexicalNameResolution::Unbound => {}
+        }
+
+        let reference_start = reference.start_byte();
+        let reference_end = reference.end_byte();
+        let mut current = self.callable;
+        while let Some(parent) = current.parent() {
+            charge_python_binding_step(builder, self.session.cancellation())?;
+            if matches!(parent.kind(), "function_definition" | "lambda")
+                && parent.child_by_field_name("body").is_some_and(|body| {
+                    body.start_byte() <= reference_start && reference_end <= body.end_byte()
+                })
+            {
+                let inventory = collect_semantic_binding_inventory(
+                    parent,
+                    self.prepared.source(),
+                    builder,
+                    self.session.cancellation(),
+                )?;
+                match inventory.name_resolution_at(name, reference) {
+                    PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                        return Ok(false);
+                    }
+                    PythonLexicalNameResolution::Global => return Ok(true),
+                    PythonLexicalNameResolution::Unbound => {}
+                }
+            }
+            current = parent;
+        }
+        Ok(true)
     }
 
     fn expression_value(
@@ -2523,8 +2757,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )
             .collect::<Result<Vec<_>, _>>()?;
         if function.kind() == "identifier"
-            && node_text(self.prepared.source(), function)
-                .is_some_and(|name| self.class_names.contains(name))
+            && self.module_class_fallback_allowed(builder, function)?
         {
             self.session
                 .add_allocation(builder, invoke, result, AllocationKind::Object)?;
@@ -3070,23 +3303,6 @@ fn python_binding_name_node<'tree>(
         stack.extend(children.into_iter().rev());
     }
     None
-}
-
-fn python_class_names(root: Node<'_>, source: &str) -> HashSet<Box<str>> {
-    let mut names = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "class_definition"
-            && let Some(name) = node.child_by_field_name("name")
-            && let Some(name) = node_text(source, name)
-        {
-            names.insert(name.into());
-        }
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
-    names
 }
 
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {

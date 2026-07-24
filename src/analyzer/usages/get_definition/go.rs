@@ -30,6 +30,9 @@ pub(crate) trait GoDefinitionProvider {
     fn session(&self) -> Option<&ResolutionSession> {
         None
     }
+    fn retain_ambiguous_candidate_evidence(&self) -> bool {
+        false
+    }
 
     fn fqn_exists(&self, fqn: &str) -> bool {
         !self.fqn(fqn).is_empty()
@@ -146,6 +149,10 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
 
     fn session(&self) -> Option<&ResolutionSession> {
         self.session
+    }
+
+    fn retain_ambiguous_candidate_evidence(&self) -> bool {
+        self.session.is_some()
     }
 }
 
@@ -880,7 +887,11 @@ fn resolve_go_local_selector_chain(
             None => go_indexed_field_lookup(analyzer, support, &owner_fqn, member),
         };
         if let GoDefinitionMemberLookup::Ambiguous(candidates) = &lookup {
-            return Some(go_ambiguous_selector_outcome(member, candidates.clone()));
+            return Some(go_ambiguous_selector_outcome(
+                support,
+                member,
+                candidates.clone(),
+            ));
         }
         if let GoDefinitionMemberLookup::Unique(candidate) = &lookup {
             deepest_workspace_field = Some(vec![candidate.clone()]);
@@ -922,6 +933,7 @@ fn resolve_go_local_selector_chain(
 }
 
 fn go_ambiguous_selector_outcome(
+    support: &dyn GoDefinitionProvider,
     member: &str,
     mut candidates: Vec<CodeUnit>,
 ) -> DefinitionLookupOutcome {
@@ -930,7 +942,9 @@ fn go_ambiguous_selector_outcome(
     let mut outcome = ambiguous_definition(format!(
         "`{member}` resolves to multiple Go embedded members at the nearest promotion depth"
     ));
-    outcome.definitions = candidates;
+    if support.retain_ambiguous_candidate_evidence() {
+        outcome.definitions = candidates;
+    }
     outcome
 }
 

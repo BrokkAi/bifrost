@@ -32,6 +32,8 @@ use crate::text_utils::compute_line_starts;
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
+const MAX_LIMITED_QUERY_ROW_BYTES: usize = MAX_SIGNATURE_METADATA_BLOB_BYTES;
+const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = MAX_SIGNATURE_METADATA_BLOB_BYTES;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
@@ -398,6 +400,28 @@ impl<T> LimitedQueryRows<T> {
             inspected,
             complete: false,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LimitedQueryByteBudget {
+    admitted_bytes: usize,
+}
+
+impl LimitedQueryByteBudget {
+    fn admit_sqlite_bytes(&mut self, raw_bytes: i64) -> Result<bool> {
+        let row_bytes = i64_to_usize(raw_bytes)?;
+        if row_bytes > MAX_LIMITED_QUERY_ROW_BYTES {
+            return Ok(false);
+        }
+        let Some(total_bytes) = self.admitted_bytes.checked_add(row_bytes) else {
+            return Ok(false);
+        };
+        if total_bytes > MAX_LIMITED_QUERY_AGGREGATE_BYTES {
+            return Ok(false);
+        }
+        self.admitted_bytes = total_bytes;
+        Ok(true)
     }
 }
 
@@ -1836,29 +1860,113 @@ impl AnalyzerStore {
         Ok(result)
     }
 
-    pub(crate) fn first_declaration_content_qualifier_for_key(
+    pub(crate) fn content_package_limited(
         &self,
         oid: Oid,
         lang: &str,
         generation: GenerationId,
-    ) -> Result<Option<String>> {
+        limit: usize,
+    ) -> Result<LimitedQueryRows<String>> {
+        if limit == 0 {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+        }
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let sql = format!(
-            "SELECT units.content_qualifier
+            "SELECT length(CAST(meta.content_package AS BLOB)),
+                    CASE
+                        WHEN length(CAST(meta.content_package AS BLOB))
+                               <= {MAX_LIMITED_QUERY_ROW_BYTES}
+                        THEN meta.content_package
+                        ELSE NULL
+                    END
+             FROM blob_meta AS meta
+             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+        );
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut query = statement.query(params![oid.to_string(), lang])?;
+        let result = if let Some(row) = query.next()? {
+            let mut bytes = LimitedQueryByteBudget::default();
+            if !bytes.admit_sqlite_bytes(row.get::<_, i64>(0)?)? {
+                LimitedQueryRows::incomplete(Vec::new(), 1)
+            } else if let Some(content_package) = row.get::<_, Option<String>>(1)? {
+                LimitedQueryRows::complete(vec![content_package], 1)
+            } else {
+                LimitedQueryRows::incomplete(Vec::new(), 1)
+            }
+        } else {
+            LimitedQueryRows::incomplete(Vec::new(), 0)
+        };
+        drop(query);
+        drop(statement);
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn first_declaration_content_qualifier_for_key_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<String>> {
+        if limit == 0 {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+        }
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT length(CAST(units.content_qualifier AS BLOB)),
+                    CASE
+                        WHEN length(CAST(units.content_qualifier AS BLOB))
+                               <= {MAX_LIMITED_QUERY_ROW_BYTES}
+                        THEN units.content_qualifier
+                        ELSE NULL
+                    END
              FROM code_units AS units
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
              WHERE units.blob_oid = ?1 AND units.lang = ?2
-               AND units.content_qualifier <> ''
                AND {PARSED_BLOB_COMPLETE_CONDITION}
              ORDER BY units.unit_key
-             LIMIT 1"
+             LIMIT ?3"
         );
-        let result = tx
-            .query_row(&sql, params![oid.to_string(), lang], |row| row.get(0))
-            .optional()?;
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut query = statement.query(params![oid.to_string(), lang, sql_limit])?;
+        let mut bytes = LimitedQueryByteBudget::default();
+        let mut inspected = 0usize;
+        let mut result = None;
+        while let Some(row) = query.next()? {
+            inspected = inspected.saturating_add(1);
+            if !bytes.admit_sqlite_bytes(row.get::<_, i64>(0)?)? {
+                result = Some(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                break;
+            }
+            let Some(content_qualifier) = row.get::<_, Option<String>>(1)? else {
+                result = Some(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                break;
+            };
+            if !content_qualifier.is_empty() {
+                result = Some(LimitedQueryRows::complete(
+                    vec![content_qualifier],
+                    inspected,
+                ));
+                break;
+            }
+        }
+        let result = result.unwrap_or_else(|| {
+            if inspected == limit {
+                LimitedQueryRows::incomplete(Vec::new(), inspected)
+            } else {
+                LimitedQueryRows::complete(Vec::new(), inspected)
+            }
+        });
+        drop(query);
+        drop(statement);
         tx.commit()?;
         Ok(result)
     }
@@ -1892,23 +2000,40 @@ impl AnalyzerStore {
         };
         let import_count = i64_to_usize(import_count)?;
         let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut statement = tx.prepare_cached(
-            "SELECT info FROM import_details
+        let sql = format!(
+            "SELECT length(info),
+                    CASE
+                        WHEN length(info) <= {MAX_LIMITED_QUERY_ROW_BYTES} THEN info
+                        ELSE NULL
+                    END
+             FROM import_details
              WHERE blob_oid = ?1 AND lang = ?2
              ORDER BY ordinal
-             LIMIT ?3",
-        )?;
-        let mapped = statement.query_map(params![&oid, lang, sql_limit], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?;
-        let mut rows = Vec::with_capacity(import_count.min(limit));
-        for row in mapped {
-            rows.push(deserialize_blob(&row?)?);
+             LIMIT ?3"
+        );
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut query = statement.query(params![&oid, lang, sql_limit])?;
+        let mut rows = Vec::new();
+        let mut inspected = 0usize;
+        let mut bytes = LimitedQueryByteBudget::default();
+        let mut byte_complete = true;
+        while let Some(row) = query.next()? {
+            inspected = inspected.saturating_add(1);
+            let byte_len = row.get::<_, i64>(0)?;
+            if !bytes.admit_sqlite_bytes(byte_len)? {
+                byte_complete = false;
+                break;
+            }
+            let Some(info) = row.get::<_, Option<Vec<u8>>>(1)? else {
+                byte_complete = false;
+                break;
+            };
+            rows.push(deserialize_limited_blob(&info)?);
         }
+        drop(query);
         drop(statement);
         tx.commit()?;
-        let inspected = rows.len();
-        if import_count > inspected {
+        if !byte_complete || inspected == limit || import_count != inspected {
             Ok(LimitedQueryRows::incomplete(rows, inspected))
         } else {
             Ok(LimitedQueryRows::complete(rows, inspected))
@@ -2043,7 +2168,7 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = candidate_rows_sql_with_membership(
+        let sql = limited_candidate_rows_sql_with_membership(
             "units",
             "FROM code_units AS units
              JOIN blob_meta AS meta
@@ -2100,7 +2225,8 @@ impl AnalyzerStore {
             PersistedLookupKey::ExactFqn => "exact_fqn",
             PersistedLookupKey::NormalizedFqn => "normalized_fqn",
         };
-        let sql = declaration_candidate_sql(&format!("units.lang = ?1 AND units.{column} = ?2"));
+        let sql =
+            limited_declaration_candidate_sql(&format!("units.lang = ?1 AND units.{column} = ?2"));
         let sql = format!("{sql} LIMIT ?3");
         let rows = candidate_rows_for_languages_limited(
             &tx,
@@ -2172,7 +2298,7 @@ impl AnalyzerStore {
         } else {
             "exact_fqn"
         };
-        let sql = candidate_rows_sql(
+        let sql = limited_candidate_rows_sql_with_membership(
             "child",
             "FROM code_units AS owner
              JOIN unit_children AS edge
@@ -2187,6 +2313,8 @@ impl AnalyzerStore {
                 "owner.lang = ?1 AND owner.{owner_column} = ?2
                  AND owner.in_declarations = 1 AND child.identifier = ?3"
             ),
+            "child.in_declarations = 1",
+            "child.blob_oid, child.unit_key",
         );
         let sql = format!("{sql} LIMIT ?4");
         let rows = candidate_rows_for_languages_limited(
@@ -2774,6 +2902,18 @@ fn declaration_candidate_sql(predicate: &str) -> String {
     declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
 }
 
+fn limited_declaration_candidate_sql(predicate: &str) -> String {
+    limited_candidate_rows_sql_with_membership(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        predicate,
+        "units.in_declarations = 1",
+        "units.blob_oid, units.unit_key",
+    )
+}
+
 fn declaration_candidate_sql_with_order(predicate: &str, order_by: &str) -> String {
     candidate_rows_sql_with_membership(
         "units",
@@ -2810,6 +2950,48 @@ fn candidate_rows_sql_with_membership(
         membership,
         order_by,
         "",
+    )
+}
+
+fn limited_candidate_rows_sql_with_membership(
+    candidate_alias: &str,
+    from_clause: &str,
+    predicate: &str,
+    membership: &str,
+    order_by: &str,
+) -> String {
+    let row_bytes = format!(
+        "length(CAST({candidate_alias}.blob_oid AS BLOB))
+         + length(CAST({candidate_alias}.lang AS BLOB))
+         + length(CAST({candidate_alias}.short_name AS BLOB))
+         + length(CAST({candidate_alias}.content_qualifier AS BLOB))
+         + COALESCE(length(CAST({candidate_alias}.signature AS BLOB)), 0)"
+    );
+    let admitted = |column: &str| {
+        format!(
+            "CASE WHEN ({row_bytes}) <= {MAX_LIMITED_QUERY_ROW_BYTES}
+                  THEN {candidate_alias}.{column}
+                  ELSE NULL
+             END"
+        )
+    };
+    format!(
+        "SELECT {}, {}, {candidate_alias}.unit_key,
+                {candidate_alias}.kind, {},
+                {}, {},
+                {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
+                {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
+                {candidate_alias}.in_definition_lookup,
+                ({row_bytes})
+         {from_clause}
+         WHERE {predicate} AND {membership}
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY {order_by}",
+        admitted("blob_oid"),
+        admitted("lang"),
+        admitted("short_name"),
+        admitted("content_qualifier"),
+        admitted("signature"),
     )
 }
 
@@ -2883,23 +3065,31 @@ fn candidate_rows_for_languages_limited<'a>(
 
     let mut statement = conn.prepare_cached(sql)?;
     let mut rows = Vec::new();
+    let mut inspected = 0usize;
+    let mut bytes = LimitedQueryByteBudget::default();
     for lang in langs {
-        let remaining = limit.saturating_sub(rows.len());
+        let remaining = limit.saturating_sub(inspected);
         if remaining == 0 {
-            return Ok(LimitedQueryRows::incomplete(rows, limit));
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
         }
         let sql_limit = i64::try_from(remaining).unwrap_or(i64::MAX);
         let params = std::iter::once(&lang as &dyn ToSql)
             .chain(values.iter().copied())
             .chain(std::iter::once(&sql_limit as &dyn ToSql));
-        rows.extend(collect_candidate_rows(
-            statement.query_map(params_from_iter(params), candidate_row_from_row)?,
-        )?);
-        if rows.len() == limit {
-            return Ok(LimitedQueryRows::incomplete(rows, limit));
+        let mut query = statement.query(params_from_iter(params))?;
+        while let Some(row) = query.next()? {
+            inspected = inspected.saturating_add(1);
+            let row_bytes = row.get::<_, i64>(12)?;
+            if !bytes.admit_sqlite_bytes(row_bytes)? {
+                return Ok(LimitedQueryRows::incomplete(rows, inspected));
+            }
+            rows.push(candidate_row_from_row(row)?);
+        }
+        drop(query);
+        if inspected == limit {
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
         }
     }
-    let inspected = rows.len();
     Ok(LimitedQueryRows::complete(rows, inspected))
 }
 
@@ -5854,7 +6044,7 @@ fn direct_children_for_unit_limited_conn(
     if limit == 0 {
         return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
     }
-    let sql = candidate_rows_sql_with_membership(
+    let sql = limited_candidate_rows_sql_with_membership(
         "child",
         "FROM code_units AS owner
          JOIN unit_children AS edge
@@ -5884,20 +6074,27 @@ fn direct_children_for_unit_limited_conn(
     let synthetic = bool_to_i64(unit.is_synthetic());
     let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut statement = conn.prepare_cached(&sql)?;
-    let rows = collect_candidate_rows(statement.query_map(
-        params![
-            oid,
-            lang,
-            unit.fq_name(),
-            kind,
-            unit.short_name(),
-            unit.signature(),
-            synthetic,
-            sql_limit,
-        ],
-        candidate_row_from_row,
-    )?)?;
-    let inspected = rows.len();
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+    ])?;
+    let mut rows = Vec::new();
+    let mut inspected = 0usize;
+    let mut bytes = LimitedQueryByteBudget::default();
+    while let Some(row) = query.next()? {
+        inspected = inspected.saturating_add(1);
+        if !bytes.admit_sqlite_bytes(row.get::<_, i64>(12)?)? {
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        }
+        rows.push(candidate_row_from_row(row)?);
+    }
+    drop(query);
     if inspected == limit {
         Ok(LimitedQueryRows::incomplete(rows, inspected))
     } else {
@@ -5944,33 +6141,32 @@ fn signature_metadata_for_unit_limited_conn(
     let synthetic = bool_to_i64(unit.is_synthetic());
     let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut statement = conn.prepare_cached(&sql)?;
-    let mapped = statement.query_map(
-        params![
-            oid,
-            lang,
-            unit.fq_name(),
-            kind,
-            unit.short_name(),
-            unit.signature(),
-            synthetic,
-            sql_limit,
-            usize_to_i64(MAX_SIGNATURE_METADATA_BLOB_BYTES)?,
-        ],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
-    )?;
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES)?,
+    ])?;
     let mut rows = Vec::new();
     let mut inspected = 0usize;
-    for row in mapped {
+    let mut byte_budget = LimitedQueryByteBudget::default();
+    while let Some(row) = query.next()? {
         inspected = inspected.saturating_add(1);
-        let (byte_len, bytes) = row?;
-        if i64_to_usize(byte_len)? > MAX_SIGNATURE_METADATA_BLOB_BYTES {
+        let byte_len = row.get::<_, i64>(0)?;
+        if !byte_budget.admit_sqlite_bytes(byte_len)? {
             return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
         }
-        let Some(bytes) = bytes else {
+        let Some(bytes) = row.get::<_, Option<Vec<u8>>>(1)? else {
             return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
         };
         rows.push(deserialize_signature_metadata_blob(&bytes)?);
     }
+    drop(query);
     if inspected == limit {
         Ok(LimitedQueryRows::incomplete(rows, inspected))
     } else {
@@ -6039,6 +6235,31 @@ fn ruby_method_dispatch_modes_for_unit_limited_conn(
     }
 }
 
+fn collect_limited_text_rows(
+    query: &mut rusqlite::Rows<'_>,
+    limit: usize,
+) -> Result<LimitedQueryRows<String>> {
+    let mut rows = Vec::new();
+    let mut inspected = 0usize;
+    let mut bytes = LimitedQueryByteBudget::default();
+    while let Some(row) = query.next()? {
+        inspected = inspected.saturating_add(1);
+        let byte_len = row.get::<_, i64>(0)?;
+        if !bytes.admit_sqlite_bytes(byte_len)? {
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        }
+        let Some(value) = row.get::<_, Option<String>>(1)? else {
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        };
+        rows.push(value);
+    }
+    if inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
+}
+
 fn raw_supertypes_for_unit_limited_conn(
     conn: &Connection,
     oid: Oid,
@@ -6050,7 +6271,13 @@ fn raw_supertypes_for_unit_limited_conn(
         return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
     }
     let sql = format!(
-        "SELECT supertypes.raw
+        "SELECT length(CAST(supertypes.raw AS BLOB)),
+                CASE
+                    WHEN length(CAST(supertypes.raw AS BLOB))
+                           <= {MAX_LIMITED_QUERY_ROW_BYTES}
+                    THEN supertypes.raw
+                    ELSE NULL
+                END
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -6074,27 +6301,17 @@ fn raw_supertypes_for_unit_limited_conn(
     let synthetic = bool_to_i64(unit.is_synthetic());
     let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut statement = conn.prepare_cached(&sql)?;
-    let rows = statement
-        .query_map(
-            params![
-                oid,
-                lang,
-                unit.fq_name(),
-                kind,
-                unit.short_name(),
-                unit.signature(),
-                synthetic,
-                sql_limit,
-            ],
-            |row| row.get(0),
-        )?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    let inspected = rows.len();
-    if inspected == limit {
-        Ok(LimitedQueryRows::incomplete(rows, inspected))
-    } else {
-        Ok(LimitedQueryRows::complete(rows, inspected))
-    }
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+    ])?;
+    collect_limited_text_rows(&mut query, limit)
 }
 
 fn supertype_lookup_paths_for_unit_limited_conn(
@@ -6108,7 +6325,13 @@ fn supertype_lookup_paths_for_unit_limited_conn(
         return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
     }
     let sql = format!(
-        "SELECT supertypes.lookup_path
+        "SELECT length(CAST(supertypes.lookup_path AS BLOB)),
+                CASE
+                    WHEN length(CAST(supertypes.lookup_path AS BLOB))
+                           <= {MAX_LIMITED_QUERY_ROW_BYTES}
+                    THEN supertypes.lookup_path
+                    ELSE NULL
+                END
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -6132,27 +6355,17 @@ fn supertype_lookup_paths_for_unit_limited_conn(
     let synthetic = bool_to_i64(unit.is_synthetic());
     let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut statement = conn.prepare_cached(&sql)?;
-    let rows = statement
-        .query_map(
-            params![
-                oid,
-                lang,
-                unit.fq_name(),
-                kind,
-                unit.short_name(),
-                unit.signature(),
-                synthetic,
-                sql_limit,
-            ],
-            |row| row.get(0),
-        )?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    let inspected = rows.len();
-    if inspected == limit {
-        Ok(LimitedQueryRows::incomplete(rows, inspected))
-    } else {
-        Ok(LimitedQueryRows::complete(rows, inspected))
-    }
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+    ])?;
+    collect_limited_text_rows(&mut query, limit)
 }
 
 fn read_cpp_template_metadata(
@@ -6877,6 +7090,17 @@ fn deserialize_signature_metadata_blob(bytes: &[u8]) -> Result<SignatureMetadata
         .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
 }
 
+fn deserialize_limited_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let byte_limit = u64::try_from(bytes.len())
+        .map_err(|_| StoreError::new("limited-query blob length does not fit in u64"))?;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(byte_limit)
+        .deserialize(bytes)
+        .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
+}
+
 fn deserialize_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     bincode::deserialize(bytes)
         .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
@@ -7154,6 +7378,461 @@ mod tests {
         );
         let limited = store
             .signature_metadata_for_unit_limited(oid, "ruby", generation, &target, usize::MAX)
+            .unwrap();
+        assert!(!limited.complete);
+        assert!(limited.rows.is_empty());
+        assert_eq!(limited.inspected, 1);
+    }
+
+    #[test]
+    fn limited_query_byte_budget_caps_individual_and_aggregate_rows() {
+        let mut bytes = LimitedQueryByteBudget::default();
+        let half = MAX_LIMITED_QUERY_AGGREGATE_BYTES / 2;
+        assert!(
+            bytes
+                .admit_sqlite_bytes(usize_to_i64(half).unwrap())
+                .unwrap()
+        );
+        assert!(
+            bytes
+                .admit_sqlite_bytes(usize_to_i64(half).unwrap())
+                .unwrap()
+        );
+        assert!(!bytes.admit_sqlite_bytes(1).unwrap());
+
+        let mut bytes = LimitedQueryByteBudget::default();
+        assert!(
+            !bytes
+                .admit_sqlite_bytes(usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn resource_bound_oversized_current_epoch_content_package_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Target.java",
+            "package demo;\nclass Target {}\n",
+        );
+        let state = parse_state(&JavaAdapter, &file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "limited-content-package-row-bytes-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .unwrap();
+
+        let ordinary = store
+            .content_package_limited(oid, "java", generation, 1)
+            .unwrap();
+        assert!(ordinary.complete);
+        assert_eq!(ordinary.rows, vec!["demo".to_string()]);
+        assert_eq!(ordinary.inspected, 1);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE blob_meta
+                     SET content_package = CAST(zeroblob(?3) AS TEXT)
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![
+                        oid.to_string(),
+                        "java",
+                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap(),
+                    ],
+                )
+                .unwrap(),
+                1
+            );
+        }
+
+        let limited = store
+            .content_package_limited(oid, "java", generation, 1)
+            .unwrap();
+        assert!(!limited.complete);
+        assert!(limited.rows.is_empty());
+        assert_eq!(limited.inspected, 1);
+    }
+
+    #[test]
+    fn resource_bound_oversized_current_epoch_fallback_qualifier_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Target.java",
+            "package demo;\nclass Target {}\n",
+        );
+        let state = parse_state(&JavaAdapter, &file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "limited-fallback-qualifier-row-bytes-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .unwrap();
+
+        let ordinary = store
+            .first_declaration_content_qualifier_for_key_limited(
+                oid,
+                "java",
+                generation,
+                usize::MAX,
+            )
+            .unwrap();
+        assert!(ordinary.complete);
+        assert_eq!(ordinary.rows, vec!["demo".to_string()]);
+        assert!(ordinary.inspected > 0);
+        let rows_before_qualifier = ordinary.inspected;
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE blob_meta
+                     SET content_package = ''
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid.to_string(), "java"],
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.execute(
+                    "UPDATE code_units
+                     SET content_qualifier = CAST(zeroblob(?3) AS TEXT)
+                     WHERE blob_oid = ?1 AND lang = ?2
+                       AND unit_key = (
+                         SELECT MIN(candidate.unit_key)
+                         FROM code_units AS candidate
+                         WHERE candidate.blob_oid = ?1
+                           AND candidate.lang = ?2
+                           AND candidate.content_qualifier <> ''
+                       )",
+                    params![
+                        oid.to_string(),
+                        "java",
+                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap(),
+                    ],
+                )
+                .unwrap(),
+                1
+            );
+        }
+
+        let package = store
+            .content_package_limited(oid, "java", generation, 1)
+            .unwrap();
+        assert!(package.complete);
+        assert_eq!(package.rows, vec![String::new()]);
+        assert_eq!(package.inspected, 1);
+
+        let limited = store
+            .first_declaration_content_qualifier_for_key_limited(
+                oid,
+                "java",
+                generation,
+                usize::MAX,
+            )
+            .unwrap();
+        assert!(!limited.complete);
+        assert!(limited.rows.is_empty());
+        assert_eq!(limited.inspected, rows_before_qualifier);
+    }
+
+    #[test]
+    fn limited_fallback_qualifier_charges_empty_rows_before_evidence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Target.java",
+            "class Target { void first() {} void second() {} }\n",
+        );
+        let state = parse_state(&JavaAdapter, &file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "limited-fallback-qualifier-scan-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let unit_count: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM code_units
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid.to_string(), "java"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(unit_count >= 2, "fixture needs two ordered persisted units");
+            assert_eq!(
+                conn.execute(
+                    "UPDATE code_units
+                     SET content_qualifier = CASE
+                         WHEN unit_key = (
+                             SELECT candidate.unit_key
+                             FROM code_units AS candidate
+                             WHERE candidate.blob_oid = ?1 AND candidate.lang = ?2
+                             ORDER BY candidate.unit_key
+                             LIMIT 1
+                         ) THEN ''
+                         WHEN unit_key = (
+                             SELECT candidate.unit_key
+                             FROM code_units AS candidate
+                             WHERE candidate.blob_oid = ?1 AND candidate.lang = ?2
+                             ORDER BY candidate.unit_key
+                             LIMIT 1 OFFSET 1
+                         ) THEN 'late.namespace'
+                         ELSE content_qualifier
+                     END
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid.to_string(), "java"],
+                )
+                .unwrap(),
+                unit_count
+            );
+        }
+
+        let tiny = store
+            .first_declaration_content_qualifier_for_key_limited(oid, "java", generation, 1)
+            .unwrap();
+        assert!(!tiny.complete);
+        assert!(tiny.rows.is_empty());
+        assert_eq!(tiny.inspected, 1);
+
+        let sufficient = store
+            .first_declaration_content_qualifier_for_key_limited(oid, "java", generation, 2)
+            .unwrap();
+        assert!(sufficient.complete);
+        assert_eq!(sufficient.rows, vec!["late.namespace".to_string()]);
+        assert_eq!(sufficient.inspected, 2);
+    }
+
+    #[test]
+    fn resource_bound_oversized_current_epoch_import_row_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "main.go",
+            "package sample\nimport \"fmt\"\nfunc run() { fmt.Println(\"ok\") }\n",
+        );
+        let state = parse_state(&GoAdapter, &file);
+        assert_eq!(state.imports.len(), 1, "fixture should persist one import");
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("go", "limited-import-row-bytes-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "go", generation, &GoAdapter, &state)
+            .unwrap();
+        let ordinary = store
+            .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
+            .unwrap();
+        assert!(ordinary.complete);
+        assert_eq!(ordinary.rows, state.imports);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE import_details
+                     SET info = zeroblob(?3)
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![
+                        oid.to_string(),
+                        "go",
+                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap(),
+                    ],
+                )
+                .unwrap(),
+                1
+            );
+        }
+
+        let limited = store
+            .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
+            .unwrap();
+        assert!(!limited.complete);
+        assert!(limited.rows.is_empty());
+        assert_eq!(limited.inspected, 1);
+    }
+
+    #[test]
+    fn resource_bound_inconsistent_current_epoch_import_count_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "main.go",
+            "package sample\nimport (\n  \"fmt\"\n  \"os\"\n)\nfunc run() { fmt.Println(os.Args) }\n",
+        );
+        let state = parse_state(&GoAdapter, &file);
+        assert_eq!(state.imports.len(), 2, "fixture should persist two imports");
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("go", "limited-import-count-integrity-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "go", generation, &GoAdapter, &state)
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE blob_meta
+                     SET import_count = 1
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid.to_string(), "go"],
+                )
+                .unwrap(),
+                1
+            );
+        }
+
+        let capped = store
+            .import_infos_for_key_limited(oid, "go", generation, 1)
+            .unwrap();
+        assert!(!capped.complete);
+        assert_eq!(capped.rows.len(), 1);
+        assert_eq!(capped.inspected, 1);
+
+        let wider = store
+            .import_infos_for_key_limited(oid, "go", generation, 3)
+            .unwrap();
+        assert!(!wider.complete);
+        assert_eq!(wider.rows.len(), 2);
+        assert_eq!(wider.inspected, 2);
+    }
+
+    #[test]
+    fn resource_bound_oversized_current_epoch_supertype_rows_fail_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Hierarchy.scala",
+            "package demo\nclass Parent\nclass Child extends Parent\n",
+        );
+        let state = parse_state(&ScalaAdapter, &file);
+        let target = state
+            .raw_supertypes
+            .iter()
+            .find(|(_, supertypes)| !supertypes.is_empty())
+            .map(|(unit, _)| unit.clone())
+            .expect("fixture should persist a raw supertype");
+        assert!(
+            state
+                .supertype_lookup_paths
+                .get(&target)
+                .is_some_and(|paths| !paths.is_empty()),
+            "fixture should persist a supertype lookup path"
+        );
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("scala", "limited-supertype-row-bytes-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "scala", generation, &ScalaAdapter, &state)
+            .unwrap();
+        let oversized = usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE unit_supertypes
+                     SET raw = CAST(zeroblob(?3) AS TEXT)
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid.to_string(), "scala", oversized],
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let raw = store
+            .raw_supertypes_for_unit_limited(oid, "scala", generation, &target, usize::MAX)
+            .unwrap();
+        assert!(!raw.complete);
+        assert!(raw.rows.is_empty());
+        assert_eq!(raw.inspected, 1);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE unit_supertypes
+                     SET lookup_path = CAST(zeroblob(?3) AS TEXT)
+                     WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid.to_string(), "scala", oversized],
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let lookup_paths = store
+            .supertype_lookup_paths_for_unit_limited(oid, "scala", generation, &target, usize::MAX)
+            .unwrap();
+        assert!(!lookup_paths.complete);
+        assert!(lookup_paths.rows.is_empty());
+        assert_eq!(lookup_paths.inspected, 1);
+    }
+
+    #[test]
+    fn resource_bound_oversized_current_epoch_candidate_row_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Target.java",
+            "class Target { void run() {} }\n",
+        );
+        let state = parse_state(&JavaAdapter, &file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "limited-candidate-row-bytes-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE code_units
+                     SET signature = CAST(zeroblob(?3) AS TEXT)
+                     WHERE blob_oid = ?1 AND lang = ?2 AND identifier = 'Target'",
+                    params![
+                        oid.to_string(),
+                        "java",
+                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap(),
+                    ],
+                )
+                .unwrap(),
+                1
+            );
+        }
+
+        let langs = vec!["java".to_string()];
+        let generations = HashMap::from_iter([("java".to_string(), generation)]);
+        let limited = store
+            .declaration_candidate_rows_by_identifier_for_langs_limited(
+                &langs,
+                &generations,
+                "Target",
+                usize::MAX,
+            )
             .unwrap();
         assert!(!limited.complete);
         assert!(limited.rows.is_empty());

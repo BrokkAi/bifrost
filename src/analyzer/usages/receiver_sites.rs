@@ -35,10 +35,10 @@ pub(crate) struct ReceiverSite {
     pub(crate) member_range: Option<Range>,
 }
 
-/// Maximum canonical fact nodes inspected while building one receiver-site index.
+/// Maximum canonical fact nodes and role edges inspected while building one receiver-site index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReceiverSiteIndexLimit {
-    pub(crate) max_inspected_nodes: usize,
+    pub(crate) max_work_items: usize,
 }
 
 /// Maximum indexed receiver sites inspected while selecting one query input.
@@ -52,25 +52,23 @@ pub(crate) struct ReceiverSiteSelectionLimit {
 pub(crate) enum ReceiverSiteIndexBuild {
     Complete {
         index: ReceiverSiteIndex,
-        inspected_nodes: usize,
+        inspected_work: usize,
     },
     Exceeded {
-        inspected_nodes: usize,
+        inspected_work: usize,
     },
     Cancelled {
-        inspected_nodes: usize,
+        inspected_work: usize,
     },
 }
 
 impl ReceiverSiteIndexBuild {
     #[cfg(test)]
-    pub(crate) fn inspected_nodes(&self) -> usize {
+    pub(crate) fn inspected_work(&self) -> usize {
         match self {
-            Self::Complete {
-                inspected_nodes, ..
-            }
-            | Self::Exceeded { inspected_nodes }
-            | Self::Cancelled { inspected_nodes } => *inspected_nodes,
+            Self::Complete { inspected_work, .. }
+            | Self::Exceeded { inspected_work }
+            | Self::Cancelled { inspected_work } => *inspected_work,
         }
     }
 }
@@ -258,21 +256,21 @@ pub(crate) fn build_receiver_site_index(
     limit: ReceiverSiteIndexLimit,
     cancellation: Option<&CancellationToken>,
 ) -> ReceiverSiteIndexBuild {
-    let mut inspected_nodes = 0;
+    let mut inspected_work = 0;
     let mut sites = Vec::new();
 
     if is_cancelled(cancellation) {
-        return ReceiverSiteIndexBuild::Cancelled { inspected_nodes };
+        return ReceiverSiteIndexBuild::Cancelled { inspected_work };
     }
 
     for (source_order, node) in facts.nodes().iter().enumerate() {
         if is_cancelled(cancellation) {
-            return ReceiverSiteIndexBuild::Cancelled { inspected_nodes };
+            return ReceiverSiteIndexBuild::Cancelled { inspected_work };
         }
-        if inspected_nodes >= limit.max_inspected_nodes {
-            return ReceiverSiteIndexBuild::Exceeded { inspected_nodes };
+        if inspected_work >= limit.max_work_items {
+            return ReceiverSiteIndexBuild::Exceeded { inspected_work };
         }
-        inspected_nodes += 1;
+        inspected_work += 1;
 
         let (kind, receiver_role, member_role) = match node.kind {
             NormalizedKind::Call => (ReceiverSiteKind::Call, Role::Receiver, Role::Callee),
@@ -282,17 +280,33 @@ pub(crate) fn build_receiver_site_index(
             _ => continue,
         };
         let fact_id = source_order as u32;
-        let Some(receiver) = facts.role_targets(fact_id, receiver_role).next() else {
-            continue;
-        };
-        let member_span = node.name.or_else(|| {
-            facts
-                .role_targets(fact_id, member_role)
-                .find_map(|target| match kind {
+        let mut receiver = None;
+        let mut member_span = node.name;
+        for target in facts.roles(fact_id) {
+            if is_cancelled(cancellation) {
+                return ReceiverSiteIndexBuild::Cancelled { inspected_work };
+            }
+            if inspected_work >= limit.max_work_items {
+                return ReceiverSiteIndexBuild::Exceeded { inspected_work };
+            }
+            inspected_work += 1;
+
+            if receiver.is_none() && target.role == receiver_role {
+                receiver = Some(target);
+            }
+            if member_span.is_none() && target.role == member_role {
+                member_span = match kind {
                     ReceiverSiteKind::Call => target.name,
                     ReceiverSiteKind::FieldAccess => Some(target.name.unwrap_or(target.span)),
-                })
-        });
+                };
+            }
+            if receiver.is_some() && member_span.is_some() {
+                break;
+            }
+        }
+        let Some(receiver) = receiver else {
+            continue;
+        };
         sites.push(IndexedReceiverSite {
             site: ReceiverSite {
                 kind,
@@ -305,7 +319,7 @@ pub(crate) fn build_receiver_site_index(
     }
 
     if is_cancelled(cancellation) {
-        return ReceiverSiteIndexBuild::Cancelled { inspected_nodes };
+        return ReceiverSiteIndexBuild::Cancelled { inspected_work };
     }
 
     ReceiverSiteIndexBuild::Complete {
@@ -313,7 +327,7 @@ pub(crate) fn build_receiver_site_index(
             facts,
             sites: sites.into_boxed_slice(),
         },
-        inspected_nodes,
+        inspected_work,
     }
 }
 
@@ -361,19 +375,19 @@ mod tests {
 
     fn complete_index(source: &str) -> ReceiverSiteIndex {
         let facts = facts(source);
-        let node_count = facts.nodes().len();
+        let work_item_count = facts.work_item_count();
         match build_receiver_site_index(
             facts,
             ReceiverSiteIndexLimit {
-                max_inspected_nodes: node_count,
+                max_work_items: work_item_count,
             },
             None,
         ) {
             ReceiverSiteIndexBuild::Complete {
                 index,
-                inspected_nodes,
+                inspected_work,
             } => {
-                assert_eq!(inspected_nodes, node_count);
+                assert!(inspected_work <= work_item_count);
                 index
             }
             other => panic!("expected complete receiver-site index, got {other:?}"),
@@ -503,24 +517,42 @@ mod tests {
     }
 
     #[test]
-    fn tiny_build_limit_reports_only_inspected_nodes() {
+    fn tiny_build_limit_reports_only_inspected_work() {
         let facts = facts(
             "class Service { public void Run() {} }\n\
              class Caller { void Go(Service service) { service.Run(); } }\n",
         );
+        let outcome =
+            build_receiver_site_index(facts, ReceiverSiteIndexLimit { max_work_items: 1 }, None);
+
+        assert!(matches!(
+            &outcome,
+            ReceiverSiteIndexBuild::Exceeded { inspected_work: 1 }
+        ));
+        assert_eq!(outcome.inspected_work(), 1);
+    }
+
+    #[test]
+    fn node_only_budget_does_not_hide_role_edge_work() {
+        let facts = facts(
+            "class Service { public void Run() {} }\n\
+             class Caller { void Go(Service service) { service.Run(); } }\n",
+        );
+        let node_count = facts.nodes().len();
         let outcome = build_receiver_site_index(
             facts,
             ReceiverSiteIndexLimit {
-                max_inspected_nodes: 1,
+                max_work_items: node_count,
             },
             None,
         );
 
         assert!(matches!(
-            &outcome,
-            ReceiverSiteIndexBuild::Exceeded { inspected_nodes: 1 }
+            outcome,
+            ReceiverSiteIndexBuild::Exceeded {
+                inspected_work
+            } if inspected_work == node_count
         ));
-        assert_eq!(outcome.inspected_nodes(), 1);
     }
 
     #[test]
@@ -569,20 +601,20 @@ mod tests {
     }
 
     #[test]
-    fn pre_cancelled_build_stops_before_inspecting_nodes() {
+    fn pre_cancelled_build_stops_before_inspecting_work() {
         let cancellation = CancellationToken::default();
         cancellation.cancel();
         let outcome = build_receiver_site_index(
             facts("class Service { public void Run() {} }\n"),
             ReceiverSiteIndexLimit {
-                max_inspected_nodes: usize::MAX,
+                max_work_items: usize::MAX,
             },
             Some(&cancellation),
         );
 
         assert!(matches!(
             outcome,
-            ReceiverSiteIndexBuild::Cancelled { inspected_nodes: 0 }
+            ReceiverSiteIndexBuild::Cancelled { inspected_work: 0 }
         ));
     }
 
@@ -592,21 +624,21 @@ mod tests {
             "class Service { public void Run() {} }\n\
              class Caller { void Go(Service service) { service.Run(); service.Run(); } }\n",
         );
-        let node_count = facts.nodes().len();
+        let work_item_count = facts.work_item_count();
         let cancellation = CancellationToken::cancel_after_checks_for_test(4);
         let outcome = build_receiver_site_index(
             facts,
             ReceiverSiteIndexLimit {
-                max_inspected_nodes: usize::MAX,
+                max_work_items: usize::MAX,
             },
             Some(&cancellation),
         );
 
-        let ReceiverSiteIndexBuild::Cancelled { inspected_nodes } = outcome else {
+        let ReceiverSiteIndexBuild::Cancelled { inspected_work } = outcome else {
             panic!("expected mid-build cancellation, got {outcome:?}");
         };
-        assert!(inspected_nodes > 0);
-        assert!(inspected_nodes < node_count);
+        assert!(inspected_work > 0);
+        assert!(inspected_work < work_item_count);
     }
 
     #[test]

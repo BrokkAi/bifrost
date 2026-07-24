@@ -1,4 +1,5 @@
 mod adapter;
+pub(crate) mod bindings;
 mod cache;
 mod clones;
 mod declarations;

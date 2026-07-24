@@ -6206,6 +6206,201 @@ func shadowBuiltins() int {
 }
 
 #[test]
+fn go_builtin_new_shadowing_remains_lexically_structured_after_file_precomputation() {
+    const LEXICAL_SOURCE: &str = r#"package conformance
+
+type Service struct{}
+func (*Service) Run() {}
+func makeNew(value any) *Service { return nil }
+
+func builtin() {
+    new(Service).Run()
+}
+
+func localShadow() {
+    new := makeNew
+    new(Service).Run()
+}
+
+func namedResultShadow() (new func(any) *Service) {
+    new(Service).Run()
+    return
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/new_lexical_shadow.go", LEXICAL_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "go/new_lexical_shadow.go");
+
+    let has_new_allocation = |procedure_name: &str| {
+        let procedure = procedure_named(&graph, procedure_name, ProcedureKind::Function);
+        procedure.allocations().iter().any(|allocation| {
+            let mapping = procedure
+                .source_mapping(allocation.source)
+                .expect("Go allocation must retain a source mapping");
+            let span = mapping.locator.anchor().span();
+            LEXICAL_SOURCE.get(span.start_byte() as usize..span.end_byte() as usize)
+                == Some("new(Service)")
+        })
+    };
+
+    assert!(
+        has_new_allocation("builtin"),
+        "the unshadowed predeclared new must remain an allocation"
+    );
+    for procedure_name in ["localShadow", "namedResultShadow"] {
+        assert!(
+            !has_new_allocation(procedure_name),
+            "{procedure_name} must treat its lexical new binding as an ordinary call"
+        );
+        let procedure = procedure_named(&graph, procedure_name, ProcedureKind::Function);
+        let _ = exact_call_site(procedure, LEXICAL_SOURCE, "new(Service)");
+    }
+
+    const PACKAGE_SOURCE: &str = r#"package conformance
+
+type Service struct{}
+func (*Service) Run() {}
+func new(value any) *Service { return nil }
+
+func first() {
+    new(Service).Run()
+}
+
+func second() {
+    new(Service).Run()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/new_package_shadow.go", PACKAGE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "go/new_package_shadow.go");
+
+    for procedure_name in ["first", "second"] {
+        let procedure = procedure_named(&graph, procedure_name, ProcedureKind::Function);
+        assert!(
+            procedure.allocations().iter().all(|allocation| {
+                let mapping = procedure
+                    .source_mapping(allocation.source)
+                    .expect("Go allocation must retain a source mapping");
+                let span = mapping.locator.anchor().span();
+                PACKAGE_SOURCE.get(span.start_byte() as usize..span.end_byte() as usize)
+                    != Some("new(Service)")
+            }),
+            "one package-level new declaration must shadow the builtin in every procedure"
+        );
+        let _ = exact_call_site(procedure, PACKAGE_SOURCE, "new(Service)");
+    }
+}
+
+#[test]
+fn go_many_procedure_enumeration_is_budgeted_without_double_counting_identity_work() {
+    let mut source = String::from("package conformance\n\ntype Service struct{}\n");
+    for index in 0..64 {
+        source.push_str(&format!("func procedure{index}() {{ _ = new(Service) }}\n"));
+    }
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/many_procedures.go", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("go/many_procedures.go");
+    let cancellation = CancellationToken::default();
+
+    let mut limits = SemanticBudget::default().limits();
+    limits.nested_entries = 12;
+    let mut budget = SemanticBudget::new(limits).expect("positive semantic budget");
+    let outcome = analyzer
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("enumeration exhaustion is a semantic outcome");
+    assert!(matches!(
+        outcome,
+        SemanticOutcome::ExceededBudget { exceeded, work, .. }
+            if exceeded.dimension() == SemanticBudgetDimension::NestedEntries
+                && work.nested_entries > 12
+    ));
+
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("sufficient enumeration budget");
+    let SemanticOutcome::Complete { value, work } = outcome else {
+        panic!("sufficient enumeration budget must complete");
+    };
+    assert_eq!(value.procedures().len(), 64);
+    assert_eq!(
+        work.procedures,
+        value.procedures().len(),
+        "enumeration identity preflight must not be charged again when lowering starts"
+    );
+    assert!(
+        work.nested_entries > value.procedures().len(),
+        "the one-pass file traversal must be represented in semantic work"
+    );
+}
+
+#[test]
+fn go_wide_package_binding_inventory_stops_at_the_nested_entry_budget() {
+    let names = (0..4_096)
+        .map(|index| format!("binding{index} /* package binding {index} */"))
+        .chain(std::iter::once("new".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "package conformance\n\nvar {names} int\n\nfunc use() {{ _ = new(Service{{}}) }}\n"
+    );
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/wide_package_binding.go", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("go/wide_package_binding.go");
+    let cancellation = CancellationToken::default();
+    let mut limits = SemanticBudget::default().limits();
+    limits.nested_entries = 8;
+    let mut budget = SemanticBudget::new(limits).expect("positive semantic budget");
+
+    let outcome = analyzer
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("wide package inventory exhaustion is a semantic outcome");
+    let SemanticOutcome::ExceededBudget { exceeded, work, .. } = outcome else {
+        panic!("wide Go package inventory must exhaust its nested-entry budget");
+    };
+    assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+    assert_eq!(work.nested_entries, limits.nested_entries + 1);
+}
+
+#[test]
+fn python_wide_function_body_stops_at_the_nested_entry_budget() {
+    let mut source = String::from("def wide():\n");
+    for index in 0..4_096 {
+        source.push_str(&format!("    value_{index} = {index}\n"));
+    }
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("python/wide_function.py", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("python/wide_function.py");
+    let cancellation = CancellationToken::default();
+    let mut limits = SemanticBudget::default().limits();
+    limits.nested_entries = 8;
+    let mut budget = SemanticBudget::new(limits).expect("positive semantic budget");
+
+    let outcome = analyzer
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("wide Python enumeration exhaustion is a semantic outcome");
+    let SemanticOutcome::ExceededBudget { exceeded, work, .. } = outcome else {
+        panic!("wide Python enumeration must exhaust its nested-entry budget");
+    };
+    assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+    assert!(
+        work.nested_entries > limits.nested_entries
+            && work.nested_entries <= limits.nested_entries + 4,
+        "enumeration must stop within one bounded identity-work increment, not after the 4,096-child body"
+    );
+}
+
+#[test]
 fn csharp_direct_call_conformance() {
     assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::CSharp,
@@ -11012,7 +11207,7 @@ fn php_direct_free_call_conformance() {
 
 #[test]
 fn php_typed_instance_method_call_uses_the_shared_dispatch_oracle() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::Php,
         dialect: SemanticLanguage::Standard(Language::Php),
         callee_path: "src/Service.php",
@@ -11045,7 +11240,7 @@ fn php_typed_instance_method_call_uses_the_shared_dispatch_oracle() {
 
 #[test]
 fn php_typed_nullsafe_method_call_has_matched_icfg_returns() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::Php,
         dialect: SemanticLanguage::Standard(Language::Php),
         callee_path: "src/NullableService.php",
