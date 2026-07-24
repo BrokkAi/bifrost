@@ -15,7 +15,7 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 10:35+02:00) Verified the attached issue branch, fetched `origin`, confirmed the branch is clean at `7748331e`, and found the one newer `origin/master` commit is release-metadata-only with no overlap.
 - [x] (2026-07-24 10:44+02:00) Audited the immutable CFG representation, ICFG return-mask cache, cancellation and budget conventions, existing lifecycle benchmarks, and the broader typestate roadmap.
 - [x] (2026-07-24 11:26+02:00) Implemented the dense bidirectional `ProcedureSemantics` view, shared node/edge budgets and cancellation, complete iterative reachability/DFS/Kosaraju/loop/path algorithms, and seven synthetic tests including a 100,000-node chain.
-- [ ] Replace the ICFG builder’s bespoke return-path traversals and add behavior and artifact-isolation regression coverage.
+- [x] (2026-07-24 11:42+02:00) Replaced the ICFG builder’s bespoke return-path traversals with shared forward/reverse reachability while preserving precharge/cancellation/cache behavior; all 41 CFG, 25 ICFG, and 11 tabulation contracts plus the new artifact-isolation unit regression pass.
 - [ ] Add the ignored release benchmark, runner, versioned JSON output, lifecycle evidence note, and roadmap checkpoint.
 - [ ] Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [ ] Complete specialist review, resolve material findings, and record final outcomes.
@@ -182,3 +182,5 @@ Operations return `Result<CompleteResult, CfgAlgorithmError>`. Successful result
 Revision note (2026-07-24): Created the focused issue #819 execution record after live branch, source, consumer, lifecycle, and benchmark-boundary verification.
 
 Revision note (2026-07-24): Marked Milestone 1 complete after the focused algorithm suite passed all seven tests, including the 100,000-node stack-safety case.
+
+Revision note (2026-07-24): Marked Milestone 2 complete after shared reachability replaced the ICFG stacks and the focused contract matrix plus distinct-artifact cache regression passed.
