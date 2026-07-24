@@ -7,15 +7,9 @@ Cursor can use Bifrost through the native Cursor plugin package in this reposito
 
 ## Install From GitHub
 
-Use the dedicated **Cursor Agents** window, rather than the editor-adjacent
-Customize page. In a new agent, run:
-
-```text
-/add-plugin bifrost@https://github.com/BrokkAi/bifrost
-```
-
-This opens the Plugins view. You can also reach the same flow through
-**Customize -> Plugins -> Search or Paste Link** and paste:
+Use the dedicated **Cursor Agents** window. In a new agent, type
+`/add-plugin`, select the **Add Plugin** slash-command suggestion, and press
+Return. Cursor opens its Plugins view; in **Search or Paste Link**, paste:
 
 ```text
 https://github.com/BrokkAi/bifrost
@@ -25,22 +19,32 @@ Open the Bifrost result, choose **Add to Cursor**, and confirm **Add Plugin**.
 Cursor reads `.cursor-plugin/marketplace.json`, finds the `bifrost` package at
 `plugins/bifrost-agent`, and installs it.
 
+Cursor's settings labels vary by build. If **Customize -> Plugins** exposes
+**Search or Paste Link**, pasting the same repository URL there is equivalent.
+Typing the slash-command text as an ordinary chat prompt is not: select the
+slash-command suggestion before submitting it.
+
+To upgrade an existing installation, remove the GitHub-installed Bifrost
+package from the Plugins view and repeat the GitHub install flow. Fully quit
+and reopen Cursor afterward, then confirm that the installed plugin metadata
+reports the expected version.
+
 The plugin needs two Cursor-specific compatibility details: the MCP definition
 resolves its launcher from Cursor's installed plugin directory, and Bifrost
 accepts the absolute native path that Cursor returns from `roots/list`. A
 connected MCP status or visible tool list is not sufficient evidence that both
 boundaries worked; complete the smoke test below.
 
-:::caution[Cursor and Bifrost 0.8.9]
-Cursor can install the GitHub plugin at version 0.8.9, but the published 0.8.9
-Bifrost binary rejects Cursor's bare absolute workspace path because it expects
-a `file:` URI. Workspace-backed tool calls therefore remain unbound by default.
-Use a newer Bifrost release containing Cursor native-root support when one is
-available; do not treat the 0.8.9 installation alone as a successful
-verification.
+:::caution[Upgrade from Bifrost 0.8.9]
+Bifrost 0.8.10 is the minimum release with both the Cursor plugin-root launcher
+fix and support for Cursor's bare absolute workspace path. A 0.8.9 installation
+can appear connected while workspace-backed calls remain unbound. Upgrade,
+fully restart Cursor, and complete the exact-workspace smoke below rather than
+treating installation or a visible tool list as verification.
 
-For one fixed project, 0.8.9 has an explicit compatibility override. Fully quit
-Cursor, change to that project, and start a new app process with:
+If upgrading is temporarily impossible, 0.8.9 has an explicit compatibility
+override for one fixed project. Fully quit Cursor, change to that project, and
+start a new app process with:
 
 ```bash
 BIFROST_WORKSPACE_ROOT="$(pwd)" cursor .
@@ -94,27 +98,43 @@ active workspace through the standard `roots/list` mechanism with compatibility
 for Cursor's native-path response. Bifrost never treats Cursor's process
 directory or the installed plugin directory as the analyzer workspace.
 
+Cursor can also import an installed Claude Code plugin automatically. If the
+MCP list contains both the native `plugin-bifrost-bifrost` entry and an imported
+`plugin-brokk-bifrost` entry, leave the native Cursor entry enabled and disable
+the imported duplicate in Cursor. This does not disable the Claude Code
+installation itself.
+
+For strong exact-checkout evidence, add a temporary declaration whose name is
+unique to the smoke:
+
+```rust
+// src/cursor_bifrost_host_probe_4f6f2b7.rs
+pub fn cursor_bifrost_host_probe_4f6f2b7() {}
+```
+
 Use this strict smoke prompt to prove Cursor called the plugin's MCP server
 instead of silently falling back to file or shell tools:
 
 ```text
-Use only the installed Bifrost plugin MCP tools. First confirm query_code is in the callable Bifrost MCP surface. Then call the Bifrost search_symbols MCP tool with patterns ["reconcile_codex_sandbox_workspace"]. Do not use Shell, terminal, rg, codebase search, file reading, or the bifrost CLI. Report the exact MCP result, especially the returned path.
+Use only the installed Bifrost plugin MCP tools. First confirm query_code is in the callable Bifrost MCP surface. Call search_symbols with patterns ["cursor_bifrost_host_probe_4f6f2b7"]. Then call query_code with schema_version 2, languages ["rust"], match {"kind":"function","name":"cursor_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". Do not use Shell, terminal, rg, codebase search, file reading, or the bifrost CLI. Show both exact structured MCP results. PASS only if both return src/cursor_bifrost_host_probe_4f6f2b7.rs.
 ```
 
 Apply the shared
 [host-integration evidence contract](/mcp/#validate-host-integration): retain
 Cursor's Bifrost tool event and structured result, verify the result belongs to
-the active workspace (the current smoke result is `src/mcp_common.rs`), and
-reject ordinary file-reading fallbacks or paths under the installed plugin.
+the active workspace, and reject ordinary file-reading fallbacks or paths under
+the installed plugin. Remove the temporary declaration after retaining the
+evidence.
 
 :::caution[Cursor Agents worktrees]
-In Cursor Agents 3.12.30, `roots/list` can name the base repository while the
-agent composer shows a separate worktree. A relative result such as
-`src/mcp_common.rs` exists in both checkouts and cannot prove the binding is
-correct. When using a worktree, also query a declaration or file that exists
-only on that worktree and reject results from the base checkout. Cursor remains
-unchecked in the cross-host verification matrix until this exact-checkout
-boundary passes.
+In Cursor Agents 3.12.30, this host issue remains after upgrading to Bifrost
+0.8.10: `roots/list` can name the base repository while the agent composer
+shows a separate worktree. Bifrost correctly accepts the native root supplied
+by Cursor, but it cannot infer that Cursor meant a different checkout. A
+relative result from a file shared by both checkouts cannot prove the binding
+is correct. When using a worktree, run the unique-declaration smoke above and
+reject results from the base checkout. Cursor remains unchecked in the
+cross-host verification matrix until this exact-checkout boundary passes.
 :::
 
 The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can load plugin skills, but it has not proven reliable for plugin-provided MCP servers. Treat the desktop Customize/MCP flow as the MCP validation path.

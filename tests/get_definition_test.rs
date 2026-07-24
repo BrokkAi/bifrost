@@ -3397,6 +3397,40 @@ fn csharp_private_field_reference_resolves_via_enclosing_class() {
     );
 }
 
+// A static import may name a nested type: `import static com.x.Tacos.Burritos`
+// followed by `Burritos.makeBurritos(1)` must resolve to the nested class,
+// not fail with a static-import boundary claim (tier-4 spoon/mockito,
+// #1132).
+#[test]
+fn java_static_import_of_nested_type_resolves_to_the_class() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/com/x/Tacos.java",
+            "package com.x;\npublic class Tacos {\n    public static class Burritos {\n        public static void makeBurritos(int n) {}\n    }\n}\n",
+        )
+        .file(
+            "src/test/java/com/y/TacosTest.java",
+            "package com.y;\nimport static com.x.Tacos.Burritos;\npublic class TacosTest {\n    public void m2() {\n        Burritos.makeBurritos(1);\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        Burritos.makeBurritos(1);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/test/java/com/y/TacosTest.java","line":5,"column":{}}}]}}"#,
+            column_of(line, "Burritos")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "com.x.Tacos.Burritos",
+        "{value}"
+    );
+}
+
 #[test]
 fn csharp_dotted_type_lookup_does_not_import_child_namespace() {
     let project = InlineTestProject::with_language(Language::CSharp)

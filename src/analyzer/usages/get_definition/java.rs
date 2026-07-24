@@ -359,6 +359,7 @@ pub(crate) enum JavaTypeLookupResolution {
 enum JavaMemberLookupKind {
     Field,
     Method,
+    Type,
 }
 
 pub(crate) fn java_type_lookup_resolution(
@@ -2599,6 +2600,7 @@ fn java_filter_member_candidates(
         .filter(|unit| match kind {
             JavaMemberLookupKind::Field => unit.is_field(),
             JavaMemberLookupKind::Method => unit.is_function(),
+            JavaMemberLookupKind::Type => unit.is_class(),
         })
         .collect()
 }
@@ -2972,8 +2974,24 @@ fn java_static_import_candidates(
             continue;
         };
         if let Some(owner) = path.strip_suffix(".*") {
-            let owner_candidates =
+            let mut owner_candidates =
                 java_filter_member_candidates(support.fqn(&format!("{owner}.{member}")), kind);
+            if owner_candidates.is_empty() {
+                // Static imports may also name nested types.
+                owner_candidates = java_filter_member_candidates(
+                    support.fqn(&format!("{owner}.{member}")),
+                    JavaMemberLookupKind::Type,
+                );
+            }
+            if owner_candidates.is_empty()
+                && let Some((outer, leaf)) = owner.rsplit_once('.')
+            {
+                // On-demand static imports may land on nested types too.
+                owner_candidates = java_filter_member_candidates(
+                    support.fqn(&format!("{outer}${leaf}.{member}")),
+                    kind,
+                );
+            }
             if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, owner) {
                 saw_external = true;
             }
@@ -2986,7 +3004,19 @@ fn java_static_import_candidates(
         if imported_member != member {
             continue;
         }
-        let imported = java_filter_member_candidates(support.fqn(path), kind);
+        let mut imported = java_filter_member_candidates(support.fqn(path), kind);
+        if imported.is_empty() {
+            // Static imports may also name nested types
+            // (`import static com.x.Tacos.Burritos`).
+            imported = java_filter_member_candidates(support.fqn(path), JavaMemberLookupKind::Type);
+        }
+        if imported.is_empty()
+            && let Some((outer, leaf)) = path.rsplit_once('.')
+        {
+            // The index keys nested types with `$`, not `.` (tier-4
+            // spoon/mockito static-import claims).
+            imported = java_filter_member_candidates(support.fqn(&format!("{outer}${leaf}")), kind);
+        }
         if imported.is_empty() && !java_workspace_fqn_exists(support, owner) {
             saw_external = true;
         }

@@ -33,15 +33,30 @@ claude mcp list
 
 Start a fresh Claude Code session after installing the plugin so the MCP server configuration is loaded at startup.
 
+To upgrade the user-scoped installation created above to the latest published
+Bifrost plugin, refresh its marketplace metadata and update the installed
+package:
+
+```bash
+claude plugin marketplace update bifrost
+claude plugin update brokk@bifrost --scope user
+claude plugin list
+claude mcp list
+```
+
+Then run `/reload-plugins` or exit and start a fresh Claude Code session.
+If the plugin was installed with another scope, pass that original scope to
+`claude plugin update` instead.
+
 The plugin automatically registers its packaged MCP server, so do not add a duplicate manual entry. Without an explicit `BIFROST_WORKSPACE_ROOT` or launcher `--root`, Bifrost requests the host-approved project directory through MCP roots and never uses the installed plugin directory as analyzer scope.
 
 `claude plugin list` should show `brokk@bifrost` enabled. `claude mcp list`
-should show `plugin:brokk:bifrost` connected. If a v0.8.9 installation instead
-reports `posix_spawn './bin/bifrost-launcher.mjs'`, it predates the Claude
-plugin-root fix: upgrade to a later Bifrost plugin release, then run
-`/reload-plugins` or start a fresh session. Claude caches installed plugin
-contents by version, so refreshing the marketplace alone does not replace an
-already cached v0.8.9 copy.
+should show `plugin:brokk:bifrost` connected. Bifrost 0.8.10 is the minimum
+release with the Claude plugin-root launcher fix. If a v0.8.9 installation
+instead reports `posix_spawn './bin/bifrost-launcher.mjs'`, run the upgrade
+commands above, then reload plugins or start a fresh session. Claude caches
+installed plugin contents by version, so refreshing the marketplace alone does
+not replace an already cached v0.8.9 copy.
 
 ## Local Plugin Testing
 
