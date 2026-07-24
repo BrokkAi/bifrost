@@ -2276,7 +2276,7 @@ fn resolve_cpp_type(
             file,
             &qualifier.reference,
             node.start_byte(),
-            |_| true,
+            |unit| unit.source() == file,
         ) {
             return candidates_outcome(vec![parameter]);
         }
@@ -2427,7 +2427,9 @@ fn resolve_cpp_type_without_focused_qualifier(
             // it is indexed; without it the qualifier fell through to a
             // dishonest include-boundary claim (tier-4 DeepSpeed).
             if let Some(parameter) =
-                resolve_in_enclosing_scopes(analyzer, file, scope_text, node.start_byte(), |_| true)
+                resolve_in_enclosing_scopes(analyzer, file, scope_text, node.start_byte(), |unit| {
+                    unit.source() == file
+                })
             {
                 let member = cpp_node_text(name, source);
                 let candidates = cpp_direct_member_candidates(
