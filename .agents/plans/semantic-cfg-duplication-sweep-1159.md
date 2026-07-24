@@ -20,7 +20,7 @@ After this change, every language will still own syntax recognition, evaluation 
 - [x] (2026-07-24 18:47Z) Milestone 3: extracted small structured-control combinators for conditional choices, short-circuit conditions, and C-style loops while leaving AST classification in language adapters.
 - [x] (2026-07-24 19:10Z) Milestone 4: extracted cleanup-route specialization and migrated the compatible try/finally implementations.
 - [x] (2026-07-24 19:30Z) Milestone 5: centralized duplicated data-flow outcome status, deterministic ordering, and cancellation-checkpointed budget reservation without merging the distinct solver engines.
-- [ ] Milestone 6: formatting, focused semantic/data-flow tests, isolated all-targets clippy, CPD remeasurement, five specialist review passes, commit, and branch push are complete. Draft PR creation is externally blocked by GitHub HTTP 500 responses.
+- [x] (2026-07-24 21:21Z) Milestone 6: completed formatting, focused semantic/data-flow tests, isolated all-targets clippy, CPD remeasurement, five specialist review passes, commit and branch push, and opened draft PR #1164 after GitHub's PR endpoint recovered.
 
 ## Surprises & Discoveries
 
@@ -93,6 +93,8 @@ Milestone 6's adversarial review covered duplication, intent/architecture, secur
 The final PMD 7.14.0 comparison uses identical 80-token scans over `src/analyzer` and `src/searchtools` at `origin/master` `3317217e` and this branch. Cross-language handler clone blocks fell from 680 to 607 and token mass from 91,709 to 79,951. Within semantic lowering, blocks fell from 424 to 351, token mass from 53,899 to 42,141 (down 21.8%), and the largest clone fell from 601 to 429 tokens. The remaining Java/JavaScript structured-statement pair rose slightly from 3,265 to 3,372 tokens because their language-owned syntax glue remains deliberately separate; the total semantic clone surface still dropped materially.
 
 Formatting and isolated `cargo clippy --all-targets --all-features -- -D warnings` pass. Focused semantic CFG/language, data-flow, receiver-budget, semantic-provider, and source-projection tests pass. The all-feature run passes every sweep-related target and reaches the unchanged PHP usage-graph failure described above; the same failure reproduces alone and is recorded as a base-branch defect rather than hidden by this refactor.
+
+Draft PR [#1164](https://github.com/BrokkAi/bifrost/pull/1164) publishes the completed sweep against `master`, including the architectural boundaries, CPD measurements, specialist-review hardening, validation record, and explicit PHP base-branch failure.
 
 ## Context and Orientation
 
@@ -236,4 +238,4 @@ In `src/analyzer/semantic/lowering.rs` or `src/analyzer/semantic/control_lowerin
 
 In `src/analyzer/dataflow`, define one semantic outcome status implementation and one cancellation-checkpointed staging operation on `DataflowRequest`. No new external crate dependencies are expected.
 
-Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 5 to record completed shared kernels, bounded topology, cleanup and data-flow invariant extraction, and regression coverage. Updated again during Milestone 6 with specialist-review fixes, final CPD deltas, host-specific validation requirements, cold/cache work accounting, the unrelated PHP base-branch gate failure, and GitHub's external PR-creation blocker after the completed branch push.
+Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 5 to record completed shared kernels, bounded topology, cleanup and data-flow invariant extraction, and regression coverage. Updated again during Milestone 6 with specialist-review fixes, final CPD deltas, host-specific validation requirements, cold/cache work accounting, the unrelated PHP base-branch gate failure, and GitHub's temporary PR-creation blocker after the completed branch push. Closed after the endpoint recovered and draft PR #1164 was created.
