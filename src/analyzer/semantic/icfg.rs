@@ -2481,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn return_path_masks_are_scoped_to_distinct_artifact_instances() {
+    fn exit_profiles_are_scoped_to_distinct_artifact_instances() {
         fn materialize_handle() -> ProcedureHandle {
             let fixture = AnalyzerFixture::new_for_language(
                 crate::analyzer::Language::TypeScript,
@@ -2526,32 +2526,35 @@ mod tests {
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         let mut request = SemanticRequest::new(&mut budget, &cancellation);
-        let first_exit = first.semantics().normal_exit_point();
-        let second_exit = second.semantics().normal_exit_point();
+        for procedure in [&first, &second] {
+            let entry = procedure
+                .point_handle(procedure.semantics().entry_point())
+                .expect("entry point handle");
+            let exit = procedure
+                .point_handle(procedure.semantics().normal_exit_point())
+                .expect("normal exit point handle");
+            let outcome = materialize_exit_profile(&entry, &exit, &mut request)
+                .expect("exit profile")
+                .map(Arc::new);
+            assert!(
+                builder
+                    .exit_profiles
+                    .insert((procedure.clone(), entry.id(), exit.id()), outcome,)
+                    .is_none()
+            );
+        }
 
-        assert!(cache_return_path_mask(
-            &mut builder,
-            &first,
-            first_exit,
-            &mut request
-        ));
-        assert!(cache_return_path_mask(
-            &mut builder,
-            &second,
-            second_exit,
-            &mut request
-        ));
-        assert_eq!(builder.return_path_masks.len(), 2);
-        assert!(
-            builder
-                .return_path_masks
-                .contains_key(&(first.clone(), first_exit))
-        );
-        assert!(
-            builder
-                .return_path_masks
-                .contains_key(&(second.clone(), second_exit))
-        );
+        assert_eq!(builder.exit_profiles.len(), 2);
+        assert!(builder.exit_profiles.contains_key(&(
+            first.clone(),
+            first.semantics().entry_point(),
+            first.semantics().normal_exit_point(),
+        )));
+        assert!(builder.exit_profiles.contains_key(&(
+            second.clone(),
+            second.semantics().entry_point(),
+            second.semantics().normal_exit_point(),
+        )));
     }
 
     #[test]
