@@ -51,8 +51,9 @@ the analyzer tree.
       recorded in Surprises & Discoveries.
 - [ ] M1: dual representation — emission points populate `FqName` alongside the
       legacy strings, with an equivalence check (per language; check off individually).
-  - [ ] rust  - [ ] cpp  - [ ] java  - [ ] python  - [x] go (2026-07-24)  - [ ] php
-  - [ ] ruby  - [ ] scala  - [ ] csharp  - [ ] javascript  - [ ] typescript
+  - [x] rust (2026-07-24)  - [x] cpp (2026-07-24)  - [ ] java  - [ ] python
+  - [x] go (2026-07-24)  - [ ] php  - [ ] ruby  - [x] scala (2026-07-24)
+  - [ ] csharp  - [ ] javascript  - [ ] typescript
 - [ ] M2: shared services and selectors consume `FqName`; input parsing produces it.
 - [ ] M3: persistence flip — store schema carries segments; single epoch salt bump.
 - [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip.
@@ -97,6 +98,27 @@ the analyzer tree.
         qualified name (kind=Class, package_name="main", short_name="Target")
           left: "main.Target.BOGUS_MUTATION"
           right: "main.Target"
+
+- Observation (scala Companion `$` was mis-modelled by go/M0): the synthetic
+  go/M0 rule rendered a Companion segment with a `$` PREFIX separator
+  (`Outer$Foo`), but Scala's real legacy `short_name` uses a trailing `$`
+  SUFFIX on the object's own name joined with `.` — top-level `object
+  LocalScheduler` -> `LocalScheduler$`; `object Foo { def bar }` -> `Foo$.bar`;
+  `class Outer { object Foo }` -> `Outer.Foo$`; `object Outer { object Inner }`
+  -> `Outer$.Inner$`. The render/​separator rules and the unit test were
+  corrected to the suffix spelling (see Decision Log). Every scala analyzer/
+  usages suite passes with the live equivalence assertion active, which is the
+  proof the suffix form is the byte-exact legacy spelling.
+
+- Observation (cpp `::`/`$` both needed, and the assertion had to render
+  natively): C++'s legacy fq string is mixed-separator — `::` between namespace
+  Package components, `$` between nested-class Type components, `.` to the
+  terminal member (`cutlass::gemm::warp.Outer$Inner.method`). The canonical
+  `.`-join cannot reproduce it, so the M1 equivalence assertion was changed to
+  render each unit with `display_native(language)` (the plan's "cpp-specific
+  expected-join", generalized: it is a no-op for every non-cpp language). A
+  second native rule (`$` between adjacent Type segments) joined the existing
+  `::`-between-Package rule.
 
 - Observation (`_module_` scope): Go package-level `var`/`const`/`type alias`
   units carry the synthetic scope segment `GO_MODULE_SCOPE_SEGMENT` (`_module_`)
@@ -172,10 +194,91 @@ the analyzer tree.
   (C++'s mixed `::`/`.` store) as a workaround; that workaround inverts at M3 when
   the store carries explicit segments and C++ emits tagged segments like every other
   language. Recorded so nobody "fixes" the workaround independently.
+- Decision (M1 rust/scala/cpp): the M1 equivalence assertion in
+  `CodeUnit::with_signature_and_fq` now renders `fq.display_native(lang, ..)` where
+  `lang = common::language_for_file(source)`, not the canonical `fq.display(..)`.
+  Rationale: this is the plan's prescribed "cpp-specific expected-join" realized
+  generally. `display_native` equals the canonical rendering for every language
+  except C++, so go/rust/scala are unaffected, while C++ units are checked against
+  the mixed-separator legacy string (`::` between namespace Package segments, `$`
+  between nested-class Type segments) they must reproduce until M3. The unit's
+  language is recovered from its file extension (debug/test-only path). Date/Author:
+  2026-07-24.
+- Decision (M1 scala Companion display rule): the go/M0 Companion rule rendered `$`
+  as a *prefix separator* before a Companion segment (`Outer$Foo`, JVM binary-name
+  style). Scala's actual legacy `short_name` spells an `object` with a trailing `$`
+  *suffix* on its own name (`format!("{raw_name}$")`) joined to neighbours with `.`
+  (`LocalScheduler$`, `Outer$.Inner$`, `Outer.Foo$` for an object nested in a class).
+  Changed `separator`/`render` in `src/analyzer/fq_name.rs`: a Companion segment now
+  emits its text followed by a literal `$` and takes an ordinary `.` separator from
+  its neighbours; the `display_companion_uses_dollar` unit test was retargeted to the
+  suffix spelling (`display_companion_uses_trailing_dollar_suffix`). Only Scala emits
+  Companion segments, so no other language is affected. Rationale: the go/M0 rule was
+  unit-tested synthetically and never validated against Scala's real convention; the
+  suffix form is what round-trips the legacy strings. Date/Author: 2026-07-24.
+- Decision (M1 cpp nested-class `$`): C++ nested classes are stored `Outer$Inner` in
+  `short_name` — those `$` are NESTED-CLASS separators (issue #1121), distinct from
+  Scala's companion `$` suffix. Each nested class is its own `SegmentKind::Type`
+  segment; a new `display_native(Cpp)` rule renders `$` between adjacent Type
+  segments (mirroring the existing `::`-between-Package rule). Rationale: preserves
+  the per-class structure M2/M3 owner-chain walking needs while round-tripping the
+  legacy `$`-joined string. Date/Author: 2026-07-24.
+- Decision (M1 rust/scala/cpp package prefixes): each language recovers its package
+  prefix by splitting the already-joined legacy `package_name` at construction —
+  rust/scala on `.` (module/package components -> `Package` segments), cpp on `::`
+  (namespace components -> `Package` segments) — mirroring go's `/`-split
+  `go_package_fq`. This is the sanctioned M1 bridge: the legacy strings remain
+  authoritative until M3, so reconstructing their components is not the banned
+  "regex instead of tree-sitter" (there is no richer AST for an
+  already-collapsed path string), and any mis-split fails the equivalence assertion
+  loudly. Rust package-level `const`/`static` items additionally carry a
+  `_module_` `Package` scope segment (matching go's `_module_`). Date/Author:
+  2026-07-24.
+- Decision (M1 cpp per-site string reconstruction): rather than thread parent
+  `FqName`s through C++'s scope machinery (which stores `package_name`/class
+  `short_name` as strings on `ScopeInfo`/`class_unit`), each C++ construction site
+  rebuilds the `FqName` from the assembled `package_name` + `short_name` via three
+  helpers (`cpp_namespace_fq`, `cpp_class_fq`, `cpp_member_fq`) that split on `::`
+  (Package), `$` (Type), and the single member-boundary `.` (Member). Rationale:
+  C++ member/owner names never contain a literal `.` and nested classes never a
+  `::`, so the split is unambiguous; this avoids invasive plumbing while the strings
+  remain authoritative. The template-metadata `primary_fq_name` site keeps an
+  empty-`fq` `CodeUnit::new` (it is a throwaway used only for its `.fq_name()`
+  string, never indexed). Date/Author: 2026-07-24.
 
 ## Outcomes & Retrospective
 
-(to be filled at milestone completions)
+- M1 rust/scala/cpp (2026-07-24): all three "hard" languages now populate
+  `FqName` at every `CodeUnit` emission point, with the live equivalence
+  assertion (`display_native(language)` vs the legacy joined string) active
+  across their full suites. Census: rust 7 constructor sites
+  (`visit_rust_class_like` Type, `visit_rust_module` Package, `visit_rust_function`
+  Member, `register_rust_macro` Member, `visit_rust_field` Member under a
+  `_module_` Package scope at top level, `visit_rust_alias` Member, and the
+  synthesized `rust_impl_owner` fallback built from strings); scala 8 sites
+  (`visit_recovered_type_header` + `visit_type_declaration` Type/Companion, the
+  primary-constructor Function, `visit_class_parameter_fields`/`visit_field_declaration`/
+  `visit_type_alias`/`visit_enum_case` Member, `visit_function_with_signature`
+  Member); cpp 8 live sites (`visit_namespace` Package, class-like + type-alias
+  Type via `cpp_class_fq`, two enum-enumerator sites Member, variable Member,
+  macro Member, `FunctionInfo::code_unit_with_synthetic` Member via
+  `cpp_member_fq`) plus one deliberately-empty throwaway (`primary_fq_name`).
+  Two shared-infra changes landed with them: the Scala companion display rule was
+  corrected from a `$` prefix separator to a trailing `$` suffix, and the M1
+  equivalence assertion now renders `display_native(language)` so C++'s
+  `::`/`$` mixed-separator legacy string is the compatibility target (see
+  Decision Log). Validation: `cargo fmt` clean; `cargo clippy --all-targets
+  --all-features -D warnings` clean; the full targeted suite green — lib 1879,
+  cpp_analyzer 43, get_definition 635, issue_1093 9, issue_1120 10, issue_1121 11,
+  issue_1128 12, issue_1142 11, issue_1162 10, mcp_property_fuzzer 61,
+  rust_analyzer 15, rust_macro_item 9, scala_analyzer 29,
+  scala_definition_precedence 52, searchtools_definition_selectors 73,
+  searchtools_service 188, usages_cpp_graph 145, usages_rust_graph 202,
+  usages_scala_graph 148 (all 0 failed). Mutation check: flipping the scala
+  object segment kind `Companion` -> `Type` (dropping the `$`) fired the assertion
+  loudly — `FqName does not round-trip ... language=Scala ... short_name="Nested$"`
+  — and failed multiple scala tests; reverted. Remaining M1 languages: java,
+  python, php, ruby, csharp, javascript, typescript.
 
 ## Context and Orientation
 
@@ -433,3 +536,18 @@ Scala `$` spelling inconsistency noted in issue 1126's closing comment. The
 consolidated chokepoints that make the migration cheap were landed by the 2026-07
 cross-language duplication campaign (see `.agents/docs/cross-language-duplication-survey.md`,
 whose backlog items 1–6 are all landed on master as of 2026-07-24).
+
+## Revision note (2026-07-24, M1 rust/scala/cpp)
+
+Recorded the completion of M1 for rust, scala, and cpp: `Progress` checkboxes
+flipped, three `Surprises & Discoveries` observations added (the scala companion
+`$`-suffix correction, the cpp `::`/`$` native-render requirement, and the
+mutation-check evidence via go's earlier entry pattern), six `Decision Log`
+entries added (native-render equivalence assertion, scala companion suffix rule,
+cpp nested-class `$` rule, the `.`/`::`-split package bridge, and cpp per-site
+string reconstruction), and an `Outcomes & Retrospective` entry with the full
+validation tally. Why: these three languages each carried a known reconciliation
+(rust module nesting + `_module_` scope; scala companion `$` spelling; cpp
+mixed-separator `::` store and nested-class `$` chains) that required display-rule
+and assertion changes beyond the mechanical go/M0 pattern; the plan must capture
+those decisions so the next contributor (and M2/M3) inherits the reasoning.

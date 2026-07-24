@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
@@ -9,6 +10,71 @@ use crate::analyzer::{
 };
 use regex::Regex;
 use tree_sitter::{Node, Parser, Tree};
+
+/// Intern one qualified-name segment in the process-global interner.
+fn cpp_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Push per-component [`SegmentKind::Package`] segments for a C++ namespace
+/// path stored in its legacy `::`-joined form (`cutlass::gemm::warp`). The
+/// `::` head is exactly the mixed-separator store issue #1163 is about; the
+/// structured form records each namespace component, and the equivalence check
+/// renders it natively (with `::` between adjacent Package segments) so it
+/// round-trips to the legacy string. Splitting the already-joined string here is
+/// the M1 bridge — the legacy strings stay authoritative until M3.
+fn cpp_push_package(fq: &mut FqName, package_name: &str) {
+    for component in package_name.split("::").filter(|c| !c.is_empty()) {
+        fq.push(cpp_segment(component, SegmentKind::Package));
+    }
+}
+
+/// Push per-class [`SegmentKind::Type`] segments for a nested-class chain stored
+/// in Bifrost's legacy `$`-joined `short_name` form (`Outer$Inner`, issue
+/// #1121). Each `$`-separated component is its own nested class; the native
+/// rendering rejoins adjacent Type segments with `$`.
+fn cpp_push_type_chain(fq: &mut FqName, chain: &str) {
+    for component in chain.split('$').filter(|c| !c.is_empty()) {
+        fq.push(cpp_segment(component, SegmentKind::Type));
+    }
+}
+
+/// Structured name for a C++ namespace module: every `::`-separated component is
+/// a [`SegmentKind::Package`] segment (the legacy unit stores the whole path in
+/// `short_name` with an empty `package_name`).
+fn cpp_namespace_fq(full_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    cpp_push_package(&mut fq, full_name);
+    fq
+}
+
+/// Structured name for a class-like unit: the enclosing namespace's `Package`
+/// segments followed by the `$`-joined nested-class `Type` chain in `short_name`.
+fn cpp_class_fq(package_name: &str, short_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    cpp_push_package(&mut fq, package_name);
+    cpp_push_type_chain(&mut fq, short_name);
+    fq
+}
+
+/// Structured name for a member unit (function, field, enumerator). The
+/// `short_name` is the owning `$`-joined nested-class `Type` chain followed, when
+/// the member has an owner, by `.member`; free functions and globals have no
+/// owner and no `.`, so the whole `short_name` is the terminal [`SegmentKind::Member`].
+/// C++ member names never contain a literal `.`, so the single `.` (if any)
+/// separates the owner chain from the member.
+fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    cpp_push_package(&mut fq, package_name);
+    match short_name.rsplit_once('.') {
+        Some((owner_chain, member)) => {
+            cpp_push_type_chain(&mut fq, owner_chain);
+            fq.push(cpp_segment(member, SegmentKind::Member));
+        }
+        None => fq.push(cpp_segment(short_name, SegmentKind::Member)),
+    }
+    fq
+}
 
 #[derive(Clone)]
 pub(super) struct ScopeInfo {
@@ -1044,11 +1110,12 @@ impl<'a> CppVisitor<'a> {
         } else {
             format!("{}::{}", scope.package_name, name)
         };
-        let module = CodeUnit::new(
+        let module = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Module,
             "",
             full_name.clone(),
+            cpp_namespace_fq(&full_name),
         );
         if !self.parsed.contains_declaration(&module) {
             self.parsed
@@ -1124,13 +1191,15 @@ impl<'a> CppVisitor<'a> {
         } else {
             name
         };
-        let code_unit = CodeUnit::with_signature(
+        let fq = cpp_class_fq(&scope.package_name, &short_name);
+        let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Class,
             scope.package_name.clone(),
             short_name,
             scope.template_signature.clone(),
             false,
+            fq,
         );
         let has_body = definition_body_present;
         if !has_body && self.parsed.contains_declaration(&code_unit) {
@@ -1248,11 +1317,15 @@ impl<'a> CppVisitor<'a> {
             if name.is_empty() {
                 return WalkControl::Continue;
             }
-            let code_unit = CodeUnit::new(
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), name),
+                parent
+                    .fq()
+                    .clone()
+                    .with_pushed(cpp_segment(&name, SegmentKind::Member)),
             );
             if self.parsed.contains_declaration(&code_unit) {
                 return WalkControl::Continue;
@@ -1293,11 +1366,15 @@ impl<'a> CppVisitor<'a> {
             if name.is_empty() {
                 continue;
             }
-            let code_unit = CodeUnit::new(
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), name),
+                parent
+                    .fq()
+                    .clone()
+                    .with_pushed(cpp_segment(name, SegmentKind::Member)),
             );
             if self.parsed.contains_declaration(&code_unit) {
                 continue;
@@ -1631,11 +1708,13 @@ impl<'a> CppVisitor<'a> {
         } else {
             name
         };
-        let code_unit = CodeUnit::new(
+        let fq = cpp_member_fq(&scope.package_name, &short_name);
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             scope.package_name.clone(),
             short_name,
+            fq,
         );
         if self.parsed.contains_declaration(&code_unit) {
             return;
@@ -1750,13 +1829,15 @@ impl<'a> CppVisitor<'a> {
             } else {
                 alias_name
             };
-            let code_unit = CodeUnit::with_signature(
+            let fq = cpp_class_fq(&scope.package_name, &short_name);
+            let code_unit = CodeUnit::with_signature_and_fq(
                 self.file.clone(),
                 CodeUnitType::Class,
                 scope.package_name.clone(),
                 short_name,
                 Some(signature.clone()),
                 false,
+                fq,
             );
             if self.parsed.contains_declaration_identity(&code_unit) {
                 continue;
@@ -1788,7 +1869,8 @@ impl<'a> CppVisitor<'a> {
         if signature.is_empty() {
             return;
         }
-        let code_unit = CodeUnit::new(self.file.clone(), CodeUnitType::Macro, "", name);
+        let fq = cpp_member_fq("", &name);
+        let code_unit = CodeUnit::new_fq(self.file.clone(), CodeUnitType::Macro, "", name, fq);
         if self.parsed.contains_declaration_identity(&code_unit) {
             return;
         }
@@ -1969,13 +2051,15 @@ impl FunctionInfo {
         } else {
             self.name.clone()
         };
-        CodeUnit::with_signature(
+        let fq = cpp_member_fq(&self.package_name, &short_name);
+        CodeUnit::with_signature_and_fq(
             file,
             CodeUnitType::Function,
             self.package_name.clone(),
             short_name,
             Some(self.signature.clone()),
             synthetic,
+            fq,
         )
     }
 }

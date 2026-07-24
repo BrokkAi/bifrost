@@ -1887,10 +1887,19 @@ impl CodeUnit {
             } else {
                 format!("{package_name}.{short_name}")
             };
+            // Render natively for the unit's language so the compatibility
+            // target is the exact legacy string. Only C++ differs from the
+            // canonical `.`-join (its package_name keeps a `::`-headed spelling
+            // and nested classes use `$`); `display_native` falls back to the
+            // canonical rendering for every other language, so this stays a
+            // no-op for go/rust/scala while making the cpp check `::`/`$`-aware
+            // (the plan's "cpp-specific expected-join"). See
+            // `.agents/plans/fqname-interned-segments.md`.
+            let language = crate::analyzer::common::language_for_file(&source);
             debug_assert_eq!(
-                fq.display(interner),
+                fq.display_native(language, interner),
                 expected,
-                "FqName does not round-trip to the legacy qualified name (kind={kind:?}, package_name={package_name:?}, short_name={short_name:?})"
+                "FqName does not round-trip to the legacy qualified name (kind={kind:?}, language={language:?}, package_name={package_name:?}, short_name={short_name:?})"
             );
         }
 

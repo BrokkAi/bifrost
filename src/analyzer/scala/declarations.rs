@@ -1,3 +1,4 @@
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{
@@ -6,6 +7,50 @@ use crate::analyzer::{
 };
 use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
+
+/// Intern one qualified-name segment in the process-global interner.
+fn scala_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured package prefix for a Scala declaration.
+///
+/// A Scala `package_name` is the dotted package path (`com.example.experimental`),
+/// each component a package. Each becomes a [`SegmentKind::Package`] segment so
+/// the [`FqName`] renders back to the exact legacy `package_name` string.
+/// Splitting the already-joined string here is the M1 bridge; the legacy string
+/// stays authoritative until M3.
+fn scala_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name
+        .split('.')
+        .filter(|component| !component.is_empty())
+    {
+        fq.push(scala_segment(component, SegmentKind::Package));
+    }
+    fq
+}
+
+/// The [`FqName`] a child declaration extends: its enclosing type's structured
+/// name when nested, otherwise the file's package prefix.
+fn scala_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName {
+    match parent {
+        Some(parent) => parent.fq().clone(),
+        None => scala_package_fq(package_name),
+    }
+}
+
+/// The structured segment for a Scala type declaration's own name. A Scala
+/// `object` is spelled with a trailing `$` on its own name (`Foo$`), captured
+/// by a [`SegmentKind::Companion`] segment whose text is the bare name (the `$`
+/// is added by the display rule); every other type kind is a [`SegmentKind::Type`].
+fn scala_type_name_segment(raw_name: &str, is_object: bool) -> SegmentId {
+    if is_object {
+        scala_segment(raw_name, SegmentKind::Companion)
+    } else {
+        scala_segment(raw_name, SegmentKind::Type)
+    }
+}
 
 use super::imports::{
     scala_export_info_from_node, scala_import_infos_from_node_with_prefixes,
@@ -331,11 +376,14 @@ impl<'a> ScalaVisitor<'a> {
             || display_name.clone(),
             |parent| format!("{}.{}", parent.short_name(), display_name),
         );
-        let code_unit = CodeUnit::new(
+        let fq = scala_child_fq_base(parent.as_ref(), package_name)
+            .with_pushed(scala_type_name_segment(raw_name, kind == "object"));
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
             package_name.to_string(),
             short_name,
+            fq,
         );
         if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
@@ -383,11 +431,15 @@ impl<'a> ScalaVisitor<'a> {
         } else {
             display_name
         };
-        let code_unit = CodeUnit::new(
+        let fq = scala_child_fq_base(parent.as_ref(), package_name).with_pushed(
+            scala_type_name_segment(raw_name, node.kind() == "object_definition"),
+        );
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
             package_name.to_string(),
             short_name,
+            fq,
         );
         if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
@@ -427,11 +479,15 @@ impl<'a> ScalaVisitor<'a> {
         if matches!(node.kind(), "class_definition" | "full_enum_case")
             && !scala_class_parameter_lists(node).is_empty()
         {
-            let constructor = CodeUnit::new(
+            let constructor = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Function,
                 package_name.to_string(),
                 format!("{}.{}", code_unit.short_name(), raw_name),
+                code_unit
+                    .fq()
+                    .clone()
+                    .with_pushed(scala_segment(raw_name, SegmentKind::Member)),
             )
             .with_synthetic(true);
             self.parsed.add_code_unit(
@@ -485,11 +541,15 @@ impl<'a> ScalaVisitor<'a> {
                 if name.is_empty() {
                     continue;
                 }
-                let code_unit = CodeUnit::new(
+                let code_unit = CodeUnit::new_fq(
                     self.file.clone(),
                     CodeUnitType::Field,
                     package_name.to_string(),
                     format!("{}.{}", parent.short_name(), name),
+                    parent
+                        .fq()
+                        .clone()
+                        .with_pushed(scala_segment(name, SegmentKind::Member)),
                 );
                 self.parsed.add_code_unit(
                     code_unit.clone(),
@@ -722,14 +782,17 @@ impl<'a> ScalaVisitor<'a> {
         let short_name = if let Some(parent) = &parent {
             format!("{}.{}", parent.short_name(), effective_name)
         } else {
-            effective_name
+            effective_name.clone()
         };
 
-        let code_unit = CodeUnit::new(
+        let fq = scala_child_fq_base(parent.as_ref(), package_name)
+            .with_pushed(scala_segment(&effective_name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Function,
             package_name.to_string(),
             short_name,
+            fq,
         );
         let dispatch_extensibility =
             scala_callable_dispatch_extensibility(parent.as_ref(), raw_name);
@@ -767,11 +830,14 @@ impl<'a> ScalaVisitor<'a> {
             } else {
                 name.clone()
             };
-            let code_unit = CodeUnit::new(
+            let fq = scala_child_fq_base(parent.as_ref(), package_name)
+                .with_pushed(scala_segment(&name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 package_name.to_string(),
                 short_name,
+                fq,
             );
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
@@ -793,11 +859,14 @@ impl<'a> ScalaVisitor<'a> {
             || name.to_string(),
             |parent| format!("{}.{}", parent.short_name(), name),
         );
-        let code_unit = CodeUnit::new(
+        let fq = scala_child_fq_base(parent.as_ref(), package_name)
+            .with_pushed(scala_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             package_name.to_string(),
             short_name,
+            fq,
         );
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
@@ -817,11 +886,15 @@ impl<'a> ScalaVisitor<'a> {
             return;
         }
 
-        let code_unit = CodeUnit::new(
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
+            parent
+                .fq()
+                .clone()
+                .with_pushed(scala_segment(name, SegmentKind::Member)),
         );
         self.parsed.add_code_unit(
             code_unit.clone(),

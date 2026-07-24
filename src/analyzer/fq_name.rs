@@ -114,17 +114,25 @@ impl FqName {
 
     /// Canonical display: `.`-joined, `/` between adjacent [`SegmentKind::Path`]
     /// segments (so import-path heads such as `github.com/foo/bar` round-trip),
-    /// and `$` before a [`SegmentKind::Companion`] segment. This reproduces
-    /// exactly today's user-facing `fq_name()` convention, so display output
-    /// does not change.
+    /// and a trailing `$` suffix on each [`SegmentKind::Companion`] segment (so
+    /// Scala object spellings such as `LocalScheduler$` and `Outer$.Inner$`
+    /// round-trip). This reproduces exactly today's user-facing `fq_name()`
+    /// convention, so display output does not change.
+    ///
+    /// The M1 equivalence check renders natively (see [`Self::display_native`]);
+    /// this canonical form is exercised by the module unit tests now and becomes
+    /// the user-facing rendering surface in M2, so it is allowed to be otherwise
+    /// unused in the meantime (same rationale as `len`/`parent`/... above).
+    #[allow(dead_code)]
     pub(crate) fn display(&self, interner: &SegmentInterner) -> String {
         self.render(interner, None)
     }
 
     /// Native display: language-specific separators (`::` between adjacent C++
-    /// [`SegmentKind::Package`] segments, etc.) for surfaces that render native
-    /// spellings.
-    #[allow(dead_code)] // consumed in M2 (see note on `len`)
+    /// [`SegmentKind::Package`] segments, `$` between adjacent C++ nested-class
+    /// [`SegmentKind::Type`] segments) for surfaces that render native
+    /// spellings — including the M1 equivalence check in
+    /// [`crate::analyzer::CodeUnit::with_signature_and_fq`].
     pub(crate) fn display_native(&self, lang: Language, interner: &SegmentInterner) -> String {
         self.render(interner, Some(lang))
     }
@@ -138,6 +146,13 @@ impl FqName {
                 out.push_str(separator(prev_kind, kind, native));
             }
             out.push_str(text);
+            // A Scala `object` segment is spelled with a trailing `$` *suffix*
+            // on its own name (`LocalScheduler$`, `Outer$.Inner$`), joined to
+            // neighbours with an ordinary `.`. The `$` is part of this segment,
+            // not a separator, so it is emitted here rather than by `separator`.
+            if kind == SegmentKind::Companion {
+                out.push('$');
+            }
             prev = Some(kind);
         }
         out
@@ -147,15 +162,22 @@ impl FqName {
 /// The separator that renders between a segment of kind `prev` and a following
 /// segment of kind `cur`. `native` selects language-specific spellings.
 fn separator(prev: SegmentKind, cur: SegmentKind, native: Option<Language>) -> &'static str {
-    if cur == SegmentKind::Companion {
-        return "$";
-    }
     if prev == SegmentKind::Path && cur == SegmentKind::Path {
         return "/";
     }
-    if native == Some(Language::Cpp) && prev == SegmentKind::Package && cur == SegmentKind::Package
-    {
-        return "::";
+    if native == Some(Language::Cpp) {
+        // C++'s legacy string spelling is mixed-separator: `::` between
+        // namespace (Package) components and `$` between nested-class (Type)
+        // components, joined to the terminal member with `.` (issue #1163). The
+        // canonical `.`-join renders the same structure without the native
+        // punctuation; both round-trip because the equivalence check renders
+        // each unit natively (see `CodeUnit::with_signature_and_fq`).
+        if prev == SegmentKind::Package && cur == SegmentKind::Package {
+            return "::";
+        }
+        if prev == SegmentKind::Type && cur == SegmentKind::Type {
+            return "$";
+        }
     }
     "."
 }
@@ -322,16 +344,68 @@ mod tests {
     }
 
     #[test]
-    fn display_companion_uses_dollar() {
+    fn display_companion_uses_trailing_dollar_suffix() {
+        // A Scala `object` segment carries a trailing `$` on its own name and
+        // joins to neighbours with `.`, matching the legacy short_name spelling
+        // (`format!("{raw_name}$")` then `.`-joined) rather than a JVM-style
+        // `Outer$Foo` prefix separator.
         let interner = SegmentInterner::new();
-        let name = fq(
+
+        // Top-level object: `object LocalScheduler` -> `LocalScheduler$`.
+        let top = fq(&interner, &[("LocalScheduler", SegmentKind::Companion)]);
+        assert_eq!(top.display(&interner), "LocalScheduler$");
+
+        // Object member: `object Foo { def bar }` -> `Foo$.bar`.
+        let member = fq(
+            &interner,
+            &[
+                ("Foo", SegmentKind::Companion),
+                ("bar", SegmentKind::Member),
+            ],
+        );
+        assert_eq!(member.display(&interner), "Foo$.bar");
+
+        // Object nested in a class: `class Outer { object Foo }` -> `Outer.Foo$`.
+        let nested = fq(
             &interner,
             &[
                 ("Outer", SegmentKind::Type),
                 ("Foo", SegmentKind::Companion),
             ],
         );
-        assert_eq!(name.display(&interner), "Outer$Foo");
+        assert_eq!(nested.display(&interner), "Outer.Foo$");
+
+        // Object nested in an object: `object Outer { object Inner }` ->
+        // `Outer$.Inner$`.
+        let nested_objects = fq(
+            &interner,
+            &[
+                ("Outer", SegmentKind::Companion),
+                ("Inner", SegmentKind::Companion),
+            ],
+        );
+        assert_eq!(nested_objects.display(&interner), "Outer$.Inner$");
+    }
+
+    #[test]
+    fn display_native_cpp_nested_class_uses_dollar() {
+        // C++ nested classes are spelled `Outer$Inner` (Type$Type) natively but
+        // `Outer.Inner` canonically; both must round-trip.
+        let interner = SegmentInterner::new();
+        let name = fq(
+            &interner,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("Inner", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+        );
+        assert_eq!(name.display(&interner), "ns.Outer.Inner.method");
+        assert_eq!(
+            name.display_native(Language::Cpp, &interner),
+            "ns.Outer$Inner.method"
+        );
     }
 
     #[test]
