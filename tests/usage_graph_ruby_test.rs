@@ -70,7 +70,7 @@ end
 }
 
 #[test]
-fn resolves_locally_typed_instance_and_bare_self_calls() {
+fn resolves_locally_typed_instance_and_leaves_bare_self_calls_unproven() {
     let value = ruby_usage_graph();
 
     assert!(
@@ -83,7 +83,7 @@ fn resolves_locally_typed_instance_and_bare_self_calls() {
     // appears as a proven usage-graph edge.
     assert!(
         !has_edge(&value, "Consumer.calls_local", "Consumer.local"),
-        "same-owner calls_local -> Consumer.local must not be a proven edge (#1138): {}",
+        "same-owner bare calls must not create a proven calls_local -> Consumer.local edge: {}",
         value["edges"]
     );
 }
