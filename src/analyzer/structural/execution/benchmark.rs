@@ -30,6 +30,9 @@ use tempfile::TempDir;
 
 use super::plan::PhysicalQueryOperator;
 use super::profile::QueryExecutionProfile;
+use crate::analyzer::benchmark_provenance::{
+    command_output_in, git_tree_fingerprint as framed_git_tree_fingerprint,
+};
 use crate::analyzer::structural::query::{CodeQuery, MAX_LIMIT};
 use crate::analyzer::structural::search::{
     CodeQueryCompletion, CodeQueryExecutionLimits, CodeQueryExecutionWork, DetailedCodeQueryResult,
@@ -1664,58 +1667,6 @@ fn git_dirty(root: &Path) -> Option<bool> {
     .map(|status| !status.is_empty())
 }
 
-fn git_tree_fingerprint(root: &Path) -> Option<String> {
-    let commit = git_commit(root)?;
-    let diff = Command::new("git")
-        .current_dir(root)
-        .args(["diff", "--binary", "HEAD", "--"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let untracked = Command::new("git")
-        .current_dir(root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let mut hasher = Sha256::new();
-    hasher.update(commit.as_bytes());
-    hasher.update(&diff.stdout);
-    for raw_path in untracked.stdout.split(|byte| *byte == 0) {
-        if raw_path.is_empty() {
-            continue;
-        }
-        let relative = std::str::from_utf8(raw_path).ok()?;
-        let path = root.join(relative);
-        let metadata = fs::symlink_metadata(&path).ok()?;
-        hasher.update(u64::try_from(raw_path.len()).ok()?.to_le_bytes());
-        hasher.update(raw_path);
-        if metadata.is_dir() {
-            // Git reports an untracked nested repository as one directory
-            // entry. It is not part of this repository's source tree, but its
-            // presence must not make provenance collection fail.
-            hasher.update([b'd']);
-            continue;
-        }
-        let contents = fs::read(path).ok()?;
-        hasher.update([b'f']);
-        hasher.update(u64::try_from(contents.len()).ok()?.to_le_bytes());
-        hasher.update(contents);
-    }
-    Some(digest_hex(hasher.finalize()))
-}
-
-fn command_output_in(root: &Path, program: &str, arguments: &[&str]) -> Option<String> {
-    Command::new(program)
-        .current_dir(root)
-        .args(arguments)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|output| output.trim().to_owned())
-}
-
 fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
     Command::new(program)
         .args(arguments)
@@ -1760,7 +1711,7 @@ fn provenance() -> BenchmarkProvenance {
     BenchmarkProvenance {
         bifrost_commit: git_commit(root),
         bifrost_dirty: git_dirty(root),
-        bifrost_tree_fingerprint: git_tree_fingerprint(root),
+        bifrost_tree_fingerprint: framed_git_tree_fingerprint(root, &[]),
         rustc_version_verbose: command_output(&rustc, &["--version", "--verbose"]),
         operating_system: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),

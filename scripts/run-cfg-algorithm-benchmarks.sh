@@ -5,6 +5,7 @@ set -euo pipefail
 
 readonly vscode_commit='19e0f9e681ecb8e5c09d8784acaa601316ca4571'
 readonly petclinic_commit='f182358d02e4a68e52bdbabf55ca7800288511e7'
+readonly maximum_repeats=10
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
@@ -49,8 +50,9 @@ require_pinned_repo BIFROST_SEMANTIC_JAVA_REPO "$petclinic_commit"
 output_path=${BIFROST_CFG_ALGORITHM_BENCHMARK_OUTPUT:-"$repo_root/.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json"}
 repeats=${BIFROST_CFG_ALGORITHM_BENCHMARK_REPEATS:-3}
 
-if [[ ! $repeats =~ ^[1-9][0-9]*$ ]]; then
-    printf 'BIFROST_CFG_ALGORITHM_BENCHMARK_REPEATS must be a positive integer\n' >&2
+if [[ ! $repeats =~ ^[1-9][0-9]*$ ]] || (( repeats > maximum_repeats )); then
+    printf 'BIFROST_CFG_ALGORITHM_BENCHMARK_REPEATS must be between 1 and %d\n' \
+        "$maximum_repeats" >&2
     exit 2
 fi
 

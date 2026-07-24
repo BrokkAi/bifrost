@@ -372,27 +372,14 @@ impl ControlFlowGraph {
         &self,
         point: ProgramPointId,
     ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
-        let point = point.index();
-        assert!(
-            point < self.incoming.rows(),
-            "program point {point} is outside this control-flow graph"
-        );
-        let start = self.outgoing_row_offsets[point] as usize;
-        let end = self.outgoing_row_offsets[point + 1] as usize;
-        self.edges[start..end]
-            .iter()
-            .enumerate()
-            .map(move |(offset, edge)| {
-                let id = ControlEdgeId::try_from_index(start + offset)
-                    .expect("validated control-edge index fits in u32");
-                (id, edge)
-            })
+        self.successor_edges_bidirectional(point)
     }
 
-    pub(crate) fn successor_edges_reversed(
+    pub(crate) fn successor_edges_bidirectional(
         &self,
         point: ProgramPointId,
-    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
         let point = point.index();
         assert!(
             point < self.incoming.rows(),
@@ -403,7 +390,6 @@ impl ControlFlowGraph {
         self.edges[start..end]
             .iter()
             .enumerate()
-            .rev()
             .map(move |(offset, edge)| {
                 let id = ControlEdgeId::try_from_index(start + offset)
                     .expect("validated control-edge index fits in u32");
@@ -415,6 +401,14 @@ impl ControlFlowGraph {
         &self,
         point: ProgramPointId,
     ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        self.predecessor_edges_bidirectional(point)
+    }
+
+    pub(crate) fn predecessor_edges_bidirectional(
+        &self,
+        point: ProgramPointId,
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
         let point = point.index();
         assert!(
             point < self.incoming.rows(),
@@ -422,22 +416,6 @@ impl ControlFlowGraph {
         );
         let edge_ids = self.incoming.row(point);
         edge_ids.iter().copied().map(|id| {
-            let edge = &self.edges[id.index()];
-            (id, edge)
-        })
-    }
-
-    pub(crate) fn predecessor_edges_reversed(
-        &self,
-        point: ProgramPointId,
-    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
-        let point = point.index();
-        assert!(
-            point < self.incoming.rows(),
-            "program point {point} is outside this control-flow graph"
-        );
-        let edge_ids = self.incoming.row(point);
-        edge_ids.iter().rev().copied().map(|id| {
             let edge = &self.edges[id.index()];
             (id, edge)
         })
@@ -638,11 +616,12 @@ impl ProcedureSemantics {
         self.cfg.successor_edges(point)
     }
 
-    pub(crate) fn successor_edges_reversed(
+    pub(crate) fn successor_edges_bidirectional(
         &self,
         point: ProgramPointId,
-    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
-        self.cfg.successor_edges_reversed(point)
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
+        self.cfg.successor_edges_bidirectional(point)
     }
 
     pub fn predecessor_edges(
@@ -652,11 +631,12 @@ impl ProcedureSemantics {
         self.cfg.predecessor_edges(point)
     }
 
-    pub(crate) fn predecessor_edges_reversed(
+    pub(crate) fn predecessor_edges_bidirectional(
         &self,
         point: ProgramPointId,
-    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
-        self.cfg.predecessor_edges_reversed(point)
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
+        self.cfg.predecessor_edges_bidirectional(point)
     }
 
     pub const fn entry_point(&self) -> ProgramPointId {

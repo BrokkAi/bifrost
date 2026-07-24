@@ -23,6 +23,9 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 16:02+02:00) Regenerated the retained release matrix from clean reviewed checkpoint `3582f291`, confirmed clean-tree provenance, and refreshed the evidence narrative for one-byte reachability membership and exact 1x/2x/3x DFS/SCC/loop work.
 - [x] (2026-07-24) Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [x] (2026-07-24) Complete specialist review, resolve material findings, and record final outcomes.
+- [x] (2026-07-24) Rebased the eight issue commits onto current `origin/master`, reran the focused suite, and completed the five-perspective guided review against the synchronized merge base.
+- [x] (2026-07-24) Resolved all code and harness findings: cancellable linear SCC/loop emission, budgeted path reconstruction, one enforceable double-ended adjacency contract, shared synthetic graph support, declaration-scoped lint expectations, framed shared provenance/digests, redacted corpus locations, and bounded recomputation counts. The expanded focused suite, 41/25/11 contracts, formatting, and strict all-feature Clippy pass.
+- [ ] Regenerate the retained eight-dataset release matrix from the clean post-review checkpoint and refresh every provenance, timing, work, digest, and documentation claim.
 
 ## Surprises & Discoveries
 
@@ -55,6 +58,12 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 - Observation: the macOS Python feature build needs dynamic symbol lookup, while three MCP stderr tests need unrestricted child-process access.
   Evidence: the restricted run passed 1,872 library tests and failed only the three process tests with `EPERM`; the unrestricted rerun passed all 1,875 library tests plus every binary and integration target, with six ignored tests.
+
+- Observation: rebasing a branch invalidates a retained benchmark commit even when the issue patches replay without conflicts.
+  Evidence: the synchronized branch no longer contained recorded checkpoint `3582f291`, so exact reproducibility requires a fresh clean-tree measurement from a post-review commit that remains in the branch history.
+
+- Observation: benchmark provenance and result fingerprints need structural framing, not plain concatenation before SHA-256.
+  Evidence: different path/content or loop-field boundaries could produce identical byte streams without a cryptographic collision. Both ignored analyzer benchmarks now share length- and type-framed Git provenance, and CFG result fields are independently framed.
 
 ## Decision Log
 
@@ -229,3 +238,5 @@ Revision note (2026-07-24): Recorded specialist review and the resulting bounded
 Revision note (2026-07-24): Replaced the stale pre-review evidence with the final clean reviewed release matrix and refreshed all affected timing, work, retention, and provenance claims.
 
 Revision note (2026-07-24): Closed the validation and review checkpoints after the focused suites, reviewed benchmark matrix, formatting, strict Clippy, full feature matrix, and separate coherent documentation phase all passed.
+
+Revision note (2026-07-24): Recorded the synchronized guided review and its complete code/harness fix batch. Retained evidence regeneration remains pending from the clean post-review checkpoint.

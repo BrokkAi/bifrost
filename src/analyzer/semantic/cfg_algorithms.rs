@@ -1,11 +1,4 @@
 //! Stack-safe, request-bounded algorithms over immutable dense control-flow graphs.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "issue #819 intentionally provides crate-internal on-demand algorithms before every derivation has a production consumer"
-    )
-)]
 
 use std::collections::VecDeque;
 
@@ -26,23 +19,14 @@ pub(crate) trait DenseBidirectionalGraph {
     fn node_count(&self) -> usize;
     fn node_at(&self, index: usize) -> Option<Self::Node>;
     fn node_index(&self, node: Self::Node) -> Option<usize>;
-    fn edge_index(&self, edge: Self::Edge) -> Option<usize>;
     fn successors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
-    fn successors_reversed(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_;
     fn predecessors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
-    fn predecessors_reversed(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_;
     fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)>;
 }
 
@@ -63,39 +47,19 @@ impl DenseBidirectionalGraph for ProcedureSemantics {
         (node.index() < self.points().len()).then_some(node.index())
     }
 
-    fn edge_index(&self, edge: Self::Edge) -> Option<usize> {
-        (edge.index() < self.control_edges().len()).then_some(edge.index())
-    }
-
     fn successors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.successor_edges(node)
-            .map(|(edge_id, edge)| (edge_id, edge.target_point))
-    }
-
-    fn successors_reversed(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.successor_edges_reversed(node)
+    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
+        self.successor_edges_bidirectional(node)
             .map(|(edge_id, edge)| (edge_id, edge.target_point))
     }
 
     fn predecessors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.predecessor_edges(node)
-            .map(|(edge_id, edge)| (edge_id, edge.source_point))
-    }
-
-    fn predecessors_reversed(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.predecessor_edges_reversed(node)
+    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
+        self.predecessor_edges_bidirectional(node)
             .map(|(edge_id, edge)| (edge_id, edge.source_point))
     }
 
@@ -140,6 +104,10 @@ impl CfgAlgorithmBudget {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test convenience for all on-demand algorithms")
+    )]
     pub(crate) const fn uniform(limit: usize) -> Self {
         Self::new(CfgAlgorithmWork {
             node_visits: limit,
@@ -246,6 +214,13 @@ pub(crate) struct Reachability<Node> {
 }
 
 impl<Node: Copy> Reachability<Node> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "dense membership is the current production consumer"
+        )
+    )]
     pub(crate) fn contains<G>(&self, graph: &G, node: Node) -> bool
     where
         G: DenseBidirectionalGraph<Node = Node>,
@@ -257,6 +232,13 @@ impl<Node: Copy> Reachability<Node> {
             .unwrap_or(false)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "dense membership is the current production consumer"
+        )
+    )]
     pub(crate) fn iter<'graph, G>(
         &'graph self,
         graph: &'graph G,
@@ -275,6 +257,13 @@ impl<Node: Copy> Reachability<Node> {
         &self.membership
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "benchmark and future consumers inspect exact work"
+        )
+    )]
     pub(crate) const fn work(&self) -> CfgAlgorithmWork {
         self.work
     }
@@ -332,7 +321,7 @@ where
         match direction {
             Direction::Forward => discover_adjacent(
                 graph,
-                graph.successors_reversed(node),
+                graph.successors(node).rev(),
                 &mut membership,
                 &mut stack,
                 request,
@@ -433,7 +422,7 @@ where
                     colors[index] = 1;
                     preorder.push(node);
                     actions.push(DfsAction::Finish(node));
-                    for (edge, target) in graph.successors_reversed(node) {
+                    for (edge, target) in graph.successors(node).rev() {
                         request.visit_edge()?;
                         actions.push(DfsAction::Examine(edge, target));
                     }
@@ -474,6 +463,10 @@ pub(crate) struct StronglyConnectedComponents<Node> {
 }
 
 impl<Node: Copy> StronglyConnectedComponents<Node> {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "SCC queries intentionally await a consumer")
+    )]
     pub(crate) fn component_of<G>(&self, graph: &G, node: Node) -> Option<usize>
     where
         G: DenseBidirectionalGraph<Node = Node>,
@@ -485,6 +478,13 @@ impl<Node: Copy> StronglyConnectedComponents<Node> {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "issue 819 keeps SCC derivation available on demand"
+    )
+)]
 pub(crate) fn strongly_connected_components<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
@@ -506,59 +506,67 @@ where
     let started = request.budget.used();
     let order = depth_first_order(graph, request)?;
     let mut assigned = vec![false; graph.node_count()];
-    let mut unsorted_components = Vec::<Vec<G::Node>>::new();
+    let mut raw_component_by_node = vec![usize::MAX; graph.node_count()];
+    let mut raw_component_count = 0usize;
 
     for seed in order.reverse_postorder.iter().copied() {
         let seed_index = required_index(graph, seed)?;
         if assigned[seed_index] {
             continue;
         }
+        let raw_component = raw_component_count;
+        raw_component_count += 1;
         assigned[seed_index] = true;
+        raw_component_by_node[seed_index] = raw_component;
         let mut stack = vec![seed];
-        let mut members = Vec::new();
         while let Some(node) = stack.pop() {
             request.visit_node()?;
-            members.push(node);
-            for (_, predecessor) in graph.predecessors_reversed(node) {
+            for (_, predecessor) in graph.predecessors(node).rev() {
                 request.visit_edge()?;
                 let predecessor_index = required_index(graph, predecessor)?;
                 if !assigned[predecessor_index] {
                     assigned[predecessor_index] = true;
+                    raw_component_by_node[predecessor_index] = raw_component;
                     stack.push(predecessor);
                 }
             }
         }
-        members.sort_unstable_by_key(|node| {
-            graph
-                .node_index(*node)
-                .expect("component members came from the graph")
-        });
-        unsorted_components.push(members);
     }
 
-    unsorted_components.sort_unstable_by_key(|members| {
-        graph
-            .node_index(members[0])
-            .expect("component members came from the graph")
-    });
-    let mut component_by_node = vec![usize::MAX; graph.node_count()];
-    let components = unsorted_components
-        .into_iter()
-        .enumerate()
-        .map(|(component, members)| {
-            for &node in &members {
-                component_by_node[graph
-                    .node_index(node)
-                    .expect("component members came from the graph")] = component;
-            }
-            members.into_boxed_slice()
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+    let mut members_by_raw = (0..raw_component_count)
+        .map(|_| Vec::<G::Node>::new())
+        .collect::<Vec<_>>();
+    let mut raw_order = Vec::with_capacity(raw_component_count);
+    let mut raw_seen = vec![false; raw_component_count];
+    for (index, &raw_component) in raw_component_by_node.iter().enumerate() {
+        request.checkpoint()?;
+        debug_assert_ne!(raw_component, usize::MAX);
+        if !raw_seen[raw_component] {
+            raw_seen[raw_component] = true;
+            raw_order.push(raw_component);
+        }
+        members_by_raw[raw_component].push(required_node(graph, index));
+    }
+
+    let mut canonical_by_raw = vec![usize::MAX; raw_component_count];
+    for (canonical, &raw_component) in raw_order.iter().enumerate() {
+        request.checkpoint()?;
+        canonical_by_raw[raw_component] = canonical;
+    }
+    let mut component_by_node = Vec::with_capacity(graph.node_count());
+    for raw_component in raw_component_by_node {
+        request.checkpoint()?;
+        component_by_node.push(canonical_by_raw[raw_component]);
+    }
+    let mut components = Vec::with_capacity(raw_component_count);
+    for raw_component in raw_order {
+        request.checkpoint()?;
+        components.push(std::mem::take(&mut members_by_raw[raw_component]).into_boxed_slice());
+    }
 
     Ok((
         StronglyConnectedComponents {
-            components,
+            components: components.into_boxed_slice(),
             component_by_node: component_by_node.into_boxed_slice(),
             work: request.budget.used().saturating_sub(started),
         },
@@ -589,6 +597,10 @@ pub(crate) struct LoopRegions<Node, Edge> {
     pub(crate) work: CfgAlgorithmWork,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "issue 819 keeps loop regions available on demand")
+)]
 pub(crate) fn loop_regions<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
@@ -600,7 +612,7 @@ where
     let started = request.budget.used();
     let (components, dfs) = strongly_connected_components_with_order(graph, request)?;
     let mut self_loops = vec![false; components.components.len()];
-    let mut entries = vec![Vec::<G::Node>::new(); components.components.len()];
+    let mut entry_membership = vec![false; graph.node_count()];
     let mut back_edges = vec![Vec::<G::Edge>::new(); components.components.len()];
 
     for edge in dfs.back_edges {
@@ -628,38 +640,44 @@ where
                 self_loops[source_component] = true;
             }
             if source_component != target_component {
-                entries[target_component].push(target);
+                entry_membership[target_index] = true;
             }
         }
     }
 
     let mut regions = Vec::new();
     for (component, members) in components.components.iter().enumerate() {
+        request.checkpoint()?;
         if members.len() == 1 && !self_loops[component] {
             continue;
         }
-        entries[component].sort_unstable_by_key(|node| {
-            graph
-                .node_index(*node)
-                .expect("region entries came from the graph")
-        });
-        entries[component].dedup();
-        let mut internal_back_edges = std::mem::take(&mut back_edges[component]);
-        internal_back_edges.sort_unstable();
-        let entry_structure = match entries[component].len() {
+        let mut canonical_members = Vec::with_capacity(members.len());
+        let mut canonical_entries = Vec::new();
+        for &member in members {
+            request.checkpoint()?;
+            canonical_members.push(member);
+            let member_index = required_index(graph, member)?;
+            if entry_membership[member_index] {
+                canonical_entries.push(member);
+            }
+        }
+        let entry_structure = match canonical_entries.len() {
             0 => LoopEntryStructure::None,
             1 => LoopEntryStructure::Single,
             _ => LoopEntryStructure::Multiple,
         };
+        let internal_back_edges = std::mem::take(&mut back_edges[component]);
+        request.checkpoint()?;
         regions.push(LoopRegion {
-            members: members.clone(),
-            entries: entries[component].clone().into_boxed_slice(),
+            members: canonical_members.into_boxed_slice(),
+            entries: canonical_entries.into_boxed_slice(),
             entry_structure,
             back_edges: internal_back_edges.into_boxed_slice(),
             has_self_loop: self_loops[component],
         });
     }
 
+    request.checkpoint()?;
     Ok(LoopRegions {
         regions: regions.into_boxed_slice(),
         work: request.budget.used().saturating_sub(started),
@@ -674,6 +692,13 @@ pub(crate) struct ShortestPath<Node, Edge> {
     pub(crate) work: CfgAlgorithmWork,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "issue 819 keeps shortest paths available on demand"
+    )
+)]
 pub(crate) fn shortest_path<G>(
     graph: &G,
     start: G::Node,
@@ -739,9 +764,10 @@ where
     let mut edges = Vec::new();
     let mut cursor = goal;
     while cursor != start {
-        request.checkpoint()?;
         let index = required_index(graph, cursor)?;
         let (previous, edge) = parent[index].expect("discovered path node has a parent");
+        request.visit_edge()?;
+        request.visit_node()?;
         edges.push(edge);
         nodes.push(previous);
         cursor = previous;
@@ -775,35 +801,39 @@ where
 }
 
 #[cfg(test)]
-mod benchmark;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod test_support {
+    use super::DenseBidirectionalGraph;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    struct TestEdgeId(usize);
+    pub(crate) struct SyntheticEdgeId(pub(crate) usize);
 
     #[derive(Debug, Clone)]
-    struct TestEdge {
+    struct SyntheticEdge {
         source: usize,
         target: usize,
         label: u8,
     }
 
     #[derive(Debug)]
-    struct TestGraph {
+    pub(crate) struct SyntheticGraph {
         nodes: usize,
-        edges: Vec<TestEdge>,
-        outgoing: Vec<Vec<TestEdgeId>>,
-        incoming: Vec<Vec<TestEdgeId>>,
+        edges: Box<[SyntheticEdge]>,
+        outgoing: Box<[Box<[SyntheticEdgeId]>]>,
+        incoming: Box<[Box<[SyntheticEdgeId]>]>,
     }
 
-    impl TestGraph {
-        fn new(nodes: usize, edges: &[(usize, usize, u8)]) -> Self {
+    impl SyntheticGraph {
+        pub(crate) fn new(nodes: usize, edges: &[(usize, usize, u8)]) -> Self {
+            Self::from_edges(nodes, edges.iter().copied())
+        }
+
+        pub(crate) fn from_edges(
+            nodes: usize,
+            edges: impl IntoIterator<Item = (usize, usize, u8)>,
+        ) -> Self {
             let mut edges = edges
-                .iter()
-                .map(|&(source, target, label)| TestEdge {
+                .into_iter()
+                .map(|(source, target, label)| SyntheticEdge {
                     source,
                     target,
                     label,
@@ -814,22 +844,30 @@ mod tests {
             let mut incoming = vec![Vec::new(); nodes];
             for (index, edge) in edges.iter().enumerate() {
                 assert!(edge.source < nodes && edge.target < nodes);
-                let id = TestEdgeId(index);
+                let id = SyntheticEdgeId(index);
                 outgoing[edge.source].push(id);
                 incoming[edge.target].push(id);
             }
             Self {
                 nodes,
-                edges,
-                outgoing,
-                incoming,
+                edges: edges.into_boxed_slice(),
+                outgoing: outgoing.into_iter().map(Vec::into_boxed_slice).collect(),
+                incoming: incoming.into_iter().map(Vec::into_boxed_slice).collect(),
             }
+        }
+
+        pub(crate) fn edge_count(&self) -> usize {
+            self.edges.len()
+        }
+
+        pub(crate) fn edge_label(&self, edge: SyntheticEdgeId) -> Option<u8> {
+            self.edges.get(edge.0).map(|edge| edge.label)
         }
     }
 
-    impl DenseBidirectionalGraph for TestGraph {
+    impl DenseBidirectionalGraph for SyntheticGraph {
         type Node = usize;
-        type Edge = TestEdgeId;
+        type Edge = SyntheticEdgeId;
 
         fn node_count(&self) -> usize {
             self.nodes
@@ -843,27 +881,13 @@ mod tests {
             (node < self.nodes).then_some(node)
         }
 
-        fn edge_index(&self, edge: Self::Edge) -> Option<usize> {
-            (edge.0 < self.edges.len()).then_some(edge.0)
-        }
-
         fn successors(
             &self,
             node: Self::Node,
-        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+        ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_
+        {
             self.outgoing[node]
                 .iter()
-                .copied()
-                .map(|id| (id, self.edges[id.0].target))
-        }
-
-        fn successors_reversed(
-            &self,
-            node: Self::Node,
-        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-            self.outgoing[node]
-                .iter()
-                .rev()
                 .copied()
                 .map(|id| (id, self.edges[id.0].target))
         }
@@ -871,20 +895,10 @@ mod tests {
         fn predecessors(
             &self,
             node: Self::Node,
-        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+        ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_
+        {
             self.incoming[node]
                 .iter()
-                .copied()
-                .map(|id| (id, self.edges[id.0].source))
-        }
-
-        fn predecessors_reversed(
-            &self,
-            node: Self::Node,
-        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-            self.incoming[node]
-                .iter()
-                .rev()
                 .copied()
                 .map(|id| (id, self.edges[id.0].source))
         }
@@ -895,6 +909,15 @@ mod tests {
                 .map(|edge| (edge.source, edge.target))
         }
     }
+}
+
+#[cfg(test)]
+mod benchmark;
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::SyntheticGraph as TestGraph;
+    use super::*;
 
     fn request<'request>(
         budget: &'request mut CfgAlgorithmBudget,
@@ -1043,8 +1066,8 @@ mod tests {
         assert_eq!(
             loops.work,
             CfgAlgorithmWork {
-                node_visits: graph.nodes * 3,
-                edge_visits: graph.edges.len() * 3,
+                node_visits: graph.node_count() * 3,
+                edge_visits: graph.edge_count() * 3,
             }
         );
     }
@@ -1058,7 +1081,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&*path.nodes, &[0, 1, 4]);
-        assert_eq!(graph.edges[path.edges[0].0].label, 1);
+        assert_eq!(graph.edge_label(path.edges[0]), Some(1));
 
         let mut budget = CfgAlgorithmBudget::uniform(100);
         let zero = shortest_path(&graph, 3, 3, &mut request(&mut budget, &cancellation))
@@ -1094,6 +1117,78 @@ mod tests {
             ),
             Err(CfgAlgorithmError::Cancelled { .. })
         ));
+    }
+
+    #[test]
+    fn shortest_path_reconstruction_is_charged_to_the_visit_budget() {
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)]);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::new(CfgAlgorithmWork {
+            node_visits: 4,
+            edge_visits: 3,
+        });
+
+        assert!(matches!(
+            shortest_path(&graph, 0, 3, &mut request(&mut budget, &cancellation)),
+            Err(CfgAlgorithmError::ExceededBudget(
+                CfgAlgorithmBudgetExceeded {
+                    limit_kind: CfgAlgorithmLimit::EdgeVisits,
+                    attempted: 4,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn scc_and_loop_emission_observe_cancellation_after_graph_visits() {
+        let node_count = 32;
+        let edges = (0..node_count)
+            .map(|source| (source, (source + 1) % node_count, 0))
+            .collect::<Vec<_>>();
+        let graph = TestGraph::new(node_count, &edges);
+
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        let scc_work =
+            strongly_connected_components(&graph, &mut request(&mut budget, &cancellation))
+                .unwrap()
+                .work;
+        let mut cancelled_during_scc_emission = false;
+        for checks in 1..1_000 {
+            let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+            let mut budget = CfgAlgorithmBudget::uniform(1_000);
+            if matches!(
+                strongly_connected_components(
+                    &graph,
+                    &mut request(&mut budget, &cancellation)
+                ),
+                Err(CfgAlgorithmError::Cancelled { work }) if work == scc_work
+            ) {
+                cancelled_during_scc_emission = true;
+                break;
+            }
+        }
+        assert!(cancelled_during_scc_emission);
+
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        let loop_work = loop_regions(&graph, &mut request(&mut budget, &cancellation))
+            .unwrap()
+            .work;
+        let mut cancelled_during_loop_emission = false;
+        for checks in 1..2_000 {
+            let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+            let mut budget = CfgAlgorithmBudget::uniform(1_000);
+            if matches!(
+                loop_regions(&graph, &mut request(&mut budget, &cancellation)),
+                Err(CfgAlgorithmError::Cancelled { work }) if work == loop_work
+            ) {
+                cancelled_during_loop_emission = true;
+                break;
+            }
+        }
+        assert!(cancelled_during_loop_emission);
     }
 
     #[test]

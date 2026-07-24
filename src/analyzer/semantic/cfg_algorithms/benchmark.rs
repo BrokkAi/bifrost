@@ -1,18 +1,20 @@
 //! Ignored release benchmark for the issue #819 algorithm lifecycle decision.
 
-use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
+use super::test_support::{SyntheticEdgeId, SyntheticGraph};
 use super::*;
+use crate::analyzer::benchmark_provenance::{
+    command_output_in as command_output, git_tree_fingerprint,
+};
 use crate::analyzer::semantic::{SemanticBudget, SemanticOutcome, SemanticRequest, StableDigest};
 use crate::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
 
@@ -22,105 +24,21 @@ const TS_REPO_ENV: &str = "BIFROST_SEMANTIC_TS_REPO";
 const JAVA_REPO_ENV: &str = "BIFROST_SEMANTIC_JAVA_REPO";
 const VSCODE_COMMIT: &str = "19e0f9e681ecb8e5c09d8784acaa601316ca4571";
 const SPRING_PETCLINIC_COMMIT: &str = "f182358d02e4a68e52bdbabf55ca7800288511e7";
+const MAX_REPEATS: usize = 10;
 
-#[derive(Debug, Clone, Copy)]
-struct BenchEdge {
-    source: usize,
-    target: usize,
-    label: u8,
+trait BenchmarkGraph: DenseBidirectionalGraph {
+    fn benchmark_edge_index(&self, edge: Self::Edge) -> Option<usize>;
 }
 
-#[derive(Debug)]
-struct BenchGraph {
-    nodes: usize,
-    edges: Box<[BenchEdge]>,
-    outgoing: Box<[Box<[usize]>]>,
-    incoming: Box<[Box<[usize]>]>,
-}
-
-impl BenchGraph {
-    fn new(nodes: usize, mut edges: Vec<BenchEdge>) -> Self {
-        edges.sort_unstable_by_key(|edge| (edge.source, edge.target, edge.label));
-        let mut outgoing = vec![Vec::new(); nodes];
-        let mut incoming = vec![Vec::new(); nodes];
-        for (index, edge) in edges.iter().enumerate() {
-            assert!(edge.source < nodes && edge.target < nodes);
-            outgoing[edge.source].push(index);
-            incoming[edge.target].push(index);
-        }
-        Self {
-            nodes,
-            edges: edges.into_boxed_slice(),
-            outgoing: outgoing.into_iter().map(Vec::into_boxed_slice).collect(),
-            incoming: incoming.into_iter().map(Vec::into_boxed_slice).collect(),
-        }
+impl BenchmarkGraph for SyntheticGraph {
+    fn benchmark_edge_index(&self, edge: SyntheticEdgeId) -> Option<usize> {
+        self.edge_endpoints(edge).map(|_| edge.0)
     }
 }
 
-impl DenseBidirectionalGraph for BenchGraph {
-    type Node = usize;
-    type Edge = usize;
-
-    fn node_count(&self) -> usize {
-        self.nodes
-    }
-
-    fn node_at(&self, index: usize) -> Option<Self::Node> {
-        (index < self.nodes).then_some(index)
-    }
-
-    fn node_index(&self, node: Self::Node) -> Option<usize> {
-        (node < self.nodes).then_some(node)
-    }
-
-    fn edge_index(&self, edge: Self::Edge) -> Option<usize> {
-        (edge < self.edges.len()).then_some(edge)
-    }
-
-    fn successors(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.outgoing[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].target))
-    }
-
-    fn successors_reversed(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.outgoing[node]
-            .iter()
-            .rev()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].target))
-    }
-
-    fn predecessors(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.incoming[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].source))
-    }
-
-    fn predecessors_reversed(
-        &self,
-        node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
-        self.incoming[node]
-            .iter()
-            .rev()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].source))
-    }
-
-    fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)> {
-        self.edges.get(edge).map(|edge| (edge.source, edge.target))
+impl BenchmarkGraph for ProcedureSemantics {
+    fn benchmark_edge_index(&self, edge: ControlEdgeId) -> Option<usize> {
+        self.control_edge(edge).map(|_| edge.index())
     }
 }
 
@@ -195,7 +113,7 @@ struct DatasetMeasurement {
 struct CorpusProvenance {
     environment_variable: &'static str,
     expected_commit: &'static str,
-    configured_path: Option<String>,
+    configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -270,7 +188,7 @@ impl DatasetAccumulator {
 
     fn measure<G>(&mut self, graph: &G, start: G::Node, goal: G::Node)
     where
-        G: DenseBidirectionalGraph,
+        G: BenchmarkGraph,
     {
         let edge_count = (0..graph.node_count())
             .map(|index| graph.successors(required_node(graph, index)).len())
@@ -352,7 +270,7 @@ fn run_algorithm<G>(
     algorithm: Algorithm,
 ) -> (Duration, RunResult)
 where
-    G: DenseBidirectionalGraph,
+    G: BenchmarkGraph,
 {
     let mut budget = CfgAlgorithmBudget::new(CfgAlgorithmWork {
         node_visits: graph.node_count().saturating_add(1).saturating_mul(8),
@@ -370,7 +288,7 @@ where
             let started = Instant::now();
             let result = forward_reachability(graph, start, &mut request).unwrap();
             elapsed = started.elapsed();
-            push_nodes(graph, result.iter(graph), &mut material);
+            push_nodes(graph, result.iter(graph), &mut material, b'n');
             work = result.work();
             retained_bytes = bytes(result.membership().len(), size_of::<bool>());
         }
@@ -378,7 +296,7 @@ where
             let started = Instant::now();
             let result = reverse_reachability(graph, goal, &mut request).unwrap();
             elapsed = started.elapsed();
-            push_nodes(graph, result.iter(graph), &mut material);
+            push_nodes(graph, result.iter(graph), &mut material, b'n');
             work = result.work();
             retained_bytes = bytes(result.membership().len(), size_of::<bool>());
         }
@@ -386,13 +304,19 @@ where
             let started = Instant::now();
             let result = depth_first_order(graph, &mut request).unwrap();
             elapsed = started.elapsed();
-            push_nodes(graph, result.preorder.iter().copied(), &mut material);
+            push_nodes(graph, result.preorder.iter().copied(), &mut material, b'p');
             push_nodes(
                 graph,
                 result.reverse_postorder.iter().copied(),
                 &mut material,
+                b'r',
             );
-            push_edges(graph, result.back_edges.iter().copied(), &mut material);
+            push_edges(
+                graph,
+                result.back_edges.iter().copied(),
+                &mut material,
+                b'b',
+            );
             work = result.work;
             retained_bytes = bytes(
                 result
@@ -408,9 +332,9 @@ where
             let started = Instant::now();
             let result = strongly_connected_components(graph, &mut request).unwrap();
             elapsed = started.elapsed();
+            push_count(&mut material, b'c', result.components.len());
             for component in &result.components {
-                push_nodes(graph, component.iter().copied(), &mut material);
-                material.extend_from_slice(&u64::try_from(component.len()).unwrap().to_le_bytes());
+                push_nodes(graph, component.iter().copied(), &mut material, b'm');
             }
             work = result.work;
             retained_bytes = bytes(graph.node_count(), size_of::<usize>())
@@ -421,20 +345,30 @@ where
             let started = Instant::now();
             let result = loop_regions(graph, &mut request).unwrap();
             elapsed = started.elapsed();
+            push_count(&mut material, b'r', result.regions.len());
             let mut retained = bytes(
                 result.regions.len(),
                 size_of::<LoopRegion<G::Node, G::Edge>>(),
             );
             for region in &result.regions {
-                push_nodes(graph, region.members.iter().copied(), &mut material);
-                push_nodes(graph, region.entries.iter().copied(), &mut material);
-                push_edges(graph, region.back_edges.iter().copied(), &mut material);
-                material.push(u8::from(region.has_self_loop));
-                material.push(match region.entry_structure {
-                    LoopEntryStructure::None => 0,
-                    LoopEntryStructure::Single => 1,
-                    LoopEntryStructure::Multiple => 2,
-                });
+                push_nodes(graph, region.members.iter().copied(), &mut material, b'm');
+                push_nodes(graph, region.entries.iter().copied(), &mut material, b'e');
+                push_edges(
+                    graph,
+                    region.back_edges.iter().copied(),
+                    &mut material,
+                    b'b',
+                );
+                push_field(&mut material, b'h', &[u8::from(region.has_self_loop)]);
+                push_field(
+                    &mut material,
+                    b's',
+                    &[match region.entry_structure {
+                        LoopEntryStructure::None => 0,
+                        LoopEntryStructure::Single => 1,
+                        LoopEntryStructure::Multiple => 2,
+                    }],
+                );
                 retained = retained
                     .saturating_add(bytes(region.members.len(), size_of::<G::Node>()))
                     .saturating_add(bytes(region.entries.len(), size_of::<G::Node>()))
@@ -448,13 +382,13 @@ where
             let result = shortest_path(graph, start, goal, &mut request).unwrap();
             elapsed = started.elapsed();
             if let Some(path) = result {
-                material.push(1);
-                push_nodes(graph, path.nodes.iter().copied(), &mut material);
-                push_edges(graph, path.edges.iter().copied(), &mut material);
+                push_field(&mut material, b'o', &[1]);
+                push_nodes(graph, path.nodes.iter().copied(), &mut material, b'n');
+                push_edges(graph, path.edges.iter().copied(), &mut material, b'e');
                 retained_bytes = bytes(path.nodes.len(), size_of::<G::Node>())
                     .saturating_add(bytes(path.edges.len(), size_of::<G::Edge>()));
             } else {
-                material.push(0);
+                push_field(&mut material, b'o', &[0]);
                 retained_bytes = 0;
             }
             work = budget.used();
@@ -470,12 +404,18 @@ where
     )
 }
 
-fn push_nodes<G>(graph: &G, nodes: impl IntoIterator<Item = G::Node>, material: &mut Vec<u8>)
-where
+fn push_nodes<G>(
+    graph: &G,
+    nodes: impl IntoIterator<Item = G::Node>,
+    material: &mut Vec<u8>,
+    tag: u8,
+) where
     G: DenseBidirectionalGraph,
 {
+    let mut encoded = Vec::new();
+    let mut count = 0usize;
     for node in nodes {
-        material.extend_from_slice(
+        encoded.extend_from_slice(
             &u64::try_from(
                 graph
                     .node_index(node)
@@ -484,55 +424,68 @@ where
             .unwrap()
             .to_le_bytes(),
         );
+        count = count.saturating_add(1);
     }
+    push_sequence(material, tag, count, &encoded);
 }
 
-fn push_edges<G>(graph: &G, edges: impl IntoIterator<Item = G::Edge>, material: &mut Vec<u8>)
-where
-    G: DenseBidirectionalGraph,
+fn push_edges<G>(
+    graph: &G,
+    edges: impl IntoIterator<Item = G::Edge>,
+    material: &mut Vec<u8>,
+    tag: u8,
+) where
+    G: BenchmarkGraph,
 {
+    let mut encoded = Vec::new();
+    let mut count = 0usize;
     for edge in edges {
-        material.extend_from_slice(
+        encoded.extend_from_slice(
             &u64::try_from(
                 graph
-                    .edge_index(edge)
+                    .benchmark_edge_index(edge)
                     .expect("result edge belongs to graph"),
             )
             .unwrap()
             .to_le_bytes(),
         );
+        count = count.saturating_add(1);
     }
+    push_sequence(material, tag, count, &encoded);
+}
+
+fn push_count(material: &mut Vec<u8>, tag: u8, count: usize) {
+    push_field(material, tag, &u64::try_from(count).unwrap().to_le_bytes());
+}
+
+fn push_sequence(material: &mut Vec<u8>, tag: u8, count: usize, encoded: &[u8]) {
+    material.push(tag);
+    material.extend_from_slice(&u64::try_from(count).unwrap().to_le_bytes());
+    material.extend_from_slice(&u64::try_from(encoded.len()).unwrap().to_le_bytes());
+    material.extend_from_slice(encoded);
+}
+
+fn push_field(material: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+    material.push(tag);
+    material.extend_from_slice(&u64::try_from(bytes.len()).unwrap().to_le_bytes());
+    material.extend_from_slice(bytes);
 }
 
 fn synthetic_datasets(repeats: usize) -> Vec<DatasetMeasurement> {
     let chain_nodes = 100_000;
-    let chain = BenchGraph::new(
+    let chain = SyntheticGraph::from_edges(
         chain_nodes,
-        (0..chain_nodes - 1)
-            .map(|source| BenchEdge {
-                source,
-                target: source + 1,
-                label: 0,
-            })
-            .collect(),
+        (0..chain_nodes - 1).map(|source| (source, source + 1, 0)),
     );
     let mut branch_edges = Vec::new();
     for source in 0..19_999 {
-        branch_edges.push(BenchEdge {
-            source,
-            target: source + 1,
-            label: 0,
-        });
+        branch_edges.push((source, source + 1, 0));
         if source % 3 == 0 && source + 2 < 20_000 {
-            branch_edges.push(BenchEdge {
-                source,
-                target: source + 2,
-                label: 1,
-            });
+            branch_edges.push((source, source + 2, 1));
         }
     }
-    let branch = BenchGraph::new(20_000, branch_edges);
-    let reducible = BenchGraph::new(
+    let branch = SyntheticGraph::from_edges(20_000, branch_edges);
+    let reducible = SyntheticGraph::from_edges(
         9,
         edges(&[
             (0, 1),
@@ -545,38 +498,13 @@ fn synthetic_datasets(repeats: usize) -> Vec<DatasetMeasurement> {
             (5, 8),
         ]),
     );
-    let multi_entry = BenchGraph::new(7, edges(&[(0, 2), (1, 3), (2, 3), (3, 4), (4, 2), (4, 6)]));
+    let multi_entry =
+        SyntheticGraph::from_edges(7, edges(&[(0, 2), (1, 3), (2, 3), (3, 4), (4, 2), (4, 6)]));
     let disconnected =
-        BenchGraph::new(10, edges(&[(0, 1), (1, 2), (3, 4), (4, 3), (6, 6), (8, 9)]));
-    let exceptional = BenchGraph::new(
+        SyntheticGraph::from_edges(10, edges(&[(0, 1), (1, 2), (3, 4), (4, 3), (6, 6), (8, 9)]));
+    let exceptional = SyntheticGraph::from_edges(
         8,
-        vec![
-            BenchEdge {
-                source: 0,
-                target: 1,
-                label: 0,
-            },
-            BenchEdge {
-                source: 1,
-                target: 2,
-                label: 0,
-            },
-            BenchEdge {
-                source: 1,
-                target: 7,
-                label: 9,
-            },
-            BenchEdge {
-                source: 2,
-                target: 5,
-                label: 0,
-            },
-            BenchEdge {
-                source: 2,
-                target: 6,
-                label: 9,
-            },
-        ],
+        vec![(0, 1, 0), (1, 2, 0), (1, 7, 9), (2, 5, 0), (2, 6, 9)],
     );
 
     [
@@ -596,15 +524,11 @@ fn synthetic_datasets(repeats: usize) -> Vec<DatasetMeasurement> {
     .collect()
 }
 
-fn edges(pairs: &[(usize, usize)]) -> Vec<BenchEdge> {
+fn edges(pairs: &[(usize, usize)]) -> Vec<(usize, usize, u8)> {
     pairs
         .iter()
         .enumerate()
-        .map(|(label, &(source, target))| BenchEdge {
-            source,
-            target,
-            label: u8::try_from(label).unwrap(),
-        })
+        .map(|(label, &(source, target))| (source, target, u8::try_from(label).unwrap()))
         .collect()
 }
 
@@ -686,7 +610,7 @@ fn corpus_dataset(
     dataset.finish()
 }
 
-fn provenance() -> Provenance {
+fn provenance(output: &Path) -> Provenance {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     Provenance {
         bifrost_commit: command_output(root, "git", &["rev-parse", "HEAD"]),
@@ -696,7 +620,7 @@ fn provenance() -> Provenance {
             &["status", "--porcelain", "--untracked-files=normal"],
         )
         .map(|status| !status.is_empty()),
-        bifrost_tree_fingerprint: tree_fingerprint(root),
+        bifrost_tree_fingerprint: git_tree_fingerprint(root, &[output]),
         rustc_version_verbose: command_output(root, "rustc", &["-Vv"]),
         cargo_version: command_output(root, "cargo", &["-V"]),
         operating_system: std::env::consts::OS,
@@ -716,53 +640,15 @@ fn provenance() -> Provenance {
             CorpusProvenance {
                 environment_variable: TS_REPO_ENV,
                 expected_commit: VSCODE_COMMIT,
-                configured_path: std::env::var(TS_REPO_ENV).ok(),
+                configured: std::env::var_os(TS_REPO_ENV).is_some(),
             },
             CorpusProvenance {
                 environment_variable: JAVA_REPO_ENV,
                 expected_commit: SPRING_PETCLINIC_COMMIT,
-                configured_path: std::env::var(JAVA_REPO_ENV).ok(),
+                configured: std::env::var_os(JAVA_REPO_ENV).is_some(),
             },
         ],
     }
-}
-
-fn command_output(root: &Path, command: &str, arguments: &[&str]) -> Option<String> {
-    let output = Command::new(command)
-        .current_dir(root)
-        .args(arguments)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn tree_fingerprint(root: &Path) -> Option<String> {
-    let diff = Command::new("git")
-        .current_dir(root)
-        .args(["diff", "--binary", "HEAD", "--"])
-        .output()
-        .ok()?;
-    let untracked = Command::new("git")
-        .current_dir(root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()?;
-    if !diff.status.success() || !untracked.status.success() {
-        return None;
-    }
-    let mut material = diff.stdout;
-    for raw_path in untracked.stdout.split(|byte| *byte == 0) {
-        if raw_path.is_empty() {
-            continue;
-        }
-        material.extend_from_slice(raw_path);
-        let relative = std::str::from_utf8(raw_path).ok()?;
-        material.extend_from_slice(&fs::read(root.join(relative)).ok()?);
-    }
-    Some(StableDigest::sha256(material).to_string())
 }
 
 fn digest_strings(digests: &[String]) -> String {
@@ -783,6 +669,23 @@ fn milliseconds(duration: Duration) -> f64 {
 }
 
 #[test]
+fn framed_result_digest_distinguishes_field_boundaries() {
+    let mut first = Vec::new();
+    push_sequence(&mut first, b'e', 3, &[1, 2, 3]);
+    push_sequence(&mut first, b'b', 1, &[7]);
+
+    let mut second = Vec::new();
+    push_sequence(&mut second, b'e', 2, &[1, 2]);
+    push_sequence(&mut second, b'b', 2, &[3, 7]);
+
+    assert_ne!(
+        StableDigest::sha256(first),
+        StableDigest::sha256(second),
+        "field framing must prevent structurally different loop results from colliding"
+    );
+}
+
+#[test]
 #[ignore = "release-only measurement; run scripts/run-cfg-algorithm-benchmarks.sh"]
 fn cfg_algorithm_release_measurement() {
     if cfg!(debug_assertions) {
@@ -792,14 +695,14 @@ fn cfg_algorithm_release_measurement() {
         .ok()
         .map(|value| value.parse::<usize>().expect("positive benchmark repeats"))
         .unwrap_or(3);
-    assert!(repeats > 0);
+    assert!((1..=MAX_REPEATS).contains(&repeats));
     let output = std::env::var_os(OUTPUT_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(".agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json")
         });
-    let run_provenance = provenance();
+    let run_provenance = provenance(&output);
 
     let parent = output
         .parent()
