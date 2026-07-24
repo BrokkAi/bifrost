@@ -12364,8 +12364,13 @@ type Options struct {
         project.root(),
         &location_reference("main.go", source, alias_start),
     );
+    // The alias qualifier `cfg` names the workspace package
+    // `example.com/app/config`; it has no single declaration, but reporting it as
+    // an unindexed boundary would be misleading (issue #1089 facet B). The honest
+    // outcome is a workspace package namespace.
+    assert_eq!(alias["results"][0]["status"], "no_definition", "{alias}");
     assert_eq!(
-        alias["results"][0]["status"], "unresolvable_import_boundary",
+        alias["results"][0]["diagnostics"][0]["kind"], "workspace_package_namespace",
         "{alias}"
     );
 

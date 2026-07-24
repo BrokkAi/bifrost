@@ -40,6 +40,29 @@ pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &Imp
     let Some((module_specifier, imported_name)) =
         split_rust_import_module_and_name(&import.raw_snippet)
     else {
+        // A single-segment aliased import has no `::` for the splitter to
+        // separate module from name: `use forc_pkg as pkg;` — the desugaring of
+        // the grouped `use forc_pkg::{self as pkg}` — aliases a whole crate or
+        // module root to a local name. Bind the alias as a namespace so `pkg`
+        // (and `pkg::Item`) resolves through the aliased root exactly like
+        // `forc_pkg` would (issue #1089: sway forc-pkg exposed as `pkg`).
+        if let Some(alias) = import.alias.as_deref() {
+            let module = rust_import_body(raw)
+                .map(|body| body.rsplit_once(" as ").map_or(body, |(module, _)| module))
+                .map(str::trim)
+                .unwrap_or_default();
+            if !alias.is_empty() && !module.is_empty() && !module.contains("::") {
+                binder.bindings.insert(
+                    alias.to_string(),
+                    ImportBinding {
+                        module_specifier: module.to_string(),
+                        namespace_imported_module: None,
+                        kind: ImportKind::Namespace,
+                        imported_name: None,
+                    },
+                );
+            }
+        }
         return;
     };
     let local_name = import

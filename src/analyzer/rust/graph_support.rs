@@ -408,6 +408,12 @@ impl RustAnalyzer {
         {
             return Some(package);
         }
+        // Only after cargo routing fails — the miss path, not the hot path — try
+        // a `use <crate> as <alias>` module alias so the binder is built solely
+        // for unresolved roots (issue #1089).
+        if let Some(aliased) = self.rust_apply_import_alias(importing_file, module_specifier) {
+            return self.resolve_module_package(importing_file, &aliased);
+        }
         resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
     }
 
@@ -696,6 +702,42 @@ impl RustAnalyzer {
             }
         }
         targets
+    }
+
+    /// Rewrite a leading `use <crate> as <alias>` module-alias segment in
+    /// `module_specifier` to the aliased crate/module. `use forc_pkg::{self as
+    /// pkg}` makes `pkg` (and `pkg::Item`) mean `forc_pkg` (`forc_pkg::Item`),
+    /// so every module resolver must first substitute the alias before routing —
+    /// otherwise the alias root is unknown and draws a false "not indexed"
+    /// boundary even though the crate is in the workspace (issue #1089).
+    fn rust_apply_import_alias(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Option<String> {
+        let (root, rest) = module_specifier
+            .split_once("::")
+            .map_or((module_specifier, None), |(root, rest)| (root, Some(rest)));
+        if root.is_empty() || matches!(root, "crate" | "self" | "super") {
+            return None;
+        }
+        let binder = self.import_binder_of(importing_file);
+        let binding = binder.bindings.get(root)?;
+        if binding.kind != ImportKind::Namespace || binding.imported_name.is_some() {
+            return None;
+        }
+        let target = binding.module_specifier.as_str();
+        // Only a genuine rename (`use path as alias`) where the alias spelling
+        // differs from the imported module's own last segment; an ordinary
+        // `use a::b` namespace binding names its own last segment and must not
+        // be rewritten (that would loop or mis-route).
+        if target.is_empty() || target == root || target.rsplit("::").next() == Some(root) {
+            return None;
+        }
+        Some(match rest {
+            Some(rest) => format!("{target}::{rest}"),
+            None => target.to_string(),
+        })
     }
 
     pub fn resolve_module_files(

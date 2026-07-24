@@ -312,6 +312,21 @@ pub(super) fn resolve_go(
             && let Some(selector) = selector
         {
             if selector.focus_segment == 0 {
+                // The focus is the package qualifier itself (`fs` in
+                // `fs.Debugf`). A package names a namespace, not a single
+                // declaration, so there is nothing to navigate to — but when the
+                // package is indexed in this workspace the honest answer is
+                // "workspace package namespace", never a boundary claim whose
+                // tail implies it may be outside the workspace (issue #1089 go
+                // cousin: rclone `fs.Debugf`).
+                if go_import_path_is_workspace(support, package) {
+                    return no_definition(
+                        "workspace_package_namespace",
+                        format!(
+                            "`{reference}` names a Go package in this workspace, not a single indexed declaration"
+                        ),
+                    );
+                }
                 return boundary(format!(
                     "`{reference}` is a Go import namespace rather than an indexed declaration"
                 ));

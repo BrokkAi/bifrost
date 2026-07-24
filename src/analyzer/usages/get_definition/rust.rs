@@ -2565,6 +2565,14 @@ fn rust_focused_prefix_resolution_outcome(
                 ) {
                     return candidates_outcome(vec![unit]);
                 }
+                if rust_focused_is_workspace_module_namespace(rust, file, focused_text) {
+                    return no_definition(
+                        "workspace_module_namespace",
+                        format!(
+                            "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+                        ),
+                    );
+                }
                 return boundary(format!(
                     "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
                 ));
@@ -2697,6 +2705,22 @@ fn rust_focused_prefix_resolution_outcome(
             site.focus_start_byte,
         ) {
             return candidates_outcome(vec![unit]);
+        }
+        // Only for a *bound* alias root (`use forc_pkg as pkg; pkg::Item`) do we
+        // treat a resolvable workspace module as an honest namespace. When the
+        // boundary is due to `enclosing_module_self_root`, the segment names the
+        // extern-prelude crate that an inline `mod <name>` shadows (`mod
+        // serde_json { serde_json::… }`), which is genuinely unindexed — keep the
+        // boundary there.
+        if !enclosing_module_self_root
+            && rust_focused_is_workspace_module_namespace(rust, file, focused_text)
+        {
+            return no_definition(
+                "workspace_module_namespace",
+                format!(
+                    "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+                ),
+            );
         }
         return boundary(format!(
             "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
@@ -5282,6 +5306,20 @@ fn rust_enclosing_scope_member_fallback(
     resolve_in_enclosing_scopes(analyzer, file, name, byte, |candidate| {
         candidate.is_field() || candidate.is_class()
     })
+}
+
+/// True when the focused owner/qualifier resolves to a Rust crate or module that
+/// is indexed in this workspace — e.g. a `use forc_pkg::{self as pkg}` alias
+/// whose `pkg` root routes through cargo to a workspace crate. Such a qualifier
+/// names a namespace, not a single declaration, so the honest outcome is
+/// `no_definition`, never a confident "crosses an unindexed boundary" claim
+/// (issue #1089: sway forc-pkg exposed as `pkg`).
+fn rust_focused_is_workspace_module_namespace(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    focused_text: &str,
+) -> bool {
+    !rust.resolve_module_files(file, focused_text).is_empty()
 }
 
 pub(super) fn parse_rust_tree(source: &str) -> Option<Tree> {
