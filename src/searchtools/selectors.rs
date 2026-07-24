@@ -1,5 +1,9 @@
 use super::navigation::*;
 use super::*;
+use crate::analyzer::{
+    CallableLinkage, CppCallableUnitRole, cpp_callable_definitions_share_identity_evidence,
+    cpp_callable_unit_role, cpp_indexed_callable_linkage,
+};
 
 pub(super) type DefinitionCandidateKey = (
     String,
@@ -12,6 +16,8 @@ pub(super) type DefinitionCandidateKey = (
     String,
     Option<String>,
     String,
+    Option<String>,
+    Option<String>,
 );
 
 pub(super) type DefinitionOutcomeKey = (String, Vec<DefinitionCandidateKey>);
@@ -32,6 +38,10 @@ pub struct DefinitionCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +190,8 @@ pub(super) fn definition_candidate_key(candidate: &DefinitionCandidate) -> Defin
         candidate.kind.clone(),
         candidate.signature.clone(),
         candidate.language.clone(),
+        candidate.canonical_selector.clone(),
+        candidate.occurrence_role.clone(),
     )
 }
 
@@ -218,6 +230,8 @@ pub(super) fn lexical_definition_candidate(
         ),
         kind: declaration_kind_name(definition.kind).to_string(),
         signature: (!signature.is_empty()).then_some(signature),
+        canonical_selector: None,
+        occurrence_role: None,
         language: language_name(language_for_file(file)),
     })
 }
@@ -236,8 +250,83 @@ pub(super) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
 }
 
 #[derive(Default)]
+pub(super) struct CppIdentityRenderCache {
+    cpp_classifiers: HashMap<ProjectFile, Option<crate::analyzer::CppOccurrenceClassifier>>,
+    canonical_selectors: HashMap<CodeUnit, String>,
+    loaded_fqns: HashSet<String>,
+}
+
+impl CppIdentityRenderCache {
+    pub(super) fn canonical_selector(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<String> {
+        if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
+            return None;
+        }
+        let fqn = unit.fq_name();
+        if self.loaded_fqns.insert(fqn.clone()) {
+            let definitions: Vec<_> = analyzer
+                .definitions(&fqn)
+                .filter(|candidate| language_for_target(candidate) == Language::Cpp)
+                .collect();
+            self.canonical_selectors
+                .extend(cpp_canonical_selectors(analyzer, &definitions));
+        }
+        self.canonical_selectors
+            .get(unit)
+            .cloned()
+            .or_else(|| Some(file_anchored_definition_selector(unit)))
+    }
+
+    fn classifier(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        source: &ProjectFile,
+    ) -> Option<&crate::analyzer::CppOccurrenceClassifier> {
+        self.cpp_classifiers
+            .entry(source.clone())
+            .or_insert_with(|| {
+                analyzer
+                    .indexed_source(source)
+                    .and_then(|content| crate::analyzer::CppOccurrenceClassifier::new(&content))
+            })
+            .as_ref()
+    }
+
+    pub(super) fn primary_range(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<Range> {
+        let classifier = if language_for_target(unit) == Language::Cpp && unit.is_callable() {
+            self.classifier(analyzer, unit.source())
+        } else {
+            None
+        };
+        primary_range_with_cpp_classifier(analyzer, unit, classifier)
+    }
+
+    pub(super) fn occurrence_role(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        range: &Range,
+    ) -> Option<String> {
+        if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
+            return None;
+        }
+        self.classifier(analyzer, unit.source())
+            .and_then(|classifier| classifier.classify(unit, range).api_label())
+            .map(str::to_string)
+    }
+}
+
+#[derive(Default)]
 pub(super) struct DefinitionCandidateRenderCache {
     contexts: HashMap<ProjectFile, Option<DeclarationNameRangeContext>>,
+    cpp_identity: CppIdentityRenderCache,
 }
 
 impl DefinitionCandidateRenderCache {
@@ -271,14 +360,20 @@ impl DefinitionCandidateRenderCache {
             .contexts
             .entry(unit.source().clone())
             .or_insert_with(|| load_declaration_name_context(analyzer, unit.source()));
-        let name_range = context
-            .as_ref()
-            .and_then(|context| context.name_range(analyzer, unit));
+        let name_range = context.as_ref().and_then(|context| {
+            if language_for_target(unit) == Language::Cpp && unit.is_callable() {
+                self.cpp_identity
+                    .primary_range(analyzer, unit)
+                    .and_then(|range| context.name_range_for_declaration(unit, range))
+            } else {
+                context.name_range(analyzer, unit)
+            }
+        });
         if let (Some(context), Some(name_range)) = (context.as_ref(), name_range) {
             let (name_range, columns) = Self::exact_display_range(context, name_range);
             return Some((name_range, Some(columns)));
         }
-        Some((primary_range(analyzer, unit)?, None))
+        Some((self.cpp_identity.primary_range(analyzer, unit)?, None))
     }
 
     pub(super) fn navigation_display_range(
@@ -301,6 +396,36 @@ impl DefinitionCandidateRenderCache {
             return Some((name_range, Some(columns)));
         }
         Some((declaration_range, None))
+    }
+
+    fn identity_metadata(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        range: &Range,
+    ) -> (Option<String>, Option<String>) {
+        if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
+            return (None, None);
+        }
+        let canonical_selector = self.cpp_identity.canonical_selector(analyzer, unit);
+        let occurrence_role = self.cpp_identity.occurrence_role(analyzer, unit, range);
+        (canonical_selector, occurrence_role)
+    }
+
+    fn candidate_from_range(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        range: Range,
+        identity_range: &Range,
+        columns: Option<(usize, usize)>,
+    ) -> DefinitionCandidate {
+        let (canonical_selector, occurrence_role) =
+            self.identity_metadata(analyzer, unit, identity_range);
+        let mut candidate = definition_candidate_from_range_base(analyzer, unit, range, columns);
+        candidate.canonical_selector = canonical_selector;
+        candidate.occurrence_role = occurrence_role;
+        candidate
     }
 }
 
@@ -332,10 +457,16 @@ pub(super) fn navigation_candidates_with_cache(
         .iter()
         .filter_map(|target| {
             let (range, columns) = render_cache.navigation_display_range(analyzer, target)?;
-            Some(definition_candidate_from_range(
+            let identity_range = target.declaration_range.as_ref().cloned().or_else(|| {
+                render_cache
+                    .cpp_identity
+                    .primary_range(analyzer, &target.code_unit)
+            })?;
+            Some(render_cache.candidate_from_range(
                 analyzer,
                 &target.code_unit,
                 range,
+                &identity_range,
                 columns,
             ))
         })
@@ -359,12 +490,22 @@ pub(super) fn definition_candidate_with_cache(
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> Option<DefinitionCandidate> {
     let (range, columns) = render_cache.display_range(analyzer, unit)?;
-    Some(definition_candidate_from_range(
-        analyzer, unit, range, columns,
-    ))
+    let identity_range = render_cache.cpp_identity.primary_range(analyzer, unit)?;
+    Some(render_cache.candidate_from_range(analyzer, unit, range, &identity_range, columns))
 }
 
+#[cfg(test)]
 pub(super) fn definition_candidate_from_range(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    range: Range,
+    columns: Option<(usize, usize)>,
+) -> DefinitionCandidate {
+    DefinitionCandidateRenderCache::default()
+        .candidate_from_range(analyzer, unit, range, &range, columns)
+}
+
+fn definition_candidate_from_range_base(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     range: Range,
@@ -390,6 +531,8 @@ pub(super) fn definition_candidate_from_range(
             .map(str::to_string)
             .or_else(|| analyzer.signatures(unit).first().cloned()),
         language: language_name(language),
+        canonical_selector: None,
+        occurrence_role: None,
     }
 }
 
@@ -767,6 +910,176 @@ pub(super) fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
     format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
 }
 
+fn cpp_callable_family_selectors(
+    analyzer: &dyn IAnalyzer,
+    same_signature: &[CodeUnit],
+) -> HashMap<CodeUnit, String> {
+    let roles: HashMap<_, _> = same_signature
+        .iter()
+        .map(|unit| (unit.clone(), cpp_callable_unit_role(analyzer, unit)))
+        .collect();
+    let declarations: Vec<_> = same_signature
+        .iter()
+        .filter(|unit| {
+            matches!(roles.get(*unit), Some(CppCallableUnitRole::DeclarationOnly))
+                && matches!(
+                    cpp_indexed_callable_linkage(analyzer, unit),
+                    Some(CallableLinkage::External)
+                )
+        })
+        .collect();
+    let definitions: Vec<_> = same_signature
+        .iter()
+        .filter(|unit| {
+            matches!(
+                roles.get(*unit),
+                Some(CppCallableUnitRole::Definition | CppCallableUnitRole::Both)
+            ) && matches!(
+                cpp_indexed_callable_linkage(analyzer, unit),
+                Some(CallableLinkage::External)
+            )
+        })
+        .collect();
+
+    let mut definitions_by_declaration: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
+    for declaration in declarations {
+        let related = definitions
+            .iter()
+            .filter(|definition| {
+                cpp_callable_definitions_share_identity_evidence(analyzer, declaration, definition)
+            })
+            .map(|definition| (*definition).clone())
+            .collect();
+        definitions_by_declaration.insert(declaration.clone(), related);
+    }
+
+    let mut canonical_declaration_by_definition: HashMap<CodeUnit, CodeUnit> = HashMap::default();
+    for definition in definitions {
+        let mut declarations: Vec<_> = definitions_by_declaration
+            .iter()
+            .filter(|(_, related)| related.as_slice() == [(*definition).clone()])
+            .map(|(declaration, _)| declaration.clone())
+            .collect();
+        declarations.sort_by_key(|candidate| {
+            (
+                rel_path_string(candidate.source()),
+                analyzer
+                    .ranges(candidate)
+                    .into_iter()
+                    .map(|range| range.start_byte)
+                    .min()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        if let Some(declaration) = declarations.into_iter().next() {
+            canonical_declaration_by_definition.insert((*definition).clone(), declaration);
+        }
+    }
+
+    same_signature
+        .iter()
+        .map(|unit| {
+            let canonical = match roles.get(unit) {
+                Some(CppCallableUnitRole::Definition) => canonical_declaration_by_definition
+                    .get(unit)
+                    .map(file_anchored_definition_selector),
+                Some(CppCallableUnitRole::DeclarationOnly) => {
+                    definitions_by_declaration.get(unit).and_then(|related| {
+                        let [definition] = related.as_slice() else {
+                            return None;
+                        };
+                        canonical_declaration_by_definition
+                            .get(definition)
+                            .map(file_anchored_definition_selector)
+                    })
+                }
+                Some(CppCallableUnitRole::Both | CppCallableUnitRole::Unknown) | None => None,
+            }
+            .unwrap_or_else(|| file_anchored_definition_selector(unit));
+            (unit.clone(), canonical)
+        })
+        .collect()
+}
+
+fn cpp_canonical_selectors(
+    analyzer: &dyn IAnalyzer,
+    units: &[CodeUnit],
+) -> HashMap<CodeUnit, String> {
+    let mut by_fqn_signature: HashMap<(String, Option<String>), Vec<CodeUnit>> = HashMap::default();
+    for unit in units {
+        if language_for_target(unit) == Language::Cpp && unit.is_callable() {
+            by_fqn_signature
+                .entry((unit.fq_name(), unit.signature().map(str::to_string)))
+                .or_default()
+                .push(unit.clone());
+        }
+    }
+
+    let mut family_by_unit = HashMap::default();
+    let mut families_by_fqn_signature: HashMap<(String, Option<String>), HashSet<String>> =
+        HashMap::default();
+    for ((fqn, signature), members) in &by_fqn_signature {
+        for (member, family) in cpp_callable_family_selectors(analyzer, members) {
+            family_by_unit.insert(member, family.clone());
+            families_by_fqn_signature
+                .entry((fqn.clone(), signature.clone()))
+                .or_default()
+                .insert(family);
+        }
+    }
+
+    let mut collision_fqns = HashSet::default();
+    for ((fqn, _), families) in &families_by_fqn_signature {
+        if families.len() > 1 {
+            collision_fqns.insert(fqn.clone());
+        }
+    }
+
+    let mut canonical_by_fqn = HashMap::default();
+    for unit in units {
+        if language_for_target(unit) != Language::Cpp
+            || !unit.is_callable()
+            || collision_fqns.contains(&unit.fq_name())
+        {
+            continue;
+        }
+        let family = family_by_unit
+            .get(unit)
+            .cloned()
+            .unwrap_or_else(|| file_anchored_definition_selector(unit));
+        let prefer = matches!(
+            cpp_callable_unit_role(analyzer, unit),
+            CppCallableUnitRole::DeclarationOnly
+        );
+        let entry = canonical_by_fqn
+            .entry(unit.fq_name())
+            .or_insert_with(|| (prefer, family.clone()));
+        if (prefer && !entry.0) || (prefer == entry.0 && family < entry.1) {
+            *entry = (prefer, family);
+        }
+    }
+
+    let mut out = HashMap::default();
+    for unit in units {
+        if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
+            continue;
+        }
+        let canonical = if collision_fqns.contains(&unit.fq_name()) {
+            family_by_unit
+                .get(unit)
+                .cloned()
+                .unwrap_or_else(|| file_anchored_definition_selector(unit))
+        } else {
+            canonical_by_fqn
+                .get(&unit.fq_name())
+                .map(|(_, selector)| selector.clone())
+                .unwrap_or_else(|| file_anchored_definition_selector(unit))
+        };
+        out.insert(unit.clone(), canonical);
+    }
+    out
+}
+
 /// Partition resolved overloads into distinct selectable definitions, preserving
 /// first-seen order. Overloads of one symbol share a selector and scan together.
 /// An FQN present in multiple language/file domains is file-anchored in every
@@ -803,6 +1116,7 @@ pub(super) fn distinct_definitions(
     // languages still render file-anchored there).
     let mut domains_by_fqn: HashMap<String, HashSet<(Language, Option<String>)>> =
         HashMap::default();
+    let cpp_canonical = cpp_canonical_selectors(analyzer, &overloads);
     let mut files_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for unit in &overloads {
@@ -814,10 +1128,22 @@ pub(super) fn distinct_definitions(
             .entry(unit.fq_name())
             .or_default()
             .insert((language, module_path));
+        let signature = if language == Language::Cpp && unit.is_callable() {
+            unit.signature()
+                .map(|signature| vec![signature.to_string()])
+                .unwrap_or_default()
+        } else {
+            analyzer.signatures(unit)
+        };
         files_by_fqn_signature
-            .entry((unit.fq_name(), analyzer.signatures(unit)))
+            .entry((unit.fq_name(), signature))
             .or_default()
-            .insert(rel_path_string(unit.source()));
+            .insert(
+                cpp_canonical
+                    .get(unit)
+                    .cloned()
+                    .unwrap_or_else(|| rel_path_string(unit.source())),
+            );
     }
 
     // FQNs where some (identical) signature is declared in more than one file.
@@ -835,7 +1161,10 @@ pub(super) fn distinct_definitions(
             .get(&fqn)
             .is_some_and(|domains| domains.len() > 1);
         let selector = if cross_domain || collision_split_fqns.contains(&fqn) {
-            file_anchored_definition_selector(&unit)
+            cpp_canonical
+                .get(&unit)
+                .cloned()
+                .unwrap_or_else(|| file_anchored_definition_selector(&unit))
         } else {
             definition_selector(&unit)
         };

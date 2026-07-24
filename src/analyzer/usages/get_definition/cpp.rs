@@ -1,9 +1,11 @@
 use super::*;
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cpp::CppAdapter;
-use crate::analyzer::declaration_range::{
-    code_unit_declaration_name_range_for_range, node_for_exact_range,
+use crate::analyzer::cpp::{
+    CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence,
+    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_occurrence_role_for_range,
 };
+use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
@@ -15,14 +17,6 @@ use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 const CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
     crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_SCOPE_NODES * 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CppNavigationKind {
-    DeclarationOnly,
-    Definition,
-    Both,
-    Unknown,
-}
 
 pub(super) struct CppNavigationIndex {
     ranges: HashMap<CodeUnit, Vec<Range>>,
@@ -93,7 +87,7 @@ pub(super) fn select_navigation_targets(
     for candidate in candidates {
         let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
             if operation == NavigationOperation::Declaration {
-                classified.push((candidate.clone(), None, CppNavigationKind::Unknown));
+                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown));
             }
             structure_unavailable = true;
             continue;
@@ -101,7 +95,7 @@ pub(super) fn select_navigation_targets(
         let root = tree.root_node();
         let Some(index) = context.cpp_navigation_index(candidate.source()) else {
             if operation == NavigationOperation::Declaration {
-                classified.push((candidate.clone(), None, CppNavigationKind::Unknown));
+                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown));
             }
             structure_unavailable = true;
             continue;
@@ -109,30 +103,30 @@ pub(super) fn select_navigation_targets(
         let ranges = index.ranges(candidate);
         source_ranges_truncated |= index.is_truncated(candidate);
         if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
-            classified.push((candidate.clone(), None, CppNavigationKind::Both));
+            classified.push((candidate.clone(), None, CppOccurrenceRole::Both));
             continue;
         }
         classified.extend(ranges.iter().copied().map(|range| {
-            let kind = cpp_navigation_kind_for_range(root, candidate, &range);
+            let kind = cpp_occurrence_role_for_range(root, candidate, &range);
             (candidate.clone(), Some(range), kind)
         }));
     }
     let has_declaration_only = classified
         .iter()
-        .any(|(_, _, kind)| *kind == CppNavigationKind::DeclarationOnly);
+        .any(|(_, _, kind)| *kind == CppOccurrenceRole::DeclarationOnly);
     let mut selected: Vec<_> = classified
         .into_iter()
         .filter(|(_, _, kind)| match operation {
             NavigationOperation::Declaration => {
                 if has_declaration_only {
-                    *kind == CppNavigationKind::DeclarationOnly
+                    *kind == CppOccurrenceRole::DeclarationOnly
                 } else {
                     true
                 }
             }
             NavigationOperation::Definition => matches!(
                 *kind,
-                CppNavigationKind::Definition | CppNavigationKind::Both
+                CppOccurrenceRole::Definition | CppOccurrenceRole::Both
             ),
         })
         .collect();
@@ -141,12 +135,12 @@ pub(super) fn select_navigation_targets(
     let unproven_link_unit = operation == NavigationOperation::Definition
         && selected
             .iter()
-            .filter(|(_, _, kind)| *kind == CppNavigationKind::Definition)
+            .filter(|(_, _, kind)| *kind == CppOccurrenceRole::Definition)
             .count()
             > 1
         && selected
             .iter()
-            .filter(|(_, _, kind)| *kind == CppNavigationKind::Definition)
+            .filter(|(_, _, kind)| *kind == CppOccurrenceRole::Definition)
             .map(|(candidate, _, _)| {
                 (
                     definition_symbol_key(candidate),
@@ -170,79 +164,6 @@ pub(super) fn select_navigation_targets(
         unproven_link_unit,
         truncated,
     }
-}
-
-fn cpp_navigation_kind_for_range(
-    root: Node<'_>,
-    candidate: &CodeUnit,
-    range: &Range,
-) -> CppNavigationKind {
-    if !candidate.is_callable() && !candidate.is_class() {
-        return CppNavigationKind::Both;
-    }
-    let Some(node) = cpp_declaration_node_for_range(root, range) else {
-        return CppNavigationKind::Unknown;
-    };
-    if candidate.is_callable() {
-        return if cpp_subtree_contains(node, |descendant| {
-            descendant.kind() == "function_definition"
-                && descendant.child_by_field_name("body").is_some()
-        }) {
-            CppNavigationKind::Definition
-        } else {
-            CppNavigationKind::DeclarationOnly
-        };
-    }
-    // Export macros between `class`/`struct` and the type name can make
-    // tree-sitter recover a complete class as a function-shaped node. The C++
-    // declaration parser only assigns such a range to a class after recovering
-    // its body structurally, so retain that body classification for explicit
-    // definition navigation.
-    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
-        return CppNavigationKind::Definition;
-    }
-    if !cpp_subtree_contains(node, |descendant| {
-        matches!(
-            descendant.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-        )
-    }) {
-        return CppNavigationKind::Both;
-    }
-    if cpp_subtree_contains(node, |descendant| {
-        matches!(
-            descendant.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-        ) && descendant.child_by_field_name("body").is_some()
-    }) {
-        CppNavigationKind::Definition
-    } else {
-        CppNavigationKind::DeclarationOnly
-    }
-}
-
-fn cpp_declaration_node_for_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
-    node_for_exact_range(root, range).or_else(|| {
-        root.descendant_for_byte_range(range.start_byte, range.end_byte)
-            .and_then(|mut node| {
-                while node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
-                    node = node.parent()?;
-                }
-                Some(node)
-            })
-    })
-}
-
-fn cpp_subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if predicate(candidate) {
-            return true;
-        }
-        let mut cursor = candidate.walk();
-        stack.extend(candidate.named_children(&mut cursor));
-    }
-    false
 }
 
 pub(super) fn resolve_cpp(
@@ -3344,11 +3265,6 @@ fn resolve_cpp_construction_type(
     )
 }
 
-fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
-    let path = rel_path_string(source).to_ascii_lowercase();
-    matches!(path.rsplit('.').next(), Some("h" | "hh" | "hpp" | "hxx"))
-}
-
 fn resolve_cpp_field(
     ctx: CppLookupCtx<'_, '_>,
     field: Node<'_>,
@@ -3478,55 +3394,6 @@ fn cpp_visible_name_candidates(
     candidates
 }
 
-fn cpp_callable_definitions_share_identity_evidence(
-    analyzer: &dyn IAnalyzer,
-    visible: &CodeUnit,
-    candidate: &CodeUnit,
-) -> bool {
-    visible.source() == candidate.source()
-        || (matches!(
-            cpp_indexed_callable_linkage(analyzer, visible),
-            Some(crate::analyzer::CallableLinkage::External)
-        ) && matches!(
-            cpp_indexed_callable_linkage(analyzer, candidate),
-            Some(crate::analyzer::CallableLinkage::External)
-        ) && cpp_header_body_files_are_related(analyzer, visible.source(), candidate.source()))
-}
-
-/// The include graph can relate one declaration header to one implementation
-/// file, but it cannot prove that every external definition with the same FQN
-/// belongs to the same binary. Keep only a direct header/body include edge;
-/// broader workspace-global linkage is deliberately rejected.
-fn cpp_header_body_files_are_related(
-    analyzer: &dyn IAnalyzer,
-    left: &ProjectFile,
-    right: &ProjectFile,
-) -> bool {
-    let (header, implementation) = if cpp_source_path_is_header(left) {
-        (left, right)
-    } else if cpp_source_path_is_header(right) {
-        (right, left)
-    } else {
-        return false;
-    };
-    if cpp_source_path_is_header(implementation) {
-        return false;
-    }
-    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
-        return false;
-    };
-    let include_targets = cpp.include_target_index();
-    analyzer
-        .import_statements(implementation)
-        .into_iter()
-        .flat_map(|import| cpp_include_paths(std::slice::from_ref(&import)))
-        .any(|include| {
-            let targets =
-                resolve_include_targets_with_index(implementation, &include, include_targets);
-            targets.len() == 1 && targets.first() == Some(header)
-        })
-}
-
 /// Cross-file C/C++ callable bodies selected from include evidence are useful
 /// targets, but their link-unit identity remains unproven without build graph
 /// metadata. Preserve the candidates while making that uncertainty explicit.
@@ -3547,23 +3414,6 @@ fn cpp_callable_candidates_outcome(candidates: Vec<CodeUnit>) -> DefinitionLooku
         });
     }
     outcome
-}
-
-pub(crate) fn cpp_indexed_callable_linkage(
-    analyzer: &dyn IAnalyzer,
-    callable: &CodeUnit,
-) -> Option<crate::analyzer::CallableLinkage> {
-    let mut external = false;
-    for metadata in analyzer.signature_metadata(callable) {
-        match metadata.callable_linkage() {
-            Some(crate::analyzer::CallableLinkage::Internal) => {
-                return Some(crate::analyzer::CallableLinkage::Internal);
-            }
-            Some(crate::analyzer::CallableLinkage::External) => external = true,
-            None => {}
-        }
-    }
-    external.then_some(crate::analyzer::CallableLinkage::External)
 }
 
 fn cpp_unit_matches_kind(

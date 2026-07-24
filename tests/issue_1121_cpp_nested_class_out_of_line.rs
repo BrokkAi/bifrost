@@ -83,7 +83,8 @@ int Outer::Inner::method() const {
 
 /// Header declaration and out-of-line definition of a nested-class member now
 /// unify: the header's `log4cxx.Outer$Inner.method` identity is shared by the
-/// `.cpp` definition, so the canonical symbol resolves to *both* sources.
+/// `.cpp` definition. Bare source lookup presents the definition while its
+/// canonical selector remains anchored to the header declaration.
 #[test]
 fn namespace_block_nested_member_unifies_declaration_and_definition() {
     let project = namespace_block_project();
@@ -101,17 +102,21 @@ fn namespace_block_nested_member_unifies_declaration_and_definition() {
     );
     assert_eq!(
         sorted_source_paths(&result),
-        vec!["nested.cpp".to_string(), "nested.h".to_string()],
+        vec!["nested.cpp".to_string()],
         "declaration and out-of-line definition did not unify: {result}"
+    );
+    assert_eq!(
+        result["sources"][0]["canonical_selector"], "nested.h#log4cxx.Outer$Inner.method",
+        "definition did not retain the header-anchored identity: {result}"
     );
 }
 
 /// The full display-spelling matrix for the nested member -- the canonical fq,
 /// its `::` twin, the owner-qualified and fully-qualified `::` forms, and the
-/// bare terminal name -- must all resolve, unambiguously, to the *same* two
-/// declarations (header declaration + `.cpp` out-of-line definition). This is
+/// bare terminal name -- must all resolve, unambiguously, to the same
+/// definition and header-anchored canonical selector. This is
 /// the #1093-style I2 contract: no display spelling of a symbol may resolve to
-/// a different declaration set than any other.
+/// a different callable identity than any other.
 #[test]
 fn every_display_spelling_of_the_nested_member_resolves_to_the_same_pair() {
     let project = namespace_block_project();
@@ -136,8 +141,12 @@ fn every_display_spelling_of_the_nested_member_resolves_to_the_same_pair() {
         );
         assert_eq!(
             sorted_source_paths(&result),
-            vec!["nested.cpp".to_string(), "nested.h".to_string()],
-            "`{spelling}` did not resolve to both the declaration and the definition: {result}"
+            vec!["nested.cpp".to_string()],
+            "`{spelling}` did not resolve to the definition: {result}"
+        );
+        assert_eq!(
+            result["sources"][0]["canonical_selector"], "nested.h#log4cxx.Outer$Inner.method",
+            "`{spelling}` did not retain the declaration-anchored identity: {result}"
         );
     }
 }
@@ -182,8 +191,12 @@ int A::B::C::method() const {
     let result = symbol_sources(&project, "log4cxx.A$B$C.method");
     assert_eq!(
         sorted_source_paths(&result),
-        vec!["deep.cpp".to_string(), "deep.h".to_string()],
+        vec!["deep.cpp".to_string()],
         "three-deep nested member did not unify: {result}"
+    );
+    assert_eq!(
+        result["sources"][0]["canonical_selector"], "deep.h#log4cxx.A$B$C.method",
+        "three-deep definition did not retain the declaration identity: {result}"
     );
 }
 
@@ -214,13 +227,16 @@ int Outer::Inner::method() const {
 
     let result = symbol_sources(&project, "log4cxx.Outer$Inner.method");
     assert_eq!(result["not_found"].as_array().unwrap().len(), 0, "{result}");
-    // Declaration and definition are both in `same.cpp`, so the one nested
-    // identity spans two source blocks in that file (the in-class declaration
-    // and the out-of-line definition) rather than the definition splitting off
-    // as a separate `log4cxx.Inner.method`.
+    // Declaration and definition are both in `same.cpp`, so bare lookup
+    // presents the definition rather than the definition splitting off as a
+    // separate `log4cxx.Inner.method`.
     assert_eq!(
         sorted_source_paths(&result),
-        vec!["same.cpp".to_string(), "same.cpp".to_string()],
+        vec!["same.cpp".to_string()],
+        "{result}"
+    );
+    assert_eq!(
+        result["sources"][0]["occurrence_role"], "definition",
         "{result}"
     );
     // The mis-split identity (Outer dropped) must not exist: `Inner` is not a
@@ -272,22 +288,21 @@ int log4cxx::Outer::Inner::method() const {
     let result = symbol_sources(&project, "log4cxx.Outer$Inner.method");
     assert_eq!(
         sorted_source_paths(&result),
-        vec!["requal.cpp".to_string(), "requal.h".to_string()],
+        vec!["requal.cpp".to_string()],
         "redundant re-qualification did not unify onto the nested identity: {result}"
+    );
+    assert_eq!(
+        result["sources"][0]["canonical_selector"], "requal.h#log4cxx.Outer$Inner.method",
+        "redundantly qualified definition lost its declaration identity: {result}"
     );
 }
 
 /// CRITICAL negative control: a *genuine* namespace chain
 /// (`ns1::ns2::Klass::method`) written out-of-line at file scope must keep the
 /// correct namespace interpretation (`package = ns1::ns2`, `owner = Klass`) and
-/// still unify its header declaration with its definition. Had the fix mangled
-/// the chain by dropping a namespace segment (e.g. to `ns1.Klass.method`), the
-/// definition's normalized identity would diverge from the header's and the
-/// symbol would resolve to only one source; requiring *both* sources proves the
-/// namespace interpretation is intact. (The `$`/`::`/`.` display normalization
-/// is deliberately lenient, so spelling-level negative probes cannot
-/// distinguish `ns1$ns2$Klass` from `ns1::ns2::Klass` -- the source-count
-/// contract is the meaningful signal here.)
+/// still unify its header declaration with its definition. The bare result is
+/// definition-only, so the header-anchored canonical selector is the evidence
+/// that the namespace interpretation remains intact.
 #[test]
 fn genuine_namespace_chain_keeps_namespace_interpretation() {
     let project = InlineTestProject::with_language(Language::Cpp)
@@ -316,9 +331,8 @@ int ns1::ns2::Klass::method() const {
         )
         .build();
 
-    // Correct namespace-qualified identity: declaration + definition unify to
-    // both sources -- proof the definition's owner stayed `ns1::ns2.Klass` and
-    // was not mangled (a mangled owner would drop a source).
+    // Correct namespace-qualified identity: the definition keeps the header's
+    // canonical selector, proving its owner stayed `ns1::ns2.Klass`.
     let correct = symbol_sources(&project, "ns1::ns2.Klass.method");
     assert_eq!(
         correct["ambiguous"].as_array().unwrap().len(),
@@ -327,8 +341,12 @@ int ns1::ns2::Klass::method() const {
     );
     assert_eq!(
         sorted_source_paths(&correct),
-        vec!["ns.cpp".to_string(), "ns.h".to_string()],
+        vec!["ns.cpp".to_string()],
         "genuine namespace chain lost its declaration/definition unification: {correct}"
+    );
+    assert_eq!(
+        correct["sources"][0]["canonical_selector"], "ns.h#ns1::ns2.Klass.method",
+        "genuine namespace definition lost its declaration identity: {correct}"
     );
 }
 

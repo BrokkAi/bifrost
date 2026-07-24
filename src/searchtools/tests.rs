@@ -287,6 +287,8 @@ fn source_block_fields_are_publicly_constructible() {
         start_line: 10,
         end_line: 12,
         text: "class A {}".to_string(),
+        canonical_selector: None,
+        occurrence_role: None,
         presentation: None,
         note: None,
     };
