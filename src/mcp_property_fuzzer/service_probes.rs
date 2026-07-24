@@ -1198,6 +1198,29 @@ fn derive_follow_ups(
                                 outcome: None,
                                 elapsed_ms: None,
                             });
+                            // Owner-qualified elements (TanstackLitQueryDemo.properties)
+                            // of unexported classes cannot resolve globally by
+                            // design; the listing's own path is the agent's
+                            // guided re-call, so probe it too — the checker
+                            // accepts either spelling resolving (tier-4
+                            // TanStack query).
+                            if symbol.contains('.') {
+                                follow.push(ProbeRecord {
+                                    id: format!(
+                                        "i3a:get_symbol_sources:{}:{path}#{symbol}",
+                                        probe.symbol_path
+                                    ),
+                                    tool: "get_symbol_sources",
+                                    arguments: json!({"symbols": [format!("{path}#{symbol}")]}),
+                                    symbol_fq: symbol.to_string(),
+                                    symbol_path: path.to_string(),
+                                    kind: ProbeKind::SummaryElementSource {
+                                        element_path: path.to_string(),
+                                    },
+                                    outcome: None,
+                                    elapsed_ms: None,
+                                });
+                            }
                             taken += 1;
                         }
                     }
@@ -1993,70 +2016,51 @@ fn spelling_reference_site(record: &ProbeRecord) -> (&str, &str) {
 }
 
 /// I3(a): a symbol `get_summaries` lists under file F must resolve via
-/// `get_symbol_sources`, and its reported path must be F.
+/// `get_symbol_sources`, and its reported path must be F. Owner-qualified
+/// elements also get an anchored (`F#symbol`) probe at generation time;
+/// either spelling resolving makes the element consistent — the listing
+/// itself supplies the disambiguating path, which is the guided re-call an
+/// agent makes for module-private owners (TanStack's unexported lit demo).
 pub fn check_i3a(
     records: &[&ProbeRecord],
     language: &str,
     sink: &mut ViolationSink,
     summary: &mut ProbeSummary,
 ) {
+    let mut groups: HashMap<(&str, &str), Vec<&ProbeRecord>> = HashMap::new();
     for record in records {
         let ProbeKind::SummaryElementSource { element_path } = &record.kind else {
             continue;
         };
-        let Some(structured) = structured_outcome(record) else {
-            continue;
-        };
-        summary.i3a_summary_element_checks += 1;
-        let mut sources = array_field(structured, "sources");
-        let Some(block) = sources.next() else {
-            // Bare element names collide across a large workspace by design;
-            // an ambiguity answer is consistent when it offers the listed
-            // file's own `path#symbol` selector, because the listing itself
-            // supplies the disambiguating path (an agent following the
-            // summary resolves in one guided re-call). It is also consistent
-            // when the ambiguity offers the listed name itself — the element
-            // resolves by name (laravel's identical types/ stub twins).
-            // The violation is resolvability from the listing context: a hard
-            // not_found, or matches that offer only *other* names — never the
-            // listed one (the bfg shape: `LFS.Pointer` offered only
-            // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
-            let own_selector = format!("{element_path}#");
-            let candidates: Vec<&str> = array_field(structured, "ambiguous")
-                .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            let resolvable_from_listing = candidates.iter().any(|candidate| {
-                candidate.starts_with(&own_selector) || *candidate == record.symbol_fq
-            });
-            // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
-            // (selectors.rs); at the cap the list is a truncated prefix, so
-            // the listed selector's absence proves nothing — it may sort
-            // beyond the cut (livewire's global `UnitTest` behind 25
-            // namespaced `Livewire.*.UnitTest` candidates). Undecidable:
-            // never a violation.
-            let undecidable_at_match_cap =
-                candidates.len() >= crate::searchtools::AMBIGUOUS_SYMBOL_MATCH_LIMIT;
-            if !resolvable_from_listing && !undecidable_at_match_cap {
-                sink.record(violation(
-                    InvariantKind::I3,
-                    language,
-                    "get_symbol_sources",
-                    "summaries-listed-symbol-unresolvable",
-                    &record.symbol_fq,
-                    &record.symbol_path,
-                    Some(record.arguments.clone()),
-                    json!({
-                        "listed_under": element_path,
-                        "expected": "a symbol get_summaries lists resolves via get_symbol_sources from its listing context",
-                    }),
-                ));
+        groups
+            .entry((element_path.as_str(), record.symbol_fq.as_str()))
+            .or_default()
+            .push(record);
+    }
+    for ((element_path, symbol_fq), group) in groups {
+        let mut resolved_with_path = false;
+        let mut mismatch: Option<(&ProbeRecord, String)> = None;
+        let mut unresolved_record: Option<&ProbeRecord> = None;
+        for record in &group {
+            let Some(structured) = structured_outcome(record) else {
+                continue;
+            };
+            summary.i3a_summary_element_checks += 1;
+            if let Some(block) = array_field(structured, "sources").next() {
+                let reported_path = block.get("path").and_then(Value::as_str).unwrap_or("");
+                if reported_path == element_path {
+                    resolved_with_path = true;
+                } else if mismatch.is_none() {
+                    mismatch = Some((record, reported_path.to_string()));
+                }
+            } else if unresolved_record.is_none() {
+                unresolved_record = Some(record);
             }
+        }
+        if resolved_with_path {
             continue;
-        };
-        let reported_path = block.get("path").and_then(Value::as_str).unwrap_or("");
-        if reported_path != element_path {
+        }
+        if let Some((record, reported_path)) = mismatch {
             sink.record(violation(
                 InvariantKind::I3,
                 language,
@@ -2069,6 +2073,56 @@ pub fn check_i3a(
                     "listed_under": element_path,
                     "reported_path": reported_path,
                     "expected": "get_symbol_sources reports the same path get_summaries listed the symbol under",
+                }),
+            ));
+            continue;
+        }
+        let Some(record) = unresolved_record else {
+            continue;
+        };
+        let Some(structured) = structured_outcome(record) else {
+            continue;
+        };
+        // Bare element names collide across a large workspace by design;
+        // an ambiguity answer is consistent when it offers the listed
+        // file's own `path#symbol` selector, because the listing itself
+        // supplies the disambiguating path (an agent following the
+        // summary resolves in one guided re-call). It is also consistent
+        // when the ambiguity offers the listed name itself — the element
+        // resolves by name (laravel's identical types/ stub twins).
+        // The violation is resolvability from the listing context: a hard
+        // not_found, or matches that offer only *other* names — never the
+        // listed one (the bfg shape: `LFS.Pointer` offered only
+        // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
+        let own_selector = format!("{element_path}#");
+        let candidates: Vec<&str> = array_field(structured, "ambiguous")
+            .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let resolvable_from_listing = candidates
+            .iter()
+            .any(|candidate| candidate.starts_with(&own_selector) || *candidate == symbol_fq);
+        // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
+        // (selectors.rs); at the cap the list is a truncated prefix, so
+        // the listed selector's absence proves nothing — it may sort
+        // beyond the cut (livewire's global `UnitTest` behind 25
+        // namespaced `Livewire.*.UnitTest` candidates). Undecidable:
+        // never a violation.
+        let undecidable_at_match_cap =
+            candidates.len() >= crate::searchtools::AMBIGUOUS_SYMBOL_MATCH_LIMIT;
+        if !resolvable_from_listing && !undecidable_at_match_cap {
+            sink.record(violation(
+                InvariantKind::I3,
+                language,
+                "get_symbol_sources",
+                "summaries-listed-symbol-unresolvable",
+                symbol_fq,
+                &record.symbol_path,
+                Some(record.arguments.clone()),
+                json!({
+                    "listed_under": element_path,
+                    "expected": "a symbol get_summaries lists resolves via get_symbol_sources from its listing context",
                 }),
             ));
         }
