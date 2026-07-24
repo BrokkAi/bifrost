@@ -15,7 +15,19 @@
 mod common;
 
 use brokk_bifrost::Language;
-use common::{InlineTestProject, sorted_source_paths, symbol_sources};
+use common::{InlineTestProject, call_tool, sorted_source_paths, symbol_sources};
+use serde_json::Value;
+
+/// `scan_usages_by_reference` for a single `symbol`. Local to this suite: it is
+/// the only caller today, so it stays here rather than in `tests/common` until a
+/// second binary needs it.
+fn scan_usages(project: &common::BuiltInlineTestProject, symbol: &str) -> Value {
+    call_tool(
+        project,
+        "scan_usages_by_reference",
+        &serde_json::json!({ "symbols": [symbol] }).to_string(),
+    )
+}
 
 /// The exact shape from the issue: a header declaring a class-nested-in-class
 /// member, and an out-of-line `.cpp` definition of it written inside a
@@ -378,6 +390,54 @@ int Outer::Inner::method() const {
     assert_eq!(
         result["sources"][0]["canonical_selector"], "using.h#log4cxx.Outer$Inner.method",
         "file-scope definition did not retain the header-anchored identity: {result}"
+    );
+}
+
+/// Usage-surface check (#1134): once the file-scope-under-using-directive
+/// definition unifies onto `log4cxx.Outer$Inner.method`, scanning that canonical
+/// symbol's usages must find the call site -- the resolution-time reconciliation
+/// is visible to `scan_usages`, not only `get_symbol_sources`.
+#[test]
+fn file_scope_using_directive_nested_member_usage_is_scannable() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "scan.h",
+            r#"
+namespace log4cxx {
+class Outer {
+public:
+    class Inner {
+    public:
+        int method() const;
+    };
+};
+}
+"#,
+        )
+        .file(
+            "scan.cpp",
+            r#"
+#include "scan.h"
+
+using namespace log4cxx;
+
+int Outer::Inner::method() const {
+    return 2;
+}
+
+int caller() {
+    Outer::Inner inner;
+    return inner.method();
+}
+"#,
+        )
+        .build();
+
+    let result = scan_usages(&project, "log4cxx.Outer$Inner.method");
+    let text = result.to_string();
+    assert!(
+        text.contains("scan.cpp"),
+        "reconciled definition's usage was not scannable: {result}"
     );
 }
 
