@@ -35,6 +35,14 @@ fn symbol_sources(project: &common::BuiltInlineTestProject, symbol: &str) -> Val
     )
 }
 
+fn scan_usages(project: &common::BuiltInlineTestProject, symbol: &str) -> Value {
+    call_tool(
+        project,
+        "scan_usages_by_reference",
+        &serde_json::json!({ "symbols": [symbol] }).to_string(),
+    )
+}
+
 fn sorted_source_paths(result: &Value) -> Vec<String> {
     let mut paths: Vec<String> = result["sources"]
         .as_array()
@@ -407,6 +415,54 @@ int Outer::Inner::method() const {
     assert_eq!(
         result["sources"][0]["canonical_selector"], "using.h#log4cxx.Outer$Inner.method",
         "file-scope definition did not retain the header-anchored identity: {result}"
+    );
+}
+
+/// Usage-surface check (#1134): once the file-scope-under-using-directive
+/// definition unifies onto `log4cxx.Outer$Inner.method`, scanning that canonical
+/// symbol's usages must find the call site -- the resolution-time reconciliation
+/// is visible to `scan_usages`, not only `get_symbol_sources`.
+#[test]
+fn file_scope_using_directive_nested_member_usage_is_scannable() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "scan.h",
+            r#"
+namespace log4cxx {
+class Outer {
+public:
+    class Inner {
+    public:
+        int method() const;
+    };
+};
+}
+"#,
+        )
+        .file(
+            "scan.cpp",
+            r#"
+#include "scan.h"
+
+using namespace log4cxx;
+
+int Outer::Inner::method() const {
+    return 2;
+}
+
+int caller() {
+    Outer::Inner inner;
+    return inner.method();
+}
+"#,
+        )
+        .build();
+
+    let result = scan_usages(&project, "log4cxx.Outer$Inner.method");
+    let text = result.to_string();
+    assert!(
+        text.contains("scan.cpp"),
+        "reconciled definition's usage was not scannable: {result}"
     );
 }
 
