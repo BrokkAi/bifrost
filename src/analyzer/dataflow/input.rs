@@ -1,6 +1,6 @@
 //! ICFG input quality and malformed-input errors.
 
-use std::{error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt};
 
 use crate::analyzer::semantic::{
     IcfgNodeId, IcfgSnapshot, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
@@ -11,18 +11,39 @@ use crate::analyzer::semantic::{
 /// The snapshot itself does not retain this envelope, so callers must keep it
 /// beside the graph to prevent a partial input from becoming a complete
 /// data-flow result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IcfgInputStatus {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticInputStatus {
+    #[default]
     Complete,
     Ambiguous,
     Unknown,
-    Unsupported { capability: SemanticCapability },
+    Unsupported {
+        capability: SemanticCapability,
+    },
     Unproven,
-    ExceededBudget { exceeded: SemanticBudgetExceeded },
+    ExceededBudget {
+        exceeded: SemanticBudgetExceeded,
+    },
     Cancelled,
 }
 
-impl IcfgInputStatus {
+impl SemanticInputStatus {
+    pub fn from_outcome<T>(outcome: &SemanticOutcome<T>) -> Self {
+        match outcome {
+            SemanticOutcome::Complete { .. } => Self::Complete,
+            SemanticOutcome::Ambiguous { .. } => Self::Ambiguous,
+            SemanticOutcome::Unknown { .. } => Self::Unknown,
+            SemanticOutcome::Unsupported { capability, .. } => Self::Unsupported {
+                capability: *capability,
+            },
+            SemanticOutcome::Unproven { .. } => Self::Unproven,
+            SemanticOutcome::ExceededBudget { exceeded, .. } => Self::ExceededBudget {
+                exceeded: *exceeded,
+            },
+            SemanticOutcome::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Complete => "complete",
@@ -51,6 +72,91 @@ impl IcfgInputStatus {
             Self::ExceededBudget { exceeded } => Some(exceeded),
             _ => None,
         }
+    }
+
+    /// Merge statuses independently of provider traversal order.
+    pub(crate) fn merge(self, incoming: Self) -> Self {
+        use SemanticInputStatus::{
+            Ambiguous, Cancelled, Complete, ExceededBudget, Unknown, Unproven, Unsupported,
+        };
+
+        match (self, incoming) {
+            (Cancelled, _) | (_, Cancelled) => Cancelled,
+            (ExceededBudget { exceeded: left }, ExceededBudget { exceeded: right }) => {
+                ExceededBudget {
+                    exceeded: min_budget_exceeded(left, right),
+                }
+            }
+            (ExceededBudget { exceeded }, _) | (_, ExceededBudget { exceeded }) => {
+                ExceededBudget { exceeded }
+            }
+            (Unsupported { capability: left }, Unsupported { capability: right }) => Unsupported {
+                capability: left.min(right),
+            },
+            (Unsupported { capability }, _) | (_, Unsupported { capability }) => {
+                Unsupported { capability }
+            }
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (Unproven, _) | (_, Unproven) => Unproven,
+            (Ambiguous, _) | (_, Ambiguous) => Ambiguous,
+            (Complete, Complete) => Complete,
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Complete => 0,
+            Self::Ambiguous => 1,
+            Self::Unproven => 2,
+            Self::Unknown => 3,
+            Self::Unsupported { .. } => 4,
+            Self::ExceededBudget { .. } => 5,
+            Self::Cancelled => 6,
+        }
+    }
+}
+
+impl Ord for SemanticInputStatus {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| match (*self, *other) {
+                (
+                    Self::Unsupported { capability: left },
+                    Self::Unsupported { capability: right },
+                ) => left.cmp(&right),
+                (
+                    Self::ExceededBudget { exceeded: left },
+                    Self::ExceededBudget { exceeded: right },
+                ) => (left.dimension(), left.limit(), left.attempted()).cmp(&(
+                    right.dimension(),
+                    right.limit(),
+                    right.attempted(),
+                )),
+                _ => Ordering::Equal,
+            })
+    }
+}
+
+impl PartialOrd for SemanticInputStatus {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Direct ICFG solve terminology for the shared semantic input status.
+pub type IcfgInputStatus = SemanticInputStatus;
+
+fn min_budget_exceeded(
+    left: SemanticBudgetExceeded,
+    right: SemanticBudgetExceeded,
+) -> SemanticBudgetExceeded {
+    if (left.dimension(), left.limit(), left.attempted())
+        <= (right.dimension(), right.limit(), right.attempted())
+    {
+        left
+    } else {
+        right
     }
 }
 
@@ -85,19 +191,7 @@ impl<'graph> TryFrom<&'graph SemanticOutcome<IcfgSnapshot>> for IcfgSolveInput<'
     type Error = DataflowError;
 
     fn try_from(outcome: &'graph SemanticOutcome<IcfgSnapshot>) -> Result<Self, Self::Error> {
-        let status = match outcome {
-            SemanticOutcome::Complete { .. } => IcfgInputStatus::Complete,
-            SemanticOutcome::Ambiguous { .. } => IcfgInputStatus::Ambiguous,
-            SemanticOutcome::Unknown { .. } => IcfgInputStatus::Unknown,
-            SemanticOutcome::Unsupported { capability, .. } => IcfgInputStatus::Unsupported {
-                capability: *capability,
-            },
-            SemanticOutcome::Unproven { .. } => IcfgInputStatus::Unproven,
-            SemanticOutcome::ExceededBudget { exceeded, .. } => IcfgInputStatus::ExceededBudget {
-                exceeded: *exceeded,
-            },
-            SemanticOutcome::Cancelled { .. } => IcfgInputStatus::Cancelled,
-        };
+        let status = IcfgInputStatus::from_outcome(outcome);
         let snapshot = outcome
             .available_value()
             .ok_or(DataflowError::MissingIcfgSnapshot { status })?;

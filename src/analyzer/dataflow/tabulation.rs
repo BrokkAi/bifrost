@@ -210,17 +210,10 @@ where
             callback_rows: seed_rows,
             ..SolverWork::default()
         };
-        let staged_budget = match request.budget.staged_charge(charge) {
-            Ok(staged) => staged,
-            Err(exceeded) => {
-                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
-            }
-        };
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
+        if let Some(termination) = request.reserve(charge) {
+            return Ok(Some(termination));
         }
 
-        *request.budget = staged_budget;
         self.facts = staged_facts;
         self.fact_ids = staged_fact_ids;
         for state in staged_states {
@@ -337,17 +330,10 @@ where
             propagated_outputs,
             ..SolverWork::default()
         };
-        let staged_budget = match request.budget.staged_charge(charge) {
-            Ok(staged) => staged,
-            Err(exceeded) => {
-                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
-            }
-        };
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
+        if let Some(termination) = request.reserve(charge) {
+            return Ok(Some(termination));
         }
 
-        *request.budget = staged_budget;
         for (fact, fact_id) in staged_facts {
             let expected = FactId::try_from_index(self.facts.len())
                 .expect("prevalidated fact index remains representable");
