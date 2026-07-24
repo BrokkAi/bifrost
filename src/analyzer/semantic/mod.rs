@@ -52,6 +52,7 @@ pub(crate) use impl_program_semantics_provider;
 
 pub mod capabilities;
 pub(crate) mod cfg;
+pub(crate) mod cfg_algorithms;
 pub mod icfg;
 pub mod ids;
 pub mod ir;

@@ -10,6 +10,10 @@ use std::fmt;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::hash::{HashMap, HashSet};
 
+use super::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, CfgAlgorithmWork,
+    forward_reachability, reverse_reachability,
+};
 use super::workspace_oracle::{
     WorkspaceSemanticOracle, exact_source_for_procedure, semantic_locator_work,
 };
@@ -1547,43 +1551,61 @@ fn cache_return_path_mask(
     }
     builder.work = builder.work.conservative_add(scan_work);
 
-    let mut from_entry = vec![false; point_count];
-    let mut stack = vec![semantics.entry_point()];
-    while let Some(point) = stack.pop() {
-        if request.cancellation.is_cancelled() {
+    let algorithm_limits = CfgAlgorithmWork {
+        node_visits: point_count.saturating_mul(2),
+        edge_visits: edge_count.saturating_mul(2),
+    };
+    let mut algorithm_budget = CfgAlgorithmBudget::new(algorithm_limits);
+    let mut algorithm_request =
+        CfgAlgorithmRequest::new(&mut algorithm_budget, request.cancellation);
+    let from_entry =
+        match forward_reachability(semantics, semantics.entry_point(), &mut algorithm_request) {
+            Ok(reachable) => reachable,
+            Err(CfgAlgorithmError::Cancelled { .. }) => {
+                builder.quality = SnapshotQuality::Cancelled;
+                return false;
+            }
+            Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
+                unreachable!(
+                    "precharged return-path traversal exceeded its complete-graph {} limit: \
+                     attempted {}, limit {}, work {:?}",
+                    exceeded.limit_kind.label(),
+                    exceeded.attempted,
+                    exceeded.limit,
+                    exceeded.work
+                );
+            }
+            Err(CfgAlgorithmError::InvalidNode(point)) => {
+                unreachable!("validated procedure has an invalid entry point {point}");
+            }
+        };
+    let to_exit = match reverse_reachability(semantics, exit, &mut algorithm_request) {
+        Ok(reachable) => reachable,
+        Err(CfgAlgorithmError::Cancelled { .. }) => {
             builder.quality = SnapshotQuality::Cancelled;
             return false;
         }
-        if std::mem::replace(&mut from_entry[point.index()], true) {
-            continue;
+        Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
+            unreachable!(
+                "precharged return-path traversal exceeded its complete-graph {} limit: \
+                 attempted {}, limit {}, work {:?}",
+                exceeded.limit_kind.label(),
+                exceeded.attempted,
+                exceeded.limit,
+                exceeded.work
+            );
         }
-        stack.extend(
-            semantics
-                .successor_edges(point)
-                .map(|(_, edge)| edge.target_point),
-        );
-    }
-
-    let mut to_exit = vec![false; point_count];
-    stack.push(exit);
-    while let Some(point) = stack.pop() {
-        if request.cancellation.is_cancelled() {
-            builder.quality = SnapshotQuality::Cancelled;
-            return false;
+        Err(CfgAlgorithmError::InvalidNode(point)) => {
+            unreachable!("validated procedure has an invalid exit point {point}");
         }
-        if std::mem::replace(&mut to_exit[point.index()], true) {
-            continue;
-        }
-        stack.extend(
-            semantics
-                .predecessor_edges(point)
-                .map(|(_, edge)| edge.source_point),
-        );
-    }
+    };
+    debug_assert_eq!(algorithm_budget.limits(), algorithm_limits);
 
     let path_mask = from_entry
-        .into_iter()
-        .zip(to_exit)
+        .membership()
+        .iter()
+        .copied()
+        .zip(to_exit.membership().iter().copied())
         .map(|(reachable, reaches_exit)| reachable && reaches_exit)
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -2063,6 +2085,80 @@ mod tests {
             ),
             &call,
         ));
+    }
+
+    #[test]
+    fn return_path_masks_are_scoped_to_distinct_artifact_instances() {
+        fn materialize_handle() -> ProcedureHandle {
+            let fixture = AnalyzerFixture::new_for_language(
+                crate::analyzer::Language::TypeScript,
+                &[(
+                    "artifact-scope.ts",
+                    "export function target(flag: boolean) {\n\
+                     if (flag) { return; }\n\
+                     return;\n\
+                     const unreachable = 1;\n\
+                     }\n",
+                )],
+            );
+            let file = ProjectFile::new(fixture.project_root(), "artifact-scope.ts");
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let artifact = fixture
+                .analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("TypeScript semantic materialization")
+                .available_value()
+                .cloned()
+                .expect("complete TypeScript semantic artifact");
+            let procedure = artifact
+                .procedures()
+                .first()
+                .expect("one TypeScript procedure");
+            artifact
+                .procedure_handle(procedure.id())
+                .expect("procedure handle")
+        }
+
+        let first = materialize_handle();
+        let second = materialize_handle();
+        assert_eq!(first.id(), second.id());
+        assert!(!std::sync::Arc::ptr_eq(first.artifact(), second.artifact()));
+        assert_ne!(first, second);
+
+        let mut builder = SnapshotBuilder::new(IcfgSnapshotLimits::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let first_exit = first.semantics().normal_exit_point();
+        let second_exit = second.semantics().normal_exit_point();
+
+        assert!(cache_return_path_mask(
+            &mut builder,
+            &first,
+            first_exit,
+            &mut request
+        ));
+        assert!(cache_return_path_mask(
+            &mut builder,
+            &second,
+            second_exit,
+            &mut request
+        ));
+        assert_eq!(builder.return_path_masks.len(), 2);
+        assert!(
+            builder
+                .return_path_masks
+                .contains_key(&(first.clone(), first_exit))
+        );
+        assert!(
+            builder
+                .return_path_masks
+                .contains_key(&(second.clone(), second_exit))
+        );
     }
 
     #[test]
