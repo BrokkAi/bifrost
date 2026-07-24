@@ -20,9 +20,12 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
 - [x] (2026-07-24 07:48Z) Extracted the provider-owned procedure-exit profile and matched-return/call-boundary projections, then kept the existing ICFG unit and contract suites green.
 - [x] (2026-07-24 07:48Z) Added summary-specific result rows, coverage, reuse metrics, and independently bounded end-summary, incoming-call, and provider-materialization work.
 - [x] (2026-07-24 07:48Z) Implemented the iterative relative path-edge, incoming-call, end-summary, and exact replay tables, and verified that the existing bounded solver/client regression suites remain green after sharing transfer evaluation.
-- [x] (2026-07-24 09:03Z) Added the independent provider-backed repeated-scan reference and 11 summary behaviors covering direct/mutual recursion, reuse without cross-return, both return families, deferred bypass, incomplete providers, cancellation, malformed provider rows, every summary budget, and permutation determinism.
-- [ ] Run formatting, focused tests, strict all-feature Clippy, and the complete `nlp,python` suite.
-- [ ] Run five specialist reviews, fix every actionable finding, rerun validation, and update this plan with final evidence.
+- [x] (2026-07-24 09:03Z) Added the independent provider-backed repeated-scan reference and the first 11 summary behaviors covering direct/mutual recursion, reuse without cross-return, both return families, deferred bypass, incomplete providers, cancellation, malformed provider rows, every summary budget, and permutation determinism.
+- [x] (2026-07-24 11:42Z) Fixed every actionable specialist-review finding: exact provider profile/provenance validation, compact incoming rows and replay indexes, shared profile/transfer scratch storage, deterministic projected-edge canonicalization, bounded cached bypass replay, precise return-gap text accounting, and atomic seed, coverage, incoming, and summary-application publication.
+- [x] (2026-07-24 11:42Z) Expanded the integration suite to 18 tests, including a multi-fact recursive delta-replay fixed point, exact cache-materialization counts, retained and absent semantic-budget payloads, staged-output cancellation, and dimension-specific no-publication assertions.
+- [x] (2026-07-24 12:42+02:00) Completed formatting, focused gates, strict all-feature Clippy, and the full serialized `cargo test --features nlp,python` suite outside the sandbox. The isolated target was removed automatically.
+- [x] (2026-07-24 11:42Z) Ran five specialist reviews and fixed every actionable algorithm, semantic-contract, resource-boundedness, architecture, and test-coverage finding.
+- [x] (2026-07-24 12:17Z) Ran a final post-fix verifier across return caching, incoming staging, replay cancellation, local-edge deduplication, deterministic evidence ordering, and public-result ownership; it reported no actionable findings.
 
 ## Surprises & Discoveries
 
@@ -49,6 +52,21 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
 
 - Observation: summary coverage must own the evidence that a snapshot-backed result could otherwise dereference.
   Evidence: summary results have no backing ICFG edge table. `SummaryEdge` now retains proof and completeness, dispatch boundaries retain their structured provenance, and unique coverage rows are incrementally deduplicated and independently bounded.
+
+- Observation: provider cache hits still need their own bounded execution path.
+  Evidence: call-to-return projections are fact-independent but transfer callbacks are fact-sensitive. The solver now caches one canonical projected edge set, replays only its transfer relation for later facts, checks cancellation per edge, and charges every callback/output while avoiding repeated provider, provenance, and boundary work.
+
+- Observation: semantically distinct provenance rows can collapse to one solver edge.
+  Evidence: two valid dispatch boundaries may retain different oracle evidence while projecting to the same procedure-local edge. Coverage retains both boundaries, but projected edges are sorted and deduplicated before transfer evaluation so equivalent topology cannot double-charge flow budgets.
+
+- Observation: the main worktree target can become materially larger than the source under all-feature validation.
+  Evidence: the accumulated generated `target/` reached 104 GiB and exhausted the filesystem during final review validation. `cargo clean` removed only reproducible build artifacts; subsequent complete gates use `scripts/with-isolated-cargo-target.sh` so temporary targets are removed automatically.
+
+- Observation: caching a matched return is useful only if replay does not deep-clone its proof, completeness, and gap evidence.
+  Evidence: the exact matched-return projection cache owns one `Arc<SummaryEdge>` per call-transfer/entry/exit relation. Coverage sets borrow or clone that shared allocation, the cache is discarded before result construction, and `Arc::unwrap_or_clone` performs at most the one unavoidable clone when a single edge must appear in both public incomplete-evidence categories.
+
+- Observation: the repository's JS/TS deadlock watchdog is sensitive to machine load during a fully parallel all-feature run.
+  Evidence: the first complete run reached the unrelated `jsts_usage_graph_deadlock` binary after the 1,868-test library suite had passed, but one case exceeded its 60-second watchdog. The binary passed alone in 19.96 seconds and passed again, in context, when the full suite was serialized; the remainder of that serialized suite and doc tests also passed.
 
 ## Decision Log
 
@@ -84,13 +102,27 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
   Rationale: equivalent relations emitted in a different order must produce identical dense IDs, budget failures, metrics, and public results.
   Date/Author: 2026-07-24 / Codex
 
+- Decision: retain exact semantic boundary provenance separately from canonical projected solver edges.
+  Rationale: provenance-distinct boundaries remain observable coverage, but applying the same collapsed procedure edge more than once would make solver work and budget termination depend on evidence multiplicity rather than topology.
+  Date/Author: 2026-07-24 / Codex
+
+- Decision: keep compact call origins and shared exit profiles in retained summary state.
+  Rationale: incoming rows need only an exact cache key plus relative identities, and end summaries may share one immutable provider profile. Reconstructing semantic calls or cloning profile payloads during every replay adds work without strengthening identity or evidence.
+  Date/Author: 2026-07-24 / Codex
+
+- Decision: cache exact matched-return projections as shared owned evidence, but clear that private cache before constructing public coverage.
+  Rationale: replaying a recursive summary can revisit the same semantic return many times. Sharing avoids repeated proof and reason-string allocation while preserving an ordinary owned public result with no cache-dependent lifetime.
+  Date/Author: 2026-07-24 / Codex
+
 - Decision: expose query-local end summaries and reuse metrics, but do not create a persistent summary identity.
   Rationale: issue #820 owns correctness-critical tabulation summaries. Cross-query semantic, taint, and protocol summary keys belong to later #823/#817 work after the in-memory shapes and reuse measurements stabilize.
   Date/Author: 2026-07-24 / Codex
 
 ## Outcomes & Retrospective
 
-Implementation is not yet complete. The expected outcome is a second solver backend that terminates on direct and mutual recursion without a call-depth parameter, publishes deterministic in-memory end summaries, reports observable reuse, and retains all semantic and solver incompleteness. Witnesses and IDE edge functions will remain explicit later #820 children.
+The second solver backend is complete. It terminates direct and mutual recursion without a call-depth parameter, publishes deterministic query-local end summaries, reports observable summary reuse, and retains semantic and solver incompleteness without partial publication. The production worklist agrees with an intentionally simple repeated-scan implementation, including a multi-wave recursive fact transition that cannot pass through a single replay.
+
+The review materially tightened the implementation rather than changing its scope. Exact provider profiles and dispatch provenance are validated before caching; root facts, callback outputs, incoming rows, summaries, applications, and coverage all have atomic bounded publication; expensive semantic projections are shared without exposing private cache ownership; and cancellation is checked before allocation and during replay. No heap model, taint client, finite-state protocol, persistence, witness reconstruction, IDE edge function, policy compiler, or RQL integration was added. Those remain later children built on this kernel.
 
 ## Context and Orientation
 
@@ -108,7 +140,7 @@ A path edge in this plan is not a graph edge. It is a dynamic-programming row sa
 
 First, refactor `src/analyzer/semantic/icfg.rs` without changing snapshot behavior. Add a provider-visible procedure-exit descriptor containing the exit handle, normal/exceptional kind, proof, and completeness. Its default provider operation iteratively computes the existing entry-to-exit path mask, selects return-affecting gaps, charges the same semantic work, and returns an explicit `SemanticOutcome`. Extract pure helpers for matched return projection and modeled boundary continuations. Make the existing snapshot builder cache and consume those operations. Focused ICFG tests must remain unchanged and green before the summary solver is added.
 
-Second, extend the data-flow contracts. In `src/analyzer/dataflow/quality.rs`, add internal quality conjunction and proof/completeness application. In `src/analyzer/dataflow/budget.rs`, add the three summary dimensions. In `src/analyzer/dataflow/problem.rs` and a small shared transfer helper, reuse one callback collector and edge-family dispatcher between both runners so zero preservation, cancellation checkpoints, callback-row bounds, canonicalization, and atomic publication have one interpretation.
+Second, extend the data-flow contracts. In `src/analyzer/dataflow/quality.rs`, add internal quality conjunction and proof/completeness application. In `src/analyzer/dataflow/budget.rs`, add five summary dimensions: retained end summaries, retained incoming calls, provider materializations, summary applications, and owned coverage rows. In `src/analyzer/dataflow/problem.rs` and a small shared transfer helper, reuse one callback collector and edge-family dispatcher between both runners so zero preservation, cancellation checkpoints, callback-row bounds, canonicalization, and atomic publication have one interpretation.
 
 Third, add `src/analyzer/dataflow/summary_result.rs`. Define `SummaryEntry`, `SummaryReachedFact`, `TabulationEndSummary`, owned observed edges, point-keyed semantic/dispatch/continuation boundaries, `SummaryCoverage`, deterministic `SummaryMetrics`, `SummaryDataflowResult`, and `SummaryDataflowError`. Dense `FactId` values remain run-local. Public rows carry semantic handles, while result construction sorts by deterministic procedure discovery ordinal and local IDs.
 
@@ -120,7 +152,7 @@ Fourth, add `src/analyzer/dataflow/summary.rs`. `SummarySolveInput` borrows the 
 - incoming-call rows keyed by exact caller entry, call point/fact, canonical transfer index, and callee entry;
 - per-entry incoming and summary indexes that preserve insertion order;
 - per-run call-transfer and procedure-exit provider caches;
-- an application set preventing the same incoming-quality/summary-quality pair from invoking `return_flow` twice.
+- a fact-independent canonical call-to-return projection cache and one reusable transfer-output scratch set.
 
 At an ordinary point, apply the appropriate local callback. At a call point, retain unusual non-scaffolding local edges, query and canonicalize the call-transfer set once, evaluate `call_flow`, create callee entry rows and exact incoming-call rows atomically, and apply only explicitly modeled call-to-return boundary arms. At an exit, incorporate provider-owned exit evidence into an end summary. A new incoming quality replays existing summaries; a new summary quality replays waiting incoming rows. Return projection chooses only the matching normal or exceptional continuation and applies `return_flow` before publishing back into the original caller entry context.
 
@@ -147,7 +179,7 @@ After adding the summary contracts and engine, run:
 
     cargo test --test dataflow_tabulation --test dataflow_clients --test dataflow_summaries --test icfg_contract
 
-Expect 12 client tests, 11 bounded tabulation tests, 15 tests in the summary binary, and 25 ICFG contract tests to pass. A direct-recursion test explicitly demonstrates that a depth-two snapshot has a call-depth boundary while `solve_with_summaries` terminates at `FixedPoint`.
+Expect 12 client tests, 11 bounded tabulation tests, 18 tests in the summary binary, and 25 ICFG contract tests to pass. A direct-recursion test explicitly demonstrates that a depth-two snapshot has a call-depth boundary while `solve_with_summaries` terminates at `FixedPoint`; a separate multi-fact test requires successive recursive summary deltas to produce `Wave2`.
 
 Before review, run the repository gates with one coherent Rust toolchain. On this host, use the rustup 1.96 toolchain binaries if Homebrew `rustdoc` or `cargo-clippy` selects a different LLVM build:
 
@@ -167,7 +199,7 @@ The child is accepted when all of the following behavior is demonstrated:
 - Explicit deferred dispatch boundaries use `call_to_return_flow`; ordinary materialized calls do not receive an invented bypass.
 - Partial, unknown, unsupported, unproven, or semantic-budget-limited provider work remains visible in `SummaryCoverage` and prevents `is_complete()`.
 - Pre-cancellation and callback-triggered cancellation return `SolverTermination::Cancelled` without publishing outputs after the cancellation checkpoint.
-- `end_summaries`, `incoming_calls`, and `provider_materializations` each produce their own exact `SolverBudgetDimension` failure and do not partially publish the charged row.
+- `end_summaries`, `incoming_calls`, `provider_materializations`, `summary_applications`, and `coverage_rows` each produce their own exact `SolverBudgetDimension` failure and do not partially publish the charged row.
 - Reversing equivalent root facts, callback facts, and provider transfer rows produces an exactly equal public result, work record, coverage, and metrics.
 - The repeated-scan reference and optimized solver agree on small direct, recursive, mutually recursive, normal-return, exceptional-return, and boundary fixtures.
 - Existing bounded snapshot data-flow and ICFG tests remain green.
@@ -246,4 +278,4 @@ In `src/analyzer/dataflow/summary.rs`, expose:
 
 No new external dependency is required.
 
-Plan revision note (2026-07-24): Created the second-child plan after refreshing live issue and remote state, reading the landed first-child contracts, and completing independent provider-seam, engine, and test-design audits. The plan chooses relative procedure summaries and exact incoming-call replay so recursion converges without extending the bounded context-expanded snapshot.
+Plan revision note (2026-07-24): Created the second-child plan after refreshing live issue and remote state, reading the landed first-child contracts, and completing independent provider-seam, engine, and test-design audits. The plan chooses relative procedure summaries and exact incoming-call replay so recursion converges without extending the bounded context-expanded snapshot. Updated after implementation, five specialist reviews plus a post-fix verifier, strict Clippy, focused regression gates, and the complete serialized all-feature test suite.

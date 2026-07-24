@@ -12,6 +12,18 @@ pub(crate) enum TransferEvaluation<Fact> {
     Terminated(SolverTermination),
 }
 
+pub(crate) struct TransferScratch<Fact> {
+    emitted_outputs: HashSet<Fact>,
+}
+
+impl<Fact> TransferScratch<Fact> {
+    pub(crate) fn new() -> Self {
+        Self {
+            emitted_outputs: HashSet::default(),
+        }
+    }
+}
+
 struct BoundedFactOutputs<'request, Fact> {
     values: &'request mut HashSet<Fact>,
     budget: &'request super::SolverBudget,
@@ -73,6 +85,7 @@ pub(crate) fn evaluate_transfer<P>(
     fact: P::Fact,
     zero_fact: P::Fact,
     preserve_zero: bool,
+    scratch: &mut TransferScratch<P::Fact>,
     request: &mut DataflowRequest<'_>,
 ) -> TransferEvaluation<P::Fact>
 where
@@ -95,10 +108,13 @@ where
     }
     *request.budget = staged_budget;
 
-    let mut emitted_outputs = HashSet::default();
+    scratch.emitted_outputs.clear();
     let sink_exceeded = {
-        let mut outputs =
-            BoundedFactOutputs::new(&mut emitted_outputs, request.budget, request.cancellation);
+        let mut outputs = BoundedFactOutputs::new(
+            &mut scratch.emitted_outputs,
+            request.budget,
+            request.cancellation,
+        );
         apply_transfer(problem, edge, fact, &mut outputs);
         if preserve_zero {
             let _ = outputs.emit(zero_fact);
@@ -115,7 +131,7 @@ where
         return TransferEvaluation::Terminated(SolverTermination::ExceededBudget(exceeded));
     }
 
-    let mut outputs = emitted_outputs.into_iter().collect::<Vec<_>>();
+    let mut outputs = scratch.emitted_outputs.iter().copied().collect::<Vec<_>>();
     outputs.sort_unstable();
     TransferEvaluation::Outputs(outputs)
 }

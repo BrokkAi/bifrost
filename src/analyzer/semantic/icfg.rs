@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::hash::{HashMap, HashSet};
@@ -505,7 +506,7 @@ struct SnapshotBuilder {
     queue: VecDeque<IcfgNodeId>,
     exit_profiles: HashMap<
         (ProcedureHandle, ProgramPointId, ProgramPointId),
-        SemanticOutcome<IcfgExitProfile>,
+        SemanticOutcome<Arc<IcfgExitProfile>>,
     >,
     quality: SnapshotQuality,
     budget_exceeded: Option<SemanticBudgetExceeded>,
@@ -1698,38 +1699,90 @@ fn materialize_exit_profile(
         .map(|(reachable, reaches_exit)| reachable && reaches_exit)
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let return_gaps = semantics
-        .gaps()
-        .iter()
-        .filter(|gap| {
-            let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
-            let scoped_to_return_path = match gap.subject {
-                SemanticGapSubject::Procedure => true,
-                _ => path_mask.get(gap.point.index()).copied() == Some(true),
-            };
-            return_affecting && scoped_to_return_path
-        })
-        .collect::<Vec<_>>();
-    let quality = return_gaps
-        .iter()
-        .fold(SnapshotQuality::Complete, |quality, gap| {
-            merge_quality(quality, semantic_gap_quality(gap))
+    let is_return_gap = |gap: &SemanticGap| {
+        let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
+        let scoped_to_return_path = match gap.subject {
+            SemanticGapSubject::Procedure => true,
+            _ => path_mask.get(gap.point.index()).copied() == Some(true),
+        };
+        return_affecting && scoped_to_return_path
+    };
+    let mut return_gap_count = 0usize;
+    let mut quality = SnapshotQuality::Complete;
+    let mut gap_reason_bytes = 0usize;
+    for gap in semantics.gaps() {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: scan_work,
+            });
+        }
+        if !is_return_gap(gap) {
+            continue;
+        }
+        quality = merge_quality(quality, semantic_gap_quality(gap));
+        gap_reason_bytes = gap_reason_bytes
+            .saturating_add(usize::from(return_gap_count > 0).saturating_mul(2))
+            .saturating_add(gap.kind.label().len())
+            .saturating_add(1)
+            .saturating_add(gap.capability.label().len())
+            .saturating_add(2)
+            .saturating_add(gap.detail.len());
+        return_gap_count = return_gap_count.saturating_add(1);
+    }
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: scan_work,
         });
-    let gap_reason = (!return_gaps.is_empty()).then(|| {
-        return_gaps
-            .iter()
-            .map(|gap| {
-                format!(
-                    "{} {}: {}",
-                    gap.kind.label(),
-                    gap.capability.label(),
-                    gap.detail
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-            .into_boxed_str()
-    });
+    }
+    let text_work = SemanticWork {
+        owned_text_bytes: gap_reason_bytes,
+        ..SemanticWork::default()
+    };
+    if let Err(exceeded) = request.budget.charge(text_work) {
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work: scan_work,
+        });
+    }
+    let total_work = sum_semantic_work(scan_work, text_work);
+    let gap_reason = if return_gap_count == 0 {
+        None
+    } else {
+        let mut reason = String::with_capacity(gap_reason_bytes);
+        let mut written = 0usize;
+        for gap in semantics.gaps() {
+            if request.cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: total_work,
+                });
+            }
+            if !is_return_gap(gap) {
+                continue;
+            }
+            if written > 0 {
+                reason.push_str("; ");
+            }
+            reason.push_str(gap.kind.label());
+            reason.push(' ');
+            reason.push_str(gap.capability.label());
+            reason.push_str(": ");
+            reason.push_str(&gap.detail);
+            written = written.saturating_add(1);
+        }
+        debug_assert_eq!(written, return_gap_count);
+        debug_assert_eq!(reason.len(), gap_reason_bytes);
+        Some(reason.into_boxed_str())
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: total_work,
+        });
+    }
     let profile = IcfgExitProfile {
         callee_entry: callee_entry.clone(),
         callee_exit: callee_exit.clone(),
@@ -1737,7 +1790,7 @@ fn materialize_exit_profile(
         gap_reason,
         quality,
     };
-    Ok(exit_profile_outcome(profile, quality, scan_work))
+    Ok(exit_profile_outcome(profile, quality, total_work))
 }
 
 fn exit_profile_outcome(
@@ -1926,9 +1979,9 @@ pub(crate) fn project_matched_return(
             incoming.exceptional_continuation,
         ),
     };
-    let (proof, completeness) = return_evidence(exit, incoming);
     match destination {
         ControlContinuation::Target(point) => {
+            let (proof, completeness) = return_evidence(exit, incoming);
             let continuation = incoming
                 .origin
                 .procedure()
@@ -2024,6 +2077,10 @@ where
         (cached.clone(), false)
     } else {
         let outcome = provider.exit_profile(&frame.transfer.callee_entry, &key.point, request)?;
+        if let Some(profile) = outcome.available_value() {
+            validate_exit_profile(&frame.transfer.callee_entry, &key.point, profile)?;
+        }
+        let outcome = outcome.map(Arc::new);
         builder.exit_profiles.insert(cache_key, outcome.clone());
         (outcome, true)
     };
@@ -2114,6 +2171,25 @@ pub(crate) fn invoked_call_at(
         }))
 }
 
+/// Validate provider-owned exit evidence before either ICFG backend caches it.
+pub(crate) fn validate_exit_profile(
+    callee_entry: &ProgramPointHandle,
+    callee_exit: &ProgramPointHandle,
+    profile: &IcfgExitProfile,
+) -> Result<(), SemanticProviderError> {
+    if profile.callee_entry() != callee_entry {
+        return Err(SemanticProviderError::internal(
+            "ICFG exit profile entry does not match the requested entry",
+        ));
+    }
+    if profile.callee_exit() != callee_exit {
+        return Err(SemanticProviderError::internal(
+            "ICFG exit profile exit does not match the requested exit",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate provider-owned call projections before either ICFG backend
 /// publishes them.
 pub(crate) fn validate_call_transfer_set(
@@ -2162,6 +2238,14 @@ pub(crate) fn validate_call_transfer_set(
                 "ICFG call boundary origin does not match the requested call",
             ));
         }
+        boundary
+            .dispatch
+            .validate_for_call(&origin)
+            .map_err(|error| {
+                SemanticProviderError::internal(format!(
+                    "ICFG call boundary has invalid dispatch provenance: {error}"
+                ))
+            })?;
     }
     Ok(())
 }
@@ -3937,6 +4021,65 @@ void raii_caller() {
             canonical_profile.has_return_affecting_gaps(),
             "canonical entry-to-exit topology crosses the defer gap"
         );
+        let expected_reason = semantics
+            .gaps()
+            .iter()
+            .filter(|gap| gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
+            .map(|gap| {
+                format!(
+                    "{} {}: {}",
+                    gap.kind.label(),
+                    gap.capability.label(),
+                    gap.detail,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            canonical_profile.gap_reason.as_deref(),
+            Some(expected_reason.as_str()),
+        );
+        assert_eq!(
+            canonical_outcome.work().owned_text_bytes,
+            expected_reason.len(),
+            "the exact retained return-gap text must be charged",
+        );
+        assert_eq!(canonical_budget.used(), canonical_outcome.work());
+
+        let mut text_limited_work = SemanticBudget::default().limits();
+        text_limited_work.owned_text_bytes = expected_reason
+            .len()
+            .checked_sub(1)
+            .expect("return-gap reason is non-empty");
+        let mut text_limited_budget =
+            SemanticBudget::new(text_limited_work).expect("all semantic limits remain positive");
+        let text_limited_outcome = provider
+            .exit_profile(
+                &canonical_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut text_limited_budget, &cancellation),
+            )
+            .expect("owned-text boundary is a typed semantic outcome");
+        let SemanticOutcome::ExceededBudget {
+            partial,
+            exceeded,
+            work,
+        } = text_limited_outcome
+        else {
+            panic!("the exact return-gap text must exceed the one-byte-short budget");
+        };
+        assert!(
+            partial.is_none(),
+            "a failed text charge publishes no profile"
+        );
+        assert_eq!(
+            exceeded.dimension(),
+            crate::analyzer::semantic::SemanticBudgetDimension::OwnedTextBytes,
+        );
+        assert_eq!(exceeded.limit(), expected_reason.len() - 1);
+        assert_eq!(exceeded.attempted(), expected_reason.len());
+        assert_eq!(work.owned_text_bytes, 0);
+        assert_eq!(text_limited_budget.used(), work);
 
         let alternate_entry = exit.clone();
         let mut alternate_budget = SemanticBudget::default();
@@ -3959,6 +4102,8 @@ void raii_caller() {
             matches!(alternate_outcome, SemanticOutcome::Complete { .. }),
             "no other return gap should weaken the alternate entry profile"
         );
+        assert_eq!(alternate_outcome.work().owned_text_bytes, 0);
+        assert_eq!(alternate_budget.used(), alternate_outcome.work());
     }
 
     #[test]

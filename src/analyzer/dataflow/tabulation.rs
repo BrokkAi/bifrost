@@ -7,7 +7,7 @@ use crate::analyzer::semantic::{
 };
 use crate::hash::{HashMap, HashSet};
 
-use super::transfer::{TransferEvaluation, evaluate_transfer};
+use super::transfer::{TransferEvaluation, TransferScratch, evaluate_transfer};
 use super::{
     BoundedSnapshotDataflowProblem, DataflowCoverage, DataflowEdge, DataflowError, DataflowOutput,
     DataflowRequest, DataflowResult, DataflowSeed, DistributiveDataflowProblem, FactId,
@@ -117,6 +117,7 @@ struct TabulationState<'graph, Fact> {
     worklist: VecDeque<QueuedState>,
     unproven_edges: HashSet<IcfgEdgeId>,
     partial_edges: HashSet<IcfgEdgeId>,
+    transfer_scratch: TransferScratch<Fact>,
 }
 
 impl<'graph, Fact> TabulationState<'graph, Fact>
@@ -132,6 +133,7 @@ where
             worklist: VecDeque::new(),
             unproven_edges: HashSet::default(),
             partial_edges: HashSet::default(),
+            transfer_scratch: TransferScratch::new(),
         }
     }
 
@@ -268,6 +270,7 @@ where
                     fact,
                     self.facts[ZERO_FACT_ID.index()],
                     queued.state.fact == ZERO_FACT_ID,
+                    &mut self.transfer_scratch,
                     request,
                 ) {
                     TransferEvaluation::Outputs(outputs) => outputs,

@@ -115,6 +115,41 @@ impl DispatchBoundary {
             | DispatchBoundaryKind::Truncated => None,
         }
     }
+
+    /// Validate one retained boundary independently of the dispatch result
+    /// that originally sealed it.
+    ///
+    /// ICFG providers retain boundaries after consuming dispatch candidates,
+    /// so this exact-call check is the shared trust boundary for those
+    /// provider-owned rows.
+    pub(crate) fn validate_for_call(
+        &self,
+        call: &CallSiteHandle,
+    ) -> Result<(), OracleContractError> {
+        let owner = OracleRelationOwner::Dispatch(call.clone());
+        let Some(first) = self.provenance.first() else {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        };
+        let mut seen = std::collections::HashSet::new();
+        if self.provenance.iter().any(|relation| {
+            relation.owner() != &owner
+                || relation.record().kind() != OracleRelationKind::DispatchBoundary
+                || !relation.record().identifies_dispatch_boundary(&self.kind)
+                || relation.record().evidence().is_empty()
+                || !first.same_arena(relation)
+                || !seen.insert(relation.clone())
+        }) {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        if self.provenance.iter().any(|relation| {
+            !relation
+                .record()
+                .supports_quality(&self.proof, &self.completeness)
+        }) {
+            return Err(OracleContractError::InvalidRelationQuality);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,13 +322,11 @@ impl DispatchResult {
         }) {
             return Err(OracleContractError::InvalidRelationIdentity);
         }
-        if self.boundaries.iter().any(|boundary| {
-            boundary.provenance.iter().any(|relation| {
-                !relation
-                    .record()
-                    .identifies_dispatch_boundary(&boundary.kind)
-            })
-        }) {
+        if self
+            .boundaries
+            .iter()
+            .any(|boundary| boundary.validate_for_call(call).is_err())
+        {
             return Err(OracleContractError::InvalidRelationIdentity);
         }
         Ok(())

@@ -5,6 +5,7 @@ use std::{
     error::Error,
     fmt,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use crate::analyzer::semantic::{
@@ -13,6 +14,7 @@ use crate::analyzer::semantic::{
     IcfgLimitKind, OracleRelationHandle, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge,
     ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticBudgetExceeded,
     SemanticCapability, SemanticOutcome, SemanticProviderError, SemanticWork,
+    compare_relation_provenance,
 };
 
 use super::{FactId, PathQualityFrontier, SolverTermination, SolverWork};
@@ -110,7 +112,7 @@ impl SummaryReachedFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabulationEndSummary {
     entry: SummaryEntry,
-    exit: IcfgExitProfile,
+    exit: Arc<IcfgExitProfile>,
     exit_fact: FactId,
     path_qualities: PathQualityFrontier,
 }
@@ -118,7 +120,7 @@ pub struct TabulationEndSummary {
 impl TabulationEndSummary {
     pub(crate) fn new(
         entry: SummaryEntry,
-        exit: IcfgExitProfile,
+        exit: Arc<IcfgExitProfile>,
         exit_fact: FactId,
         path_qualities: PathQualityFrontier,
     ) -> Self {
@@ -144,15 +146,15 @@ impl TabulationEndSummary {
         &self.entry
     }
 
-    pub const fn exit(&self) -> &IcfgExitProfile {
-        &self.exit
+    pub fn exit(&self) -> &IcfgExitProfile {
+        self.exit.as_ref()
     }
 
     pub fn exit_point(&self) -> &ProgramPointHandle {
         self.exit.callee_exit()
     }
 
-    pub const fn exit_kind(&self) -> ReturnTransferKind {
+    pub fn exit_kind(&self) -> ReturnTransferKind {
         self.exit.kind()
     }
 
@@ -189,6 +191,17 @@ impl SummaryEdge {
             target: edge.target.clone(),
             proof: edge.proof.clone(),
             completeness: edge.completeness.clone(),
+        }
+    }
+
+    pub(crate) fn from_owned_procedure_edge(edge: ProcedureIcfgEdge) -> Self {
+        Self {
+            kind: edge.kind,
+            origin: edge.origin,
+            source: edge.source,
+            target: edge.target,
+            proof: edge.proof,
+            completeness: edge.completeness,
         }
     }
 
@@ -751,7 +764,7 @@ fn compare_summary_boundaries(left: &SummaryBoundary, right: &SummaryBoundary) -
         .then_with(|| compare_boundary_kinds(left.kind(), right.kind()))
         .then_with(|| compare_optional_proof(left.proof(), right.proof()))
         .then_with(|| compare_optional_completeness(left.completeness(), right.completeness()))
-        .then_with(|| compare_provenance(left.provenance(), right.provenance()))
+        .then_with(|| compare_relation_provenance(left.provenance(), right.provenance()))
 }
 
 fn compare_optional_proof(left: Option<&ProofStatus>, right: Option<&ProofStatus>) -> Ordering {
@@ -773,19 +786,6 @@ fn compare_optional_completeness(
         (Some(_), None) => Ordering::Greater,
         (Some(left), Some(right)) => compare_completeness(left, right),
     }
-}
-
-fn compare_provenance(left: &[OracleRelationHandle], right: &[OracleRelationHandle]) -> Ordering {
-    left.iter()
-        .zip(right)
-        .find_map(|(left, right)| {
-            let ordering = left
-                .arena_identity()
-                .cmp(&right.arena_identity())
-                .then_with(|| left.id().cmp(&right.id()));
-            (!ordering.is_eq()).then_some(ordering)
-        })
-        .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
 fn edge_kind_key(kind: IcfgEdgeKind) -> (u8, u8) {
