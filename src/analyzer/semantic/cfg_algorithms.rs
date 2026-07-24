@@ -12,12 +12,13 @@ use crate::analyzer::semantic::{
 /// must have the same endpoints as `edge_endpoints`. Implementations are views:
 /// algorithms never require a copied or normalized graph.
 pub(crate) trait DenseBidirectionalGraph {
-    type Node: Copy + Eq + Ord;
-    type Edge: Copy + Eq + Ord;
+    type Node: Copy + Eq + Ord + std::fmt::Debug;
+    type Edge: Copy + Eq + Ord + std::fmt::Debug;
 
     fn node_count(&self) -> usize;
     fn node_at(&self, index: usize) -> Option<Self::Node>;
     fn node_index(&self, node: Self::Node) -> Option<usize>;
+    fn edge_index(&self, edge: Self::Edge) -> Option<usize>;
     fn successors(
         &self,
         node: Self::Node,
@@ -44,6 +45,10 @@ impl DenseBidirectionalGraph for ProcedureSemantics {
 
     fn node_index(&self, node: Self::Node) -> Option<usize> {
         (node.index() < self.points().len()).then_some(node.index())
+    }
+
+    fn edge_index(&self, edge: Self::Edge) -> Option<usize> {
+        (edge.index() < self.control_edges().len()).then_some(edge.index())
     }
 
     fn successors(
@@ -737,6 +742,9 @@ where
 }
 
 #[cfg(test)]
+mod benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -800,6 +808,10 @@ mod tests {
 
         fn node_index(&self, node: Self::Node) -> Option<usize> {
             (node < self.nodes).then_some(node)
+        }
+
+        fn edge_index(&self, edge: Self::Edge) -> Option<usize> {
+            (edge.0 < self.edges.len()).then_some(edge.0)
         }
 
         fn successors(
