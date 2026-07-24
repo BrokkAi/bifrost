@@ -6267,7 +6267,7 @@ fn scan_usages_by_location_keeps_python_class_annotation_references() {
                     && file["hits"].as_array().into_iter().flatten().any(|hit| {
                         hit["snippet"]
                             .as_str()
-                            .is_some_and(|snippet| snippet.contains("-> \\\"User\\\""))
+                            .is_some_and(|snippet| snippet.contains(r#"-> "User""#))
                     })
             }),
         "quoted return annotation must remain an external class usage: {value}"
