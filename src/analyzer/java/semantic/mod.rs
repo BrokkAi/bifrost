@@ -48,33 +48,38 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let mut specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (mut specs, initial_work, inventory_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    inventory_work,
+                } => (value, initial_work, inventory_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
         if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
-                work: SemanticWork::default(),
+                work: inventory_work,
             });
         }
         for index in 0..specs.len() {
             if cancellation.is_cancelled() {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
-                    work: SemanticWork::default(),
+                    work: inventory_work,
                 });
             }
             let can_capture_receiver = specs[index]
@@ -109,7 +114,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {

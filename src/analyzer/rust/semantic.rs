@@ -49,26 +49,31 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (specs, initial_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    ..
+                } => (value, initial_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
@@ -130,14 +135,7 @@ struct ProcedureSpec<'tree> {
     callable: Node<'tree>,
 }
 
-enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-        work: SemanticWork,
-    },
-    Cancelled,
-}
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -151,38 +149,22 @@ fn enumerate_procedures<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
-    let mount = WorkspaceMountId::from_root(file.root());
-    let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let language = prepared.dialect();
     let root = prepared.tree().root_node();
-    let file_anchor = source_anchor(root, 0).map_err(SemanticProviderError::invalid_identity)?;
-    let file_name = file
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("rust-source");
-    let file_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::File, file_name, file_anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-
-    type SiblingKey = (usize, DeclarationSegmentKind, Option<Box<str>>);
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "rust-source", budget)?;
     let mut specs = Vec::new();
-    let mut siblings: HashMap<SiblingKey, u32> = HashMap::default();
-    let mut declaration_paths = vec![DeclarationPathEntry {
-        parent: None,
-        segment: file_segment,
-    }];
-    let mut preflight = SemanticWork::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
-        declaration_path: 0,
+        declaration_path: inventory.root_path(),
     }];
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
         }
         let child_path = frame.declaration_path;
         let mut callable_body_scope = None;
@@ -190,47 +172,29 @@ fn enumerate_procedures<'tree>(
         if let Some((kind, segment_kind, body, properties)) =
             callable_shape(frame.node, frame.lexical_parent)
         {
-            let id = ProcedureId::try_from_index(specs.len())
-                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
             let name = callable_name(prepared.source(), frame.node);
-            let ordinal =
-                next_sibling_ordinal(&mut siblings, child_path, segment_kind, name.as_deref());
             let anchor =
                 source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let mut segments = collect_declaration_path(&declaration_paths, child_path);
-            segments.push(segment.clone());
-            let declaration = DeclarationLocator::new(segments)
-                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-            let locator = SemanticLocator::new(
-                mount,
-                path.clone(),
-                language,
-                declaration,
-                SemanticRole::Procedure,
+            let identity = match inventory.allocate_procedure(
+                child_path,
+                segment_kind,
+                name.as_deref(),
                 anchor,
-            );
-            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: candidate,
-                });
-            }
-            preflight = candidate;
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
             specs.push(ProcedureSpec {
-                id,
+                id: identity.id,
                 body,
-                locator,
+                locator: identity.locator,
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
                 has_parameter_bindings: callable_has_parameter_bindings(frame.node),
                 callable: frame.node,
             });
-            let callable_path = push_declaration_path(&mut declaration_paths, child_path, segment);
-            callable_body_scope = Some((body.id(), id, callable_path));
+            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
         }
 
         let children = named_children(frame.node);
@@ -247,7 +211,7 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    Ok(ProcedureEnumeration::Complete(specs))
+    Ok(inventory.complete(specs))
 }
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {

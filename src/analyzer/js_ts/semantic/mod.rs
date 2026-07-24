@@ -103,33 +103,38 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 prepared.dialect()
             )));
         }
-        let mut specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (mut specs, initial_work, inventory_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    inventory_work,
+                } => (value, initial_work, inventory_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
         if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
-                work: SemanticWork::default(),
+                work: inventory_work,
             });
         }
         for index in 0..specs.len() {
             if cancellation.is_cancelled() {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
-                    work: SemanticWork::default(),
+                    work: inventory_work,
                 });
             }
             let parent = specs[index]
@@ -143,7 +148,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
         if cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
-                work: SemanticWork::default(),
+                work: inventory_work,
             });
         }
         let procedure_targets = specs
@@ -163,7 +168,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
         let mut bound_capture_targets = HashSet::default();
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {

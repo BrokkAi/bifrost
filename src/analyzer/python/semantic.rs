@@ -50,13 +50,13 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, class_names, enumeration_work) =
+        let (specs, class_names, initial_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
-                    specs,
-                    class_names,
-                    work,
-                } => (specs, class_names, work),
+                    value,
+                    initial_work,
+                    ..
+                } => (value.specs, value.class_names, initial_work),
                 ProcedureEnumeration::ExceededBudget { exceeded, work } => {
                     return Ok(SemanticOutcome::ExceededBudget {
                         partial: None,
@@ -74,7 +74,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
 
         lower_procedure_batch(
             &specs,
-            enumeration_work,
+            initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
@@ -134,20 +134,12 @@ struct ProcedureSpec<'tree> {
     properties: ProcedureProperties,
 }
 
-enum ProcedureEnumeration<'tree> {
-    Complete {
-        specs: Vec<ProcedureSpec<'tree>>,
-        class_names: HashSet<Box<str>>,
-        work: SemanticWork,
-    },
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-        work: SemanticWork,
-    },
-    Cancelled {
-        work: SemanticWork,
-    },
+struct PythonProcedureInventory<'tree> {
+    specs: Vec<ProcedureSpec<'tree>>,
+    class_names: HashSet<Box<str>>,
 }
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<PythonProcedureInventory<'tree>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -162,63 +154,29 @@ fn enumerate_procedures<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
-    let mount = WorkspaceMountId::from_root(file.root());
-    let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let language = prepared.dialect();
     let root = prepared.tree().root_node();
-    let file_anchor = source_anchor(root, 0).map_err(SemanticProviderError::invalid_identity)?;
-    let file_name = file
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("python-source");
-    let file_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::File, file_name, file_anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-
-    type SiblingKey = (usize, DeclarationSegmentKind, Option<Box<str>>);
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "python-source", budget)?;
     let mut specs = Vec::new();
-    let mut siblings: HashMap<SiblingKey, u32> = HashMap::default();
-    let mut declaration_paths = vec![DeclarationPathEntry {
-        parent: None,
-        segment: file_segment,
-    }];
-    let mut preflight = SemanticWork::default();
-    let mut traversal_work = SemanticWork::default();
     let mut module_bindings: HashMap<Box<str>, PythonDirectScopeBindingKind> = HashMap::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
-        declaration_path: 0,
+        declaration_path: inventory.root_path(),
         entry_precharged: false,
     }];
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled {
-                work: sum_lowering_work(preflight, traversal_work),
-            });
+            return Ok(inventory.cancelled());
         }
-        if !frame.entry_precharged {
-            let traversal = sum_lowering_work(
-                traversal_work,
-                SemanticWork {
-                    nested_entries: 1,
-                    ..SemanticWork::default()
-                },
-            );
-            let traversal_candidate = sum_lowering_work(preflight, traversal);
-            if let Err(exceeded) = budget.check(traversal_candidate) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: traversal_candidate,
-                });
-            }
-            traversal_work = traversal;
+        if !frame.entry_precharged
+            && let Err(stop) = inventory.charge_traversal_entry()
+        {
+            return Ok(stop.into_outcome());
         }
 
-        if frame.lexical_parent.is_none() && frame.declaration_path == 0 {
+        if frame.lexical_parent.is_none() && frame.declaration_path == inventory.root_path() {
             let mut binding_scan_cancelled = false;
             let mut binding_scan_exceeded = None;
             let bindings =
@@ -227,34 +185,21 @@ fn enumerate_procedures<'tree>(
                         binding_scan_cancelled = true;
                         return false;
                     }
-                    let next = sum_lowering_work(
-                        traversal_work,
-                        SemanticWork {
-                            nested_entries: 1,
-                            ..SemanticWork::default()
-                        },
-                    );
-                    let candidate = sum_lowering_work(preflight, next);
-                    match budget.check(candidate) {
-                        Ok(()) => {
-                            traversal_work = next;
-                            true
-                        }
-                        Err(exceeded) => {
-                            binding_scan_exceeded = Some((exceeded, candidate));
+                    match inventory.charge_traversal_entry() {
+                        Ok(()) => true,
+                        Err(stop) => {
+                            binding_scan_exceeded = Some(stop);
                             false
                         }
                     }
                 });
             let Some(bindings) = bindings else {
                 if binding_scan_cancelled {
-                    return Ok(ProcedureEnumeration::Cancelled {
-                        work: sum_lowering_work(preflight, traversal_work),
-                    });
+                    return Ok(inventory.cancelled());
                 }
-                let (exceeded, work) =
+                let stop =
                     binding_scan_exceeded.expect("bounded binding scan stopped without a cause");
-                return Ok(ProcedureEnumeration::ExceededBudget { exceeded, work });
+                return Ok(stop.into_outcome());
             };
             for binding in bindings {
                 let Some(name) = node_text(prepared.source(), binding.declaration) else {
@@ -266,21 +211,12 @@ fn enumerate_procedures<'tree>(
                     *existing = PythonDirectScopeBindingKind::Other;
                     continue;
                 }
-                let inventory = sum_lowering_work(
-                    traversal_work,
-                    SemanticWork {
-                        owned_text_bytes: name.len(),
-                        ..SemanticWork::default()
-                    },
-                );
-                let inventory_candidate = sum_lowering_work(preflight, inventory);
-                if let Err(exceeded) = budget.check(inventory_candidate) {
-                    return Ok(ProcedureEnumeration::ExceededBudget {
-                        exceeded,
-                        work: inventory_candidate,
-                    });
+                if let Err(stop) = inventory.observe_additional_work(SemanticWork {
+                    owned_text_bytes: name.len(),
+                    ..SemanticWork::default()
+                }) {
+                    return Ok(stop.into_outcome());
                 }
-                traversal_work = inventory;
                 module_bindings.insert(name.into(), binding.kind);
             }
         }
@@ -289,18 +225,14 @@ fn enumerate_procedures<'tree>(
         let mut container_body_scope = None;
         if let Some(segment_kind) = declaration_container_kind(frame.node) {
             let name = declaration_container_name(prepared.source(), frame.node);
-            let ordinal = next_sibling_ordinal(
-                &mut siblings,
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            let container_path = inventory.push_container(
                 frame.declaration_path,
                 segment_kind,
                 name.as_deref(),
-            );
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let container_path =
-                push_declaration_path(&mut declaration_paths, frame.declaration_path, segment);
+                anchor,
+            )?;
             if let Some(body) = frame.node.child_by_field_name("body") {
                 container_body_scope = Some((body.id(), container_path));
             }
@@ -310,54 +242,33 @@ fn enumerate_procedures<'tree>(
         if let Some((kind, segment_kind, body, properties)) =
             callable_shape(frame.node, frame.lexical_parent)
         {
-            let id = ProcedureId::try_from_index(specs.len())
-                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
             let name = callable_name(prepared.source(), frame.node);
-            let ordinal =
-                next_sibling_ordinal(&mut siblings, child_path, segment_kind, name.as_deref());
             let anchor =
                 source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let mut segments = collect_declaration_path(&declaration_paths, child_path);
-            segments.push(segment.clone());
-            let declaration = DeclarationLocator::new(segments)
-                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-            let locator = SemanticLocator::new(
-                mount,
-                path.clone(),
-                language,
-                declaration,
-                SemanticRole::Procedure,
+            let identity = match inventory.allocate_procedure(
+                child_path,
+                segment_kind,
+                name.as_deref(),
                 anchor,
-            );
-            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            let candidate_with_traversal = sum_lowering_work(candidate, traversal_work);
-            if let Err(exceeded) = budget.check(candidate_with_traversal) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: candidate_with_traversal,
-                });
-            }
-            preflight = candidate;
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
             specs.push(ProcedureSpec {
-                id,
+                id: identity.id,
                 callable: frame.node,
                 body,
-                locator,
+                locator: identity.locator,
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
             });
-            let callable_path = push_declaration_path(&mut declaration_paths, child_path, segment);
-            callable_body_scope = Some((body.id(), id, callable_path));
+            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
         }
 
         for child_index in (0..frame.node.child_count()).rev() {
             if cancellation.is_cancelled() {
-                return Ok(ProcedureEnumeration::Cancelled {
-                    work: sum_lowering_work(preflight, traversal_work),
-                });
+                return Ok(inventory.cancelled());
             }
             let Some(child) = frame
                 .node
@@ -366,21 +277,9 @@ fn enumerate_procedures<'tree>(
             else {
                 continue;
             };
-            let traversal = sum_lowering_work(
-                traversal_work,
-                SemanticWork {
-                    nested_entries: 1,
-                    ..SemanticWork::default()
-                },
-            );
-            let traversal_candidate = sum_lowering_work(preflight, traversal);
-            if let Err(exceeded) = budget.check(traversal_candidate) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: traversal_candidate,
-                });
+            if let Err(stop) = inventory.charge_traversal_entry() {
+                return Ok(stop.into_outcome());
             }
-            traversal_work = traversal;
             let child_path = container_body_scope
                 .filter(|(body_id, _)| *body_id == child.id())
                 .map(|(_, path)| path)
@@ -404,13 +303,7 @@ fn enumerate_procedures<'tree>(
             (kind == PythonDirectScopeBindingKind::ClassDeclaration).then_some(name)
         })
         .collect();
-    Ok(ProcedureEnumeration::Complete {
-        specs,
-        class_names,
-        // Procedure lowering accounts retained locator identity. Seed only the
-        // one-time file inventory to avoid charging that identity twice.
-        work: traversal_work,
-    })
+    Ok(inventory.complete(PythonProcedureInventory { specs, class_names }))
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {

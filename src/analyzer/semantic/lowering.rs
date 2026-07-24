@@ -13,15 +13,15 @@ use super::cfg::{ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
 use super::{
     AllocationId, AllocationKind, AllocationSite, ArgumentDomain, CallContinuationKind, CallSiteId,
     CallableTargetResolution, CancellationToken, CaptureBinding, CaptureId, CaptureMode,
-    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, DeclarationSegment,
-    DeclarationSegmentKind, Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity,
-    MemoryAccessKind, MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId,
-    ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
-    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
-    SemanticGap, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
-    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
-    SourceMappingKind, SourcePosition, SourceSpan, ValueId,
+    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, Evidence,
+    EvidenceCompleteness, EvidenceId, FormalMultiplicity, MemoryAccessKind, MemoryLocation,
+    MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts, ProgramPointId,
+    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite,
+    SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapId,
+    SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind, SemanticWork,
+    SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition, SourceSpan,
+    ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -142,96 +142,6 @@ pub(crate) const fn formal_multiplicity(
         Some(FormalVariadicKind::Both) => {
             FormalMultiplicity::Rest(ArgumentDomain::PositionalOrKeyword)
         }
-    }
-}
-
-/// One node in the persistent declaration path assembled while adapters walk
-/// nested syntax iteratively.
-///
-/// Adapters decide which syntax introduces a declaration segment; this shared
-/// representation owns the language-neutral path mechanics used after that
-/// decision.
-pub(crate) struct DeclarationPathEntry {
-    pub(crate) parent: Option<usize>,
-    pub(crate) segment: DeclarationSegment,
-}
-
-pub(crate) fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-pub(crate) fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-pub(crate) fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let next = siblings.entry(key).or_default();
-    let ordinal = *next;
-    *next += 1;
-    ordinal
-}
-
-pub(crate) fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
-}
-
-/// Work retained for the shared procedure identity rows created by
-/// [`ProcedureLoweringSession::start`]. Adapters use the same calculation to
-/// reject an enumeration before retaining an unbounded locator path.
-pub(crate) fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        // Two empty adjacency offset arrays, one evidence source, and three
-        // retained locator copies (procedure, locator index, source mapping).
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
     }
 }
 
