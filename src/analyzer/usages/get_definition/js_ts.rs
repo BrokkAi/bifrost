@@ -3,6 +3,7 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::syntax::{
     JsTsLexicalBindingIndex, is_declaration_identifier, is_explicit_object_literal_key,
 };
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::typescript::ts_is_global_internal_module;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
@@ -1119,21 +1120,14 @@ fn jsts_nearest_lexical_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope
 }
 
 fn jsts_pattern_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if matches!(
+    subtree_contains(node, |node| {
+        matches!(
             node.kind(),
             "identifier" | "shorthand_property_identifier_pattern"
         ) && source
             .get(node.start_byte()..node.end_byte())
             .is_some_and(|text| text.trim() == name)
-        {
-            return true;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
+    })
 }
 
 fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {

@@ -27,6 +27,7 @@ use super::extractor::{
 use super::hits::rust_path_segments;
 use crate::analyzer::rust::RustReferenceNamespace;
 use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
     classify_reference_node, parse_and_collect,
@@ -257,64 +258,55 @@ struct ScopeFacts {
 }
 
 fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &mut Vec<ScopeFacts>) {
-    let mut stack = vec![WalkFrame::Enter(node)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            WalkFrame::Enter(node) => match node.kind() {
-                "use_declaration" => {}
-                // A function or closure opens a parameter scope. `let` bindings
-                // are seeded incrementally when traversal reaches them so later
-                // shadowing cannot type earlier receiver calls.
-                "function_item" | "closure_expression" => {
-                    scopes.push(collect_parameter_scope_facts(node, ctx));
-                    stack.push(WalkFrame::ExitScope);
-                    push_children(node, &mut stack);
-                }
-                "block" => {
-                    scopes.push(ScopeFacts::default());
-                    stack.push(WalkFrame::ExitScope);
-                    push_children(node, &mut stack);
-                }
-                "let_declaration" => {
-                    handle_let_declaration(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                "call_expression" => {
-                    handle_method_call(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                "token_tree" => {
-                    handle_token_tree_paths(node, ctx);
-                    push_children(node, &mut stack);
-                }
-                "identifier" | "type_identifier" => {
-                    handle_identifier(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                "scoped_identifier" | "scoped_type_identifier" => {
-                    handle_scoped(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                _ => push_children(node, &mut stack),
-            },
-            WalkFrame::ExitScope => {
-                scopes.pop();
+    let mut state = RustWalkState { ctx, scopes };
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, state| match node.kind() {
+            "use_declaration" => TreeWalkAction::Skip,
+            // A function or closure opens a parameter scope. `let` bindings
+            // are seeded incrementally when traversal reaches them so later
+            // shadowing cannot type earlier receiver calls.
+            "function_item" | "closure_expression" => {
+                let facts = collect_parameter_scope_facts(node, state.ctx);
+                state.scopes.push(facts);
+                TreeWalkAction::DescendWithExit
             }
-        }
-    }
+            "block" => {
+                state.scopes.push(ScopeFacts::default());
+                TreeWalkAction::DescendWithExit
+            }
+            "let_declaration" => {
+                handle_let_declaration(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            "call_expression" => {
+                handle_method_call(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            "token_tree" => {
+                handle_token_tree_paths(node, state.ctx);
+                TreeWalkAction::Descend
+            }
+            "identifier" | "type_identifier" => {
+                handle_identifier(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                handle_scoped(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            _ => TreeWalkAction::Descend,
+        },
+        |state| {
+            state.scopes.pop();
+        },
+    );
 }
 
-enum WalkFrame<'tree> {
-    Enter(Node<'tree>),
-    ExitScope,
-}
-
-fn push_children<'tree>(node: Node<'tree>, stack: &mut Vec<WalkFrame<'tree>>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(WalkFrame::Enter(child));
-        }
-    }
+struct RustWalkState<'a, 'b, 'c> {
+    ctx: &'a mut RustScan<'b, 'c>,
+    scopes: &'a mut Vec<ScopeFacts>,
 }
 
 fn is_shadowed(scopes: &[ScopeFacts], name: &str) -> bool {

@@ -330,10 +330,7 @@ fn runtime_computed_member_name(member: Node<'_>) -> Option<Node<'_>> {
         .filter(|name| name.kind() == "computed_property_name")
 }
 
-pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
-}
+pub(super) use crate::analyzer::tree_walk::named_children;
 
 pub(super) fn default_parameter_values(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(parameters) = node.child_by_field_name("parameters") else {

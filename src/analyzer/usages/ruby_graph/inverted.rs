@@ -18,7 +18,7 @@ use super::syntax::{
     dynamic_dispatch_target_argument, is_call_method_identifier, is_declaration_constant,
     is_declaration_identifier, method_receiver_mode, node_text,
 };
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,

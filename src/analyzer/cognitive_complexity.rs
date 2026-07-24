@@ -9,6 +9,7 @@
 //! AST iteratively (no recursion to keep deeply nested code safe) and
 //! accumulates per-frame nesting, mirroring the reference implementation.
 
+use crate::analyzer::tree_walk::named_children;
 use tree_sitter::Node;
 
 /// Predicate returning `true` when a switch/match case node is the
@@ -360,17 +361,6 @@ pub fn is_wildcard_case(node: Node<'_>, source: &str) -> bool {
     };
     let stripped = text.trim_start();
     stripped.starts_with('_') || stripped.starts_with("case _ =>")
-}
-
-fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
-    let count = node.named_child_count();
-    let mut out = Vec::with_capacity(count);
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        out.push(child);
-    }
-    let _ = count;
-    out
 }
 
 fn direct_named_child_matching<'tree, F>(node: Node<'tree>, pred: F) -> Option<Node<'tree>>

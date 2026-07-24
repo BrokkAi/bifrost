@@ -12,6 +12,7 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
+use crate::analyzer::tree_walk::{named_children, subtree_contains};
 use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
 
@@ -3273,11 +3274,6 @@ fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
     }
 }
 
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
-}
-
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
     named_children(node)
         .into_iter()
@@ -3454,16 +3450,7 @@ fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
 }
 
 fn contains_token(node: Node<'_>, kind: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        let mut cursor = current.walk();
-        let children = current.children(&mut cursor).collect::<Vec<_>>();
-        if children.iter().any(|child| child.kind() == kind) {
-            return true;
-        }
-        stack.extend(children.into_iter().filter(|child| child.is_named()));
-    }
-    false
+    subtree_contains(node, |current| has_direct_token(current, kind))
 }
 
 fn is_runtime_node(kind: &str) -> bool {

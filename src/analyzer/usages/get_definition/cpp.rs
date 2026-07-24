@@ -7,6 +7,7 @@ use crate::analyzer::cpp::{
 };
 use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
@@ -5087,15 +5088,7 @@ fn cpp_seed_binding(
 }
 
 fn cpp_contains_template_id(node: Node<'_>) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "template_type" {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    false
+    subtree_contains(node, |current| current.kind() == "template_type")
 }
 
 fn cpp_resolve_type_unit(

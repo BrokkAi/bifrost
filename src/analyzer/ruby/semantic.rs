@@ -16,6 +16,7 @@ use crate::analyzer::semantic::lowering::formal_multiplicity;
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, Range, RubyAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
@@ -180,11 +181,6 @@ fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
     named_children(node)
         .into_iter()
         .find(|child| is_runtime_node(child.kind()))
-}
-
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
 }
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RubyLoweringError> {
@@ -4544,6 +4540,7 @@ fn node_range(node: Node<'_>) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::tree_walk::descendants_of_kind;
 
     fn parsed_method(source: &str) -> (tree_sitter::Tree, usize) {
         let mut parser = tree_sitter::Parser::new();
@@ -4559,14 +4556,13 @@ mod tests {
     }
 
     fn descendants_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+        // Preorder, including `node` itself if it matches (matches this test
+        // helper's original hand-rolled stack walk).
         let mut matches = Vec::new();
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            if current.kind() == kind {
-                matches.push(current);
-            }
-            stack.extend(named_children(current).into_iter().rev());
+        if node.kind() == kind {
+            matches.push(node);
         }
+        matches.extend(descendants_of_kind(node, kind));
         matches
     }
 

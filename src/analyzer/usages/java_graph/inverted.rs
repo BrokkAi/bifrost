@@ -29,7 +29,7 @@ use super::return_type::{
     method_return_type_for_owner_fqn,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     build_file_declarations, build_file_declarations_from_state, classify_reference_node,

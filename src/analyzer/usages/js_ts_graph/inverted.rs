@@ -28,7 +28,7 @@ use crate::analyzer::js_ts::syntax::{
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice,
 };
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey, build_edge_output,
     build_edge_weights, classify_reference_node, collect_file_edges, parse_and_collect,

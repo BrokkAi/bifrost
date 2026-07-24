@@ -1,7 +1,7 @@
 use crate::analyzer::ruby::{
     RubyFieldScope, extract_name_segments, parse_ruby_tree, ruby_variable_field_name,
 };
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};

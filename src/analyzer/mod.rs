@@ -40,6 +40,7 @@ pub mod structural;
 pub(crate) mod symbol_lookup;
 pub(crate) mod test_paths;
 pub(crate) mod tree_sitter_analyzer;
+pub(crate) mod tree_walk;
 pub(crate) mod type_relations;
 mod typescript;
 mod usage_facts;

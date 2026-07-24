@@ -2,8 +2,9 @@ use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
-use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
     rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,

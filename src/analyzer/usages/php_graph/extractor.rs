@@ -1,3 +1,4 @@
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::model::UsageHit;
@@ -514,43 +515,25 @@ fn scan_member_scope<'tree>(
     }
 }
 
-fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<Node<'tree>>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    stack.extend(children.into_iter().rev());
-}
-
 fn contains_member_reference_candidate(root: Node<'_>, source: &str, spec: &TargetSpec) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "member_access_expression"
-            | "nullsafe_member_access_expression"
-            | "member_call_expression"
-            | "nullsafe_member_call_expression" => {
-                if node
-                    .child_by_field_name("name")
-                    .and_then(|member| literal_member_identifier(member, source))
-                    == Some(spec.member_name.as_str())
-                {
-                    return true;
-                }
-            }
-            "class_constant_access_expression"
-            | "scoped_call_expression"
-            | "scoped_property_access_expression" => {
-                if let Some((_, member)) = static_member_parts(node)
-                    && static_member_identifier(node, member, source)
-                        == Some(spec.member_name.as_str())
-                {
-                    return true;
-                }
-            }
-            _ => {}
+    subtree_contains(root, |node| match node.kind() {
+        "member_access_expression"
+        | "nullsafe_member_access_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression" => {
+            node.child_by_field_name("name")
+                .and_then(|member| literal_member_identifier(member, source))
+                == Some(spec.member_name.as_str())
         }
-        push_named_children(node, &mut stack);
-    }
-    false
+        "class_constant_access_expression"
+        | "scoped_call_expression"
+        | "scoped_property_access_expression" => {
+            static_member_parts(node).is_some_and(|(_, member)| {
+                static_member_identifier(node, member, source) == Some(spec.member_name.as_str())
+            })
+        }
+        _ => false,
+    })
 }
 
 fn seed_parameter_receivers(

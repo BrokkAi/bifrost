@@ -41,7 +41,7 @@ use super::resolver::{
     type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, first_precise, parse_and_collect,

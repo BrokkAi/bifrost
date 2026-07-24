@@ -1,4 +1,5 @@
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
     Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
@@ -1331,15 +1332,7 @@ fn scala_callable_arity(parameters: Option<Node<'_>>) -> Option<CallableArity> {
 }
 
 fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "repeated_parameter_type" {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    false
+    subtree_contains(node, |current| current.kind() == "repeated_parameter_type")
 }
 
 fn scala_parameter_label_nodes<'tree>(parameter_nodes: &[Node<'tree>]) -> Vec<Node<'tree>> {

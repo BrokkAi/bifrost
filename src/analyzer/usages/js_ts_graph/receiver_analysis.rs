@@ -10,6 +10,7 @@ use crate::analyzer::js_ts::syntax::slice;
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::get_definition::js_ts::{
     parse_js_ts_tree, resolve_js_ts_module_binding_candidates,
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -1535,22 +1536,12 @@ fn binding_node_shadows_receiver(node: Node<'_>, source: &str, receiver: &str) -
 }
 
 fn binding_pattern_contains_name(node: Node<'_>, source: &str, receiver: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if matches!(
+    subtree_contains(node, |node| {
+        matches!(
             node.kind(),
             "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
         ) && node_text_matches(node, source, receiver)
-        {
-            return true;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    false
+    })
 }
 
 fn declaration_scope_id(node: Node<'_>) -> Option<usize> {
