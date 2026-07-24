@@ -2019,6 +2019,15 @@ fn spelling_reference_site(record: &ProbeRecord) -> (&str, &str) {
         .unwrap_or(("", ""))
 }
 
+/// Strip C# CLR generic arity per fq segment (`Type`1` -> `Type`), so an
+/// arity-free listed name compares equal to an offered aritied variant.
+fn strip_arity_per_segment(fq: &str) -> String {
+    fq.split('.')
+        .map(crate::analyzer::strip_csharp_generic_arity)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// I3(a): a symbol `get_summaries` lists under file F must resolve via the
 /// physical `F#symbol` selector, and its reported path must remain F.
 pub fn check_i3a(
@@ -2055,9 +2064,17 @@ pub fn check_i3a(
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
-            let resolvable_from_listing = candidates
-                .iter()
-                .any(|candidate| candidate.starts_with(&own_selector));
+            let resolvable_from_listing = candidates.iter().any(|candidate| {
+                candidate.starts_with(&own_selector)
+                    // Two generic classes sharing one name (cake-build's
+                    // `ChocolateyFixture`1` and ``2`) make the arity-free
+                    // listing genuinely ambiguous; the offered aritied
+                    // variants resolve in one re-call, so they count as
+                    // resolvable from the listing too.
+                    || (language == "csharp"
+                        && strip_arity_per_segment(candidate)
+                            == strip_arity_per_segment(record.symbol_fq.as_str()))
+            });
             // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
             // (selectors.rs); at the cap the list is a truncated prefix, so
             // the listed selector's absence proves nothing — it may sort

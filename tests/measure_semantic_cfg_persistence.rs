@@ -26,6 +26,10 @@ use brokk_bifrost::analyzer::semantic::{
     CancellationToken, CapabilitySupport, ControlContinuation, SemanticArtifact, SemanticBudget,
     SemanticOutcome, SemanticProviderError, SemanticRequest, StableDigest,
 };
+use brokk_bifrost::benchmark::{
+    ArtifactPromotionGateStatus, ArtifactPromotionMeasurement, ArtifactPromotionThresholds,
+    evaluate_artifact_promotion,
+};
 use brokk_bifrost::{
     AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
 };
@@ -1615,35 +1619,40 @@ fn gate_for_dataset(dataset: &str, medians: &[MedianMeasurement]) -> GateDataset
     let rebuild = get("rebuild");
     let build_write = get("build_write");
     let hydrate = get("hydrate");
-    let hydration_saved_ms = rebuild.operation_ms - hydrate.operation_ms;
-    let hydration_speedup_percent = hydration_saved_ms / rebuild.operation_ms * 100.0;
-    let hydration_fast_enough = hydration_speedup_percent >= 30.0;
-    let hydration_absolute_saving_met = hydration_saved_ms >= 50.0;
-    let rss_measurement_available = cfg!(unix);
-    let rss_within_limit = rss_measurement_available
-        && hydrate.peak_rss_bytes as f64 <= rebuild.peak_rss_bytes as f64 * 1.10;
-    let packed_size_within_limit =
-        hydrate.database_bytes <= hydrate.estimated_hydrated_bytes.saturating_mul(2);
-    let cold_write_within_percent = build_write.operation_ms <= rebuild.operation_ms * 1.25;
-    let cold_write_absolute_overhead_met = build_write.operation_ms - rebuild.operation_ms <= 250.0;
-    let passed = hydration_fast_enough
-        && hydration_absolute_saving_met
-        && rss_within_limit
-        && packed_size_within_limit
-        && cold_write_within_percent
-        && cold_write_absolute_overhead_met;
+    let thresholds = ArtifactPromotionThresholds::default();
+    assert_eq!(thresholds.minimum_hydration_speedup_percent, 30.0);
+    assert_eq!(thresholds.minimum_hydration_saved_ms, 50.0);
+    assert_eq!(thresholds.maximum_hydration_rss_ratio, 1.10);
+    assert_eq!(thresholds.maximum_serialized_to_hydrated_bytes_ratio, 2.0);
+    assert_eq!(thresholds.maximum_build_write_time_ratio, 1.25);
+    assert_eq!(thresholds.maximum_build_write_overhead_ms, 250.0);
+    let evaluation = evaluate_artifact_promotion(
+        thresholds,
+        ArtifactPromotionMeasurement {
+            rebuild_ms: rebuild.operation_ms,
+            build_write_ms: build_write.operation_ms,
+            hydrate_ms: hydrate.operation_ms,
+            rebuild_peak_rss_bytes: cfg!(unix).then_some(rebuild.peak_rss_bytes),
+            hydrate_peak_rss_bytes: cfg!(unix).then_some(hydrate.peak_rss_bytes),
+            serialized_bytes: hydrate.database_bytes,
+            estimated_hydrated_bytes: hydrate.estimated_hydrated_bytes,
+        },
+    )
+    .expect("retained semantic CFG persistence samples must be valid promotion measurements");
+    let rss_measurement_available =
+        evaluation.hydration_rss != ArtifactPromotionGateStatus::Unavailable;
     GateDatasetResult {
         dataset: dataset.to_owned(),
-        hydration_speedup_percent,
-        hydration_saved_ms,
-        hydration_fast_enough,
-        hydration_absolute_saving_met,
+        hydration_speedup_percent: evaluation.hydration_speedup_percent,
+        hydration_saved_ms: evaluation.hydration_saved_ms,
+        hydration_fast_enough: evaluation.hydration_speedup.passed(),
+        hydration_absolute_saving_met: evaluation.hydration_absolute_saving.passed(),
         rss_measurement_available,
-        rss_within_limit,
-        packed_size_within_limit,
-        cold_write_within_percent,
-        cold_write_absolute_overhead_met,
-        passed,
+        rss_within_limit: evaluation.hydration_rss.passed(),
+        packed_size_within_limit: evaluation.serialized_size.passed(),
+        cold_write_within_percent: evaluation.build_write_time.passed(),
+        cold_write_absolute_overhead_met: evaluation.build_write_absolute_overhead.passed(),
+        passed: evaluation.passed(),
     }
 }
 

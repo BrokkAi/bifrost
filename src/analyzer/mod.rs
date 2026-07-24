@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
 mod capabilities;
 mod clone_detection;
@@ -81,7 +83,7 @@ pub(crate) use csharp::{
     csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
     csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
     csharp_using_directive_is_global, csharp_using_directive_is_static,
-    csharp_using_directive_namespace, csharp_using_directive_target,
+    csharp_using_directive_namespace, csharp_using_directive_target, strip_csharp_generic_arity,
 };
 pub use global_usage_definition_index::GlobalUsageDefinitionIndex;
 pub(crate) use global_usage_definition_index::{

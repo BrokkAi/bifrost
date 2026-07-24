@@ -372,6 +372,14 @@ impl ControlFlowGraph {
         &self,
         point: ProgramPointId,
     ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        self.successor_edges_bidirectional(point)
+    }
+
+    pub(crate) fn successor_edges_bidirectional(
+        &self,
+        point: ProgramPointId,
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
         let point = point.index();
         assert!(
             point < self.incoming.rows(),
@@ -393,6 +401,14 @@ impl ControlFlowGraph {
         &self,
         point: ProgramPointId,
     ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        self.predecessor_edges_bidirectional(point)
+    }
+
+    pub(crate) fn predecessor_edges_bidirectional(
+        &self,
+        point: ProgramPointId,
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
         let point = point.index();
         assert!(
             point < self.incoming.rows(),
@@ -600,11 +616,27 @@ impl ProcedureSemantics {
         self.cfg.successor_edges(point)
     }
 
+    pub(crate) fn successor_edges_bidirectional(
+        &self,
+        point: ProgramPointId,
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
+        self.cfg.successor_edges_bidirectional(point)
+    }
+
     pub fn predecessor_edges(
         &self,
         point: ProgramPointId,
     ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
         self.cfg.predecessor_edges(point)
+    }
+
+    pub(crate) fn predecessor_edges_bidirectional(
+        &self,
+        point: ProgramPointId,
+    ) -> impl DoubleEndedIterator<Item = (ControlEdgeId, &ControlEdge)> + ExactSizeIterator + '_
+    {
+        self.cfg.predecessor_edges_bidirectional(point)
     }
 
     pub const fn entry_point(&self) -> ProgramPointId {
