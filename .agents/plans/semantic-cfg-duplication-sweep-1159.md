@@ -20,7 +20,7 @@ After this change, every language will still own syntax recognition, evaluation 
 - [x] (2026-07-24 18:47Z) Milestone 3: extracted small structured-control combinators for conditional choices, short-circuit conditions, and C-style loops while leaving AST classification in language adapters.
 - [x] (2026-07-24 19:10Z) Milestone 4: extracted cleanup-route specialization and migrated the compatible try/finally implementations.
 - [x] (2026-07-24 19:30Z) Milestone 5: centralized duplicated data-flow outcome status, deterministic ordering, and cancellation-checkpointed budget reservation without merging the distinct solver engines.
-- [ ] Milestone 6: formatting, focused semantic/data-flow tests, isolated all-targets clippy, CPD remeasurement, and five specialist review passes are complete. Publication remains.
+- [ ] Milestone 6: formatting, focused semantic/data-flow tests, isolated all-targets clippy, CPD remeasurement, five specialist review passes, commit, and branch push are complete. Draft PR creation is externally blocked by GitHub HTTP 500 responses.
 
 ## Surprises & Discoveries
 
@@ -50,6 +50,9 @@ After this change, every language will still own syntax recognition, evaluation 
 
 - Observation: the full all-feature suite has a deterministic PHP usage-graph failure already present on `origin/master`.
   Evidence: `usage_graph_php_test::resolves_free_function_instance_static_and_self_calls` omits `App.Consumer.callsSelfMethod -> App.Consumer.viaInstance`. The test, fixture, PHP usage-graph implementation, and search-tool path are unchanged on this branch, and `usage_graph` does not invoke semantic materialization. This sweep does not widen into that unrelated same-owner resolution defect.
+
+- Observation: GitHub accepts the pushed branch and compare operation but currently rejects PR creation.
+  Evidence: the GitHub connector, `gh pr create`, and the REST `POST /repos/BrokkAi/bifrost/pulls` endpoint all returned server-side internal errors; REST returned HTTP 500 with an empty body. GitHub compare reports the branch as valid and six commits ahead of current master, and querying all PR states confirms that no duplicate PR was created.
 
 ## Decision Log
 
@@ -233,4 +236,4 @@ In `src/analyzer/semantic/lowering.rs` or `src/analyzer/semantic/control_lowerin
 
 In `src/analyzer/dataflow`, define one semantic outcome status implementation and one cancellation-checkpointed staging operation on `DataflowRequest`. No new external crate dependencies are expected.
 
-Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 5 to record completed shared kernels, bounded topology, cleanup and data-flow invariant extraction, and regression coverage. Updated again during Milestone 6 with specialist-review fixes, final CPD deltas, host-specific validation requirements, cold/cache work accounting, and the unrelated PHP base-branch gate failure.
+Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 5 to record completed shared kernels, bounded topology, cleanup and data-flow invariant extraction, and regression coverage. Updated again during Milestone 6 with specialist-review fixes, final CPD deltas, host-specific validation requirements, cold/cache work accounting, the unrelated PHP base-branch gate failure, and GitHub's external PR-creation blocker after the completed branch push.
