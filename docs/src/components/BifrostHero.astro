@@ -5,152 +5,316 @@ import type { StarlightRouteData } from '@astrojs/starlight/route-data';
 const { data } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute.entry;
 const { actions = [] } = data.hero || {};
 
-const contours = [
-	'M 60 416 C 210 356, 350 385, 468 344 S 704 315, 890 360',
-	'M 16 450 C 204 386, 348 423, 490 375 S 733 348, 930 396',
-	'M -30 488 C 174 424, 358 457, 508 410 S 755 384, 970 432',
-	'M -60 528 C 174 462, 364 500, 528 452 S 795 425, 1000 476',
-	'M -90 570 C 138 506, 370 540, 548 494 S 820 470, 1030 522',
-	'M -120 614 C 126 548, 378 586, 568 538 S 850 514, 1060 568',
+// The beam is one cubic Bézier from lower-left to upper-right, crossing behind
+// the console card. Every layer — spectral ribbons, fibers, sparks, the exit
+// flare, and the user-space gradients — derives from these four control
+// points, so the composition is tuned here and nowhere else.
+const A = { x: 6, y: 667 };
+const B = { x: 435, y: 558 };
+const C = { x: 845, y: 360 };
+const D = { x: 1434, y: 62 };
+
+const beamArc = `M ${A.x} ${A.y} C ${B.x} ${B.y}, ${C.x} ${C.y}, ${D.x} ${D.y}`;
+
+const cubicPoint = (t: number) => {
+	const u = 1 - t;
+	return {
+		x: u ** 3 * A.x + 3 * u ** 2 * t * B.x + 3 * u * t ** 2 * C.x + t ** 3 * D.x,
+		y: u ** 3 * A.y + 3 * u ** 2 * t * B.y + 3 * u * t ** 2 * C.y + t ** 3 * D.y,
+	};
+};
+
+const cubicTangent = (t: number) => {
+	const u = 1 - t;
+	return {
+		x: 3 * u ** 2 * (B.x - A.x) + 6 * u * t * (C.x - B.x) + 3 * t ** 2 * (D.x - C.x),
+		y: 3 * u ** 2 * (B.y - A.y) + 6 * u * t * (C.y - B.y) + 3 * t ** 2 * (D.y - C.y),
+	};
+};
+
+// The spectrum gradients live in user space, perpendicular to the arc where it
+// crosses the console card: warm fringe up-left, cool fringe down-right.
+const anchor = cubicPoint(0.71);
+const anchorTangent = cubicTangent(0.71);
+const anchorLength = Math.hypot(anchorTangent.x, anchorTangent.y);
+const normal = { x: -anchorTangent.y / anchorLength, y: anchorTangent.x / anchorLength };
+
+const spectrumBand = (halfWidth: number) => ({
+	x1: (anchor.x - normal.x * halfWidth).toFixed(1),
+	y1: (anchor.y - normal.y * halfWidth).toFixed(1),
+	x2: (anchor.x + normal.x * halfWidth).toFixed(1),
+	y2: (anchor.y + normal.y * halfWidth).toFixed(1),
+});
+
+const auraBand = spectrumBand(150);
+const haloBand = spectrumBand(68);
+const bodyBand = spectrumBand(26);
+
+const rampFrom = cubicPoint(0.5);
+const rampTo = cubicPoint(0.98);
+
+// Spectral fibers ride the same arc shifted along the beam normal, so each hue
+// holds its own track across the ribbon.
+const fibers = [
+	{ k: 21, color: '#ff4a2d', width: 2.6, dash: 150, gap: 940, dur: '8.4s', delay: '-1.2s', opacity: 0.6 },
+	{ k: 12, color: '#ff9438', width: 2.3, dash: 110, gap: 820, dur: '6.8s', delay: '-3.4s', opacity: 0.65 },
+	{ k: 5, color: '#ffd76a', width: 2.0, dash: 80, gap: 700, dur: '5.6s', delay: '-0.8s', opacity: 0.7 },
+	{ k: -4, color: '#7df0cf', width: 2.0, dash: 95, gap: 760, dur: '6.1s', delay: '-2.6s', opacity: 0.65 },
+	{ k: -11, color: '#55b6ff', width: 2.3, dash: 120, gap: 860, dur: '7.2s', delay: '-4.5s', opacity: 0.6 },
+	{ k: -19, color: '#8f6bff', width: 2.6, dash: 140, gap: 920, dur: '8.9s', delay: '-1.9s', opacity: 0.55 },
+].map((f) => ({ ...f, dx: (-f.k * normal.x).toFixed(1), dy: (-f.k * normal.y).toFixed(1) }));
+
+// Two brighter threads with slightly perturbed control points for organic wobble.
+const threads = [
+	{ d: `M ${A.x} ${A.y + 4} C ${B.x + 2} ${B.y + 6}, ${C.x + 2} ${C.y - 6}, ${D.x} ${D.y + 4}`, color: '#ffe9a8', width: 1.2, dash: 60, gap: 520, dur: '4.8s', delay: '-2.2s', opacity: 0.7 },
+	{ d: `M ${A.x} ${A.y - 4} C ${B.x - 2} ${B.y - 6}, ${C.x - 2} ${C.y + 6}, ${D.x} ${D.y - 4}`, color: '#9fd8ff', width: 1.2, dash: 70, gap: 560, dur: '5.3s', delay: '-0.4s', opacity: 0.65 },
 ];
 
-const rays = [
-	'M 455 338 C 396 420, 280 526, 158 640',
-	'M 477 338 C 446 430, 382 536, 316 640',
-	'M 501 337 C 492 432, 474 538, 456 640',
-	'M 527 337 C 540 428, 568 535, 600 640',
-	'M 553 338 C 590 426, 658 530, 738 640',
-	'M 580 340 C 644 420, 758 522, 886 640',
-	'M 425 342 C 326 414, 152 515, -18 610',
-	'M 610 344 C 704 414, 848 496, 990 574',
-];
+// Embers that drift along the beam direction and fade.
+const sparkDrift = (() => {
+	const tangent = cubicTangent(0.75);
+	const length = Math.hypot(tangent.x, tangent.y);
+	return { x: `${((tangent.x / length) * 42).toFixed(1)}px`, y: `${((tangent.y / length) * 42).toFixed(1)}px` };
+})();
 
-const nodes = [
-	{ x: 217, y: 413, kind: 'quiet' },
-	{ x: 357, y: 413, kind: 'hot' },
-	{ x: 487, y: 376, kind: 'quiet' },
-	{ x: 650, y: 365, kind: 'hot' },
-	{ x: 783, y: 405, kind: 'quiet' },
-	{ x: 182, y: 511, kind: 'hot' },
-	{ x: 477, y: 500, kind: 'quiet' },
-	{ x: 701, y: 485, kind: 'quiet' },
-	{ x: 847, y: 520, kind: 'hot' },
-];
+const sparks = [
+	{ t: 0.55, r: 2.2, dur: '3.6s', delay: '-0.6s' },
+	{ t: 0.65, r: 1.7, dur: '4.2s', delay: '-2.1s' },
+	{ t: 0.75, r: 2.6, dur: '3.2s', delay: '-1.4s' },
+	{ t: 0.85, r: 1.8, dur: '4.7s', delay: '-3.3s' },
+	{ t: 0.92, r: 2.3, dur: '3.9s', delay: '-2.8s' },
+].map((s) => {
+	const p = cubicPoint(s.t);
+	return { ...s, x: p.x.toFixed(1), y: p.y.toFixed(1) };
+});
+
+// The exit flare sits on the arc near the right edge so it crops with the beam
+// at every viewport width instead of being positioned against the hero box.
+const flarePoint = cubicPoint(0.9);
+const flareTangent = cubicTangent(0.9);
+const flareAngle = ((Math.atan2(flareTangent.y, flareTangent.x) * 180) / Math.PI).toFixed(1);
+
+// Deterministic starfield so every build renders the same sky.
+function mulberry32(seed: number) {
+	return () => {
+		seed |= 0;
+		seed = (seed + 0x6d2b79f5) | 0;
+		let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+const rand = mulberry32(1408);
+const tints = ['#f4f1ec', '#f4f1ec', '#ffe3c2', '#cfe0ff'];
+const stars = Array.from({ length: 46 }, () => ({
+	x: Math.round(rand() * 1440),
+	y: Math.round(rand() * 700),
+	r: (0.5 + rand() * 1.2).toFixed(2),
+	o: (0.1 + rand() * 0.3).toFixed(2),
+	tint: tints[Math.floor(rand() * tints.length)],
+	twinkles: rand() < 0.45,
+	dur: `${(3.5 + rand() * 4).toFixed(2)}s`,
+	delay: `${(-rand() * 6).toFixed(2)}s`,
+}));
+
+// The beam is split across two sibling layers so the browser can cache the
+// expensive one. Everything blurred is static and rasterizes exactly once;
+// everything that moves is filter-free and repaints cheaply. Mixing the two —
+// as a single SVG does — makes every animation frame re-run every Gaussian
+// blur across the whole viewport, which is what made this hero crawl.
+const staticStars = stars.filter((s) => !s.twinkles);
+const liveStars = stars.filter((s) => s.twinkles);
 ---
 
-<section class="bifrost-hero" aria-labelledby="_top">
-	<div class="terrain-wrap" aria-hidden="true">
-		<div class="terrain-halo"></div>
-		<svg class="semantic-terrain" viewBox="0 0 920 640" preserveAspectRatio="xMidYMax slice">
+<div class="beam-wrap" aria-hidden="true" data-beam-wrap>
+		<svg class="beam-layer beam-layer--static" viewBox="0 0 1440 720" preserveAspectRatio="xMidYMid slice">
 			<defs>
-				<linearGradient id="terrain-stroke" x1="0" y1="0" x2="1" y2="0">
-					<stop offset="0" stop-color="#eb3f33" stop-opacity="0" />
-					<stop offset="0.24" stop-color="#eb3f33" stop-opacity="0.38" />
-					<stop offset="0.58" stop-color="#f4f1ec" stop-opacity="0.28" />
-					<stop offset="1" stop-color="#eb3f33" stop-opacity="0" />
+			<linearGradient id="beam-spectrum-aura" gradientUnits="userSpaceOnUse" x1={auraBand.x1} y1={auraBand.y1} x2={auraBand.x2} y2={auraBand.y2}>
+				<stop offset="0" stop-color="#ff3b2c" stop-opacity="0" />
+				<stop offset="0.1" stop-color="#ff5a33" stop-opacity="0.65" />
+				<stop offset="0.22" stop-color="#ff9a3c" stop-opacity="0.85" />
+				<stop offset="0.36" stop-color="#ffd975" />
+				<stop offset="0.47" stop-color="#fffdf4" />
+				<stop offset="0.58" stop-color="#8ff0d8" />
+				<stop offset="0.74" stop-color="#4fa8ff" stop-opacity="0.95" />
+				<stop offset="0.9" stop-color="#8a63ff" stop-opacity="0.75" />
+				<stop offset="1" stop-color="#8a63ff" stop-opacity="0" />
+			</linearGradient>
+			<linearGradient id="beam-spectrum-halo" gradientUnits="userSpaceOnUse" x1={haloBand.x1} y1={haloBand.y1} x2={haloBand.x2} y2={haloBand.y2}>
+				<stop offset="0" stop-color="#ff3b2c" stop-opacity="0" />
+				<stop offset="0.1" stop-color="#ff5a33" stop-opacity="0.65" />
+				<stop offset="0.22" stop-color="#ff9a3c" stop-opacity="0.85" />
+				<stop offset="0.36" stop-color="#ffd975" />
+				<stop offset="0.47" stop-color="#fffdf4" />
+				<stop offset="0.58" stop-color="#8ff0d8" />
+				<stop offset="0.74" stop-color="#4fa8ff" stop-opacity="0.95" />
+				<stop offset="0.9" stop-color="#8a63ff" stop-opacity="0.75" />
+				<stop offset="1" stop-color="#8a63ff" stop-opacity="0" />
+			</linearGradient>
+				<linearGradient id="beam-spectrum-body" gradientUnits="userSpaceOnUse" x1={bodyBand.x1} y1={bodyBand.y1} x2={bodyBand.x2} y2={bodyBand.y2}>
+					<stop offset="0" stop-color="#ff3b2c" stop-opacity="0" />
+					<stop offset="0.08" stop-color="#ff5a33" stop-opacity="0.75" />
+					<stop offset="0.24" stop-color="#ff9a3c" stop-opacity="0.95" />
+					<stop offset="0.38" stop-color="#ffd975" />
+					<stop offset="0.5" stop-color="#fffdf4" />
+					<stop offset="0.62" stop-color="#8ff0d8" />
+					<stop offset="0.76" stop-color="#4fa8ff" stop-opacity="0.95" />
+					<stop offset="0.92" stop-color="#8a63ff" stop-opacity="0.75" />
+					<stop offset="1" stop-color="#8a63ff" stop-opacity="0" />
 				</linearGradient>
-				<radialGradient id="node-fill">
-					<stop offset="0" stop-color="#fff5ee" />
-					<stop offset="0.28" stop-color="#ff6a5f" />
-					<stop offset="1" stop-color="#eb3f33" stop-opacity="0" />
-				</radialGradient>
-				<filter id="terrain-glow" x="-100%" y="-100%" width="300%" height="300%">
-					<feGaussianBlur stdDeviation="4" result="blur" />
-					<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-				</filter>
-				<mask id="terrain-fade">
-					<linearGradient id="fade-gradient" x1="0" y1="0" x2="0" y2="1">
-						<stop offset="0" stop-color="black" />
-						<stop offset="0.5" stop-color="white" />
-						<stop offset="1" stop-color="white" />
-					</linearGradient>
-					<rect width="920" height="640" fill="url(#fade-gradient)" />
+				<linearGradient id="beam-ramp-gradient" gradientUnits="userSpaceOnUse" x1={rampFrom.x} y1={rampFrom.y} x2={rampTo.x} y2={rampTo.y}>
+					<stop offset="0" stop-color="#fff3d9" stop-opacity="0" />
+					<stop offset="0.55" stop-color="#fff3d9" stop-opacity="0" />
+					<stop offset="0.82" stop-color="#ffe9bd" stop-opacity="0.3" />
+					<stop offset="1" stop-color="#fffdf4" stop-opacity="0.75" />
+				</linearGradient>
+				<linearGradient id="beam-entry" x1="0" y1="0" x2="1" y2="0">
+					<stop offset="0" stop-color="black" />
+					<stop offset="0.2" stop-color="black" />
+					<stop offset="0.46" stop-color="white" />
+					<stop offset="1" stop-color="white" />
+				</linearGradient>
+				<mask id="beam-entry-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="1440" height="720">
+					<rect width="1440" height="720" fill="url(#beam-entry)" />
 				</mask>
-			</defs>
+				<!-- Filter regions are sized to half the stroke plus the blur's ~3σ
+				     spread and no further. The old uniform -40%/-80%/180%/260% box
+				     rasterised roughly 4M pixels per pass, most of it empty. -->
+				<filter id="beam-blur-xl" x="-20%" y="-50%" width="140%" height="200%">
+					<feGaussianBlur stdDeviation="30" />
+				</filter>
+				<filter id="beam-blur-lg" x="-12%" y="-25%" width="124%" height="150%">
+					<feGaussianBlur stdDeviation="13" />
+				</filter>
+				<filter id="beam-blur-sm" x="-5%" y="-12%" width="110%" height="124%">
+					<feGaussianBlur stdDeviation="1.6" />
+				</filter>
+			<filter id="core-glow" x="-5%" y="-12%" width="110%" height="124%">
+				<feGaussianBlur stdDeviation="4" result="blur" />
+				<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+			</filter>
+			<radialGradient id="flare-glow">
+				<stop offset="0" stop-color="#fffdf4" stop-opacity="0.75" />
+				<stop offset="0.24" stop-color="#ffe9bd" stop-opacity="0.32" />
+				<stop offset="0.52" stop-color="#ffb27a" stop-opacity="0.1" />
+				<stop offset="1" stop-color="#ffb27a" stop-opacity="0" />
+			</radialGradient>
+			<!-- The flare's hot centre was a solid disc pushed through a Gaussian
+			     blur. Baking the same falloff into a gradient costs no filter pass,
+			     which lets the flare animate on the cheap live layer. -->
+			<radialGradient id="flare-core">
+				<stop offset="0" stop-color="#fffdf4" stop-opacity="0.92" />
+				<stop offset="0.34" stop-color="#fffdf4" stop-opacity="0.6" />
+				<stop offset="0.68" stop-color="#fffdf4" stop-opacity="0.16" />
+				<stop offset="1" stop-color="#fffdf4" stop-opacity="0" />
+			</radialGradient>
+		</defs>
 
-			<g class="terrain-mesh" mask="url(#terrain-fade)" fill="none" stroke="url(#terrain-stroke)">
-				{contours.map((d, index) => <path d={d} style={`--line-index:${index}`} />)}
-				{rays.map((d, index) => <path class="terrain-ray" d={d} style={`--line-index:${index}`} />)}
-			</g>
-
-			<path
-				class="analysis-route"
-				d="M 182 511 C 245 467, 294 446, 357 413 S 550 386, 650 365 S 758 431, 847 520"
-				fill="none"
-				stroke="#ff6a5f"
-				stroke-width="2"
-				stroke-linecap="round"
-				filter="url(#terrain-glow)"
-			/>
-
-			<g class="route-arrows" fill="none" stroke="#ff6a5f" stroke-width="1.25" stroke-opacity="0.78" stroke-linecap="square" stroke-linejoin="miter">
-				<path d="M -6 -4 L 0 0 L -6 4" transform="translate(292 443) rotate(-23)" />
-				<path d="M -6 -4 L 0 0 L -6 4" transform="translate(515 385) rotate(-7)" />
-				<path d="M -6 -4 L 0 0 L -6 4" transform="translate(751 423) rotate(35)" />
-			</g>
-
-			<g class="terrain-nodes">
+			<g class="starfield">
 				{
-					nodes.map(({ x, y, kind }, index) => (
-						<g class:list={['terrain-node', kind]} style={`--node-index:${index}`}>
-							<circle cx={x} cy={y} r={kind === 'hot' ? 16 : 10} fill="url(#node-fill)" />
-							<rect
-								x={x - (kind === 'hot' ? 4 : 3)}
-								y={y - (kind === 'hot' ? 4 : 3)}
-								width={kind === 'hot' ? 8 : 6}
-								height={kind === 'hot' ? 8 : 6}
-								fill={kind === 'hot' ? '#fff5ee' : '#ff6a5f'}
-								transform={`rotate(45 ${x} ${y})`}
-							/>
-						</g>
+					staticStars.map((s) => (
+						<circle class="star" cx={s.x} cy={s.y} r={s.r} fill={s.tint} style={`--o:${s.o}`} />
 					))
 				}
 			</g>
 
-			<g class="graph-annotations" font-family="JetBrains Mono, ui-monospace, monospace" font-weight="500">
-				<g class="symbol-label" transform="translate(125 523)">
-					<rect width="116" height="21" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="9" y="14" style="fill:#cbc4b7;font-size:7.5px;letter-spacing:0.15px">call("authenticate")</text>
-				</g>
-				<g class="symbol-label" transform="translate(276 382)">
-					<rect width="164" height="21" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="9" y="14" style="fill:#cbc4b7;font-size:7.5px;letter-spacing:0.15px">LoginController.authenticate</text>
-				</g>
-				<g class="symbol-label" transform="translate(595 326)">
-					<rect width="112" height="21" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="9" y="14" style="fill:#cbc4b7;font-size:7.5px;letter-spacing:0.15px">AuthService.login</text>
-				</g>
-				<g class="symbol-label" transform="translate(605 541)">
-					<rect width="120" height="21" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="9" y="14" style="fill:#cbc4b7;font-size:7.5px;letter-spacing:0.15px">token_refresh.py:41</text>
-				</g>
+			<g class="beam" mask="url(#beam-entry-mask)">
+				<path class="beam-aura" d={beamArc} fill="none" stroke="url(#beam-spectrum-aura)" stroke-width="300" filter="url(#beam-blur-xl)" />
+				<path class="beam-halo" d={beamArc} fill="none" stroke="url(#beam-spectrum-halo)" stroke-width="130" filter="url(#beam-blur-lg)" />
+				<path class="beam-ramp" d={beamArc} fill="none" stroke="url(#beam-ramp-gradient)" stroke-width="90" filter="url(#beam-blur-lg)" />
+				<path class="beam-body" d={beamArc} fill="none" stroke="url(#beam-spectrum-body)" stroke-width="46" filter="url(#beam-blur-sm)" />
+				<path class="beam-core-soft" d={beamArc} fill="none" stroke="#ffffff" stroke-width="20" opacity="0.22" filter="url(#beam-blur-lg)" />
+				<path class="beam-core" d={beamArc} fill="none" stroke="#fff8ea" stroke-width="6" opacity="0.82" filter="url(#core-glow)" />
+			</g>
+	</svg>
 
-				<g class="edge-label" transform="translate(226 448)">
-					<rect width="82" height="16" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="7" y="11" style="fill:#ff6a5f;font-size:6.5px;letter-spacing:0.35px;text-transform:none">enclosing-decl</text>
-				</g>
-				<g class="edge-label" transform="translate(466 367)">
-					<rect width="48" height="16" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="7" y="11" style="fill:#ff6a5f;font-size:6.5px;letter-spacing:0.35px;text-transform:none">callees</text>
-				</g>
-				<g class="edge-label" transform="translate(650 392)">
-					<rect width="76" height="16" rx="2" style="fill:#080808;fill-opacity:0.72;stroke:#f4f1ec;stroke-opacity:0.12;stroke-width:0.7px" />
-					<text x="7" y="11" style="fill:#ff6a5f;font-size:6.5px;letter-spacing:0.35px;text-transform:none">references-of</text>
-				</g>
+	<svg class="beam-layer beam-layer--live" viewBox="0 0 1440 720" preserveAspectRatio="xMidYMid slice">
+			<g class="starfield">
+				{
+					liveStars.map((s) => (
+						<circle
+							class="star twinkle"
+							cx={s.x}
+							cy={s.y}
+							r={s.r}
+							fill={s.tint}
+							style={`--o:${s.o};--dur:${s.dur};--delay:${s.delay}`}
+						/>
+					))
+				}
 			</g>
 
-			<g class="horizon-cluster" transform="translate(530 322)">
-				<circle r="54" fill="none" stroke="#eb3f33" stroke-opacity="0.18" />
-				<circle r="33" fill="none" stroke="#f4f1ec" stroke-opacity="0.14" stroke-dasharray="2 8" />
-				<rect x="-7" y="-7" width="14" height="14" fill="#eb3f33" transform="rotate(45)" filter="url(#terrain-glow)" />
+			<g>
+				{
+					fibers.map((f) => (
+						<path
+							class="beam-fiber"
+							d={beamArc}
+							stroke={f.color}
+							stroke-width={f.width}
+							stroke-dasharray={`${f.dash} ${f.gap}`}
+							opacity={f.opacity}
+							transform={`translate(${f.dx} ${f.dy})`}
+							style={`--dur:${f.dur};--delay:${f.delay};--cycle:${f.dash + f.gap}`}
+						/>
+					))
+				}
+				{
+					threads.map((t) => (
+						<path
+							class="beam-fiber"
+							d={t.d}
+							stroke={t.color}
+							stroke-width={t.width}
+							stroke-dasharray={`${t.dash} ${t.gap}`}
+							opacity={t.opacity}
+							style={`--dur:${t.dur};--delay:${t.delay};--cycle:${t.dash + t.gap}`}
+						/>
+					))
+				}
+				<path class="beam-core-pulse" d={beamArc} fill="none" stroke="#fff8ea" stroke-width="6" />
 			</g>
-		</svg>
-	</div>
 
+			<g>
+				{
+					sparks.map((s) => (
+						<circle
+							class="beam-spark"
+							cx={s.x}
+							cy={s.y}
+							r={s.r}
+							fill="#fff8ea"
+							style={`--dur:${s.dur};--delay:${s.delay};--dx:${sparkDrift.x};--dy:${sparkDrift.y}`}
+						/>
+					))
+				}
+			</g>
+
+			<g transform={`translate(${flarePoint.x.toFixed(1)} ${flarePoint.y.toFixed(1)})`}>
+				<g class="exit-flare">
+					<circle r="200" fill="url(#flare-glow)" />
+					<ellipse rx="230" ry="10" fill="url(#flare-glow)" opacity="0.8" transform={`rotate(${flareAngle})`} />
+					<circle r="72" fill="url(#flare-core)" />
+				</g>
+			</g>
+	</svg>
+</div>
+
+<script is:inline>
+	// The beam is a page-level backdrop: hoist it out of the constrained content
+	// column so it spans the full viewport width from the very top of the page.
+	// Structural move only — no measurement. Runs inline to avoid a first-paint flash.
+	const beamWrap = document.querySelector('[data-beam-wrap]');
+	if (beamWrap && beamWrap.parentElement !== document.body) {
+		document.body.prepend(beamWrap);
+	}
+</script>
+
+<section class="bifrost-hero" aria-labelledby="_top">
 	<div class="hero-copy">
 		<p class="hero-eyebrow">
 			<span></span> Bifrost by <a href="https://brokk.ai" rel="external">Brokk</a>
-			<b>Analyzer online</b>
 		</p>
 		<h1
 			id="_top"
@@ -187,26 +351,30 @@ const nodes = [
 		</ul>
 	</div>
 
-	<div class="query-console" aria-hidden="true">
-		<div class="console-topline">
-			<span><i></i> QUERY / SYMBOL GRAPH</span>
-			<small>RQL</small>
+	<div class="query-console bifrost-panel bifrost-panel--reverse" aria-hidden="true">
+		<div class="console-topline">WHAT IS CODE INTELLIGENCE?</div>
+		<p class="console-brief">
+			One structured model of the whole repository — symbols, references, and call edges
+			resolved across files, never text matching.
+		</p>
+		<div class="console-spec">
+			<span>LANGUAGES</span>
+			<small>PY · JAVA · JS · TS · GO · C · C++ · RUST · PHP · SCALA · C# · RUBY</small>
 		</div>
-		<code>(<b>call</b> :callee (<b>name</b> <span>"authenticate"</span>))</code>
-		<div class="result-row primary"><i></i><span>AuthService.login</span><small>callsite</small></div>
-		<div class="result-row"><i></i><span>SessionController.create</span><small>callsite</small></div>
-		<div class="result-row"><i></i><span>TokenRefresh.run</span><small>callsite</small></div>
-		<div class="console-foot"><span>3 structured results</span><span>NO TEXT FALLBACK</span></div>
+		<div class="console-spec">
+			<span>INTERFACES</span>
+			<small>MCP · LSP · CLI · PYTHON · RUST</small>
+		</div>
 	</div>
 </section>
 
 <script>
 	const audiences = [
-		{ text: 'for AI.', scale: '1' },
-		{ text: 'for developers.', scale: '0.78' },
-		{ text: 'for researchers.', scale: '0.74' },
-		{ text: 'for security teams.', scale: '0.6' },
-		{ text: 'for tool builders.', scale: '0.67' },
+		'for AI.',
+		'for developers.',
+		'for researchers.',
+		'for security teams.',
+		'for tool builders.',
 	];
 
 	function startAudienceRotation() {
@@ -233,8 +401,7 @@ const nodes = [
 				if (!audience.isConnected) return;
 				audienceIndex = (audienceIndex + 1) % audiences.length;
 				const nextAudience = audiences[audienceIndex];
-				audience.textContent = nextAudience.text;
-				audience.style.setProperty('--audience-scale', nextAudience.scale);
+				audience.textContent = nextAudience;
 				audience.classList.remove('is-changing');
 			}, 180);
 		}, 3600);
@@ -247,25 +414,55 @@ const nodes = [
 <style>
 	@layer starlight.user {
 		.bifrost-hero {
+			/* Legibility over the beam. Wide, soft shadows spread the same ink over
+			   a large area, so density at the glyph edge — the only place it does
+			   any work — ends up near zero against a bright backdrop. These stack
+			   short radii at high opacity instead: a contact shadow that hugs the
+			   letterform, then one or two tighter falloffs to seat it. */
+			--bifrost-text-shadow-sm:
+				0 0 2px rgb(5 5 5 / 0.95),
+				0 1px 3px rgb(5 5 5 / 0.9),
+				0 1px 6px rgb(5 5 5 / 0.7);
+			--bifrost-text-shadow-md:
+				0 0 2px rgb(5 5 5 / 0.96),
+				0 1px 4px rgb(5 5 5 / 0.92),
+				0 1px 8px rgb(5 5 5 / 0.72);
+			--bifrost-text-shadow-lg:
+				0 0 3px rgb(5 5 5 / 0.94),
+				0 2px 6px rgb(5 5 5 / 0.9),
+				0 2px 12px rgb(5 5 5 / 0.7);
+
 			position: relative;
 			isolation: isolate;
 			min-height: min(43rem, calc(100vh - var(--sl-nav-height) - 3rem));
 			display: grid;
 			align-items: center;
-			padding: clamp(2rem, 4.5vw, 4.5rem) clamp(0rem, 2vw, 1.5rem) clamp(6rem, 13vw, 11rem);
-			overflow: hidden;
+			padding:
+				clamp(var(--bifrost-space-8), 4.5vw, 4.5rem)
+				clamp(0rem, 2vw, var(--bifrost-space-6))
+				clamp(6rem, 13vw, 11rem);
+			/* Deliberately not clipped. The copy's scrim has to run off the left
+			   of the page, and clipping it here cut it at the hero's edge — which
+			   on a wide display lands in the middle of the lit area and reads as
+			   a hard vertical line. Nothing inside the hero overflows now that
+			   ::before is capped, verified from 520px to 2400px. */
+			overflow: visible;
 		}
 
 		.bifrost-hero::before {
 			position: absolute;
 			z-index: -1;
 			inset: 6% auto auto 45%;
-			width: 36rem;
-			height: 36rem;
+			/* Capped at half the hero so it cannot spill off the right edge at
+			   narrow widths. A fixed 36rem starting at 45% overflowed by ~290px
+			   at 520px wide, and that was the only reason the hero had to clip. */
+			width: min(36rem, 50%);
+			aspect-ratio: 1;
 			border-radius: 50%;
+			/* A radial gradient is already smooth; blurring it only bought a
+			   full-size filter pass on every repaint. */
 			background: radial-gradient(circle, rgb(235 63 51 / 0.14), transparent 66%);
 			content: '';
-			filter: blur(6px);
 		}
 
 		.hero-copy {
@@ -274,15 +471,48 @@ const nodes = [
 			width: min(43rem, 64%);
 		}
 
+		/* The beam passes directly behind this column and its core is near-white,
+		   which no amount of text shadow can hold contrast against — a shadow can
+		   only darken the few pixels it reaches, and against a bright backdrop
+		   the glyph itself is still light-on-light. So the copy sits on a soft
+		   scrim that darkens the backdrop only where the words actually are and
+		   fades out well before any edge, leaving the beam intact around it. */
+		.hero-copy::before {
+			position: absolute;
+			z-index: -1;
+			/* Runs off the left of the hero rather than stopping beside the text.
+			   The hero's own overflow clips it, but by that point the beam is
+			   behind its entry mask and the scrim is the same colour as the page
+			   background, so there is nothing there for a cut edge to show
+			   against. Stopping at -4rem put the cut in the middle of the lit
+			   area, which read as a hard border. */
+			inset: -3rem -9rem -2.5rem -50vw;
+			/* Stops are measured from the right edge so the falloff keeps its
+			   shape instead of stretching with the box. */
+			background: linear-gradient(
+				270deg,
+				transparent 0,
+				rgb(5 5 5 / 0.45) 7rem,
+				rgb(5 5 5 / 0.85) 22rem,
+				rgb(5 5 5 / 0.88) 100%
+			);
+			/* Softens the top and bottom so those edges do not cut either. */
+			mask-image: linear-gradient(180deg, transparent 0, black 14%, black 82%, transparent 100%);
+			content: '';
+			pointer-events: none;
+		}
+
 		.hero-eyebrow {
 			display: flex;
 			align-items: center;
-			gap: 0.6rem;
-			margin: 0 0 1.5rem;
+			gap: var(--bifrost-space-3);
+			margin: 0 0 var(--bifrost-space-6);
 			color: #cbc4b7;
-			font-family: var(--sl-font-mono);
-			font-size: clamp(0.64rem, 0.8vw, 0.74rem);
-			letter-spacing: 0.09em;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-bold);
+			letter-spacing: var(--bifrost-tracking-widest);
+			text-shadow: var(--bifrost-text-shadow-sm);
 			text-transform: uppercase;
 		}
 
@@ -292,13 +522,6 @@ const nodes = [
 			background: #eb3f33;
 			box-shadow: 0 0 14px #eb3f33;
 			transform: rotate(45deg);
-		}
-
-		.hero-eyebrow b {
-			margin-inline-start: auto;
-			color: #ff6a5f;
-			font-size: 0.58rem;
-			font-weight: 500;
 		}
 
 		.hero-eyebrow a {
@@ -319,11 +542,12 @@ const nodes = [
 			max-width: 11ch;
 			margin: 0;
 			color: #f4f1ec;
-			font-family: "Staatliches", "Brokk Docs Display", Impact, sans-serif;
-			font-size: clamp(4.3rem, 9.2vw, 8.6rem);
-			font-weight: 400;
-			letter-spacing: -0.025em;
-			line-height: 0.82;
+			font-family: var(--bifrost-font-display);
+			font-size: var(--bifrost-text-display-hero);
+			font-weight: var(--bifrost-weight-regular);
+			letter-spacing: var(--bifrost-tracking-tightest);
+			line-height: var(--bifrost-leading-hero);
+			text-shadow: var(--bifrost-text-shadow-lg);
 			text-wrap: balance;
 		}
 
@@ -331,52 +555,56 @@ const nodes = [
 			display: block;
 			color: #eb3f33;
 			font-style: normal;
-			text-shadow: 0 0 38px rgb(235 63 51 / 0.22);
+			/* Keeps a trace of the red bloom, but behind the same tight dark stack
+			   so the red never has to carry legibility on its own. */
+			text-shadow:
+				var(--bifrost-text-shadow-lg),
+				0 0 20px rgb(235 63 51 / 0.18);
 		}
 
 		.hero-audience {
 			display: inline-block;
 			white-space: nowrap;
-			transform: translateY(0) scale(var(--audience-scale, 1));
+			transform: translateY(0);
 			transform-origin: left center;
 			transition: opacity 180ms ease, transform 180ms ease;
 		}
 
 		.hero-audience.is-changing {
 			opacity: 0;
-			transform: translateY(0.08em) scale(var(--audience-scale, 1));
+			transform: translateY(0.08em);
 		}
 
 		.hero-tagline {
 			max-width: 56ch;
-			margin: clamp(1.5rem, 3vw, 2.2rem) 0 0;
+			margin: var(--bifrost-space-8) 0 0;
 			color: #cbc4b7;
-			font-size: clamp(1.02rem, 1.55vw, 1.24rem);
-			font-weight: 500;
-			line-height: 1.52;
+			font-size: var(--bifrost-text-tagline);
+			font-weight: var(--bifrost-weight-medium);
+			line-height: var(--bifrost-leading-body);
+			text-shadow: var(--bifrost-text-shadow-md);
 		}
 
 		.hero-actions {
 			display: flex;
 			flex-wrap: wrap;
-			gap: 0.75rem;
-			margin-top: 1.8rem;
+			gap: var(--bifrost-space-3);
+			margin-top: var(--bifrost-space-8);
 		}
 
 		.hero-actions :global(a) {
 			position: relative;
-			border-radius: 0.2rem;
-			font-family: var(--sl-font-mono);
-			font-size: 0.74rem;
-			letter-spacing: 0.055em;
+			border-radius: 999rem;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-bold);
+			letter-spacing: var(--bifrost-tracking-wider);
 			text-transform: uppercase;
 			transition:
 				background-color 180ms ease,
 				border-color 180ms ease,
 				box-shadow 180ms ease,
 				color 180ms ease,
-				filter 180ms ease,
-				opacity 180ms ease,
 				transform 180ms ease;
 		}
 
@@ -384,17 +612,18 @@ const nodes = [
 			transition: transform 180ms ease;
 		}
 
-		.hero-actions:hover :global(a),
-		.hero-actions:focus-within :global(a) {
-			filter: saturate(0.45);
-			opacity: 0.48;
-			transform: scale(0.985);
+		.hero-actions :global(a.secondary) {
+			border-color: var(--bifrost-line-strong);
+			background: color-mix(in srgb, var(--bifrost-surface-raised) 92%, transparent);
 		}
 
+		/* Each button answers for itself. The previous version dimmed the whole
+		   group on :hover/:focus-within and then restored the active one, which
+		   made the gap between the buttons a dead zone where both went flat, and
+		   left both stuck at 48% after a mouse click — :focus-within matched the
+		   dimming but :focus-visible never matched the restore. */
 		.hero-actions :global(a:hover),
 		.hero-actions :global(a:focus-visible) {
-			filter: saturate(1.08);
-			opacity: 1;
 			transform: translateY(-2px);
 		}
 
@@ -431,280 +660,255 @@ const nodes = [
 			display: grid;
 			grid-template-columns: repeat(3, 1fr);
 			gap: 0;
-			max-width: 42rem;
-			margin: 2.6rem 0 0;
+			max-width: 46rem;
+			margin: calc(var(--bifrost-space-12) + var(--bifrost-space-2)) 0 0;
 			padding: 0;
 			border-block: 1px solid rgb(255 255 255 / 0.1);
 			list-style: none;
 		}
 
+		/* Single column: the index sits on its own row above the label rather
+		   than beside it. */
 		.hero-proof li {
 			display: grid;
-			grid-template-columns: auto 1fr;
-			gap: 0.08rem 0.75rem;
-			padding: 0.92rem 0.9rem 0.92rem 0;
+			gap: var(--bifrost-space-1);
+			padding: var(--bifrost-space-5) var(--bifrost-space-4) var(--bifrost-space-5) 0;
 		}
 
 		.hero-proof li + li {
-			padding-inline-start: 0.9rem;
+			padding-inline-start: var(--bifrost-space-5);
 			border-inline-start: 1px solid rgb(255 255 255 / 0.1);
 		}
 
+		/* #eb3f33 lost against the beam's warm band; #ff6a5f is the same hue with
+		   enough lightness to separate from it. */
 		.hero-proof span {
-			grid-row: 1 / 3;
-			align-self: center;
-			color: #eb3f33;
-			font-family: var(--sl-font-mono);
-			font-size: 0.64rem;
+			margin-bottom: var(--bifrost-space-1);
+			color: #ff6a5f;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-shadow: var(--bifrost-text-shadow-sm);
 		}
 
 		.hero-proof strong,
 		.hero-proof small {
-			font-family: var(--sl-font-mono);
+			font-family: var(--bifrost-font-mono);
+			text-shadow: var(--bifrost-text-shadow-sm);
 		}
 
 		.hero-proof strong {
 			color: #f4f1ec;
-			font-size: 0.82rem;
-			font-weight: 500;
+			font-size: var(--bifrost-text-xl);
+			font-weight: var(--bifrost-weight-semibold);
 		}
 
+		/* Was #948b7e — a mid grey with nowhere near enough contrast once the
+		   beam is behind it. */
 		.hero-proof small {
-			color: #948b7e;
-			font-size: 0.66rem;
+			color: #cbc4b7;
+			font-size: var(--bifrost-text-sm);
 		}
 
-		.terrain-wrap {
+		.beam-wrap {
 			position: absolute;
 			z-index: 0;
-			inset: 0 -5% -4% 14%;
+			inset: 0 0 auto 0;
+			height: min(62rem, 100vh);
+			overflow: hidden;
+			contain: layout paint;
 			pointer-events: none;
+			mask-image: linear-gradient(180deg, black 80%, transparent 99%);
 		}
 
-		.terrain-halo {
+		.beam-layer {
 			position: absolute;
-			inset: 40% 0 0 15%;
-			background: radial-gradient(ellipse at 58% 55%, rgb(235 63 51 / 0.16), transparent 50%);
-			filter: blur(18px);
-		}
-
-		.semantic-terrain {
+			inset: 0;
 			width: 100%;
 			height: 100%;
-			overflow: visible;
+			/* Promote both layers so the static raster is retained across frames
+			   instead of being regenerated whenever the live layer ticks. */
+			transform: translateZ(0);
 		}
 
-		.terrain-mesh path {
-			stroke-width: 1;
-			opacity: calc(0.38 + var(--line-index) * 0.04);
-			vector-effect: non-scaling-stroke;
+		/* Holds every Gaussian blur, and nothing that animates: painted once. */
+		.beam-layer--static {
+			z-index: 0;
 		}
 
-		.terrain-ray {
-			stroke-dasharray: 1 5;
+		/* Holds everything that animates, and no filter at all. Blending once at
+		   the layer level replaces the 13 per-element blends this used to do, and
+		   the entry fade is a composited CSS mask rather than an SVG mask that
+		   would force an offscreen pass every frame. */
+		.beam-layer--live {
+			z-index: 1;
+			mix-blend-mode: screen;
+			mask-image: linear-gradient(90deg, transparent 0 20%, black 46%);
 		}
 
-		.analysis-route {
-			stroke-dasharray: 2 14;
-			animation: route-flow 5s linear infinite;
-			vector-effect: non-scaling-stroke;
+		.star {
+			opacity: var(--o, 0.3);
 		}
 
-		.route-arrows path {
-			stroke-width: 1.25;
-			opacity: 0.78;
-			vector-effect: non-scaling-stroke;
+		.star.twinkle {
+			animation: star-twinkle var(--dur, 5s) ease-in-out var(--delay, 0s) infinite;
 		}
 
-		.graph-annotations text {
-			font-family: var(--sl-font-mono);
-			font-weight: 500;
+		.beam-aura {
+			mix-blend-mode: screen;
+			opacity: 0.17;
 		}
 
-		.symbol-label rect,
-		.edge-label rect {
-			fill: rgb(8 8 8 / 0.78);
-			stroke: rgb(255 255 255 / 0.11);
-			stroke-width: 0.7;
-			vector-effect: non-scaling-stroke;
+		.beam-halo {
+			mix-blend-mode: screen;
+			opacity: 0.42;
 		}
 
-		.symbol-label text {
-			fill: #cbc4b7;
-			font-size: 7.5px;
-			letter-spacing: 0.15px;
-			text-transform: none;
+		.beam-ramp {
+			mix-blend-mode: screen;
 		}
 
-		.edge-label text {
-			fill: #ff6a5f;
-			font-size: 6.5px;
-			letter-spacing: 0.7px;
+		.beam-core-soft {
+			mix-blend-mode: screen;
 		}
 
+		.beam-core {
+			mix-blend-mode: screen;
+		}
 
-		.terrain-node {
-			animation: node-breathe 3.6s ease-in-out infinite;
-			animation-delay: calc(var(--node-index) * -0.38s);
+		/* The core's breathing is now an additive, filter-free overlay on the live
+		   layer. Animating the filtered core directly re-ran its glow every frame. */
+		.beam-core-pulse {
+			animation: core-breathe 4.6s ease-in-out infinite;
+		}
+
+		.beam-fiber {
+			fill: none;
+			stroke-linecap: round;
+			animation: fiber-flow var(--dur, 7s) linear var(--delay, 0s) infinite;
+		}
+
+		.beam-spark {
+			opacity: 0;
+			animation: spark-drift var(--dur, 4s) ease-in-out var(--delay, 0s) infinite;
+		}
+
+		.exit-flare {
+			opacity: 0.75;
 			transform-box: fill-box;
 			transform-origin: center;
-		}
-
-		.terrain-node.quiet {
-			opacity: 0.56;
-		}
-
-		.horizon-cluster {
-			animation: cluster-float 8s ease-in-out infinite;
-			transform-box: fill-box;
-			transform-origin: center;
-		}
-
-		.horizon-cluster circle:last-of-type {
-			animation: cluster-spin 18s linear infinite;
-			transform-box: fill-box;
-			transform-origin: center;
+			animation: flare-pulse 5.4s ease-in-out infinite;
 		}
 
 		.query-console {
-			position: absolute;
 			z-index: 4;
 			inset-inline-end: 1.5%;
-			inset-block-start: 16%;
-			width: min(28rem, 34%);
-			padding: 0.85rem;
-			border: 1px solid rgb(255 255 255 / 0.13);
-			border-radius: 0.35rem;
+			inset-block-start: 18.5%;
+			/* Held at 34% so the panel keeps clear of .hero-copy; the larger type
+			   is absorbed by growing downward, which the hero has room for. */
+			width: min(29rem, 34%);
+			padding: var(--bifrost-space-5);
+			font-family: var(--bifrost-font-mono);
+			transform: none;
+			background: linear-gradient(
+				112deg,
+				rgb(255 92 60 / 0.6),
+				rgb(255 196 92 / 0.62) 26%,
+				rgb(244 241 236 / 0.66) 50%,
+				rgb(94 190 255 / 0.62) 76%,
+				rgb(141 107 255 / 0.6)
+			);
+		}
+
+		.query-console::after {
 			background:
+				linear-gradient(112deg, rgb(255 122 77 / 0.08), transparent 32%, transparent 68%, rgb(85 140 255 / 0.08)),
 				linear-gradient(150deg, rgb(255 255 255 / 0.055), transparent 50%),
-				rgb(8 8 8 / 0.82);
+				rgb(8 8 8 / 0.94);
 			box-shadow: 0 28px 70px rgb(0 0 0 / 0.46);
-			backdrop-filter: blur(16px);
-			transform: perspective(1000px) rotateY(-4deg) rotateX(1deg);
 		}
 
 		.console-topline,
-		.console-foot,
-		.result-row {
-			display: flex;
-			align-items: center;
+		.console-brief,
+		.console-spec {
+			position: relative;
+			z-index: 1;
 		}
 
 		.console-topline {
-			justify-content: space-between;
-			padding-bottom: 0.75rem;
+			padding-bottom: var(--bifrost-space-3);
 			border-bottom: 1px solid rgb(255 255 255 / 0.09);
-			color: #948b7e;
-			font-family: var(--sl-font-mono);
-			font-size: 0.57rem;
-			letter-spacing: 0.08em;
-		}
-
-		.console-topline i {
-			display: inline-block;
-			width: 0.42rem;
-			height: 0.42rem;
-			margin-inline-end: 0.45rem;
-			border-radius: 50%;
-			background: #eb3f33;
-			box-shadow: 0 0 9px #eb3f33;
-		}
-
-		.console-topline small {
-			color: #ff6a5f;
-		}
-
-		.query-console code {
-			display: block;
-			margin: 0.75rem 0;
-			padding: 0.72rem;
-			border: 1px solid rgb(235 63 51 / 0.22);
-			background: rgb(235 63 51 / 0.045);
 			color: #cbc4b7;
-			font-size: clamp(0.6rem, 0.8vw, 0.72rem);
-			white-space: nowrap;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-base);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-widest);
 		}
 
-		.query-console code b {
-			color: #ff6a5f;
-			font-weight: 500;
+		.console-brief {
+			margin: var(--bifrost-space-4) 0;
+			color: #cbc4b7;
+			font-family: var(--bifrost-font-body);
+			font-size: var(--bifrost-text-xl);
+			font-weight: var(--bifrost-weight-medium);
+			line-height: 1.55;
 		}
 
-		.query-console code span {
-			color: #f4f1ec;
-		}
-
-		.result-row {
-			gap: 0.6rem;
-			padding: 0.55rem 0.4rem;
+		/* Label stacked above its list rather than beside it, so the values get
+		   the panel's full width instead of sharing it with a label column. */
+		.console-spec {
+			padding-top: var(--bifrost-space-3);
 			border-top: 1px solid rgb(255 255 255 / 0.06);
-			color: #948b7e;
-			font-family: var(--sl-font-mono);
-			font-size: clamp(0.55rem, 0.72vw, 0.68rem);
 		}
 
-		.result-row i {
-			width: 0.36rem;
-			height: 0.36rem;
-			border: 1px solid currentColor;
-			transform: rotate(45deg);
+		.console-spec + .console-spec {
+			margin-top: var(--bifrost-space-3);
 		}
 
-		.result-row span {
-			min-width: 0;
-			overflow: hidden;
-			text-overflow: ellipsis;
-			white-space: nowrap;
+		.console-spec > span {
+			display: block;
+			margin-bottom: var(--bifrost-space-2);
+			color: #ff6a5f;
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-widest);
 		}
 
-		.result-row small {
-			margin-inline-start: auto;
-			color: #5f5a52;
-			text-transform: uppercase;
+		.console-spec > small {
+			display: block;
+			color: #cbc4b7;
+			font-size: var(--bifrost-text-base);
+			letter-spacing: var(--bifrost-tracking-wide);
+			line-height: 1.65;
 		}
 
-		.result-row.primary {
-			color: #f4f1ec;
+		@keyframes fiber-flow {
+			to { stroke-dashoffset: calc(-1 * var(--cycle, 1000)); }
 		}
 
-		.result-row.primary i {
-			border-color: #eb3f33;
-			background: #eb3f33;
-			box-shadow: 0 0 8px rgb(235 63 51 / 0.6);
+		@keyframes core-breathe {
+			0%, 100% { opacity: 0; }
+			50% { opacity: 0.28; }
 		}
 
-		.console-foot {
-			justify-content: space-between;
-			padding: 0.7rem 0.4rem 0;
-			color: #5f5a52;
-			font-family: var(--sl-font-mono);
-			font-size: 0.5rem;
-			letter-spacing: 0.06em;
+		@keyframes spark-drift {
+			0% { opacity: 0; transform: translate(0, 0); }
+			16% { opacity: 0.85; }
+			100% { opacity: 0; transform: translate(var(--dx, 42px), var(--dy, -16px)); }
 		}
 
-		.console-foot span:last-child {
-			color: #80615d;
+		@keyframes star-twinkle {
+			0%, 100% { opacity: calc(var(--o, 0.3) * 0.35); }
+			50% { opacity: var(--o, 0.3); }
 		}
 
-		@keyframes route-flow {
-			to { stroke-dashoffset: -160; }
+		@keyframes flare-pulse {
+			0%, 100% { opacity: 0.6; transform: scale(1); }
+			50% { opacity: 0.85; transform: scale(1.04); }
 		}
 
-		@keyframes node-breathe {
-			0%, 100% { opacity: 0.5; transform: scale(0.82); }
-			50% { opacity: 1; transform: scale(1.12); }
-		}
-
-		@keyframes cluster-float {
-			0%, 100% { transform: translateY(0); }
-			50% { transform: translateY(-7px); }
-		}
-
-		@keyframes cluster-spin {
-			to { transform: rotate(360deg); }
-		}
-
-		@media (max-width: 68rem) {
+		@media (width < 68rem) {
 			.query-console {
 				inset-block-start: 21%;
 				width: 36%;
@@ -719,7 +923,7 @@ const nodes = [
 			}
 		}
 
-		@media (max-width: 49.99rem) {
+		@media (width < 50rem) {
 			.bifrost-hero {
 				min-height: 41rem;
 				align-items: start;
@@ -730,23 +934,20 @@ const nodes = [
 				width: 100%;
 			}
 
-			.hero-eyebrow b,
+			/* .hero-copy is full width here, so the scrim's right overhang would
+			   push past the viewport and raise a horizontal scrollbar now that
+			   the hero no longer clips. It has nothing to fade past at this size
+			   anyway. */
+			.hero-copy::before {
+				right: 0;
+			}
+
 			.query-console {
 				display: none;
 			}
 
-			.terrain-wrap {
-				inset: 21% -42% -3% -20%;
-				opacity: 0.78;
-			}
-
-			.graph-annotations {
-				display: none;
-			}
-
-			h1 {
-				font-size: clamp(3.8rem, 17.2vw, 5.4rem);
-				letter-spacing: -0.035em;
+			.beam-wrap {
+				opacity: 0.45;
 			}
 
 			.hero-tagline {
@@ -788,15 +989,15 @@ const nodes = [
 				transform: none;
 			}
 
-			.analysis-route,
-			.terrain-node,
-			.horizon-cluster,
-			.horizon-cluster circle:last-of-type {
+			.star.twinkle,
+			.beam-core-pulse,
+			.exit-flare {
 				animation: none;
 			}
 
-			.terrain-node {
-				opacity: 0.86;
+			.beam-fiber,
+			.beam-spark {
+				display: none;
 			}
 		}
 	}
