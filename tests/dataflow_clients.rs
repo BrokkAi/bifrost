@@ -402,6 +402,13 @@ fn budget_with_limit(dimension: SolverBudgetDimension, limit: usize) -> SolverBu
         SolverBudgetDimension::FlowEvaluations => limits.flow_evaluations = limit,
         SolverBudgetDimension::CallbackRows => limits.callback_rows = limit,
         SolverBudgetDimension::PropagatedOutputs => limits.propagated_outputs = limit,
+        SolverBudgetDimension::EndSummaries => limits.end_summaries = limit,
+        SolverBudgetDimension::IncomingCalls => limits.incoming_calls = limit,
+        SolverBudgetDimension::ProviderMaterializations => {
+            limits.provider_materializations = limit;
+        }
+        SolverBudgetDimension::SummaryApplications => limits.summary_applications = limit,
+        SolverBudgetDimension::CoverageRows => limits.coverage_rows = limit,
     }
     SolverBudget::new(limits)
 }

@@ -33,11 +33,33 @@ impl PathQuality {
         self.complete
     }
 
-    pub(crate) fn through_edge(self, edge: &IcfgEdge) -> Self {
+    /// Conjoin the proof and completeness of two concrete path segments.
+    ///
+    /// Summary tabulation keeps a callee path relative to its own entry. A
+    /// matched return uses this operation to reattach the exact incoming-call
+    /// prefix without joining proof from one path with completeness from
+    /// another.
+    pub(crate) const fn conjoin(self, other: Self) -> Self {
         Self {
-            proven: self.proven && matches!(&edge.proof, ProofStatus::Proven),
-            complete: self.complete && matches!(&edge.completeness, EvidenceCompleteness::Complete),
+            proven: self.proven && other.proven,
+            complete: self.complete && other.complete,
         }
+    }
+
+    /// Retain this path's quality through one owned semantic edge profile.
+    pub(crate) fn through_evidence(
+        self,
+        proof: &ProofStatus,
+        completeness: &EvidenceCompleteness,
+    ) -> Self {
+        Self {
+            proven: self.proven && matches!(proof, ProofStatus::Proven),
+            complete: self.complete && matches!(completeness, EvidenceCompleteness::Complete),
+        }
+    }
+
+    pub(crate) fn through_edge(self, edge: &IcfgEdge) -> Self {
+        self.through_evidence(&edge.proof, &edge.completeness)
     }
 
     const fn dominates(self, other: Self) -> bool {
@@ -171,6 +193,21 @@ mod tests {
         assert_eq!(
             after_edge.iter().collect::<Vec<_>>(),
             vec![PathQuality::UNPROVEN_COMPLETE]
+        );
+    }
+
+    #[test]
+    fn concrete_path_segments_conjoin_component_wise() {
+        assert_eq!(
+            PathQuality::PROVEN_PARTIAL.conjoin(PathQuality::UNPROVEN_COMPLETE),
+            PathQuality::UNPROVEN_PARTIAL
+        );
+        assert_eq!(
+            PathQuality::PROVEN_COMPLETE.through_evidence(
+                &ProofStatus::Unproven("test evidence".into()),
+                &EvidenceCompleteness::Complete,
+            ),
+            PathQuality::UNPROVEN_COMPLETE
         );
     }
 }

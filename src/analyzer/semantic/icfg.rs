@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::hash::{HashMap, HashSet};
@@ -28,7 +29,7 @@ use super::{
     SemanticProviderError, SemanticRequest, SemanticWork,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallTransfer {
     pub origin: CallSiteHandle,
     pub callee: ProcedureHandle,
@@ -71,6 +72,93 @@ pub struct ReturnTransfer {
     pub callee_exit: ProgramPointHandle,
     pub continuation: ProgramPointHandle,
     pub kind: ReturnTransferKind,
+    pub proof: ProofStatus,
+    pub completeness: EvidenceCompleteness,
+}
+
+/// One procedure-local ICFG edge before a bounded call context assigns dense
+/// snapshot node IDs.
+///
+/// Summary tabulation and bounded snapshot stitching consume the same owned
+/// projection so call/return evidence cannot drift between the two backends.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProcedureIcfgEdge {
+    pub source: ProgramPointHandle,
+    pub target: ProgramPointHandle,
+    pub kind: IcfgEdgeKind,
+    pub origin: Option<CallSiteHandle>,
+    pub proof: ProofStatus,
+    pub completeness: EvidenceCompleteness,
+}
+
+/// One procedure-local incomplete ICFG boundary before snapshot node
+/// materialization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProcedureIcfgBoundary {
+    pub at: ProgramPointHandle,
+    pub origin: Option<CallSiteHandle>,
+    pub kind: IcfgBoundaryKind,
+}
+
+/// Callee-local evidence from one entry to one normal or exceptional exit.
+///
+/// The profile deliberately excludes the evidence of any incoming call.
+/// [`IcfgExitProfile::project_matched_return`] composes that caller-specific
+/// evidence only when replaying a summary for an exact incoming call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcfgExitProfile {
+    callee_entry: ProgramPointHandle,
+    callee_exit: ProgramPointHandle,
+    kind: ReturnTransferKind,
+    gap_reason: Option<Box<str>>,
+    // `SemanticOutcome` has no representation for a retained payload whose
+    // quality is specifically truncated without attributing that truncation
+    // to the current request budget. Keep the exact local quality so the
+    // bounded snapshot adapter preserves its pre-extraction precedence when
+    // it combines this profile with other semantic evidence.
+    quality: SnapshotQuality,
+}
+
+impl IcfgExitProfile {
+    pub fn callee_entry(&self) -> &ProgramPointHandle {
+        &self.callee_entry
+    }
+
+    pub fn callee_exit(&self) -> &ProgramPointHandle {
+        &self.callee_exit
+    }
+
+    pub const fn kind(&self) -> ReturnTransferKind {
+        self.kind
+    }
+
+    pub const fn has_return_affecting_gaps(&self) -> bool {
+        self.gap_reason.is_some()
+    }
+
+    /// Project this callee-local exit through one exact incoming call.
+    pub fn project_matched_return(
+        &self,
+        incoming: &CallTransfer,
+    ) -> Result<MatchedReturnProjection, SemanticProviderError> {
+        project_matched_return(self, incoming)
+    }
+}
+
+/// Exact result of matching one profiled callee exit to one incoming call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchedReturnProjection {
+    Edge(ProcedureIcfgEdge),
+    Absent,
+    Boundary(ProcedureIcfgBoundary),
+}
+
+/// Procedure-local call-to-return edges and continuation boundaries projected
+/// from one modeled dispatch boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallToReturnProjection {
+    pub edges: Box<[ProcedureIcfgEdge]>,
+    pub boundaries: Box<[ProcedureIcfgBoundary]>,
 }
 
 pub trait IcfgProvider: DispatchOracle {
@@ -87,6 +175,21 @@ pub trait IcfgProvider: DispatchOracle {
         limits: IcfgSnapshotLimits,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError>;
+
+    /// Materialize callee-local evidence from one procedure entry to one exit.
+    ///
+    /// Callers should cache the outcome query-locally by procedure, entry, and
+    /// exit. A cache miss owns the bounded forward/reverse topology scan;
+    /// replaying the returned profile for additional callers or facts owns no
+    /// semantic work.
+    fn exit_profile(
+        &self,
+        callee_entry: &ProgramPointHandle,
+        callee_exit: &ProgramPointHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+        materialize_exit_profile(callee_entry, callee_exit, request)
+    }
 }
 
 /// One provider is tied to one [`WorkspaceAnalyzer`] generation.
@@ -372,10 +475,7 @@ fn compact_row(offsets: &[u32], row: usize, stored_len: usize) -> std::ops::Rang
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CallFrame {
-    origin: CallSiteHandle,
-    callee: ProcedureHandle,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
+    transfer: CallTransfer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -404,7 +504,10 @@ struct SnapshotBuilder {
     edge_set: HashSet<IcfgEdge>,
     boundaries: Vec<IcfgBoundary>,
     queue: VecDeque<IcfgNodeId>,
-    return_path_masks: HashMap<(ProcedureHandle, ProgramPointId), Box<[bool]>>,
+    exit_profiles: HashMap<
+        (ProcedureHandle, ProgramPointId, ProgramPointId),
+        SemanticOutcome<Arc<IcfgExitProfile>>,
+    >,
     quality: SnapshotQuality,
     budget_exceeded: Option<SemanticBudgetExceeded>,
     work: SemanticWork,
@@ -421,7 +524,7 @@ impl SnapshotBuilder {
             edge_set: HashSet::default(),
             boundaries: Vec::new(),
             queue: VecDeque::new(),
-            return_path_masks: HashMap::default(),
+            exit_profiles: HashMap::default(),
             quality: SnapshotQuality::Complete,
             budget_exceeded: None,
             work: SemanticWork::default(),
@@ -464,7 +567,7 @@ impl SnapshotBuilder {
         let call_context = key
             .frames
             .iter()
-            .map(|frame| frame.origin.clone())
+            .map(|frame| frame.transfer.origin.clone())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         self.nodes.push(IcfgNodeKey {
@@ -963,22 +1066,10 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 break;
             }
             let key = builder.traversal[node.index()].clone();
-            if expand_return(&mut builder, node, &key, &mut staged_request)? {
+            if expand_return(self, &mut builder, node, &key, &mut staged_request)? {
                 continue;
             }
-            let semantic_point = key
-                .point
-                .procedure()
-                .semantics()
-                .point(key.point.id())
-                .ok_or_else(|| SemanticProviderError::internal("ICFG point handle is stale"))?;
-            let call = semantic_point
-                .events
-                .iter()
-                .find_map(|event| match event.effect {
-                    super::SemanticEffect::Invoke { call_site } => Some(call_site),
-                    _ => None,
-                });
+            let call = invoked_call_at(&key.point)?;
 
             if let Some(call) = call {
                 let semantic_call = key
@@ -1019,6 +1110,11 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         builder.work = builder.work.conservative_add(outcome.work());
                     }
                     if let Some(transfers) = outcome.available_value().cloned() {
+                        validate_call_transfer_set(
+                            key.point.procedure(),
+                            &semantic_call,
+                            &transfers,
+                        )?;
                         builder.record_dispatch_boundaries(node, &transfers.boundaries);
                         for boundary in &transfers.boundaries {
                             link_boundary_continuations(
@@ -1031,15 +1127,13 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                             )?;
                         }
                         for transfer in transfers.transfers.into_vec() {
+                            let callee_entry = transfer.callee_entry.clone();
+                            let proof = transfer.proof.clone();
+                            let completeness = transfer.completeness.clone();
                             let mut frames = key.frames.to_vec();
-                            frames.push(CallFrame {
-                                origin: transfer.origin.clone(),
-                                callee: transfer.callee.clone(),
-                                proof: transfer.proof.clone(),
-                                completeness: transfer.completeness.clone(),
-                            });
+                            frames.push(CallFrame { transfer });
                             let target_key = TraversalKey {
-                                point: transfer.callee_entry.clone(),
+                                point: callee_entry,
                                 frames: frames.into_boxed_slice(),
                             };
                             builder.link(
@@ -1047,8 +1141,8 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                                 target_key,
                                 IcfgEdgeKind::Call,
                                 Some(origin.clone()),
-                                transfer.proof,
-                                transfer.completeness,
+                                proof,
+                                completeness,
                                 &mut staged_request,
                             )?;
                         }
@@ -1494,43 +1588,34 @@ fn sum_semantic_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
     left.conservative_add(right)
 }
 
-fn scoped_return_affecting_gap_indices(
-    builder: &mut SnapshotBuilder,
-    procedure: &ProcedureHandle,
-    exit: ProgramPointId,
-) -> Vec<usize> {
-    let semantics = procedure.semantics();
-    let path_mask = builder
-        .return_path_masks
-        .get(&(procedure.clone(), exit))
-        .expect("return path mask must be cached before gap selection");
-    semantics
-        .gaps()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, gap)| {
-            let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
-            let scoped_to_return_path = match gap.subject {
-                SemanticGapSubject::Procedure => true,
-                _ => path_mask.get(gap.point.index()).copied() == Some(true),
-            };
-            (return_affecting && scoped_to_return_path).then_some(index)
-        })
-        .collect()
-}
-
-fn cache_return_path_mask(
-    builder: &mut SnapshotBuilder,
-    procedure: &ProcedureHandle,
-    exit: ProgramPointId,
+fn materialize_exit_profile(
+    callee_entry: &ProgramPointHandle,
+    callee_exit: &ProgramPointHandle,
     request: &mut SemanticRequest<'_>,
-) -> bool {
-    let cache_key = (procedure.clone(), exit);
-    if builder.return_path_masks.contains_key(&cache_key) {
-        return true;
+) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: SemanticWork::default(),
+        });
     }
 
+    if callee_entry.procedure() != callee_exit.procedure() {
+        return Err(SemanticProviderError::internal(
+            "ICFG exit profile entry and exit belong to different procedures",
+        ));
+    }
+    let procedure = callee_exit.procedure();
     let semantics = procedure.semantics();
+    let kind = if callee_exit.id() == semantics.normal_exit_point() {
+        ReturnTransferKind::Normal
+    } else if callee_exit.id() == semantics.exceptional_exit_point() {
+        ReturnTransferKind::Exceptional
+    } else {
+        return Err(SemanticProviderError::internal(
+            "ICFG exit profile requires a normal or exceptional procedure exit",
+        ));
+    };
     let point_count = semantics.points().len();
     let edge_count = semantics.control_edges().len();
     let gap_count = semantics.gaps().len();
@@ -1545,11 +1630,12 @@ fn cache_return_path_mask(
         ..SemanticWork::default()
     };
     if let Err(exceeded) = request.budget.charge(scan_work) {
-        builder.budget_exceeded = Some(exceeded);
-        builder.quality = merge_quality(builder.quality, SnapshotQuality::Truncated);
-        return false;
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work: SemanticWork::default(),
+        });
     }
-    builder.work = builder.work.conservative_add(scan_work);
 
     let algorithm_limits = CfgAlgorithmWork {
         node_visits: point_count.saturating_mul(2),
@@ -1559,11 +1645,13 @@ fn cache_return_path_mask(
     let mut algorithm_request =
         CfgAlgorithmRequest::new(&mut algorithm_budget, request.cancellation);
     let from_entry =
-        match forward_reachability(semantics, semantics.entry_point(), &mut algorithm_request) {
+        match forward_reachability(semantics, callee_entry.id(), &mut algorithm_request) {
             Ok(reachable) => reachable,
             Err(CfgAlgorithmError::Cancelled { .. }) => {
-                builder.quality = SnapshotQuality::Cancelled;
-                return false;
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: scan_work,
+                });
             }
             Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
                 unreachable!(
@@ -1579,11 +1667,13 @@ fn cache_return_path_mask(
                 unreachable!("validated procedure has an invalid entry point {point}");
             }
         };
-    let to_exit = match reverse_reachability(semantics, exit, &mut algorithm_request) {
+    let to_exit = match reverse_reachability(semantics, callee_exit.id(), &mut algorithm_request) {
         Ok(reachable) => reachable,
         Err(CfgAlgorithmError::Cancelled { .. }) => {
-            builder.quality = SnapshotQuality::Cancelled;
-            return false;
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: scan_work,
+            });
         }
         Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
             unreachable!(
@@ -1609,8 +1699,132 @@ fn cache_return_path_mask(
         .map(|(reachable, reaches_exit)| reachable && reaches_exit)
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    builder.return_path_masks.insert(cache_key, path_mask);
-    true
+    let is_return_gap = |gap: &SemanticGap| {
+        let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
+        let scoped_to_return_path = match gap.subject {
+            SemanticGapSubject::Procedure => true,
+            _ => path_mask.get(gap.point.index()).copied() == Some(true),
+        };
+        return_affecting && scoped_to_return_path
+    };
+    let mut return_gap_count = 0usize;
+    let mut quality = SnapshotQuality::Complete;
+    let mut gap_reason_bytes = 0usize;
+    for gap in semantics.gaps() {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: scan_work,
+            });
+        }
+        if !is_return_gap(gap) {
+            continue;
+        }
+        quality = merge_quality(quality, semantic_gap_quality(gap));
+        gap_reason_bytes = gap_reason_bytes
+            .saturating_add(usize::from(return_gap_count > 0).saturating_mul(2))
+            .saturating_add(gap.kind.label().len())
+            .saturating_add(1)
+            .saturating_add(gap.capability.label().len())
+            .saturating_add(2)
+            .saturating_add(gap.detail.len());
+        return_gap_count = return_gap_count.saturating_add(1);
+    }
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: scan_work,
+        });
+    }
+    let text_work = SemanticWork {
+        owned_text_bytes: gap_reason_bytes,
+        ..SemanticWork::default()
+    };
+    if let Err(exceeded) = request.budget.charge(text_work) {
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work: scan_work,
+        });
+    }
+    let total_work = sum_semantic_work(scan_work, text_work);
+    let gap_reason = if return_gap_count == 0 {
+        None
+    } else {
+        let mut reason = String::with_capacity(gap_reason_bytes);
+        let mut written = 0usize;
+        for gap in semantics.gaps() {
+            if request.cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: total_work,
+                });
+            }
+            if !is_return_gap(gap) {
+                continue;
+            }
+            if written > 0 {
+                reason.push_str("; ");
+            }
+            reason.push_str(gap.kind.label());
+            reason.push(' ');
+            reason.push_str(gap.capability.label());
+            reason.push_str(": ");
+            reason.push_str(&gap.detail);
+            written = written.saturating_add(1);
+        }
+        debug_assert_eq!(written, return_gap_count);
+        debug_assert_eq!(reason.len(), gap_reason_bytes);
+        Some(reason.into_boxed_str())
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: total_work,
+        });
+    }
+    let profile = IcfgExitProfile {
+        callee_entry: callee_entry.clone(),
+        callee_exit: callee_exit.clone(),
+        kind,
+        gap_reason,
+        quality,
+    };
+    Ok(exit_profile_outcome(profile, quality, total_work))
+}
+
+fn exit_profile_outcome(
+    profile: IcfgExitProfile,
+    quality: SnapshotQuality,
+    work: SemanticWork,
+) -> SemanticOutcome<IcfgExitProfile> {
+    match quality {
+        SnapshotQuality::Complete => SemanticOutcome::Complete {
+            value: profile,
+            work,
+        },
+        SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
+            candidates: profile,
+            work,
+        },
+        SnapshotQuality::Unproven => SemanticOutcome::Unproven {
+            partial: profile,
+            work,
+        },
+        SnapshotQuality::Unknown | SnapshotQuality::Truncated => SemanticOutcome::Unknown {
+            partial: Some(profile),
+            work,
+        },
+        SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(profile),
+            work,
+        },
+        SnapshotQuality::Cancelled => SemanticOutcome::Cancelled {
+            partial: Some(profile),
+            work,
+        },
+    }
 }
 
 fn semantic_gap_quality(gap: &SemanticGap) -> SnapshotQuality {
@@ -1631,47 +1845,55 @@ fn deferred_invocation_kind(properties: super::ProcedureProperties) -> DeferredI
     }
 }
 
-fn link_boundary_continuations(
-    builder: &mut SnapshotBuilder,
-    source: IcfgNodeId,
-    key: &TraversalKey,
-    semantic_call: &super::SemanticCallSite,
+pub(crate) fn project_call_boundary(
+    caller: &ProcedureHandle,
+    semantic_call: &SemanticCallSite,
     boundary: &CallBoundary,
-    request: &mut SemanticRequest<'_>,
-) -> Result<(), SemanticProviderError> {
+) -> Result<CallToReturnProjection, SemanticProviderError> {
     let Some(model) = boundary.model else {
-        return Ok(());
+        return Ok(CallToReturnProjection::default());
     };
-    let mut link = |kind: CallContinuationKind,
-                    continuation: ControlContinuation,
-                    edge_kind: IcfgEdgeKind|
+    if boundary.origin.procedure() != caller {
+        return Err(SemanticProviderError::internal(
+            "call-to-return boundary belongs to a different caller",
+        ));
+    }
+    if boundary.origin.id() != semantic_call.id {
+        return Err(SemanticProviderError::internal(
+            "call boundary origin does not match the projected call",
+        ));
+    }
+    let at = caller
+        .point_handle(semantic_call.point)
+        .ok_or_else(|| SemanticProviderError::internal("call boundary point is stale"))?;
+
+    let mut edges = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut project = |kind: CallContinuationKind,
+                       continuation: ControlContinuation,
+                       edge_kind: IcfgEdgeKind|
      -> Result<(), SemanticProviderError> {
         match continuation {
             ControlContinuation::Target(point) => {
-                let point = key.point.procedure().point_handle(point).ok_or_else(|| {
+                let target = caller.point_handle(point).ok_or_else(|| {
                     SemanticProviderError::internal("call boundary continuation is stale")
                 })?;
-                builder.link(
-                    source,
-                    TraversalKey {
-                        point,
-                        frames: key.frames.clone(),
-                    },
-                    edge_kind,
-                    Some(boundary.origin.clone()),
-                    boundary.dispatch.proof.clone(),
-                    boundary.dispatch.completeness.clone(),
-                    request,
-                )?;
+                edges.push(ProcedureIcfgEdge {
+                    source: at.clone(),
+                    target,
+                    kind: edge_kind,
+                    origin: Some(boundary.origin.clone()),
+                    proof: boundary.dispatch.proof.clone(),
+                    completeness: boundary.dispatch.completeness.clone(),
+                });
             }
             ControlContinuation::Absent => {}
             state => {
-                builder.boundaries.push(IcfgBoundary {
-                    at: source,
+                boundaries.push(ProcedureIcfgBoundary {
+                    at: at.clone(),
                     origin: Some(boundary.origin.clone()),
                     kind: IcfgBoundaryKind::Continuation { kind, state },
                 });
-                builder.quality = merge_quality(builder.quality, SnapshotQuality::Unknown);
             }
         }
         Ok(())
@@ -1680,7 +1902,7 @@ fn link_boundary_continuations(
         model,
         CallToReturnModel::Normal | CallToReturnModel::NormalAndExceptional
     ) {
-        link(
+        project(
             CallContinuationKind::Normal,
             semantic_call.normal_continuation,
             IcfgEdgeKind::CallToNormalContinuation,
@@ -1690,141 +1912,213 @@ fn link_boundary_continuations(
         model,
         CallToReturnModel::Exceptional | CallToReturnModel::NormalAndExceptional
     ) {
-        link(
+        project(
             CallContinuationKind::Exceptional,
             semantic_call.exceptional_continuation,
             IcfgEdgeKind::CallToExceptionalContinuation,
         )?;
     }
+    Ok(CallToReturnProjection {
+        edges: edges.into_boxed_slice(),
+        boundaries: boundaries.into_boxed_slice(),
+    })
+}
+
+fn link_boundary_continuations(
+    builder: &mut SnapshotBuilder,
+    source: IcfgNodeId,
+    key: &TraversalKey,
+    semantic_call: &SemanticCallSite,
+    boundary: &CallBoundary,
+    request: &mut SemanticRequest<'_>,
+) -> Result<(), SemanticProviderError> {
+    let projection = project_call_boundary(key.point.procedure(), semantic_call, boundary)?;
+    for edge in projection.edges {
+        debug_assert_eq!(edge.source, key.point);
+        builder.link(
+            source,
+            TraversalKey {
+                point: edge.target,
+                frames: key.frames.clone(),
+            },
+            edge.kind,
+            edge.origin,
+            edge.proof,
+            edge.completeness,
+            request,
+        )?;
+    }
+    for boundary in projection.boundaries {
+        debug_assert_eq!(boundary.at, key.point);
+        builder.boundaries.push(IcfgBoundary {
+            at: source,
+            origin: boundary.origin,
+            kind: boundary.kind,
+        });
+        builder.quality = merge_quality(builder.quality, SnapshotQuality::Unknown);
+    }
     Ok(())
 }
 
-fn expand_return(
-    builder: &mut SnapshotBuilder,
-    node: IcfgNodeId,
-    key: &TraversalKey,
-    request: &mut SemanticRequest<'_>,
-) -> Result<bool, SemanticProviderError> {
-    let semantics = key.point.procedure().semantics();
-    let (kind, continuation_kind, continuation) = if key.point.id() == semantics.normal_exit_point()
+pub(crate) fn project_matched_return(
+    exit: &IcfgExitProfile,
+    incoming: &CallTransfer,
+) -> Result<MatchedReturnProjection, SemanticProviderError> {
+    if incoming.callee != *exit.callee_exit.procedure()
+        || incoming.callee_entry != exit.callee_entry
     {
-        (
-            IcfgEdgeKind::NormalReturn,
-            CallContinuationKind::Normal,
-            ReturnTransferKind::Normal,
-        )
-    } else if key.point.id() == semantics.exceptional_exit_point() {
-        (
-            IcfgEdgeKind::ExceptionalReturn,
-            CallContinuationKind::Exceptional,
-            ReturnTransferKind::Exceptional,
-        )
-    } else {
-        return Ok(false);
-    };
-    let Some(frame) = key.frames.last() else {
-        return Ok(false);
-    };
-    if frame.callee != *key.point.procedure() {
         return Err(SemanticProviderError::internal(
-            "ICFG return context does not match the exiting callee",
+            "ICFG incoming call does not match the profiled callee entry",
         ));
     }
-    let semantic_call = frame
-        .origin
-        .procedure()
-        .semantics()
-        .call_site(frame.origin.id())
-        .ok_or_else(|| SemanticProviderError::internal("return origin call handle is stale"))?;
-    if !cache_return_path_mask(builder, key.point.procedure(), key.point.id(), request) {
-        return Ok(true);
-    }
-    let return_gap_indices =
-        scoped_return_affecting_gap_indices(builder, key.point.procedure(), key.point.id());
-    let return_gaps = return_gap_indices
-        .iter()
-        .map(|index| &semantics.gaps()[*index])
-        .collect::<Vec<_>>();
-    let (return_proof, return_completeness) = if return_gaps.is_empty() {
-        (frame.proof.clone(), frame.completeness.clone())
-    } else {
-        for gap in &return_gaps {
-            builder.quality = merge_quality(builder.quality, semantic_gap_quality(gap));
-        }
-        let gap_reason = return_gaps
-            .iter()
-            .map(|gap| {
-                format!(
-                    "{} {}: {}",
-                    gap.kind.label(),
-                    gap.capability.label(),
-                    gap.detail
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let proof_reason = match &frame.proof {
-            ProofStatus::Proven => format!(
-                "callee-exit evidence does not prove this {:?} completion returns to its caller: {gap_reason}",
-                continuation
-            ),
-            ProofStatus::Unproven(existing) => format!("{existing}; {gap_reason}"),
-        };
-        let completeness_reason = match &frame.completeness {
-            EvidenceCompleteness::Complete => {
-                format!("the callee exit has exact return-affecting semantic gaps: {gap_reason}")
-            }
-            EvidenceCompleteness::Partial(existing) => {
-                format!("{existing}; return-affecting gaps: {gap_reason}")
-            }
-        };
-        (
-            ProofStatus::Unproven(proof_reason.into()),
-            EvidenceCompleteness::Partial(completeness_reason.into()),
-        )
-    };
-    let destination = match continuation {
-        ReturnTransferKind::Normal => semantic_call.normal_continuation,
-        ReturnTransferKind::Exceptional => semantic_call.exceptional_continuation,
+
+    let (continuation_kind, destination) = match exit.kind {
+        ReturnTransferKind::Normal => (CallContinuationKind::Normal, incoming.normal_continuation),
+        ReturnTransferKind::Exceptional => (
+            CallContinuationKind::Exceptional,
+            incoming.exceptional_continuation,
+        ),
     };
     match destination {
         ControlContinuation::Target(point) => {
-            let target_point = frame
+            let (proof, completeness) = return_evidence(exit, incoming);
+            let continuation = incoming
                 .origin
                 .procedure()
                 .point_handle(point)
                 .ok_or_else(|| SemanticProviderError::internal("return continuation is stale"))?;
+            Ok(MatchedReturnProjection::Edge(ProcedureIcfgEdge {
+                source: exit.callee_exit.clone(),
+                target: continuation,
+                kind: match exit.kind {
+                    ReturnTransferKind::Normal => IcfgEdgeKind::NormalReturn,
+                    ReturnTransferKind::Exceptional => IcfgEdgeKind::ExceptionalReturn,
+                },
+                origin: Some(incoming.origin.clone()),
+                proof,
+                completeness,
+            }))
+        }
+        ControlContinuation::Absent => Ok(MatchedReturnProjection::Absent),
+        state => Ok(MatchedReturnProjection::Boundary(ProcedureIcfgBoundary {
+            at: exit.callee_exit.clone(),
+            origin: Some(incoming.origin.clone()),
+            kind: IcfgBoundaryKind::Continuation {
+                kind: continuation_kind,
+                state,
+            },
+        })),
+    }
+}
+
+fn return_evidence(
+    exit: &IcfgExitProfile,
+    incoming: &CallTransfer,
+) -> (ProofStatus, EvidenceCompleteness) {
+    let Some(gap_reason) = &exit.gap_reason else {
+        return (incoming.proof.clone(), incoming.completeness.clone());
+    };
+    let proof = match &incoming.proof {
+        ProofStatus::Proven => ProofStatus::Unproven(
+            format!(
+                "callee-exit evidence does not prove this {:?} completion returns to its caller: {gap_reason}",
+                exit.kind
+            )
+            .into(),
+        ),
+        ProofStatus::Unproven(existing) => {
+            ProofStatus::Unproven(format!("{existing}; {gap_reason}").into())
+        }
+    };
+    let completeness = match &incoming.completeness {
+        EvidenceCompleteness::Complete => EvidenceCompleteness::Partial(
+            format!("the callee exit has exact return-affecting semantic gaps: {gap_reason}")
+                .into(),
+        ),
+        EvidenceCompleteness::Partial(existing) => EvidenceCompleteness::Partial(
+            format!("{existing}; return-affecting gaps: {gap_reason}").into(),
+        ),
+    };
+    (proof, completeness)
+}
+
+fn expand_return<P>(
+    provider: &P,
+    builder: &mut SnapshotBuilder,
+    node: IcfgNodeId,
+    key: &TraversalKey,
+    request: &mut SemanticRequest<'_>,
+) -> Result<bool, SemanticProviderError>
+where
+    P: IcfgProvider + ?Sized,
+{
+    let semantics = key.point.procedure().semantics();
+    if key.point.id() != semantics.normal_exit_point()
+        && key.point.id() != semantics.exceptional_exit_point()
+    {
+        return Ok(false);
+    }
+    let Some(frame) = key.frames.last() else {
+        return Ok(false);
+    };
+    if frame.transfer.callee != *key.point.procedure() {
+        return Err(SemanticProviderError::internal(
+            "ICFG return context does not match the exiting callee",
+        ));
+    }
+
+    let cache_key = (
+        key.point.procedure().clone(),
+        frame.transfer.callee_entry.id(),
+        key.point.id(),
+    );
+    let (outcome, newly_materialized) = if let Some(cached) = builder.exit_profiles.get(&cache_key)
+    {
+        (cached.clone(), false)
+    } else {
+        let outcome = provider.exit_profile(&frame.transfer.callee_entry, &key.point, request)?;
+        if let Some(profile) = outcome.available_value() {
+            validate_exit_profile(&frame.transfer.callee_entry, &key.point, profile)?;
+        }
+        let outcome = outcome.map(Arc::new);
+        builder.exit_profiles.insert(cache_key, outcome.clone());
+        (outcome, true)
+    };
+    builder.absorb_quality(&outcome);
+    if newly_materialized {
+        builder.work = builder.work.conservative_add(outcome.work());
+    }
+    let Some(profile) = outcome.available_value() else {
+        return Ok(true);
+    };
+    builder.quality = merge_quality(builder.quality, profile.quality);
+
+    match profile.project_matched_return(&frame.transfer)? {
+        MatchedReturnProjection::Edge(edge) => {
+            debug_assert_eq!(edge.source, key.point);
             let target_key = TraversalKey {
-                point: target_point.clone(),
+                point: edge.target,
                 frames: key.frames[..key.frames.len() - 1]
                     .to_vec()
                     .into_boxed_slice(),
             };
-            let transfer = ReturnTransfer {
-                origin: frame.origin.clone(),
-                callee_exit: key.point.clone(),
-                continuation: target_point,
-                kind: continuation,
-            };
             builder.link(
                 node,
                 target_key,
-                kind,
-                Some(transfer.origin),
-                return_proof,
-                return_completeness,
+                edge.kind,
+                edge.origin,
+                edge.proof,
+                edge.completeness,
                 request,
             )?;
         }
-        ControlContinuation::Absent => {}
-        state => {
+        MatchedReturnProjection::Absent => {}
+        MatchedReturnProjection::Boundary(boundary) => {
+            debug_assert_eq!(boundary.at, key.point);
             builder.boundaries.push(IcfgBoundary {
                 at: node,
-                origin: Some(frame.origin.clone()),
-                kind: IcfgBoundaryKind::Continuation {
-                    kind: continuation_kind,
-                    state,
-                },
+                origin: boundary.origin,
+                kind: boundary.kind,
             });
             builder.quality = merge_quality(builder.quality, SnapshotQuality::Unknown);
         }
@@ -1860,7 +2154,106 @@ fn add_local_edge(
     Ok(())
 }
 
-fn is_call_scaffolding(edge: &super::ControlEdge, call: &super::SemanticCallSite) -> bool {
+pub(crate) fn invoked_call_at(
+    point: &ProgramPointHandle,
+) -> Result<Option<CallSiteId>, SemanticProviderError> {
+    let semantic_point = point
+        .procedure()
+        .semantics()
+        .point(point.id())
+        .ok_or_else(|| SemanticProviderError::internal("ICFG point handle is stale"))?;
+    Ok(semantic_point
+        .events
+        .iter()
+        .find_map(|event| match event.effect {
+            super::SemanticEffect::Invoke { call_site } => Some(call_site),
+            _ => None,
+        }))
+}
+
+/// Validate provider-owned exit evidence before either ICFG backend caches it.
+pub(crate) fn validate_exit_profile(
+    callee_entry: &ProgramPointHandle,
+    callee_exit: &ProgramPointHandle,
+    profile: &IcfgExitProfile,
+) -> Result<(), SemanticProviderError> {
+    if profile.callee_entry() != callee_entry {
+        return Err(SemanticProviderError::internal(
+            "ICFG exit profile entry does not match the requested entry",
+        ));
+    }
+    if profile.callee_exit() != callee_exit {
+        return Err(SemanticProviderError::internal(
+            "ICFG exit profile exit does not match the requested exit",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate provider-owned call projections before either ICFG backend
+/// publishes them.
+pub(crate) fn validate_call_transfer_set(
+    caller: &ProcedureHandle,
+    semantic_call: &SemanticCallSite,
+    transfers: &CallTransferSet,
+) -> Result<(), SemanticProviderError> {
+    let Some(stored_call) = caller.semantics().call_site(semantic_call.id) else {
+        return Err(SemanticProviderError::internal(
+            "ICFG call transfer set refers to a call outside its caller",
+        ));
+    };
+    if stored_call != semantic_call {
+        return Err(SemanticProviderError::internal(
+            "ICFG call transfer set refers to a mismatched semantic call",
+        ));
+    }
+    let origin = caller
+        .call_site_handle(semantic_call.id)
+        .ok_or_else(|| SemanticProviderError::internal("failed to scope ICFG transfer call"))?;
+    for transfer in &transfers.transfers {
+        if transfer.origin != origin {
+            return Err(SemanticProviderError::internal(
+                "ICFG call transfer origin does not match the requested call",
+            ));
+        }
+        if transfer.callee_entry.procedure() != &transfer.callee {
+            return Err(SemanticProviderError::internal(
+                "ICFG call transfer entry belongs to a different callee",
+            ));
+        }
+        if transfer.normal_continuation != semantic_call.normal_continuation {
+            return Err(SemanticProviderError::internal(
+                "ICFG call transfer has a mismatched normal continuation",
+            ));
+        }
+        if transfer.exceptional_continuation != semantic_call.exceptional_continuation {
+            return Err(SemanticProviderError::internal(
+                "ICFG call transfer has a mismatched exceptional continuation",
+            ));
+        }
+    }
+    for boundary in &transfers.boundaries {
+        if boundary.origin != origin {
+            return Err(SemanticProviderError::internal(
+                "ICFG call boundary origin does not match the requested call",
+            ));
+        }
+        boundary
+            .dispatch
+            .validate_for_call(&origin)
+            .map_err(|error| {
+                SemanticProviderError::internal(format!(
+                    "ICFG call boundary has invalid dispatch provenance: {error}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn is_call_scaffolding(
+    edge: &super::ControlEdge,
+    call: &super::SemanticCallSite,
+) -> bool {
     matches!(
         (edge.kind, call.normal_continuation),
         (ControlEdgeKind::Normal, ControlContinuation::Target(target)) if edge.target_point == target
@@ -2088,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn return_path_masks_are_scoped_to_distinct_artifact_instances() {
+    fn exit_profiles_are_scoped_to_distinct_artifact_instances() {
         fn materialize_handle() -> ProcedureHandle {
             let fixture = AnalyzerFixture::new_for_language(
                 crate::analyzer::Language::TypeScript,
@@ -2133,32 +2526,35 @@ mod tests {
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         let mut request = SemanticRequest::new(&mut budget, &cancellation);
-        let first_exit = first.semantics().normal_exit_point();
-        let second_exit = second.semantics().normal_exit_point();
+        for procedure in [&first, &second] {
+            let entry = procedure
+                .point_handle(procedure.semantics().entry_point())
+                .expect("entry point handle");
+            let exit = procedure
+                .point_handle(procedure.semantics().normal_exit_point())
+                .expect("normal exit point handle");
+            let outcome = materialize_exit_profile(&entry, &exit, &mut request)
+                .expect("exit profile")
+                .map(Arc::new);
+            assert!(
+                builder
+                    .exit_profiles
+                    .insert((procedure.clone(), entry.id(), exit.id()), outcome,)
+                    .is_none()
+            );
+        }
 
-        assert!(cache_return_path_mask(
-            &mut builder,
-            &first,
-            first_exit,
-            &mut request
-        ));
-        assert!(cache_return_path_mask(
-            &mut builder,
-            &second,
-            second_exit,
-            &mut request
-        ));
-        assert_eq!(builder.return_path_masks.len(), 2);
-        assert!(
-            builder
-                .return_path_masks
-                .contains_key(&(first.clone(), first_exit))
-        );
-        assert!(
-            builder
-                .return_path_masks
-                .contains_key(&(second.clone(), second_exit))
-        );
+        assert_eq!(builder.exit_profiles.len(), 2);
+        assert!(builder.exit_profiles.contains_key(&(
+            first.clone(),
+            first.semantics().entry_point(),
+            first.semantics().normal_exit_point(),
+        )));
+        assert!(builder.exit_profiles.contains_key(&(
+            second.clone(),
+            second.semantics().entry_point(),
+            second.semantics().normal_exit_point(),
+        )));
     }
 
     #[test]
@@ -2379,6 +2775,34 @@ mod tests {
                 >= dispatch_outcome.work().nested_entries.saturating_add(3)
         );
         assert_eq!(transfer_budget.used(), transfer_outcome.work());
+        let semantic_call = caller
+            .semantics()
+            .call_site(call.id())
+            .expect("deferred semantic call");
+        let continuation_projection = project_call_boundary(&caller, semantic_call, deferred)
+            .expect("modeled deferred continuations");
+        let expected_projection_rows = [
+            semantic_call.normal_continuation,
+            semantic_call.exceptional_continuation,
+        ]
+        .into_iter()
+        .filter(|continuation| !matches!(*continuation, ControlContinuation::Absent))
+        .count();
+        assert_eq!(
+            continuation_projection
+                .edges
+                .len()
+                .saturating_add(continuation_projection.boundaries.len()),
+            expected_projection_rows
+        );
+        assert!(
+            continuation_projection
+                .edges
+                .iter()
+                .all(|edge| edge.origin.as_ref() == Some(&call)
+                    && edge.proof == deferred.dispatch.proof
+                    && edge.completeness == deferred.dispatch.completeness)
+        );
 
         let mut limited = SemanticBudget::default().limits();
         limited.nested_entries = transfer_outcome.work().nested_entries.saturating_sub(1);
@@ -3299,6 +3723,390 @@ void raii_caller() {
     fn workspace_icfg_provider_remains_copy() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<WorkspaceIcfgProvider<'static>>();
+    }
+
+    #[test]
+    fn exit_profile_projects_exact_returns_and_owns_one_topology_scan() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[(
+                "returns.ts",
+                concat!(
+                    "function target(): number { return 1; }\n",
+                    "function other(): number { return target(); }\n",
+                    "export function caller(): number { return target(); }\n",
+                ),
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "returns.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript artifact");
+        let find_procedure = |name| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(DeclarationSegment::name)
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let target = find_procedure("target");
+        let other = find_procedure("other");
+        let caller = find_procedure("caller");
+        let semantic_call = caller
+            .semantics()
+            .call_sites()
+            .first()
+            .expect("target call");
+        let call_point = caller
+            .point_handle(semantic_call.point)
+            .expect("target call point");
+        let other_call = other
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| other.call_site_handle(call.id))
+            .expect("other target call");
+        assert_eq!(
+            invoked_call_at(&call_point).expect("valid invocation point"),
+            Some(semantic_call.id)
+        );
+        assert!(
+            caller
+                .semantics()
+                .successor_edges(semantic_call.point)
+                .any(|(_, edge)| is_call_scaffolding(edge, semantic_call))
+        );
+
+        let provider = fixture.analyzer.icfg_provider();
+        let mut transfer_budget = SemanticBudget::default();
+        let transfer_outcome = provider
+            .call_transfers(
+                &caller,
+                semantic_call.id,
+                &mut SemanticRequest::new(&mut transfer_budget, &cancellation),
+            )
+            .expect("target call transfer");
+        let transfer_set = transfer_outcome
+            .available_value()
+            .expect("target transfer payload");
+        validate_call_transfer_set(&caller, semantic_call, transfer_set)
+            .expect("valid target transfer set");
+        let incoming = transfer_set
+            .transfers
+            .iter()
+            .find(|transfer| transfer.callee == target)
+            .expect("target transfer")
+            .clone();
+        let caller_entry = caller
+            .point_handle(caller.semantics().entry_point())
+            .expect("caller entry");
+        let mut mismatched_origin = transfer_set.clone();
+        mismatched_origin.transfers[0].origin = other_call.clone();
+        assert!(
+            validate_call_transfer_set(&caller, semantic_call, &mismatched_origin).is_err(),
+            "transfer origins must identify the requested call"
+        );
+        let mut mismatched_entry_owner = transfer_set.clone();
+        mismatched_entry_owner.transfers[0].callee_entry = caller_entry.clone();
+        assert!(
+            validate_call_transfer_set(&caller, semantic_call, &mismatched_entry_owner).is_err(),
+            "callee entries must belong to their declared callees"
+        );
+        let mut mismatched_normal = transfer_set.clone();
+        mismatched_normal.transfers[0].normal_continuation =
+            if semantic_call.normal_continuation == ControlContinuation::Unknown {
+                ControlContinuation::Absent
+            } else {
+                ControlContinuation::Unknown
+            };
+        assert!(
+            validate_call_transfer_set(&caller, semantic_call, &mismatched_normal).is_err(),
+            "normal continuations must match the semantic call"
+        );
+        let mut mismatched_exceptional = transfer_set.clone();
+        mismatched_exceptional.transfers[0].exceptional_continuation =
+            if semantic_call.exceptional_continuation == ControlContinuation::Unknown {
+                ControlContinuation::Absent
+            } else {
+                ControlContinuation::Unknown
+            };
+        assert!(
+            validate_call_transfer_set(&caller, semantic_call, &mismatched_exceptional).is_err(),
+            "exceptional continuations must match the semantic call"
+        );
+        let mut mismatched_boundary = transfer_set.clone();
+        mismatched_boundary
+            .boundaries
+            .first_mut()
+            .expect("TypeScript open-world boundary")
+            .origin = other_call;
+        assert!(
+            validate_call_transfer_set(&caller, semantic_call, &mismatched_boundary).is_err(),
+            "boundary origins must identify the requested call"
+        );
+        let exit = target
+            .point_handle(target.semantics().normal_exit_point())
+            .expect("target normal exit");
+        let expected_work = SemanticWork {
+            program_points: target.semantics().points().len().saturating_mul(2),
+            control_edges: target.semantics().control_edges().len().saturating_mul(2),
+            gaps: target.semantics().gaps().len(),
+            nested_entries: target
+                .semantics()
+                .points()
+                .len()
+                .saturating_mul(2)
+                .saturating_add(target.semantics().control_edges().len().saturating_mul(2))
+                .saturating_add(target.semantics().gaps().len()),
+            ..SemanticWork::default()
+        };
+        let mut exit_budget = SemanticBudget::default();
+        let exit_outcome = provider
+            .exit_profile(
+                &incoming.callee_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut exit_budget, &cancellation),
+            )
+            .expect("target exit profile");
+        assert!(matches!(&exit_outcome, SemanticOutcome::Complete { .. }));
+        assert_eq!(exit_outcome.work(), expected_work);
+        assert_eq!(exit_budget.used(), expected_work);
+        let profile = exit_outcome.available_value().expect("target exit payload");
+        assert_eq!(profile.callee_entry(), &incoming.callee_entry);
+        assert_eq!(profile.kind(), ReturnTransferKind::Normal);
+        assert!(!profile.has_return_affecting_gaps());
+
+        let mut mismatched_profile_budget = SemanticBudget::default();
+        assert!(
+            provider
+                .exit_profile(
+                    &caller_entry,
+                    &exit,
+                    &mut SemanticRequest::new(&mut mismatched_profile_budget, &cancellation),
+                )
+                .is_err(),
+            "profile entry and exit must belong to one procedure"
+        );
+        assert_eq!(
+            mismatched_profile_budget.used(),
+            SemanticWork::default(),
+            "invalid profile topology must not own semantic work"
+        );
+
+        let MatchedReturnProjection::Edge(return_edge) = profile
+            .project_matched_return(&incoming)
+            .expect("matched target return")
+        else {
+            panic!("target normal exit must project a return edge");
+        };
+        assert_eq!(return_edge.source, exit);
+        assert_eq!(return_edge.target.procedure(), &caller);
+        assert_eq!(return_edge.kind, IcfgEdgeKind::NormalReturn);
+        assert_eq!(return_edge.origin.as_ref(), Some(&incoming.origin));
+        assert_eq!(return_edge.proof, incoming.proof);
+        assert_eq!(return_edge.completeness, incoming.completeness);
+
+        let mut mismatched_entry = incoming.clone();
+        mismatched_entry.callee_entry = exit.clone();
+        assert!(
+            profile.project_matched_return(&mismatched_entry).is_err(),
+            "matched returns require the exact profiled entry"
+        );
+
+        let mut unknown_continuation = incoming;
+        unknown_continuation.normal_continuation = ControlContinuation::Unknown;
+        let MatchedReturnProjection::Boundary(boundary) = profile
+            .project_matched_return(&unknown_continuation)
+            .expect("unknown return continuation")
+        else {
+            panic!("unknown continuation must remain a typed boundary");
+        };
+        assert_eq!(boundary.at, exit);
+        assert_eq!(boundary.origin.as_ref(), Some(&unknown_continuation.origin));
+        assert_eq!(
+            boundary.kind,
+            IcfgBoundaryKind::Continuation {
+                kind: CallContinuationKind::Normal,
+                state: ControlContinuation::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn exit_profile_scopes_point_return_gaps_from_the_requested_entry() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Go,
+            &[(
+                "entry_scope.go",
+                "package sample\nfunc mayPanic() {}\nfunc target() { defer mayPanic() }\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "entry_scope.go");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Go materialization")
+            .available_value()
+            .cloned()
+            .expect("Go artifact");
+        let target = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("target")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("target procedure");
+        let semantics = target.semantics();
+        let return_gap = semantics
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.subject == SemanticGapSubject::Point
+                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            })
+            .expect("point-scoped defer return gap");
+        let canonical_entry = target
+            .point_handle(semantics.entry_point())
+            .expect("canonical target entry");
+        let exit = target
+            .point_handle(semantics.normal_exit_point())
+            .expect("target normal exit");
+        assert_ne!(
+            return_gap.point,
+            exit.id(),
+            "alternate exit entry must begin after the defer gap"
+        );
+
+        let provider = fixture.analyzer.icfg_provider();
+        let mut canonical_budget = SemanticBudget::default();
+        let canonical_outcome = provider
+            .exit_profile(
+                &canonical_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut canonical_budget, &cancellation),
+            )
+            .expect("canonical entry profile");
+        let canonical_profile = canonical_outcome
+            .available_value()
+            .expect("canonical entry profile payload");
+        assert_eq!(canonical_profile.callee_entry(), &canonical_entry);
+        assert!(
+            canonical_profile.has_return_affecting_gaps(),
+            "canonical entry-to-exit topology crosses the defer gap"
+        );
+        let expected_reason = semantics
+            .gaps()
+            .iter()
+            .filter(|gap| gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
+            .map(|gap| {
+                format!(
+                    "{} {}: {}",
+                    gap.kind.label(),
+                    gap.capability.label(),
+                    gap.detail,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            canonical_profile.gap_reason.as_deref(),
+            Some(expected_reason.as_str()),
+        );
+        assert_eq!(
+            canonical_outcome.work().owned_text_bytes,
+            expected_reason.len(),
+            "the exact retained return-gap text must be charged",
+        );
+        assert_eq!(canonical_budget.used(), canonical_outcome.work());
+
+        let mut text_limited_work = SemanticBudget::default().limits();
+        text_limited_work.owned_text_bytes = expected_reason
+            .len()
+            .checked_sub(1)
+            .expect("return-gap reason is non-empty");
+        let mut text_limited_budget =
+            SemanticBudget::new(text_limited_work).expect("all semantic limits remain positive");
+        let text_limited_outcome = provider
+            .exit_profile(
+                &canonical_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut text_limited_budget, &cancellation),
+            )
+            .expect("owned-text boundary is a typed semantic outcome");
+        let SemanticOutcome::ExceededBudget {
+            partial,
+            exceeded,
+            work,
+        } = text_limited_outcome
+        else {
+            panic!("the exact return-gap text must exceed the one-byte-short budget");
+        };
+        assert!(
+            partial.is_none(),
+            "a failed text charge publishes no profile"
+        );
+        assert_eq!(
+            exceeded.dimension(),
+            crate::analyzer::semantic::SemanticBudgetDimension::OwnedTextBytes,
+        );
+        assert_eq!(exceeded.limit(), expected_reason.len() - 1);
+        assert_eq!(exceeded.attempted(), expected_reason.len());
+        assert_eq!(work.owned_text_bytes, 0);
+        assert_eq!(text_limited_budget.used(), work);
+
+        let alternate_entry = exit.clone();
+        let mut alternate_budget = SemanticBudget::default();
+        let alternate_outcome = provider
+            .exit_profile(
+                &alternate_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut alternate_budget, &cancellation),
+            )
+            .expect("alternate entry profile");
+        let alternate_profile = alternate_outcome
+            .available_value()
+            .expect("alternate entry profile payload");
+        assert_eq!(alternate_profile.callee_entry(), &alternate_entry);
+        assert!(
+            !alternate_profile.has_return_affecting_gaps(),
+            "starting at the exit must exclude the earlier point-scoped defer gap"
+        );
+        assert!(
+            matches!(alternate_outcome, SemanticOutcome::Complete { .. }),
+            "no other return gap should weaken the alternate entry profile"
+        );
+        assert_eq!(alternate_outcome.work().owned_text_bytes, 0);
+        assert_eq!(alternate_budget.used(), alternate_outcome.work());
     }
 
     #[test]
