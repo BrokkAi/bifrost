@@ -11,8 +11,21 @@ use tree_sitter::{Node, Tree};
 
 use super::imports::rust_imports_from_use_declaration;
 
+/// Text of `node` verbatim from source, EXCEPT that when `node` is one of
+/// tree-sitter-rust's identifier leaf kinds (see
+/// [`crate::analyzer::common::rust_identifier_like_node_kind`]) a leading
+/// `r#` raw-identifier escape is stripped so identity text (short_name,
+/// fq_name) and reference/member-name text agree on the canonical spelling
+/// (issue #1128). Compound nodes (whole signatures, headers, macro token
+/// spans, scoped paths) are returned unmodified — those are only ever
+/// normalized by first walking down to their own identifier-kind children.
 pub(super) fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    let text = source.get(node.start_byte()..node.end_byte()).unwrap_or("");
+    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    }
 }
 
 /// Whether `item` is directly preceded by a test-evidence attribute

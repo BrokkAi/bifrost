@@ -161,6 +161,39 @@ fn is_reserved_identifier(language: Language, name: &str) -> bool {
     })
 }
 
+/// Whether `kind` is one of tree-sitter-rust's identifier leaf node kinds.
+/// `identifier`, `field_identifier`, `type_identifier`, and
+/// `shorthand_field_identifier` are all grammar aliases of the exact same
+/// lexical rule (`/(r#)?[_\p{XID_Start}][_\p{XID_Continue}]*/`), so any of
+/// them can carry the `r#` raw-identifier escape prefix verbatim in their
+/// token text. Compound path nodes (`scoped_identifier`,
+/// `scoped_type_identifier`) are deliberately excluded: callers read those by
+/// walking to their constituent identifier-kind children (the `path`/`name`
+/// fields), never by string-splitting the whole node text, so each segment's
+/// text is normalized individually when it is itself read as one of the leaf
+/// kinds above.
+pub(crate) fn rust_identifier_like_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier"
+    )
+}
+
+/// Strip the `r#` raw-identifier escape prefix, if present.
+///
+/// `r#` is escape syntax, not part of the identifier's canonical name — this
+/// is how rustc/rust-analyzer treat raw identifiers, and it is the single
+/// normalization rule declaration short_names/fq_names and reference/member
+/// text must agree on for a raw-identifier declaration (`r#type`) and its
+/// plain spelling (`type`) to resolve to the same symbol. Apply this only to
+/// text already known to be a single identifier token (e.g. gated by
+/// [`rust_identifier_like_node_kind`]) — never as a blanket string replace
+/// over a larger span, where the two characters `r#` could legitimately
+/// appear inside a string literal or doc comment that must not change.
+pub(crate) fn strip_raw_identifier_prefix(text: &str) -> &str {
+    text.strip_prefix("r#").unwrap_or(text)
+}
+
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
     language_for_target(target) == Language::Scala
         && (target.is_class() || target.is_module())

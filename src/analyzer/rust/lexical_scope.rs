@@ -830,8 +830,16 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
     }
 }
 
+/// Same identifier-kind-gated `r#` stripping as `declarations::rust_node_text`
+/// (#1128): local bindings/imports here must match the normalized names
+/// declarations and usage sites agree on.
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
+    let text = source
         .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    }
 }

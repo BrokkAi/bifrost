@@ -36,6 +36,13 @@ pub(crate) fn resolve_reference_site_with_line_starts(
     line_starts: &[usize],
 ) -> Result<ResolvedReferenceSite, String> {
     let allow_at_ident = language_for_file(&request.file) == Language::Ruby;
+    // A Rust raw identifier (`r#type`) is one token whose `r#` escape prefix
+    // is not made of ordinary identifier characters, so the generic
+    // ident-byte token scanner below needs to special-case it (#1128) --
+    // otherwise a `self.r#type` reference site is seen as the bare one-byte
+    // token `r`, and a caller-supplied `[start, end)` spanning the whole
+    // `r#type` text is rejected as "not a single reference token".
+    let raw_identifier_aware = language_for_file(&request.file) == Language::Rust;
     let (selection_start, selection_end) = match (
         request.start_byte,
         request.end_byte,
@@ -54,7 +61,9 @@ pub(crate) fn resolve_reference_site_with_line_starts(
                     "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
                 ));
             }
-            if let Some(token) = token_bounds_at(source, start, allow_at_ident) {
+            if let Some(token) =
+                token_bounds_at(source, start, allow_at_ident, raw_identifier_aware)
+            {
                 if end > token.1 {
                     return Err(
                         "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
@@ -78,7 +87,7 @@ pub(crate) fn resolve_reference_site_with_line_starts(
                     "start_byte {start} does not align to a UTF-8 character boundary"
                 ));
             }
-            token_bounds_at(source, start, allow_at_ident)
+            token_bounds_at(source, start, allow_at_ident, raw_identifier_aware)
                 .ok_or_else(|| format!("no reference token at byte {start}"))?
         }
         (_, _, Some(line), column) => {
@@ -97,7 +106,7 @@ pub(crate) fn resolve_reference_site_with_line_starts(
             let point =
                 byte_offset_for_character_column(source, line_start, line_end, line, column)?;
             let point = point.min(source.len().saturating_sub(1));
-            token_bounds_at(source, point, allow_at_ident)
+            token_bounds_at(source, point, allow_at_ident, raw_identifier_aware)
                 .or_else(|| single_non_whitespace_character_at(source, point))
                 .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
         }
@@ -160,7 +169,50 @@ pub(crate) fn byte_offset_for_character_column(
     Err(format!("column {column} is outside line {line_number}"))
 }
 
-fn token_bounds_at(source: &str, byte: usize, allow_at_ident: bool) -> Option<(usize, usize)> {
+/// Whether the identifier-byte run `[start, end)` in `bytes` is (or borders)
+/// a Rust raw identifier's `r#` escape prefix: `r#` sits at the position
+/// immediately before `start` (the ordinary case -- the scan already landed
+/// on the un-escaped tail, e.g. `type` inside `r#type`), or the run itself is
+/// the bare `r` immediately followed by `#` and further ident bytes (the
+/// scan landed on the `r` itself). `r#` is escape syntax, not part of the
+/// identifier (#1128), but it is not made of ordinary identifier *bytes*
+/// either, so the generic ident-byte scan in [`token_bounds_at`] cannot see
+/// across it on its own.
+fn rust_raw_identifier_bounds(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    allow_at_ident: bool,
+) -> Option<(usize, usize)> {
+    if start >= 2
+        && bytes[start - 1] == b'#'
+        && bytes[start - 2] == b'r'
+        && (start == 2 || !is_ident_byte(bytes[start - 3], allow_at_ident))
+    {
+        return Some((start - 2, end));
+    }
+    if end - start == 1
+        && bytes[start] == b'r'
+        && bytes.get(end) == Some(&b'#')
+        && bytes
+            .get(end + 1)
+            .is_some_and(|&byte| is_ident_byte(byte, allow_at_ident))
+    {
+        let mut extended_end = end + 1;
+        while extended_end < bytes.len() && is_ident_byte(bytes[extended_end], allow_at_ident) {
+            extended_end += 1;
+        }
+        return Some((start, extended_end));
+    }
+    None
+}
+
+fn token_bounds_at(
+    source: &str,
+    byte: usize,
+    allow_at_ident: bool,
+    raw_identifier_aware: bool,
+) -> Option<(usize, usize)> {
     if source.is_empty() {
         return None;
     }
@@ -183,6 +235,11 @@ fn token_bounds_at(source: &str, byte: usize, allow_at_ident: bool) -> Option<(u
     while end < bytes.len() && is_ident_byte(bytes[end], allow_at_ident) {
         end += 1;
     }
+    if raw_identifier_aware
+        && let Some(extended) = rust_raw_identifier_bounds(bytes, start, end, allow_at_ident)
+    {
+        return Some(extended);
+    }
     Some((start, end))
 }
 
@@ -192,12 +249,22 @@ pub(crate) fn reference_target_match_offsets<'a>(
     language: Language,
 ) -> impl Iterator<Item = usize> + 'a {
     let allow_at_ident = language == Language::Ruby;
+    let raw_identifier_aware = language == Language::Rust;
+    // A target that is itself a raw identifier (`r#type`) is not made of
+    // ordinary identifier bytes (the `#` fails `is_ident_byte`), but it is
+    // still exactly one reference token in Rust source, so it must take the
+    // same strict token-boundary check below as any other identifier target
+    // rather than falling back to unchecked substring matching (#1128).
     let target_is_identifier = target
         .bytes()
-        .all(|byte| is_ident_byte(byte, allow_at_ident));
+        .all(|byte| is_ident_byte(byte, allow_at_ident))
+        || (raw_identifier_aware
+            && target.strip_prefix("r#").is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(|byte| is_ident_byte(byte, allow_at_ident))
+            }));
     source.match_indices(target).filter_map(move |(offset, _)| {
         if !target_is_identifier
-            || token_bounds_at(source, offset, allow_at_ident)
+            || token_bounds_at(source, offset, allow_at_ident, raw_identifier_aware)
                 .is_some_and(|(start, end)| start == offset && end == offset + target.len())
         {
             Some(offset)

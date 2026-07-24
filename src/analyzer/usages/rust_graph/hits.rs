@@ -386,11 +386,22 @@ fn has_ancestor_kind(mut node: Node<'_>, kind: &str) -> bool {
     false
 }
 
+/// Text of `node`, normalizing away a leading `r#` raw-identifier escape when
+/// `node` is one of tree-sitter-rust's identifier leaf kinds, so a usage site
+/// like `self.r#type` compares equal to the (also-normalized) declaration
+/// name `type` (#1128). See
+/// `crate::analyzer::rust::declarations::rust_node_text` for the extraction
+/// side of the same normalization.
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
+    let text = source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
-        .trim()
+        .trim();
+    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    }
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {

@@ -786,6 +786,17 @@ fn normalized_client_symbol_segment(language: Language, segment: &str) -> String
         return normalized_go_client_symbol_segment(segment);
     }
 
+    // Rust declarations are indexed under the canonical (un-escaped) name —
+    // `r#` is raw-identifier escape syntax, not part of the identifier
+    // (#1128) — so a client-typed segment carrying the escape (`r#type`,
+    // copy-pasted from an old display or from source) must alias to the
+    // same canonical segment (`type`) the index uses. Only the identifier's
+    // own `r#` prefix is stripped; this operates on one already-flushed
+    // selector segment, never a larger path or arbitrary text.
+    if language == Language::Rust {
+        return crate::analyzer::common::strip_raw_identifier_prefix(segment).to_string();
+    }
+
     segment.to_string()
 }
 

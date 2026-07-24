@@ -5219,10 +5219,19 @@ fn rust_simple_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
+/// Same identifier-kind-gated `r#` stripping as
+/// `crate::analyzer::rust::declarations::rust_node_text` (#1128): reference
+/// text read here (e.g. `self.r#type`'s `field` node) must agree with the
+/// normalized declaration names built on the extraction side.
 fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
+    let text = source
         .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    }
 }
 
 fn rust_imported_export_candidates(

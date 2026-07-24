@@ -335,7 +335,7 @@ lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07"
 );
 lang_epoch!(
     Php,

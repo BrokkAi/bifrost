@@ -714,7 +714,13 @@ pub(super) fn scan_files_for_member_target(
         receiver_names.sort();
         receiver_names.dedup();
         let static_owner_names = owner_local_names;
-        let has_static_trait_call = trait_owner && source.contains(&format!("::{}", member_name));
+        // The raw-identifier escape sits between the path separator and the
+        // name in source text (`Trait::r#type`), so the plain `::{member}`
+        // substring check alone would miss a normalized raw-identifier member
+        // name's escaped spelling; check both (#1128).
+        let has_static_trait_call = trait_owner
+            && (source.contains(&format!("::{member_name}"))
+                || source.contains(&format!("::r#{member_name}")));
         let record_unproven_receivers =
             !receiver_names.is_empty() || !static_owner_names.is_empty() || has_static_trait_call;
         let mut type_lookup_cache = RustTypeLookupCache::default();
@@ -3053,8 +3059,16 @@ fn simple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
         .flatten()
 }
 
+/// Same identifier-kind-gated `r#` stripping as `rust_graph::hits::node_text`
+/// (#1128): usage-side member/reference text must agree with normalized
+/// declaration names.
 fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
     let text = source.get(node.start_byte()..node.end_byte())?.trim();
+    let text = if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    };
     (!text.is_empty()).then(|| text.to_string())
 }
 

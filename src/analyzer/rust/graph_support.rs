@@ -1510,11 +1510,19 @@ fn simple_type_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
+/// Same identifier-kind-gated `r#` stripping as `declarations::rust_node_text`,
+/// applied here too so trait/impl member-name matching agrees with
+/// normalized declaration names (#1128).
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
+    let text = source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
-        .trim()
+        .trim();
+    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    }
 }
 
 fn trait_reference_matches(

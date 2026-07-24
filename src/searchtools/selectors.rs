@@ -605,6 +605,21 @@ pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
 /// real file; fall back to the plain parse when none checks out (the
 /// `file.rs#r#type` raw-identifier case keeps its first-`#` split because
 /// `file.rs` resolves).
+///
+/// The single-`#` fallback below only re-checks `anchor_is_file` for a
+/// slash-free anchor. A slash (or backslash) is an unambiguous, intentional
+/// path signal -- callers rely on that shape reaching the anchor-recovery
+/// diagnostics (`anchor_not_found_input`,
+/// `unsupported_selector_shape_guidance`'s extensionless-path note) even when
+/// the named file does not exist, e.g. a typo'd `src/wrong.js#Widget` or a
+/// Java FQN-as-path missing its extension. A slash-free anchor's only
+/// "looks like a path" signal is a trailing dot-suffix
+/// (`looks_like_path_selector_anchor`'s extension check), which is far
+/// weaker and is exactly what a bare Rust raw identifier can trip by
+/// accident: `DbColumn.r#type`'s only `#` splits into `DbColumn.r` (which
+/// "looks like" a `.r` file) and `type` (#1128). So a slash-free anchor must
+/// additionally name a real file before this fallback treats it as one;
+/// otherwise it falls through to a plain name lookup.
 pub(super) fn split_definition_selector_with_resolver<'a>(
     input: &'a str,
     anchor_is_file: impl Fn(&str) -> bool,
@@ -629,7 +644,8 @@ pub(super) fn split_definition_selector_with_resolver<'a>(
         Some((anchor, name))
             if !anchor.is_empty()
                 && !name.is_empty()
-                && looks_like_path_selector_anchor(anchor) =>
+                && looks_like_path_selector_anchor(anchor)
+                && (anchor.contains('/') || anchor.contains('\\') || anchor_is_file(anchor)) =>
         {
             DefinitionSelector::FileAnchored {
                 anchor: anchor.to_string(),

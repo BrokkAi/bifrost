@@ -716,6 +716,7 @@ fn build_macro_scope_edges(
                     source
                         .get(name.start_byte()..name.end_byte())
                         .map(str::trim)
+                        .map(crate::analyzer::common::strip_raw_identifier_prefix)
                         .filter(|name| !name.is_empty())
                 }) else {
                     continue;

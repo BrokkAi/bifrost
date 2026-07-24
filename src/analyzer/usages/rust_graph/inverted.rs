@@ -770,9 +770,17 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
     }
 }
 
+/// Same identifier-kind-gated `r#` stripping as `rust_graph::hits::node_text`
+/// (#1128): usage-side member/reference text must agree with normalized
+/// declaration names.
 fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
+    let text = source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
-        .trim()
+        .trim();
+    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
+        crate::analyzer::common::strip_raw_identifier_prefix(text)
+    } else {
+        text
+    }
 }
