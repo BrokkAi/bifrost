@@ -121,38 +121,15 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     };
     context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
-    if let Err(error) = builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
-        context.step(builder, work, stack)
-    }) {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(JavaLoweringError::Cancelled(_)) => {
-                Err(JavaLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(JavaLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(JavaLoweringError::Budget(exceeded, _)) => {
-                Err(JavaLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(JavaLoweringError::Invalid(detail)) => {
-                Err(JavaLoweringError::Invalid(detail))
-            }
-        };
-    }
-
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(JavaLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    builder
-        .finish_with_work()
-        .map_err(|error| JavaLoweringError::Budget(error, Box::new(work_before_freeze)))
+    drive_and_finish_procedure(
+        builder,
+        [initial],
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {

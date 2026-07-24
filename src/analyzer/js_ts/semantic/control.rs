@@ -130,47 +130,15 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         function_scope,
         &mut pending,
     )?;
-    let mut drive_error = None;
-    while let Some(initial) = pending.pop() {
-        if let Err(error) =
-            builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
-                context.step(builder, work, stack)
-            })
-        {
-            drive_error = Some(error);
-            break;
-        }
-    }
-    if let Some(error) = drive_error {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(TsLoweringError::Cancelled(_)) => {
-                Err(TsLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(TsLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(TsLoweringError::Budget(exceeded, _)) => {
-                Err(TsLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(TsLoweringError::Invalid(detail)) => {
-                Err(TsLoweringError::Invalid(detail))
-            }
-        };
-    }
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(TsLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    let (parts, work) = builder
-        .finish_with_work()
-        .map_err(|error| TsLoweringError::Budget(error, Box::new(work_before_freeze)))?;
-    Ok((parts, work))
+    drive_and_finish_procedure(
+        builder,
+        pending.drain(..).rev(),
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -2184,53 +2152,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let awaited_node = node
             .child_by_field_name("argument")
             .or_else(|| first_named_child(node));
-        let suspend = self.point(builder, node, Vec::new())?;
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
-        let awaited = self.value(builder, suspend, SemanticValueKind::Temporary)?;
-        let result = self.value(builder, normal, SemanticValueKind::AwaitResult)?;
-        self.append_effect(
-            builder,
+        let suspend_metadata = self.mapping(builder, node)?;
+        let normal_metadata = self.mapping(builder, node)?;
+        let exceptional_metadata = self.mapping(builder, node)?;
+        let AwaitScaffold {
             suspend,
-            SemanticEffect::AsyncSuspend {
-                awaited: Some(awaited),
-                normal_resume: ControlContinuation::Target(normal),
-                exceptional_resume: ControlContinuation::Target(exceptional),
-            },
-        )?;
-        self.append_effect(
+            normal_resume: normal,
+            exceptional_resume: exceptional,
+            ..
+        } = self.session.add_await_scaffold(
             builder,
-            normal,
-            SemanticEffect::AsyncResume {
-                suspend,
-                kind: AsyncResumeKind::Normal,
-                result: Some(result),
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::AsyncResume {
-                suspend,
-                kind: AsyncResumeKind::Exceptional,
-                result: None,
-            },
-        )?;
-        self.edge(
-            builder,
-            suspend,
-            EdgeTarget {
-                point: normal,
-                kind: ControlEdgeKind::AsyncNormal,
-            },
-        )?;
-        self.edge(
-            builder,
-            suspend,
-            EdgeTarget {
-                point: exceptional,
-                kind: ControlEdgeKind::AsyncExceptional,
-            },
+            suspend_metadata,
+            normal_metadata,
+            exceptional_metadata,
         )?;
         self.edge(builder, normal, next)?;
         self.abrupt(

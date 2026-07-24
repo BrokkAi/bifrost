@@ -9,19 +9,19 @@ use crate::analyzer::lexical_definitions::FormalVariadicKind;
 use crate::hash::HashMap;
 use tree_sitter::Node;
 
-use super::cfg::{ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
+use super::cfg::{DriveError, ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
 use super::{
-    AllocationId, AllocationKind, AllocationSite, ArgumentDomain, CallContinuationKind, CallSiteId,
-    CallableTargetResolution, CancellationToken, CaptureBinding, CaptureId, CaptureMode,
-    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, Evidence,
-    EvidenceCompleteness, EvidenceId, FormalMultiplicity, MemoryAccessKind, MemoryLocation,
-    MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts, ProgramPointId,
-    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapId,
-    SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind, SemanticWork,
-    SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition, SourceSpan,
-    ValueId,
+    AllocationId, AllocationKind, AllocationSite, ArgumentDomain, AsyncResumeKind,
+    CallContinuationKind, CallSiteId, CallableTargetResolution, CancellationToken, CaptureBinding,
+    CaptureId, CaptureMode, CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind,
+    Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity, MemoryAccessKind,
+    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts,
+    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument,
+    SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
+    SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
+    SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
+    SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
+    SourceSpan, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -221,10 +221,98 @@ where
     })
 }
 
+/// Drive one adapter's opaque work items, seal detached source regions, and
+/// freeze the completed procedure.
+///
+/// The adapter owns the work-item type and step function. This helper owns the
+/// identical cancellation, budget, and finalization policy used after syntax
+/// has already been classified.
+pub(crate) fn drive_and_finish_procedure<I, F>(
+    mut builder: ProcedureCfgBuilder,
+    initial: I,
+    entry: ProgramPointId,
+    normal_exit: ProgramPointId,
+    exceptional_exit: ProgramPointId,
+    cancellation: &CancellationToken,
+    mut step: F,
+) -> Result<(ProcedureSemanticsParts, SemanticWork), ProcedureLoweringError>
+where
+    I: IntoIterator,
+    F: FnMut(
+        &mut ProcedureCfgBuilder,
+        I::Item,
+        &mut Vec<I::Item>,
+    ) -> Result<(), ProcedureLoweringError>,
+{
+    for initial in initial {
+        if let Err(error) =
+            builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
+                step(builder, work, stack)
+            })
+        {
+            let work = Box::new(builder.prospective_work());
+            return match error {
+                DriveError::Cancelled | DriveError::Step(ProcedureLoweringError::Cancelled(_)) => {
+                    Err(ProcedureLoweringError::Cancelled(work))
+                }
+                DriveError::ExceededBudget(exceeded)
+                | DriveError::Step(ProcedureLoweringError::Budget(exceeded, _)) => {
+                    Err(ProcedureLoweringError::Budget(exceeded, work))
+                }
+                DriveError::Step(ProcedureLoweringError::Invalid(detail)) => {
+                    Err(ProcedureLoweringError::Invalid(detail))
+                }
+            };
+        }
+    }
+
+    if builder
+        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
+        .is_err()
+    {
+        return Err(ProcedureLoweringError::Cancelled(Box::new(
+            builder.prospective_work(),
+        )));
+    }
+    let work_before_freeze = builder.prospective_work();
+    builder
+        .finish_with_work()
+        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PointMetadata {
     pub(crate) source: SourceMappingId,
     pub(crate) evidence: EvidenceId,
+}
+
+/// One already-classified control-flow destination.
+///
+/// Language adapters decide which syntax owns the destination and which edge
+/// kind applies. This shared value only carries that syntax-free decision
+/// through their iterative work queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlTarget {
+    pub(crate) point: ProgramPointId,
+    pub(crate) kind: ControlEdgeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AwaitScaffold {
+    pub(crate) suspend: ProgramPointId,
+    pub(crate) normal_resume: ProgramPointId,
+    pub(crate) exceptional_resume: ProgramPointId,
+    pub(crate) awaited: ValueId,
+    pub(crate) result: ValueId,
+}
+
+impl ControlTarget {
+    pub(crate) const fn normal(point: ProgramPointId) -> Self {
+        Self {
+            point,
+            kind: ControlEdgeKind::Normal,
+        }
+    }
 }
 
 /// Target-local slot reserved for the lexical receiver capture, when present.
@@ -510,6 +598,89 @@ impl<'a> ProcedureLoweringSession<'a> {
         Ok(id)
     }
 
+    /// Retain a semantic value at most once for one adapter-selected syntax
+    /// identity. The returned flag distinguishes a newly allocated value so an
+    /// adapter can attach auxiliary type or binding metadata exactly once.
+    pub(crate) fn cache_value_with_metadata(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        cache: &mut HashMap<usize, ValueId>,
+        syntax_id: usize,
+        metadata: PointMetadata,
+        kind: SemanticValueKind,
+    ) -> Result<(ValueId, bool), ProcedureLoweringError> {
+        if let Some(value) = cache.get(&syntax_id).copied() {
+            return Ok((value, false));
+        }
+        let value = self.add_value_with_metadata(builder, metadata, kind)?;
+        cache.insert(syntax_id, value);
+        Ok((value, true))
+    }
+
+    /// Emit the language-neutral suspend and two-resume core of an await.
+    ///
+    /// Operand selection, exceptional completion routing, and any
+    /// runtime-specific uncertainty remain adapter-owned.
+    pub(crate) fn add_await_scaffold(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        suspend_metadata: PointMetadata,
+        normal_metadata: PointMetadata,
+        exceptional_metadata: PointMetadata,
+    ) -> Result<AwaitScaffold, ProcedureLoweringError> {
+        let suspend = self.add_point(builder, suspend_metadata, Vec::new())?;
+        let normal_resume = self.add_point(builder, normal_metadata, Vec::new())?;
+        let exceptional_resume = self.add_point(builder, exceptional_metadata, Vec::new())?;
+        let awaited = self.add_value(builder, suspend, SemanticValueKind::Temporary)?;
+        let result = self.add_value(builder, normal_resume, SemanticValueKind::AwaitResult)?;
+        self.append_effect(
+            builder,
+            suspend,
+            SemanticEffect::AsyncSuspend {
+                awaited: Some(awaited),
+                normal_resume: ControlContinuation::Target(normal_resume),
+                exceptional_resume: ControlContinuation::Target(exceptional_resume),
+            },
+        )?;
+        self.append_effect(
+            builder,
+            normal_resume,
+            SemanticEffect::AsyncResume {
+                suspend,
+                kind: AsyncResumeKind::Normal,
+                result: Some(result),
+            },
+        )?;
+        self.append_effect(
+            builder,
+            exceptional_resume,
+            SemanticEffect::AsyncResume {
+                suspend,
+                kind: AsyncResumeKind::Exceptional,
+                result: None,
+            },
+        )?;
+        self.add_edge(
+            builder,
+            suspend,
+            normal_resume,
+            ControlEdgeKind::AsyncNormal,
+        )?;
+        self.add_edge(
+            builder,
+            suspend,
+            exceptional_resume,
+            ControlEdgeKind::AsyncExceptional,
+        )?;
+        Ok(AwaitScaffold {
+            suspend,
+            normal_resume,
+            exceptional_resume,
+            awaited,
+            result,
+        })
+    }
+
     pub(crate) fn add_allocation(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -653,6 +824,46 @@ impl<'a> ProcedureLoweringSession<'a> {
             kind,
             detail,
         )
+    }
+
+    /// Publish the paired value/call-site gaps for one unresolved callable
+    /// target while preserving adapter-owned diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_callable_resolution_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callee: ValueId,
+        call_site: CallSiteId,
+        resolution: &CallableTargetResolution,
+        callable_detail: impl Into<Box<str>>,
+        call_detail: impl Into<Box<str>>,
+    ) -> Result<(), ProcedureLoweringError> {
+        let kind = match resolution {
+            CallableTargetResolution::Proven(_) => return Ok(()),
+            CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
+            CallableTargetResolution::Unknown => SemanticGapKind::Unknown,
+            CallableTargetResolution::Unsupported => SemanticGapKind::Unsupported,
+            CallableTargetResolution::Unproven(_) => SemanticGapKind::Unproven,
+            CallableTargetResolution::ExceededBudget(_) => SemanticGapKind::ExceededBudget,
+        };
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::Value(callee),
+            SemanticCapability::CallableReferences,
+            kind,
+            callable_detail,
+        )?;
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::Calls,
+            kind,
+            call_detail,
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -895,6 +1106,116 @@ mod tests {
             0
         );
         assert_eq!(start.session.point_metadata.len(), 3);
+    }
+
+    #[test]
+    fn cached_values_report_insertion_without_duplicate_rows() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let metadata = session
+            .add_mapping(&mut builder, anchor(8, 14, 0), SourceMappingKind::Exact)
+            .expect("value mapping");
+        let mut cache = HashMap::default();
+
+        let (first, inserted) = session
+            .cache_value_with_metadata(
+                &mut builder,
+                &mut cache,
+                42,
+                metadata,
+                SemanticValueKind::Temporary,
+            )
+            .expect("first cached value");
+        let (second, inserted_again) = session
+            .cache_value_with_metadata(
+                &mut builder,
+                &mut cache,
+                42,
+                metadata,
+                SemanticValueKind::Temporary,
+            )
+            .expect("reused cached value");
+        let (parts, _) = builder.finish_with_work().expect("finished parts");
+
+        assert!(inserted);
+        assert!(!inserted_again);
+        assert_eq!(first, second);
+        assert_eq!(parts.values.len(), 1);
+    }
+
+    #[test]
+    fn await_scaffold_emits_exact_suspend_resume_core() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let suspend = session
+            .add_mapping(&mut builder, anchor(8, 14, 0), SourceMappingKind::Exact)
+            .expect("suspend mapping");
+        let normal = session
+            .add_mapping(&mut builder, anchor(8, 14, 1), SourceMappingKind::Exact)
+            .expect("normal mapping");
+        let exceptional = session
+            .add_mapping(&mut builder, anchor(8, 14, 2), SourceMappingKind::Exact)
+            .expect("exceptional mapping");
+        let scaffold = session
+            .add_await_scaffold(&mut builder, suspend, normal, exceptional)
+            .expect("await scaffold");
+        let (parts, _) = builder.finish_with_work().expect("finished parts");
+
+        assert_eq!(scaffold.suspend.index(), 3);
+        assert_eq!(scaffold.normal_resume.index(), 4);
+        assert_eq!(scaffold.exceptional_resume.index(), 5);
+        assert_eq!(scaffold.awaited.index(), 0);
+        assert_eq!(scaffold.result.index(), 1);
+        let resume_edges = parts
+            .control_edges
+            .iter()
+            .filter(|edge| edge.source_point == scaffold.suspend)
+            .map(|edge| (edge.target_point, edge.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resume_edges,
+            vec![
+                (scaffold.normal_resume, ControlEdgeKind::AsyncNormal),
+                (
+                    scaffold.exceptional_resume,
+                    ControlEdgeKind::AsyncExceptional
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_driver_reports_cancellation_with_retained_work() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            builder,
+            entry,
+            normal_exit,
+            exceptional_exit,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        cancellation.cancel();
+        let outcome = drive_and_finish_procedure(
+            builder,
+            [()],
+            entry,
+            normal_exit,
+            exceptional_exit,
+            &cancellation,
+            |_, (), _| Ok(()),
+        );
+        assert!(matches!(outcome, Err(ProcedureLoweringError::Cancelled(_))));
     }
 
     #[test]

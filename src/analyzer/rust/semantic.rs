@@ -8,8 +8,8 @@ use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
-    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
-    ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::lowering::formal_multiplicity;
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
@@ -395,20 +395,7 @@ fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
 
 type RustLoweringError = ProcedureLoweringError;
 
-#[derive(Debug, Clone, Copy)]
-struct EdgeTarget {
-    point: ProgramPointId,
-    kind: ControlEdgeKind,
-}
-
-impl EdgeTarget {
-    const fn normal(point: ProgramPointId) -> Self {
-        Self {
-            point,
-            kind: ControlEdgeKind::Normal,
-        }
-    }
-}
+type EdgeTarget = ControlTarget;
 
 #[derive(Debug, Clone, Copy)]
 enum Work<'tree> {
@@ -599,47 +586,15 @@ fn lower_procedure<'tree>(
     let mut pending = vec![initial];
     context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
-    let mut drive_error = None;
-    while let Some(initial) = pending.pop() {
-        if let Err(error) =
-            builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
-                context.step(builder, work, stack)
-            })
-        {
-            drive_error = Some(error);
-            break;
-        }
-    }
-    if let Some(error) = drive_error {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(RustLoweringError::Cancelled(_)) => {
-                Err(RustLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(RustLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(RustLoweringError::Budget(exceeded, _)) => {
-                Err(RustLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(RustLoweringError::Invalid(detail)) => {
-                Err(RustLoweringError::Invalid(detail))
-            }
-        };
-    }
-
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(RustLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    builder
-        .finish_with_work()
-        .map_err(|error| RustLoweringError::Budget(error, Box::new(work_before_freeze)))
+    drive_and_finish_procedure(
+        builder,
+        pending.drain(..).rev(),
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -779,10 +734,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let value = self
-            .session
-            .add_value_with_metadata(builder, metadata, kind)?;
-        self.expression_values.insert(node.id(), value);
+        let (value, _) = self.session.cache_value_with_metadata(
+            builder,
+            &mut self.expression_values,
+            node.id(),
+            metadata,
+            kind,
+        )?;
         Ok(value)
     }
 
@@ -2238,53 +2196,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         let awaited_node = first_named_child(node);
-        let suspend = self.point(builder, node, Vec::new())?;
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
-        let awaited = self.value(builder, suspend, SemanticValueKind::Temporary)?;
-        let result = self.value(builder, normal, SemanticValueKind::AwaitResult)?;
-        self.append_effect(
-            builder,
+        let suspend_metadata = self.mapping(builder, node)?;
+        let normal_metadata = self.mapping(builder, node)?;
+        let exceptional_metadata = self.mapping(builder, node)?;
+        let AwaitScaffold {
             suspend,
-            SemanticEffect::AsyncSuspend {
-                awaited: Some(awaited),
-                normal_resume: ControlContinuation::Target(normal),
-                exceptional_resume: ControlContinuation::Target(exceptional),
-            },
-        )?;
-        self.append_effect(
+            normal_resume: normal,
+            exceptional_resume: exceptional,
+            ..
+        } = self.session.add_await_scaffold(
             builder,
-            normal,
-            SemanticEffect::AsyncResume {
-                suspend,
-                kind: AsyncResumeKind::Normal,
-                result: Some(result),
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::AsyncResume {
-                suspend,
-                kind: AsyncResumeKind::Exceptional,
-                result: None,
-            },
-        )?;
-        self.edge(
-            builder,
-            suspend,
-            EdgeTarget {
-                point: normal,
-                kind: ControlEdgeKind::AsyncNormal,
-            },
-        )?;
-        self.edge(
-            builder,
-            suspend,
-            EdgeTarget {
-                point: exceptional,
-                kind: ControlEdgeKind::AsyncExceptional,
-            },
+            suspend_metadata,
+            normal_metadata,
+            exceptional_metadata,
         )?;
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
@@ -2780,28 +2704,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         call_site: CallSiteId,
         resolution: &CallableTargetResolution,
     ) -> Result<(), RustLoweringError> {
-        let kind = match resolution {
-            CallableTargetResolution::Proven(_) => return Ok(()),
-            CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
-            CallableTargetResolution::Unknown => SemanticGapKind::Unknown,
-            CallableTargetResolution::Unsupported => SemanticGapKind::Unsupported,
-            CallableTargetResolution::Unproven(_) => SemanticGapKind::Unproven,
-            CallableTargetResolution::ExceededBudget(_) => SemanticGapKind::ExceededBudget,
-        };
-        self.add_gap(
+        self.session.add_callable_resolution_gaps(
             builder,
             point,
-            SemanticGapSubject::Value(callee),
-            SemanticCapability::CallableReferences,
-            kind,
+            callee,
+            call_site,
+            resolution,
             "callable target requires whole-program Rust dispatch refinement",
-        )?;
-        self.add_gap(
-            builder,
-            point,
-            SemanticGapSubject::CallSite(call_site),
-            SemanticCapability::Calls,
-            kind,
             "call target requires whole-program Rust dispatch refinement",
         )
     }
