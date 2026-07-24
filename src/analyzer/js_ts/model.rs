@@ -1,3 +1,4 @@
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::{ParsedFile, WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
 use tree_sitter::Node;
@@ -6,8 +7,32 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
 }
 
+/// Intern one qualified-name segment in the process-global interner. Shared by
+/// the JavaScript and TypeScript adapters (both build `FqName`s the same way:
+/// `package_name` is always empty, so every chain starts fresh from either a
+/// parent's own `fq` or one of the synthetic file-scope prefixes below).
+pub(crate) fn js_ts_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// The file's own base name (with extension) as a single [`SegmentKind::Path`]
+/// segment. Its text may itself contain literal dots (`utils.test.js`), which
+/// is exactly what `Path` is for; this is never further split into directory
+/// components because js/ts short names are never qualified by directory path,
+/// only (optionally) by this bare file-name marker (see
+/// `file_scoped_field_name` below).
+fn file_name_path_segment(file: &ProjectFile) -> SegmentId {
+    let name = file
+        .rel_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("module");
+    js_ts_segment(name, SegmentKind::Path)
+}
+
 pub(crate) fn module_code_unit(file: &ProjectFile) -> CodeUnit {
-    CodeUnit::new(
+    let fq = FqName::new().with_pushed(file_name_path_segment(file));
+    CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Module,
         "",
@@ -15,6 +40,7 @@ pub(crate) fn module_code_unit(file: &ProjectFile) -> CodeUnit {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("module"),
+        fq,
     )
 }
 
@@ -39,7 +65,16 @@ pub(crate) fn add_default_export_unit(
     kind: CodeUnitType,
     parsed: &mut ParsedFile,
 ) -> CodeUnit {
-    let code_unit = CodeUnit::new(file.clone(), kind, "", "default");
+    // The synthetic `default` name is a Type segment for a default-exported
+    // class, a Member segment for a default-exported function/object (mirrors
+    // how every other class-vs-member site in this module tags its own name).
+    let segment_kind = if kind == CodeUnitType::Class {
+        SegmentKind::Type
+    } else {
+        SegmentKind::Member
+    };
+    let fq = FqName::new().with_pushed(js_ts_segment("default", segment_kind));
+    let code_unit = CodeUnit::new_fq(file.clone(), kind, "", "default", fq);
     parsed.add_code_unit(
         code_unit.clone(),
         export,
@@ -122,6 +157,14 @@ pub(crate) fn file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
             .unwrap_or("module"),
         name
     )
+}
+
+/// Structured counterpart to [`file_scoped_field_name`]: the same file-name
+/// `Path` prefix followed by the field's own `Member` segment.
+pub(crate) fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
+    FqName::new()
+        .with_pushed(file_name_path_segment(file))
+        .with_pushed(js_ts_segment(name, SegmentKind::Member))
 }
 
 /// Whether `code_unit` is a module-scope field whose short name was qualified

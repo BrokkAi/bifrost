@@ -29,13 +29,22 @@ fn cpp_push_package(fq: &mut FqName, package_name: &str) {
     }
 }
 
-/// Push per-class [`SegmentKind::Type`] segments for a nested-class chain stored
-/// in Bifrost's legacy `$`-joined `short_name` form (`Outer$Inner`, issue
-/// #1121). Each `$`-separated component is its own nested class; the native
-/// rendering rejoins adjacent Type segments with `$`.
+/// Push per-class segments for a nested-class chain stored in Bifrost's legacy
+/// `$`-joined `short_name` form (`Outer$Inner`, issue #1121). The outermost
+/// class is a plain [`SegmentKind::Type`]; every subsequently nested class is
+/// [`SegmentKind::Nested`], which renders its `$` join unconditionally (the
+/// same mechanism python/php/ruby's `$`-joined nesting already uses) — so no
+/// cpp-specific native rendering rule is needed for this chain.
 fn cpp_push_type_chain(fq: &mut FqName, chain: &str) {
+    let mut first = true;
     for component in chain.split('$').filter(|c| !c.is_empty()) {
-        fq.push(cpp_segment(component, SegmentKind::Type));
+        let kind = if first {
+            SegmentKind::Type
+        } else {
+            SegmentKind::Nested
+        };
+        fq.push(cpp_segment(component, kind));
+        first = false;
     }
 }
 

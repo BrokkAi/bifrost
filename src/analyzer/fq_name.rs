@@ -183,17 +183,13 @@ fn separator(prev: SegmentKind, cur: SegmentKind, native: Option<Language>) -> &
         return "$";
     }
     if native == Some(Language::Cpp) {
-        // C++'s legacy string spelling is mixed-separator: `::` between
-        // namespace (Package) components and `$` between nested-class (Type)
-        // components, joined to the terminal member with `.` (issue #1163). The
-        // canonical `.`-join renders the same structure without the native
-        // punctuation; both round-trip because the equivalence check renders
-        // each unit natively (see `CodeUnit::with_signature_and_fq`).
+        // C++'s legacy string spelling keeps a `::`-joined namespace (Package)
+        // head, joined to the terminal member with `.` (issue #1163). Nested
+        // classes are `$`-joined too, but that is handled generically by the
+        // `Nested` rule above (see `cpp_push_type_chain` in
+        // `src/analyzer/cpp/declarations.rs`), not by a cpp-specific rule here.
         if prev == SegmentKind::Package && cur == SegmentKind::Package {
             return "::";
-        }
-        if prev == SegmentKind::Type && cur == SegmentKind::Type {
-            return "$";
         }
     }
     "."
@@ -406,19 +402,22 @@ mod tests {
 
     #[test]
     fn display_native_cpp_nested_class_uses_dollar() {
-        // C++ nested classes are spelled `Outer$Inner` (Type$Type) natively but
-        // `Outer.Inner` canonically; both must round-trip.
+        // C++ nested classes are spelled `Outer$Inner` — the outermost class is
+        // a plain Type, each subsequently nested class is `Nested` (the general
+        // `$`-join mechanism shared with python/php/ruby/csharp/java, not a
+        // cpp-specific rule), so `Outer$Inner` round-trips identically in BOTH
+        // the canonical and native renderings.
         let interner = SegmentInterner::new();
         let name = fq(
             &interner,
             &[
                 ("ns", SegmentKind::Package),
                 ("Outer", SegmentKind::Type),
-                ("Inner", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
                 ("method", SegmentKind::Member),
             ],
         );
-        assert_eq!(name.display(&interner), "ns.Outer.Inner.method");
+        assert_eq!(name.display(&interner), "ns.Outer$Inner.method");
         assert_eq!(
             name.display_native(Language::Cpp, &interner),
             "ns.Outer$Inner.method"

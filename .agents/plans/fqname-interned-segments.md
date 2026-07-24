@@ -49,11 +49,15 @@ the analyzer tree.
       memory/size measurement. Landed as `src/analyzer/fq_name.rs` (registered
       in `src/analyzer/mod.rs`). Ten `--lib fq_name` tests pass; measurement
       recorded in Surprises & Discoveries.
-- [ ] M1: dual representation — emission points populate `FqName` alongside the
+- [x] M1: dual representation — emission points populate `FqName` alongside the
       legacy strings, with an equivalence check (per language; check off individually).
   - [x] rust (2026-07-24)  - [x] cpp (2026-07-24)  - [x] python (2026-07-24)
   - [x] go (2026-07-24)  - [x] php (2026-07-24)  - [x] ruby (2026-07-24)
-  - [x] scala (2026-07-24)  - [ ] java  - [ ] csharp  - [ ] javascript  - [ ] typescript
+  - [x] scala (2026-07-24)  - [x] java (2026-07-24)  - [x] csharp (2026-07-24)
+  - [x] javascript (2026-07-24)  - [x] typescript (2026-07-24)
+  - [x] cleanup: migrate cpp's nested-class Type-Type native `$` rule onto
+        `Nested` (2026-07-24, logged in the M1 rust/scala/cpp Decision Log
+        entry above; done as part of this wave)
 - [ ] M2: shared services and selectors consume `FqName`; input parsing produces it.
 - [ ] M3: persistence flip — store schema carries segments; single epoch salt bump.
 - [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip.
@@ -410,6 +414,114 @@ the analyzer tree.
   wave's validation - flipped with #1138 justifications as part of this
   integration, not new behavior.
   Rationale: coordinator, 2026-07-24.
+- Decision (M1 java — nested classes are `.`-joined, NOT `$`-joined; task
+  briefing's premise was wrong, same pattern as the earlier python/php
+  reconciliation): the briefing for this wave assumed "java nested classes use
+  `$` in short_name (`Outer$Inner`)" by analogy with JVM binary names. Empirically
+  `visit_class_like` in `src/analyzer/java/declarations.rs` joins a nested class
+  onto its parent with a plain `.` (`format!("{}.{}", parent.short_name(),
+  simple_name)`) — confirmed by `tests/usage_graph_java_test.rs`'s
+  `com.example.Outer.Inner.helper` expectation and `external.rs`'s
+  `qualified_name` helper, which is als `.`-joined. The `$`-joined JVM
+  convention only appears in `normalize_java_full_name`/`is_java_anonymous_structure`,
+  which post-process bytecode-derived strings from a DIFFERENT subsystem
+  (`JavaExternalType`, not `CodeUnit`) that this M1 wave does not touch. Every
+  java nested class is therefore tagged a plain `SegmentKind::Type` (not
+  `Nested`), hanging off its parent's own `fq` exactly like a top-level class
+  hangs off the package-path `Package` chain — java needed NO native rule and
+  NO `Nested` segments for its class hierarchy. Date/Author: 2026-07-24,
+  implementation (java M1 wave).
+- Decision (M1 java — the anonymous-lambda `$anon$line:column` marker IS a
+  genuine `Nested` join): `lambda_code_unit` in `src/analyzer/java/declarations.rs`
+  builds a synthetic name `{parent.short_name()}$anon${line}:{column}` (lambda
+  directly in a method) or `{parent.short_name()}.{parent.identifier()}$anon${line}:{column}`
+  (lambda in a field/class-level initializer, confirmed by
+  `tests/java_lambda_parity.rs`'s `Interface.Interface$anon$5:24` fixture
+  expectation). The marker is modelled as ONE `Nested` segment whose OWN text
+  is `anon${line}:{column}` (embedding a literal `$` between "anon" and the
+  coordinate, which `Nested`'s free-form segment text permits) — `Nested`'s
+  unconditional `$` join supplies the leading `$` before it. The
+  field/class-level variant additionally re-pushes the parent's own last `fq`
+  segment (mirroring `parent.identifier()`) before the `Nested` marker.
+  Date/Author: 2026-07-24, implementation.
+- Decision (M1 csharp — nested types ARE `$`-joined, confirming the task
+  briefing's guess): `visit_type_declaration` in
+  `src/analyzer/csharp/declarations.rs` joins a nested type onto its parent
+  with a literal `$` (`format!("{}${identity_name}", parent.short_name())`,
+  issue #1121-style), tagged `SegmentKind::Nested` with zero new rules (same
+  mechanism as python/php/ruby/cpp/java's now-shared `$`-join primitive);
+  namespaces (`csharp_join_namespace`, always `.`-joined, never `/`) are
+  `Package` segments, mirroring java/python. Date/Author: 2026-07-24,
+  implementation.
+- Decision (M1 javascript/typescript — `package_name` is ALWAYS empty; there
+  is no directory-derived `Path` prefix, contrary to the task briefing's guess
+  that this needed empirical path-vs-package verification): every js/ts
+  `CodeUnit` constructor passes a literal `""` for `package_name` (grepped:
+  zero non-literal uses in `javascript/mod.rs`, `typescript/mod.rs`, or
+  `js_ts/model.rs`) — the whole qualified name lives in `short_name`, exactly
+  like ruby. Declarations are therefore NOT qualified by directory path at all;
+  the only place a file's own name appears is the bare basename (with
+  extension, e.g. `utils.js`) used as a synthetic prefix in two places: the
+  file's own `Module` `CodeUnit` (`module_code_unit`) and
+  `file_scoped_field_name`'s qualifier for a top-level exported field/type-alias
+  with no enclosing class. Both are modelled as a single `SegmentKind::Path`
+  segment (its designed "may contain literal dots" case, e.g. `utils.test.js`)
+  — never split into directory components, since none exist here — followed by
+  the ordinary `.`-joined `Member` chain. Added shared helpers
+  `js_ts_segment`/`file_scoped_field_fq`/`file_name_path_segment` to
+  `src/analyzer/js_ts/model.rs` alongside the pre-existing (string-only)
+  `file_scoped_field_name`, and threaded `fq` through `module_code_unit` and
+  `add_default_export_unit` there so both javascript and typescript share one
+  implementation. Date/Author: 2026-07-24, implementation.
+- Decision (M1 typescript — a `$static` suffix and a TS `internal_module`
+  namespace need NO new segment kind): `visit_ts_method`/`visit_ts_field` spell
+  a static class member as `{name}$static` — a literal suffix baked into the
+  member's OWN name text, not a join between two segments — so it is pushed
+  as a single ordinary `Member` segment whose text already includes the
+  suffix; no new kind or separator rule is needed (segment text is free-form).
+  Separately, a TS `internal_module` (namespace) is already treated identically
+  to `class_declaration`/`interface_declaration`/`enum_declaration` by
+  `visit_ts_class_like` (same `CodeUnitType::Class`, same `.`-joined nesting),
+  so it needed no special-casing beyond the ordinary `Type` tagging every
+  class-like site already gets. Date/Author: 2026-07-24, implementation.
+- Decision (M1 javascript — a CommonJS `object.property` assignment chain
+  (`Foo.Bar.baz = ...`) builds its `fq` recursively alongside its `name`
+  string, not via re-splitting the joined string): `js_member_assignment_target`
+  in `src/analyzer/javascript/mod.rs` already recurses structurally through
+  nested `member_expression` nodes to build `target.name` component-by-component
+  (`format!("{object_name}.{property_name}")`); `JsMemberAssignmentTarget`
+  gained a parallel `fq: FqName` field built the same way (base case: an
+  identifier is one `Member` segment; recursive case: the nested call's `fq`
+  plus one more `Member` segment) so the structured form is read off the same
+  AST recursion that built the string, never off the assembled string itself
+  (CLAUDE.md's "no mini string parsers" targets exactly the alternative of
+  re-splitting `target.name` on `.`, which was avoided). The sibling
+  `js_commonjs_export_assignment_name` branch (a bare `exports.foo = ...`
+  property, no chain) builds its `fq` as a single `Member` segment the same way.
+  Date/Author: 2026-07-24, implementation.
+- Decision (cleanup — cpp nested-class chain migrated from Type+native-rule
+  onto the general `Nested` mechanism, per the M1 rust/scala/cpp wave's logged
+  plan): `cpp_push_type_chain` in `src/analyzer/cpp/declarations.rs` now tags
+  only the OUTERMOST class in a `$`-joined nested-class chain (`Outer$Inner`)
+  as `SegmentKind::Type`; every subsequently nested class is
+  `SegmentKind::Nested`, reusing the same `$`-join primitive python/php/ruby/
+  csharp/java's nested/local scopes already share. The cpp-native
+  `Type`-`Type` → `$` rule was deleted from `separator()` in
+  `src/analyzer/fq_name.rs` (the `::`-between-Package cpp-native rule stays —
+  that one is genuinely cpp-only, not a `$`-join). This is representation-only:
+  `display_native(Cpp, ..)` renders byte-identically before and after (the
+  `Nested` rule fires unconditionally, same as the deleted cpp-only rule did
+  for this case), confirmed by the full cpp suite staying green with identical
+  pass counts before and after the retag (cpp_analyzer_test, usages_cpp_graph_test,
+  usage_graph_cpp_test, issue_1093_cpp_using_namespace_owner,
+  issue_1120_cpp_bare_call_lexical_scope, issue_1121_cpp_nested_class_out_of_line —
+  246 tests total, 0 failed both times) and by retargeting the
+  `display_native_cpp_nested_class_uses_dollar` unit test to assert BOTH
+  `display()` and `display_native(Cpp, ..)` now produce the identical
+  `ns.Outer$Inner.method` (previously only the native rendering carried the
+  `$`; now the canonical rendering does too, since `Nested` is unconditional —
+  this is the intended convergence, not a behavior change to any legacy
+  string). Date/Author: 2026-07-24, implementation (java/csharp/js/ts M1 wave).
 
 ## Outcomes & Retrospective
 
@@ -444,6 +556,97 @@ the analyzer tree.
   loudly — `FqName does not round-trip ... language=Scala ... short_name="Nested$"`
   — and failed multiple scala tests; reverted. Remaining M1 languages: java,
   python, php, ruby, csharp, javascript, typescript.
+
+- M1 java/csharp/javascript/typescript + cpp cleanup (2026-07-24): the last four
+  languages now populate `FqName` at every `CodeUnit` emission point, with the
+  live equivalence assertion active across their full suites, and the logged
+  cpp `Nested`-migration cleanup landed alongside them. All 11 languages are
+  now checked off M1 (see the completion note below).
+
+  Census — java, 8 sites in `src/analyzer/java/declarations.rs`:
+  `module_code_unit` (Package chain, via new `java_package_fq`), `visit_class_like`
+  (Type — nested classes are `.`-joined here, NOT `$`-joined; see Decision Log),
+  `visit_callable`/`visit_compact_constructor` (Function, Member),
+  `visit_field_declaration`/`visit_record_components`/`visit_enum_constant`
+  (Field, Member), and `lambda_code_unit` (synthetic Function, one `Nested`
+  segment whose own text is `anon$line:column`; see Decision Log).
+
+  Census — csharp, 6 sites in `src/analyzer/csharp/declarations.rs`:
+  `visit_type_declaration` (Class — nested types ARE `$`-joined, tagged
+  `Nested`, confirming the task's guess), `visit_method`/`visit_constructor`
+  (Function, Member), `visit_property`/`visit_field_declaration`/
+  `visit_enum_member` (Field, Member); namespaces (`csharp_join_namespace`,
+  always `.`-joined) are `Package` segments via new `csharp_package_fq`.
+
+  Census — javascript, 12 sites, all in `src/analyzer/javascript/mod.rs` except
+  the two shared ones: `module_code_unit`/`add_default_export_unit` (shared,
+  `src/analyzer/js_ts/model.rs`), `visit_js_class` (Type), `visit_js_function`
+  (Member), `visit_js_method` (Member), `visit_js_constructor_assigned_fields`
+  (Member), `visit_js_field` (Member), `visit_js_variable_statement` (Member,
+  or the new `file_scoped_field_fq` Path+Member for a top-level exported field)
+  plus its nested `surface_code_unit` (bare Member),
+  `visit_js_object_literal_properties_for_surface` (Member),
+  `visit_js_module_exports_object_literal_properties` (bare Member per root),
+  and `js_member_assignment_target`/`JsMemberAssignmentTarget` (recursive
+  Member chain built alongside the `name` string; see Decision Log).
+
+  Census — typescript, 13 sites, all in `src/analyzer/typescript/mod.rs`
+  reusing the same shared `js_ts::model` helpers: `visit_ts_class_like` (Type,
+  real nesting via `internal_module`/class stacking), `visit_ts_function`
+  (Member), `visit_ts_value`'s `type_alias_declaration` branch (Member, or
+  `file_scoped_field_fq` at top level) and its `variable_declarator` loop
+  (Member/`file_scoped_field_fq`) plus its `surface_code_unit`,
+  `visit_ts_object_literal_properties` (Member), `visit_ts_method`/
+  `visit_ts_field` (Member — the `$static` suffix is baked into the segment's
+  own text, no new kind needed; see Decision Log),
+  `visit_ts_constructor_assigned_fields` (Member), `visit_ts_enum_member`
+  (Member).
+
+  Shared-infra changes: `src/analyzer/js_ts/model.rs` gained `js_ts_segment`,
+  `file_name_path_segment` (private), and `file_scoped_field_fq` alongside the
+  pre-existing `file_scoped_field_name`, and threaded `fq` through the shared
+  `module_code_unit`/`add_default_export_unit` so javascript and typescript
+  share one implementation for both. `src/analyzer/cpp/declarations.rs`'s
+  `cpp_push_type_chain` now tags only the first (outermost) class in a nested
+  chain `Type`, every subsequent one `Nested`; `src/analyzer/fq_name.rs`'s
+  `separator()` lost its cpp-native `Type`-`Type` → `$` rule (the `::`-between-
+  Package cpp-native rule stays) and its `display_native_cpp_nested_class_uses_dollar`
+  unit test was retargeted (see Decision Log for both).
+
+  Validation: `cargo fmt` clean; `cargo clippy --all-targets --all-features -D
+  warnings` clean; `--lib` 1879/1879; the full targeted suite green across 63
+  test binaries / 2005 tests, 0 failed — `cpp_analyzer_test`, `usages_cpp_graph_test`,
+  `usage_graph_cpp_test`, `issue_1093_cpp_using_namespace_owner`,
+  `issue_1120_cpp_bare_call_lexical_scope`, `issue_1121_cpp_nested_class_out_of_line`,
+  every `csharp_*`/`*_csharp_*` suite plus `issue_csharp_verbatim_identifiers` and
+  `roslyn_goto_definition`/`roslyn_find_references`, every `java_*`/`*_java_*`
+  suite plus `intellij_java_definition`/`intellij_java_find_usages`, every
+  `javascript_*`/`typescript_*`/`*_js_ts_*`/`usage_graph_ts_test` suite, and the
+  six shared regression suites (`get_definition_test` 635, `searchtools_service`
+  189, `searchtools_definition_selectors` 73, `issue_1128_rust_raw_identifiers`
+  12, `issue_1162_separator_aware_enclosing_scope` 10, `mcp_property_fuzzer_service`
+  61). A rerun of every prior-wave language's suite (rust, scala, go, python,
+  ruby, php analyzer + usages_graph tests) confirmed the shared `fq_name.rs`
+  edit changed nothing for them. Mutation check: appending a bogus `Member`
+  segment `"BOGUS_MUTATION"` to a top-level java class's `fq` in
+  `visit_class_like` fired the `debug_assert_eq!` in
+  `CodeUnit::with_signature_and_fq` loudly across every fixture class in
+  `java_declarations_parity` (`left: "ClassName.BOGUS_MUTATION"`, `right:
+  "ClassName"`) before being reverted; `cargo test --test java_declarations_parity`
+  returned to 4/4 passing afterward.
+
+- **M1 complete (2026-07-24):** all 11 languages (go, python, ruby, php, scala,
+  rust, cpp, java, csharp, javascript, typescript) now populate `FqName` at
+  every `CodeUnit` emission point with a live debug/test-only equivalence
+  assertion proving the structured form round-trips to the legacy joined
+  string, and the cpp/java `Nested`-vs-`Type` reconciliation from the
+  integration Decision Log is fully landed (cpp migrated; java's nested
+  classes turned out to be genuinely `.`-joined, not `$`-joined, so they never
+  needed `Nested`). `SegmentKind::Nested` is now shared by cpp, java (only for
+  the anonymous-lambda marker), csharp, python, php, and ruby — one mechanism
+  for every `$`-joined nesting convention in the tree; `SegmentKind::Companion`
+  remains scala-only. M2 (shared services and selectors consuming `FqName`;
+  input parsing producing it) is next.
 
 ## Context and Orientation
 

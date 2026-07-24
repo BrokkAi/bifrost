@@ -3,6 +3,7 @@ use crate::analyzer::clone_detection::{
     detect_structural_clone_smells,
 };
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::fq_name::{FqName, SegmentKind};
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set, weight_string_set,
@@ -22,8 +23,8 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{
     add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
-    collect_function_nodes, file_scoped_field_name, module_code_unit,
-    module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
+    collect_function_nodes, file_scoped_field_fq, file_scoped_field_name, js_ts_segment,
+    module_code_unit, module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
     this_member_property, trim_statement, variable_header,
 };
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -1067,11 +1068,19 @@ fn visit_js_class(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq = match parent {
+        Some(parent) => parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(name, SegmentKind::Type)),
+        None => FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Type)),
+    };
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Class,
         "",
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     let range_node = if exported { node } else { definition };
@@ -1143,11 +1152,19 @@ fn visit_js_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq = match parent {
+        Some(parent) => parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+        None => FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+    };
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         "",
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     let range_node = if exported { node } else { definition };
@@ -1185,11 +1202,16 @@ fn visit_js_method(
         return;
     }
 
-    let code_unit = CodeUnit::new(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(js_ts_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         "",
         format!("{}.{}", parent.short_name(), name),
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -1238,11 +1260,16 @@ fn visit_js_constructor_assigned_fields(
             let Some(name) = property_name_text(property, source) else {
                 continue;
             };
-            let code_unit = CodeUnit::new(
+            let fq = parent
+                .fq()
+                .clone()
+                .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
                 file.clone(),
                 crate::analyzer::CodeUnitType::Field,
                 "",
                 format!("{}.{}", parent.short_name(), name),
+                fq,
             );
             parsed.add_code_unit(
                 code_unit.clone(),
@@ -1277,11 +1304,16 @@ fn visit_js_field(
     if name.is_empty() {
         return;
     }
-    let code_unit = CodeUnit::new(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(js_ts_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         "",
         format!("{}.{}", parent.short_name(), name),
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -1345,7 +1377,28 @@ fn visit_js_variable_statement(
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
                 .unwrap_or_else(|| name.to_string())
         };
-        let code_unit = CodeUnit::new(file.clone(), kind, "", short_name);
+        // Mirrors `short_name` above segment-for-segment: a Field with no
+        // enclosing scope is qualified by the file-name `Path` prefix (the
+        // structured counterpart of `file_scoped_field_name`); every other
+        // case is a plain `Member` off the parent's `fq` or a fresh chain.
+        let fq = if kind == crate::analyzer::CodeUnitType::Field {
+            match parent {
+                Some(parent) => parent
+                    .fq()
+                    .clone()
+                    .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                None => file_scoped_field_fq(file, name),
+            }
+        } else {
+            match parent {
+                Some(parent) => parent
+                    .fq()
+                    .clone()
+                    .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                None => FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+            }
+        };
+        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
         let range_node = if exported { node } else { definition };
         parsed.add_code_unit(
@@ -1388,8 +1441,14 @@ fn visit_js_variable_statement(
             );
         }
         if module_surface && kind == crate::analyzer::CodeUnitType::Field && parent.is_none() {
-            let surface_code_unit =
-                CodeUnit::new(file.clone(), crate::analyzer::CodeUnitType::Field, "", name);
+            let surface_fq = FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member));
+            let surface_code_unit = CodeUnit::new_fq(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Field,
+                "",
+                name,
+                surface_fq,
+            );
             parsed.add_code_unit(
                 surface_code_unit.clone(),
                 range_node,
@@ -1449,11 +1508,16 @@ fn visit_js_object_literal_properties_for_surface(
             continue;
         };
         let kind = js_object_literal_property_kind(child);
-        let code_unit = CodeUnit::new(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             file.clone(),
             kind,
             "",
             format!("{}.{}", parent.short_name(), name),
+            fq,
         );
         match surface {
             JsAssignmentSymbolSurface::Declaration => {
@@ -1490,7 +1554,8 @@ fn visit_js_module_exports_object_literal_properties(
             continue;
         };
         let kind = js_object_literal_property_kind(child);
-        let code_unit = CodeUnit::new(file.clone(), kind, "", name);
+        let fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", name, fq);
         parsed.add_code_unit(
             code_unit.clone(),
             child,
@@ -1949,6 +2014,11 @@ enum JsAssignmentSymbolSurface {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JsMemberAssignmentTarget {
     name: String,
+    /// Structured counterpart to `name`, built segment-for-segment alongside
+    /// it (see `js_member_assignment_target`): every link in the
+    /// `object.property` chain is a `Member` segment, mirroring the `.`-joined
+    /// `name` string exactly.
+    fq: FqName,
     surface: JsAssignmentSymbolSurface,
 }
 
@@ -2232,9 +2302,13 @@ fn visit_js_assignment_expression(
     let value_is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
     let Some(target) = js_commonjs_export_assignment_name(left, value, source)
-        .map(|name| JsMemberAssignmentTarget {
-            name,
-            surface: JsAssignmentSymbolSurface::Declaration,
+        .map(|name| {
+            let fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
+            JsMemberAssignmentTarget {
+                name,
+                fq,
+                surface: JsAssignmentSymbolSurface::Declaration,
+            }
         })
         .or_else(|| js_member_assignment_target(left, source, state))
     else {
@@ -2245,7 +2319,7 @@ fn visit_js_assignment_expression(
     } else {
         crate::analyzer::CodeUnitType::Field
     };
-    let code_unit = CodeUnit::new(file.clone(), kind, "", target.name);
+    let code_unit = CodeUnit::new_fq(file.clone(), kind, "", target.name, target.fq);
     add_js_assignment_code_unit(parsed, target.surface, code_unit.clone(), node, source);
     let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
     if let Some(value) = value.filter(|_| value_is_function) {
@@ -2347,9 +2421,17 @@ fn js_member_assignment_target(
     if property.kind() == "computed_property_name" {
         return None;
     }
-    let object_name = match object.kind() {
-        "identifier" | "property_identifier" => node_text(object, source).trim().to_string(),
-        "member_expression" => js_member_assignment_target(object, source, state)?.name,
+    let (object_name, object_fq) = match object.kind() {
+        "identifier" | "property_identifier" => {
+            let object_name = node_text(object, source).trim().to_string();
+            let object_fq =
+                FqName::new().with_pushed(js_ts_segment(&object_name, SegmentKind::Member));
+            (object_name, object_fq)
+        }
+        "member_expression" => {
+            let nested = js_member_assignment_target(object, source, state)?;
+            (nested.name, nested.fq)
+        }
         _ => return None,
     };
     let property_name = node_text(property, source)
@@ -2360,6 +2442,7 @@ fn js_member_assignment_target(
         return None;
     }
     let name = format!("{object_name}.{property_name}");
+    let fq = object_fq.with_pushed(js_ts_segment(property_name, SegmentKind::Member));
     let surface = if state.commonjs_exported_members.contains(&name) {
         JsAssignmentSymbolSurface::Declaration
     } else if js_member_assignment_has_plain_local_root(node, source, state) {
@@ -2367,7 +2450,7 @@ fn js_member_assignment_target(
     } else {
         JsAssignmentSymbolSurface::Declaration
     };
-    Some(JsMemberAssignmentTarget { name, surface })
+    Some(JsMemberAssignmentTarget { name, fq, surface })
 }
 
 fn js_member_assignment_has_plain_local_root(
