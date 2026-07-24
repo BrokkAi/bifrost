@@ -19,6 +19,7 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 13:06+02:00) Added and compiled the ignored release benchmark and pinned-corpus runner, covering six algorithm families over deep, branch-heavy, cyclic, irreducible, disconnected, exceptional, VS Code, and PetClinic datasets with versioned provenance-rich JSON output.
 - [x] (2026-07-24 14:04+02:00) Ran the retained release matrix from clean checkpoint `537262d7` over six synthetic shapes plus pinned VS Code/PetClinic, wrote schema-v1 JSON, and recorded the on-demand lifecycle and dominance no-go evidence.
 - [x] (2026-07-24 14:12+02:00) Added the evidence note and marked the broader typestate roadmap’s #819 checkpoint complete without adding persistence, dominance, or public surface.
+- [x] (2026-07-24 15:08+02:00) Completed five specialist reviews and fixed every material finding: linear checked back-edge partitioning, direct bounded adjacency consumption, shared budget-ledger reuse, SCC/loop DFS reuse, closed-region entry fidelity, cancellable path reconstruction, crate-private reverse iteration, atomic evidence output, and algorithm-only timing.
 - [ ] Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [ ] Complete specialist review, resolve material findings, and record final outcomes.
 
@@ -42,6 +43,12 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - Observation: the retained work counts match the implementation’s declared whole-graph passes exactly.
   Evidence: PetClinic DFS used 9,833/10,992 node/edge visits, SCC used 19,666/21,984, and loop derivation used 39,332/43,968. VS Code exhibited the same 1x/2x/4x relationship.
 
+- Observation: the initial reviewed loop derivation had an uncharged quadratic post-pass and an avoidable second DFS.
+  Evidence: back edges were filtered once per cyclic component and SCC discarded the DFS result that loop derivation immediately recomputed. Review replaced both with one checked back-edge partition and one shared SCC/DFS result, reducing loop work from four graph passes to three.
+
+- Observation: a cyclic SCC with no incoming edge has no generic entry node.
+  Evidence: the graph view has no distinguished root. Review removed the fabricated minimum-member entry and added explicit `NoEntry` structure so closed, single-entry, and multi-entry regions remain distinct.
+
 ## Decision Log
 
 - Decision: define a crate-private `DenseBidirectionalGraph` trait with dense node lookup, canonical successor and predecessor iterators, and typed edge endpoint lookup, then implement it directly for `ProcedureSemantics`.
@@ -60,6 +67,10 @@ Dominators and post-dominators are deliberately not part of this work. The prese
   Rationale: SCC membership does not prove dominance. Regions retain self-loops, external entry nodes, traversal-relative DFS back edges, and explicit single-entry versus multi-entry structure without implying reducibility.
   Date: 2026-07-24.
 
+- Decision: represent cyclic regions with zero external entries explicitly.
+  Rationale: choosing the minimum member for a closed SCC would invent topology and collapse closed regions into single-entry ones. `NoEntry`, `SingleEntry`, and `MultiEntry` now preserve the graph facts exactly.
+  Date: 2026-07-24.
+
 - Decision: retain only the existing query-local ICFG return-mask memoization.
   Rationale: it has a demonstrated repeated consumer and immutable-artifact scope. RPO, SCC, loop, and path results remain on demand because no production path currently repeats the same whole-snapshot derivation.
   Date: 2026-07-24.
@@ -72,7 +83,7 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 Milestones 1 through 3 are complete in checkpoints `cd0998ce`, `9283fd4a`, and `537262d7`. The algorithm layer is crate-private, iterative, deterministic, and complete-only under cancellation or node/edge exhaustion. ICFG return-gap scoping is its first production consumer and retains only the existing artifact-instance-scoped builder memo.
 
-The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. Measurement supports on-demand RPO/SCC/loop/path results, no persistence, and no dominance implementation. Final repository gates and specialist review remain before issue closure.
+The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. The initial matrix supported the lifecycle decision; specialist review then changed retained reachability bytes, loop work, and timing boundaries, so the final clean-checkpoint matrix must replace it before closure.
 
 ## Context and Orientation
 
@@ -175,10 +186,15 @@ The module remains crate-private. Its conceptual interfaces are:
         fn node_count(&self) -> usize;
         fn node_at(&self, index: usize) -> Option<Self::Node>;
         fn node_index(&self, node: Self::Node) -> Option<usize>;
+        fn edge_index(&self, edge: Self::Edge) -> Option<usize>;
         fn successors(&self, node: Self::Node)
-            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_;
+            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+        fn successors_reversed(&self, node: Self::Node)
+            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
         fn predecessors(&self, node: Self::Node)
-            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_;
+            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+        fn predecessors_reversed(&self, node: Self::Node)
+            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
         fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)>;
     }
 
@@ -198,3 +214,5 @@ Revision note (2026-07-24): Marked Milestone 2 complete after shared reachabilit
 Revision note (2026-07-24): Added the compiled release measurement harness and runner; retained measurement, evidence interpretation, and roadmap closure remain.
 
 Revision note (2026-07-24): Recorded the retained clean-tree release matrix, completed the lifecycle and dominance decisions, and closed the broader roadmap checkpoint.
+
+Revision note (2026-07-24): Recorded specialist review and the resulting bounded-work, lifecycle, topology, timing, and API-boundary corrections. The retained matrix is explicitly pending regeneration from the reviewed checkpoint.

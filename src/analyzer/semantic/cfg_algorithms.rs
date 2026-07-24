@@ -1,10 +1,18 @@
 //! Stack-safe, request-bounded algorithms over immutable dense control-flow graphs.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "issue #819 intentionally provides crate-internal on-demand algorithms before every derivation has a production consumer"
+    )
+)]
 
 use std::collections::VecDeque;
 
 use crate::analyzer::semantic::{
     CancellationToken, ControlEdgeId, ProcedureSemantics, ProgramPointId,
 };
+use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
 /// Immutable directed graph with dense node identities and canonical adjacency.
 ///
@@ -22,11 +30,19 @@ pub(crate) trait DenseBidirectionalGraph {
     fn successors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_;
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+    fn successors_reversed(
+        &self,
+        node: Self::Node,
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
     fn predecessors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_;
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+    fn predecessors_reversed(
+        &self,
+        node: Self::Node,
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
     fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)>;
 }
 
@@ -54,16 +70,32 @@ impl DenseBidirectionalGraph for ProcedureSemantics {
     fn successors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_ {
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
         self.successor_edges(node)
+            .map(|(edge_id, edge)| (edge_id, edge.target_point))
+    }
+
+    fn successors_reversed(
+        &self,
+        node: Self::Node,
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+        self.successor_edges_reversed(node)
             .map(|(edge_id, edge)| (edge_id, edge.target_point))
     }
 
     fn predecessors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_ {
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
         self.predecessor_edges(node)
+            .map(|(edge_id, edge)| (edge_id, edge.source_point))
+    }
+
+    fn predecessors_reversed(
+        &self,
+        node: Self::Node,
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+        self.predecessor_edges_reversed(node)
             .map(|(edge_id, edge)| (edge_id, edge.source_point))
     }
 
@@ -73,34 +105,17 @@ impl DenseBidirectionalGraph for ProcedureSemantics {
     }
 }
 
-/// Work completed by one or more algorithms sharing a request-local budget.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CfgAlgorithmWork {
-    pub(crate) node_visits: usize,
-    pub(crate) edge_visits: usize,
-}
-
-impl CfgAlgorithmWork {
-    fn checked_add(self, other: Self) -> Option<Self> {
-        Some(Self {
-            node_visits: self.node_visits.checked_add(other.node_visits)?,
-            edge_visits: self.edge_visits.checked_add(other.edge_visits)?,
-        })
-    }
-
-    const fn saturating_sub(self, other: Self) -> Self {
-        Self {
-            node_visits: self.node_visits.saturating_sub(other.node_visits),
-            edge_visits: self.edge_visits.saturating_sub(other.edge_visits),
-        }
-    }
-}
-
-/// Independently bounded kinds of CFG work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CfgAlgorithmLimit {
-    NodeVisits,
-    EdgeVisits,
+define_work_dimensions! {
+    /// Independently bounded kinds of CFG work.
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) enum CfgAlgorithmLimit;
+    /// Work completed by one or more algorithms sharing a request-local budget.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) struct CfgAlgorithmWork;
+    all: [2];
+    NodeVisits => node_visits = usize::MAX,
+    EdgeVisits => edge_visits = usize::MAX,
 }
 
 /// Exact failed node- or edge-visit charge.
@@ -115,18 +130,13 @@ pub(crate) struct CfgAlgorithmBudgetExceeded {
 /// Request-local two-dimensional CFG work budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CfgAlgorithmBudget {
-    limits: CfgAlgorithmWork,
-    used: CfgAlgorithmWork,
+    ledger: BudgetLedger<CfgAlgorithmWork>,
 }
 
 impl CfgAlgorithmBudget {
     pub(crate) const fn new(limits: CfgAlgorithmWork) -> Self {
         Self {
-            limits,
-            used: CfgAlgorithmWork {
-                node_visits: 0,
-                edge_visits: 0,
-            },
+            ledger: BudgetLedger::new(limits, CfgAlgorithmWork::uniform(0)),
         }
     }
 
@@ -138,54 +148,35 @@ impl CfgAlgorithmBudget {
     }
 
     pub(crate) const fn limits(&self) -> CfgAlgorithmWork {
-        self.limits
+        self.ledger.limits()
     }
 
     pub(crate) const fn used(&self) -> CfgAlgorithmWork {
-        self.used
+        self.ledger.used()
     }
 
     fn charge(&mut self, work: CfgAlgorithmWork) -> Result<(), CfgAlgorithmBudgetExceeded> {
-        let attempted = self.used.checked_add(work);
-        let Some(attempted) = attempted else {
-            let limit_kind = if self
-                .used
-                .node_visits
-                .checked_add(work.node_visits)
-                .is_none()
-            {
-                CfgAlgorithmLimit::NodeVisits
-            } else {
-                CfgAlgorithmLimit::EdgeVisits
-            };
-            return Err(CfgAlgorithmBudgetExceeded {
-                limit_kind,
-                limit: match limit_kind {
-                    CfgAlgorithmLimit::NodeVisits => self.limits.node_visits,
-                    CfgAlgorithmLimit::EdgeVisits => self.limits.edge_visits,
-                },
-                attempted: usize::MAX,
-                work: self.used,
-            });
-        };
-        if attempted.node_visits > self.limits.node_visits {
-            return Err(CfgAlgorithmBudgetExceeded {
-                limit_kind: CfgAlgorithmLimit::NodeVisits,
-                limit: self.limits.node_visits,
-                attempted: attempted.node_visits,
-                work: self.used,
-            });
-        }
-        if attempted.edge_visits > self.limits.edge_visits {
-            return Err(CfgAlgorithmBudgetExceeded {
-                limit_kind: CfgAlgorithmLimit::EdgeVisits,
-                limit: self.limits.edge_visits,
-                attempted: attempted.edge_visits,
-                work: self.used,
-            });
-        }
-        self.used = attempted;
-        Ok(())
+        self.ledger
+            .charge(work)
+            .map_err(|exceeded| budget_exceeded(exceeded, self.ledger.used()))
+    }
+}
+
+impl Default for CfgAlgorithmBudget {
+    fn default() -> Self {
+        Self::new(CfgAlgorithmWork::default_limits())
+    }
+}
+
+fn budget_exceeded(
+    exceeded: WorkBudgetExceeded<CfgAlgorithmLimit>,
+    work: CfgAlgorithmWork,
+) -> CfgAlgorithmBudgetExceeded {
+    CfgAlgorithmBudgetExceeded {
+        limit_kind: exceeded.dimension(),
+        limit: exceeded.limit(),
+        attempted: exceeded.attempted(),
+        work,
     }
 }
 
@@ -250,8 +241,8 @@ impl<'request> CfgAlgorithmRequest<'request> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reachability<Node> {
     membership: Box<[bool]>,
-    nodes: Box<[Node]>,
     work: CfgAlgorithmWork,
+    node: std::marker::PhantomData<Node>,
 }
 
 impl<Node: Copy> Reachability<Node> {
@@ -266,8 +257,17 @@ impl<Node: Copy> Reachability<Node> {
             .unwrap_or(false)
     }
 
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = Node> + '_ {
-        self.nodes.iter().copied()
+    pub(crate) fn iter<'graph, G>(
+        &'graph self,
+        graph: &'graph G,
+    ) -> impl Iterator<Item = Node> + 'graph
+    where
+        G: DenseBidirectionalGraph<Node = Node> + 'graph,
+    {
+        self.membership
+            .iter()
+            .enumerate()
+            .filter_map(|(index, reachable)| reachable.then(|| required_node(graph, index)))
     }
 
     pub(crate) fn membership(&self) -> &[bool] {
@@ -328,34 +328,53 @@ where
 
     while let Some(node) = stack.pop() {
         request.checkpoint()?;
-        let adjacent = match direction {
-            Direction::Forward => graph.successors(node).collect::<Vec<_>>(),
-            Direction::Reverse => graph.predecessors(node).collect::<Vec<_>>(),
-        };
-        for (_, adjacent_node) in adjacent.into_iter().rev() {
-            request.visit_edge()?;
-            let index = graph
-                .node_index(adjacent_node)
-                .ok_or(CfgAlgorithmError::InvalidNode(adjacent_node))?;
-            if !membership[index] {
-                membership[index] = true;
-                request.visit_node()?;
-                stack.push(adjacent_node);
-            }
+        match direction {
+            Direction::Forward => discover_adjacent(
+                graph,
+                graph.successors_reversed(node),
+                &mut membership,
+                &mut stack,
+                request,
+            )?,
+            Direction::Reverse => discover_adjacent(
+                graph,
+                graph.predecessors(node),
+                &mut membership,
+                &mut stack,
+                request,
+            )?,
         }
     }
 
-    let nodes = membership
-        .iter()
-        .enumerate()
-        .filter_map(|(index, reachable)| reachable.then(|| required_node(graph, index)))
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
     Ok(Reachability {
         membership: membership.into_boxed_slice(),
-        nodes,
         work: request.budget.used().saturating_sub(started),
+        node: std::marker::PhantomData,
     })
+}
+
+fn discover_adjacent<G>(
+    graph: &G,
+    adjacent: impl Iterator<Item = (G::Edge, G::Node)>,
+    membership: &mut [bool],
+    stack: &mut Vec<G::Node>,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<(), CfgAlgorithmError<G::Node>>
+where
+    G: DenseBidirectionalGraph,
+{
+    for (_, adjacent_node) in adjacent {
+        request.visit_edge()?;
+        let index = graph
+            .node_index(adjacent_node)
+            .ok_or(CfgAlgorithmError::InvalidNode(adjacent_node))?;
+        if !membership[index] {
+            membership[index] = true;
+            request.visit_node()?;
+            stack.push(adjacent_node);
+        }
+    }
+    Ok(())
 }
 
 /// Complete deterministic iterative DFS forest.
@@ -406,13 +425,12 @@ where
                     colors[index] = 1;
                     preorder.push(node);
                     actions.push(DfsAction::Finish(node));
-                    let successors = graph.successors(node).collect::<Vec<_>>();
-                    for (edge, target) in successors.into_iter().rev() {
+                    for (edge, target) in graph.successors_reversed(node) {
+                        request.visit_edge()?;
                         actions.push(DfsAction::Examine(edge, target));
                     }
                 }
                 DfsAction::Examine(edge, target) => {
-                    request.visit_edge()?;
                     let target_index = required_index(graph, target)?;
                     match colors[target_index] {
                         0 => actions.push(DfsAction::Enter(target)),
@@ -466,13 +484,29 @@ pub(crate) fn strongly_connected_components<G>(
 where
     G: DenseBidirectionalGraph,
 {
+    strongly_connected_components_with_order(graph, request).map(|(components, _)| components)
+}
+
+fn strongly_connected_components_with_order<G>(
+    graph: &G,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<
+    (
+        StronglyConnectedComponents<G::Node>,
+        DepthFirstOrder<G::Node, G::Edge>,
+    ),
+    CfgAlgorithmError<G::Node>,
+>
+where
+    G: DenseBidirectionalGraph,
+{
     request.checkpoint()?;
     let started = request.budget.used();
     let order = depth_first_order(graph, request)?;
     let mut assigned = vec![false; graph.node_count()];
     let mut unsorted_components = Vec::<Vec<G::Node>>::new();
 
-    for seed in order.reverse_postorder {
+    for seed in order.reverse_postorder.iter().copied() {
         let seed_index = required_index(graph, seed)?;
         if assigned[seed_index] {
             continue;
@@ -483,8 +517,7 @@ where
         while let Some(node) = stack.pop() {
             request.visit_node()?;
             members.push(node);
-            let predecessors = graph.predecessors(node).collect::<Vec<_>>();
-            for (_, predecessor) in predecessors.into_iter().rev() {
+            for (_, predecessor) in graph.predecessors_reversed(node) {
                 request.visit_edge()?;
                 let predecessor_index = required_index(graph, predecessor)?;
                 if !assigned[predecessor_index] {
@@ -521,15 +554,19 @@ where
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
-    Ok(StronglyConnectedComponents {
-        components,
-        component_by_node: component_by_node.into_boxed_slice(),
-        work: request.budget.used().saturating_sub(started),
-    })
+    Ok((
+        StronglyConnectedComponents {
+            components,
+            component_by_node: component_by_node.into_boxed_slice(),
+            work: request.budget.used().saturating_sub(started),
+        },
+        order,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoopEntryStructure {
+    NoEntry,
     SingleEntry,
     MultiEntry,
 }
@@ -559,10 +596,23 @@ where
 {
     request.checkpoint()?;
     let started = request.budget.used();
-    let components = strongly_connected_components(graph, request)?;
-    let dfs = depth_first_order(graph, request)?;
+    let (components, dfs) = strongly_connected_components_with_order(graph, request)?;
     let mut self_loops = vec![false; components.components.len()];
     let mut entries = vec![Vec::<G::Node>::new(); components.components.len()];
+    let mut back_edges = vec![Vec::<G::Edge>::new(); components.components.len()];
+
+    for edge in dfs.back_edges {
+        request.checkpoint()?;
+        let (source, target) = graph
+            .edge_endpoints(edge)
+            .expect("DFS returned an edge belonging to the graph");
+        let source_index = required_index(graph, source)?;
+        let target_index = required_index(graph, target)?;
+        let component = components.component_by_node[source_index];
+        if component == components.component_by_node[target_index] {
+            back_edges[component].push(edge);
+        }
+    }
 
     for source_index in 0..graph.node_count() {
         request.visit_node()?;
@@ -592,32 +642,12 @@ where
                 .expect("region entries came from the graph")
         });
         entries[component].dedup();
-        if entries[component].is_empty() {
-            entries[component].push(members[0]);
-        }
-        let mut internal_back_edges = dfs
-            .back_edges
-            .iter()
-            .copied()
-            .filter(|edge| {
-                let Some((source, target)) = graph.edge_endpoints(*edge) else {
-                    return false;
-                };
-                let Some(source_index) = graph.node_index(source) else {
-                    return false;
-                };
-                let Some(target_index) = graph.node_index(target) else {
-                    return false;
-                };
-                components.component_by_node[source_index] == component
-                    && components.component_by_node[target_index] == component
-            })
-            .collect::<Vec<_>>();
+        let mut internal_back_edges = std::mem::take(&mut back_edges[component]);
         internal_back_edges.sort_unstable();
-        let entry_structure = if entries[component].len() == 1 {
-            LoopEntryStructure::SingleEntry
-        } else {
-            LoopEntryStructure::MultiEntry
+        let entry_structure = match entries[component].len() {
+            0 => LoopEntryStructure::NoEntry,
+            1 => LoopEntryStructure::SingleEntry,
+            _ => LoopEntryStructure::MultiEntry,
         };
         regions.push(LoopRegion {
             members: members.clone(),
@@ -698,7 +728,7 @@ fn reconstruct_path<G>(
     goal: G::Node,
     parent: &[Option<(G::Node, G::Edge)>],
     started: CfgAlgorithmWork,
-    request: &CfgAlgorithmRequest<'_>,
+    request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<ShortestPath<G::Node, G::Edge>, CfgAlgorithmError<G::Node>>
 where
     G: DenseBidirectionalGraph,
@@ -707,6 +737,7 @@ where
     let mut edges = Vec::new();
     let mut cursor = goal;
     while cursor != start {
+        request.checkpoint()?;
         let index = required_index(graph, cursor)?;
         let (previous, edge) = parent[index].expect("discovered path node has a parent");
         edges.push(edge);
@@ -817,10 +848,20 @@ mod tests {
         fn successors(
             &self,
             node: Self::Node,
-        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_
-        {
+        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
             self.outgoing[node]
                 .iter()
+                .copied()
+                .map(|id| (id, self.edges[id.0].target))
+        }
+
+        fn successors_reversed(
+            &self,
+            node: Self::Node,
+        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+            self.outgoing[node]
+                .iter()
+                .rev()
                 .copied()
                 .map(|id| (id, self.edges[id.0].target))
         }
@@ -828,10 +869,20 @@ mod tests {
         fn predecessors(
             &self,
             node: Self::Node,
-        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_
-        {
+        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
             self.incoming[node]
                 .iter()
+                .copied()
+                .map(|id| (id, self.edges[id.0].source))
+        }
+
+        fn predecessors_reversed(
+            &self,
+            node: Self::Node,
+        ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+            self.incoming[node]
+                .iter()
+                .rev()
                 .copied()
                 .map(|id| (id, self.edges[id.0].source))
         }
@@ -857,7 +908,7 @@ mod tests {
         let mut budget = CfgAlgorithmBudget::uniform(100);
         let forward = forward_reachability(&graph, 0, &mut request(&mut budget, &cancellation))
             .expect("forward reachability");
-        assert_eq!(forward.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(forward.iter(&graph).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
         assert!(forward.contains(&graph, 2));
         assert!(!forward.contains(&graph, 5));
         assert_eq!(
@@ -871,7 +922,7 @@ mod tests {
         let mut budget = CfgAlgorithmBudget::uniform(100);
         let reverse = reverse_reachability(&graph, 3, &mut request(&mut budget, &cancellation))
             .expect("reverse reachability");
-        assert_eq!(reverse.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(reverse.iter(&graph).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -961,11 +1012,41 @@ mod tests {
         assert!(!loops.regions[0].has_self_loop);
         assert!(!loops.regions[0].back_edges.is_empty());
         assert_eq!(&*loops.regions[1].members, &[5]);
-        assert_eq!(&*loops.regions[1].entries, &[5]);
+        assert!(loops.regions[1].entries.is_empty());
         assert!(loops.regions[1].has_self_loop);
         assert_eq!(
             loops.regions[1].entry_structure,
-            LoopEntryStructure::SingleEntry
+            LoopEntryStructure::NoEntry
+        );
+    }
+
+    #[test]
+    fn loop_region_back_edges_are_partitioned_linearly_across_many_cycles() {
+        let cycle_count = 1_000;
+        let edges = (0..cycle_count)
+            .flat_map(|cycle| {
+                let first = cycle * 2;
+                [(first, first + 1, 0), (first + 1, first, 0)]
+            })
+            .collect::<Vec<_>>();
+        let graph = TestGraph::new(cycle_count * 2, &edges);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(edges.len() * 8);
+        let loops = loop_regions(&graph, &mut request(&mut budget, &cancellation)).unwrap();
+
+        assert_eq!(loops.regions.len(), cycle_count);
+        assert!(
+            loops
+                .regions
+                .iter()
+                .all(|region| region.back_edges.len() == 1)
+        );
+        assert_eq!(
+            loops.work,
+            CfgAlgorithmWork {
+                node_visits: graph.nodes * 3,
+                edge_visits: graph.edges.len() * 3,
+            }
         );
     }
 
@@ -993,6 +1074,27 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn shortest_path_cancellation_during_reconstruction_returns_no_path() {
+        let node_count = 100;
+        let edges = (0..node_count - 1)
+            .map(|source| (source, source + 1, 0))
+            .collect::<Vec<_>>();
+        let graph = TestGraph::new(node_count, &edges);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(300);
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+
+        assert!(matches!(
+            shortest_path(
+                &graph,
+                0,
+                node_count - 1,
+                &mut request(&mut budget, &cancellation)
+            ),
+            Err(CfgAlgorithmError::Cancelled { .. })
+        ));
     }
 
     #[test]

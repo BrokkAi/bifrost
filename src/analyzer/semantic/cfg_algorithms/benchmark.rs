@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::hint::black_box;
+use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tempfile::NamedTempFile;
 
 use super::*;
 use crate::analyzer::semantic::{SemanticBudget, SemanticOutcome, SemanticRequest, StableDigest};
@@ -78,9 +80,20 @@ impl DenseBidirectionalGraph for BenchGraph {
     fn successors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_ {
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
         self.outgoing[node]
             .iter()
+            .copied()
+            .map(|edge| (edge, self.edges[edge].target))
+    }
+
+    fn successors_reversed(
+        &self,
+        node: Self::Node,
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+        self.outgoing[node]
+            .iter()
+            .rev()
             .copied()
             .map(|edge| (edge, self.edges[edge].target))
     }
@@ -88,9 +101,20 @@ impl DenseBidirectionalGraph for BenchGraph {
     fn predecessors(
         &self,
         node: Self::Node,
-    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + DoubleEndedIterator + '_ {
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
         self.incoming[node]
             .iter()
+            .copied()
+            .map(|edge| (edge, self.edges[edge].source))
+    }
+
+    fn predecessors_reversed(
+        &self,
+        node: Self::Node,
+    ) -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_ {
+        self.incoming[node]
+            .iter()
+            .rev()
             .copied()
             .map(|edge| (edge, self.edges[edge].source))
     }
@@ -256,14 +280,13 @@ impl DatasetAccumulator {
         self.edges = self.edges.saturating_add(edge_count);
 
         for (index, algorithm) in Algorithm::ALL.into_iter().enumerate() {
-            let started = Instant::now();
-            let cold = run_algorithm(graph, start, goal, algorithm);
-            self.algorithms[index].cold += started.elapsed();
+            let (cold_duration, cold) = run_algorithm(graph, start, goal, edge_count, algorithm);
+            self.algorithms[index].cold += cold_duration;
             black_box(&cold);
 
-            let repeated_started = Instant::now();
             for _ in 0..self.repeats {
-                let repeated = run_algorithm(graph, start, goal, algorithm);
+                let (repeated_duration, repeated) =
+                    run_algorithm(graph, start, goal, edge_count, algorithm);
                 assert_eq!(
                     repeated,
                     cold,
@@ -271,9 +294,9 @@ impl DatasetAccumulator {
                     algorithm.label(),
                     self.name
                 );
+                self.algorithms[index].repeated += repeated_duration;
                 black_box(repeated);
             }
-            self.algorithms[index].repeated += repeated_started.elapsed();
             self.algorithms[index].work.node_visits = self.algorithms[index]
                 .work
                 .node_visits
@@ -321,13 +344,16 @@ impl DatasetAccumulator {
     }
 }
 
-fn run_algorithm<G>(graph: &G, start: G::Node, goal: G::Node, algorithm: Algorithm) -> RunResult
+fn run_algorithm<G>(
+    graph: &G,
+    start: G::Node,
+    goal: G::Node,
+    edge_count: usize,
+    algorithm: Algorithm,
+) -> (Duration, RunResult)
 where
     G: DenseBidirectionalGraph,
 {
-    let edge_count = (0..graph.node_count())
-        .map(|index| graph.successors(required_node(graph, index)).len())
-        .sum::<usize>();
     let mut budget = CfgAlgorithmBudget::new(CfgAlgorithmWork {
         node_visits: graph.node_count().saturating_add(1).saturating_mul(8),
         edge_visits: edge_count.saturating_add(1).saturating_mul(8),
@@ -337,24 +363,29 @@ where
     let mut material = Vec::new();
     let retained_bytes;
     let work;
+    let elapsed;
 
     match algorithm {
         Algorithm::ForwardReachability => {
+            let started = Instant::now();
             let result = forward_reachability(graph, start, &mut request).unwrap();
-            push_nodes(graph, result.iter(), &mut material);
+            elapsed = started.elapsed();
+            push_nodes(graph, result.iter(graph), &mut material);
             work = result.work();
-            retained_bytes = bytes(result.membership().len(), size_of::<bool>())
-                .saturating_add(bytes(result.iter().len(), size_of::<G::Node>()));
+            retained_bytes = bytes(result.membership().len(), size_of::<bool>());
         }
         Algorithm::ReverseReachability => {
+            let started = Instant::now();
             let result = reverse_reachability(graph, goal, &mut request).unwrap();
-            push_nodes(graph, result.iter(), &mut material);
+            elapsed = started.elapsed();
+            push_nodes(graph, result.iter(graph), &mut material);
             work = result.work();
-            retained_bytes = bytes(result.membership().len(), size_of::<bool>())
-                .saturating_add(bytes(result.iter().len(), size_of::<G::Node>()));
+            retained_bytes = bytes(result.membership().len(), size_of::<bool>());
         }
         Algorithm::DfsAndReversePostorder => {
+            let started = Instant::now();
             let result = depth_first_order(graph, &mut request).unwrap();
+            elapsed = started.elapsed();
             push_nodes(graph, result.preorder.iter().copied(), &mut material);
             push_nodes(
                 graph,
@@ -374,7 +405,9 @@ where
             .saturating_add(bytes(result.back_edges.len(), size_of::<G::Edge>()));
         }
         Algorithm::KosarajuScc => {
+            let started = Instant::now();
             let result = strongly_connected_components(graph, &mut request).unwrap();
+            elapsed = started.elapsed();
             for component in &result.components {
                 push_nodes(graph, component.iter().copied(), &mut material);
                 material.extend_from_slice(&u64::try_from(component.len()).unwrap().to_le_bytes());
@@ -385,7 +418,9 @@ where
                 .saturating_add(bytes(result.components.len(), size_of::<Box<[G::Node]>>()));
         }
         Algorithm::LoopRegions => {
+            let started = Instant::now();
             let result = loop_regions(graph, &mut request).unwrap();
+            elapsed = started.elapsed();
             let mut retained = bytes(
                 result.regions.len(),
                 size_of::<LoopRegion<G::Node, G::Edge>>(),
@@ -396,6 +431,7 @@ where
                 push_edges(graph, region.back_edges.iter().copied(), &mut material);
                 material.push(u8::from(region.has_self_loop));
                 material.push(match region.entry_structure {
+                    LoopEntryStructure::NoEntry => 0,
                     LoopEntryStructure::SingleEntry => 1,
                     LoopEntryStructure::MultiEntry => 2,
                 });
@@ -408,7 +444,9 @@ where
             retained_bytes = retained;
         }
         Algorithm::ShortestPath => {
+            let started = Instant::now();
             let result = shortest_path(graph, start, goal, &mut request).unwrap();
+            elapsed = started.elapsed();
             if let Some(path) = result {
                 material.push(1);
                 push_nodes(graph, path.nodes.iter().copied(), &mut material);
@@ -422,11 +460,14 @@ where
             work = budget.used();
         }
     }
-    RunResult {
-        work,
-        retained_bytes,
-        digest: StableDigest::sha256(material).to_string(),
-    }
+    (
+        elapsed,
+        RunResult {
+            work,
+            retained_bytes,
+            digest: StableDigest::sha256(material).to_string(),
+        },
+    )
 }
 
 fn push_nodes<G>(graph: &G, nodes: impl IntoIterator<Item = G::Node>, material: &mut Vec<u8>)
@@ -760,6 +801,12 @@ fn cfg_algorithm_release_measurement() {
                 .join(".agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json")
         });
 
+    let parent = output
+        .parent()
+        .expect("benchmark output must have a parent directory");
+    let mut temporary_output =
+        NamedTempFile::new_in(parent).expect("create benchmark output beside destination");
+
     let mut datasets = synthetic_datasets(repeats);
     datasets.push(corpus_dataset(
         TS_REPO_ENV,
@@ -784,10 +831,18 @@ fn cfg_algorithm_release_measurement() {
         datasets,
     };
     let json = serde_json::to_string_pretty(&report).expect("serialize benchmark report");
-    fs::write(&output, json).unwrap_or_else(|error| {
+    temporary_output
+        .write_all(json.as_bytes())
+        .expect("write temporary CFG algorithm benchmark");
+    temporary_output
+        .as_file_mut()
+        .sync_all()
+        .expect("sync temporary CFG algorithm benchmark");
+    temporary_output.persist(&output).unwrap_or_else(|error| {
         panic!(
-            "write CFG algorithm benchmark {}: {error}",
-            output.display()
+            "atomically persist CFG algorithm benchmark {}: {}",
+            output.display(),
+            error.error
         )
     });
     println!("BIFROST_CFG_ALGORITHM_BENCHMARK={}", output.display());

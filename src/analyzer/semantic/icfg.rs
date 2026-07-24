@@ -1567,9 +1567,12 @@ fn cache_return_path_mask(
             }
             Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
                 unreachable!(
-                    "precharged return-path traversal exceeded its complete-graph {:?} limit: \
+                    "precharged return-path traversal exceeded its complete-graph {} limit: \
                      attempted {}, limit {}, work {:?}",
-                    exceeded.limit_kind, exceeded.attempted, exceeded.limit, exceeded.work
+                    exceeded.limit_kind.label(),
+                    exceeded.attempted,
+                    exceeded.limit,
+                    exceeded.work
                 );
             }
             Err(CfgAlgorithmError::InvalidNode(point)) => {
@@ -1584,9 +1587,12 @@ fn cache_return_path_mask(
         }
         Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
             unreachable!(
-                "precharged return-path traversal exceeded its complete-graph {:?} limit: \
+                "precharged return-path traversal exceeded its complete-graph {} limit: \
                  attempted {}, limit {}, work {:?}",
-                exceeded.limit_kind, exceeded.attempted, exceeded.limit, exceeded.work
+                exceeded.limit_kind.label(),
+                exceeded.attempted,
+                exceeded.limit,
+                exceeded.work
             );
         }
         Err(CfgAlgorithmError::InvalidNode(point)) => {

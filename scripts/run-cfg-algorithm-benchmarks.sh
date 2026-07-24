@@ -58,7 +58,7 @@ printf 'CFG algorithm benchmark: %s recomputations per graph\n' "$repeats" >&2
 BIFROST_CFG_ALGORITHM_BENCHMARK_OUTPUT=$output_path \
 BIFROST_CFG_ALGORITHM_BENCHMARK_REPEATS=$repeats \
 BIFROST_SEMANTIC_INDEX=off \
-cargo test --release --lib \
+cargo test --locked --release --lib \
     analyzer::semantic::cfg_algorithms::benchmark::cfg_algorithm_release_measurement \
     -- --ignored --nocapture
 
