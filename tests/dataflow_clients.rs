@@ -407,6 +407,8 @@ fn budget_with_limit(dimension: SolverBudgetDimension, limit: usize) -> SolverBu
         SolverBudgetDimension::ProviderMaterializations => {
             limits.provider_materializations = limit;
         }
+        SolverBudgetDimension::SummaryApplications => limits.summary_applications = limit,
+        SolverBudgetDimension::CoverageRows => limits.coverage_rows = limit,
     }
     SolverBudget::new(limits)
 }

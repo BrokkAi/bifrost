@@ -20,7 +20,7 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
 - [x] (2026-07-24 07:48Z) Extracted the provider-owned procedure-exit profile and matched-return/call-boundary projections, then kept the existing ICFG unit and contract suites green.
 - [x] (2026-07-24 07:48Z) Added summary-specific result rows, coverage, reuse metrics, and independently bounded end-summary, incoming-call, and provider-materialization work.
 - [x] (2026-07-24 07:48Z) Implemented the iterative relative path-edge, incoming-call, end-summary, and exact replay tables, and verified that the existing bounded solver/client regression suites remain green after sharing transfer evaluation.
-- [ ] Add the repeated-scan reference plus recursion, reuse, return, incompleteness, cancellation, budget, and determinism tests.
+- [x] (2026-07-24 09:03Z) Added the independent provider-backed repeated-scan reference and 11 summary behaviors covering direct/mutual recursion, reuse without cross-return, both return families, deferred bypass, incomplete providers, cancellation, malformed provider rows, every summary budget, and permutation determinism.
 - [ ] Run formatting, focused tests, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [ ] Run five specialist reviews, fix every actionable finding, rerun validation, and update this plan with final evidence.
 
@@ -41,6 +41,15 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
 - Observation: the public semantic envelope is not by itself sufficient to preserve the snapshot builder's exact internal quality precedence.
   Evidence: an exit-local exceeded-budget gap is exposed as an available `Unknown` profile, while the bounded snapshot previously retained its internal `Truncated` quality when combining that gap with other unsupported or ambiguous gaps. The exit profile therefore privately retains its exact local quality for snapshot replay, while summary clients continue to see the stable public envelope and concrete gap evidence.
 
+- Observation: procedure-exit evidence must be relative to the exact summary entry, not merely the procedure.
+  Evidence: a provider may legally select a noncanonical entry in `CallTransfer`. Computing the return-gap path mask from the declared entry could either miss a gap unique to that selected entry or import a gap from an unreachable canonical-entry branch. `IcfgExitProfile` and both caches therefore use `(procedure, entry, exit)`.
+
+- Observation: an explicit applied-return deduplication table is unnecessary and creates a potentially unbounded Cartesian-product allocation.
+  Evidence: a replay is triggered only when one incoming quality or one end-summary quality is newly admitted; whichever side arrives second owns that pair exactly once. Removing the table keeps retained state linear in incoming and summary rows, while an explicit `summary_applications` budget bounds the unavoidable replay work.
+
+- Observation: summary coverage must own the evidence that a snapshot-backed result could otherwise dereference.
+  Evidence: summary results have no backing ICFG edge table. `SummaryEdge` now retains proof and completeness, dispatch boundaries retain their structured provenance, and unique coverage rows are incrementally deduplicated and independently bounded.
+
 ## Decision Log
 
 - Decision: add a second solver entry point over a root `ProcedureHandle` and generic `IcfgProvider`; do not extend the bounded snapshot runner or add a second call stack to it.
@@ -59,7 +68,7 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
   Rationale: seeds are runner-specific. The bounded runner already isolates dense snapshot seeds in `BoundedSnapshotDataflowProblem`; a borrowed root plus entry-fact slice gives the summary runner the same separation without inventing a second analysis trait.
   Date/Author: 2026-07-24 / Codex
 
-- Decision: add a default provider operation that describes one procedure exit, and a shared pure projection that matches that exit to one incoming call.
+- Decision: add a default provider operation that describes one exact procedure-entry-to-exit relation, and a shared pure projection that matches that exit to one incoming call.
   Rationale: procedure-exit gap analysis belongs beside semantic ICFG construction and consumes `SemanticBudget`. The pure matched-return projection can then be reused by the bounded snapshot and summary runner, preserving exact continuation, proof, completeness, and typed boundary behavior.
   Date/Author: 2026-07-24 / Codex
 
@@ -67,8 +76,8 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
   Rationale: summary rows, incoming rows, and provider cache misses consume solver-owned limits; source/oracle/exit materialization consumes `SemanticBudget`. A semantic budget boundary must not be mislabeled as `SolverTermination::ExceededBudget`.
   Date/Author: 2026-07-24 / Codex
 
-- Decision: extend `SolverWork` with `end_summaries`, `incoming_calls`, and `provider_materializations`.
-  Rationale: these are independent finite growth dimensions introduced by this runner. Explicit limits make cancellation and every new resource failure distinguishable and prevent an apparently bounded fact worklist from retaining unbounded summary metadata.
+- Decision: extend `SolverWork` with `end_summaries`, `incoming_calls`, `provider_materializations`, `summary_applications`, and `coverage_rows`.
+  Rationale: the first three bound independently retained tables and provider cache misses. The latter two bound matched-return Cartesian-product work and owned incomplete-evidence rows, preventing no-op returns or repeated boundaries from escaping the fact-worklist limits.
   Date/Author: 2026-07-24 / Codex
 
 - Decision: canonicalize every client relation and provider transfer set before assigning fact, procedure, incoming, or summary identities.
@@ -136,9 +145,9 @@ Expect all existing ICFG contract tests to pass with no changed assertion.
 
 After adding the summary contracts and engine, run:
 
-    cargo test --test dataflow_tabulation --test dataflow_clients --test dataflow_summaries
+    cargo test --test dataflow_tabulation --test dataflow_clients --test dataflow_summaries --test icfg_contract
 
-Expect all existing bounded tests plus every new summary test to pass. A direct-recursion test must explicitly demonstrate that a depth-one snapshot has a call-depth boundary while `solve_with_summaries` terminates at `FixedPoint`.
+Expect 12 client tests, 11 bounded tabulation tests, 15 tests in the summary binary, and 25 ICFG contract tests to pass. A direct-recursion test explicitly demonstrates that a depth-two snapshot has a call-depth boundary while `solve_with_summaries` terminates at `FixedPoint`.
 
 Before review, run the repository gates with one coherent Rust toolchain. On this host, use the rustup 1.96 toolchain binaries if Homebrew `rustdoc` or `cargo-clippy` selects a different LLVM build:
 
@@ -193,26 +202,27 @@ Caller quality is deliberately absent from the relative callee rows. It is reint
 
 ## Interfaces and Dependencies
 
-In `src/analyzer/semantic/icfg.rs`, add a provider-owned exit contract equivalent to:
+In `src/analyzer/semantic/icfg.rs`, add the provider-owned exit contract:
 
-    pub struct ProcedureExitTransfer {
+    pub struct IcfgExitProfile {
+        callee_entry: ProgramPointHandle,
         callee_exit: ProgramPointHandle,
         kind: ReturnTransferKind,
-        proof: ProofStatus,
-        completeness: EvidenceCompleteness,
+        gap_reason: Option<Box<str>>,
     }
 
     pub trait IcfgProvider: DispatchOracle {
         fn call_transfers(...);
-        fn procedure_exit(
+        fn exit_profile(
             &self,
-            exit: &ProgramPointHandle,
+            callee_entry: &ProgramPointHandle,
+            callee_exit: &ProgramPointHandle,
             request: &mut SemanticRequest<'_>,
-        ) -> Result<SemanticOutcome<Option<ProcedureExitTransfer>>, SemanticProviderError>;
+        ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError>;
         fn snapshot(...);
     }
 
-The default `procedure_exit` implementation must be usable by custom providers because the immutable `ProcedureHandle` contains the local CFG and semantic gaps. Add shared projection helpers that turn one incoming call relation plus one `ProcedureExitTransfer` into either a matched `ReturnTransfer`, an absent continuation, or a typed continuation boundary. `ReturnTransfer` must carry proof and completeness so both solver backends construct the same `DataflowEdge`.
+The default `exit_profile` implementation is usable by custom providers because immutable procedure handles contain the local CFG and semantic gaps. Shared projection helpers turn one incoming call relation plus one `IcfgExitProfile` into either a matched return edge, an absent continuation, or a typed continuation boundary. Provider transfer rows are validated before either backend publishes them.
 
 In `src/analyzer/dataflow/summary.rs`, expose:
 

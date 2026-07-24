@@ -13,7 +13,7 @@ define_work_dimensions! {
     /// Work performed or limits applied by one data-flow solve.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SolverWork;
-    all: pub(crate) [8];
+    all: pub(crate) [10];
     InternedFacts => interned_facts = 100_000,
     ReachedStates => reached_states = 1_000_000,
     FlowEvaluations => flow_evaluations = 4_000_000,
@@ -22,6 +22,8 @@ define_work_dimensions! {
     EndSummaries => end_summaries = 1_000_000,
     IncomingCalls => incoming_calls = 1_000_000,
     ProviderMaterializations => provider_materializations = 100_000,
+    SummaryApplications => summary_applications = 4_000_000,
+    CoverageRows => coverage_rows = 1_000_000,
 }
 
 /// Exact failed solver-budget charge.
@@ -70,7 +72,7 @@ impl fmt::Display for SolverBudgetExceeded {
 
 impl Error for SolverBudgetExceeded {}
 
-/// Eight-dimensional request-local work budget.
+/// Ten-dimensional request-local work budget.
 ///
 /// `callback_rows` is the single deterministic cap for each unique seed or
 /// transfer relation collected from clients. If a complete relation fits that
@@ -78,7 +80,8 @@ impl Error for SolverBudgetExceeded {}
 /// callback-row, and propagated-output charge. Problem implementations must
 /// still stop emitting when requested and return cooperatively to bound their
 /// own CPU work. Summary tabulation additionally limits retained end summaries,
-/// waiting incoming calls, and semantic-provider cache misses independently.
+/// waiting incoming calls, semantic-provider cache misses, matched-return
+/// applications, and retained incomplete-coverage rows independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverBudget {
     ledger: BudgetLedger<SolverWork>,
@@ -166,6 +169,8 @@ mod tests {
             end_summaries: 10,
             incoming_calls: 10,
             provider_materializations: 10,
+            summary_applications: 10,
+            coverage_rows: 10,
         });
         budget
             .charge(SolverWork {

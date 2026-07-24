@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::analyzer::semantic::{
     CallBoundary, CallSiteHandle, CallTransfer, CallTransferSet, ControlContinuation,
@@ -76,9 +77,8 @@ struct EndSummaryKey {
 #[derive(Debug, Clone)]
 struct EndSummaryRow {
     key: EndSummaryKey,
-    exit: IcfgExitProfile,
+    exit: Arc<IcfgExitProfile>,
     qualities: PathQualityFrontier,
-    applications: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,14 +95,6 @@ struct IncomingCall {
     key: IncomingKey,
     transfer: CallTransfer,
     qualities: PathQualityFrontier,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct AppliedReturn {
-    incoming: usize,
-    summary: usize,
-    incoming_quality: PathQuality,
-    summary_quality: PathQuality,
 }
 
 struct StagedFacts<Fact> {
@@ -124,12 +116,14 @@ struct SummaryState<Fact> {
     incoming: Vec<IncomingCall>,
     incoming_ids: HashMap<IncomingKey, usize>,
     incoming_by_entry: HashMap<EntryKey, Vec<usize>>,
-    applied_returns: HashSet<AppliedReturn>,
-    call_cache: HashMap<CallSiteHandle, SemanticOutcome<CallTransferSet>>,
-    exit_cache: HashMap<(ProcedureHandle, ProgramPointId), SemanticOutcome<IcfgExitProfile>>,
+    call_cache: HashMap<CallSiteHandle, Arc<SemanticOutcome<CallTransferSet>>>,
+    exit_cache: HashMap<
+        (ProcedureHandle, ProgramPointId, ProgramPointId),
+        Arc<SemanticOutcome<Arc<IcfgExitProfile>>>,
+    >,
     unproven_edges: HashSet<SummaryEdge>,
     partial_edges: HashSet<SummaryEdge>,
-    boundaries: Vec<SummaryBoundary>,
+    boundaries: HashSet<SummaryBoundary>,
     metrics: SummaryMetrics,
 }
 
@@ -152,12 +146,11 @@ where
             incoming: Vec::new(),
             incoming_ids: HashMap::default(),
             incoming_by_entry: HashMap::default(),
-            applied_returns: HashSet::default(),
             call_cache: HashMap::default(),
             exit_cache: HashMap::default(),
             unproven_edges: HashSet::default(),
             partial_edges: HashSet::default(),
-            boundaries: Vec::new(),
+            boundaries: HashSet::default(),
             metrics: SummaryMetrics::default(),
         }
     }
@@ -341,19 +334,61 @@ where
         Ok(None)
     }
 
-    fn observe_edge(&mut self, edge: &ProcedureIcfgEdge) {
+    fn observe_edge(
+        &mut self,
+        edge: &ProcedureIcfgEdge,
+        request: &mut DataflowRequest<'_>,
+    ) -> Option<SolverTermination> {
+        if request.cancellation.is_cancelled() {
+            return Some(SolverTermination::Cancelled);
+        }
+        if matches!(edge.proof, ProofStatus::Proven)
+            && matches!(edge.completeness, EvidenceCompleteness::Complete)
+        {
+            return None;
+        }
         let row = SummaryEdge::from_procedure_edge(edge);
-        if !matches!(edge.proof, ProofStatus::Proven) {
+        let retain_unproven =
+            !matches!(edge.proof, ProofStatus::Proven) && !self.unproven_edges.contains(&row);
+        let retain_partial = !matches!(edge.completeness, EvidenceCompleteness::Complete)
+            && !self.partial_edges.contains(&row);
+        let new_rows = usize::from(retain_unproven) + usize::from(retain_partial);
+        if let Some(termination) = reserve_coverage_rows(new_rows, request) {
+            return Some(termination);
+        }
+        if retain_unproven {
             self.unproven_edges.insert(row.clone());
         }
-        if !matches!(edge.completeness, EvidenceCompleteness::Complete) {
+        if retain_partial {
             self.partial_edges.insert(row);
         }
+        None
     }
 
-    fn observe_boundary(&mut self, boundary: ProcedureIcfgBoundary) {
-        self.boundaries
-            .push(SummaryBoundary::from_procedure_boundary(boundary));
+    fn observe_boundary(
+        &mut self,
+        boundary: ProcedureIcfgBoundary,
+        request: &mut DataflowRequest<'_>,
+    ) -> Option<SolverTermination> {
+        self.retain_boundary(SummaryBoundary::from_procedure_boundary(boundary), request)
+    }
+
+    fn retain_boundary(
+        &mut self,
+        boundary: SummaryBoundary,
+        request: &mut DataflowRequest<'_>,
+    ) -> Option<SolverTermination> {
+        if request.cancellation.is_cancelled() {
+            return Some(SolverTermination::Cancelled);
+        }
+        if self.boundaries.contains(&boundary) {
+            return None;
+        }
+        if let Some(termination) = reserve_coverage_rows(1, request) {
+            return Some(termination);
+        }
+        self.boundaries.insert(boundary);
+        None
     }
 
     fn observe_semantic_outcome<T>(
@@ -361,15 +396,16 @@ where
         at: &ProgramPointHandle,
         origin: Option<CallSiteHandle>,
         outcome: &SemanticOutcome<T>,
-    ) {
+        request: &mut DataflowRequest<'_>,
+    ) -> Option<SolverTermination> {
         let status = SummarySemanticStatus::from_outcome(outcome);
         if !status.is_complete() {
-            self.boundaries.push(SummaryBoundary::new(
-                at.clone(),
-                origin,
-                SummaryBoundaryKind::Semantic(status),
-            ));
+            return self.retain_boundary(
+                SummaryBoundary::new(at.clone(), origin, SummaryBoundaryKind::Semantic(status)),
+                request,
+            );
         }
+        None
     }
 
     fn reserve_provider_materialization(
@@ -402,17 +438,23 @@ where
         call: crate::analyzer::semantic::CallSiteId,
         semantic_budget: &mut SemanticBudget,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Result<SemanticOutcome<CallTransferSet>, SolverTermination>, SummaryDataflowError>
+    ) -> Result<
+        Result<(Arc<SemanticOutcome<CallTransferSet>>, bool), SolverTermination>,
+        SummaryDataflowError,
+    >
     where
         Provider: IcfgProvider + ?Sized,
     {
+        if request.cancellation.is_cancelled() {
+            return Ok(Err(SolverTermination::Cancelled));
+        }
         let origin = point
             .procedure()
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope summary call"))?;
-        if let Some(cached) = self.call_cache.get(&origin).cloned() {
+        if let Some(cached) = self.call_cache.get(&origin) {
             self.metrics.provider_cache_hits = self.metrics.provider_cache_hits.saturating_add(1);
-            return Ok(Ok(cached));
+            return Ok(Ok((Arc::clone(cached), false)));
         }
         if let Some(termination) = self.reserve_provider_materialization(request) {
             return Ok(Err(termination));
@@ -421,32 +463,58 @@ where
         let outcome = provider
             .call_transfers(point.procedure(), call, &mut semantic_request)?
             .map(canonicalize_call_transfer_set);
-        self.call_cache.insert(origin, outcome.clone());
-        Ok(Ok(outcome))
+        if let Some(transfers) = outcome.available_value() {
+            let semantic_call = point
+                .procedure()
+                .semantics()
+                .call_site(call)
+                .ok_or_else(|| {
+                    SemanticProviderError::internal("summary invoke event has no call row")
+                })?;
+            crate::analyzer::semantic::icfg::validate_call_transfer_set(
+                point.procedure(),
+                semantic_call,
+                transfers,
+            )?;
+        }
+        let outcome = Arc::new(outcome);
+        self.call_cache.insert(origin, Arc::clone(&outcome));
+        Ok(Ok((outcome, true)))
     }
 
     fn cached_exit_profile<Provider>(
         &mut self,
         provider: &Provider,
+        entry: &ProgramPointHandle,
         point: &ProgramPointHandle,
         semantic_budget: &mut SemanticBudget,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Result<SemanticOutcome<IcfgExitProfile>, SolverTermination>, SummaryDataflowError>
+    ) -> Result<
+        Result<(Arc<SemanticOutcome<Arc<IcfgExitProfile>>>, bool), SolverTermination>,
+        SummaryDataflowError,
+    >
     where
         Provider: IcfgProvider + ?Sized,
     {
-        let cache_key = (point.procedure().clone(), point.id());
-        if let Some(cached) = self.exit_cache.get(&cache_key).cloned() {
+        if request.cancellation.is_cancelled() {
+            return Ok(Err(SolverTermination::Cancelled));
+        }
+        let cache_key = (point.procedure().clone(), entry.id(), point.id());
+        if let Some(cached) = self.exit_cache.get(&cache_key) {
             self.metrics.provider_cache_hits = self.metrics.provider_cache_hits.saturating_add(1);
-            return Ok(Ok(cached));
+            return Ok(Ok((Arc::clone(cached), false)));
         }
         if let Some(termination) = self.reserve_provider_materialization(request) {
             return Ok(Err(termination));
         }
         let mut semantic_request = SemanticRequest::new(semantic_budget, request.cancellation);
-        let outcome = provider.exit_profile(point, &mut semantic_request)?;
-        self.exit_cache.insert(cache_key, outcome.clone());
-        Ok(Ok(outcome))
+        let outcome = Arc::new(
+            provider
+                .exit_profile(entry, point, &mut semantic_request)?
+                .map(Arc::new),
+        );
+        self.exit_cache.insert(cache_key, Arc::clone(&outcome));
+        Ok(Ok((outcome, true)))
     }
 
     fn propagate<P, Provider>(
@@ -506,7 +574,11 @@ where
                 return Ok(termination);
             }
         }
-        Ok(SolverTermination::FixedPoint)
+        if request.cancellation.is_cancelled() {
+            Ok(SolverTermination::Cancelled)
+        } else {
+            Ok(SolverTermination::FixedPoint)
+        }
     }
 
     fn process_exit<P, Provider>(
@@ -522,12 +594,23 @@ where
         P: DistributiveDataflowProblem<Fact = Fact>,
         Provider: IcfgProvider + ?Sized,
     {
-        let outcome = match self.cached_exit_profile(provider, point, semantic_budget, request)? {
-            Ok(outcome) => outcome,
-            Err(termination) => return Ok(Some(termination)),
-        };
-        self.observe_semantic_outcome(point, None, &outcome);
-        if matches!(outcome, SemanticOutcome::Cancelled { .. })
+        let entry = point
+            .procedure()
+            .point_handle(queued.key.entry.entry_point)
+            .ok_or_else(|| SemanticProviderError::internal("summary entry point is stale"))?;
+        let (outcome, newly_materialized) =
+            match self.cached_exit_profile(provider, &entry, point, semantic_budget, request)? {
+                Ok(outcome) => outcome,
+                Err(termination) => return Ok(Some(termination)),
+            };
+        if newly_materialized {
+            if let Some(termination) =
+                self.observe_semantic_outcome(point, None, outcome.as_ref(), request)
+            {
+                return Ok(Some(termination));
+            }
+        }
+        if matches!(outcome.as_ref(), SemanticOutcome::Cancelled { .. })
             || request.cancellation.is_cancelled()
         {
             return Ok(Some(SolverTermination::Cancelled));
@@ -569,32 +652,52 @@ where
             .procedure()
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope summary invoke"))?;
-        let outcome =
+        let (outcome, newly_materialized) =
             match self.cached_call_transfers(provider, point, call, semantic_budget, request)? {
                 Ok(outcome) => outcome,
                 Err(termination) => return Ok(Some(termination)),
             };
-        self.observe_semantic_outcome(point, Some(origin.clone()), &outcome);
-        if matches!(outcome, SemanticOutcome::Cancelled { .. })
+        if newly_materialized {
+            if let Some(termination) = self.observe_semantic_outcome(
+                point,
+                Some(origin.clone()),
+                outcome.as_ref(),
+                request,
+            ) {
+                return Ok(Some(termination));
+            }
+        }
+        if matches!(outcome.as_ref(), SemanticOutcome::Cancelled { .. })
             || request.cancellation.is_cancelled()
         {
             return Ok(Some(SolverTermination::Cancelled));
         }
 
-        if let Some(transfers) = outcome.available_value().cloned() {
+        if let Some(transfers) = outcome.available_value() {
             for boundary in &transfers.boundaries {
-                self.boundaries.push(SummaryBoundary::new(
-                    point.clone(),
-                    Some(boundary.origin.clone()),
-                    SummaryBoundaryKind::Dispatch(boundary.dispatch.kind.clone()),
-                ));
+                if newly_materialized {
+                    if let Some(termination) = self.retain_boundary(
+                        SummaryBoundary::from_dispatch(
+                            point.clone(),
+                            boundary.origin.clone(),
+                            &boundary.dispatch,
+                        ),
+                        request,
+                    ) {
+                        return Ok(Some(termination));
+                    }
+                }
                 let projection = crate::analyzer::semantic::icfg::project_call_boundary(
                     point.procedure(),
                     &semantic_call,
                     boundary,
                 )?;
                 for boundary in projection.boundaries {
-                    self.observe_boundary(boundary);
+                    if newly_materialized {
+                        if let Some(termination) = self.observe_boundary(boundary, request) {
+                            return Ok(Some(termination));
+                        }
+                    }
                 }
                 for edge in projection.edges {
                     if let Some(termination) = self.propagate_owned_edge(
@@ -603,6 +706,7 @@ where
                         queued.key.fact,
                         queued.quality,
                         edge,
+                        newly_materialized,
                         request,
                     )? {
                         return Ok(Some(termination));
@@ -619,7 +723,11 @@ where
                     proof: transfer.proof.clone(),
                     completeness: transfer.completeness.clone(),
                 };
-                self.observe_edge(&edge);
+                if newly_materialized {
+                    if let Some(termination) = self.observe_edge(&edge, request) {
+                        return Ok(Some(termination));
+                    }
+                }
                 let incoming_quality = queued
                     .quality
                     .through_evidence(&edge.proof, &edge.completeness);
@@ -697,6 +805,7 @@ where
                 queued.key.fact,
                 queued.quality,
                 owned,
+                true,
                 request,
             )? {
                 return Ok(Some(termination));
@@ -712,12 +821,17 @@ where
         fact_id: FactId,
         input_quality: PathQuality,
         edge: ProcedureIcfgEdge,
+        observe_evidence: bool,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, SummaryDataflowError>
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
-        self.observe_edge(&edge);
+        if observe_evidence {
+            if let Some(termination) = self.observe_edge(&edge, request) {
+                return Ok(Some(termination));
+            }
+        }
         let output_quality = input_quality.through_evidence(&edge.proof, &edge.completeness);
         let target = edge.target.id();
         let flow = descriptor(&edge);
@@ -871,7 +985,7 @@ where
     fn publish_end_summary<P>(
         &mut self,
         path: PathEdgeKey,
-        exit: IcfgExitProfile,
+        exit: Arc<IcfgExitProfile>,
         quality: PathQuality,
         problem: &P,
         request: &mut DataflowRequest<'_>,
@@ -884,9 +998,16 @@ where
             exit_point: exit.callee_exit().id(),
             exit_fact: path.fact,
         };
-        let (summary_id, changed) = if let Some(id) = self.summary_ids.get(&key).copied() {
-            let changed = self.summaries[id].qualities.insert(quality);
-            (id, changed)
+        let summary_id = if let Some(id) = self.summary_ids.get(&key).copied() {
+            let mut prospective = self.summaries[id].qualities;
+            if !prospective.insert(quality) {
+                return Ok(None);
+            }
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
+            self.summaries[id].qualities = prospective;
+            id
         } else {
             let staged_budget = match request.budget.staged_charge(SolverWork {
                 end_summaries: 1,
@@ -906,18 +1027,14 @@ where
                 key,
                 exit,
                 qualities: PathQualityFrontier::singleton(quality),
-                applications: 0,
             });
             self.summary_ids.insert(key, id);
             self.summaries_by_entry
                 .entry(key.entry)
                 .or_default()
                 .push(id);
-            (id, true)
+            id
         };
-        if !changed {
-            return Ok(None);
-        }
 
         let incoming = self
             .incoming_by_entry
@@ -925,6 +1042,9 @@ where
             .cloned()
             .unwrap_or_default();
         for incoming_id in incoming {
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
             let qualities = self.incoming[incoming_id]
                 .qualities
                 .iter()
@@ -955,6 +1075,14 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
+        if request.cancellation.is_cancelled() {
+            return Ok(Some(SolverTermination::Cancelled));
+        }
+        // No applied-pair table is needed: this path runs only for one newly
+        // admitted incoming quality, while `publish_end_summary` runs only for
+        // one newly admitted summary quality. The side admitted second owns
+        // the pair exactly once. Avoiding a retained Cartesian-product table
+        // keeps query memory linear in incoming and summary rows.
         let entry = self.incoming[incoming].key.callee;
         let summaries = self
             .summaries_by_entry
@@ -967,6 +1095,9 @@ where
         }
         self.metrics.summary_hits = self.metrics.summary_hits.saturating_add(1);
         for summary in summaries {
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
             let qualities = self.summaries[summary].qualities.iter().collect::<Vec<_>>();
             for summary_quality in qualities {
                 if let Some(termination) = self.apply_summary(
@@ -997,31 +1128,43 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
-        let application = AppliedReturn {
-            incoming: incoming_id,
-            summary: summary_id,
-            incoming_quality,
-            summary_quality,
-        };
-        if !self.applied_returns.insert(application) {
-            return Ok(None);
+        if let Some(termination) = reserve_summary_application(request) {
+            return Ok(Some(termination));
         }
-        self.metrics.summary_applications = self.metrics.summary_applications.saturating_add(1);
-        self.summaries[summary_id].applications =
-            self.summaries[summary_id].applications.saturating_add(1);
-
-        let incoming = self.incoming[incoming_id].clone();
-        let summary = self.summaries[summary_id].clone();
-        debug_assert_eq!(incoming.key.callee, summary.key.entry);
-        let projection = summary.exit.project_matched_return(&incoming.transfer)?;
+        let (caller, exit_fact, projection) = {
+            let incoming = &self.incoming[incoming_id];
+            let summary = &self.summaries[summary_id];
+            debug_assert_eq!(incoming.key.callee, summary.key.entry);
+            (
+                incoming.key.caller,
+                summary.key.exit_fact,
+                summary.exit.project_matched_return(&incoming.transfer)?,
+            )
+        };
         match projection {
-            MatchedReturnProjection::Absent => Ok(None),
+            MatchedReturnProjection::Absent => {
+                self.metrics.summary_applications =
+                    self.metrics.summary_applications.saturating_add(1);
+                Ok(None)
+            }
             MatchedReturnProjection::Boundary(boundary) => {
-                self.observe_boundary(boundary);
+                if let Some(termination) = self.observe_boundary(boundary, request) {
+                    return Ok(Some(termination));
+                }
+                self.metrics.summary_applications =
+                    self.metrics.summary_applications.saturating_add(1);
                 Ok(None)
             }
             MatchedReturnProjection::Edge(edge) => {
-                self.observe_edge(&edge);
+                if self.procedures[caller.procedure] != *edge.target.procedure() {
+                    return Err(SemanticProviderError::internal(
+                        "summary return target belongs to a different caller",
+                    )
+                    .into());
+                }
+                if let Some(termination) = self.observe_edge(&edge, request) {
+                    return Ok(Some(termination));
+                }
                 let quality = incoming_quality
                     .conjoin(summary_quality)
                     .through_evidence(&edge.proof, &edge.completeness);
@@ -1030,9 +1173,9 @@ where
                 let outputs = match evaluate_transfer(
                     problem,
                     flow,
-                    self.facts[summary.key.exit_fact.index()],
+                    self.facts[exit_fact.index()],
                     self.zero_fact,
-                    summary.key.exit_fact == ZERO_FACT_ID,
+                    exit_fact == ZERO_FACT_ID,
                     request,
                 ) {
                     TransferEvaluation::Outputs(outputs) => outputs,
@@ -1040,7 +1183,9 @@ where
                         return Ok(Some(termination));
                     }
                 };
-                self.publish_path_outputs(incoming.key.caller, target, quality, &outputs, request)
+                self.metrics.summary_applications =
+                    self.metrics.summary_applications.saturating_add(1);
+                self.publish_path_outputs(caller, target, quality, &outputs, request)
             }
         }
     }
@@ -1083,7 +1228,7 @@ where
                     .expect("published summary entry point remains valid");
                 TabulationEndSummary::new(
                     SummaryEntry::new(procedure, entry_point, row.key.entry.entry_fact),
-                    row.exit,
+                    Arc::unwrap_or_clone(row.exit),
                     row.key.exit_fact,
                     row.qualities,
                 )
@@ -1092,7 +1237,7 @@ where
         let coverage = SummaryCoverage::from_parts(
             self.unproven_edges.into_iter().collect(),
             self.partial_edges.into_iter().collect(),
-            self.boundaries,
+            self.boundaries.into_iter().collect(),
         );
         SummaryDataflowResult::from_parts(
             self.facts,
@@ -1130,6 +1275,47 @@ where
     let work = request.budget.used().saturating_sub(initial_work);
     let semantic_work = semantic_budget.used().saturating_sub(initial_semantic_work);
     Ok(state.finish(termination, work, semantic_work))
+}
+
+fn reserve_summary_application(request: &mut DataflowRequest<'_>) -> Option<SolverTermination> {
+    reserve_solver_work(
+        SolverWork {
+            summary_applications: 1,
+            ..SolverWork::default()
+        },
+        request,
+    )
+}
+
+fn reserve_coverage_rows(
+    rows: usize,
+    request: &mut DataflowRequest<'_>,
+) -> Option<SolverTermination> {
+    reserve_solver_work(
+        SolverWork {
+            coverage_rows: rows,
+            ..SolverWork::default()
+        },
+        request,
+    )
+}
+
+fn reserve_solver_work(
+    work: SolverWork,
+    request: &mut DataflowRequest<'_>,
+) -> Option<SolverTermination> {
+    if request.cancellation.is_cancelled() {
+        return Some(SolverTermination::Cancelled);
+    }
+    let staged = match request.budget.staged_charge(work) {
+        Ok(staged) => staged,
+        Err(exceeded) => return Some(SolverTermination::ExceededBudget(exceeded)),
+    };
+    if request.cancellation.is_cancelled() {
+        return Some(SolverTermination::Cancelled);
+    }
+    *request.budget = staged;
+    None
 }
 
 fn canonicalize_call_transfer_set(mut set: CallTransferSet) -> CallTransferSet {
@@ -1191,6 +1377,11 @@ fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Orderi
         .cmp(right.artifact().key())
         .then_with(|| left.semantics().locator().cmp(right.semantics().locator()))
         .then_with(|| left.id().cmp(&right.id()))
+        .then_with(|| {
+            Arc::as_ptr(left.artifact())
+                .cast::<()>()
+                .cmp(&Arc::as_ptr(right.artifact()).cast::<()>())
+        })
 }
 
 fn compare_call_sites(left: &CallSiteHandle, right: &CallSiteHandle) -> Ordering {

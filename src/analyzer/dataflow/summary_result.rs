@@ -8,11 +8,11 @@ use std::{
 };
 
 use crate::analyzer::semantic::{
-    CallContinuationKind, CallSiteHandle, ControlContinuation, ControlEdgeKind,
-    DispatchBoundaryKind, IcfgBoundaryKind, IcfgEdgeKind, IcfgExitProfile, IcfgLimitKind,
-    ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge, ProgramPointHandle,
-    ReturnTransferKind, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
-    SemanticProviderError, SemanticWork,
+    CallContinuationKind, CallSiteHandle, ControlContinuation, ControlEdgeKind, DispatchBoundary,
+    DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind, IcfgEdgeKind, IcfgExitProfile,
+    IcfgLimitKind, OracleRelationHandle, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge,
+    ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticBudgetExceeded,
+    SemanticCapability, SemanticOutcome, SemanticProviderError, SemanticWork,
 };
 
 use super::{FactId, PathQualityFrontier, SolverTermination, SolverWork};
@@ -127,6 +127,11 @@ impl TabulationEndSummary {
             exit.callee_exit().procedure(),
             "summary exit must belong to its entry procedure"
         );
+        debug_assert_eq!(
+            entry.entry_point(),
+            exit.callee_entry(),
+            "summary exit evidence must start at its exact entry"
+        );
         Self {
             entry,
             exit,
@@ -160,42 +165,31 @@ impl TabulationEndSummary {
     }
 }
 
-/// Owned topology of one reachable semantic transfer whose evidence is
-/// unproven or incomplete.
+/// One reachable semantic transfer whose evidence is unproven or incomplete.
 ///
-/// Proof and completeness are represented by membership in the corresponding
-/// [`SummaryCoverage`] collection, so the topology row itself remains compact
-/// and can occur in both collections.
+/// Unlike bounded tabulation, a summary result has no backing `IcfgSnapshot`
+/// from which a client could recover the evidence. The owned row therefore
+/// retains exact proof and completeness details as well as topology.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SummaryEdge {
     kind: IcfgEdgeKind,
     origin: Option<CallSiteHandle>,
     source: ProgramPointHandle,
     target: ProgramPointHandle,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
 }
 
 impl SummaryEdge {
-    pub(crate) fn from_parts(
-        kind: IcfgEdgeKind,
-        origin: Option<CallSiteHandle>,
-        source: ProgramPointHandle,
-        target: ProgramPointHandle,
-    ) -> Self {
-        Self {
-            kind,
-            origin,
-            source,
-            target,
-        }
-    }
-
     pub(crate) fn from_procedure_edge(edge: &ProcedureIcfgEdge) -> Self {
-        Self::from_parts(
-            edge.kind,
-            edge.origin.clone(),
-            edge.source.clone(),
-            edge.target.clone(),
-        )
+        Self {
+            kind: edge.kind,
+            origin: edge.origin.clone(),
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            proof: edge.proof.clone(),
+            completeness: edge.completeness.clone(),
+        }
     }
 
     pub const fn kind(&self) -> IcfgEdgeKind {
@@ -213,18 +207,31 @@ impl SummaryEdge {
     pub const fn target(&self) -> &ProgramPointHandle {
         &self.target
     }
+
+    pub const fn proof(&self) -> &ProofStatus {
+        &self.proof
+    }
+
+    pub const fn completeness(&self) -> &EvidenceCompleteness {
+        &self.completeness
+    }
 }
 
 /// Aggregate semantic-provider quality observed while materializing a summary
 /// solve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SummarySemanticStatus {
+    #[default]
     Complete,
     Ambiguous,
     Unknown,
-    Unsupported { capability: SemanticCapability },
+    Unsupported {
+        capability: SemanticCapability,
+    },
     Unproven,
-    ExceededBudget { exceeded: SemanticBudgetExceeded },
+    ExceededBudget {
+        exceeded: SemanticBudgetExceeded,
+    },
     Cancelled,
 }
 
@@ -305,12 +312,6 @@ impl SummarySemanticStatus {
     }
 }
 
-impl Default for SummarySemanticStatus {
-    fn default() -> Self {
-        Self::Complete
-    }
-}
-
 impl Hash for SummarySemanticStatus {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
@@ -357,6 +358,9 @@ pub struct SummaryBoundary {
     at: ProgramPointHandle,
     origin: Option<CallSiteHandle>,
     kind: SummaryBoundaryKind,
+    proof: Option<ProofStatus>,
+    completeness: Option<EvidenceCompleteness>,
+    provenance: Box<[OracleRelationHandle]>,
 }
 
 impl SummaryBoundary {
@@ -365,7 +369,29 @@ impl SummaryBoundary {
         origin: Option<CallSiteHandle>,
         kind: SummaryBoundaryKind,
     ) -> Self {
-        Self { at, origin, kind }
+        Self {
+            at,
+            origin,
+            kind,
+            proof: None,
+            completeness: None,
+            provenance: Box::new([]),
+        }
+    }
+
+    pub(crate) fn from_dispatch(
+        at: ProgramPointHandle,
+        origin: CallSiteHandle,
+        dispatch: &DispatchBoundary,
+    ) -> Self {
+        Self {
+            at,
+            origin: Some(origin),
+            kind: SummaryBoundaryKind::Dispatch(dispatch.kind.clone()),
+            proof: Some(dispatch.proof.clone()),
+            completeness: Some(dispatch.completeness.clone()),
+            provenance: dispatch.provenance.clone(),
+        }
     }
 
     pub(crate) fn from_procedure_boundary(boundary: ProcedureIcfgBoundary) -> Self {
@@ -382,6 +408,22 @@ impl SummaryBoundary {
 
     pub const fn kind(&self) -> &SummaryBoundaryKind {
         &self.kind
+    }
+
+    /// Exact boundary proof when the originating semantic relation supplied
+    /// one. Continuation and request-status boundaries have no edge proof.
+    pub const fn proof(&self) -> Option<&ProofStatus> {
+        self.proof.as_ref()
+    }
+
+    /// Exact boundary completeness when supplied by dispatch.
+    pub const fn completeness(&self) -> Option<&EvidenceCompleteness> {
+        self.completeness.as_ref()
+    }
+
+    /// Structured dispatch provenance retained by the semantic oracle.
+    pub fn provenance(&self) -> &[OracleRelationHandle] {
+        &self.provenance
     }
 }
 
@@ -469,7 +511,8 @@ pub struct SummaryMetrics {
     pub summary_hits: usize,
     /// Incoming qualities that had to wait for a later end summary.
     pub summary_misses: usize,
-    /// Unique incoming-quality/end-summary-quality matched-return applications.
+    /// Matched-return projections whose no-op/boundary handling or transfer
+    /// callback completed without cancellation or a work-budget failure.
     pub summary_applications: usize,
     /// Incoming relations that reused an existing callee entry context.
     pub reused_entry_contexts: usize,
@@ -627,6 +670,11 @@ fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Orderi
         .cmp(right.artifact().key())
         .then_with(|| left.semantics().locator().cmp(right.semantics().locator()))
         .then_with(|| left.id().cmp(&right.id()))
+        .then_with(|| {
+            std::sync::Arc::as_ptr(left.artifact())
+                .cast::<()>()
+                .cmp(&std::sync::Arc::as_ptr(right.artifact()).cast::<()>())
+        })
 }
 
 fn compare_points(left: &ProgramPointHandle, right: &ProgramPointHandle) -> Ordering {
@@ -673,12 +721,71 @@ fn compare_summary_edges(left: &SummaryEdge, right: &SummaryEdge) -> Ordering {
         .then_with(|| compare_points(left.target(), right.target()))
         .then_with(|| edge_kind_key(left.kind()).cmp(&edge_kind_key(right.kind())))
         .then_with(|| compare_optional_call_sites(left.origin(), right.origin()))
+        .then_with(|| compare_proof(left.proof(), right.proof()))
+        .then_with(|| compare_completeness(left.completeness(), right.completeness()))
+}
+
+fn compare_proof(left: &ProofStatus, right: &ProofStatus) -> Ordering {
+    match (left, right) {
+        (ProofStatus::Proven, ProofStatus::Proven) => Ordering::Equal,
+        (ProofStatus::Proven, ProofStatus::Unproven(_)) => Ordering::Less,
+        (ProofStatus::Unproven(_), ProofStatus::Proven) => Ordering::Greater,
+        (ProofStatus::Unproven(left), ProofStatus::Unproven(right)) => left.cmp(right),
+    }
+}
+
+fn compare_completeness(left: &EvidenceCompleteness, right: &EvidenceCompleteness) -> Ordering {
+    match (left, right) {
+        (EvidenceCompleteness::Complete, EvidenceCompleteness::Complete) => Ordering::Equal,
+        (EvidenceCompleteness::Complete, EvidenceCompleteness::Partial(_)) => Ordering::Less,
+        (EvidenceCompleteness::Partial(_), EvidenceCompleteness::Complete) => Ordering::Greater,
+        (EvidenceCompleteness::Partial(left), EvidenceCompleteness::Partial(right)) => {
+            left.cmp(right)
+        }
+    }
 }
 
 fn compare_summary_boundaries(left: &SummaryBoundary, right: &SummaryBoundary) -> Ordering {
     compare_points(left.at(), right.at())
         .then_with(|| compare_optional_call_sites(left.origin(), right.origin()))
         .then_with(|| compare_boundary_kinds(left.kind(), right.kind()))
+        .then_with(|| compare_optional_proof(left.proof(), right.proof()))
+        .then_with(|| compare_optional_completeness(left.completeness(), right.completeness()))
+        .then_with(|| compare_provenance(left.provenance(), right.provenance()))
+}
+
+fn compare_optional_proof(left: Option<&ProofStatus>, right: Option<&ProofStatus>) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => compare_proof(left, right),
+    }
+}
+
+fn compare_optional_completeness(
+    left: Option<&EvidenceCompleteness>,
+    right: Option<&EvidenceCompleteness>,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => compare_completeness(left, right),
+    }
+}
+
+fn compare_provenance(left: &[OracleRelationHandle], right: &[OracleRelationHandle]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .find_map(|(left, right)| {
+            let ordering = left
+                .arena_identity()
+                .cmp(&right.arena_identity())
+                .then_with(|| left.id().cmp(&right.id()));
+            (!ordering.is_eq()).then_some(ordering)
+        })
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
 fn edge_kind_key(kind: IcfgEdgeKind) -> (u8, u8) {

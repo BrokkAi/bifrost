@@ -336,6 +336,12 @@ impl OracleRelationHandle {
         &self.arena.records[self.id.index()]
     }
 
+    /// Query-local identity used only to total-order retained handles whose
+    /// durable owner/row coordinates are otherwise equal.
+    pub(crate) fn arena_identity(&self) -> *const () {
+        Arc::as_ptr(&self.arena).cast()
+    }
+
     pub(super) fn same_arena(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.arena, &other.arena)
     }
