@@ -18,7 +18,7 @@ The observable outcome is a retained benchmark report over generated projects, i
 - [x] (2026-07-24 07:41Z) Re-read `.agents/PLANS.md`, the live issue, the semantic roadmap, the completed CFG/ICFG and oracle lifecycle evidence, the structural snapshot implementation, and the first bounded #820 solver child.
 - [x] (2026-07-24 07:44Z) Published the artifact lifecycle matrix and checkpointed the plan in `b1aeef86`.
 - [x] (2026-07-24 07:49Z) Added the reusable artifact-promotion benchmark API, migrated the semantic CFG persistence gate without changing its report shape, and passed focused unit and integration tests.
-- [ ] Add the fresh-process data-flow lifecycle benchmark and runner.
+- [x] (2026-07-24 08:08Z) Added the fresh-process data-flow lifecycle benchmark and runner; seven non-ignored schema/behavior tests pass, and release smokes select and solve the exact pinned VS Code and Spring PetClinic procedures.
 - [ ] Run the retained matrix, record the evidence and decision, and complete focused and repository-wide validation.
 - [ ] Run specialist review, resolve findings, update the retrospective, and checkpoint the reviewed result.
 
@@ -35,6 +35,12 @@ The observable outcome is a retained benchmark report over generated projects, i
 
 - Observation: the issue branch was one commit behind `origin/master`, and the delta changed release metadata only.
   Evidence: fast-forward `7748331e..71b3d3f8` changed the VS Code and plugin release metadata files without touching analysis code.
+
+- Observation: peak RSS is process-cumulative, so measuring every dataset sequentially in one process would attach allocator history from earlier datasets to later rows.
+  Evidence: the initial benchmark draft used one process for all datasets. The corrected runner launches nine fresh processes per dataset and records one process peak on that dataset, not separate client peaks.
+
+- Observation: both pinned external roots resolve uniquely through structured declaration suffixes, and both bounded ICFGs remain traversable while visibly incomplete.
+  Evidence: the VS Code `Function(quickSelect)` release smoke produced 31 reachable nodes with an `unknown` outcome and two boundaries; Spring PetClinic `Type(OwnerController)::Method(processFindForm)` produced 41 reachable nodes with an `unsupported` outcome and two boundaries. Both clients reached fixed points without claiming complete coverage.
 
 ## Decision Log
 
@@ -58,8 +64,8 @@ The observable outcome is a retained benchmark report over generated projects, i
   Rationale: they contain concrete seeds, run-local dense fact IDs, budgets, truncations, and path-quality frontiers. Repeating the same solve measures their cost but does not create semantic reuse identity. #823 summaries are the separate reusable projection.
   Date/Author: 2026-07-24 / Codex
 
-- Decision: use fresh processes with two discarded warmups and seven retained samples.
-  Rationale: this matches the completed semantic CFG persistence protocol and keeps process startup, allocator state, and page-cache effects visible in the raw evidence.
+- Decision: use nine fresh processes per dataset with two discarded warmups and seven retained samples.
+  Rationale: this matches the completed semantic CFG persistence protocol, keeps process startup, allocator state, and page-cache effects visible in the raw evidence, and makes process-peak RSS attributable to one dataset.
   Date/Author: 2026-07-24 / Codex
 
 ## Outcomes & Retrospective
@@ -138,7 +144,7 @@ Each sample reports Bifrost commit and dirty-tree fingerprint, toolchain/machine
 
 The aggregate validates identical provenance and topology/work checksums within each dataset/client group, retains rounds two through eight, computes medians, and emits the recommendation `ephemeral_not_eligible; persist reusable summaries only after #823 defines and measures them`. It must not pass the samples through the persistence gate because no equivalent serialized candidate was built.
 
-Create `scripts/run-dataflow-lifecycle-benchmarks.sh`. It uses `set -euo pipefail`, validates optional external roots and exact clean commits, creates one `mktemp -d` work directory, removes it on exit, runs nine release processes, retains seven sample JSON rows, runs aggregation, and prints exactly one `BIFROST_DATAFLOW_LIFECYCLE_BENCHMARK=` record. It sets `BIFROST_SEMANTIC_INDEX=off` and does not create a manually named Cargo target directory.
+Create `scripts/run-dataflow-lifecycle-benchmarks.sh`. It uses `set -euo pipefail`, validates the external roots and exact clean commits, creates one `mktemp -d` work directory, removes it on exit, runs nine release processes per dataset, retains seven sample JSON rows per dataset, runs aggregation, and prints exactly one `BIFROST_DATAFLOW_LIFECYCLE_BENCHMARK=` record. It sets `BIFROST_SEMANTIC_INDEX=off` and does not create a manually named Cargo target directory.
 
 After collecting the retained matrix, write `.agents/docs/dataflow-lifecycle-benchmark-2026-07-24.md` with the exact command, Bifrost/toolchain/machine and dataset revisions, all retained samples or the aggregate’s raw-sample section, medians, counts, limits, memory observations, and recommendation. Update the lifecycle matrix and this plan with the measured evidence.
 
