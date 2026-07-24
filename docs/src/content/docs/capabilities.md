@@ -30,14 +30,9 @@ Named arguments refer to call-site syntax represented by the normalized `kwargs`
 
 ### Bounded Receiver Provenance
 
-| Query languages | `receiver_targets`, `points_to`, and `member_targets` |
-| --- | --- |
-| Java | Bounded values, allocation/factory provenance, current/static/type values, and exact member declarations with explicit outcomes. |
-| JavaScript and TypeScript | Bounded values, allocation/factory provenance, and exact member declarations with explicit outcomes. |
-| C++ and C# | Typed/current receivers, allocation and factory provenance where represented, and exact owner-scoped members; unresolved virtual, overload, template, extension, or other open dispatch remains explicit. |
-| Go and Rust | Named or current receivers, allocations and factory returns, and exact owner-scoped members; unresolved interface, trait, promotion, and autoderef uncertainty remains explicit. |
-| Python, PHP, Ruby, and Scala | Structured typed/current receivers, allocations and returns, and exact owner-scoped members where the adapter can prove them; dynamic dispatch and language-specific metaprogramming remain explicit. |
-| C | Unsupported because class/member receiver semantics do not apply; the query returns an explicit receiver-analysis boundary. |
+`receiver_targets`, `points_to`, and `member_targets` share one adapter-neutral result contract. When an input site exposes structured receiver facts, the steps return bounded values, allocation or factory provenance where represented, and exact owner-scoped members where the analyzer can prove them. Open dispatch, dynamic behavior, metaprogramming, unsupported syntax, and source forms without receiver semantics remain explicit through `ambiguous`, `unknown`, or `unsupported` outcomes.
+
+Receiver availability is not defined by a static language allowlist. The selected adapter, exact source shape, workspace evidence, budgets, and cancellation state determine the result. Treat each `receiver_analysis` row and its diagnostics as authoritative for that input.
 
 The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records direct-edge support and the PHP diagnostic boundary, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks the shared outcome and provenance contract.
 
@@ -67,4 +62,4 @@ Bifrost does not currently provide:
 - general interprocedural data-flow or taint tracking; or
 - compiler-complete external dependency indexing.
 
-`call_input` can project the expression written at a resolved call site, and a supported adapter's `points_to` step can analyze that exact expression under a bounded receiver budget. Neither operation is a general value-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.
+`call_input` can project the expression written at a resolved call site, and the selected adapter's `points_to` step can analyze that exact expression under a bounded receiver budget. Neither operation is a general value-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.
