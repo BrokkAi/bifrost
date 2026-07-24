@@ -784,6 +784,44 @@ fn cpp_using_namespace_target(node: Node<'_>, source: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Every `using namespace X;` directive target in a file, in source order, for
+/// resolution-time consumers that need the file's using-directives without the
+/// per-position scope threading extraction does. Parses `source` fresh and
+/// walks the tree structurally, reusing `cpp_using_namespace_target` (which
+/// keys on the grammar's `namespace` keyword token, not source text), so it
+/// never misreads a member-importing `using X::Y;` as a namespace directive.
+///
+/// This is a whole-file over-approximation of what is in scope at any one point
+/// (a directive nested inside a `namespace {}` block or a function body is still
+/// reported), which is exactly what the #1134 identity reconciler wants: extra
+/// candidate namespaces that no visible class confirms are harmless, and two
+/// that both confirm are treated as a genuine ambiguity by the reconciler.
+pub(crate) fn cpp_file_using_namespaces(source: &str) -> Vec<String> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut namespaces = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if let Some(namespace) = cpp_using_namespace_target(node, source)
+            && seen.insert(namespace.clone())
+        {
+            namespaces.push(namespace);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    namespaces
+}
+
 pub(super) struct CppVisitor<'a> {
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
