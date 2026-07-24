@@ -17,15 +17,15 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 11:26+02:00) Implemented the dense bidirectional `ProcedureSemantics` view, shared node/edge budgets and cancellation, complete iterative reachability/DFS/Kosaraju/loop/path algorithms, and seven synthetic tests including a 100,000-node chain.
 - [x] (2026-07-24 11:42+02:00) Replaced the ICFG builder’s bespoke return-path traversals with shared forward/reverse reachability while preserving precharge/cancellation/cache behavior; all 41 CFG, 25 ICFG, and 11 tabulation contracts plus the new artifact-isolation unit regression pass.
 - [x] (2026-07-24 13:06+02:00) Added and compiled the ignored release benchmark and pinned-corpus runner, covering six algorithm families over deep, branch-heavy, cyclic, irreducible, disconnected, exceptional, VS Code, and PetClinic datasets with versioned provenance-rich JSON output.
-- [x] (2026-07-24 14:04+02:00) Ran the retained release matrix from clean checkpoint `537262d7` over six synthetic shapes plus pinned VS Code/PetClinic, wrote schema-v1 JSON, and recorded the on-demand lifecycle and dominance no-go evidence.
+- [x] (2026-07-24 14:04+02:00) Ran the retained release matrix from clean checkpoint `e9c10115` over six synthetic shapes plus pinned VS Code/PetClinic, wrote schema-v1 JSON, and recorded the on-demand lifecycle and dominance no-go evidence.
 - [x] (2026-07-24 14:12+02:00) Added the evidence note and marked the broader typestate roadmap’s #819 checkpoint complete without adding persistence, dominance, or public surface.
 - [x] (2026-07-24 15:08+02:00) Completed five specialist reviews and fixed every material finding: linear checked back-edge partitioning, direct bounded adjacency consumption, shared budget-ledger reuse, SCC/loop DFS reuse, closed-region entry fidelity, cancellable path reconstruction, crate-private reverse iteration, atomic evidence output, and algorithm-only timing.
-- [x] (2026-07-24 16:02+02:00) Regenerated the retained release matrix from clean reviewed checkpoint `3582f291`, confirmed clean-tree provenance, and refreshed the evidence narrative for one-byte reachability membership and exact 1x/2x/3x DFS/SCC/loop work.
-- [x] (2026-07-24) Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
+- [x] (2026-07-24 16:02+02:00) Regenerated the pre-sync retained release matrix from clean reviewed checkpoint `0f0470fd`, confirmed clean-tree provenance, and refreshed the evidence narrative for one-byte reachability membership and exact 1x/2x/3x DFS/SCC/loop work.
+- [x] (2026-07-24) Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite. The post-sync rerun passed the 1,861-test library target (1,855 passed, six ignored) and every target reached before `code_query_pipelines`; its unrelated `reference_traversal_resolves_inbound_and_outbound_across_all_adapters` test reproducibly fails for Java on synchronized `origin/master`.
 - [x] (2026-07-24) Complete specialist review, resolve material findings, and record final outcomes.
 - [x] (2026-07-24) Rebased the eight issue commits onto current `origin/master`, reran the focused suite, and completed the five-perspective guided review against the synchronized merge base.
 - [x] (2026-07-24) Resolved all code and harness findings: cancellable linear SCC/loop emission, budgeted path reconstruction, one enforceable double-ended adjacency contract, shared synthetic graph support, declaration-scoped lint expectations, framed shared provenance/digests, redacted corpus locations, and bounded recomputation counts. The expanded focused suite, 41/25/11 contracts, formatting, and strict all-feature Clippy pass.
-- [ ] Regenerate the retained eight-dataset release matrix from the clean post-review checkpoint and refresh every provenance, timing, work, digest, and documentation claim.
+- [x] (2026-07-24) Regenerated the retained eight-dataset release matrix from clean post-review checkpoint `bc85c99c`, with framed clean-tree provenance, redacted local paths, updated reconstruction work, and refreshed timing and digest evidence.
 
 ## Surprises & Discoveries
 
@@ -38,8 +38,8 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - Observation: current production consumers do not repeatedly derive whole-snapshot RPO, SCCs, loops, or paths.
   Evidence: repository searches find only the return-affecting gap traversal as a repeated local graph derivation; the solver performs its own problem-state worklist and heap strong updates use explicit update certificates.
 
-- Observation: the existing CFG iterators were concretely double-ended but their opaque public return bounds did not advertise that fact.
-  Evidence: the generic view initially could not preserve reverse canonical stack insertion through the opaque iterator type. Adding the truthful `DoubleEndedIterator` bound required no representation or behavior change.
+- Observation: the existing CFG rows were concretely double-ended, but exposing that fact through the public iterator contract would have widened the API.
+  Evidence: one crate-private bidirectional row helper now backs both the unchanged public forward view and the crate-private graph adapter. The adapter requires one enforceable double-ended successor/predecessor pair instead of four methods that could diverge.
 
 - Observation: whole-corpus algorithm costs scale with the number of callable snapshots, making retained global results expensive even when each graph is small.
   Evidence: VS Code contains 133,316 materialized procedure CFGs. Cold SCC and loop-region totals were 8.67 s and 9.12 s, and retained SCC results were estimated at 165 MB; no current consumer requests those derivations.
@@ -61,6 +61,9 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 - Observation: rebasing a branch invalidates a retained benchmark commit even when the issue patches replay without conflicts.
   Evidence: the synchronized branch no longer contained recorded checkpoint `3582f291`, so exact reproducibility requires a fresh clean-tree measurement from a post-review commit that remains in the branch history.
+
+- Observation: the synchronized full-feature matrix has one reproducible failure outside the issue's CFG changes.
+  Evidence: `cargo test --features nlp,python` passed the 1,861-test library target (1,855 passed, six ignored), then `tests/code_query_pipelines.rs::reference_traversal_resolves_inbound_and_outbound_across_all_adapters` reported an empty inbound Java reference. The exact isolated rerun failed identically. This branch does not change that test or the structural reference pipeline relative to `origin/master`.
 
 - Observation: benchmark provenance and result fingerprints need structural framing, not plain concatenation before SHA-256.
   Evidence: different path/content or loop-field boundaries could produce identical byte streams without a cryptographic collision. Both ignored analyzer benchmarks now share length- and type-framed Git provenance, and CFG result fields are independently framed.
@@ -97,11 +100,11 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are complete in checkpoints `cd0998ce`, `9283fd4a`, and `537262d7`. The algorithm layer is crate-private, iterative, deterministic, and complete-only under cancellation or node/edge exhaustion. ICFG return-gap scoping is its first production consumer and retains only the existing artifact-instance-scoped builder memo.
+Milestones 1 through 3 are complete in rebased checkpoints `9d5a93a2`, `0dc00f0e`, and `e9c10115`. The algorithm layer is crate-private, iterative, deterministic, and complete-only under cancellation or node/edge exhaustion. ICFG return-gap scoping is its first production consumer and retains only the existing artifact-instance-scoped builder memo.
 
-The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. The final matrix is from clean reviewed checkpoint `3582f291`, times only algorithm execution, retains one byte per reachability point, and confirms exact 1x/2x/3x DFS/SCC/loop work. It continues to support on-demand RPO/SCC/loop/path results, no persistence, and no dominance implementation.
+The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. The final matrix is from clean post-guided-review checkpoint `bc85c99c`, times only algorithm execution, retains one byte per reachability point, charges shortest-path reconstruction, and confirms exact 1x/2x/3x DFS/SCC/loop graph visits. It continues to support on-demand RPO/SCC/loop/path results, no persistence, and no dominance implementation.
 
-Final validation is complete. The focused algorithm suite passed 9 tests with the benchmark ignored, the semantic CFG, ICFG, and dataflow contracts passed 41, 25, and 11 tests, respectively, and the reviewed release benchmark passed across all eight datasets. Formatting, diff checks, and strict all-feature Clippy are clean. The unrestricted `nlp,python` run passed 1,875 library tests with six ignored tests plus every binary and integration target, and the coherent rustup documentation phase also passed.
+Issue-local validation is complete. The expanded focused algorithm suite passed 12 tests with the benchmark ignored, the shared provenance framing test passed, the semantic CFG, ICFG, and dataflow contracts passed 41, 25, and 11 tests, respectively, and the reviewed release benchmark passed across all eight datasets. Formatting, diff checks, and strict all-feature Clippy are clean. After synchronization, the unrestricted `nlp,python` rerun passed the 1,861-test library target (1,855 passed, six ignored) and all targets reached before the reproducible, non-CFG Java reference failure in `code_query_pipelines`; the exact failing test also fails alone. The earlier pre-sync full matrix and coherent rustup documentation phase passed, but they are retained only as historical evidence rather than presented as the current gate.
 
 ## Context and Orientation
 
@@ -204,15 +207,12 @@ The module remains crate-private. Its conceptual interfaces are:
         fn node_count(&self) -> usize;
         fn node_at(&self, index: usize) -> Option<Self::Node>;
         fn node_index(&self, node: Self::Node) -> Option<usize>;
-        fn edge_index(&self, edge: Self::Edge) -> Option<usize>;
         fn successors(&self, node: Self::Node)
-            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
-        fn successors_reversed(&self, node: Self::Node)
-            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+            -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)>
+                 + ExactSizeIterator + '_;
         fn predecessors(&self, node: Self::Node)
-            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
-        fn predecessors_reversed(&self, node: Self::Node)
-            -> impl ExactSizeIterator<Item = (Self::Edge, Self::Node)> + '_;
+            -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)>
+                 + ExactSizeIterator + '_;
         fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)>;
     }
 
@@ -237,6 +237,10 @@ Revision note (2026-07-24): Recorded specialist review and the resulting bounded
 
 Revision note (2026-07-24): Replaced the stale pre-review evidence with the final clean reviewed release matrix and refreshed all affected timing, work, retention, and provenance claims.
 
-Revision note (2026-07-24): Closed the validation and review checkpoints after the focused suites, reviewed benchmark matrix, formatting, strict Clippy, full feature matrix, and separate coherent documentation phase all passed.
+Revision note (2026-07-24): Closed the original validation and review checkpoints after the focused suites, reviewed benchmark matrix, formatting, strict Clippy, full feature matrix, and separate coherent documentation phase all passed.
 
 Revision note (2026-07-24): Recorded the synchronized guided review and its complete code/harness fix batch. Retained evidence regeneration remains pending from the clean post-review checkpoint.
+
+Revision note (2026-07-24): Replaced the orphaned pre-sync artifact with the clean `bc85c99c` matrix and refreshed provenance, path-reconstruction work, timings, digests, and the evidence interpretation.
+
+Revision note (2026-07-24): Recorded the synchronized full-feature rerun accurately: issue-local and library gates pass, while one unrelated Java reference-pipeline integration test on `origin/master` fails reproducibly.
