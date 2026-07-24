@@ -6,12 +6,13 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
 use brokk_bifrost::WorkspaceAnalyzer;
+use brokk_bifrost::analyzer::dataflow::{IcfgInputStatus, IcfgSolveInput};
 use brokk_bifrost::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, CancellationToken, ControlContinuation, ControlEdgeKind,
     DeferredInvocationKind, DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind,
@@ -232,6 +233,18 @@ pub enum IcfgOutcomeKind {
     Unproven,
     ExceededBudget,
     Cancelled,
+}
+
+const fn icfg_outcome_kind(status: IcfgInputStatus) -> IcfgOutcomeKind {
+    match status {
+        IcfgInputStatus::Complete => IcfgOutcomeKind::Complete,
+        IcfgInputStatus::Ambiguous => IcfgOutcomeKind::Ambiguous,
+        IcfgInputStatus::Unknown => IcfgOutcomeKind::Unknown,
+        IcfgInputStatus::Unsupported { .. } => IcfgOutcomeKind::Unsupported,
+        IcfgInputStatus::Unproven => IcfgOutcomeKind::Unproven,
+        IcfgInputStatus::ExceededBudget { .. } => IcfgOutcomeKind::ExceededBudget,
+        IcfgInputStatus::Cancelled => IcfgOutcomeKind::Cancelled,
+    }
 }
 
 /// Typed boundary expectations that deliberately omit unstable target detail
@@ -1111,19 +1124,58 @@ impl SemanticGraph {
     }
 }
 
+/// Compute ordinary reachability over the materialized ICFG topology.
+pub fn reachable_icfg_nodes(
+    snapshot: &IcfgSnapshot,
+    seeds: impl IntoIterator<Item = IcfgNodeId>,
+) -> BTreeSet<IcfgNodeId> {
+    let mut reached = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for seed in seeds {
+        if reached.insert(seed) {
+            queue.push_back(seed);
+        }
+    }
+    while let Some(source) = queue.pop_front() {
+        for (_, edge) in snapshot.successor_edges(source) {
+            if reached.insert(edge.target) {
+                queue.push_back(edge.target);
+            }
+        }
+    }
+    reached
+}
+
 /// A bounded ICFG snapshot plus source-backed point and call-site aliases.
 ///
 /// Dense snapshot IDs remain an implementation detail. Nodes are selected by
 /// file, ordinary [`PointSelector`], and an exact call-context alias sequence.
 pub struct IcfgGraph {
-    snapshot: IcfgSnapshot,
-    outcome: IcfgOutcomeKind,
+    outcome: SemanticOutcome<IcfgSnapshot>,
     files: HashMap<Box<str>, FixtureSemanticFile>,
     aliases: HashMap<Box<str>, IcfgNodeId>,
     call_aliases: HashMap<Box<str>, CallSiteHandle>,
 }
 
 impl IcfgGraph {
+    /// Return the immutable snapshot retained by this source-backed fixture.
+    pub fn snapshot(&self) -> &IcfgSnapshot {
+        self.outcome
+            .available_value()
+            .expect("ICFG fixture retains a traversable snapshot")
+    }
+
+    /// Pair this fixture with the exact provider status retained with its snapshot.
+    pub fn solve_input(&self) -> IcfgSolveInput<'_> {
+        IcfgSolveInput::from_outcome(&self.outcome)
+            .expect("ICFG fixture retains a traversable snapshot")
+    }
+
+    /// Resolve a previously bound readable alias to its snapshot-local node.
+    pub fn node(&self, alias: &str) -> IcfgNodeId {
+        self.bound_node(alias)
+    }
+
     pub fn materialize(
         project: &BuiltInlineTestProject,
         analyzer: &WorkspaceAnalyzer,
@@ -1184,7 +1236,9 @@ impl IcfgGraph {
             .icfg_provider()
             .snapshot(&root, limits, request)
             .map_err(|error| SemanticGraphError::new(error.to_string()))?;
-        let (snapshot, outcome) = take_icfg_snapshot(outcome)?;
+        let snapshot = IcfgSolveInput::from_outcome(&outcome)
+            .map_err(|error| SemanticGraphError::new(error.to_string()))?
+            .snapshot();
 
         let mut files = HashMap::new();
         insert_fixture_semantic_file(
@@ -1212,7 +1266,6 @@ impl IcfgGraph {
         }
 
         Ok(Self {
-            snapshot,
             outcome,
             files,
             aliases: HashMap::new(),
@@ -1220,13 +1273,13 @@ impl IcfgGraph {
         })
     }
 
-    pub const fn outcome(&self) -> IcfgOutcomeKind {
-        self.outcome
+    pub fn outcome(&self) -> IcfgOutcomeKind {
+        icfg_outcome_kind(self.solve_input().status())
     }
 
     pub fn assert_outcome(&self, expected: IcfgOutcomeKind) {
         assert_eq!(
-            self.outcome,
+            self.outcome(),
             expected,
             "unexpected ICFG outcome\n\n{}",
             self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
@@ -1330,11 +1383,11 @@ impl IcfgGraph {
             .collect::<Result<Vec<_>, _>>()?;
         let (file, bound) = self.resolve_file_point(relative_path.as_ref(), &selector.into())?;
         let candidates = self
-            .snapshot
+            .snapshot()
             .node_ids()
             .filter(|id| {
                 let key = self
-                    .snapshot
+                    .snapshot()
                     .node(*id)
                     .expect("published ICFG node must exist");
                 Arc::ptr_eq(key.point().procedure().artifact(), &file.artifact)
@@ -1387,10 +1440,10 @@ impl IcfgGraph {
     }
 
     pub fn assert_adjacency_symmetric(&self) {
-        for node in self.snapshot.node_ids() {
-            for (edge_id, edge) in self.snapshot.successor_edges(node) {
+        for node in self.snapshot().node_ids() {
+            for (edge_id, edge) in self.snapshot().successor_edges(node) {
                 if !self
-                    .snapshot
+                    .snapshot()
                     .predecessor_edges(edge.target)
                     .any(|(candidate_id, candidate)| candidate_id == edge_id && candidate == edge)
                 {
@@ -1403,9 +1456,9 @@ impl IcfgGraph {
                     );
                 }
             }
-            for (edge_id, edge) in self.snapshot.predecessor_edges(node) {
+            for (edge_id, edge) in self.snapshot().predecessor_edges(node) {
                 if !self
-                    .snapshot
+                    .snapshot()
                     .successor_edges(edge.source)
                     .any(|(candidate_id, candidate)| candidate_id == edge_id && candidate == edge)
                 {
@@ -1432,7 +1485,7 @@ impl IcfgGraph {
     pub fn assert_boundary(&self, alias: &str, expected: ExpectedIcfgBoundary<'_>) {
         let node = self.bound_node(alias);
         let origin = expected.originating_call.map(|call| self.bound_call(call));
-        if !self.snapshot.boundaries().iter().any(|boundary| {
+        if !self.snapshot().boundaries().iter().any(|boundary| {
             boundary.at == node
                 && boundary.origin.as_ref() == origin
                 && boundary_kind_matches(&boundary.kind, expected.kind)
@@ -1449,7 +1502,7 @@ impl IcfgGraph {
     pub fn assert_no_boundaries(&self, alias: &str) {
         let node = self.bound_node(alias);
         if self
-            .snapshot
+            .snapshot()
             .boundaries()
             .iter()
             .any(|boundary| boundary.at == node)
@@ -1468,7 +1521,7 @@ impl IcfgGraph {
 
     pub fn render_topology_with_limits(&self, limits: IcfgTopologyRenderLimits) -> String {
         let mut writer = BoundedTopologyWriter::new(limits.max_output_bytes);
-        let mut nodes = self.snapshot.node_ids().collect::<Vec<_>>();
+        let mut nodes = self.snapshot().node_ids().collect::<Vec<_>>();
         nodes.sort_unstable_by_key(|node| self.node_descriptor(*node));
         let mut rendered_edges = 0usize;
         let mut rendered_boundaries = 0usize;
@@ -1491,7 +1544,7 @@ impl IcfgGraph {
                 break;
             }
 
-            let mut edges = self.snapshot.successor_edges(node).collect::<Vec<_>>();
+            let mut edges = self.snapshot().successor_edges(node).collect::<Vec<_>>();
             edges.sort_unstable_by_key(|(_, edge)| {
                 (
                     edge.kind.label(),
@@ -1527,7 +1580,7 @@ impl IcfgGraph {
             }
 
             let mut boundaries = self
-                .snapshot
+                .snapshot()
                 .boundaries()
                 .iter()
                 .filter(|boundary| boundary.at == node)
@@ -1616,7 +1669,7 @@ impl IcfgGraph {
             .collect::<Vec<_>>();
         let mut actual = match direction {
             EdgeDirection::Successors => self
-                .snapshot
+                .snapshot()
                 .successor_edges(node)
                 .map(|(_, edge)| ComparableIcfgEdge {
                     endpoint: edge.target,
@@ -1625,7 +1678,7 @@ impl IcfgGraph {
                 })
                 .collect::<Vec<_>>(),
             EdgeDirection::Predecessors => self
-                .snapshot
+                .snapshot()
                 .predecessor_edges(node)
                 .map(|(_, edge)| ComparableIcfgEdge {
                     endpoint: edge.source,
@@ -1670,7 +1723,7 @@ impl IcfgGraph {
             .originating_call
             .map(|call| self.bound_call(call).clone());
         let matching = self
-            .snapshot
+            .snapshot()
             .successor_edges(source)
             .filter(|(_, edge)| {
                 edge.target == target && edge.kind == expected.kind && edge.origin == origin
@@ -1710,16 +1763,7 @@ impl IcfgGraph {
     fn assert_reachability(&self, from: &str, to: &str, expected: bool) {
         let from = self.bound_node(from);
         let to = self.bound_node(to);
-        let mut queue = VecDeque::from([from]);
-        let mut visited = HashSet::from([from]);
-        while let Some(node) = queue.pop_front() {
-            for (_, edge) in self.snapshot.successor_edges(node) {
-                if visited.insert(edge.target) {
-                    queue.push_back(edge.target);
-                }
-            }
-        }
-        let actual = visited.contains(&to);
+        let actual = reachable_icfg_nodes(self.snapshot(), [from]).contains(&to);
         if actual != expected {
             let relation = if expected { "reachable" } else { "unreachable" };
             panic!(
@@ -1769,7 +1813,7 @@ impl IcfgGraph {
 
     fn node_descriptor(&self, node: IcfgNodeId) -> String {
         let key = self
-            .snapshot
+            .snapshot()
             .node(node)
             .expect("published ICFG node must remain available");
         let point = key.point();
@@ -1907,35 +1951,6 @@ pub fn resolve_procedure_handle(
         .artifact
         .procedure_handle(candidates[0].bound.procedure)
         .expect("resolved root procedure remains in its artifact")
-}
-
-fn take_icfg_snapshot(
-    outcome: SemanticOutcome<IcfgSnapshot>,
-) -> Result<(IcfgSnapshot, IcfgOutcomeKind), SemanticGraphError> {
-    let missing = |kind: IcfgOutcomeKind| {
-        SemanticGraphError::new(format!(
-            "ICFG provider returned {kind:?} without an available bounded snapshot"
-        ))
-    };
-    match outcome {
-        SemanticOutcome::Complete { value, .. } => Ok((value, IcfgOutcomeKind::Complete)),
-        SemanticOutcome::Ambiguous { candidates, .. } => {
-            Ok((candidates, IcfgOutcomeKind::Ambiguous))
-        }
-        SemanticOutcome::Unknown { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::Unknown))
-            .ok_or_else(|| missing(IcfgOutcomeKind::Unknown)),
-        SemanticOutcome::Unsupported { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::Unsupported))
-            .ok_or_else(|| missing(IcfgOutcomeKind::Unsupported)),
-        SemanticOutcome::Unproven { partial, .. } => Ok((partial, IcfgOutcomeKind::Unproven)),
-        SemanticOutcome::ExceededBudget { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::ExceededBudget))
-            .ok_or_else(|| missing(IcfgOutcomeKind::ExceededBudget)),
-        SemanticOutcome::Cancelled { partial, .. } => partial
-            .map(|snapshot| (snapshot, IcfgOutcomeKind::Cancelled))
-            .ok_or_else(|| missing(IcfgOutcomeKind::Cancelled)),
-    }
 }
 
 fn insert_fixture_semantic_file(

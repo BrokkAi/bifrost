@@ -578,6 +578,15 @@ impl SnapshotBuilder {
     fn freeze(mut self) -> Result<IcfgSnapshot, SemanticProviderError> {
         self.edges.sort_by_key(icfg_edge_sort_key);
         let node_count = self.nodes.len();
+        let mut incoming_counts = vec![0_u32; node_count];
+        for edge in &self.edges {
+            validate_frozen_edge(edge, node_count)?;
+            let count = &mut incoming_counts[edge.target.index()];
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming row overflow"))?;
+        }
+
         let mut outgoing_offsets = Vec::with_capacity(node_count.saturating_add(1));
         outgoing_offsets.push(0_u32);
         let mut cursor = 0usize;
@@ -589,23 +598,12 @@ impl SnapshotBuilder {
                 SemanticProviderError::internal("ICFG outgoing offsets exceed u32")
             })?);
         }
-        if cursor != self.edges.len() {
-            return Err(SemanticProviderError::internal(
-                "ICFG edge has an out-of-range source",
-            ));
-        }
+        debug_assert_eq!(
+            cursor,
+            self.edges.len(),
+            "frozen edge sources were validated"
+        );
 
-        let mut incoming_counts = vec![0_u32; node_count];
-        for edge in &self.edges {
-            let Some(count) = incoming_counts.get_mut(edge.target.index()) else {
-                return Err(SemanticProviderError::internal(
-                    "ICFG edge has an out-of-range target",
-                ));
-            };
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming row overflow"))?;
-        }
         let mut incoming_offsets = Vec::with_capacity(node_count.saturating_add(1));
         incoming_offsets.push(0_u32);
         for count in incoming_counts {
@@ -639,6 +637,25 @@ impl SnapshotBuilder {
             boundaries: self.boundaries.into_boxed_slice(),
         })
     }
+}
+
+fn validate_frozen_edge(edge: &IcfgEdge, node_count: usize) -> Result<(), SemanticProviderError> {
+    if edge.source.index() >= node_count {
+        return Err(SemanticProviderError::internal(
+            "ICFG edge has an out-of-range source",
+        ));
+    }
+    if edge.target.index() >= node_count {
+        return Err(SemanticProviderError::internal(
+            "ICFG edge has an out-of-range target",
+        ));
+    }
+    if !matches!(edge.kind, IcfgEdgeKind::Intraprocedural(_)) && edge.origin.is_none() {
+        return Err(SemanticProviderError::internal(
+            "interprocedural ICFG edge has no originating call site",
+        ));
+    }
+    Ok(())
 }
 
 fn node_work(key: &TraversalKey) -> SemanticWork {
@@ -1844,6 +1861,49 @@ mod tests {
     use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
+
+    fn test_edge(source: u32, target: u32, kind: IcfgEdgeKind) -> IcfgEdge {
+        IcfgEdge {
+            source: IcfgNodeId::new(source),
+            target: IcfgNodeId::new(target),
+            kind,
+            origin: None,
+            proof: ProofStatus::Proven,
+            completeness: EvidenceCompleteness::Complete,
+        }
+    }
+
+    #[test]
+    fn frozen_edge_validation_owns_snapshot_invariants() {
+        let local = test_edge(0, 1, IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal));
+        assert!(validate_frozen_edge(&local, 2).is_ok());
+
+        let invalid_source =
+            test_edge(2, 1, IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal));
+        assert!(
+            validate_frozen_edge(&invalid_source, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-range source")
+        );
+
+        let invalid_target =
+            test_edge(0, 2, IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal));
+        assert!(
+            validate_frozen_edge(&invalid_target, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-range target")
+        );
+
+        let missing_origin = test_edge(0, 1, IcfgEdgeKind::Call);
+        assert!(
+            validate_frozen_edge(&missing_origin, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("no originating call site")
+        );
+    }
 
     #[test]
     fn unsupported_snapshot_quality_uses_stable_capability_order() {

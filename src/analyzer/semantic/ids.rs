@@ -5,61 +5,21 @@ use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::analyzer::dense_id::define_dense_id;
+
 pub use crate::analyzer::LanguageDialect as SemanticLanguage;
-
-/// A failed conversion from a collection index to a fixed-width dense ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DenseIdOverflow {
-    id_type: &'static str,
-    index: usize,
-}
-
-impl DenseIdOverflow {
-    pub const fn id_type(self) -> &'static str {
-        self.id_type
-    }
-
-    pub const fn index(self) -> usize {
-        self.index
-    }
-}
-
-impl fmt::Display for DenseIdOverflow {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} index {} does not fit in a u32",
-            self.id_type, self.index
-        )
-    }
-}
-
-impl std::error::Error for DenseIdOverflow {}
+pub use crate::analyzer::dense_id::DenseIdOverflow;
 
 macro_rules! dense_ids {
     ($($name:ident),+ $(,)?) => {
         $(
-            #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-            pub struct $name(u32);
-
-            impl $name {
-                pub const fn new(raw: u32) -> Self {
-                    Self(raw)
-                }
-
-                pub const fn get(self) -> u32 {
-                    self.0
-                }
-
-                pub const fn index(self) -> usize {
-                    self.0 as usize
-                }
-
-                pub fn try_from_index(index: usize) -> Result<Self, DenseIdOverflow> {
-                    u32::try_from(index).map(Self).map_err(|_| DenseIdOverflow {
-                        id_type: stringify!($name),
-                        index,
-                    })
+            define_dense_id! {
+                #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+                pub struct $name {
+                    new: pub,
+                    get: pub,
+                    index: pub,
+                    try_from_index: pub,
                 }
             }
 
@@ -83,11 +43,6 @@ macro_rules! dense_ids {
                 }
             }
 
-            impl fmt::Display for $name {
-                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    self.0.fmt(formatter)
-                }
-            }
         )+
     };
 }
@@ -944,13 +899,12 @@ mod tests {
         );
 
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(
-            ProcedureId::try_from_index(u32::MAX as usize + 1),
-            Err(DenseIdOverflow {
-                id_type: "ProcedureId",
-                index: u32::MAX as usize + 1,
-            })
-        );
+        {
+            let overflow = u32::MAX as usize + 1;
+            let error = ProcedureId::try_from_index(overflow).unwrap_err();
+            assert_eq!(error.id_type(), "ProcedureId");
+            assert_eq!(error.index(), overflow);
+        }
     }
 
     #[test]
