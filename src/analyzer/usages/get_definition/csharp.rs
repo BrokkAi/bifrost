@@ -539,7 +539,7 @@ fn resolve_csharp_in_session(
             let member_name_node = csharp_member_name(name)
                 .map(|name| name.identifier)
                 .unwrap_or(name);
-            let owners = csharp_receiver_type_units(
+            let receiver_types = csharp_receiver_types(
                 analyzer,
                 csharp,
                 definitions,
@@ -548,7 +548,8 @@ fn resolve_csharp_in_session(
                 tree.root_node(),
                 receiver,
             );
-            let mut receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
+            let owners = receiver_types.units;
+            let mut receiver_type_names = receiver_types.fq_names;
             if receiver_type_names.is_empty() {
                 receiver_type_names = csharp_structured_receiver_type_names(
                     csharp,
@@ -885,7 +886,7 @@ fn csharp_type_lookup_node_resolution(
             });
         }
         let candidates =
-            csharp_receiver_type_units(analyzer, csharp, definitions, file, source, root, node);
+            csharp_receiver_types(analyzer, csharp, definitions, file, source, root, node).units;
         return csharp_type_candidates_resolution(csharp_node_text(node, source), candidates);
     }
 
@@ -1005,7 +1006,7 @@ fn csharp_receiver_type_lookup_units(
         );
     }
     (
-        csharp_receiver_type_units(
+        csharp_receiver_types(
             csharp as &dyn IAnalyzer,
             csharp,
             definitions,
@@ -1013,7 +1014,8 @@ fn csharp_receiver_type_lookup_units(
             source,
             root,
             receiver,
-        ),
+        )
+        .units,
         if matches!(
             receiver.kind(),
             "qualified_name" | "alias_qualified_name" | "generic_name" | "predefined_type"
@@ -2214,6 +2216,36 @@ struct CSharpReceiverProgram<'tree> {
     transitions: Vec<CSharpReceiverTransition<'tree>>,
 }
 
+/// Receiver evidence for forward member resolution. `units` are the indexed
+/// declarations that ordinary member lookup can traverse; `fq_names` also keeps
+/// precise declared types that are not indexed in the workspace, such as
+/// `System.String`, for extension-method applicability.
+#[derive(Default)]
+struct CSharpReceiverTypes {
+    units: Vec<CodeUnit>,
+    fq_names: Vec<String>,
+}
+
+impl CSharpReceiverTypes {
+    fn from_units(units: Vec<CodeUnit>) -> Self {
+        let fq_names = units.iter().map(CodeUnit::fq_name).collect();
+        Self { units, fq_names }.normalized()
+    }
+
+    fn push_fq_name(&mut self, definitions: &CSharpDefinitionProvider<'_>, fqn: String) {
+        self.units.extend(definitions.fqn(&fqn));
+        self.fq_names.push(fqn);
+    }
+
+    fn normalized(mut self) -> Self {
+        sort_units(&mut self.units);
+        self.units.dedup();
+        self.fq_names.sort();
+        self.fq_names.dedup();
+        self
+    }
+}
+
 fn csharp_receiver_program<'tree>(
     definitions: &CSharpDefinitionProvider<'_>,
     mut expression: Node<'tree>,
@@ -2282,7 +2314,7 @@ fn csharp_receiver_program<'tree>(
     Some(CSharpReceiverProgram { base, transitions })
 }
 
-fn csharp_receiver_type_units(
+fn csharp_receiver_types(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
@@ -2290,46 +2322,46 @@ fn csharp_receiver_type_units(
     source: &str,
     root: Node<'_>,
     receiver: Node<'_>,
-) -> Vec<CodeUnit> {
+) -> CSharpReceiverTypes {
     let Some(program) = csharp_receiver_program(definitions, receiver) else {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     };
     if !definitions.observe_cancellation() {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     }
 
-    let mut owners = match program.base {
+    let mut receiver_types = match program.base {
         CSharpReceiverBase::Expression(base) => {
-            csharp_receiver_base_type_units(analyzer, csharp, definitions, file, source, root, base)
+            csharp_receiver_base_types(analyzer, csharp, definitions, file, source, root, base)
         }
-        CSharpReceiverBase::EnclosingType { byte } => {
+        CSharpReceiverBase::EnclosingType { byte } => CSharpReceiverTypes::from_units(
             csharp_enclosing_class(analyzer, definitions, file, byte)
                 .into_iter()
-                .collect()
-        }
+                .collect(),
+        ),
     };
     if !definitions.observe_cancellation() {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     }
 
     let mut first_transition = 0usize;
-    if owners.is_empty()
+    if receiver_types.units.is_empty()
         && let CSharpReceiverBase::Expression(base) = program.base
         && !csharp_receiver_base_is_shadowed(csharp, definitions, file, source, root, base)
     {
         if !definitions.scope_step() {
-            return Vec::new();
+            return CSharpReceiverTypes::default();
         }
         let expression_type = csharp_reference_type_text(receiver, source);
         let direct_types =
             csharp_logical_visible_type_candidates(csharp, definitions, file, &expression_type);
         if !direct_types.is_empty() {
-            return direct_types;
+            return CSharpReceiverTypes::from_units(direct_types);
         }
 
         for (index, transition) in program.transitions.iter().enumerate() {
             if !definitions.scope_step() {
-                return Vec::new();
+                return CSharpReceiverTypes::default();
             }
             let CSharpReceiverTransition::Member { expression, .. } = transition else {
                 continue;
@@ -2338,7 +2370,7 @@ fn csharp_receiver_type_units(
             let candidates =
                 csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
             if !candidates.is_empty() {
-                owners = candidates;
+                receiver_types = CSharpReceiverTypes::from_units(candidates);
                 first_transition = index + 1;
                 break;
             }
@@ -2346,25 +2378,25 @@ fn csharp_receiver_type_units(
     }
 
     for transition in &program.transitions[first_transition..] {
-        if owners.is_empty() || !definitions.scope_step() {
-            return Vec::new();
+        if receiver_types.fq_names.is_empty() || !definitions.scope_step() {
+            return CSharpReceiverTypes::default();
         }
-        owners = match *transition {
+        receiver_types = match *transition {
             CSharpReceiverTransition::Member { name, .. } => {
                 let Some(name) = csharp_member_name(name) else {
-                    return Vec::new();
+                    return CSharpReceiverTypes::default();
                 };
-                csharp_nearest_member_type_units(
+                csharp_nearest_member_types(
                     analyzer,
                     csharp,
                     definitions,
                     file,
-                    owners,
+                    receiver_types.units,
                     csharp_node_text(name.identifier, source),
                 )
             }
             CSharpReceiverTransition::Invocation { invocation, name } => {
-                csharp_invocation_return_type_units_for_owners(
+                csharp_invocation_return_types(
                     analyzer,
                     csharp,
                     definitions,
@@ -2372,19 +2404,19 @@ fn csharp_receiver_type_units(
                     source,
                     invocation,
                     name,
-                    owners,
+                    receiver_types,
                 )
             }
         };
         if !definitions.observe_cancellation() {
-            return Vec::new();
+            return CSharpReceiverTypes::default();
         }
     }
-    owners
+    receiver_types.normalized()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn csharp_receiver_base_type_units(
+fn csharp_receiver_base_types(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
@@ -2392,9 +2424,9 @@ fn csharp_receiver_base_type_units(
     source: &str,
     root: Node<'_>,
     receiver: Node<'_>,
-) -> Vec<CodeUnit> {
+) -> CSharpReceiverTypes {
     if !definitions.scope_step() {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     }
     match receiver.kind() {
         "identifier" => {
@@ -2408,7 +2440,7 @@ fn csharp_receiver_base_type_units(
                 receiver.start_byte(),
             );
             if let Some(targets) = bindings.resolve_symbol(name).as_precise() {
-                return targets.iter().cloned().collect();
+                return CSharpReceiverTypes::from_units(targets.iter().cloned().collect());
             }
             if bindings.is_shadowed(name) {
                 let legacy = csharp_legacy_bindings_before_scoped(
@@ -2419,11 +2451,13 @@ fn csharp_receiver_base_type_units(
                     root,
                     receiver.start_byte(),
                 );
-                first_precise(&legacy, name)
-                    .map(|fqn| definitions.fqn(&fqn))
-                    .unwrap_or_default()
+                let mut receiver_types = CSharpReceiverTypes::default();
+                if let Some(fqn) = first_precise(&legacy, name) {
+                    receiver_types.push_fq_name(definitions, fqn);
+                }
+                receiver_types
             } else {
-                let mut candidates = csharp_enclosing_member_type_units(
+                let mut receiver_types = csharp_enclosing_member_types(
                     analyzer,
                     csharp,
                     definitions,
@@ -2431,34 +2465,41 @@ fn csharp_receiver_base_type_units(
                     receiver,
                     name,
                 );
-                if candidates.is_empty() {
-                    candidates =
-                        csharp_logical_visible_type_candidates(csharp, definitions, file, name);
+                if receiver_types.units.is_empty() && receiver_types.fq_names.is_empty() {
+                    receiver_types = CSharpReceiverTypes::from_units(
+                        csharp_logical_visible_type_candidates(csharp, definitions, file, name),
+                    );
                 }
-                candidates
+                receiver_types
             }
         }
-        "this" => csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
-            .into_iter()
-            .collect(),
-        "base" => csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
-            .and_then(|owner| csharp_usage_direct_base(analyzer, csharp, &owner))
-            .into_iter()
-            .collect(),
+        "this" => CSharpReceiverTypes::from_units(
+            csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
+                .into_iter()
+                .collect(),
+        ),
+        "base" => CSharpReceiverTypes::from_units(
+            csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
+                .and_then(|owner| csharp_usage_direct_base(analyzer, csharp, &owner))
+                .into_iter()
+                .collect(),
+        ),
         "qualified_name" | "alias_qualified_name" | "generic_name" => {
-            csharp_logical_visible_type_candidates(
+            CSharpReceiverTypes::from_units(csharp_logical_visible_type_candidates(
                 csharp,
                 definitions,
                 file,
                 &csharp_reference_type_text(receiver, source),
-            )
+            ))
         }
         "predefined_type" => {
             let reference = csharp_reference_type_text(receiver, source);
             let Some(fqn) = canonical_csharp_predefined_type(&reference) else {
-                return Vec::new();
+                return CSharpReceiverTypes::default();
             };
-            definitions.fqn(fqn)
+            let mut receiver_types = CSharpReceiverTypes::default();
+            receiver_types.push_fq_name(definitions, fqn.to_string());
+            receiver_types
         }
         // These are flattened into explicit transitions by
         // `csharp_receiver_program`; seeing one here means an unsupported shape
@@ -2467,34 +2508,38 @@ fn csharp_receiver_base_type_units(
         | "conditional_access_expression"
         | "invocation_expression"
         | "parenthesized_expression"
-        | "checked_expression" => Vec::new(),
-        "object_creation_expression" => receiver
-            .child_by_field_name("type")
-            .map(|type_node| {
-                csharp_logical_visible_type_candidates(
-                    csharp,
-                    definitions,
-                    file,
-                    &csharp_reference_type_text(type_node, source),
-                )
-            })
-            .unwrap_or_default(),
-        "cast_expression" | "as_expression" => receiver
-            .child_by_field_name(if receiver.kind() == "cast_expression" {
-                "type"
-            } else {
-                "right"
-            })
-            .map(|type_node| {
-                csharp_logical_visible_type_candidates(
-                    csharp,
-                    definitions,
-                    file,
-                    &csharp_reference_type_text(type_node, source),
-                )
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
+        | "checked_expression" => CSharpReceiverTypes::default(),
+        "object_creation_expression" => CSharpReceiverTypes::from_units(
+            receiver
+                .child_by_field_name("type")
+                .map(|type_node| {
+                    csharp_logical_visible_type_candidates(
+                        csharp,
+                        definitions,
+                        file,
+                        &csharp_reference_type_text(type_node, source),
+                    )
+                })
+                .unwrap_or_default(),
+        ),
+        "cast_expression" | "as_expression" => CSharpReceiverTypes::from_units(
+            receiver
+                .child_by_field_name(if receiver.kind() == "cast_expression" {
+                    "type"
+                } else {
+                    "right"
+                })
+                .map(|type_node| {
+                    csharp_logical_visible_type_candidates(
+                        csharp,
+                        definitions,
+                        file,
+                        &csharp_reference_type_text(type_node, source),
+                    )
+                })
+                .unwrap_or_default(),
+        ),
+        _ => CSharpReceiverTypes::default(),
     }
 }
 
@@ -2545,32 +2590,32 @@ fn canonical_csharp_predefined_type(reference: &str) -> Option<&'static str> {
     }
 }
 
-fn csharp_nearest_member_type_units(
+fn csharp_nearest_member_types(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     owners: Vec<CodeUnit>,
     name: &str,
-) -> Vec<CodeUnit> {
+) -> CSharpReceiverTypes {
     let provider = analyzer.type_hierarchy_provider();
-    let mut result = Vec::new();
+    let mut result = CSharpReceiverTypes::default();
     for owner in owners {
         if !definitions.scope_step() {
-            return Vec::new();
+            return CSharpReceiverTypes::default();
         }
         let mut seen = HashSet::default();
         let mut level = vec![owner];
         while !level.is_empty() {
             if !definitions.scope_step() {
-                return Vec::new();
+                return CSharpReceiverTypes::default();
             }
-            let mut level_types = Vec::new();
+            let mut level_types = CSharpReceiverTypes::default();
             let mut level_declares_member = false;
             let mut next_level = Vec::new();
             for current in level {
                 if !definitions.scope_step() {
-                    return Vec::new();
+                    return CSharpReceiverTypes::default();
                 }
                 if !seen.insert(current.clone()) {
                     continue;
@@ -2578,7 +2623,7 @@ fn csharp_nearest_member_type_units(
                 level_declares_member |= !definitions
                     .members_for_owner_name(&current.fq_name(), name)
                     .is_empty();
-                csharp_collect_member_type_units(
+                csharp_collect_member_types(
                     csharp,
                     definitions,
                     file,
@@ -2591,22 +2636,21 @@ fn csharp_nearest_member_type_units(
                 }
             }
             if level_declares_member {
-                result.extend(level_types);
+                result.units.extend(level_types.units);
+                result.fq_names.extend(level_types.fq_names);
                 break;
             }
             level = next_level;
         }
     }
-    sort_units(&mut result);
-    result.dedup();
-    result
+    result.normalized()
 }
 
 /// Fold one invocation transition over already-resolved owners. Keeping owner
 /// evaluation outside this helper prevents alternating call/member syntax from
 /// recursing through the Rust stack.
 #[allow(clippy::too_many_arguments)]
-fn csharp_invocation_return_type_units_for_owners(
+fn csharp_invocation_return_types(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
@@ -2614,29 +2658,29 @@ fn csharp_invocation_return_type_units_for_owners(
     source: &str,
     invocation: Node<'_>,
     name_node: Node<'_>,
-    owners: Vec<CodeUnit>,
-) -> Vec<CodeUnit> {
+    receiver_types: CSharpReceiverTypes,
+) -> CSharpReceiverTypes {
     if !definitions.scope_step() {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     }
     let Some(name) = csharp_member_name(name_node) else {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     };
     let method = csharp_node_text(name.identifier, source);
-    if owners.is_empty() || method.is_empty() {
-        return Vec::new();
+    if receiver_types.fq_names.is_empty() || method.is_empty() {
+        return CSharpReceiverTypes::default();
     }
     let explicit_type_arguments =
         csharp_resolved_type_arguments(csharp, definitions, file, source, name.type_arguments);
     let extension_site =
         (!csharp_is_unqualified_invocation_target(name_node)).then_some(name.identifier);
 
-    let receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
-    let mut return_type_units = Vec::new();
+    let receiver_type_names = receiver_types.fq_names;
+    let mut return_types = CSharpReceiverTypes::default();
     let value_arity = csharp_argument_count_in_session(invocation, source, definitions);
-    for owner in &owners {
+    for owner in &receiver_types.units {
         if !definitions.scope_step() {
-            return Vec::new();
+            return CSharpReceiverTypes::default();
         }
         let type_fqn = match definitions.session() {
             Some(session) => csharp_method_return_type_fq_name_for_arity_in_session(
@@ -2660,7 +2704,7 @@ fn csharp_invocation_return_type_units_for_owners(
             ),
         };
         if let Some(type_fqn) = type_fqn {
-            return_type_units.extend(definitions.fqn(&type_fqn));
+            return_types.push_fq_name(definitions, type_fqn);
         }
     }
     // The invoked name was not an ordinary member of the receiver type; the callee
@@ -2668,7 +2712,7 @@ fn csharp_invocation_return_type_units_for_owners(
     // `this Handler`). Type the invocation by that extension's declared return type
     // so a chained extension call on the result (`…​.Tag()`) can still resolve. Uses
     // the shared extension matcher + return-type derivation — no duplicated typing.
-    if return_type_units.is_empty()
+    if return_types.fq_names.is_empty()
         && let Some(site) = extension_site
     {
         let type_fqn = match definitions.session() {
@@ -2699,12 +2743,10 @@ fn csharp_invocation_return_type_units_for_owners(
             ),
         };
         if let Some(type_fqn) = type_fqn {
-            return_type_units.extend(definitions.fqn(&type_fqn));
+            return_types.push_fq_name(definitions, type_fqn);
         }
     }
-    sort_units(&mut return_type_units);
-    return_type_units.dedup();
-    return_type_units
+    return_types.normalized()
 }
 
 fn csharp_resolved_type_arguments(
@@ -2738,26 +2780,37 @@ fn csharp_enclosing_member_type_units(
     receiver: Node<'_>,
     name: &str,
 ) -> Vec<CodeUnit> {
+    csharp_enclosing_member_types(analyzer, csharp, definitions, file, receiver, name).units
+}
+
+fn csharp_enclosing_member_types(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    receiver: Node<'_>,
+    name: &str,
+) -> CSharpReceiverTypes {
     if !definitions.scope_step() {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     }
     let Some(owner) = csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
     else {
-        return Vec::new();
+        return CSharpReceiverTypes::default();
     };
-    let mut candidates = Vec::new();
-    csharp_collect_member_type_units(csharp, definitions, file, &owner, name, &mut candidates);
+    let mut candidates = CSharpReceiverTypes::default();
+    csharp_collect_member_types(csharp, definitions, file, &owner, name, &mut candidates);
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
         let mut stack = definitions.direct_ancestors(provider, &owner);
         while let Some(ancestor) = stack.pop() {
             if !definitions.scope_step() {
-                return Vec::new();
+                return CSharpReceiverTypes::default();
             }
             if !seen.insert(ancestor.clone()) {
                 continue;
             }
-            csharp_collect_member_type_units(
+            csharp_collect_member_types(
                 csharp,
                 definitions,
                 file,
@@ -2768,18 +2821,16 @@ fn csharp_enclosing_member_type_units(
             stack.extend(definitions.direct_ancestors(provider, &ancestor));
         }
     }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
+    candidates.normalized()
 }
 
-fn csharp_collect_member_type_units(
+fn csharp_collect_member_types(
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     owner: &CodeUnit,
     name: &str,
-    candidates: &mut Vec<CodeUnit>,
+    candidates: &mut CSharpReceiverTypes,
 ) {
     if !definitions.scope_step() {
         return;
@@ -2791,7 +2842,7 @@ fn csharp_collect_member_type_units(
         None => csharp_member_declared_type_fq_name(csharp, file, owner, name),
     };
     if let Some(type_fqn) = type_fqn {
-        candidates.extend(definitions.fqn(&type_fqn));
+        candidates.push_fq_name(definitions, type_fqn);
     }
 }
 
