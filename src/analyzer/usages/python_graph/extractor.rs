@@ -7,8 +7,9 @@ use crate::analyzer::usages::python_graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
 };
 use crate::analyzer::usages::python_graph::resolver::{
-    member_name, normalized_receiver_type, receiver_annotation_matches_target,
-    resolve_constructor_types, resolve_receiver_type, target_owner_code_unit, top_level_identifier,
+    annotation_reference_candidates, member_name, normalized_receiver_type,
+    receiver_annotation_matches_target, resolve_constructor_types, resolve_receiver_type,
+    target_owner_code_unit, top_level_identifier,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
@@ -579,8 +580,21 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 handle_import_candidate(node, ctx);
                 continue;
             }
-            "identifier" => handle_identifier_candidate(node, ctx),
-            "attribute" => handle_attribute_candidate(node, ctx),
+            "identifier" => {
+                if handle_annotation_reference_candidate(node, ctx) {
+                    continue;
+                }
+                handle_identifier_candidate(node, ctx);
+            }
+            "attribute" => {
+                if handle_annotation_reference_candidate(node, ctx) {
+                    continue;
+                }
+                handle_attribute_candidate(node, ctx);
+            }
+            "string_content" => {
+                handle_annotation_reference_candidate(node, ctx);
+            }
             "keyword_argument" => {
                 handle_keyword_argument_candidate(node, ctx);
                 if let Some(value) = node.child_by_field_name("value") {
@@ -596,6 +610,28 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         children.reverse();
         stack.extend(children);
     }
+}
+
+fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let Some(candidates) = annotation_reference_candidates(
+        ctx.analyzer,
+        ctx.py,
+        ctx.file,
+        ctx.source,
+        node,
+        ctx.target_self_file,
+    ) else {
+        return false;
+    };
+
+    if ctx.target_member.is_none()
+        && candidates
+            .into_iter()
+            .any(|candidate| candidate == *ctx.target)
+    {
+        record_hit(node, ctx);
+    }
+    true
 }
 
 fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

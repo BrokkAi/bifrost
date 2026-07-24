@@ -6230,6 +6230,50 @@ class Service:
 }
 
 #[test]
+fn scan_usages_by_location_keeps_python_class_annotation_references() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            "from dataclasses import dataclass\n\n@dataclass\nclass User:\n    name: str\n\n    @property\n    def normalized_name(self) -> str:\n        return self.name.lower()\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls(\"guest\")\n\n    @staticmethod\n    def format_name(name: str) -> str:\n        return name.title()\n",
+        )
+        .file("src/shop/__init__.py", "from .models import User as Account\n")
+        .file(
+            "tests/test_models.py",
+            "from shop import Account\nuser = Account.guest()\nAccount.format_name(\"ada\")\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"src/shop/models.py","line":4,"column":7}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("shop.models.User", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(3, result["total_hits"], "payload: {value}");
+    assert!(
+        result["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .any(|hit| {
+                hit["path"] == "src/shop/models.py"
+                    && hit["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains("-> \\\"User\\\""))
+            }),
+        "quoted return annotation must remain an external class usage: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_requires_symbols() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
 
