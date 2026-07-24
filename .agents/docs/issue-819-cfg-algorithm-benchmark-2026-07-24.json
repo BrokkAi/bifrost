@@ -1,0 +1,633 @@
+{
+  "format": "bifrost-cfg-algorithm-benchmark",
+  "schema_version": 1,
+  "purpose": "issue-819 on-demand immutable CFG algorithm lifecycle evidence",
+  "provenance": {
+    "bifrost_commit": "537262d7c2fe58c1f190d910f904413302be7792",
+    "bifrost_dirty": false,
+    "bifrost_tree_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rustc_version_verbose": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "cargo_version": "cargo 1.96.0 (30a34c682 2026-05-25)",
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "build_profile": "release",
+    "crate_version": "0.8.10",
+    "timer": "std::time::Instant monotonic elapsed wall time",
+    "generated_unix_seconds": 1784881211,
+    "corpora": [
+      {
+        "environment_variable": "BIFROST_SEMANTIC_TS_REPO",
+        "expected_commit": "19e0f9e681ecb8e5c09d8784acaa601316ca4571",
+        "configured_path": "/Users/dave/Workspace/test-repos/vscode-semantic-cfg"
+      },
+      {
+        "environment_variable": "BIFROST_SEMANTIC_JAVA_REPO",
+        "expected_commit": "f182358d02e4a68e52bdbabf55ca7800288511e7",
+        "configured_path": "/Users/dave/Workspace/test-repos/spring-petclinic-semantic-cfg"
+      }
+    ]
+  },
+  "repeats_per_graph": 3,
+  "datasets": [
+    {
+      "name": "deep_chain_100000",
+      "origin": "generated",
+      "language": null,
+      "repository_commit": null,
+      "repository_dirty": null,
+      "status": "complete",
+      "files_seen": 0,
+      "files_materialized": 0,
+      "graphs": 1,
+      "nodes": 100000,
+      "edges": 99999,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 8.428667,
+          "repeated_total_ms": 12.516124999999999,
+          "repeated_recomputations": 3,
+          "visited_nodes": 100000,
+          "visited_edges": 99999,
+          "retained_result_bytes": 900000,
+          "result_digest": "58470d3e42668c71e3fdf39ae269b79f13405cf458d4f709e1105e2c9c48e6f2"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 7.794416,
+          "repeated_total_ms": 17.414625,
+          "repeated_recomputations": 3,
+          "visited_nodes": 100000,
+          "visited_edges": 99999,
+          "retained_result_bytes": 900000,
+          "result_digest": "58470d3e42668c71e3fdf39ae269b79f13405cf458d4f709e1105e2c9c48e6f2"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 6.6055,
+          "repeated_total_ms": 25.656708000000002,
+          "repeated_recomputations": 3,
+          "visited_nodes": 100000,
+          "visited_edges": 99999,
+          "retained_result_bytes": 2400000,
+          "result_digest": "8e5cf9467da09ab7836521c04f46ff1081e2da7c7040a9dd381255d329207d30"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 22.395333,
+          "repeated_total_ms": 146.89137499999998,
+          "repeated_recomputations": 3,
+          "visited_nodes": 200000,
+          "visited_edges": 199998,
+          "retained_result_bytes": 3200000,
+          "result_digest": "a231102d9cd335e17ce7380f269e940668f3c9aec971532526572641f2307c6e"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 96.520334,
+          "repeated_total_ms": 300.23575,
+          "repeated_recomputations": 3,
+          "visited_nodes": 400000,
+          "visited_edges": 399996,
+          "retained_result_bytes": 0,
+          "result_digest": "ba5bc186df7b728aac8654f856291778d407c970d04363edf57c5fbe6f9d4356"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 5.9059159999999995,
+          "repeated_total_ms": 30.237416,
+          "repeated_recomputations": 3,
+          "visited_nodes": 100000,
+          "visited_edges": 99999,
+          "retained_result_bytes": 1599992,
+          "result_digest": "6609c333016ea77c0468e754e62bf5c9018147d9e736243234c9bac5753df98d"
+        }
+      ]
+    },
+    {
+      "name": "branch_heavy_20000",
+      "origin": "generated",
+      "language": null,
+      "repository_commit": null,
+      "repository_dirty": null,
+      "status": "complete",
+      "files_seen": 0,
+      "files_materialized": 0,
+      "graphs": 1,
+      "nodes": 20000,
+      "edges": 26665,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 0.8392080000000001,
+          "repeated_total_ms": 2.442541,
+          "repeated_recomputations": 3,
+          "visited_nodes": 20000,
+          "visited_edges": 26665,
+          "retained_result_bytes": 180000,
+          "result_digest": "e29dcd8d642cd439bbfdf36e6f58840c4b226b83ed3498553b9665453126e914"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 0.8187920000000001,
+          "repeated_total_ms": 2.306958,
+          "repeated_recomputations": 3,
+          "visited_nodes": 20000,
+          "visited_edges": 26665,
+          "retained_result_bytes": 180000,
+          "result_digest": "e29dcd8d642cd439bbfdf36e6f58840c4b226b83ed3498553b9665453126e914"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 1.16375,
+          "repeated_total_ms": 21.493125,
+          "repeated_recomputations": 3,
+          "visited_nodes": 20000,
+          "visited_edges": 26665,
+          "retained_result_bytes": 480000,
+          "result_digest": "b85df7d2261561b5fd9a9673b79399f83a60147a1f0fc2135dc48b83032bfcca"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 18.281125,
+          "repeated_total_ms": 38.732124999999996,
+          "repeated_recomputations": 3,
+          "visited_nodes": 40000,
+          "visited_edges": 53330,
+          "retained_result_bytes": 640000,
+          "result_digest": "070c924f05719b0341192bcd57dc5c1297eea124246743af9c14c2da9d569daf"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 20.237875,
+          "repeated_total_ms": 21.949333000000003,
+          "repeated_recomputations": 3,
+          "visited_nodes": 80000,
+          "visited_edges": 106660,
+          "retained_result_bytes": 0,
+          "result_digest": "ba5bc186df7b728aac8654f856291778d407c970d04363edf57c5fbe6f9d4356"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 0.599,
+          "repeated_total_ms": 14.567292,
+          "repeated_recomputations": 3,
+          "visited_nodes": 20000,
+          "visited_edges": 26665,
+          "retained_result_bytes": 213336,
+          "result_digest": "659360b2e2d2f937cc0a7650bd0668edd78704d897da51fc0ece33b75b02bd56"
+        }
+      ]
+    },
+    {
+      "name": "reducible_nested_cycles",
+      "origin": "generated",
+      "language": null,
+      "repository_commit": null,
+      "repository_dirty": null,
+      "status": "complete",
+      "files_seen": 0,
+      "files_materialized": 0,
+      "graphs": 1,
+      "nodes": 9,
+      "edges": 8,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 0.009666000000000001,
+          "repeated_total_ms": 0.042375,
+          "repeated_recomputations": 3,
+          "visited_nodes": 7,
+          "visited_edges": 8,
+          "retained_result_bytes": 65,
+          "result_digest": "8dfaa4704295fa54df8a030776dd5eec8d81f4067d7ff2076f9e5d4a76750724"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 0.00275,
+          "repeated_total_ms": 0.007292,
+          "repeated_recomputations": 3,
+          "visited_nodes": 7,
+          "visited_edges": 8,
+          "retained_result_bytes": 65,
+          "result_digest": "8dfaa4704295fa54df8a030776dd5eec8d81f4067d7ff2076f9e5d4a76750724"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 0.008417,
+          "repeated_total_ms": 0.009708,
+          "repeated_recomputations": 3,
+          "visited_nodes": 9,
+          "visited_edges": 8,
+          "retained_result_bytes": 232,
+          "result_digest": "7a1e8b376c7f047a0ba61bb41ebc376b372f0c3e6b6f18f8f898f4c8adf06dd0"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 0.050207999999999996,
+          "repeated_total_ms": 0.014208,
+          "repeated_recomputations": 3,
+          "visited_nodes": 18,
+          "visited_edges": 16,
+          "retained_result_bytes": 240,
+          "result_digest": "dbe83ceb8c69dd591afcb9926c37467acd7268b1631d3af7e9b9dee2fee667ab"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 0.31470800000000004,
+          "repeated_total_ms": 0.015583,
+          "repeated_recomputations": 3,
+          "visited_nodes": 36,
+          "visited_edges": 32,
+          "retained_result_bytes": 184,
+          "result_digest": "6d04a9d627be25b6ba29e4fb025bcebecbc0c68135fd577d6ec95dac9a1cea45"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 0.002667,
+          "repeated_total_ms": 0.008792,
+          "repeated_recomputations": 3,
+          "visited_nodes": 7,
+          "visited_edges": 8,
+          "retained_result_bytes": 88,
+          "result_digest": "e32bc96b5dbe2b00161267c392512e68e8901f51c432cc33cd9f3513ef379d33"
+        }
+      ]
+    },
+    {
+      "name": "multi_entry_irreducible_cycle",
+      "origin": "generated",
+      "language": null,
+      "repository_commit": null,
+      "repository_dirty": null,
+      "status": "complete",
+      "files_seen": 0,
+      "files_materialized": 0,
+      "graphs": 1,
+      "nodes": 7,
+      "edges": 6,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 0.001667,
+          "repeated_total_ms": 0.002792,
+          "repeated_recomputations": 3,
+          "visited_nodes": 5,
+          "visited_edges": 5,
+          "retained_result_bytes": 47,
+          "result_digest": "790049793502cda9cbbae332141fe2fb1302f43028938e58dc7ca8a4206f61e5"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 0.0012920000000000002,
+          "repeated_total_ms": 0.002875,
+          "repeated_recomputations": 3,
+          "visited_nodes": 6,
+          "visited_edges": 6,
+          "retained_result_bytes": 55,
+          "result_digest": "93a263ceb4c3437026f2b8000dbb48da838929cd70f2283248bccbfffc6ac98a"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 0.002,
+          "repeated_total_ms": 0.004292,
+          "repeated_recomputations": 3,
+          "visited_nodes": 7,
+          "visited_edges": 6,
+          "retained_result_bytes": 176,
+          "result_digest": "b008ce8d1556b5bc0c3c6812144d3f023b29b83c33940d3e7457526037765ed3"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 0.0025840000000000004,
+          "repeated_total_ms": 0.005709,
+          "repeated_recomputations": 3,
+          "visited_nodes": 14,
+          "visited_edges": 12,
+          "retained_result_bytes": 192,
+          "result_digest": "17c948c14ee36b3e889f431e58da1ea2d9e93bd4e81e0d18deab313927505c3d"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 0.003166,
+          "repeated_total_ms": 0.009084,
+          "repeated_recomputations": 3,
+          "visited_nodes": 28,
+          "visited_edges": 24,
+          "retained_result_bytes": 104,
+          "result_digest": "8973fb2321caf9a2e6f47874e8635aa93fa69e722b59bef7d90a0fffd0eaf299"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 0.0012920000000000002,
+          "repeated_total_ms": 0.003208,
+          "repeated_recomputations": 3,
+          "visited_nodes": 5,
+          "visited_edges": 5,
+          "retained_result_bytes": 72,
+          "result_digest": "3d332ddccdb491ecbddd160fc451ec93160de0655518b5d294005ffe95bedfcd"
+        }
+      ]
+    },
+    {
+      "name": "disconnected_regions_and_self_loop",
+      "origin": "generated",
+      "language": null,
+      "repository_commit": null,
+      "repository_dirty": null,
+      "status": "complete",
+      "files_seen": 0,
+      "files_materialized": 0,
+      "graphs": 1,
+      "nodes": 10,
+      "edges": 6,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 0.000917,
+          "repeated_total_ms": 0.0022919999999999998,
+          "repeated_recomputations": 3,
+          "visited_nodes": 3,
+          "visited_edges": 2,
+          "retained_result_bytes": 34,
+          "result_digest": "84d55b6a10df579faea7e54e16a4ccf4ad8846c598d6a068f94f25f26b835637"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 0.000875,
+          "repeated_total_ms": 0.002166,
+          "repeated_recomputations": 3,
+          "visited_nodes": 2,
+          "visited_edges": 1,
+          "retained_result_bytes": 26,
+          "result_digest": "7e5765f1a8a567286da5a7fbc32c2dc378f9c54450ddaf2e479a358b5b1fd104"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 0.001792,
+          "repeated_total_ms": 0.0041659999999999996,
+          "repeated_recomputations": 3,
+          "visited_nodes": 10,
+          "visited_edges": 6,
+          "retained_result_bytes": 256,
+          "result_digest": "0d2c0b3398559184f2eb21ee501262f78e4924e40a1c2a3d01dd906b3be292b9"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 0.0050420000000000005,
+          "repeated_total_ms": 0.008749999999999999,
+          "repeated_recomputations": 3,
+          "visited_nodes": 20,
+          "visited_edges": 12,
+          "retained_result_bytes": 304,
+          "result_digest": "b324f7fd0e0c8b67bed87919613c10b48aad2f5381eee7b5e8032c3acd6af0e2"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 0.004875,
+          "repeated_total_ms": 0.009833,
+          "repeated_recomputations": 3,
+          "visited_nodes": 40,
+          "visited_edges": 24,
+          "retained_result_bytes": 168,
+          "result_digest": "7082f82e5c9427860f8e3f91b116f529f223fe4bc65fe1c0a36831195f459ec5"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 0.000875,
+          "repeated_total_ms": 0.002125,
+          "repeated_recomputations": 3,
+          "visited_nodes": 3,
+          "visited_edges": 2,
+          "retained_result_bytes": 0,
+          "result_digest": "8891d3fcf458565d6272bbad6232ebcdeced3bebf4b4d7cff6b3d3ef77016f2c"
+        }
+      ]
+    },
+    {
+      "name": "exceptional_and_multiple_exits",
+      "origin": "generated",
+      "language": null,
+      "repository_commit": null,
+      "repository_dirty": null,
+      "status": "complete",
+      "files_seen": 0,
+      "files_materialized": 0,
+      "graphs": 1,
+      "nodes": 8,
+      "edges": 5,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 0.001166,
+          "repeated_total_ms": 0.002833,
+          "repeated_recomputations": 3,
+          "visited_nodes": 6,
+          "visited_edges": 5,
+          "retained_result_bytes": 56,
+          "result_digest": "d271a0871ec248ecd34074cdf3965d05d67f73340db0e74ed088cab6838896aa"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 0.000833,
+          "repeated_total_ms": 0.002208,
+          "repeated_recomputations": 3,
+          "visited_nodes": 3,
+          "visited_edges": 2,
+          "retained_result_bytes": 32,
+          "result_digest": "83d2e36150afa1b0f4f7e7e4e310902780bd42ce775a5d79bb9d857575793e0d"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 0.0015,
+          "repeated_total_ms": 0.003625,
+          "repeated_recomputations": 3,
+          "visited_nodes": 8,
+          "visited_edges": 5,
+          "retained_result_bytes": 192,
+          "result_digest": "0225230d41144eb2c67d3854bed75262c8140b921924dee9668759fd46f253e5"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 0.002333,
+          "repeated_total_ms": 0.006291000000000001,
+          "repeated_recomputations": 3,
+          "visited_nodes": 16,
+          "visited_edges": 10,
+          "retained_result_bytes": 256,
+          "result_digest": "62121c144e1e68029044bf4695f3330ee162b7781cd2063c84dbcab6a0110f58"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 0.002458,
+          "repeated_total_ms": 0.007958999999999999,
+          "repeated_recomputations": 3,
+          "visited_nodes": 32,
+          "visited_edges": 20,
+          "retained_result_bytes": 0,
+          "result_digest": "ba5bc186df7b728aac8654f856291778d407c970d04363edf57c5fbe6f9d4356"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 0.001084,
+          "repeated_total_ms": 0.002666,
+          "repeated_recomputations": 3,
+          "visited_nodes": 4,
+          "visited_edges": 3,
+          "retained_result_bytes": 40,
+          "result_digest": "c45e8a3ab626caed61a05a4069c130397fce8c478713d6bb2242714a155e9573"
+        }
+      ]
+    },
+    {
+      "name": "pinned_vscode_typescript",
+      "origin": "pinned_external_repository",
+      "language": "typescript",
+      "repository_commit": "19e0f9e681ecb8e5c09d8784acaa601316ca4571",
+      "repository_dirty": false,
+      "status": "partial: 1 files lacked complete semantics",
+      "files_seen": 5633,
+      "files_materialized": 5632,
+      "graphs": 133316,
+      "nodes": 6094518,
+      "edges": 6399332,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 3031.10812,
+          "repeated_total_ms": 7506.252654,
+          "repeated_recomputations": 399948,
+          "visited_nodes": 5735938,
+          "visited_edges": 6087608,
+          "retained_result_bytes": 29038270,
+          "result_digest": "6434a52ae322da43155ce78f503e356f89c2e890d328e76c64dcac0c12d5ae4c"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 2391.8085379999998,
+          "repeated_total_ms": 6151.0290589999995,
+          "repeated_recomputations": 399948,
+          "visited_nodes": 4870600,
+          "visited_edges": 4868382,
+          "retained_result_bytes": 25576918,
+          "result_digest": "88ec2bb467c675c10debdf48faea05a9aafb8d6a8c54548ee181cc2359d8c237"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 3878.802341,
+          "repeated_total_ms": 9849.625883,
+          "repeated_recomputations": 399948,
+          "visited_nodes": 6094518,
+          "visited_edges": 6399332,
+          "retained_result_bytes": 73186608,
+          "result_digest": "99c06da23dc9d37676fdc14656f169859e0ea77ee37d2a7a9cb50c662a3db36e"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 8671.308822,
+          "repeated_total_ms": 24704.093728,
+          "repeated_recomputations": 399948,
+          "visited_nodes": 12189036,
+          "visited_edges": 12798664,
+          "retained_result_bytes": 165012056,
+          "result_digest": "732a856750245cc81be99da026005d12daf09812039d19354d5936a6af1e535a"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 9120.654901,
+          "repeated_total_ms": 27974.138178,
+          "repeated_recomputations": 399948,
+          "visited_nodes": 24378072,
+          "visited_edges": 25597328,
+          "retained_result_bytes": 1960816,
+          "result_digest": "d1f6f14a2e13ab9a8b0e9e07c2a3636d57e215900d02e9ffe57e81c7e862f8d8"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 2955.6189910000003,
+          "repeated_total_ms": 6167.023764,
+          "repeated_recomputations": 399948,
+          "visited_nodes": 4305926,
+          "visited_edges": 4454646,
+          "retained_result_bytes": 25717480,
+          "result_digest": "8f3a243b608f90407199d703770f354bef43e11efcdd3355b6fdf53ec93d1432"
+        }
+      ]
+    },
+    {
+      "name": "pinned_spring_petclinic_java",
+      "origin": "pinned_external_repository",
+      "language": "java",
+      "repository_commit": "f182358d02e4a68e52bdbabf55ca7800288511e7",
+      "repository_dirty": false,
+      "status": "complete",
+      "files_seen": 49,
+      "files_materialized": 49,
+      "graphs": 227,
+      "nodes": 9833,
+      "edges": 10992,
+      "algorithms": [
+        {
+          "algorithm": "forward_reachability",
+          "cold_ms": 1.220921,
+          "repeated_total_ms": 3.382965,
+          "repeated_recomputations": 681,
+          "visited_nodes": 9781,
+          "visited_edges": 10992,
+          "retained_result_bytes": 48957,
+          "result_digest": "02c7e8541ea5fb1142979201203ee0e7f9f18f6a47295046241157a4a4a78440"
+        },
+        {
+          "algorithm": "reverse_reachability",
+          "cold_ms": 1.036253,
+          "repeated_total_ms": 2.955044,
+          "repeated_recomputations": 681,
+          "visited_nodes": 8034,
+          "visited_edges": 7901,
+          "retained_result_bytes": 41969,
+          "result_digest": "05a3573845d4fa6855f848707e719c405eda85d4aed1a14b47b8824eaf093a2b"
+        },
+        {
+          "algorithm": "dfs_reverse_postorder",
+          "cold_ms": 1.677087,
+          "repeated_total_ms": 4.464036999999999,
+          "repeated_recomputations": 681,
+          "visited_nodes": 9833,
+          "visited_edges": 10992,
+          "retained_result_bytes": 118080,
+          "result_digest": "1e132758894a83c1ddea6b4594957e2242fff80b81cbd65788f97cf70af76551"
+        },
+        {
+          "algorithm": "kosaraju_scc",
+          "cold_ms": 3.4160399999999997,
+          "repeated_total_ms": 9.776908,
+          "repeated_recomputations": 681,
+          "visited_nodes": 19666,
+          "visited_edges": 21984,
+          "retained_result_bytes": 268092,
+          "result_digest": "3d2ff3983e63e9854f07804179f7da8f2420a93764f1c5aed19b2ae2af1b0170"
+        },
+        {
+          "algorithm": "loop_regions",
+          "cold_ms": 3.817502,
+          "repeated_total_ms": 11.019829999999999,
+          "repeated_recomputations": 681,
+          "visited_nodes": 39332,
+          "visited_edges": 43968,
+          "retained_result_bytes": 2532,
+          "result_digest": "5c2fd832e85c3849f4b5a3362a085d5683d574459b6453be9267842590858cdc"
+        },
+        {
+          "algorithm": "shortest_path",
+          "cold_ms": 1.096218,
+          "repeated_total_ms": 3.031452,
+          "repeated_recomputations": 681,
+          "visited_nodes": 8887,
+          "visited_edges": 9898,
+          "retained_result_bytes": 55272,
+          "result_digest": "12bc311bacedb0c16d475da17117623d3b8e552ae55f73cd76b4111e5ab3863c"
+        }
+      ]
+    }
+  ]
+}

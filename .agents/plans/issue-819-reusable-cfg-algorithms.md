@@ -17,7 +17,8 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 11:26+02:00) Implemented the dense bidirectional `ProcedureSemantics` view, shared node/edge budgets and cancellation, complete iterative reachability/DFS/Kosaraju/loop/path algorithms, and seven synthetic tests including a 100,000-node chain.
 - [x] (2026-07-24 11:42+02:00) Replaced the ICFG builder’s bespoke return-path traversals with shared forward/reverse reachability while preserving precharge/cancellation/cache behavior; all 41 CFG, 25 ICFG, and 11 tabulation contracts plus the new artifact-isolation unit regression pass.
 - [x] (2026-07-24 13:06+02:00) Added and compiled the ignored release benchmark and pinned-corpus runner, covering six algorithm families over deep, branch-heavy, cyclic, irreducible, disconnected, exceptional, VS Code, and PetClinic datasets with versioned provenance-rich JSON output.
-- [ ] Add the ignored release benchmark, runner, versioned JSON output, lifecycle evidence note, and roadmap checkpoint.
+- [x] (2026-07-24 14:04+02:00) Ran the retained release matrix from clean checkpoint `537262d7` over six synthetic shapes plus pinned VS Code/PetClinic, wrote schema-v1 JSON, and recorded the on-demand lifecycle and dominance no-go evidence.
+- [x] (2026-07-24 14:12+02:00) Added the evidence note and marked the broader typestate roadmap’s #819 checkpoint complete without adding persistence, dominance, or public surface.
 - [ ] Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [ ] Complete specialist review, resolve material findings, and record final outcomes.
 
@@ -34,6 +35,12 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 - Observation: the existing CFG iterators were concretely double-ended but their opaque public return bounds did not advertise that fact.
   Evidence: the generic view initially could not preserve reverse canonical stack insertion through the opaque iterator type. Adding the truthful `DoubleEndedIterator` bound required no representation or behavior change.
+
+- Observation: whole-corpus algorithm costs scale with the number of callable snapshots, making retained global results expensive even when each graph is small.
+  Evidence: VS Code contains 133,316 materialized procedure CFGs. Cold SCC and loop-region totals were 8.67 s and 9.12 s, and retained SCC results were estimated at 165 MB; no current consumer requests those derivations.
+
+- Observation: the retained work counts match the implementation’s declared whole-graph passes exactly.
+  Evidence: PetClinic DFS used 9,833/10,992 node/edge visits, SCC used 19,666/21,984, and loop derivation used 39,332/43,968. VS Code exhibited the same 1x/2x/4x relationship.
 
 ## Decision Log
 
@@ -63,7 +70,9 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 ## Outcomes & Retrospective
 
-This section will be completed after implementation, measurement, validation, and review. It will state the checkpoint commits, exact gates run, benchmark artifact location, measured lifecycle decision, and any remaining work outside #819.
+Milestones 1 through 3 are complete in checkpoints `cd0998ce`, `9283fd4a`, and `537262d7`. The algorithm layer is crate-private, iterative, deterministic, and complete-only under cancellation or node/edge exhaustion. ICFG return-gap scoping is its first production consumer and retains only the existing artifact-instance-scoped builder memo.
+
+The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. Measurement supports on-demand RPO/SCC/loop/path results, no persistence, and no dominance implementation. Final repository gates and specialist review remain before issue closure.
 
 ## Context and Orientation
 
@@ -187,3 +196,5 @@ Revision note (2026-07-24): Marked Milestone 1 complete after the focused algori
 Revision note (2026-07-24): Marked Milestone 2 complete after shared reachability replaced the ICFG stacks and the focused contract matrix plus distinct-artifact cache regression passed.
 
 Revision note (2026-07-24): Added the compiled release measurement harness and runner; retained measurement, evidence interpretation, and roadmap closure remain.
+
+Revision note (2026-07-24): Recorded the retained clean-tree release matrix, completed the lifecycle and dominance decisions, and closed the broader roadmap checkpoint.
