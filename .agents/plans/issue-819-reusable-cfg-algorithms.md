@@ -20,6 +20,7 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 14:04+02:00) Ran the retained release matrix from clean checkpoint `537262d7` over six synthetic shapes plus pinned VS Code/PetClinic, wrote schema-v1 JSON, and recorded the on-demand lifecycle and dominance no-go evidence.
 - [x] (2026-07-24 14:12+02:00) Added the evidence note and marked the broader typestate roadmap’s #819 checkpoint complete without adding persistence, dominance, or public surface.
 - [x] (2026-07-24 15:08+02:00) Completed five specialist reviews and fixed every material finding: linear checked back-edge partitioning, direct bounded adjacency consumption, shared budget-ledger reuse, SCC/loop DFS reuse, closed-region entry fidelity, cancellable path reconstruction, crate-private reverse iteration, atomic evidence output, and algorithm-only timing.
+- [x] (2026-07-24 16:02+02:00) Regenerated the retained release matrix from clean reviewed checkpoint `3582f291`, confirmed clean-tree provenance, and refreshed the evidence narrative for one-byte reachability membership and exact 1x/2x/3x DFS/SCC/loop work.
 - [ ] Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [ ] Complete specialist review, resolve material findings, and record final outcomes.
 
@@ -83,7 +84,7 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 
 Milestones 1 through 3 are complete in checkpoints `cd0998ce`, `9283fd4a`, and `537262d7`. The algorithm layer is crate-private, iterative, deterministic, and complete-only under cancellation or node/edge exhaustion. ICFG return-gap scoping is its first production consumer and retains only the existing artifact-instance-scoped builder memo.
 
-The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. The initial matrix supported the lifecycle decision; specialist review then changed retained reachability bytes, loop work, and timing boundaries, so the final clean-checkpoint matrix must replace it before closure.
+The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. The final matrix is from clean reviewed checkpoint `3582f291`, times only algorithm execution, retains one byte per reachability point, and confirms exact 1x/2x/3x DFS/SCC/loop work. It continues to support on-demand RPO/SCC/loop/path results, no persistence, and no dominance implementation.
 
 ## Context and Orientation
 
@@ -216,3 +217,5 @@ Revision note (2026-07-24): Added the compiled release measurement harness and r
 Revision note (2026-07-24): Recorded the retained clean-tree release matrix, completed the lifecycle and dominance decisions, and closed the broader roadmap checkpoint.
 
 Revision note (2026-07-24): Recorded specialist review and the resulting bounded-work, lifecycle, topology, timing, and API-boundary corrections. The retained matrix is explicitly pending regeneration from the reviewed checkpoint.
+
+Revision note (2026-07-24): Replaced the stale pre-review evidence with the final clean reviewed release matrix and refreshed all affected timing, work, retention, and provenance claims.

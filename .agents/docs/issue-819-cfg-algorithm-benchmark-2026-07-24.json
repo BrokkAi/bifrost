@@ -3,9 +3,9 @@
   "schema_version": 1,
   "purpose": "issue-819 on-demand immutable CFG algorithm lifecycle evidence",
   "provenance": {
-    "bifrost_commit": "2b60d3ea36a64f5be26285b8ace8927179ef0f3e",
-    "bifrost_dirty": true,
-    "bifrost_tree_fingerprint": "806ac5bd22d549dd878d7b8050a70dab805400f18c9abd3470d9ea5363b2884a",
+    "bifrost_commit": "3582f291a8c43ed0c4ec1e372ee6f1d41faca389",
+    "bifrost_dirty": false,
+    "bifrost_tree_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "rustc_version_verbose": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
     "cargo_version": "cargo 1.96.0 (30a34c682 2026-05-25)",
     "operating_system": "macos",
@@ -13,7 +13,7 @@
     "build_profile": "release",
     "crate_version": "0.8.10",
     "timer": "std::time::Instant monotonic elapsed wall time",
-    "generated_unix_seconds": 1784883347,
+    "generated_unix_seconds": 1784883868,
     "corpora": [
       {
         "environment_variable": "BIFROST_SEMANTIC_TS_REPO",
@@ -44,8 +44,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 1.482333,
-          "repeated_total_ms": 3.64175,
+          "cold_ms": 1.582375,
+          "repeated_total_ms": 4.044626,
           "repeated_recomputations": 3,
           "visited_nodes": 100000,
           "visited_edges": 99999,
@@ -54,8 +54,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 0.947584,
-          "repeated_total_ms": 2.979583,
+          "cold_ms": 1.03775,
+          "repeated_total_ms": 4.015875,
           "repeated_recomputations": 3,
           "visited_nodes": 100000,
           "visited_edges": 99999,
@@ -64,8 +64,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 3.179459,
-          "repeated_total_ms": 7.332542,
+          "cold_ms": 2.675375,
+          "repeated_total_ms": 8.955458,
           "repeated_recomputations": 3,
           "visited_nodes": 100000,
           "visited_edges": 99999,
@@ -74,8 +74,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 14.389959000000001,
-          "repeated_total_ms": 42.925333,
+          "cold_ms": 34.050083,
+          "repeated_total_ms": 101.71108299999999,
           "repeated_recomputations": 3,
           "visited_nodes": 200000,
           "visited_edges": 199998,
@@ -84,8 +84,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 20.49875,
-          "repeated_total_ms": 60.388334,
+          "cold_ms": 36.386874999999996,
+          "repeated_total_ms": 118.842959,
           "repeated_recomputations": 3,
           "visited_nodes": 300000,
           "visited_edges": 299997,
@@ -94,8 +94,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 1.760833,
-          "repeated_total_ms": 5.138583000000001,
+          "cold_ms": 1.960083,
+          "repeated_total_ms": 10.708082000000001,
           "repeated_recomputations": 3,
           "visited_nodes": 100000,
           "visited_edges": 99999,
@@ -119,8 +119,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 0.228291,
-          "repeated_total_ms": 0.5140830000000001,
+          "cold_ms": 0.272875,
+          "repeated_total_ms": 0.837916,
           "repeated_recomputations": 3,
           "visited_nodes": 20000,
           "visited_edges": 26665,
@@ -129,8 +129,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 0.22966699999999998,
-          "repeated_total_ms": 0.511249,
+          "cold_ms": 0.264416,
+          "repeated_total_ms": 0.711667,
           "repeated_recomputations": 3,
           "visited_nodes": 20000,
           "visited_edges": 26665,
@@ -139,8 +139,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 0.494959,
-          "repeated_total_ms": 1.508208,
+          "cold_ms": 0.47225,
+          "repeated_total_ms": 1.378376,
           "repeated_recomputations": 3,
           "visited_nodes": 20000,
           "visited_edges": 26665,
@@ -149,8 +149,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 3.033625,
-          "repeated_total_ms": 8.935708,
+          "cold_ms": 3.906542,
+          "repeated_total_ms": 19.385958,
           "repeated_recomputations": 3,
           "visited_nodes": 40000,
           "visited_edges": 53330,
@@ -159,8 +159,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 4.2135,
-          "repeated_total_ms": 12.532874,
+          "cold_ms": 16.922334,
+          "repeated_total_ms": 37.640292,
           "repeated_recomputations": 3,
           "visited_nodes": 60000,
           "visited_edges": 79995,
@@ -169,8 +169,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 0.27987500000000004,
-          "repeated_total_ms": 0.796666,
+          "cold_ms": 0.37920899999999996,
+          "repeated_total_ms": 3.422167,
           "repeated_recomputations": 3,
           "visited_nodes": 20000,
           "visited_edges": 26665,
@@ -194,8 +194,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 0.000542,
-          "repeated_total_ms": 0.000917,
+          "cold_ms": 0.001333,
+          "repeated_total_ms": 0.000874,
           "repeated_recomputations": 3,
           "visited_nodes": 7,
           "visited_edges": 8,
@@ -204,8 +204,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 0.000417,
-          "repeated_total_ms": 0.003708,
+          "cold_ms": 0.000791,
+          "repeated_total_ms": 0.00075,
           "repeated_recomputations": 3,
           "visited_nodes": 7,
           "visited_edges": 8,
@@ -214,8 +214,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 0.001625,
-          "repeated_total_ms": 0.001874,
+          "cold_ms": 0.002792,
+          "repeated_total_ms": 0.003084,
           "repeated_recomputations": 3,
           "visited_nodes": 9,
           "visited_edges": 8,
@@ -224,8 +224,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 0.050958,
-          "repeated_total_ms": 0.005168000000000001,
+          "cold_ms": 0.047875,
+          "repeated_total_ms": 0.007083,
           "repeated_recomputations": 3,
           "visited_nodes": 18,
           "visited_edges": 16,
@@ -234,8 +234,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 0.006166,
-          "repeated_total_ms": 0.007833,
+          "cold_ms": 0.005625000000000001,
+          "repeated_total_ms": 0.010292,
           "repeated_recomputations": 3,
           "visited_nodes": 27,
           "visited_edges": 24,
@@ -244,8 +244,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 0.001083,
-          "repeated_total_ms": 0.0024590000000000002,
+          "cold_ms": 0.0052499999999999995,
+          "repeated_total_ms": 0.002458,
           "repeated_recomputations": 3,
           "visited_nodes": 7,
           "visited_edges": 8,
@@ -269,8 +269,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 0.000166,
-          "repeated_total_ms": 0.00033299999999999996,
+          "cold_ms": 0.000375,
+          "repeated_total_ms": 0.00045900000000000004,
           "repeated_recomputations": 3,
           "visited_nodes": 5,
           "visited_edges": 5,
@@ -279,8 +279,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 0.000375,
-          "repeated_total_ms": 0.0007080000000000001,
+          "cold_ms": 0.0005,
+          "repeated_total_ms": 0.000875,
           "repeated_recomputations": 3,
           "visited_nodes": 6,
           "visited_edges": 6,
@@ -289,8 +289,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 0.000875,
-          "repeated_total_ms": 0.001458,
+          "cold_ms": 0.001042,
+          "repeated_total_ms": 0.002042,
           "repeated_recomputations": 3,
           "visited_nodes": 7,
           "visited_edges": 6,
@@ -299,8 +299,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 0.001959,
-          "repeated_total_ms": 0.0043749999999999995,
+          "cold_ms": 0.004875,
+          "repeated_total_ms": 0.006292,
           "repeated_recomputations": 3,
           "visited_nodes": 14,
           "visited_edges": 12,
@@ -309,8 +309,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 0.004667,
-          "repeated_total_ms": 0.006626,
+          "cold_ms": 0.003792,
+          "repeated_total_ms": 0.008917,
           "repeated_recomputations": 3,
           "visited_nodes": 21,
           "visited_edges": 18,
@@ -319,8 +319,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 0.0007080000000000001,
-          "repeated_total_ms": 0.001209,
+          "cold_ms": 0.000875,
+          "repeated_total_ms": 0.0018750000000000001,
           "repeated_recomputations": 3,
           "visited_nodes": 5,
           "visited_edges": 5,
@@ -344,8 +344,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 0.001375,
-          "repeated_total_ms": 0.00033299999999999996,
+          "cold_ms": 0.00020800000000000001,
+          "repeated_total_ms": 0.000375,
           "repeated_recomputations": 3,
           "visited_nodes": 3,
           "visited_edges": 2,
@@ -354,8 +354,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 0.0006670000000000001,
-          "repeated_total_ms": 0.00029299999999999997,
+          "cold_ms": 0.000375,
+          "repeated_total_ms": 0.000375,
           "repeated_recomputations": 3,
           "visited_nodes": 2,
           "visited_edges": 1,
@@ -364,8 +364,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 0.005542,
-          "repeated_total_ms": 0.0014160000000000002,
+          "cold_ms": 0.00325,
+          "repeated_total_ms": 0.0036669999999999997,
           "repeated_recomputations": 3,
           "visited_nodes": 10,
           "visited_edges": 6,
@@ -374,8 +374,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 0.007125,
-          "repeated_total_ms": 0.006291000000000001,
+          "cold_ms": 0.004209,
+          "repeated_total_ms": 0.008457999999999999,
           "repeated_recomputations": 3,
           "visited_nodes": 20,
           "visited_edges": 12,
@@ -384,8 +384,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 0.0037500000000000003,
-          "repeated_total_ms": 0.016334,
+          "cold_ms": 0.007042,
+          "repeated_total_ms": 0.017207999999999998,
           "repeated_recomputations": 3,
           "visited_nodes": 30,
           "visited_edges": 18,
@@ -394,8 +394,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 0.00033299999999999996,
-          "repeated_total_ms": 0.000541,
+          "cold_ms": 0.000334,
+          "repeated_total_ms": 0.000709,
           "repeated_recomputations": 3,
           "visited_nodes": 3,
           "visited_edges": 2,
@@ -419,8 +419,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 0.000292,
-          "repeated_total_ms": 0.000625,
+          "cold_ms": 0.0005,
+          "repeated_total_ms": 0.000833,
           "repeated_recomputations": 3,
           "visited_nodes": 6,
           "visited_edges": 5,
@@ -430,7 +430,7 @@
         {
           "algorithm": "reverse_reachability",
           "cold_ms": 0.000125,
-          "repeated_total_ms": 0.00033299999999999996,
+          "repeated_total_ms": 0.000334,
           "repeated_recomputations": 3,
           "visited_nodes": 3,
           "visited_edges": 2,
@@ -439,8 +439,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 0.00075,
-          "repeated_total_ms": 0.001333,
+          "cold_ms": 0.0025,
+          "repeated_total_ms": 0.219499,
           "repeated_recomputations": 3,
           "visited_nodes": 8,
           "visited_edges": 5,
@@ -449,8 +449,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 0.002042,
-          "repeated_total_ms": 0.0053750000000000004,
+          "cold_ms": 0.0047090000000000005,
+          "repeated_total_ms": 0.015293000000000001,
           "repeated_recomputations": 3,
           "visited_nodes": 16,
           "visited_edges": 10,
@@ -459,8 +459,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 0.0027080000000000003,
-          "repeated_total_ms": 0.011083,
+          "cold_ms": 0.004458,
+          "repeated_total_ms": 0.008624999999999999,
           "repeated_recomputations": 3,
           "visited_nodes": 24,
           "visited_edges": 15,
@@ -469,8 +469,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 0.000583,
-          "repeated_total_ms": 0.001043,
+          "cold_ms": 0.0020829999999999998,
+          "repeated_total_ms": 0.001458,
           "repeated_recomputations": 3,
           "visited_nodes": 4,
           "visited_edges": 3,
@@ -494,8 +494,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 139.274531,
-          "repeated_total_ms": 349.113955,
+          "cold_ms": 580.9970519999999,
+          "repeated_total_ms": 749.817747,
           "repeated_recomputations": 399948,
           "visited_nodes": 5735938,
           "visited_edges": 6087608,
@@ -504,8 +504,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 103.75193,
-          "repeated_total_ms": 309.55877300000003,
+          "cold_ms": 363.589833,
+          "repeated_total_ms": 642.242966,
           "repeated_recomputations": 399948,
           "visited_nodes": 4870600,
           "visited_edges": 4868382,
@@ -514,8 +514,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 294.596841,
-          "repeated_total_ms": 686.281167,
+          "cold_ms": 1027.814617,
+          "repeated_total_ms": 1842.262297,
           "repeated_recomputations": 399948,
           "visited_nodes": 6094518,
           "visited_edges": 6399332,
@@ -524,8 +524,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 1351.431697,
-          "repeated_total_ms": 3843.739349,
+          "cold_ms": 4423.641441,
+          "repeated_total_ms": 9900.22059,
           "repeated_recomputations": 399948,
           "visited_nodes": 12189036,
           "visited_edges": 12798664,
@@ -534,8 +534,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 1753.688837,
-          "repeated_total_ms": 5115.432073,
+          "cold_ms": 5015.283015999999,
+          "repeated_total_ms": 13962.56542,
           "repeated_recomputations": 399948,
           "visited_nodes": 18283554,
           "visited_edges": 19197996,
@@ -544,8 +544,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 371.15787500000005,
-          "repeated_total_ms": 729.181958,
+          "cold_ms": 733.433247,
+          "repeated_total_ms": 1670.923063,
           "repeated_recomputations": 399948,
           "visited_nodes": 4305926,
           "visited_edges": 4454646,
@@ -569,8 +569,8 @@
       "algorithms": [
         {
           "algorithm": "forward_reachability",
-          "cold_ms": 0.17782799999999999,
-          "repeated_total_ms": 0.431048,
+          "cold_ms": 0.20137,
+          "repeated_total_ms": 0.42807700000000004,
           "repeated_recomputations": 681,
           "visited_nodes": 9781,
           "visited_edges": 10992,
@@ -579,8 +579,8 @@
         },
         {
           "algorithm": "reverse_reachability",
-          "cold_ms": 0.15478599999999998,
-          "repeated_total_ms": 0.406758,
+          "cold_ms": 0.172507,
+          "repeated_total_ms": 0.412123,
           "repeated_recomputations": 681,
           "visited_nodes": 8034,
           "visited_edges": 7901,
@@ -589,8 +589,8 @@
         },
         {
           "algorithm": "dfs_reverse_postorder",
-          "cold_ms": 0.335834,
-          "repeated_total_ms": 0.828042,
+          "cold_ms": 0.35616499999999995,
+          "repeated_total_ms": 0.834784,
           "repeated_recomputations": 681,
           "visited_nodes": 9833,
           "visited_edges": 10992,
@@ -599,8 +599,8 @@
         },
         {
           "algorithm": "kosaraju_scc",
-          "cold_ms": 1.724501,
-          "repeated_total_ms": 4.7579709999999995,
+          "cold_ms": 1.784375,
+          "repeated_total_ms": 4.765483,
           "repeated_recomputations": 681,
           "visited_nodes": 19666,
           "visited_edges": 21984,
@@ -609,8 +609,8 @@
         },
         {
           "algorithm": "loop_regions",
-          "cold_ms": 2.2532989999999997,
-          "repeated_total_ms": 6.581069,
+          "cold_ms": 2.295251,
+          "repeated_total_ms": 6.713703,
           "repeated_recomputations": 681,
           "visited_nodes": 29499,
           "visited_edges": 32976,
@@ -619,8 +619,8 @@
         },
         {
           "algorithm": "shortest_path",
-          "cold_ms": 0.323291,
-          "repeated_total_ms": 0.8440449999999999,
+          "cold_ms": 0.35549200000000003,
+          "repeated_total_ms": 0.871874,
           "repeated_recomputations": 681,
           "visited_nodes": 8887,
           "visited_edges": 9898,
