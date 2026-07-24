@@ -800,6 +800,7 @@ fn cfg_algorithm_release_measurement() {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(".agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json")
         });
+    let run_provenance = provenance();
 
     let parent = output
         .parent()
@@ -826,7 +827,7 @@ fn cfg_algorithm_release_measurement() {
         format: "bifrost-cfg-algorithm-benchmark",
         schema_version: 1,
         purpose: "issue-819 on-demand immutable CFG algorithm lifecycle evidence",
-        provenance: provenance(),
+        provenance: run_provenance,
         repeats_per_graph: repeats,
         datasets,
     };
