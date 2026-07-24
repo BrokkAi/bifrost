@@ -780,6 +780,21 @@ fn resolve_cpp_type(
                 .collect();
             return candidates_outcome(candidates);
         }
+        // A template type parameter names no indexed type but is lexically
+        // visible inside its own template (cutlass's `OperandLayout::packed`
+        // inside OperandSharedStorage): the enclosing-scope walk finds the
+        // parameter's declaration when it is indexed; without it the
+        // qualifier drew a dishonest include-boundary claim (tier-4
+        // DeepSpeed).
+        if let Some(parameter) = resolve_in_enclosing_scopes(
+            analyzer,
+            file,
+            &qualifier.reference,
+            node.start_byte(),
+            |_| true,
+        ) {
+            return candidates_outcome(vec![parameter]);
+        }
         if cpp_unresolved_include_boundary(analyzer, file, &qualifier.reference) {
             return boundary(format!(
                 "`{}` appears to cross a C++ include boundary not indexed in this workspace",
@@ -904,13 +919,46 @@ fn resolve_cpp_type_without_focused_qualifier(
             node.child_by_field_name("scope"),
             node.child_by_field_name("name"),
         )
-        && let Some(owner) = visibility.resolve_type(file, cpp_node_text(scope, source))
-        && visibility.external_type_candidate_visible_at(file, &owner, node.start_byte())
     {
-        let candidates =
-            cpp_direct_member_candidates(analyzer, support, &[owner], cpp_node_text(name, source));
-        if !candidates.is_empty() {
-            return candidates_outcome(candidates);
+        let scope_text = cpp_node_text(scope, source);
+        let owner = visibility.resolve_type(file, scope_text).filter(|owner| {
+            visibility.external_type_candidate_visible_at(file, owner, node.start_byte())
+        });
+        if let Some(owner) = owner {
+            let candidates = cpp_direct_member_candidates(
+                analyzer,
+                support,
+                &[owner],
+                cpp_node_text(name, source),
+            );
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+        } else {
+            // A template type parameter names no indexed type but is
+            // lexically visible inside its own template (cutlass's
+            // `OperandLayout::packed` inside OperandSharedStorage). The
+            // enclosing-scope walk finds the parameter's declaration when
+            // it is indexed; without it the qualifier fell through to a
+            // dishonest include-boundary claim (tier-4 DeepSpeed).
+            if let Some(parameter) =
+                resolve_in_enclosing_scopes(analyzer, file, scope_text, node.start_byte(), |_| true)
+            {
+                let member = cpp_node_text(name, source);
+                let candidates = cpp_direct_member_candidates(
+                    analyzer,
+                    support,
+                    std::slice::from_ref(&parameter),
+                    member,
+                );
+                if !candidates.is_empty() {
+                    return candidates_outcome(candidates);
+                }
+                // A parameter's members are unknowable statically; the best
+                // answer for the qualified reference is the parameter
+                // declaration itself.
+                return candidates_outcome(vec![parameter]);
+            }
         }
     }
     if matches!(

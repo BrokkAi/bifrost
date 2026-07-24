@@ -3251,6 +3251,103 @@ fn csharp_dotted_type_lookup_allows_imported_nested_type() {
     );
 }
 
+// A template type parameter is lexically visible inside its own template:
+// `OperandLayout::packed` inside OperandSharedStorage resolves to the
+// parameter declaration, not to a dishonest include-boundary claim
+// (tier-4 DeepSpeed cutlass shape, #1129).
+#[test]
+fn cpp_template_type_parameter_resolves_from_own_template_scope() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "mma.h",
+            r###"#include <unsupported/blas.h>
+namespace cutlass { namespace gemm { namespace threadblock {
+/// instructions.
+template <
+    /// Size of the Gemm problem - concept: gemm::GemmShape<>
+    typename Shape_,
+    /// Policy describing tuning details (concept: MmaPolicy)
+    typename Policy_,
+    /// Number of stages,
+    int Stages,
+    /// Used for partial specialization
+    typename Enable = bool>
+class CustomMmaBase {
+public:
+    ///< Size of the Gemm problem - concept: gemm::GemmShape<>
+    using Shape = Shape_;
+
+    ///< Policy describing tuning details
+    using Policy = Policy_;
+
+    //
+    // Dependent types
+    //
+
+    /// Warp-level Mma
+    using Operator = typename Policy::Operator;
+
+    /// Shape describing the overall GEMM computed from shared memory
+    /// by each warp.
+    using WarpGemm = typename Policy::Operator::Shape;
+
+    /// Shape describing the number of warps filling the CTA
+    using WarpCount =
+        GemmShape<Shape::kM / WarpGemm::kM, Shape::kN / WarpGemm::kN, Shape::kK / WarpGemm::kK>;
+
+    /// Number of warp-level GEMM oeprations
+    static int const kWarpGemmIterations = (WarpGemm::kK / Operator::Policy::MmaShape::kK);
+
+    /// Number of stages
+    static int const kStages = Stages;
+
+    //
+    // Nested structs
+    //
+
+    /// Shared storage object needed by threadblock-scoped GEMM
+    template <typename Element, typename OperandShape, typename OperandLayout>
+    struct OperandSharedStorage {
+        AlignedBuffer<Element, OperandShape::kCount> buffer;
+        using TensorRef = TensorRef<Element, OperandLayout>;
+
+        CUTLASS_DEVICE
+        static OperandLayout Layout()
+        {
+            return OperandLayout::packed({OperandShape::kRow, OperandShape::kColumn});
+        }
+
+        /// Returns a TensorRef to the operand
+        CUTLASS_HOST_DEVICE
+        TensorRef ref() { return TensorRef{buffer.data(), Layout()}; }
+    };
+}}}
+"###,
+        )
+        .build();
+
+    let line =
+        "            return OperandLayout::packed({OperandShape::kRow, OperandShape::kColumn});";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"mma.h","line":55,"column":{}}}]}}"#,
+            column_of(line, "OperandLayout::packed")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "mma.h", "{value}");
+    assert!(
+        result["definitions"][0]["fqn"]
+            .as_str()
+            .unwrap()
+            .ends_with("OperandSharedStorage.OperandLayout"),
+        "{value}"
+    );
+}
+
 // A nested type is visible from a sibling nested type's member type position:
 // the enclosing class scopes the lookup even though the member's own nested
 // class carries a `$`-joined fq (#1105 — the scope walk must not skip the
