@@ -291,6 +291,10 @@ pub struct ProbeSummary {
     /// package/module declaration, whose "path" is a convention rather than
     /// a per-file contract.
     pub skipped_module_summary_element: usize,
+    /// I3(a) follow-ups skipped because the summary element is an
+    /// include/import directive, whose "symbol" is a file path rather than
+    /// a resolvable code symbol.
+    pub skipped_include_summary_element: usize,
     /// Summary probes skipped for empty files (e.g. 0-byte `__init__.py`):
     /// an all-empty response is a valid result there, not a refusal.
     pub skipped_empty_file_summaries: usize,
@@ -1158,6 +1162,17 @@ fn derive_follow_ups(
                             // I1(b) module naming convention).
                             if element.get("kind").and_then(Value::as_str) == Some("module") {
                                 summary.skipped_module_summary_element += 1;
+                                continue;
+                            }
+                            // Include/import elements (`#include <Features/Feature.h>`)
+                            // name a file path, not a resolvable code symbol;
+                            // the I3a round-trip cannot apply to them (tier-4
+                            // rdkit).
+                            if matches!(
+                                element.get("kind").and_then(Value::as_str),
+                                Some("include") | Some("import")
+                            ) {
+                                summary.skipped_include_summary_element += 1;
                                 continue;
                             }
                             // Go blank identifiers (`pkg._module_._`):
