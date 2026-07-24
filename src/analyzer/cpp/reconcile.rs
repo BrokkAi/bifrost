@@ -96,9 +96,9 @@ pub(crate) fn reconcile_out_of_line_member_identity(
         let mut confirmed: Option<ReconciledIdentity> = None;
         for namespace in namespace_candidates {
             let package = join_namespace(namespace, namespace_prefix);
-            let matches = class_table.iter().any(|visible| {
-                visible.package == package && visible.nested_short_name == chain
-            });
+            let matches = class_table
+                .iter()
+                .any(|visible| visible.package == package && visible.nested_short_name == chain);
             if !matches {
                 continue;
             }
@@ -157,8 +157,14 @@ mod tests {
     #[test]
     fn file_scope_using_directive_shape_recovers_namespace_and_chain() {
         let table = [
-            VisibleClass { package: "log4cxx", nested_short_name: "Outer" },
-            VisibleClass { package: "log4cxx", nested_short_name: "Outer$Inner" },
+            VisibleClass {
+                package: "log4cxx",
+                nested_short_name: "Outer",
+            },
+            VisibleClass {
+                package: "log4cxx",
+                nested_short_name: "Outer$Inner",
+            },
         ];
         let reconciled = reconcile_out_of_line_member_identity(
             &["Outer", "Inner"],
@@ -166,7 +172,10 @@ mod tests {
             &["", "log4cxx"],
             &table,
         );
-        assert_eq!(reconciled, Some(identity("log4cxx", "Outer$Inner", "method")));
+        assert_eq!(
+            reconciled,
+            Some(identity("log4cxx", "Outer$Inner", "method"))
+        );
     }
 
     /// Template-specialization twin inside `namespace ns {}`:
@@ -175,13 +184,12 @@ mod tests {
     /// `ns::Outer::Inner`, folding `Outer` back into the class chain.
     #[test]
     fn template_shape_inside_namespace_block_folds_outer_into_chain() {
-        let table = [VisibleClass { package: "ns", nested_short_name: "Outer$Inner" }];
-        let reconciled = reconcile_out_of_line_member_identity(
-            &["Outer", "Inner"],
-            "method",
-            &["ns"],
-            &table,
-        );
+        let table = [VisibleClass {
+            package: "ns",
+            nested_short_name: "Outer$Inner",
+        }];
+        let reconciled =
+            reconcile_out_of_line_member_identity(&["Outer", "Inner"], "method", &["ns"], &table);
         assert_eq!(reconciled, Some(identity("ns", "Outer$Inner", "method")));
     }
 
@@ -192,7 +200,10 @@ mod tests {
     /// must never corrupt the owner into `ns1$ns2$Klass`.
     #[test]
     fn genuine_namespace_chain_keeps_namespace_reading() {
-        let table = [VisibleClass { package: "ns1::ns2", nested_short_name: "Klass" }];
+        let table = [VisibleClass {
+            package: "ns1::ns2",
+            nested_short_name: "Klass",
+        }];
         let reconciled = reconcile_out_of_line_member_identity(
             &["ns1", "ns2", "Klass"],
             "method",
@@ -207,15 +218,17 @@ mod tests {
     #[test]
     fn prefers_longest_confirmed_class_chain() {
         let table = [
-            VisibleClass { package: "a::Outer", nested_short_name: "Inner" },
-            VisibleClass { package: "a", nested_short_name: "Outer$Inner" },
+            VisibleClass {
+                package: "a::Outer",
+                nested_short_name: "Inner",
+            },
+            VisibleClass {
+                package: "a",
+                nested_short_name: "Outer$Inner",
+            },
         ];
-        let reconciled = reconcile_out_of_line_member_identity(
-            &["Outer", "Inner"],
-            "method",
-            &["a"],
-            &table,
-        );
+        let reconciled =
+            reconcile_out_of_line_member_identity(&["Outer", "Inner"], "method", &["a"], &table);
         assert_eq!(reconciled, Some(identity("a", "Outer$Inner", "method")));
     }
 
@@ -237,8 +250,14 @@ mod tests {
     #[test]
     fn ambiguous_equal_depth_readings_return_none() {
         let table = [
-            VisibleClass { package: "one", nested_short_name: "Outer$Inner" },
-            VisibleClass { package: "two", nested_short_name: "Outer$Inner" },
+            VisibleClass {
+                package: "one",
+                nested_short_name: "Outer$Inner",
+            },
+            VisibleClass {
+                package: "two",
+                nested_short_name: "Outer$Inner",
+            },
         ];
         let reconciled = reconcile_out_of_line_member_identity(
             &["Outer", "Inner"],
