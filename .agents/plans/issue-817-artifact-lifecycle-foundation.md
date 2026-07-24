@@ -2,7 +2,7 @@
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows `.agents/PLANS.md`. It implements the first independently useful checkpoint of GitHub issue #817, “Engineer compact semantic graph snapshots and lifecycle-aware persistence.” It does not claim to close the issue: reusable procedure, taint, and protocol summaries do not yet exist, so their storage shape and persistence decision remain downstream work with #820 and #823.
+This document follows `.agents/PLANS.md`. It implements GitHub issue #817, “Engineer compact semantic graph snapshots and lifecycle-aware persistence.” Reusable procedure, taint, and protocol summaries do not yet exist, so their storage shape and persistence decision remain downstream work with #820 and #823 rather than unfinished #817 scope.
 
 ## Purpose / Big Picture
 
@@ -24,6 +24,7 @@ The observable outcome is a retained benchmark report over generated projects, i
 - [x] (2026-07-24 10:50Z) Completed security, duplication, intent, DevOps, and architecture reviews; hardened provenance, promotion-state consistency, signal cleanup, locked execution, and topology validation in response.
 - [x] (2026-07-24 11:05Z) Re-ran the complete 72-process v2 matrix after review. All 56 retained samples reproduced canonical typed ICFG topology and result identity, and the report now contains the reviewed provenance, medians, and raw rows.
 - [x] (2026-07-24 11:12Z) Passed the final focused unit and integration tests, formatting, shell syntax, diff hygiene, and strict locked all-target/all-feature Clippy in a cleaned isolated target.
+- [x] (2026-07-24 11:21Z) Re-verified the live issue and current `origin/master`; #817 acceptance is complete, future summary work remains owned by dependent #823, and a read-only merge simulation found no conflict with the 12 newer upstream commits.
 
 ## Surprises & Discoveries
 
@@ -103,6 +104,8 @@ The reusable promotion evaluator, corrected lifecycle matrix, and reproducible d
 The measurements support a narrow conclusion: bounded exploded data-flow states are request-local and not eligible for persistence. They do not measure an equivalent reusable serialized candidate, so they are not a persistence no-go for the procedure summaries deferred to #823. No production persistence, cache, packed data-flow DTO, or durable `FactId` was introduced.
 
 Review materially improved the evidence boundary. The promotion result can no longer carry a contradictory aggregate boolean; untracked symlinks are fingerprinted without following them; large files are streamed; host provenance omits the hostname; runner builds are locked and interruption-safe; and retained samples prove the exact canonical typed ICFG topology rather than only its counts. The complete feature-enabled suite passed on the host, and the reviewed result passed the final focused tests, formatting, shell syntax, diff hygiene, and strict all-target/all-feature Clippy.
+
+The live #817 acceptance criteria are satisfied. Every currently promoted or measured artifact has a documented lifecycle and identity boundary; existing structural and semantic/CFG evidence covers parity, compact traversal, warm reuse, safe invalidation, corruption, and promotion failure; the new solver measurement carries the required provenance, size, work, cache-status, and completeness fields; and no query-local state is persisted or eagerly hydrated. #823 explicitly depends on #817 and owns the future summary algebra, in-memory reuse, and any separately measured summary-persistence promotion.
 
 ## Context and Orientation
 
