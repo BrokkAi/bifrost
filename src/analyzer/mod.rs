@@ -61,7 +61,9 @@ pub use config::{
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
-    IncludeTargetIndex, cpp_template_term, include_paths as cpp_include_paths,
+    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, IncludeTargetIndex,
+    cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
+    cpp_indexed_callable_linkage, cpp_template_term, include_paths as cpp_include_paths,
     node_text as cpp_node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
     resolve_include_targets, resolve_include_targets_with_index,
 };
