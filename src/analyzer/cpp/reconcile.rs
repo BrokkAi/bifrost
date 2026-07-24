@@ -43,6 +43,20 @@ pub(crate) struct ReconciledIdentity {
     pub member: String,
 }
 
+impl ReconciledIdentity {
+    /// Render this identity as a `CodeUnit`-style `fq_name`
+    /// (`package.owner_chain.member`, package omitted at global scope), so it can
+    /// be compared against and keyed alongside stored identities.
+    pub(crate) fn fq_name(&self) -> String {
+        let short = format!("{}.{}", self.owner_chain, self.member);
+        if self.package.is_empty() {
+            short
+        } else {
+            format!("{}.{}", self.package, short)
+        }
+    }
+}
+
 /// Decide the canonical identity of an out-of-line member definition from its
 /// qualifier segments and the include-visible class table.
 ///
