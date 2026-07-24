@@ -19,7 +19,8 @@ The observable outcome is a retained benchmark report over generated projects, i
 - [x] (2026-07-24 07:44Z) Published the artifact lifecycle matrix and checkpointed the plan in `b1aeef86`.
 - [x] (2026-07-24 07:49Z) Added the reusable artifact-promotion benchmark API, migrated the semantic CFG persistence gate without changing its report shape, and passed focused unit and integration tests.
 - [x] (2026-07-24 08:08Z) Added the fresh-process data-flow lifecycle benchmark and runner; seven non-ignored schema/behavior tests pass, and release smokes select and solve the exact pinned VS Code and Spring PetClinic procedures.
-- [ ] Run the retained matrix, record the evidence and decision, and complete focused and repository-wide validation.
+- [x] (2026-07-24 08:27Z) Ran 72 fresh release processes, retained and invariant-checked 56 samples across all eight required datasets, and recorded the medians, raw timing/RSS rows, provenance, and `ephemeral_not_eligible` decision.
+- [ ] Complete focused and repository-wide validation.
 - [ ] Run specialist review, resolve findings, update the retrospective, and checkpoint the reviewed result.
 
 ## Surprises & Discoveries
@@ -41,6 +42,12 @@ The observable outcome is a retained benchmark report over generated projects, i
 
 - Observation: both pinned external roots resolve uniquely through structured declaration suffixes, and both bounded ICFGs remain traversable while visibly incomplete.
   Evidence: the VS Code `Function(quickSelect)` release smoke produced 31 reachable nodes with an `unknown` outcome and two boundaries; Spring PetClinic `Type(OwnerController)::Method(processFindForm)` produced 41 reachable nodes with an `unsupported` outcome and two boundaries. Both clients reached fixed points without claiming complete coverage.
+
+- Observation: workspace RSS and exploded-result size are different lifecycle signals.
+  Evidence: the retained VS Code median process peak was 659.0 MiB while its finite result's public shallow slices were 5,136 bytes. The largest result was instead the complete 512-branch finite workload at 98,313 reached states and 1,179,940 shallow bytes, with a 34.9 MiB process peak.
+
+- Observation: immediate repeated execution is not reliably faster and is not cache reuse.
+  Evidence: the complete 512-branch finite workload had 34.512 ms first-solve and 63.640 ms repeat-solve medians while preserving exact work and checksums. The benchmark therefore reports both timings without treating their difference as a hydration speedup.
 
 ## Decision Log
 
@@ -70,7 +77,7 @@ The observable outcome is a retained benchmark report over generated projects, i
 
 ## Outcomes & Retrospective
 
-Work is in progress. The intended outcome is a reusable promotion evaluator, a complete lifecycle matrix, and a reproducible data-flow lifecycle report with no production persistence change. Update this section after each checkpoint with exact commands, results, deviations, and remaining #817 work.
+The reusable promotion evaluator, complete lifecycle matrix, and reproducible data-flow lifecycle report are implemented. The retained run used Bifrost `da37cbc8`, rustc 1.96.0, macOS arm64, exact clean VS Code and Spring PetClinic revisions, nine fresh processes per dataset, and seven retained samples per group. All 56 retained samples had stable topology, work, results, and checksums; all clients reached fixed points; incomplete ICFG inputs remained incomplete. No production persistence, cache, packed data-flow DTO, or durable `FactId` was introduced. Repository-wide validation and specialist review remain before the final retrospective.
 
 ## Context and Orientation
 
