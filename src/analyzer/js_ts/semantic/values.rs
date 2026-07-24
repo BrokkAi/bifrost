@@ -160,7 +160,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let (value, _) = self.session.cache_value_with_metadata(
+        let value = self.session.insert_cached_value_with_metadata(
             builder,
             &mut self.expression_values,
             node.id(),

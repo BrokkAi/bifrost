@@ -19,8 +19,8 @@ After this change, every language will still own syntax recognition, evaluation 
 - [x] (2026-07-24 18:19Z) Milestone 2: finished the syntax-free lowering kernel by sharing control targets, value interning, callable-resolution gaps, iterative-driver completion, and the identical await core.
 - [x] (2026-07-24 18:47Z) Milestone 3: extracted small structured-control combinators for conditional choices, short-circuit conditions, and C-style loops while leaving AST classification in language adapters.
 - [x] (2026-07-24 19:10Z) Milestone 4: extracted cleanup-route specialization and migrated the compatible try/finally implementations.
-- [x] (2026-07-24 19:30Z) Milestone 5: centralized duplicated data-flow outcome status, deterministic ordering, and cancellation-atomic budget reservation without merging the distinct solver engines.
-- [ ] Milestone 6: run formatting, focused and full feature-enabled tests, clippy, CPD remeasurement, adversarial review, and publish a draft pull request.
+- [x] (2026-07-24 19:30Z) Milestone 5: centralized duplicated data-flow outcome status, deterministic ordering, and cancellation-checkpointed budget reservation without merging the distinct solver engines.
+- [ ] Milestone 6: formatting, focused semantic/data-flow tests, isolated all-targets clippy, CPD remeasurement, and five specialist review passes are complete. Publication remains.
 
 ## Surprises & Discoveries
 
@@ -36,8 +36,20 @@ After this change, every language will still own syntax recognition, evaluation 
 - Observation: Bifrost method-usage resolution has a likely false-negative and latency issue in this area.
   Evidence: `scan_usages_by_location` for `ProcedureLoweringSession::add_call_site` took 117 seconds and classified direct Java, JavaScript/TypeScript, and same-file test calls as unproven even though their receiver type is statically apparent. This is outside the implementation scope and should be reported separately.
 
-- Observation: the repository's all-feature test command does not currently link on this macOS host when the `python` feature is enabled directly through Cargo.
-  Evidence: `cargo test --features nlp,python --test semantic_language_conformance enumeration` compiled the Rust sources, then failed while linking `libbrokk_bifrost.dylib` with unresolved `_Py*` symbols. The default-feature semantic conformance and CFG contract suites both link and pass; the final gate will retry with the repository's Python build environment before classifying this as an external blocker.
+- Observation: all-feature validation on this macOS host needs the extension-module dynamic lookup flags, and MCP stderr integration tests need ordinary host IPC permissions.
+  Evidence: `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' cargo test --features nlp,python` links the Python feature correctly. The five MCP stderr tests pass outside the filesystem sandbox; their sandboxed `PermissionDenied` results were environmental rather than product failures.
+
+- Observation: review exposed several allocation-order contracts that clone-shaped extraction can easily obscure.
+  Evidence: the await helper must interleave source mapping and point allocation, cleanup-route specialization must yield newly created routes one at a time so adapters retain relay/body order, and C#/Java classic loops allocate update points before initializer points. Tight-budget regressions now lock all three behaviors.
+
+- Observation: C# and Java's repeated `for` fields include unnamed comma tokens.
+  Evidence: passing every child into the shared scheduler dropped multi-initializer and multi-update loops at the adapter boundary. Both adapters now pass named children only, and a cross-language conformance test proves initializer, update, and continue order.
+
+- Observation: retained semantic artifacts and cold materialization have intentionally different work profiles.
+  Evidence: inventory traversal is charged only on a cold lower; cache hits charge source capture plus retained artifact work. Publication now reconciles any uncharged cold observed work with the caller ledger, and source points-to staging tests measure their cache-hit baseline explicitly.
+
+- Observation: the full all-feature suite has a deterministic PHP usage-graph failure already present on `origin/master`.
+  Evidence: `usage_graph_php_test::resolves_free_function_instance_static_and_self_calls` omits `App.Consumer.callsSelfMethod -> App.Consumer.viaInstance`. The test, fixture, PHP usage-graph implementation, and search-tool path are unchanged on this branch, and `usage_graph` does not invoke semantic materialization. This sweep does not widen into that unrelated same-owner resolution defect.
 
 ## Decision Log
 
@@ -73,6 +85,12 @@ Milestone 4 centralizes cleanup-region lookup, specialization allocation, dense 
 
 Milestone 5 replaces the direct-ICFG and summary-specific semantic status enums with one `SemanticInputStatus` implementation and role-specific public aliases. Labels, accessors, commutative merge precedence, hashing, and deterministic ordering now have one source of truth. `DataflowRequest::reserve` centralizes the cancellation-check/staged-charge/recheck/commit transaction used by direct tabulation, transfer evaluation, and immediate summary reservations; the incoming-call multi-stage transaction remains bespoke because its budget cannot commit until later staging succeeds. Eight data-flow unit tests, 12 direct-client tests, and 22 summary tests pass. The milestone removes about 70 net lines.
 
+Milestone 6's adversarial review covered duplication, intent/architecture, security/performance, test quality, and operations/maintenance. The resulting hardening preserves allocation and budget-observation order, lazily publishes cleanup metadata only for new routes, removes orphan evidence on reused specializations, makes cached-value insertion misses explicit, centralizes the initial CFG work estimate, exhaustively tests the semantic-status algebra, and rebalances the receiver bridge's fixed aggregate scope cap toward syntax traversal without raising the cap.
+
+The final PMD 7.14.0 comparison uses identical 80-token scans over `src/analyzer` and `src/searchtools` at `origin/master` `3317217e` and this branch. Cross-language handler clone blocks fell from 680 to 607 and token mass from 91,709 to 79,951. Within semantic lowering, blocks fell from 424 to 351, token mass from 53,899 to 42,141 (down 21.8%), and the largest clone fell from 601 to 429 tokens. The remaining Java/JavaScript structured-statement pair rose slightly from 3,265 to 3,372 tokens because their language-owned syntax glue remains deliberately separate; the total semantic clone surface still dropped materially.
+
+Formatting and isolated `cargo clippy --all-targets --all-features -- -D warnings` pass. Focused semantic CFG/language, data-flow, receiver-budget, semantic-provider, and source-projection tests pass. The all-feature run passes every sweep-related target and reaches the unchanged PHP usage-graph failure described above; the same failure reproduces alone and is recorded as a base-branch defect rather than hidden by this refactor.
+
 ## Context and Orientation
 
 The repository root is the working directory. `src/analyzer/semantic/lowering.rs` contains syntax-free helpers used by every semantic adapter, including declaration-path utilities, procedure batch lowering, `ProcedureLoweringSession`, and `CallSiteScaffold`. `src/analyzer/semantic/cfg.rs` contains the mutable procedure CFG builder. Language adapters live in `src/analyzer/{cpp,csharp,go,php,python,ruby,rust,scala}/semantic.rs`; Java and JavaScript/TypeScript split the same responsibilities across `semantic/inventory.rs`, `semantic/control.rs`, `semantic/values.rs`, and related modules.
@@ -97,7 +115,7 @@ Milestone 3 creates syntax-free scheduling functions for stable control shapes. 
 
 Milestone 4 extracts cleanup-route specialization. The shared helper handles direct routing when no cleanup exists, creates or reuses specialized cleanup entries, retains dense point metadata, preserves the destination edge kind, and returns newly created cleanup steps to the adapter. The adapter still decides whether the step is an executable `finally` body or an opaque resource, monitor, fixed, ensure, or context-manager boundary. Migrate compatible C#, Java, Python, Scala, JavaScript/TypeScript, PHP, and Ruby routes incrementally. Do not force Rust RAII or C++ destruction into the generic try model. Validate normal and exceptional relay edge kinds, update the plan, and commit.
 
-Milestone 5 introduces one shared semantic outcome status for direct ICFG input and aggregated summary results, with stable labels, accessors, hashing, ordering, and merge precedence. Retain public aliases or wrappers only where they communicate a distinct API role. Add a `DataflowRequest` operation that performs cancellation check, staged solver charge, a second cancellation check, and commit atomically; use it in tabulation, transfer evaluation, and summary solving. Centralize stable semantic-handle ordering rather than maintaining parallel handwritten rank functions. Run the data-flow test suites and commit.
+Milestone 5 introduces one shared semantic outcome status for direct ICFG input and aggregated summary results, with stable labels, accessors, hashing, ordering, and merge precedence. Retain public aliases or wrappers only where they communicate a distinct API role. Add a `DataflowRequest` operation that performs a cancellation check, staged solver charge, a second cancellation checkpoint, and commit; use it in tabulation, transfer evaluation, and summary solving. The token is cooperative, so this narrows the observation window without claiming synchronization with the final assignment. Centralize stable semantic-handle ordering rather than maintaining parallel handwritten rank functions. Run the data-flow test suites and commit.
 
 Milestone 6 validates and publishes. Run `cargo fmt`, focused semantic and data-flow suites, the full `cargo test --features nlp,python`, and `scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings`. Repeat PMD 7.14 CPD with an 80-token floor over `src/analyzer` and compare the exact issue #1159 pair masses and largest clones. Review the complete diff for security, duplication, intent, operations, and architecture; fix all critical and high findings and any bounded lower-severity findings that improve the extraction. Update this plan’s retrospective, commit the final review fixes, push the existing branch, and open a draft pull request targeting `master`.
 
@@ -119,7 +137,7 @@ Run focused semantic validation during milestones 1 through 4:
 Run focused data-flow validation during milestone 5:
 
     cargo test --features nlp,python dataflow
-    cargo test --features nlp,python --test dataflow_summary
+    cargo test --features nlp,python --test dataflow_summaries
 
 Use the repository helper for the final isolated clippy gate:
 
@@ -213,6 +231,6 @@ The exact language dialect type and error wrapping may follow existing module ty
 
 In `src/analyzer/semantic/lowering.rs` or `src/analyzer/semantic/control_lowering.rs`, define `ControlTarget`, shared cached-value and resolution-gap helpers, and small control-shape scheduling functions. These APIs must be generic over adapter-owned work payloads or closure constructors and must not depend on any language module.
 
-In `src/analyzer/dataflow`, define one semantic outcome status implementation and one cancellation-atomic staging operation on `DataflowRequest`. No new external crate dependencies are expected.
+In `src/analyzer/dataflow`, define one semantic outcome status implementation and one cancellation-checkpointed staging operation on `DataflowRequest`. No new external crate dependencies are expected.
 
-Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 5 to record completed shared kernels, bounded topology, cleanup and data-flow invariant extraction, regression coverage, and the host-specific Python extension link failure observed during all-feature validation.
+Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 5 to record completed shared kernels, bounded topology, cleanup and data-flow invariant extraction, and regression coverage. Updated again during Milestone 6 with specialist-review fixes, final CPD deltas, host-specific validation requirements, cold/cache work accounting, and the unrelated PHP base-branch gate failure.

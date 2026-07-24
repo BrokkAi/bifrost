@@ -2121,20 +2121,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let awaited_node = node
             .child_by_field_name("argument")
             .or_else(|| first_named_child(node));
-        let suspend_metadata = self.mapping(builder, node)?;
-        let normal_metadata = self.mapping(builder, node)?;
-        let exceptional_metadata = self.mapping(builder, node)?;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
             exceptional_resume: exceptional,
             ..
-        } = self.session.add_await_scaffold(
-            builder,
-            suspend_metadata,
-            normal_metadata,
-            exceptional_metadata,
-        )?;
+        } = self
+            .session
+            .add_await_scaffold(builder, |session, builder| {
+                session.add_node_mapping(builder, node)
+            })?;
         self.edge(builder, normal, next)?;
         self.abrupt(
             builder,
@@ -2533,15 +2529,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
-        let plan = plan_cleanup_route(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
             builder,
             &mut self.session,
-            route,
             &self.cleanups,
             |region| region.id,
             |region| region.body,
-        )?;
-        for step in plan.created {
+        )? {
             let body_next = if step.next.kind == ControlEdgeKind::Normal {
                 step.next
             } else {
@@ -2556,7 +2551,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope: step.region.outer_scope,
             });
         }
-        self.edge(builder, from, plan.target)
+        self.edge(builder, from, plan.target())
     }
 
     fn add_resource_cleanup_gaps(

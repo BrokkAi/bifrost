@@ -857,7 +857,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let (value, _) = self.session.cache_value_with_metadata(
+        let value = self.session.insert_cached_value_with_metadata(
             builder,
             &mut self.expression_values,
             node.id(),
@@ -3539,15 +3539,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
-        let plan = plan_cleanup_route(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
             builder,
             &mut self.session,
-            route,
             &self.cleanups,
             |region| region.id,
             |region| region.body,
-        )?;
-        for step in plan.created {
+        )? {
             let statement_next = if step.next.kind == ControlEdgeKind::Normal {
                 step.next
             } else {
@@ -3562,7 +3561,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope: step.region.outer_scope,
             });
         }
-        self.edge(builder, from, plan.target)
+        self.edge(builder, from, plan.target())
     }
 
     fn resolution_gaps(

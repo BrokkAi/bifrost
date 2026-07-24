@@ -1015,27 +1015,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
         let body = required_field(node, "body")?;
-        let initializers = children_by_field_name(node, "init");
+        let initializers = children_by_field_name(node, "init")
+            .into_iter()
+            .filter(Node::is_named)
+            .collect::<Vec<_>>();
         let condition = node.child_by_field_name("condition");
-        let updates = children_by_field_name(node, "update");
+        let updates = children_by_field_name(node, "update")
+            .into_iter()
+            .filter(Node::is_named)
+            .collect::<Vec<_>>();
         let condition_entry = match condition {
             Some(condition) => self.point(builder, condition, Vec::new())?,
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
-        let update_entries = updates
-            .iter()
-            .map(|update| self.point(builder, *update, Vec::new()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let initializer_entries = initializers
-            .iter()
-            .map(|initializer| self.point(builder, *initializer, Vec::new()))
+        let updates = updates
+            .into_iter()
+            .map(|update| {
+                self.point(builder, update, Vec::new())
+                    .map(|entry| (update, entry))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let initializers = initializers
             .into_iter()
-            .zip(initializer_entries)
-            .collect::<Vec<_>>();
-        let updates = updates.into_iter().zip(update_entries).collect::<Vec<_>>();
+            .map(|initializer| {
+                self.point(builder, initializer, Vec::new())
+                    .map(|entry| (initializer, entry))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         schedule_c_style_loop(
             builder,
             &self.session,
@@ -2108,15 +2115,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        let plan = plan_cleanup_route(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
             builder,
             &mut self.session,
-            route,
             &self.cleanups,
             |region| region.id,
             |region| region.body.source_node(),
-        )?;
-        for step in plan.created {
+        )? {
             match step.region.body {
                 CleanupBody::Statement(body) => {
                     let statement_next = if step.next.kind == ControlEdgeKind::Normal {
@@ -2173,7 +2179,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
             }
         }
-        self.edge(builder, from, plan.target)
+        self.edge(builder, from, plan.target())
     }
 
     fn edge(

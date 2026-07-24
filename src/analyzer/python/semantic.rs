@@ -849,7 +849,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let (value, _) = self.session.cache_value_with_metadata(
+        let value = self.session.insert_cached_value_with_metadata(
             builder,
             &mut self.expression_values,
             node.id(),
@@ -2681,20 +2681,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
         let awaited_node = first_named_child(node);
-        let suspend_metadata = self.mapping(builder, node)?;
-        let normal_metadata = self.mapping(builder, node)?;
-        let exceptional_metadata = self.mapping(builder, node)?;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
             exceptional_resume: exceptional,
             ..
-        } = self.session.add_await_scaffold(
-            builder,
-            suspend_metadata,
-            normal_metadata,
-            exceptional_metadata,
-        )?;
+        } = self
+            .session
+            .add_await_scaffold(builder, |session, builder| {
+                session.add_node_mapping(builder, node)
+            })?;
         self.edge(builder, normal, next)?;
         self.abrupt(
             builder,
@@ -2903,15 +2899,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
-        let plan = plan_cleanup_route(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
             builder,
             &mut self.session,
-            route,
             &self.cleanups,
             |region| region.id,
             |region| region.body.source_node(),
-        )?;
-        for step in plan.created {
+        )? {
             let CleanupBody::Statement(body) = step.region.body;
             let statement_next = if step.next.kind == ControlEdgeKind::Normal {
                 step.next
@@ -2927,7 +2922,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope: step.region.outer_scope,
             });
         }
-        self.edge(builder, from, plan.target)
+        self.edge(builder, from, plan.target())
     }
 
     fn resolution_gaps(

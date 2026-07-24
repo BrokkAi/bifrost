@@ -155,10 +155,11 @@ impl<'request> DataflowRequest<'request> {
         }
     }
 
-    /// Atomically reserve solver work unless cancellation wins before commit.
+    /// Reserve solver work with cancellation checkpoints around staging.
     ///
-    /// The second cancellation check prevents a staged budget from being
-    /// committed after the request has been cancelled.
+    /// The second check catches cancellation observed during staging. The
+    /// token remains cooperative rather than synchronized with assignment, so
+    /// cancellation may still race immediately after the final checkpoint.
     pub fn reserve(&mut self, work: SolverWork) -> Option<SolverTermination> {
         if self.cancellation.is_cancelled() {
             return Some(SolverTermination::Cancelled);
@@ -232,7 +233,7 @@ mod tests {
 
     #[test]
     fn request_reservation_does_not_commit_after_cancellation() {
-        let cancellation = CancellationToken::cancel_after_checks_for_test(1);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
         let mut budget = SolverBudget::uniform(4);
         let mut request = DataflowRequest::new(&mut budget, &cancellation);
 

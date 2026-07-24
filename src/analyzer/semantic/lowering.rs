@@ -312,6 +312,7 @@ pub(crate) type ScheduledControlNode<T> = (T, ProgramPointId);
 
 /// Push the three opaque work items for a conditional choice in execution
 /// order: evaluate the condition first, then only the selected arm.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule_conditional_choice<T, W>(
     stack: &mut Vec<W>,
     condition: ScheduledControlNode<T>,
@@ -366,76 +367,90 @@ pub(crate) struct CleanupSpecialization<R> {
     pub(crate) next: ControlTarget,
 }
 
-pub(crate) struct CleanupRoutePlan<R> {
-    pub(crate) target: ControlTarget,
-    pub(crate) created: Vec<CleanupSpecialization<R>>,
+pub(crate) struct CleanupRoutePlanner<'route> {
+    route: &'route CompletionRoute,
+    next_index: usize,
+    next: ControlTarget,
 }
 
-/// Allocate or reuse the cleanup-specialized entries for one completion route.
-///
-/// Region lookup and source-node selection are adapter-owned. The shared plan
-/// preserves the destination edge kind and reports only newly allocated steps
-/// for adapter-specific body or opaque-boundary scheduling.
-pub(crate) fn plan_cleanup_route<'tree, R>(
-    builder: &mut ProcedureCfgBuilder,
-    session: &mut ProcedureLoweringSession<'_>,
-    route: &CompletionRoute,
-    regions: &[R],
-    region_id: impl Fn(R) -> CleanupRegionId,
-    source_node: impl Fn(R) -> Node<'tree>,
-) -> Result<CleanupRoutePlan<R>, ProcedureLoweringError>
-where
-    R: Copy,
-{
-    let destination = ControlTarget {
-        point: route.destination().target(),
-        kind: route.destination().edge_kind(),
-    };
-    if route.cleanups().is_empty() {
-        return Ok(CleanupRoutePlan {
-            target: destination,
-            created: Vec::new(),
-        });
+impl<'route> CleanupRoutePlanner<'route> {
+    pub(crate) fn new(route: &'route CompletionRoute) -> Self {
+        Self {
+            route,
+            next_index: route.cleanups().len(),
+            next: ControlTarget {
+                point: route.destination().target(),
+                kind: route.destination().edge_kind(),
+            },
+        }
     }
 
-    let mut next = destination;
-    let mut first = None;
-    let mut created_steps = Vec::new();
-    for index in (0..route.cleanups().len()).rev() {
-        let expected = route.cleanups()[index];
-        let region = regions
-            .iter()
-            .copied()
-            .find(|region| region_id(*region) == expected)
-            .ok_or_else(|| ProcedureLoweringError::Invalid("missing cleanup region".into()))?;
-        let metadata = session.add_node_mapping(builder, source_node(region))?;
-        let (entry, created) =
-            builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-        if created {
-            session.register_point(
-                entry,
-                metadata,
-                "cleanup specialization broke dense point allocation",
-            )?;
-            created_steps.push(CleanupSpecialization {
-                region,
-                entry,
-                next,
-            });
+    /// Advance through reused entries and return the next newly allocated step.
+    ///
+    /// Yielding one step at a time lets the adapter finish its relay, body, or
+    /// gaps before the outer cleanup is allocated, preserving deterministic
+    /// point order and tight-budget outcomes.
+    pub(crate) fn next<'tree, R>(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        session: &mut ProcedureLoweringSession<'_>,
+        regions: &[R],
+        region_id: impl Fn(R) -> CleanupRegionId,
+        source_node: impl Fn(R) -> Node<'tree>,
+    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError>
+    where
+        R: Copy,
+    {
+        while self.next_index > 0 {
+            self.next_index -= 1;
+            let index = self.next_index;
+            let expected = self.route.cleanups()[index];
+            let region = regions
+                .iter()
+                .copied()
+                .find(|region| region_id(*region) == expected)
+                .ok_or_else(|| ProcedureLoweringError::Invalid("missing cleanup region".into()))?;
+            let (entry, step) =
+                if let Some(entry) = builder.cleanup_specialization_entry(self.route, index) {
+                    (entry, None)
+                } else {
+                    let metadata = session.add_node_mapping(builder, source_node(region))?;
+                    let (entry, created) = builder.cleanup_specialization(
+                        self.route,
+                        index,
+                        metadata.source,
+                        metadata.evidence,
+                    )?;
+                    debug_assert!(created, "cleanup lookup and allocation must agree");
+                    session.register_point(
+                        entry,
+                        metadata,
+                        "cleanup specialization broke dense point allocation",
+                    )?;
+                    (
+                        entry,
+                        Some(CleanupSpecialization {
+                            region,
+                            entry,
+                            next: self.next,
+                        }),
+                    )
+                };
+            self.next = ControlTarget {
+                point: entry,
+                kind: ControlEdgeKind::Cleanup,
+            };
+            if step.is_some() {
+                return Ok(step);
+            }
         }
-        next = ControlTarget {
-            point: entry,
-            kind: ControlEdgeKind::Cleanup,
-        };
-        first = Some(entry);
+        Ok(None)
     }
-    Ok(CleanupRoutePlan {
-        target: ControlTarget {
-            point: first.expect("route with cleanup regions has an entry"),
-            kind: ControlEdgeKind::Cleanup,
-        },
-        created: created_steps,
-    })
+
+    pub(crate) fn target(&self) -> ControlTarget {
+        debug_assert_eq!(self.next_index, 0, "cleanup route planning is incomplete");
+        self.next
+    }
 }
 
 /// Schedule a boolean short-circuit pair after the adapter has identified its
@@ -884,23 +899,27 @@ impl<'a> ProcedureLoweringSession<'a> {
         Ok(id)
     }
 
-    /// Retain a semantic value at most once for one adapter-selected syntax
-    /// identity. The returned flag distinguishes a newly allocated value so an
-    /// adapter can attach auxiliary type or binding metadata exactly once.
-    pub(crate) fn cache_value_with_metadata(
+    /// Retain a semantic value after the adapter has established that its
+    /// syntax identity is absent from the cache.
+    ///
+    /// Keeping the lookup adapter-side ensures source metadata is allocated
+    /// only for a new value rather than leaked on a cache hit.
+    pub(crate) fn insert_cached_value_with_metadata(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         cache: &mut HashMap<usize, ValueId>,
         syntax_id: usize,
         metadata: PointMetadata,
         kind: SemanticValueKind,
-    ) -> Result<(ValueId, bool), ProcedureLoweringError> {
-        if let Some(value) = cache.get(&syntax_id).copied() {
-            return Ok((value, false));
-        }
+    ) -> Result<ValueId, ProcedureLoweringError> {
+        debug_assert!(
+            !cache.contains_key(&syntax_id),
+            "cached value insertion requires an adapter-side miss"
+        );
         let value = self.add_value_with_metadata(builder, metadata, kind)?;
-        cache.insert(syntax_id, value);
-        Ok((value, true))
+        let previous = cache.insert(syntax_id, value);
+        debug_assert!(previous.is_none(), "cached value insertion replaced a row");
+        Ok(value)
     }
 
     /// Emit the language-neutral suspend and two-resume core of an await.
@@ -910,12 +929,16 @@ impl<'a> ProcedureLoweringSession<'a> {
     pub(crate) fn add_await_scaffold(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        suspend_metadata: PointMetadata,
-        normal_metadata: PointMetadata,
-        exceptional_metadata: PointMetadata,
+        mut add_mapping: impl FnMut(
+            &mut ProcedureLoweringSession<'_>,
+            &mut ProcedureCfgBuilder,
+        ) -> Result<PointMetadata, ProcedureLoweringError>,
     ) -> Result<AwaitScaffold, ProcedureLoweringError> {
+        let suspend_metadata = add_mapping(self, builder)?;
         let suspend = self.add_point(builder, suspend_metadata, Vec::new())?;
+        let normal_metadata = add_mapping(self, builder)?;
         let normal_resume = self.add_point(builder, normal_metadata, Vec::new())?;
+        let exceptional_metadata = add_mapping(self, builder)?;
         let exceptional_resume = self.add_point(builder, exceptional_metadata, Vec::new())?;
         let awaited = self.add_value(builder, suspend, SemanticValueKind::Temporary)?;
         let result = self.add_value(builder, normal_resume, SemanticValueKind::AwaitResult)?;
@@ -1256,9 +1279,11 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::analyzer::semantic::cfg::{CompletionKind, CompletionRequest};
     use crate::analyzer::semantic::{
         DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId, ProcedureKind,
-        SemanticLanguage, SourcePosition, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        SemanticBudgetDimension, SemanticLanguage, SourcePosition, SourceSpan, WorkspaceMountId,
+        WorkspaceRelativePath,
     };
 
     fn anchor(start: u32, end: u32, occurrence: u32) -> SourceAnchor {
@@ -1395,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_values_report_insertion_without_duplicate_rows() {
+    fn cached_value_insertion_retains_one_row() {
         let cancellation = CancellationToken::default();
         let ProcedureLoweringStart {
             mut builder,
@@ -1408,8 +1433,8 @@ mod tests {
             .expect("value mapping");
         let mut cache = HashMap::default();
 
-        let (first, inserted) = session
-            .cache_value_with_metadata(
+        let first = session
+            .insert_cached_value_with_metadata(
                 &mut builder,
                 &mut cache,
                 42,
@@ -1417,21 +1442,135 @@ mod tests {
                 SemanticValueKind::Temporary,
             )
             .expect("first cached value");
-        let (second, inserted_again) = session
-            .cache_value_with_metadata(
-                &mut builder,
-                &mut cache,
-                42,
-                metadata,
-                SemanticValueKind::Temporary,
-            )
-            .expect("reused cached value");
         let (parts, _) = builder.finish_with_work().expect("finished parts");
 
-        assert!(inserted);
-        assert!(!inserted_again);
-        assert_eq!(first, second);
+        assert_eq!(cache.get(&42), Some(&first));
         assert_eq!(parts.values.len(), 1);
+    }
+
+    #[test]
+    fn c_style_loop_schedules_execution_and_continue_targets() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            entry,
+            normal_exit,
+            function_scope,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let mut points = Vec::new();
+        for occurrence in 0..6 {
+            let metadata = session
+                .add_mapping(
+                    &mut builder,
+                    anchor(20 + occurrence, 21 + occurrence, occurrence),
+                    SourceMappingKind::Exact,
+                )
+                .expect("loop mapping");
+            points.push(
+                session
+                    .add_point(&mut builder, metadata, Vec::new())
+                    .expect("loop point"),
+            );
+        }
+        let [condition, body, update_one, update_two, init_one, init_two] = points.as_slice()
+        else {
+            panic!("expected six loop points");
+        };
+        type LoopWork = (
+            &'static str,
+            u8,
+            ProgramPointId,
+            ControlTarget,
+            Option<ControlTarget>,
+            ScopeFrameId,
+        );
+        let mut stack: Vec<LoopWork> = Vec::new();
+
+        schedule_c_style_loop(
+            &mut builder,
+            &session,
+            entry,
+            ControlTarget::normal(normal_exit),
+            function_scope,
+            None,
+            &[(1, *init_one), (2, *init_two)],
+            Some((3, *condition)),
+            *condition,
+            (4, *body),
+            &[(5, *update_one), (6, *update_two)],
+            &mut stack,
+            |payload, entry, next, scope| ("init", payload, entry, next, None, scope),
+            |payload, entry, next, scope| ("update", payload, entry, next, None, scope),
+            |payload, entry, next, scope| ("body", payload, entry, next, None, scope),
+            |payload, entry, when_true, when_false, scope| {
+                (
+                    "condition",
+                    payload,
+                    entry,
+                    when_true,
+                    Some(when_false),
+                    scope,
+                )
+            },
+        )
+        .expect("scheduled C-style loop");
+
+        let execution = stack.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(
+            execution
+                .iter()
+                .map(|work| (work.0, work.1))
+                .collect::<Vec<_>>(),
+            vec![
+                ("init", 1),
+                ("init", 2),
+                ("condition", 3),
+                ("body", 4),
+                ("update", 5),
+                ("update", 6),
+            ]
+        );
+        assert_eq!(execution[0].3, ControlTarget::normal(*init_two));
+        assert_eq!(execution[1].3, ControlTarget::normal(*condition));
+        assert_eq!(
+            execution[2].3,
+            ControlTarget {
+                point: *body,
+                kind: ControlEdgeKind::ConditionalTrue,
+            }
+        );
+        assert_eq!(
+            execution[2].4,
+            Some(ControlTarget {
+                point: normal_exit,
+                kind: ControlEdgeKind::ConditionalFalse,
+            })
+        );
+        assert_eq!(execution[3].3, ControlTarget::normal(*update_one));
+        assert_eq!(execution[4].3, ControlTarget::normal(*update_two));
+        assert_eq!(
+            execution[5].3,
+            ControlTarget {
+                point: *condition,
+                kind: ControlEdgeKind::LoopBack,
+            }
+        );
+
+        let loop_scope = execution[0].5;
+        let continue_route = builder
+            .resolve_completion(
+                loop_scope,
+                &CompletionRequest::new(CompletionKind::Continue, None),
+            )
+            .expect("continue route");
+        assert_eq!(continue_route.destination().target(), *update_one);
+        assert_eq!(
+            continue_route.destination().edge_kind(),
+            ControlEdgeKind::Normal
+        );
     }
 
     #[test]
@@ -1443,17 +1582,13 @@ mod tests {
             ..
         } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
             .expect("lowering start");
-        let suspend = session
-            .add_mapping(&mut builder, anchor(8, 14, 0), SourceMappingKind::Exact)
-            .expect("suspend mapping");
-        let normal = session
-            .add_mapping(&mut builder, anchor(8, 14, 1), SourceMappingKind::Exact)
-            .expect("normal mapping");
-        let exceptional = session
-            .add_mapping(&mut builder, anchor(8, 14, 2), SourceMappingKind::Exact)
-            .expect("exceptional mapping");
+        let mut occurrence = 0;
         let scaffold = session
-            .add_await_scaffold(&mut builder, suspend, normal, exceptional)
+            .add_await_scaffold(&mut builder, |session, builder| {
+                let current = occurrence;
+                occurrence += 1;
+                session.add_mapping(builder, anchor(8, 14, current), SourceMappingKind::Exact)
+            })
             .expect("await scaffold");
         let (parts, _) = builder.finish_with_work().expect("finished parts");
 
@@ -1478,6 +1613,195 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn await_scaffold_preserves_mapping_point_budget_order() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.program_points = 4;
+        let budget = SemanticBudget::new(limits).expect("positive budget");
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &budget, &cancellation)
+            .expect("lowering start");
+        let mut occurrence = 0;
+
+        let error = session
+            .add_await_scaffold(&mut builder, |session, builder| {
+                let current = occurrence;
+                occurrence += 1;
+                session.add_mapping(builder, anchor(8, 14, current), SourceMappingKind::Exact)
+            })
+            .expect_err("second await point should exceed the point budget");
+
+        let ProcedureLoweringError::Budget(exceeded, _) = error else {
+            panic!("expected a budget error");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::ProgramPoints);
+        let work = builder.prospective_work();
+        assert_eq!(work.program_points, 4);
+        assert_eq!(work.source_mappings, 3);
+        assert_eq!(work.evidence, 3);
+    }
+
+    #[test]
+    fn cleanup_planner_yields_before_allocating_the_next_step() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.program_points = 5;
+        let budget = SemanticBudget::new(limits).expect("positive budget");
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            exceptional_exit,
+            function_scope,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &budget, &cancellation)
+            .expect("lowering start");
+        let outer_region = CleanupRegionId::new(1);
+        let inner_region = CleanupRegionId::new(2);
+        let outer_scope = builder.push_scope(
+            Some(function_scope),
+            ScopeBinding::Cleanup {
+                region: outer_region,
+            },
+        );
+        let inner_scope = builder.push_scope(
+            Some(outer_scope),
+            ScopeBinding::Cleanup {
+                region: inner_region,
+            },
+        );
+        let route = builder
+            .resolve_completion(
+                inner_scope,
+                &CompletionRequest::new(CompletionKind::Throw, None),
+            )
+            .expect("throw route");
+        assert_eq!(route.destination().target(), exceptional_exit);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        let tree = parser
+            .parse("fn fixture() {}", None)
+            .expect("parsed fixture");
+        let node = tree.root_node();
+        let regions = [(outer_region, node), (inner_region, node)];
+        let mut planner = CleanupRoutePlanner::new(&route);
+
+        let first = planner
+            .next(
+                &mut builder,
+                &mut session,
+                &regions,
+                |region| region.0,
+                |region| region.1,
+            )
+            .expect("first cleanup step")
+            .expect("new outer cleanup specialization");
+        assert_eq!(first.entry.index(), 3);
+
+        let relay_metadata = session
+            .add_node_mapping(&mut builder, node)
+            .expect("relay mapping");
+        let relay = session
+            .add_point(&mut builder, relay_metadata, Vec::new())
+            .expect("relay point");
+        assert_eq!(relay.index(), 4);
+
+        let error = planner
+            .next(
+                &mut builder,
+                &mut session,
+                &regions,
+                |region| region.0,
+                |region| region.1,
+            )
+            .expect_err("inner entry should follow the relay and exceed the point budget");
+        let ProcedureLoweringError::Budget(exceeded, _) = error else {
+            panic!("expected a budget error");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::ProgramPoints);
+        let work = builder.prospective_work();
+        assert_eq!(work.program_points, 5);
+        assert_eq!(work.source_mappings, 4);
+        assert_eq!(work.evidence, 4);
+    }
+
+    #[test]
+    fn cleanup_planner_reuse_does_not_allocate_provenance() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            normal_exit,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let region_id = CleanupRegionId::new(1);
+        let route = builder.normal_cleanup_completion(region_id, normal_exit);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        let tree = parser
+            .parse("fn fixture() {}", None)
+            .expect("parsed fixture");
+        let node = tree.root_node();
+        let regions = [(region_id, node)];
+
+        let mut first_plan = CleanupRoutePlanner::new(&route);
+        let first = first_plan
+            .next(
+                &mut builder,
+                &mut session,
+                &regions,
+                |region| region.0,
+                |region| region.1,
+            )
+            .expect("first cleanup step")
+            .expect("new cleanup specialization");
+        assert!(
+            first_plan
+                .next(
+                    &mut builder,
+                    &mut session,
+                    &regions,
+                    |region| region.0,
+                    |region| region.1,
+                )
+                .expect("finished first plan")
+                .is_none()
+        );
+        let before_reuse = builder.prospective_work();
+
+        let mut reused_plan = CleanupRoutePlanner::new(&route);
+        assert!(
+            reused_plan
+                .next(
+                    &mut builder,
+                    &mut session,
+                    &regions,
+                    |region| region.0,
+                    |region| region.1,
+                )
+                .expect("reused cleanup plan")
+                .is_none()
+        );
+        assert_eq!(
+            reused_plan.target(),
+            ControlTarget {
+                point: first.entry,
+                kind: ControlEdgeKind::Cleanup,
+            }
+        );
+        assert_eq!(builder.prospective_work(), before_reuse);
     }
 
     #[test]

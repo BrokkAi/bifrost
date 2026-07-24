@@ -846,14 +846,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let (value, inserted) = self.session.cache_value_with_metadata(
+        let value = self.session.insert_cached_value_with_metadata(
             builder,
             &mut self.expression_values,
             node.id(),
             metadata,
             kind,
         )?;
-        if inserted && let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
+        if let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
             self.value_types.insert(value, identity);
         }
         Ok(value)

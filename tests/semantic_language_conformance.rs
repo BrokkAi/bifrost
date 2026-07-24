@@ -9061,7 +9061,7 @@ def evaluate():
             PointSelector::new("cleanup()")
                 .procedure("guarded")
                 .effect("invoke")
-                .anchor_occurrence(8),
+                .anchor_occurrence(5),
         )
         .bind(
             "common_cleanup_normal",
@@ -9069,7 +9069,7 @@ def evaluate():
                 .procedure("guarded")
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal)
-                .anchor_occurrence(9),
+                .anchor_occurrence(6),
         )
         .bind(
             "after_try_statement",

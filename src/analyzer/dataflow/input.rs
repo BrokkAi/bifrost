@@ -227,3 +227,79 @@ impl fmt::Display for DataflowError {
 }
 
 impl Error for DataflowError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic::{SemanticBudget, SemanticWork};
+
+    fn source_budget_error(limit: usize, attempted: usize) -> SemanticBudgetExceeded {
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = limit;
+        SemanticBudget::new(limits)
+            .expect("positive budget")
+            .check(SemanticWork {
+                source_bytes: attempted,
+                ..SemanticWork::default()
+            })
+            .expect_err("source budget should be exceeded")
+    }
+
+    fn procedure_budget_error(limit: usize, attempted: usize) -> SemanticBudgetExceeded {
+        let mut limits = SemanticBudget::default().limits();
+        limits.procedures = limit;
+        SemanticBudget::new(limits)
+            .expect("positive budget")
+            .check(SemanticWork {
+                procedures: attempted,
+                ..SemanticWork::default()
+            })
+            .expect_err("procedure budget should be exceeded")
+    }
+
+    #[test]
+    fn semantic_input_status_merge_is_a_deterministic_join() {
+        let statuses = [
+            SemanticInputStatus::Complete,
+            SemanticInputStatus::Ambiguous,
+            SemanticInputStatus::Unproven,
+            SemanticInputStatus::Unknown,
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::Assignments,
+            },
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::Calls,
+            },
+            SemanticInputStatus::ExceededBudget {
+                exceeded: source_budget_error(1, 2),
+            },
+            SemanticInputStatus::ExceededBudget {
+                exceeded: procedure_budget_error(2, 3),
+            },
+            SemanticInputStatus::Cancelled,
+        ];
+
+        for &left in &statuses {
+            assert_eq!(left.merge(left), left, "merge must be idempotent");
+            for &right in &statuses {
+                assert_eq!(
+                    left.merge(right),
+                    right.merge(left),
+                    "merge must be commutative for {left:?} and {right:?}"
+                );
+                assert_eq!(
+                    left.cmp(&right) == Ordering::Equal,
+                    left == right,
+                    "ordering must distinguish unequal payloads"
+                );
+                for &third in &statuses {
+                    assert_eq!(
+                        left.merge(right).merge(third),
+                        left.merge(right.merge(third)),
+                        "merge must be associative for {left:?}, {right:?}, and {third:?}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -734,7 +734,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let (value, _) = self.session.cache_value_with_metadata(
+        let value = self.session.insert_cached_value_with_metadata(
             builder,
             &mut self.expression_values,
             node.id(),
@@ -2196,20 +2196,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         let awaited_node = first_named_child(node);
-        let suspend_metadata = self.mapping(builder, node)?;
-        let normal_metadata = self.mapping(builder, node)?;
-        let exceptional_metadata = self.mapping(builder, node)?;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
             exceptional_resume: exceptional,
             ..
-        } = self.session.add_await_scaffold(
-            builder,
-            suspend_metadata,
-            normal_metadata,
-            exceptional_metadata,
-        )?;
+        } = self
+            .session
+            .add_await_scaffold(builder, |session, builder| {
+                session.add_node_mapping(builder, node)
+            })?;
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.add_gap(

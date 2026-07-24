@@ -11,6 +11,7 @@ use tree_sitter::Node;
 use crate::analyzer::ProjectFile;
 use crate::hash::HashMap;
 
+use super::cfg::initial_procedure_cfg_work;
 use super::lowering::{source_anchor, sum_lowering_work};
 use super::{
     DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId, SemanticBudget,
@@ -46,17 +47,17 @@ pub(crate) struct ProcedureIdentity {
 }
 
 /// Budget stop produced by one inventory step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcedureInventoryStop {
     pub(crate) exceeded: SemanticBudgetExceeded,
-    pub(crate) work: SemanticWork,
+    work: Box<SemanticWork>,
 }
 
 impl ProcedureInventoryStop {
     pub(crate) fn into_outcome<T>(self) -> ProcedureInventoryOutcome<T> {
         ProcedureInventoryOutcome::ExceededBudget {
             exceeded: self.exceeded,
-            work: self.work,
+            work: *self.work,
         }
     }
 }
@@ -163,7 +164,7 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
         if let Err(exceeded) = self.budget.check(observed_candidate) {
             return Ok(Err(ProcedureInventoryStop {
                 exceeded,
-                work: observed_candidate,
+                work: Box::new(observed_candidate),
             }));
         }
 
@@ -186,7 +187,7 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
         if let Err(exceeded) = self.budget.check(observed_candidate) {
             return Err(ProcedureInventoryStop {
                 exceeded,
-                work: observed_candidate,
+                work: Box::new(observed_candidate),
             });
         }
         self.traversal_work = traversal_candidate;
@@ -292,21 +293,5 @@ fn declaration_segment(
 /// Work retained for the shared procedure identity rows created by
 /// [`super::lowering::ProcedureLoweringSession::start`].
 fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        // Two empty adjacency offset arrays, one evidence source, and three
-        // retained locator copies (procedure, locator index, source mapping).
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
-    }
+    initial_procedure_cfg_work(locator, std::iter::once(locator), std::iter::once(1))
 }

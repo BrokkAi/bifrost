@@ -50,24 +50,14 @@ impl ProcedureCfgBuilder {
                 && parts.gaps.is_empty(),
             "CFG builder requires side-table rows to be allocated through the builder"
         );
-        let mut prospective_work = SemanticWork {
-            procedures: 1,
-            source_mappings: parts.source_mappings.len(),
-            evidence: parts.evidence_rows.len(),
-            // Each frozen CFG retains two offset arrays, even with no points.
-            nested_entries: 2usize.saturating_add(
-                parts
-                    .evidence_rows
-                    .iter()
-                    .map(|evidence| evidence.sources.len())
-                    .sum::<usize>(),
-            ),
-            ..SemanticWork::default()
-        };
-        prospective_work = combine_work(prospective_work, locator_work(&parts.locator, 2));
-        for mapping in &parts.source_mappings {
-            prospective_work = combine_work(prospective_work, locator_work(&mapping.locator, 1));
-        }
+        let prospective_work = initial_procedure_cfg_work(
+            &parts.locator,
+            parts.source_mappings.iter().map(|mapping| &mapping.locator),
+            parts
+                .evidence_rows
+                .iter()
+                .map(|evidence| evidence.sources.len()),
+        );
         budget.check(prospective_work)?;
         parts.points.clear();
         Ok(Self {
@@ -497,6 +487,16 @@ impl ProcedureCfgBuilder {
 
     /// Reserve or reuse the entry point for one cleanup body specialized to
     /// an exact abrupt destination and remaining outer-cleanup chain.
+    pub(crate) fn cleanup_specialization_entry(
+        &self,
+        route: &CompletionRoute,
+        cleanup_index: usize,
+    ) -> Option<ProgramPointId> {
+        self.cleanup_specializations
+            .get(&cleanup_key(route, cleanup_index))
+            .copied()
+    }
+
     pub(crate) fn cleanup_specialization(
         &mut self,
         route: &CompletionRoute,
@@ -504,18 +504,7 @@ impl ProcedureCfgBuilder {
         source: SourceMappingId,
         evidence: EvidenceId,
     ) -> Result<(ProgramPointId, bool), SemanticBudgetExceeded> {
-        let region = route
-            .cleanups
-            .get(cleanup_index)
-            .copied()
-            .unwrap_or_else(|| panic!("cleanup index {cleanup_index} is outside completion route"));
-        let key = CleanupKey {
-            region,
-            destination: route.destination,
-            outer_cleanups: route.cleanups[cleanup_index + 1..]
-                .to_vec()
-                .into_boxed_slice(),
-        };
+        let key = cleanup_key(route, cleanup_index);
         if let Some(point) = self.cleanup_specializations.get(&key).copied() {
             return Ok((point, false));
         }
@@ -655,11 +644,54 @@ impl ProcedureCfgBuilder {
     }
 }
 
+fn cleanup_key(route: &CompletionRoute, cleanup_index: usize) -> CleanupKey {
+    let region = route
+        .cleanups
+        .get(cleanup_index)
+        .copied()
+        .unwrap_or_else(|| panic!("cleanup index {cleanup_index} is outside completion route"));
+    CleanupKey {
+        region,
+        destination: route.destination,
+        outer_cleanups: route.cleanups[cleanup_index + 1..]
+            .to_vec()
+            .into_boxed_slice(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReachabilitySealCancelled;
 
 fn combine_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
     left.conservative_add(right)
+}
+
+/// Work retained by a newly initialized procedure CFG before points or
+/// adapter-owned rows are added.
+///
+/// Inventory preflight and the actual CFG builder both use this estimator so
+/// additions to the base provenance or locator representation cannot drift.
+pub(crate) fn initial_procedure_cfg_work<'locator>(
+    procedure_locator: &SemanticLocator,
+    source_mapping_locators: impl IntoIterator<Item = &'locator SemanticLocator>,
+    evidence_source_counts: impl IntoIterator<Item = usize>,
+) -> SemanticWork {
+    let mut work = SemanticWork {
+        procedures: 1,
+        // Each frozen CFG retains two offset arrays, even with no points.
+        nested_entries: 2,
+        ..SemanticWork::default()
+    };
+    work = combine_work(work, locator_work(procedure_locator, 2));
+    for locator in source_mapping_locators {
+        work.source_mappings = work.source_mappings.saturating_add(1);
+        work = combine_work(work, locator_work(locator, 1));
+    }
+    for source_count in evidence_source_counts {
+        work.evidence = work.evidence.saturating_add(1);
+        work.nested_entries = work.nested_entries.saturating_add(source_count);
+    }
+    work
 }
 
 fn locator_work(locator: &SemanticLocator, copies: usize) -> SemanticWork {
