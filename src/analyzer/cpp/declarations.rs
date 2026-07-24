@@ -2130,33 +2130,67 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
     if parts.len() > 1 {
         let name = parts.last().unwrap_or(&cleaned).to_string();
         let owner_parts = &parts[..parts.len() - 1];
-        let mut package_name = scope.package_name.clone();
-        let owner_path = if let Some(class_unit) = &scope.class_unit {
-            Some(class_unit.short_name().to_string())
-        } else if owner_parts.len() > 1 {
-            package_name = if package_name.is_empty() {
-                owner_parts[..owner_parts.len() - 1].join("::")
-            } else {
-                package_name
-            };
-            Some(owner_parts.last().unwrap_or(&"").to_string())
+        if let Some(class_unit) = &scope.class_unit {
+            // Lexically inside a class body: the owner is that class, whatever
+            // the declarator re-qualifies it as.
+            return (
+                Some(class_unit.short_name().to_string()),
+                name,
+                scope.package_name.clone(),
+            );
+        }
+        if !scope.package_name.is_empty() {
+            // Out-of-line member definition written *inside* an enclosing
+            // `namespace {}` block (scope package is that namespace). Every
+            // owner segment before the terminal member is a class-nesting step
+            // -- an out-of-line nested-class member `Outer::Inner::method` in
+            // Bifrost's `Outer$Inner` short-name convention (#1121) -- not a
+            // namespace path: `using namespace` never brings nested-class
+            // access into unqualified scope, so C++ always writes the full
+            // `Outer::Inner::` qualifier here. The only wrinkle is a definition
+            // that redundantly re-states the enclosing namespace it already
+            // sits in (`namespace log4cxx { void log4cxx::Foo::method() {} }`);
+            // strip that re-qualifying prefix (which duplicates a suffix of the
+            // enclosing package path) before treating what remains as the
+            // nested-class chain, so the redundant spelling still lands on the
+            // same `log4cxx.Foo.method` identity as its header declaration.
+            let nested = strip_redundant_namespace_prefix(owner_parts, &scope.package_name);
+            let owner_path = (!nested.is_empty()).then(|| nested.join("$"));
+            return (owner_path, name, scope.package_name.clone());
+        }
+        // File scope (no enclosing `namespace {}` block, scope package empty).
+        let (owner_path, package_name) = if owner_parts.len() > 1 {
+            // A multi-segment qualifier at file scope with no enclosing
+            // namespace: treat all but the last owner segment as the namespace
+            // path and the last as the owning class (`ns1::ns2::Class::method`
+            // -> package `ns1::ns2`, owner `Class`). Whether a leading segment
+            // is really a namespace or an outer class cannot be told from the
+            // declarator text alone here, and no enclosing namespace or
+            // in-index owner is available at per-file extraction to confirm the
+            // class reading, so the far-more-common namespace interpretation is
+            // kept rather than guessed away (the nested-class-at-file-scope and
+            // using-directive-qualified nested-class shapes remain on this
+            // behavior; see #1121).
+            (
+                Some(owner_parts.last().unwrap_or(&"").to_string()),
+                owner_parts[..owner_parts.len() - 1].join("::"),
+            )
         } else {
-            // A bare `Class::member` qualifier at file/namespace scope carries
-            // no namespace segment of its own. If the enclosing lexical scope
-            // is also unqualified, the declarator alone cannot say which
-            // namespace owns `Class` -- but a `using namespace X;` directive
-            // already in effect at this point in the file (#1093, e.g.
-            // log4cxx's `using namespace LOG4CXX_NS;` followed by out-of-line
-            // `LogString HTMLLayout::getContentType() const {...}`) is the
-            // remaining structural signal for it, so fall back to it rather
-            // than leaving the definition's package empty while its header
-            // declaration (parsed inside the `namespace {}` block) keeps the
-            // real one -- an identity split that made the same member
+            // A bare `Class::member` qualifier at file scope carries no
+            // namespace segment of its own. The declarator alone cannot say
+            // which namespace owns `Class` -- but a `using namespace X;`
+            // directive already in effect at this point in the file (#1093,
+            // e.g. log4cxx's `using namespace LOG4CXX_NS;` followed by
+            // out-of-line `LogString HTMLLayout::getContentType() const {...}`)
+            // is the remaining structural signal for it, so fall back to it
+            // rather than leaving the definition's package empty while its
+            // header declaration (parsed inside the `namespace {}` block) keeps
+            // the real one -- an identity split that made the same member
             // unresolvable under its own displayed spelling.
-            if package_name.is_empty() {
-                package_name = cpp_using_directive_namespace_for_bare_owner(scope);
-            }
-            Some(owner_parts[0].to_string())
+            (
+                Some(owner_parts[0].to_string()),
+                cpp_using_directive_namespace_for_bare_owner(scope),
+            )
         };
         return (owner_path, name, package_name);
     }
@@ -2167,6 +2201,37 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
         .as_ref()
         .map(|parent| parent.short_name().to_string());
     (owner_path, cleaned.to_string(), package_name)
+}
+
+/// Drop the leading owner segments of an out-of-line member qualifier that
+/// merely re-state the enclosing namespace the definition already sits in, so
+/// what remains is the pure class-nesting chain. Inside `namespace a::b`, a
+/// definition may redundantly write `a::b::Outer::Inner::method` (or the
+/// partial `b::Outer::Inner::method`); the leading segments that duplicate a
+/// suffix of the enclosing package path (`a::b`, then `b`) are re-qualification
+/// noise, not class-nesting steps. Returns the owner segments with the longest
+/// such re-qualifying prefix removed (possibly all of them, when the qualifier
+/// names only the enclosing namespace before the terminal member -- a
+/// re-qualified free function). `package_name` is the enclosing namespace path
+/// in its stored `::`-joined form; both sides are split on the same delimiter
+/// the namespace walker joined them with, so this compares namespace *segments*
+/// rather than scanning text.
+fn strip_redundant_namespace_prefix<'a>(
+    owner_parts: &'a [&'a str],
+    package_name: &str,
+) -> &'a [&'a str] {
+    if package_name.is_empty() {
+        return owner_parts;
+    }
+    let package_segments: Vec<&str> = package_name.split("::").collect();
+    let max_prefix = owner_parts.len().min(package_segments.len());
+    for prefix_len in (1..=max_prefix).rev() {
+        let package_suffix = &package_segments[package_segments.len() - prefix_len..];
+        if &owner_parts[..prefix_len] == package_suffix {
+            return &owner_parts[prefix_len..];
+        }
+    }
+    owner_parts
 }
 
 /// Best-effort package-name recovery for a bare (unqualified-by-itself) owner

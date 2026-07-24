@@ -310,22 +310,23 @@ int HTMLLayout::getContentType() const {
     );
 }
 
-/// Documents a related but *separate* pre-existing gap discovered during
-/// investigation, out of this issue's scope: an out-of-line definition of a
-/// class-nested-in-class member (`Outer$Inner` in Bifrost's own short-name
-/// convention) is always written with *two* owner segments
+/// A related but *separately-rooted* shape (issue #1121, fixed): an out-of-line
+/// definition of a class-nested-in-class member (`Outer$Inner` in Bifrost's own
+/// short-name convention) is always written with *two* owner segments
 /// (`Outer::Inner::method`), which C++ requires regardless of any
 /// using-directive -- nested-class access is never brought into unqualified
-/// scope by `using namespace`. That two-segment shape takes an entirely
-/// different, pre-existing branch of `split_cpp_name` that already treated
-/// every owner segment before the last as a *namespace* path, not a nested
-/// *class* chain, independent of using-directives (reproduces with an
-/// ordinary enclosing `namespace {}` block, no using-directive at all). This
-/// test only pins that the using-directive fallback added for #1093 does not
-/// change or worsen that pre-existing, differently-shaped behavior (tracked
-/// as #1121).
+/// scope by `using namespace`. That two-segment shape takes a different branch
+/// of `split_cpp_name` than #1093's single-segment case. When the definition is
+/// written inside an enclosing `namespace {}` block, that branch now reads the
+/// owner segments as the class-nesting chain they are (rather than dropping all
+/// but the last as a namespace path), so the definition unifies with the
+/// header declaration -- reproducing and fixing #1121 with no using-directive
+/// involved at all. The file-scope using-directive variant stays on today's
+/// (non-unifying) behavior -- at file scope the chain is genuinely ambiguous
+/// with no class table to resolve it -- and is only pinned here to show the
+/// #1093 fallback neither resolves nor worsens it.
 #[test]
-fn nested_class_two_segment_owner_is_unaffected_by_the_using_directive_fallback() {
+fn nested_class_two_segment_owner_unifies_in_namespace_block() {
     let with_namespace_block = InlineTestProject::with_language(Language::Cpp)
         .file(
             "nested_block.h",
@@ -384,19 +385,35 @@ int Outer::Inner::method() const {
         )
         .build();
 
-    // Both shapes still resolve the header's own nested declaration on its
-    // own (no crash, no spurious cross-match) -- the pre-existing limitation
-    // is that the out-of-line definition doesn't unify with it, in both the
-    // namespace-block and the using-directive variant alike.
-    for (project, header_symbol) in [
-        (&with_namespace_block, "log4cxx.Outer$Inner.method"),
-        (&with_using_directive, "log4cxx.Outer$Inner.method"),
-    ] {
-        let result = symbol_sources(project, header_symbol);
-        assert_eq!(
-            result["not_found"].as_array().unwrap().len(),
-            0,
-            "{header_symbol}: {result}"
-        );
-    }
+    // Namespace-block variant (#1121 fixed): the header declaration and the
+    // out-of-line definition unify onto `log4cxx.Outer$Inner.method`, so the
+    // canonical symbol resolves to *both* the header and the `.cpp`.
+    let unified = symbol_sources(&with_namespace_block, "log4cxx.Outer$Inner.method");
+    assert_eq!(
+        unified["not_found"].as_array().unwrap().len(),
+        0,
+        "namespace-block variant: {unified}"
+    );
+    assert_eq!(
+        sorted_source_paths(&unified),
+        vec!["nested_block.cpp".to_string(), "nested_block.h".to_string()],
+        "namespace-block nested member did not unify: {unified}"
+    );
+
+    // File-scope using-directive variant: still on today's behavior. The header
+    // declaration resolves on its own (single source, no crash, no spurious
+    // cross-match); the definition does not unify with it -- at file scope the
+    // `Outer::Inner::method` chain under a using-directive is genuinely
+    // ambiguous with no class table to resolve it (remaining #1121 gap).
+    let header_only = symbol_sources(&with_using_directive, "log4cxx.Outer$Inner.method");
+    assert_eq!(
+        header_only["not_found"].as_array().unwrap().len(),
+        0,
+        "using-directive variant: {header_only}"
+    );
+    assert_eq!(
+        sorted_source_paths(&header_only),
+        vec!["nested_using.h".to_string()],
+        "using-directive variant unexpectedly changed: {header_only}"
+    );
 }
