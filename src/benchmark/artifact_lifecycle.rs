@@ -68,7 +68,17 @@ pub struct ArtifactPromotionEvaluation {
     pub serialized_size: ArtifactPromotionGateStatus,
     pub build_write_time: ArtifactPromotionGateStatus,
     pub build_write_absolute_overhead: ArtifactPromotionGateStatus,
-    pub passed: bool,
+}
+
+impl ArtifactPromotionEvaluation {
+    pub const fn passed(&self) -> bool {
+        self.hydration_speedup.passed()
+            && self.hydration_absolute_saving.passed()
+            && self.hydration_rss.passed()
+            && self.serialized_size.passed()
+            && self.build_write_time.passed()
+            && self.build_write_absolute_overhead.passed()
+    }
 }
 
 /// Invalid benchmark input that cannot support a promotion decision.
@@ -185,15 +195,18 @@ pub fn evaluate_artifact_promotion(
         measurement.rebuild_peak_rss_bytes,
         measurement.hydrate_peak_rss_bytes,
     ) {
-        (Some(rebuild), Some(hydrate)) => {
-            gate(hydrate as f64 / rebuild as f64 <= thresholds.maximum_hydration_rss_ratio)
-        }
+        (Some(rebuild), Some(hydrate)) => gate(integer_ratio_at_most(
+            hydrate,
+            rebuild,
+            thresholds.maximum_hydration_rss_ratio,
+        )),
         _ => ArtifactPromotionGateStatus::Unavailable,
     };
-    let serialized_size = gate(
-        measurement.serialized_bytes as f64 / measurement.estimated_hydrated_bytes as f64
-            <= thresholds.maximum_serialized_to_hydrated_bytes_ratio,
-    );
+    let serialized_size = gate(integer_ratio_at_most(
+        measurement.serialized_bytes,
+        measurement.estimated_hydrated_bytes,
+        thresholds.maximum_serialized_to_hydrated_bytes_ratio,
+    ));
     let build_write_time = gate(
         measurement.build_write_ms / measurement.rebuild_ms
             <= thresholds.maximum_build_write_time_ratio,
@@ -202,15 +215,6 @@ pub fn evaluate_artifact_promotion(
         measurement.build_write_ms - measurement.rebuild_ms
             <= thresholds.maximum_build_write_overhead_ms,
     );
-    let statuses = [
-        hydration_speedup,
-        hydration_absolute_saving,
-        hydration_rss,
-        serialized_size,
-        build_write_time,
-        build_write_absolute_overhead,
-    ];
-
     Ok(ArtifactPromotionEvaluation {
         hydration_speedup_percent,
         hydration_saved_ms,
@@ -220,9 +224,6 @@ pub fn evaluate_artifact_promotion(
         serialized_size,
         build_write_time,
         build_write_absolute_overhead,
-        passed: statuses
-            .into_iter()
-            .all(ArtifactPromotionGateStatus::passed),
     })
 }
 
@@ -231,6 +232,43 @@ const fn gate(passed: bool) -> ArtifactPromotionGateStatus {
         ArtifactPromotionGateStatus::Passed
     } else {
         ArtifactPromotionGateStatus::Failed
+    }
+}
+
+/// Compare an integer ratio with the exact value represented by a positive
+/// finite `f64`, without lossy integer casts or overflowing cross-products.
+fn integer_ratio_at_most(numerator: u64, denominator: u64, maximum: f64) -> bool {
+    debug_assert!(denominator > 0);
+    debug_assert!(maximum.is_finite() && maximum > 0.0);
+    if numerator == 0 || maximum >= u64::MAX as f64 {
+        return true;
+    }
+
+    let bits = maximum.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (significand, exponent) = if exponent_bits == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1_u64 << 52), exponent_bits - 1023 - 52)
+    };
+    if exponent >= 0 {
+        let Some(power) = 1_u128.checked_shl(exponent as u32) else {
+            return true;
+        };
+        let Some(threshold_numerator) = u128::from(significand).checked_mul(power) else {
+            return true;
+        };
+        u128::from(numerator) <= u128::from(denominator).saturating_mul(threshold_numerator)
+    } else {
+        let shift = exponent.unsigned_abs();
+        let Some(power) = 1_u128.checked_shl(shift) else {
+            return false;
+        };
+        let Some(scaled_numerator) = u128::from(numerator).checked_mul(power) else {
+            return false;
+        };
+        scaled_numerator <= u128::from(denominator) * u128::from(significand)
     }
 }
 
@@ -330,49 +368,79 @@ mod tests {
 
         assert_eq!(evaluation.hydration_speedup_percent, 30.0);
         assert_eq!(evaluation.hydration_saved_ms, 300.0);
-        assert!(evaluation.passed);
+        assert!(evaluation.passed());
     }
 
     #[test]
     fn every_gate_is_required() {
         let defaults = ArtifactPromotionThresholds::default();
+        let pass = ArtifactPromotionGateStatus::Passed;
+        let fail = ArtifactPromotionGateStatus::Failed;
         let cases = [
-            ArtifactPromotionMeasurement {
-                hydrate_ms: 700.1,
-                ..boundary_measurement()
-            },
-            ArtifactPromotionMeasurement {
-                rebuild_ms: 100.0,
-                build_write_ms: 100.0,
-                hydrate_ms: 60.0,
-                ..boundary_measurement()
-            },
-            ArtifactPromotionMeasurement {
-                hydrate_peak_rss_bytes: Some(1_101),
-                ..boundary_measurement()
-            },
-            ArtifactPromotionMeasurement {
-                serialized_bytes: 2_001,
-                ..boundary_measurement()
-            },
-            ArtifactPromotionMeasurement {
-                build_write_ms: 1_250.1,
-                ..boundary_measurement()
-            },
-            ArtifactPromotionMeasurement {
-                rebuild_ms: 2_000.0,
-                build_write_ms: 2_250.1,
-                hydrate_ms: 1_000.0,
-                ..boundary_measurement()
-            },
+            (
+                ArtifactPromotionMeasurement {
+                    hydrate_ms: 700.1,
+                    ..boundary_measurement()
+                },
+                [fail, pass, pass, pass, pass, pass],
+            ),
+            (
+                ArtifactPromotionMeasurement {
+                    rebuild_ms: 100.0,
+                    build_write_ms: 100.0,
+                    hydrate_ms: 60.0,
+                    ..boundary_measurement()
+                },
+                [pass, fail, pass, pass, pass, pass],
+            ),
+            (
+                ArtifactPromotionMeasurement {
+                    hydrate_peak_rss_bytes: Some(1_101),
+                    ..boundary_measurement()
+                },
+                [pass, pass, fail, pass, pass, pass],
+            ),
+            (
+                ArtifactPromotionMeasurement {
+                    serialized_bytes: 2_001,
+                    ..boundary_measurement()
+                },
+                [pass, pass, pass, fail, pass, pass],
+            ),
+            (
+                ArtifactPromotionMeasurement {
+                    rebuild_ms: 100.0,
+                    build_write_ms: 125.1,
+                    hydrate_ms: 40.0,
+                    ..boundary_measurement()
+                },
+                [pass, pass, pass, pass, fail, pass],
+            ),
+            (
+                ArtifactPromotionMeasurement {
+                    rebuild_ms: 2_000.0,
+                    build_write_ms: 2_250.1,
+                    hydrate_ms: 1_000.0,
+                    ..boundary_measurement()
+                },
+                [pass, pass, pass, pass, pass, fail],
+            ),
         ];
 
-        for measurement in cases {
-            assert!(
-                !evaluate_artifact_promotion(defaults, measurement)
-                    .unwrap()
-                    .passed
+        for (measurement, expected) in cases {
+            let evaluation = evaluate_artifact_promotion(defaults, measurement).unwrap();
+            assert_eq!(
+                [
+                    evaluation.hydration_speedup,
+                    evaluation.hydration_absolute_saving,
+                    evaluation.hydration_rss,
+                    evaluation.serialized_size,
+                    evaluation.build_write_time,
+                    evaluation.build_write_absolute_overhead,
+                ],
+                expected
             );
+            assert!(!evaluation.passed());
         }
     }
 
@@ -392,7 +460,7 @@ mod tests {
             evaluation.hydration_rss,
             ArtifactPromotionGateStatus::Unavailable
         );
-        assert!(!evaluation.passed);
+        assert!(!evaluation.passed());
     }
 
     #[test]
@@ -440,7 +508,7 @@ mod tests {
 
     #[test]
     fn large_byte_values_do_not_overflow() {
-        let evaluation = evaluate_artifact_promotion(
+        let failed = evaluate_artifact_promotion(
             ArtifactPromotionThresholds::default(),
             ArtifactPromotionMeasurement {
                 serialized_bytes: u64::MAX,
@@ -450,9 +518,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            evaluation.serialized_size,
-            ArtifactPromotionGateStatus::Failed
-        );
+        assert_eq!(failed.serialized_size, ArtifactPromotionGateStatus::Failed);
+
+        let passed = evaluate_artifact_promotion(
+            ArtifactPromotionThresholds::default(),
+            ArtifactPromotionMeasurement {
+                serialized_bytes: u64::MAX - 1,
+                estimated_hydrated_bytes: u64::MAX / 2,
+                ..boundary_measurement()
+            },
+        )
+        .unwrap();
+        assert_eq!(passed.serialized_size, ArtifactPromotionGateStatus::Passed);
     }
 }

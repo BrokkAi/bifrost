@@ -7,6 +7,11 @@ readonly result_prefix='BIFROST_DATAFLOW_LIFECYCLE_BENCHMARK='
 readonly vscode_commit='19e0f9e681ecb8e5c09d8784acaa601316ca4571'
 readonly petclinic_commit='f182358d02e4a68e52bdbabf55ca7800288511e7'
 
+# Sample provenance uses read-only Git queries. Prevent `git status` from
+# refreshing the tracked index, which `build.rs` watches and would otherwise
+# turn every fresh-process invocation into a redundant crate rebuild.
+export GIT_OPTIONAL_LOCKS=0
+
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
@@ -68,7 +73,9 @@ samples_file="$work_dir/retained-samples.jsonl"
 cleanup() {
     rm -rf "$work_dir"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 extract_result() {
     local log_file=$1
@@ -93,7 +100,7 @@ for dataset in "${datasets[@]}"; do
         if ! BIFROST_DATAFLOW_LIFECYCLE_DATASET=$dataset \
             BIFROST_DATAFLOW_LIFECYCLE_ROUND=$round \
             BIFROST_SEMANTIC_INDEX=off \
-            cargo test --release --test measure_dataflow_lifecycle \
+            cargo test --locked --release --test measure_dataflow_lifecycle \
                 dataflow_lifecycle_measurement -- --ignored --nocapture \
                 >"$log_file" 2>&1; then
             tail -n 240 "$log_file" >&2
@@ -109,7 +116,7 @@ done
 aggregate_log="$work_dir/aggregate.log"
 if ! BIFROST_DATAFLOW_LIFECYCLE_SAMPLES_FILE=$samples_file \
     BIFROST_SEMANTIC_INDEX=off \
-    cargo test --release --test measure_dataflow_lifecycle \
+    cargo test --locked --release --test measure_dataflow_lifecycle \
         dataflow_lifecycle_measurement -- --ignored --nocapture \
         >"$aggregate_log" 2>&1; then
     tail -n 240 "$aggregate_log" >&2

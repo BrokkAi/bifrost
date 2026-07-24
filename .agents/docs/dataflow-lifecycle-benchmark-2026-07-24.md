@@ -6,9 +6,9 @@ This report records the issue #817 lifecycle decision for the current bounded ex
 
 **Recommendation: `ephemeral_not_eligible; persist reusable summaries only after #823 defines and measures them`.**
 
-All 56 retained samples reproduced identical dataset provenance, ICFG topology and semantic work, client fact/reached counts, five solver-work counters, termination, completeness, shallow retained bytes, and result checksums. Every client reached a fixed point. Complete generated branch ICFGs produced complete results; bounded call-chain, inline, and external ICFGs preserved their typed incomplete status and produced incomplete results rather than false complete negatives.
+All 56 retained v2 samples reproduced identical dataset provenance, canonical SHA-256 ICFG topology and semantic work, client fact/reached counts, five solver-work counters, termination, completeness, shallow retained bytes, and result checksums. The topology checksum sorts stable procedure-local node identities, typed edges, and typed boundaries and excludes snapshot-local pointers, dense numbering, and temporary workspace mounts. Every client reached a fixed point. Complete generated branch ICFGs produced complete results; bounded call-chain, inline, and external ICFGs preserved their typed incomplete status and produced incomplete results rather than false complete negatives.
 
-The largest exploded result was the 512-branch `finite_16` workload: 98,313 reached states and 1,179,940 estimated shallow bytes. Its median first/repeat solves were 34.512/63.640 ms. Repetition was a fresh solve over the same request-local input, not a cache hit. The VS Code process peak was 659.0 MiB while its finite reached result was only 5,136 shallow bytes, showing that process RSS is dominated by workspace construction and must not be presented as result-object size.
+The largest exploded result was the 512-branch `finite_16` workload: 98,313 reached states and 1,179,940 estimated shallow bytes. Its median first/repeat solves were 31.526/28.001 ms. Repetition was a fresh solve over the same request-local input, not a cache hit. The VS Code process peak was 657.3 MiB while its finite reached result was only 5,136 shallow bytes, showing that process RSS is dominated by workspace construction and must not be presented as result-object size.
 
 The shared artifact-promotion gate was intentionally not invoked: there is no equivalent serialized artifact, hydration path, serialized size, or cache identity to compare. A later reusable summary from #823 must define those semantics and run its own equivalent-artifact matrix before persistence is considered.
 
@@ -22,12 +22,12 @@ BIFROST_SEMANTIC_JAVA_REPO=/Users/dave/Workspace/test-repos/spring-petclinic-sem
   scripts/run-dataflow-lifecycle-benchmarks.sh
 ```
 
-The runner launched nine fresh release processes for each of eight datasets, discarded rounds zero and one for every dataset, retained rounds two through eight, and aggregated 56 JSON samples. `BIFROST_SEMANTIC_INDEX=off` was set for every process. Process peak RSS is recorded once per dataset process and repeated in the client-oriented median table only for readability; it is not a per-client allocation measurement.
+The runner launched nine fresh locked release processes for each of eight datasets, discarded rounds zero and one for every dataset, retained rounds two through eight, and aggregated 56 JSON samples. `BIFROST_SEMANTIC_INDEX=off` was set for every process. `GIT_OPTIONAL_LOCKS=0` kept sample provenance read-only so `git status` did not refresh the build-script-watched index between processes. Process peak RSS is recorded once per dataset process and repeated in the client-oriented median table only for readability; it is not a per-client allocation measurement.
 
-- Bifrost: `da37cbc839081bba1d86dd27684fec283940ae28`, clean, tree fingerprint `99d580ca9c8c50f83343b784afdc69be589a2acab5d3f94773a53526cd4f706c`
+- Bifrost: `a9daea53dd2f3c654f94e99f2f554e92c86f20b5`, dirty with the reviewed issue changes, tree fingerprint `b01357b912a9f155c36a8ab0aeb461d2fb299def7312ed6b4092c80b9665423d`
 - Crate/build: `brokk-bifrost 0.8.10`, release profile
 - Rust: `rustc 1.96.0 (ac68faa20 2026-05-25)`, LLVM 22.1.2
-- Host: macOS arm64, Darwin 25.5.0, 10 logical CPUs; CPU-model lookup was unavailable
+- Host: macOS arm64, Darwin 25.5.0, Apple M4, 10 logical CPUs; hostname was deliberately not collected
 - Timer: monotonic wall time from `std::time::Instant`
 - VS Code: `19e0f9e681ecb8e5c09d8784acaa601316ca4571`, clean; `src/vs/base/common/arrays.ts`, exact `Function(quickSelect)`
 - Spring PetClinic: `f182358d02e4a68e52bdbabf55ca7800288511e7`, clean; `OwnerController.java`, exact `Type(OwnerController)::Method(processFindForm)`
@@ -39,24 +39,24 @@ The runner launched nine fresh release processes for each of eight datasets, dis
 
 Times are milliseconds. RSS is the median fresh-process peak in MiB. “Work” is interned facts / reached states / flow evaluations / callback rows / propagated outputs. The shallow-byte estimate covers the result object plus its public fact, reached, and coverage slices; it is not allocator-inclusive retained size.
 
-| Dataset / client | Workspace / semantic / ICFG ms | Solve first / repeat ms | RSS MiB | ICFG nodes / edges / boundaries | Facts / reached | Work facts / reached / evals / callbacks / outputs | Status / complete | Bytes | Checksum |
-|---|---:|---:|---:|---:|---:|---:|---|---:|---:|
-| external_spring_petclinic_java / direct | 183.601 / 10.334 / 41.376 | 0.026 / 0.007 | 21.5 | 41 / 41 / 2 | 1 / 41 | 1 / 41 / 41 / 42 / 41 | unsupported / false | 940 | 8862284132134275048 |
-| external_spring_petclinic_java / finite_16 | 183.601 / 10.334 / 41.376 | 0.138 / 0.126 | 21.5 | 41 / 41 / 2 | 16 / 551 | 16 / 551 / 551 / 1076 / 1075 | unsupported / false | 7076 | 18154118344030636796 |
-| external_vscode_typescript / direct | 33512.965 / 33.788 / 23.610 | 0.023 / 0.006 | 659.0 | 31 / 30 / 2 | 1 / 31 | 1 / 31 / 30 / 31 / 30 | unknown / false | 812 | 18214206341767704809 |
-| external_vscode_typescript / finite_16 | 33512.965 / 33.788 / 23.610 | 0.093 / 0.083 | 659.0 | 31 / 30 / 2 | 16 / 390 | 16 / 390 / 372 / 731 / 730 | unknown / false | 5136 | 1249601727928353037 |
-| generated_typescript_branches_512 / direct | 18.976 / 49.723 / 1.632 | 0.463 / 0.434 | 34.9 | 6152 / 6663 / 0 | 1 / 6152 | 1 / 6152 / 6663 / 6664 / 6663 | complete / true | 73992 | 17031623719389330401 |
-| generated_typescript_branches_512 / finite_16 | 18.976 / 49.723 / 1.632 | 34.512 / 63.640 | 34.9 | 6152 / 6663 / 0 | 16 / 98313 | 16 / 98313 / 106483 / 206323 / 206322 | complete / true | 1179940 | 3149839785587667984 |
-| generated_typescript_branches_64 / direct | 10.997 / 5.976 / 0.544 | 0.154 / 0.132 | 19.3 | 776 / 839 / 0 | 1 / 776 | 1 / 776 / 839 / 840 / 839 | complete / true | 9480 | 14770342949475302118 |
-| generated_typescript_branches_64 / finite_16 | 10.997 / 5.976 / 0.544 | 3.024 / 1.527 | 19.3 | 776 / 839 / 0 | 16 / 12297 | 16 / 12297 / 13299 / 25779 / 25778 | complete / true | 147748 | 9941097766616935309 |
-| generated_typescript_calls_32 / direct | 13.037 / 2.755 / 13.854 | 0.021 / 0.004 | 18.6 | 53 / 52 / 9 | 1 / 53 | 1 / 53 / 52 / 53 / 52 | unknown / false | 2028 | 6411815615594076246 |
-| generated_typescript_calls_32 / finite_16 | 13.037 / 2.755 / 13.854 | 0.092 / 0.082 | 18.6 | 53 / 52 / 9 | 16 / 743 | 16 / 743 / 727 / 1417 / 1416 | unknown / false | 10324 | 48444760638508871 |
-| generated_typescript_calls_8 / direct | 10.628 / 1.264 / 5.217 | 0.036 / 0.007 | 17.9 | 85 / 84 / 8 | 1 / 85 | 1 / 85 / 84 / 85 / 84 | unsupported / false | 2340 | 1012845517010923369 |
-| generated_typescript_calls_8 / finite_16 | 10.628 / 1.264 / 5.217 | 0.160 / 0.144 | 17.9 | 85 / 84 / 8 | 16 / 1255 | 16 / 1255 / 1239 / 2409 / 2408 | unsupported / false | 16396 | 10567677753392813135 |
-| inline_java / direct | 30.961 / 0.819 / 2.478 | 0.029 / 0.006 | 17.3 | 23 / 22 / 1 | 1 / 23 | 1 / 23 / 22 / 23 / 22 | unsupported / false | 588 | 621847044399286051 |
-| inline_java / finite_16 | 30.961 / 0.819 / 2.478 | 0.093 / 0.082 | 17.3 | 23 / 22 / 1 | 16 / 260 | 16 / 260 / 241 / 478 / 477 | unsupported / false | 3448 | 4319779334050046862 |
-| inline_typescript / direct | 29.180 / 0.734 / 2.908 | 0.029 / 0.006 | 17.6 | 24 / 23 / 2 | 1 / 24 | 1 / 24 / 23 / 24 / 23 | unsupported / false | 736 | 11218546533244378642 |
-| inline_typescript / finite_16 | 29.180 / 0.734 / 2.908 | 0.089 / 0.084 | 17.6 | 24 / 23 / 2 | 16 / 276 | 16 / 276 / 257 / 509 / 508 | unsupported / false | 3776 | 3129573660448584592 |
+| Dataset / client | Workspace / semantic / ICFG ms | Solve first / repeat ms | RSS MiB | ICFG nodes / edges / boundaries | Topology SHA-256 | Facts / reached | Work facts / reached / evals / callbacks / outputs | Status / complete | Bytes | Result checksum |
+|---|---:|---:|---:|---:|---|---:|---:|---|---:|---:|
+| external_spring_petclinic_java / direct | 69.723 / 3.568 / 11.296 | 0.021 / 0.007 | 22.1 | 41 / 41 / 2 | `96f2da6eb25d024c9ffbcc35a5d28cde96cd9931070e6ffa71489367a73e0e75` | 1 / 41 | 1 / 41 / 41 / 42 / 41 | unsupported / false | 940 | 4459160236473380527 |
+| external_spring_petclinic_java / finite_16 | 69.723 / 3.568 / 11.296 | 0.141 / 0.125 | 22.1 | 41 / 41 / 2 | `96f2da6eb25d024c9ffbcc35a5d28cde96cd9931070e6ffa71489367a73e0e75` | 16 / 551 | 16 / 551 / 551 / 1076 / 1075 | unsupported / false | 7076 | 2575647176570017997 |
+| external_vscode_typescript / direct | 24921.346 / 26.348 / 18.677 | 0.018 / 0.005 | 657.3 | 31 / 30 / 2 | `5473cf4f38fb92e282dfa5a90daba86bde44fb613d60e35b4abf0a3a72d8c04a` | 1 / 31 | 1 / 31 / 30 / 31 / 30 | unknown / false | 812 | 1722895202852227132 |
+| external_vscode_typescript / finite_16 | 24921.346 / 26.348 / 18.677 | 0.095 / 0.083 | 657.3 | 31 / 30 / 2 | `5473cf4f38fb92e282dfa5a90daba86bde44fb613d60e35b4abf0a3a72d8c04a` | 16 / 390 | 16 / 390 / 372 / 731 / 730 | unknown / false | 5136 | 3005103082705446891 |
+| generated_typescript_branches_512 / direct | 22.233 / 49.838 / 4.011 | 1.227 / 1.071 | 87.5 | 6152 / 6663 / 0 | `eafd32855c811701c59f0cda7505085d656b9e2790e17c01c240b3d727c24472` | 1 / 6152 | 1 / 6152 / 6663 / 6664 / 6663 | complete / true | 73992 | 12411354750699528161 |
+| generated_typescript_branches_512 / finite_16 | 22.233 / 49.838 / 4.011 | 31.526 / 28.001 | 87.5 | 6152 / 6663 / 0 | `eafd32855c811701c59f0cda7505085d656b9e2790e17c01c240b3d727c24472` | 16 / 98313 | 16 / 98313 / 106483 / 206323 / 206322 | complete / true | 1179940 | 9847897096946759536 |
+| generated_typescript_branches_64 / direct | 12.608 / 5.272 / 0.443 | 0.117 / 0.103 | 26.0 | 776 / 839 / 0 | `56cc501eb4a7af88815174a58df7deca042eede27f101e1c691c1d24b10ac2f8` | 1 / 776 | 1 / 776 / 839 / 840 / 839 | complete / true | 9480 | 272849299080225696 |
+| generated_typescript_branches_64 / finite_16 | 12.608 / 5.272 / 0.443 | 2.821 / 2.768 | 26.0 | 776 / 839 / 0 | `56cc501eb4a7af88815174a58df7deca042eede27f101e1c691c1d24b10ac2f8` | 16 / 12297 | 16 / 12297 / 13299 / 25779 / 25778 | complete / true | 147748 | 5695708036881436000 |
+| generated_typescript_calls_32 / direct | 12.635 / 3.154 / 10.877 | 0.025 / 0.008 | 20.8 | 53 / 52 / 9 | `ba78c5034b13d4aa55d3701c9cb47db45981a51dae429a8105b1dbc138570205` | 1 / 53 | 1 / 53 / 52 / 53 / 52 | unknown / false | 2028 | 16326939603476035912 |
+| generated_typescript_calls_32 / finite_16 | 12.635 / 3.154 / 10.877 | 0.182 / 0.159 | 20.8 | 53 / 52 / 9 | `ba78c5034b13d4aa55d3701c9cb47db45981a51dae429a8105b1dbc138570205` | 16 / 743 | 16 / 743 / 727 / 1417 / 1416 | unknown / false | 10324 | 7806608045215191957 |
+| generated_typescript_calls_8 / direct | 11.110 / 1.003 / 4.114 | 0.026 / 0.013 | 20.9 | 85 / 84 / 8 | `79881596e99704abb840c7a96276ea6a214f00c251135a8bf3b526033336bcfc` | 1 / 85 | 1 / 85 / 84 / 85 / 84 | unsupported / false | 2340 | 9437642254504538861 |
+| generated_typescript_calls_8 / finite_16 | 11.110 / 1.003 / 4.114 | 0.296 / 0.271 | 20.9 | 85 / 84 / 8 | `79881596e99704abb840c7a96276ea6a214f00c251135a8bf3b526033336bcfc` | 16 / 1255 | 16 / 1255 / 1239 / 2409 / 2408 | unsupported / false | 16396 | 7556780494030992857 |
+| inline_java / direct | 10.914 / 0.576 / 1.345 | 0.021 / 0.005 | 17.6 | 23 / 22 / 1 | `ce81bc4290b0160befb77df393803b0b8a9181ef8044e9385f2dce7a1ce04a08` | 1 / 23 | 1 / 23 / 22 / 23 / 22 | unsupported / false | 588 | 14881895776368533640 |
+| inline_java / finite_16 | 10.914 / 0.576 / 1.345 | 0.077 / 0.065 | 17.6 | 23 / 22 / 1 | `ce81bc4290b0160befb77df393803b0b8a9181ef8044e9385f2dce7a1ce04a08` | 16 / 260 | 16 / 260 / 241 / 478 / 477 | unsupported / false | 3448 | 4533393618970609491 |
+| inline_typescript / direct | 11.423 / 0.557 / 1.041 | 0.017 / 0.005 | 17.8 | 24 / 23 / 2 | `123244d6c6b4afcd37dd1f0d9952e86f2de5d884a0059d28ccc59319301bf679` | 1 / 24 | 1 / 24 / 23 / 24 / 23 | unsupported / false | 736 | 15178303460503179527 |
+| inline_typescript / finite_16 | 11.423 / 0.557 / 1.041 | 0.079 / 0.068 | 17.8 | 24 / 23 / 2 | `123244d6c6b4afcd37dd1f0d9952e86f2de5d884a0059d28ccc59319301bf679` | 16 / 276 | 16 / 276 / 257 / 509 / 508 | unsupported / false | 3776 | 2686963774253515667 |
 
 ## All retained timing and RSS samples
 
@@ -64,61 +64,61 @@ These are rounds two through eight for every dataset. Solver counts, work, statu
 
 | Dataset | Round | Workspace ms | Semantic ms | ICFG ms | RSS MiB | Direct first/repeat ms | Finite first/repeat ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| external_spring_petclinic_java | 2 | 183.601 | 44.693 | 36.457 | 21.5 | 0.028 / 0.009 | 0.172 / 0.163 |
-| external_spring_petclinic_java | 3 | 126.656 | 4.452 | 18.672 | 21.4 | 0.026 / 0.007 | 0.137 / 0.126 |
-| external_spring_petclinic_java | 4 | 787.394 | 168.332 | 12.455 | 21.5 | 0.025 / 0.008 | 0.159 / 0.145 |
-| external_spring_petclinic_java | 5 | 252.703 | 13.011 | 108.006 | 21.3 | 0.026 / 0.007 | 0.136 / 0.122 |
-| external_spring_petclinic_java | 6 | 172.414 | 3.914 | 41.376 | 21.5 | 0.025 / 0.007 | 0.137 / 0.123 |
-| external_spring_petclinic_java | 7 | 171.683 | 3.899 | 135.942 | 21.4 | 0.029 / 0.010 | 22.690 / 1.063 |
-| external_spring_petclinic_java | 8 | 195.863 | 10.334 | 71.187 | 21.5 | 0.024 / 0.007 | 0.138 / 0.125 |
-| external_vscode_typescript | 2 | 22134.763 | 25.079 | 17.706 | 659.0 | 0.022 / 0.005 | 0.093 / 0.081 |
-| external_vscode_typescript | 3 | 33512.965 | 33.788 | 59.439 | 659.2 | 0.023 / 0.006 | 0.096 / 0.083 |
-| external_vscode_typescript | 4 | 35901.256 | 25.163 | 17.699 | 659.1 | 0.023 / 0.005 | 0.091 / 0.082 |
-| external_vscode_typescript | 5 | 22721.999 | 25.141 | 17.376 | 658.8 | 0.024 / 0.005 | 0.091 / 0.083 |
-| external_vscode_typescript | 6 | 33660.557 | 35.195 | 23.610 | 658.7 | 0.028 / 0.007 | 0.118 / 0.111 |
-| external_vscode_typescript | 7 | 37508.580 | 64.014 | 26.174 | 658.3 | 0.025 / 0.006 | 0.105 / 0.094 |
-| external_vscode_typescript | 8 | 31268.945 | 340.861 | 79.582 | 659.3 | 0.022 / 0.006 | 0.093 / 0.082 |
-| generated_typescript_branches_512 | 2 | 23.290 | 30.013 | 1.559 | 35.4 | 0.459 / 0.436 | 16.221 / 17.774 |
-| generated_typescript_branches_512 | 3 | 19.026 | 58.531 | 1.632 | 35.6 | 0.465 / 0.434 | 25.548 / 49.877 |
-| generated_typescript_branches_512 | 4 | 20.322 | 139.033 | 1.596 | 34.9 | 0.476 / 9.021 | 34.512 / 63.640 |
-| generated_typescript_branches_512 | 5 | 17.703 | 49.723 | 2.437 | 34.3 | 0.460 / 1.201 | 22.241 / 210.251 |
-| generated_typescript_branches_512 | 6 | 16.235 | 39.194 | 1.621 | 34.9 | 0.477 / 0.430 | 49.784 / 181.489 |
-| generated_typescript_branches_512 | 7 | 17.176 | 75.070 | 3.014 | 34.8 | 0.450 / 0.419 | 36.652 / 70.351 |
-| generated_typescript_branches_512 | 8 | 18.976 | 37.824 | 2.779 | 36.8 | 0.463 / 0.428 | 45.186 / 22.620 |
-| generated_typescript_branches_64 | 2 | 10.997 | 6.222 | 0.544 | 19.2 | 0.154 / 0.133 | 3.024 / 1.527 |
-| generated_typescript_branches_64 | 3 | 21.197 | 5.861 | 0.303 | 19.0 | 0.071 / 0.054 | 1.478 / 1.462 |
-| generated_typescript_branches_64 | 4 | 14.273 | 6.210 | 0.634 | 19.4 | 0.163 / 0.195 | 4.756 / 3.325 |
-| generated_typescript_branches_64 | 5 | 9.254 | 5.976 | 0.593 | 19.4 | 0.185 / 0.139 | 4.214 / 6.410 |
-| generated_typescript_branches_64 | 6 | 9.218 | 4.378 | 0.278 | 19.3 | 0.069 / 0.054 | 1.472 / 1.437 |
-| generated_typescript_branches_64 | 7 | 14.794 | 2.859 | 0.260 | 19.0 | 0.068 / 0.054 | 1.510 / 1.476 |
-| generated_typescript_branches_64 | 8 | 9.353 | 6.484 | 0.551 | 19.3 | 0.158 / 0.132 | 3.660 / 4.062 |
-| generated_typescript_calls_32 | 2 | 9.990 | 2.755 | 13.854 | 18.7 | 0.021 / 0.005 | 0.092 / 0.085 |
-| generated_typescript_calls_32 | 3 | 10.251 | 3.805 | 10.042 | 18.5 | 0.021 / 0.004 | 0.093 / 0.081 |
-| generated_typescript_calls_32 | 4 | 13.037 | 5.519 | 5.844 | 18.5 | 0.016 / 0.004 | 0.089 / 0.082 |
-| generated_typescript_calls_32 | 5 | 10.597 | 2.369 | 10.089 | 18.7 | 0.028 / 0.010 | 0.199 / 0.246 |
-| generated_typescript_calls_32 | 6 | 20.848 | 1.738 | 31.675 | 18.6 | 0.019 / 0.005 | 0.092 / 0.082 |
-| generated_typescript_calls_32 | 7 | 13.570 | 2.554 | 17.036 | 18.7 | 0.022 / 0.004 | 0.094 / 0.086 |
-| generated_typescript_calls_32 | 8 | 25.263 | 3.241 | 14.358 | 18.6 | 0.017 / 0.004 | 0.091 / 0.081 |
-| generated_typescript_calls_8 | 2 | 17.146 | 2.138 | 6.119 | 17.9 | 0.022 / 0.007 | 0.153 / 0.141 |
-| generated_typescript_calls_8 | 3 | 14.612 | 0.736 | 2.412 | 18.0 | 0.045 / 0.007 | 0.160 / 0.144 |
-| generated_typescript_calls_8 | 4 | 6.705 | 0.587 | 2.261 | 17.9 | 0.018 / 0.007 | 0.151 / 0.139 |
-| generated_typescript_calls_8 | 5 | 9.699 | 1.264 | 5.303 | 17.9 | 0.036 / 0.016 | 0.337 / 0.320 |
-| generated_typescript_calls_8 | 6 | 10.628 | 0.590 | 2.558 | 17.9 | 0.019 / 0.007 | 0.152 / 0.142 |
-| generated_typescript_calls_8 | 7 | 20.337 | 1.294 | 6.459 | 17.9 | 0.037 / 0.016 | 0.388 / 0.319 |
-| generated_typescript_calls_8 | 8 | 9.065 | 1.264 | 5.217 | 17.9 | 0.036 / 0.016 | 0.333 / 0.316 |
-| inline_java | 2 | 36.550 | 0.802 | 2.647 | 17.4 | 0.026 / 0.006 | 0.093 / 0.080 |
-| inline_java | 3 | 25.056 | 0.799 | 8.054 | 17.3 | 0.034 / 0.006 | 0.101 / 0.084 |
-| inline_java | 4 | 31.974 | 3.721 | 8.404 | 17.3 | 0.029 / 0.007 | 0.104 / 0.099 |
-| inline_java | 5 | 33.273 | 1.059 | 2.380 | 17.3 | 0.030 / 0.006 | 0.086 / 0.077 |
-| inline_java | 6 | 16.573 | 0.863 | 2.478 | 17.4 | 0.025 / 0.005 | 0.082 / 0.073 |
-| inline_java | 7 | 30.961 | 0.819 | 2.133 | 17.3 | 0.026 / 0.006 | 0.092 / 0.082 |
-| inline_java | 8 | 22.792 | 0.692 | 2.010 | 17.2 | 0.038 / 0.005 | 0.117 / 0.110 |
-| inline_typescript | 2 | 25.193 | 0.624 | 1.285 | 17.6 | 0.022 / 0.006 | 0.089 / 0.087 |
-| inline_typescript | 3 | 179.754 | 77.042 | 1.766 | 17.6 | 0.029 / 0.009 | 0.105 / 0.096 |
-| inline_typescript | 4 | 34.320 | 1.915 | 3.080 | 17.6 | 0.030 / 0.006 | 0.092 / 0.084 |
-| inline_typescript | 5 | 29.180 | 0.703 | 1.549 | 17.4 | 0.024 / 0.006 | 0.087 / 0.084 |
-| inline_typescript | 6 | 22.572 | 0.734 | 5.206 | 17.6 | 0.026 / 0.008 | 0.083 / 0.077 |
-| inline_typescript | 7 | 29.075 | 0.619 | 2.908 | 17.6 | 0.030 / 0.010 | 0.095 / 0.087 |
-| inline_typescript | 8 | 36.245 | 0.748 | 3.183 | 17.6 | 0.029 / 0.006 | 0.088 / 0.080 |
+| external_spring_petclinic_java | 2 | 68.263 | 3.709 | 12.028 | 22.2 | 0.024 / 0.007 | 0.139 / 0.125 |
+| external_spring_petclinic_java | 3 | 69.723 | 3.988 | 11.653 | 22.1 | 0.019 / 0.007 | 0.141 / 0.126 |
+| external_spring_petclinic_java | 4 | 70.171 | 3.660 | 15.728 | 22.3 | 0.023 / 0.010 | 0.147 / 0.147 |
+| external_spring_petclinic_java | 5 | 69.429 | 3.521 | 11.002 | 22.0 | 0.021 / 0.007 | 0.137 / 0.124 |
+| external_spring_petclinic_java | 6 | 68.676 | 3.331 | 10.880 | 22.2 | 0.021 / 0.007 | 0.144 / 0.124 |
+| external_spring_petclinic_java | 7 | 73.467 | 3.366 | 11.207 | 21.9 | 0.021 / 0.007 | 0.141 / 0.126 |
+| external_spring_petclinic_java | 8 | 72.282 | 3.568 | 11.296 | 22.0 | 0.021 / 0.007 | 0.141 / 0.125 |
+| external_vscode_typescript | 2 | 22276.512 | 26.034 | 18.616 | 657.3 | 0.023 / 0.006 | 0.096 / 0.083 |
+| external_vscode_typescript | 3 | 22759.654 | 25.830 | 18.123 | 658.7 | 0.018 / 0.005 | 0.095 / 0.087 |
+| external_vscode_typescript | 4 | 25184.787 | 26.348 | 18.846 | 658.6 | 0.018 / 0.006 | 0.092 / 0.082 |
+| external_vscode_typescript | 5 | 24921.346 | 27.619 | 19.480 | 656.6 | 0.015 / 0.005 | 0.092 / 0.082 |
+| external_vscode_typescript | 6 | 26633.914 | 26.472 | 18.441 | 651.1 | 0.017 / 0.006 | 0.096 / 0.085 |
+| external_vscode_typescript | 7 | 23905.647 | 26.587 | 19.240 | 658.1 | 0.017 / 0.005 | 0.099 / 0.082 |
+| external_vscode_typescript | 8 | 29192.209 | 25.985 | 18.677 | 657.3 | 0.018 / 0.005 | 0.093 / 0.084 |
+| generated_typescript_branches_512 | 2 | 21.383 | 46.832 | 2.931 | 87.5 | 0.852 / 0.800 | 31.526 / 28.001 |
+| generated_typescript_branches_512 | 3 | 21.678 | 46.591 | 3.390 | 88.7 | 1.030 / 0.933 | 32.530 / 27.676 |
+| generated_typescript_branches_512 | 4 | 22.233 | 49.838 | 4.710 | 90.2 | 1.427 / 1.409 | 23.828 / 24.054 |
+| generated_typescript_branches_512 | 5 | 52.036 | 93.556 | 4.246 | 87.4 | 1.227 / 1.270 | 39.245 / 37.327 |
+| generated_typescript_branches_512 | 6 | 44.714 | 71.088 | 4.754 | 88.3 | 1.433 / 1.336 | 28.749 / 30.519 |
+| generated_typescript_branches_512 | 7 | 25.179 | 55.103 | 4.011 | 87.2 | 1.355 / 1.071 | 32.970 / 38.410 |
+| generated_typescript_branches_512 | 8 | 18.286 | 39.655 | 2.734 | 87.5 | 0.839 / 0.849 | 24.677 / 23.954 |
+| generated_typescript_branches_64 | 2 | 13.109 | 5.371 | 0.451 | 26.0 | 0.119 / 0.101 | 2.791 / 2.711 |
+| generated_typescript_branches_64 | 3 | 11.923 | 5.272 | 0.448 | 25.8 | 0.116 / 0.102 | 2.894 / 2.786 |
+| generated_typescript_branches_64 | 4 | 12.608 | 5.183 | 0.405 | 25.9 | 0.115 / 0.105 | 2.816 / 2.744 |
+| generated_typescript_branches_64 | 5 | 12.379 | 5.301 | 0.443 | 26.0 | 0.117 / 0.103 | 2.776 / 2.713 |
+| generated_typescript_branches_64 | 6 | 13.001 | 5.202 | 0.421 | 25.9 | 0.115 / 0.118 | 2.821 / 3.023 |
+| generated_typescript_branches_64 | 7 | 12.779 | 5.184 | 0.406 | 26.2 | 0.118 / 0.101 | 3.003 / 3.071 |
+| generated_typescript_branches_64 | 8 | 12.354 | 5.314 | 0.609 | 26.3 | 0.156 / 0.130 | 3.318 / 2.768 |
+| generated_typescript_calls_32 | 2 | 12.521 | 3.185 | 10.525 | 20.8 | 0.025 / 0.008 | 0.176 / 0.155 |
+| generated_typescript_calls_32 | 3 | 13.462 | 3.233 | 10.814 | 20.7 | 0.028 / 0.008 | 0.177 / 0.185 |
+| generated_typescript_calls_32 | 4 | 12.812 | 3.154 | 10.894 | 20.7 | 0.028 / 0.008 | 0.170 / 0.169 |
+| generated_typescript_calls_32 | 5 | 13.210 | 3.123 | 10.877 | 20.7 | 0.025 / 0.008 | 0.182 / 0.159 |
+| generated_typescript_calls_32 | 6 | 12.129 | 3.210 | 10.961 | 20.8 | 0.025 / 0.008 | 0.195 / 0.163 |
+| generated_typescript_calls_32 | 7 | 12.216 | 3.045 | 11.842 | 20.9 | 0.025 / 0.010 | 0.184 / 0.156 |
+| generated_typescript_calls_32 | 8 | 12.635 | 3.125 | 10.646 | 20.8 | 0.025 / 0.008 | 0.184 / 0.155 |
+| generated_typescript_calls_8 | 2 | 10.849 | 0.990 | 4.135 | 21.0 | 0.026 / 0.013 | 0.286 / 0.268 |
+| generated_typescript_calls_8 | 3 | 11.070 | 1.003 | 3.952 | 20.9 | 0.025 / 0.013 | 0.296 / 0.268 |
+| generated_typescript_calls_8 | 4 | 11.672 | 0.981 | 4.150 | 20.8 | 0.025 / 0.013 | 0.290 / 0.293 |
+| generated_typescript_calls_8 | 5 | 10.924 | 1.009 | 4.379 | 20.8 | 0.026 / 0.014 | 0.294 / 0.271 |
+| generated_typescript_calls_8 | 6 | 11.481 | 0.997 | 4.059 | 20.8 | 0.026 / 0.013 | 0.314 / 0.311 |
+| generated_typescript_calls_8 | 7 | 11.952 | 1.009 | 4.021 | 20.9 | 0.026 / 0.013 | 0.431 / 0.299 |
+| generated_typescript_calls_8 | 8 | 11.110 | 1.036 | 4.114 | 20.9 | 0.025 / 0.013 | 0.296 / 0.269 |
+| inline_java | 2 | 10.832 | 0.576 | 1.353 | 17.7 | 0.025 / 0.005 | 0.077 / 0.065 |
+| inline_java | 3 | 10.616 | 0.594 | 1.345 | 17.6 | 0.022 / 0.005 | 0.083 / 0.064 |
+| inline_java | 4 | 10.912 | 0.520 | 1.251 | 17.7 | 0.019 / 0.005 | 0.073 / 0.064 |
+| inline_java | 5 | 10.914 | 0.557 | 1.310 | 17.5 | 0.015 / 0.005 | 0.073 / 0.066 |
+| inline_java | 6 | 11.130 | 0.577 | 1.342 | 17.5 | 0.021 / 0.005 | 0.078 / 0.068 |
+| inline_java | 7 | 11.176 | 0.566 | 1.362 | 17.7 | 0.024 / 0.006 | 0.077 / 0.066 |
+| inline_java | 8 | 11.144 | 0.588 | 1.355 | 17.5 | 0.020 / 0.005 | 0.077 / 0.063 |
+| inline_typescript | 2 | 11.021 | 0.631 | 1.223 | 17.8 | 0.017 / 0.007 | 0.081 / 0.067 |
+| inline_typescript | 3 | 11.807 | 0.623 | 1.041 | 17.8 | 0.020 / 0.005 | 0.079 / 0.070 |
+| inline_typescript | 4 | 10.816 | 0.652 | 1.064 | 17.8 | 0.017 / 0.005 | 0.076 / 0.070 |
+| inline_typescript | 5 | 10.680 | 0.526 | 0.937 | 17.9 | 0.015 / 0.005 | 0.077 / 0.068 |
+| inline_typescript | 6 | 11.423 | 0.545 | 1.279 | 17.7 | 0.019 / 0.005 | 0.139 / 0.081 |
+| inline_typescript | 7 | 13.245 | 0.557 | 1.005 | 17.8 | 0.015 / 0.007 | 0.081 / 0.068 |
+| inline_typescript | 8 | 11.868 | 0.533 | 0.972 | 17.8 | 0.015 / 0.005 | 0.077 / 0.068 |
 
-The raw runner aggregate was 152,434 bytes and contained the same 56 full JSON samples plus the median rows above. It was used to generate this checked-in report; the temporary aggregate itself is not a product artifact.
+The raw v2 runner aggregate was 151,174 bytes and contained the same 56 full JSON samples plus the median rows above. It was used to generate this checked-in report; the temporary aggregate itself is not a product artifact.

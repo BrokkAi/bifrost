@@ -9,9 +9,10 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::hint::black_box;
+use std::io::{BufReader, Read};
 use std::mem::{size_of, size_of_val};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,14 +25,15 @@ use brokk_bifrost::analyzer::dataflow::{
     SolverTermination, SolverWork, solve,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CancellationToken, DeclarationSegmentKind, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits,
-    ProcedureHandle, ProcedureKind, SemanticArtifact, SemanticBudget, SemanticOutcome,
-    SemanticRequest, StableDigest,
+    CallSiteHandle, CancellationToken, DeclarationSegmentKind, IcfgProvider, IcfgSnapshot,
+    IcfgSnapshotLimits, ProcedureHandle, ProcedureKind, ProgramPointHandle, SemanticArtifact,
+    SemanticBudget, SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{
     AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use common::{InlineTestProject, semantic_graph::reachable_icfg_nodes};
 
@@ -43,8 +45,8 @@ const TS_REPO_ENV: &str = "BIFROST_SEMANTIC_TS_REPO";
 const JAVA_REPO_ENV: &str = "BIFROST_SEMANTIC_JAVA_REPO";
 const VSCODE_COMMIT: &str = "19e0f9e681ecb8e5c09d8784acaa601316ca4571";
 const SPRING_PETCLINIC_COMMIT: &str = "f182358d02e4a68e52bdbabf55ca7800288511e7";
-const FORMAT: &str = "bifrost_dataflow_lifecycle_benchmark/v1";
-const AGGREGATE_FORMAT: &str = "bifrost_dataflow_lifecycle_benchmark_aggregate/v1";
+const FORMAT: &str = "bifrost_dataflow_lifecycle_benchmark/v2";
+const AGGREGATE_FORMAT: &str = "bifrost_dataflow_lifecycle_benchmark_aggregate/v2";
 const RECOMMENDATION: &str =
     "ephemeral_not_eligible; persist reusable summaries only after #823 defines and measures them";
 const REQUIRED_DATASETS: [&str; 8] = [
@@ -99,6 +101,7 @@ struct IcfgMeasurement {
     reachable_nodes: usize,
     edges: usize,
     boundaries: usize,
+    topology_checksum: String,
     semantic_work: SemanticWorkReport,
 }
 
@@ -128,7 +131,7 @@ struct SemanticWorkReport {
     owned_text_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct SolverWorkReport {
     interned_facts: usize,
     reached_states: usize,
@@ -189,6 +192,7 @@ struct MedianMeasurement {
     reachable_nodes: usize,
     edges: usize,
     boundaries: usize,
+    topology_checksum: String,
     facts: usize,
     reached: usize,
     work: SolverWorkReport,
@@ -323,9 +327,27 @@ fn median_helpers_select_the_middle_retained_sample() {
 #[test]
 fn benchmark_clients_are_deterministic_and_bounded_on_a_real_icfg() {
     let measurement = measure_generated_branches("generated_typescript_branches_8", 8);
+    let repeated = measure_generated_branches("generated_typescript_branches_8", 8);
     let direct = &measurement.clients[0];
     let finite = &measurement.clients[1];
 
+    assert_eq!(
+        measurement.icfg.topology_checksum, repeated.icfg.topology_checksum,
+        "topology checksum must ignore snapshot-local pointers and workspace mounts"
+    );
+    assert_eq!(
+        measurement
+            .clients
+            .iter()
+            .map(|client| client.checksum)
+            .collect::<Vec<_>>(),
+        repeated
+            .clients
+            .iter()
+            .map(|client| client.checksum)
+            .collect::<Vec<_>>(),
+        "client checksum must remain stable across equivalent fresh workspaces"
+    );
     assert_eq!(direct.client, "direct");
     assert_eq!(direct.facts, 1);
     assert_eq!(direct.reached, measurement.icfg.reachable_nodes);
@@ -620,6 +642,7 @@ fn measure_workspace(
             reachable_nodes,
             edges: snapshot.edge_count(),
             boundaries: snapshot.boundaries().len(),
+            topology_checksum: icfg_topology_checksum(snapshot),
             semantic_work: semantic_work_report(icfg_outcome.work()),
         },
         clients,
@@ -698,6 +721,7 @@ fn measure_client<P>(label: &str, input: IcfgSolveInput<'_>, problem: &P) -> Cli
 where
     P: BoundedSnapshotDataflowProblem,
 {
+    let snapshot = input.snapshot();
     let cancellation = CancellationToken::default();
     let mut first_budget = SolverBudget::default();
     let first_started = Instant::now();
@@ -745,7 +769,7 @@ where
         work: solver_work_report(first.work()),
         termination: termination_label(first.termination()).to_owned(),
         complete: first.is_complete(),
-        checksum: result_checksum(&first),
+        checksum: result_checksum(snapshot, &first),
         estimated_shallow_result_bytes: estimated_shallow_result_bytes(&first),
         cache_status: "not_applicable_run_local".to_owned(),
         serialized_bytes: None,
@@ -804,8 +828,108 @@ fn termination_label(termination: SolverTermination) -> &'static str {
     }
 }
 
-fn result_checksum<Fact: Hash>(result: &DataflowResult<Fact>) -> u64 {
+fn icfg_topology_checksum(snapshot: &IcfgSnapshot) -> String {
+    fn hash_records(hasher: &mut Sha256, category: &[u8], mut records: Vec<String>) {
+        records.sort_unstable();
+        hasher.update(category.len().to_le_bytes());
+        hasher.update(category);
+        hasher.update(records.len().to_le_bytes());
+        for record in records {
+            hasher.update(record.len().to_le_bytes());
+            hasher.update(record.as_bytes());
+        }
+    }
+
+    let node_labels = snapshot
+        .nodes()
+        .iter()
+        .map(|node| {
+            let context = node
+                .call_context()
+                .iter()
+                .map(stable_call_site_label)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "point={}|context=[{context}]",
+                stable_program_point_label(node.point())
+            )
+        })
+        .collect::<Vec<_>>();
+    let edge_labels = snapshot
+        .edges()
+        .iter()
+        .map(|edge| {
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                node_labels[edge.source.index()],
+                node_labels[edge.target.index()],
+                edge.kind,
+                edge.origin.as_ref().map(stable_call_site_label),
+                edge.proof,
+                edge.completeness
+            )
+        })
+        .collect();
+    let boundary_labels = snapshot
+        .boundaries()
+        .iter()
+        .map(|boundary| {
+            format!(
+                "{:?}|{:?}|{:?}",
+                node_labels[boundary.at.index()],
+                boundary.origin.as_ref().map(stable_call_site_label),
+                boundary.kind
+            )
+        })
+        .collect();
+
+    let mut hasher = Sha256::new();
+    hash_records(&mut hasher, b"nodes", node_labels);
+    hash_records(&mut hasher, b"edges", edge_labels);
+    hash_records(&mut hasher, b"boundaries", boundary_labels);
+    format!("{:x}", hasher.finalize())
+}
+
+fn stable_program_point_label(point: &ProgramPointHandle) -> String {
+    format!(
+        "{}|program_point={}",
+        stable_procedure_label(point.procedure()),
+        point.id().get()
+    )
+}
+
+fn stable_call_site_label(call: &CallSiteHandle) -> String {
+    format!(
+        "{}|call_site={}",
+        stable_procedure_label(call.procedure()),
+        call.id().get()
+    )
+}
+
+fn stable_procedure_label(procedure: &ProcedureHandle) -> String {
+    let key = procedure.artifact().key();
+    let locator = procedure.semantics().locator();
+    format!(
+        "path={}|language={}|revision={:?}|adapter={}:{}|ir={}|configuration={}|dependencies={}|declaration={:?}|role={:?}|anchor={:?}|procedure={}",
+        key.path(),
+        key.language().stable_label(),
+        key.revision(),
+        key.adapter().name(),
+        key.adapter().fingerprint(),
+        key.ir_version().digest(),
+        key.configuration().digest(),
+        key.dependencies().digest(),
+        locator.declaration(),
+        locator.role(),
+        locator.anchor(),
+        procedure.id().get()
+    )
+}
+
+fn result_checksum<Fact: Hash>(snapshot: &IcfgSnapshot, result: &DataflowResult<Fact>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    icfg_topology_checksum(snapshot).hash(&mut hasher);
     result.facts().hash(&mut hasher);
     for reached in result.reached() {
         reached.node().get().hash(&mut hasher);
@@ -823,7 +947,16 @@ fn result_checksum<Fact: Hash>(result: &DataflowResult<Fact>) -> u64 {
         edge.get().hash(&mut hasher);
     }
     for boundary in result.coverage().boundaries() {
-        boundary.at.get().hash(&mut hasher);
+        format!(
+            "{:?}|{:?}|{:?}",
+            snapshot
+                .node(boundary.at)
+                .map(|node| stable_program_point_label(node.point()))
+                .expect("data-flow boundary node belongs to its ICFG"),
+            boundary.origin.as_ref().map(stable_call_site_label),
+            boundary.kind
+        )
+        .hash(&mut hasher);
     }
     termination_label(result.termination()).hash(&mut hasher);
     solver_work_report(result.work()).hash(&mut hasher);
@@ -1001,6 +1134,7 @@ fn aggregate(samples_file: &Path) -> AggregateResult {
                 reachable_nodes: reference_dataset.icfg.reachable_nodes,
                 edges: reference_dataset.icfg.edges,
                 boundaries: reference_dataset.icfg.boundaries,
+                topology_checksum: reference_dataset.icfg.topology_checksum.clone(),
                 facts: reference_client.facts,
                 reached: reference_client.reached,
                 work: reference_client.work,
@@ -1179,7 +1313,7 @@ fn benchmark_provenance() -> BenchmarkProvenance {
         rustc_version_verbose: command_output(&rustc, &["--version", "--verbose"]),
         operating_system: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
-        system_identity: command_output("uname", &["-a"]),
+        system_identity: command_output("uname", &["-srm"]),
         cpu_model: cpu_model(),
         logical_parallelism: std::thread::available_parallelism()
             .ok()
@@ -1220,21 +1354,41 @@ fn bifrost_tree_fingerprint(root: &Path) -> Option<String> {
         .output()
         .ok()
         .filter(|output| output.status.success())?;
-    let mut material = Vec::with_capacity(diff.stdout.len() + untracked.stdout.len());
-    material.extend_from_slice(git_commit(root)?.as_bytes());
-    material.extend_from_slice(&diff.stdout);
+    let mut hasher = Sha256::new();
+    hasher.update(git_commit(root)?.as_bytes());
+    hasher.update(&diff.stdout);
     for raw_path in untracked.stdout.split(|byte| *byte == 0) {
         if raw_path.is_empty() {
             continue;
         }
         let relative = std::str::from_utf8(raw_path).ok()?;
-        let contents = fs::read(root.join(relative)).ok()?;
-        material.extend_from_slice(&u64::try_from(raw_path.len()).ok()?.to_le_bytes());
-        material.extend_from_slice(raw_path);
-        material.extend_from_slice(&u64::try_from(contents.len()).ok()?.to_le_bytes());
-        material.extend_from_slice(&contents);
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        hasher.update(u64::try_from(raw_path.len()).ok()?.to_le_bytes());
+        hasher.update(raw_path);
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(path).ok()?;
+            let target = target.to_string_lossy();
+            hasher.update(u64::try_from(target.len()).ok()?.to_le_bytes());
+            hasher.update(target.as_bytes());
+        } else if metadata.is_file() {
+            let file = File::open(path).ok()?;
+            let length = file.metadata().ok()?.len();
+            hasher.update(length.to_le_bytes());
+            let mut reader = BufReader::new(file);
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut buffer).ok()?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else {
+            return None;
+        }
     }
-    Some(StableDigest::sha256(material).to_string())
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn command_output_in(root: &Path, program: &str, arguments: &[&str]) -> Option<String> {
@@ -1275,15 +1429,5 @@ fn cpu_model() -> Option<String> {
             })
     } else {
         std::env::var("PROCESSOR_IDENTIFIER").ok()
-    }
-}
-
-impl Hash for SolverWorkReport {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.interned_facts.hash(state);
-        self.reached_states.hash(state);
-        self.flow_evaluations.hash(state);
-        self.callback_rows.hash(state);
-        self.propagated_outputs.hash(state);
     }
 }

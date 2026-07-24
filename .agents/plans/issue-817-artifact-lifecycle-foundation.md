@@ -20,8 +20,10 @@ The observable outcome is a retained benchmark report over generated projects, i
 - [x] (2026-07-24 07:49Z) Added the reusable artifact-promotion benchmark API, migrated the semantic CFG persistence gate without changing its report shape, and passed focused unit and integration tests.
 - [x] (2026-07-24 08:08Z) Added the fresh-process data-flow lifecycle benchmark and runner; seven non-ignored schema/behavior tests pass, and release smokes select and solve the exact pinned VS Code and Spring PetClinic procedures.
 - [x] (2026-07-24 08:27Z) Ran 72 fresh release processes, retained and invariant-checked 56 samples across all eight required datasets, and recorded the medians, raw timing/RSS rows, provenance, and `ephemeral_not_eligible` decision.
-- [ ] Complete focused and repository-wide validation.
-- [ ] Run specialist review, resolve findings, update the retrospective, and checkpoint the reviewed result.
+- [x] (2026-07-24 10:16Z) Completed the feature-enabled repository test matrix on the host: all library, binary, integration, and doc-test targets passed; the library target reported 1,870 passed, zero failed, and five ignored.
+- [x] (2026-07-24 10:50Z) Completed security, duplication, intent, DevOps, and architecture reviews; hardened provenance, promotion-state consistency, signal cleanup, locked execution, and topology validation in response.
+- [x] (2026-07-24 11:05Z) Re-ran the complete 72-process v2 matrix after review. All 56 retained samples reproduced canonical typed ICFG topology and result identity, and the report now contains the reviewed provenance, medians, and raw rows.
+- [x] (2026-07-24 11:12Z) Passed the final focused unit and integration tests, formatting, shell syntax, diff hygiene, and strict locked all-target/all-feature Clippy in a cleaned isolated target.
 
 ## Surprises & Discoveries
 
@@ -44,10 +46,25 @@ The observable outcome is a retained benchmark report over generated projects, i
   Evidence: the VS Code `Function(quickSelect)` release smoke produced 31 reachable nodes with an `unknown` outcome and two boundaries; Spring PetClinic `Type(OwnerController)::Method(processFindForm)` produced 41 reachable nodes with an `unsupported` outcome and two boundaries. Both clients reached fixed points without claiming complete coverage.
 
 - Observation: workspace RSS and exploded-result size are different lifecycle signals.
-  Evidence: the retained VS Code median process peak was 659.0 MiB while its finite result's public shallow slices were 5,136 bytes. The largest result was instead the complete 512-branch finite workload at 98,313 reached states and 1,179,940 shallow bytes, with a 34.9 MiB process peak.
+  Evidence: the reviewed VS Code median process peak was 657.3 MiB while its finite result's public shallow slices were 5,136 bytes. The largest result was instead the complete 512-branch finite workload at 98,313 reached states and 1,179,940 shallow bytes, with an 87.5 MiB process peak.
 
 - Observation: immediate repeated execution is not reliably faster and is not cache reuse.
-  Evidence: the complete 512-branch finite workload had 34.512 ms first-solve and 63.640 ms repeat-solve medians while preserving exact work and checksums. The benchmark therefore reports both timings without treating their difference as a hydration speedup.
+  Evidence: the reviewed complete 512-branch finite workload had 31.526 ms first-solve and 28.001 ms repeat-solve medians while preserving exact work and checksums. The benchmark reports both timings without treating their difference as a hydration speedup.
+
+- Observation: integer ratio comparisons need exact overflow-safe arithmetic at their equality boundaries.
+  Evidence: the complete test matrix exposed a large-value serialized-size boundary that the initial saturating multiplication implementation rejected. The evaluator now cross-multiplies in `u128`, and the exact-boundary regression passes.
+
+- Observation: snapshot-local graph identity is not decision-grade topology identity.
+  Evidence: the first review hardening pass hashed pointer-backed and mount-specific node identities, which made equivalent Spring PetClinic graphs differ across fresh temporary roots. The v2 checksum instead sorts stable procedure-local node labels, typed edges, and typed boundaries while excluding pointers, dense numbering, and temporary workspace mounts.
+
+- Observation: collecting source provenance can accidentally invalidate Cargo's build-script inputs.
+  Evidence: each benchmark process originally ran ordinary `git status`, refreshing the worktree index that `build.rs` watches and causing repeated release rebuilds. The runner now sets `GIT_OPTIONAL_LOCKS=0`; later rounds reuse the existing release build while still recording dirty state and the streamed tree fingerprint.
+
+- Observation: toolchain provenance and host test permissions both mattered during full validation.
+  Evidence: Homebrew `cargo-clippy` initially paired with the wrong LLVM/rustc driver until the Rustup 1.96.0 proxy paths were supplied explicitly. The managed sandbox also denied three MCP helper-subprocess tests; the identical host-side `nlp,python` command passed every enabled target.
+
+- Observation: the pinned Spring checkout acquired two Finder metadata files during local inspection.
+  Evidence: the untracked `.DS_Store` files were moved recoverably to `/private/tmp/spring-petclinic-ds-store-019f92ff/`; both external repositories were clean before the reviewed matrix ran.
 
 ## Decision Log
 
@@ -75,9 +92,17 @@ The observable outcome is a retained benchmark report over generated projects, i
   Rationale: this matches the completed semantic CFG persistence protocol, keeps process startup, allocator state, and page-cache effects visible in the raw evidence, and makes process-peak RSS attributable to one dataset.
   Date/Author: 2026-07-24 / Codex
 
+- Decision: bind retained solver evidence to a canonical typed-topology checksum rather than graph counts or snapshot-local IDs.
+  Rationale: equal node/edge/boundary counts cannot prove equal topology, while raw node identities include pointers, dense numbering, and workspace mounts that legitimately vary between processes. Stable procedure-local labels plus every typed edge and typed boundary capture the semantic input the clients actually consumed.
+  Date/Author: 2026-07-24 / Codex
+
 ## Outcomes & Retrospective
 
-The reusable promotion evaluator, complete lifecycle matrix, and reproducible data-flow lifecycle report are implemented. The retained run used Bifrost `da37cbc8`, rustc 1.96.0, macOS arm64, exact clean VS Code and Spring PetClinic revisions, nine fresh processes per dataset, and seven retained samples per group. All 56 retained samples had stable topology, work, results, and checksums; all clients reached fixed points; incomplete ICFG inputs remained incomplete. No production persistence, cache, packed data-flow DTO, or durable `FactId` was introduced. Repository-wide validation and specialist review remain before the final retrospective.
+The reusable promotion evaluator, corrected lifecycle matrix, and reproducible data-flow lifecycle report are implemented. The reviewed v2 run used Bifrost `a9daea53` plus the fingerprinted review changes, rustc 1.96.0, macOS arm64, exact clean VS Code and Spring PetClinic revisions, nine fresh processes per dataset, and seven retained samples per group. All 56 retained samples had stable canonical typed topology, work, results, and checksums; all clients reached fixed points; incomplete ICFG inputs remained incomplete.
+
+The measurements support a narrow conclusion: bounded exploded data-flow states are request-local and not eligible for persistence. They do not measure an equivalent reusable serialized candidate, so they are not a persistence no-go for the procedure summaries deferred to #823. No production persistence, cache, packed data-flow DTO, or durable `FactId` was introduced.
+
+Review materially improved the evidence boundary. The promotion result can no longer carry a contradictory aggregate boolean; untracked symlinks are fingerprinted without following them; large files are streamed; host provenance omits the hostname; runner builds are locked and interruption-safe; and retained samples prove the exact canonical typed ICFG topology rather than only its counts. The complete feature-enabled suite passed on the host, and the reviewed result passed the final focused tests, formatting, shell syntax, diff hygiene, and strict all-target/all-feature Clippy.
 
 ## Context and Orientation
 
@@ -130,7 +155,7 @@ Next add `src/benchmark/artifact_lifecycle.rs` and re-export it from `src/benchm
         measurement: ArtifactPromotionMeasurement,
     ) -> Result<ArtifactPromotionEvaluation, ArtifactPromotionInputError>;
 
-`ArtifactPromotionEvaluation` must retain calculated speedup/saving plus a typed status for every gate and an aggregate `passed` value. The error must distinguish invalid thresholds from invalid measurements. Ratios must be compared without overflowing byte multiplication. Floating values must be finite and nonnegative; rebuild time and estimated hydrated bytes must be greater than zero. RSS must be present and nonzero for both modes to pass the RSS gate.
+`ArtifactPromotionEvaluation` must retain calculated speedup/saving plus a typed status for every gate and compute aggregate `passed()` from those statuses. The error must distinguish invalid thresholds from invalid measurements. Ratios must be compared without overflowing byte multiplication. Floating values must be finite and nonnegative; rebuild time and estimated hydrated bytes must be greater than zero. RSS must be present and nonzero for both modes to pass the RSS gate.
 
 Give `ArtifactPromotionThresholds::default()` the six existing #817 thresholds. Add focused unit tests for exact boundaries, one failure at a time, missing RSS, invalid floats, zero denominators, and large byte values.
 
@@ -149,7 +174,7 @@ Run two benchmark-local clients over each available snapshot. The direct client 
 
 Each sample reports Bifrost commit and dirty-tree fingerprint, toolchain/machine context, dataset repository identity, ICFG limits and outcome, semantic/ICFG construction time, first and immediate-repeat solve time, nodes, edges, boundaries, facts, reached rows, all five solver-work dimensions, termination, completeness, deterministic checksum, estimated shallow result bytes, peak RSS where supported, cache status `not_applicable_run_local`, and serialized size `not_applicable`.
 
-The aggregate validates identical provenance and topology/work checksums within each dataset/client group, retains rounds two through eight, computes medians, and emits the recommendation `ephemeral_not_eligible; persist reusable summaries only after #823 defines and measures them`. It must not pass the samples through the persistence gate because no equivalent serialized candidate was built.
+The aggregate validates identical provenance, canonical typed-topology checksums, and work/result identity within each dataset/client group, retains rounds two through eight, computes medians, and emits the recommendation `ephemeral_not_eligible; persist reusable summaries only after #823 defines and measures them`. It must not pass the samples through the persistence gate because no equivalent serialized candidate was built.
 
 Create `scripts/run-dataflow-lifecycle-benchmarks.sh`. It uses `set -euo pipefail`, validates the external roots and exact clean commits, creates one `mktemp -d` work directory, removes it on exit, runs nine release processes per dataset, retains seven sample JSON rows per dataset, runs aggregation, and prints exactly one `BIFROST_DATAFLOW_LIFECYCLE_BENCHMARK=` record. It sets `BIFROST_SEMANTIC_INDEX=off` and does not create a manually named Cargo target directory.
 
@@ -200,7 +225,7 @@ Expected: the runner prints progress to stderr and exactly one aggregate JSON ma
 Run formatting and strict lint:
 
     cargo fmt --all -- --check
-    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    scripts/with-isolated-cargo-target.sh cargo clippy --locked --all-targets --all-features -- -D warnings
 
 Run the complete feature-enabled suite on macOS:
 

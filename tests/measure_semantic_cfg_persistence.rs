@@ -1652,7 +1652,7 @@ fn gate_for_dataset(dataset: &str, medians: &[MedianMeasurement]) -> GateDataset
         packed_size_within_limit: evaluation.serialized_size.passed(),
         cold_write_within_percent: evaluation.build_write_time.passed(),
         cold_write_absolute_overhead_met: evaluation.build_write_absolute_overhead.passed(),
-        passed: evaluation.passed,
+        passed: evaluation.passed(),
     }
 }
 
