@@ -1,5 +1,6 @@
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use std::path::Path;
+use tree_sitter::Node;
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
@@ -192,6 +193,90 @@ pub(crate) fn rust_identifier_like_node_kind(kind: &str) -> bool {
 /// appear inside a string literal or doc comment that must not change.
 pub(crate) fn strip_raw_identifier_prefix(text: &str) -> &str {
     text.strip_prefix("r#").unwrap_or(text)
+}
+
+/// Verbatim source text spanned by `node`, or `""` when the byte range is not a
+/// valid `str` boundary (adversarial or partially-parsed input).
+///
+/// This is the single "slice a node's bytes" primitive. It replaces the
+/// per-language `source.get(node.byte_range()).unwrap_or("")` copies and the
+/// panicking `&source[node.byte_range()]` slicers (bad ranges now yield `""`
+/// instead of panicking). Use [`node_source_text_trimmed`] when surrounding
+/// whitespace must be dropped, and [`node_ident_text`] when a language sigil
+/// (`r#`, `@`) must be normalized off identifier tokens.
+pub(crate) fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source.get(node.byte_range()).unwrap_or("")
+}
+
+/// [`node_source_text`] with leading/trailing whitespace trimmed. Trimming is
+/// load-bearing on the usages side, where a "name" node can span a compound
+/// token whose canonical text is the trimmed inner identifier; declaration-side
+/// callers that must preserve exact spans use [`node_source_text`] instead.
+pub(crate) fn node_source_text_trimmed<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_source_text(node, source).trim()
+}
+
+/// Per-language identifier sigil: which tree-sitter node kinds are single
+/// identifier tokens, and the escape/sigil `prefix` (`r#` in Rust, `@` in C#)
+/// to strip from those tokens so identity text (short/fq names) and
+/// reference/member text agree on the canonical spelling.
+///
+/// Stripping is gated on `is_identifier_kind`: the sigil is only removed from
+/// genuine identifier leaf nodes, never from spans where the same character is
+/// meaningful (C# `@"..."` verbatim strings, attribute markers, larger token
+/// runs). See [`node_ident_text`].
+pub(crate) struct IdentifierSigil {
+    pub(crate) is_identifier_kind: fn(&str) -> bool,
+    pub(crate) prefix: &'static str,
+}
+
+/// tree-sitter-rust raw-identifier normalization (`r#type` -> `type`), gated to
+/// the identifier leaf kinds (see [`rust_identifier_like_node_kind`]).
+pub(crate) const RUST_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
+    is_identifier_kind: rust_identifier_like_node_kind,
+    prefix: "r#",
+};
+
+/// Whether `kind` is tree-sitter-c-sharp's identifier leaf kind. C# spells its
+/// verbatim-identifier escape as a leading `@` (`@class`), carried verbatim in
+/// the `identifier` token text; no other node kind carries an `@` that denotes
+/// an identifier (verbatim strings are `verbatim_string_literal`, interpolated
+/// strings and attributes are their own kinds), so gating here keeps the sigil
+/// strip off those spans.
+fn csharp_identifier_like_node_kind(kind: &str) -> bool {
+    kind == "identifier"
+}
+
+/// tree-sitter-c-sharp verbatim-identifier normalization (`@class` -> `class`),
+/// gated to the identifier leaf kind. This is the same normalization the
+/// declaration side already applies when building short/fq names, shared here so
+/// the reference/get-definition side agrees (previously it did not — issue-1128
+/// class inconsistency).
+pub(crate) const CSHARP_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
+    is_identifier_kind: csharp_identifier_like_node_kind,
+    prefix: "@",
+};
+
+/// Node text with a language identifier sigil normalized off.
+///
+/// Slices `node`'s source (empty on a bad range), optionally trims, then strips
+/// `sigil.prefix` iff `node`'s kind satisfies `sigil.is_identifier_kind`. This
+/// is the one place the sigil-normalization invariant lives; the per-surface
+/// (declaration / graph / get-definition) copies delegate here so they cannot
+/// drift out of agreement.
+pub(crate) fn node_ident_text<'a>(
+    node: Node<'_>,
+    source: &'a str,
+    trim: bool,
+    sigil: &IdentifierSigil,
+) -> &'a str {
+    let raw = source.get(node.byte_range()).unwrap_or("");
+    let text = if trim { raw.trim() } else { raw };
+    if (sigil.is_identifier_kind)(node.kind()) {
+        text.strip_prefix(sigil.prefix).unwrap_or(text)
+    } else {
+        text
+    }
 }
 
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {

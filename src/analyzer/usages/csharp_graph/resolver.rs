@@ -1,6 +1,24 @@
 use crate::analyzer::store::LimitedQueryRows;
-pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 pub(super) use crate::analyzer::usages::common::same_node;
+
+/// Trimmed C# node text with the verbatim-identifier `@` sigil normalized off
+/// identifier tokens (`@class` -> `class`). Declaration short/fq names already
+/// strip `@` when built, so the reference/get-definition side must strip it too
+/// for a verbatim-identifier usage to resolve to its declaration (previously it
+/// did not — the same normalization-agreement class as Rust's `r#`). Gated to
+/// the `identifier` kind so `@"..."` verbatim strings and attribute markers are
+/// untouched.
+pub(in crate::analyzer::usages) fn node_text<'a>(
+    node: tree_sitter::Node<'_>,
+    source: &'a str,
+) -> &'a str {
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::CSHARP_IDENTIFIER_SIGIL,
+    )
+}
 use crate::analyzer::usages::get_definition::ResolutionSession;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};

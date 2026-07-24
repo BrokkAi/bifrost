@@ -469,7 +469,7 @@ fn collect_csharp_type_identifiers(
 }
 
 fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn normalize_cs_whitespace(value: &str) -> String {

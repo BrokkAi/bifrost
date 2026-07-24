@@ -2,7 +2,7 @@ use crate::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::Node;
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(crate) fn module_code_unit(file: &ProjectFile) -> CodeUnit {

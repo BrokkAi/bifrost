@@ -1215,7 +1215,7 @@ fn member_receiver_match_is_unproven(
 }
 
 pub(in crate::analyzer::usages) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 /// Whether `node` is the `function` callee of a call expression (`node(...)`).

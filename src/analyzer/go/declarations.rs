@@ -32,7 +32,7 @@ pub(super) fn parse_go_file(
 }
 
 pub(super) fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(crate) fn determine_go_package_name(root: Node<'_>, source: &str) -> String {

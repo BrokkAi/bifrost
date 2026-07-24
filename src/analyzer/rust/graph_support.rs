@@ -1509,15 +1509,12 @@ fn simple_type_name(node: Node<'_>, source: &str) -> Option<String> {
 /// applied here too so trait/impl member-name matching agrees with
 /// normalized declaration names (#1128).
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    }
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    )
 }
 
 fn trait_reference_matches(

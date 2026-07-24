@@ -20,12 +20,12 @@ use super::imports::rust_imports_from_use_declaration;
 /// spans, scoped paths) are returned unmodified — those are only ever
 /// normalized by first walking down to their own identifier-kind children.
 pub(super) fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    let text = source.get(node.start_byte()..node.end_byte()).unwrap_or("");
-    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    }
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        false,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    )
 }
 
 /// Whether `item` is directly preceded by a test-evidence attribute

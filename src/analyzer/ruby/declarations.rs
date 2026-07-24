@@ -15,7 +15,7 @@ pub(crate) fn parse_ruby_tree(source: &str) -> Option<Tree> {
 
 /// Reads the source text backing a tree-sitter node.
 pub(super) fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 /// Walks a Ruby file and emits its declarations into `parsed`.

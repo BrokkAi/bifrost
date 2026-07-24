@@ -223,7 +223,7 @@ fn namespace_constructor_fqn(
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn resolve_indexed_receiver_type(

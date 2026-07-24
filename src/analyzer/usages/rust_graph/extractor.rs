@@ -3063,12 +3063,12 @@ fn simple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
 /// (#1128): usage-side member/reference text must agree with normalized
 /// declaration names.
 fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
-    let text = source.get(node.start_byte()..node.end_byte())?.trim();
-    let text = if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    };
+    let text = crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    );
     (!text.is_empty()).then(|| text.to_string())
 }
 

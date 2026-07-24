@@ -2010,7 +2010,7 @@ fn pattern_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool
 }
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {

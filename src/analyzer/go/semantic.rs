@@ -515,10 +515,6 @@ fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
         .is_some_and(|candidate| candidate.id() == child.id())
 }
 
-fn nonempty_node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    node_text(source, node).filter(|text| !text.is_empty())
-}
-
 type GoLoweringError = ProcedureLoweringError;
 
 #[derive(Debug, Clone, Copy)]

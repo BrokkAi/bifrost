@@ -3968,7 +3968,7 @@ fn collapse_cpp_whitespace(value: &str) -> String {
 }
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(super) fn collect_cpp_identifiers(

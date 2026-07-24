@@ -54,10 +54,7 @@ pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
 /// valid `str` boundary. Shared by the per-language usage resolvers that key on a
 /// node's identifier/type text.
 pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
+    crate::analyzer::common::node_source_text_trimmed(node, source)
 }
 
 pub(super) fn reclassify_import_hit_at(

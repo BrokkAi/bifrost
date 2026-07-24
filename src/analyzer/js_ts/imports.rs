@@ -321,9 +321,7 @@ fn first_identifier_child(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn unquote(text: &str) -> String {

@@ -1288,7 +1288,7 @@ fn jsts_receiver_provider_member_candidates(
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn jsts_member_candidates(

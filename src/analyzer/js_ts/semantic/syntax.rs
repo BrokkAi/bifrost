@@ -135,10 +135,6 @@ fn simple_binding_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     .map(Box::<str>::from)
 }
 
-fn nonempty_node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    node_text(source, node).filter(|text| !text.is_empty())
-}
-
 pub(super) fn callable_shape<'tree>(
     node: Node<'tree>,
 ) -> Option<(

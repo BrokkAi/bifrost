@@ -640,7 +640,7 @@ fn lambda_code_unit(
 }
 
 pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(super) fn normalize_whitespace(text: &str) -> String {

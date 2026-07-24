@@ -93,6 +93,16 @@ pub(crate) fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option
     source.get(node.byte_range())
 }
 
+/// [`node_text`] filtered to reject the empty string, so a name-bearing node
+/// that spans zero bytes (or an out-of-range slice) is treated as absent.
+/// Shared by every per-language semantic lowering module.
+pub(crate) fn nonempty_node_text<'source>(
+    source: &'source str,
+    node: Node<'_>,
+) -> Option<&'source str> {
+    node_text(source, node).filter(|text| !text.is_empty())
+}
+
 /// Collect children associated with one structured tree-sitter field.
 pub(crate) fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
     let mut cursor = node.walk();

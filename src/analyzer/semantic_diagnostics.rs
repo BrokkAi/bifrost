@@ -43,7 +43,7 @@ pub(crate) fn node_range(node: Node<'_>, line_starts: &[usize]) -> Range {
 }
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(crate) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {

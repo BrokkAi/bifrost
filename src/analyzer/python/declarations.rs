@@ -453,7 +453,7 @@ impl<'a> PythonVisitor<'a> {
 }
 
 pub(super) fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 struct PythonModuleInfo {
