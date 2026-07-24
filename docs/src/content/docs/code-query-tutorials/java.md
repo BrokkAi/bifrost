@@ -186,7 +186,7 @@ Java receiver traversal uses shared semantic value and heap evidence together wi
 }
 ```
 
-The companion `points_to` and `member_targets` steps use the same Java receiver-query path. As in JavaScript and TypeScript, every analyzed input returns `precise`, `ambiguous`, `unknown`, `unsupported`, or `exceeded_budget`; a zero-result is not substituted for uncertainty.
+The companion `points_to` and `member_targets` steps use the same receiver-query path. Every analyzed input returns `precise`, `ambiguous`, `unknown`, `unsupported`, or `exceeded_budget`; a zero-result is not substituted for uncertainty.
 
 ## Find An Annotated Constructor
 

@@ -1,9 +1,9 @@
 ---
 title: Receiver Traversal
-description: Trace bounded receiver values and exact member targets across Bifrost language adapters with query_code.
+description: Trace bounded receiver values and exact member targets with query_code.
 ---
 
-Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala queries can expose Bifrost's bounded, demand-driven receiver facts. The three terminal steps preserve uncertainty explicitly:
+Receiver-bearing structural sites can expose Bifrost's bounded, demand-driven receiver facts. The three terminal steps preserve uncertainty explicitly:
 
 - `points_to` describes the value denoted by an expression.
 - `receiver_targets` describes the possible receiver values at a call or member access.
@@ -183,6 +183,6 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
 
 ## Capability And Safety Boundary
 
-The [Java tutorial](../java/#analyze-a-java-receiver) executes a typed Java receiver example; this page exercises the same public contract with JavaScript/TypeScript allocation, factory, ambiguity, exact-member, reference-site, and call-input behavior. C++, C#, Go, PHP, Python, Ruby, Rust, and Scala reuse the neutral semantic oracle and their exact language resolvers. Their supported forms return bounded candidates, while virtual or dynamic dispatch, metaprogramming, unsupported syntax, and plain C remain explicit uncertainty boundaries rather than masquerading as zero matches.
+The [Java tutorial](../java/#analyze-a-java-receiver) executes a typed receiver example; this page exercises the same public contract with JavaScript/TypeScript allocation, factory, ambiguity, exact-member, reference-site, and call-input behavior. Those examples illustrate the adapter-neutral contract rather than define its coverage. Each selected adapter contributes structured facts and exact resolver evidence when available; virtual or dynamic dispatch, metaprogramming, unsupported syntax, and source forms without receiver semantics remain explicit uncertainty boundaries rather than masquerading as zero matches.
 
 Candidate-cap truncation and receiver budget exits set top-level `truncated`, identify the exhausted limit, and emit a diagnostic. Ordinary bounded ambiguity does not set `truncated`. For a completeness-sensitive decision, require `truncated: false`, inspect every outcome, reject or account for diagnostics whose `impact` is `incomplete` or `invalid`, and check `provenance_truncated` as described in [Agent Result Safety](/agent-result-safety/).
