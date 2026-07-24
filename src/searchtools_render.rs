@@ -881,6 +881,12 @@ impl SourceBlock {
         if let Some(note) = &self.note {
             header.push_str(&format!("\n- Note: {note}"));
         }
+        if let Some(role) = &self.occurrence_role {
+            header.push_str(&format!("\n- Occurrence: {role}"));
+        }
+        if let Some(selector) = &self.canonical_selector {
+            header.push_str(&format!("\n- Canonical selector: `{selector}`"));
+        }
         // A sampled excerpt is head+tail with an OMITTED delimiter in between, so
         // sequential numbering would fabricate line numbers after the gap.
         let body = if self.presentation.as_deref() == Some("sampled_excerpt") {
@@ -1068,6 +1074,8 @@ mod tests {
                 start_line: 12,
                 end_line: 14,
                 text: "fn bar() {\n    println!(\"hi\");\n}".to_string(),
+                canonical_selector: None,
+                occurrence_role: None,
                 presentation: None,
                 note: None,
             }],

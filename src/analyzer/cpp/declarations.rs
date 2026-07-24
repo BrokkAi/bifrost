@@ -1355,8 +1355,12 @@ impl<'a> CppVisitor<'a> {
             return;
         };
         let code_unit = function.code_unit(self.file.clone());
+        // Keep an earlier same-file prototype as another physical occurrence
+        // of this callable. `CodeUnit` already identifies the role-neutral
+        // overload, while ranges and signature metadata describe its
+        // declaration/definition occurrences.
         self.parsed
-            .replace_code_unit(code_unit.clone(), node, self.source, None, None);
+            .add_code_unit(code_unit.clone(), node, self.source, None, None);
         let signature = render_cpp_function_display_signature_from_node(
             node,
             self.source,
@@ -1366,6 +1370,7 @@ impl<'a> CppVisitor<'a> {
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
             cpp_signature_metadata(signature, function_declarator, self.source)
+                .with_declaration_only(false)
                 .with_callable_linkage(cpp_callable_linkage(node, self.source)),
         );
         if let Some(parent) = &scope.class_unit {
@@ -1598,6 +1603,7 @@ impl<'a> CppVisitor<'a> {
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
             cpp_signature_metadata(signature, declarator, self.source)
+                .with_declaration_only(true)
                 .with_callable_linkage(cpp_callable_linkage(declaration_node, self.source)),
         );
         if let Some(parent) = &scope.class_unit {

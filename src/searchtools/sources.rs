@@ -20,6 +20,10 @@ pub struct SourceBlock {
     pub end_line: usize,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -38,6 +42,7 @@ pub(super) fn source_blocks_for_resolved_units(
 ) -> Vec<SourceBlock> {
     let mut blocks = Vec::new();
     let mut module_units = Vec::new();
+    let mut cpp_identity = CppIdentityRenderCache::default();
 
     for code_unit in code_units {
         if is_file_listing_target(code_unit) {
@@ -45,7 +50,8 @@ pub(super) fn source_blocks_for_resolved_units(
             continue;
         }
 
-        let source_blocks = source_blocks_for_code_unit(analyzer, code_unit, true);
+        let source_blocks =
+            source_blocks_for_code_unit_with_cache(analyzer, code_unit, true, &mut cpp_identity);
         if source_blocks.is_empty() && is_scala_object_like(code_unit) {
             module_units.push(code_unit.clone());
         } else {
@@ -55,6 +61,30 @@ pub(super) fn source_blocks_for_resolved_units(
 
     blocks.extend(module_file_listing_blocks(analyzer, &module_units));
     blocks
+}
+
+fn prefer_definition_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
+    let definition_groups: HashSet<_> = blocks
+        .iter()
+        .filter(|block| block.occurrence_role.as_deref() == Some("definition"))
+        .filter_map(|block| block.canonical_selector.clone())
+        .collect();
+    blocks
+        .into_iter()
+        .filter(|block| {
+            block.canonical_selector.as_ref().is_none_or(|selector| {
+                !definition_groups.contains(selector)
+                    || block.occurrence_role.as_deref() == Some("definition")
+            })
+        })
+        .collect()
+}
+
+fn preferred_source_blocks_for_resolved_units(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[CodeUnit],
+) -> Vec<SourceBlock> {
+    prefer_definition_source_blocks(source_blocks_for_resolved_units(analyzer, code_units))
 }
 
 pub(super) fn java_generated_accessor_source_blocks(
@@ -241,13 +271,26 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            let file_anchored = matches!(
+                split_definition_selector_with_resolver(&symbol, |anchor| {
+                    matches!(
+                        WorkspaceFileResolver::new(analyzer.project()).resolve_literal(anchor),
+                        ResolvedFileInput::File(_)
+                    )
+                }),
+                DefinitionSelector::FileAnchored { .. }
+            );
             // Exact fully-qualified lookup wins before file patterns, so a
             // canonical symbol containing `/` (e.g. a Go import path) is never
             // misrouted as a filesystem path, and real namespace symbols like
             // `fmt::formatter` are never stolen by path-selector parsing.
             match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
-                    let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                    let sources = if file_anchored {
+                        source_blocks_for_resolved_units(analyzer, &code_units)
+                    } else {
+                        preferred_source_blocks_for_resolved_units(analyzer, &code_units)
+                    };
                     return if sources.is_empty() {
                         (
                             index,
@@ -358,7 +401,7 @@ pub fn get_symbol_sources(
 
             match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
-                    let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                    let sources = preferred_source_blocks_for_resolved_units(analyzer, &code_units);
                     if sources.is_empty() {
                         (
                             index,
@@ -406,16 +449,18 @@ pub fn get_symbol_sources(
     }
 }
 
-pub(super) fn source_blocks_for_code_unit(
+fn source_blocks_for_code_unit_with_cache(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     include_comments: bool,
+    cpp_identity: &mut CppIdentityRenderCache,
 ) -> Vec<SourceBlock> {
     let Some(content) = analyzer.indexed_source(code_unit.source()) else {
         return Vec::new();
     };
 
     let language = language_for_target(code_unit);
+    let canonical_selector = cpp_identity.canonical_selector(analyzer, code_unit);
 
     let mut ranges = if code_unit.is_function() {
         let mut grouped = Vec::new();
@@ -433,6 +478,7 @@ pub(super) fn source_blocks_for_code_unit(
     ranges
         .into_iter()
         .filter_map(|range| {
+            let occurrence_role = cpp_identity.occurrence_role(analyzer, code_unit, &range);
             let start_byte = if include_comments {
                 expanded_comment_start(language, &content, range.start_byte)
             } else {
@@ -454,6 +500,8 @@ pub(super) fn source_blocks_for_code_unit(
                 start_line,
                 end_line: start_line + text.lines().count().saturating_sub(1),
                 text,
+                canonical_selector: canonical_selector.clone(),
+                occurrence_role,
                 presentation: None,
                 note: None,
             })
@@ -506,6 +554,8 @@ pub(super) fn file_outline_source_block(
         start_line: 1,
         end_line,
         text,
+        canonical_selector: None,
+        occurrence_role: None,
         presentation,
         note: Some(note),
     })
@@ -551,6 +601,8 @@ pub(super) fn include_fallback_source_block(
         start_line,
         end_line,
         text,
+        canonical_selector: None,
+        occurrence_role: None,
         presentation: None,
         note: Some(
             "no indexed declarations found in this file; showing its top-level #include lines, not the full source"
@@ -571,6 +623,8 @@ pub(super) fn excerpt_fallback_source_block(
         start_line: sampled.start_line,
         end_line: sampled.end_line,
         text: sampled.text,
+        canonical_selector: None,
+        occurrence_role: None,
         presentation: sampled.presentation,
         note: Some(note),
     })
@@ -624,6 +678,8 @@ pub(super) fn module_file_listing_blocks(
                     start_line: 1,
                     end_line: 1,
                     text: String::new(),
+                    canonical_selector: None,
+                    occurrence_role: None,
                     presentation: Some("file_listing".to_string()),
                     note: Some(note),
                 }
@@ -661,6 +717,8 @@ pub(super) fn dedup_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> 
             block.start_line,
             block.end_line,
             block.text.clone(),
+            block.canonical_selector.clone(),
+            block.occurrence_role.clone(),
             block.presentation.clone(),
         );
         if seen.insert(key) {

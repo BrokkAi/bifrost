@@ -285,10 +285,36 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
 }
 
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {
-    analyzer
-        .ranges(code_unit)
-        .iter()
-        .copied()
+    let source = (language_for_target(code_unit) == Language::Cpp && code_unit.is_callable())
+        .then(|| analyzer.indexed_source(code_unit.source()))
+        .flatten();
+    let classifier = source
+        .as_deref()
+        .and_then(crate::analyzer::CppOccurrenceClassifier::new);
+    primary_range_with_cpp_classifier(analyzer, code_unit, classifier.as_ref())
+}
+
+fn primary_range_with_cpp_classifier(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    classifier: Option<&crate::analyzer::CppOccurrenceClassifier>,
+) -> Option<Range> {
+    let ranges = analyzer.ranges(code_unit);
+    if language_for_target(code_unit) == Language::Cpp
+        && code_unit.is_callable()
+        && let Some(classifier) = classifier
+        && let Some(definition) = ranges
+            .iter()
+            .filter(|range| {
+                classifier.classify(code_unit, range)
+                    == crate::analyzer::CppOccurrenceRole::Definition
+            })
+            .min_by_key(|range| (range.start_line, range.start_byte))
+    {
+        return Some(*definition);
+    }
+    ranges
+        .into_iter()
         .min_by_key(|range| (range.start_line, range.start_byte))
 }
 

@@ -153,6 +153,78 @@ fn i2_fires_when_spellings_resolve_to_different_declarations() {
     );
 }
 
+#[test]
+fn i2_uses_canonical_selector_for_declaration_definition_identity() {
+    let canonical = "include/api.h#compute";
+    let records = vec![
+        spelling(
+            0,
+            "compute",
+            json!({
+                "sources": [{
+                    "path": "src/api.cpp",
+                    "start_line": 3,
+                    "canonical_selector": canonical,
+                    "occurrence_role": "definition"
+                }]
+            }),
+        ),
+        spelling(
+            2,
+            "include/api.h#compute",
+            json!({
+                "sources": [{
+                    "path": "include/api.h",
+                    "start_line": 1,
+                    "canonical_selector": canonical,
+                    "occurrence_role": "declaration"
+                }]
+            }),
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "cpp", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
+#[test]
+fn i2_still_rejects_different_canonical_selectors() {
+    let records = vec![
+        spelling(
+            0,
+            "compute",
+            json!({
+                "sources": [{
+                    "path": "src/first.cpp",
+                    "start_line": 3,
+                    "canonical_selector": "src/first.cpp#compute"
+                }]
+            }),
+        ),
+        spelling(
+            2,
+            "src/second.cpp#compute",
+            json!({
+                "sources": [{
+                    "path": "src/second.cpp",
+                    "start_line": 3,
+                    "canonical_selector": "src/second.cpp#compute"
+                }]
+            }),
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "cpp", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(1, violations.len(), "{violations:?}");
+    assert_eq!(
+        "spelling-resolves-to-different-declaration",
+        violations[0].shape
+    );
+}
+
 // Two files can define the same fq display name (parallel packages,
 // cross-built source trees). Their spelling sets must stay separate groups:
 // each is internally consistent, and merging them fabricates cross-file
@@ -579,6 +651,35 @@ fn i3a_fires_when_reported_path_differs_from_listed_path() {
     let violations = sink.into_sorted_vec();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert_eq!(violations[0].shape, "summaries-listed-symbol-path-mismatch");
+}
+
+#[test]
+fn i3a_fires_when_any_reported_path_differs_from_listed_path() {
+    let records = vec![record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "include/Foo.h".to_string(),
+        },
+        json!({
+            "sources": [
+                {"path": "include/Foo.h", "start_line": 3},
+                {"path": "src/Foo.cpp", "start_line": 8}
+            ],
+            "ambiguous": [],
+            "not_found": []
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "cpp", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(violations[0].shape, "summaries-listed-symbol-path-mismatch");
+    assert_eq!(
+        violations[0].evidence["mismatched_paths"],
+        json!(["src/Foo.cpp"])
+    );
 }
 
 #[test]
@@ -1512,12 +1613,45 @@ fn empty_init_files_are_skipped_for_summary_probes() {
     );
 }
 
-// The laravel types/-stub twin shape: the listed name itself is offered as
-// an ambiguity selector (resolves to an identical twin), so the element is
-// resolvable from its listing context — unlike the bfg shape, where only
-// alternative names are offered and the listed one never resolves.
 #[test]
-fn i3a_silent_when_ambiguity_offers_the_listed_name_itself() {
+fn cpp_header_source_duality_satisfies_i2_and_anchored_i3a() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/api.h", "int compute(int value);\n")
+        .file(
+            "src/api.cpp",
+            "#include \"../include/api.h\"\nint compute(int renamed) { return renamed; }\n",
+        )
+        .file(
+            "src/main.cpp",
+            "#include \"../include/api.h\"\nint main() { return compute(1); }\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("cpp"),
+        None,
+        4,
+    )
+    .expect("run invariants");
+    assert!(
+        report.violations.iter().all(|violation| {
+            violation.shape != "spelling-resolves-to-different-declaration"
+                && violation.shape != "summaries-listed-symbol-path-mismatch"
+        }),
+        "{:?}",
+        report.violations
+    );
+}
+
+// A bare ambiguity candidate does not prove that the anchored summary
+// follow-up resolves in the listed physical file.
+#[test]
+fn i3a_fires_when_ambiguity_offers_only_the_listed_name_itself() {
     let mut probe = record(
         "i3a",
         "get_symbol_sources",
@@ -1538,5 +1672,7 @@ fn i3a_silent_when_ambiguity_offers_the_listed_name_itself() {
     let mut sink = Default::default();
     let mut summary = ProbeSummary::default();
     check_i3a(&refs(&records), "php", &mut sink, &mut summary);
-    assert!(sink.into_sorted_vec().is_empty());
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(violations[0].shape, "summaries-listed-symbol-unresolvable");
 }

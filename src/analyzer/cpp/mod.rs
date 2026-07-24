@@ -3,6 +3,7 @@ mod cache;
 mod clones;
 mod declarations;
 mod hierarchy;
+mod identity;
 mod imports;
 mod semantic;
 pub(crate) mod structural;
@@ -33,6 +34,11 @@ use tests::detect_cpp_test_assertion_smells;
 pub(crate) use declarations::{
     cpp_template_term, is_direct_recovered_exported_class_field_declaration, node_text,
     normalize_cpp_whitespace, recovered_exported_class_has_body,
+};
+pub(crate) use identity::{
+    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
+    cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
+    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_occurrence_role_for_range,
 };
 pub(crate) use imports::{
     IncludeTargetIndex, include_paths, resolve_include_targets, resolve_include_targets_with_index,

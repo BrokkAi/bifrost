@@ -16,14 +16,17 @@
 //!   writes — terminal name, fully qualified name, `path#terminal`,
 //!   `path#qualified` — must resolve consistently: a strictly more specific
 //!   spelling must never fail where a less specific one succeeds, and two
-//!   resolved spellings must name the same declaration. Single-entry and
-//!   multi-entry `get_definitions_by_reference` batches must agree.
-//! - I3: (a) a symbol `get_summaries` lists under file F must resolve via
-//!   `get_symbol_sources` with path F; (b) a symbol `scan_usages_by_reference`
-//!   resolves must appear in `search_symbols` results for its terminal name;
-//!   (c) no response may both render content for a target and report that
-//!   same target in its `not_found` list. Also cross-cutting: the structured
-//!   payload must not drift between render modes.
+//!   resolved spellings must name the same canonical entity when the product
+//!   exposes one, falling back to the same physical declaration for older
+//!   responses. Single-entry and multi-entry
+//!   `get_definitions_by_reference` batches must agree.
+//! - I3: (a) a symbol `get_summaries` lists under file F must round-trip via
+//!   the physical `F#symbol` selector; (b) a symbol
+//!   `scan_usages_by_reference` resolves must appear in `search_symbols`
+//!   results for its terminal name; (c) no response may both render content
+//!   for a target and report that same target in its `not_found` list. Also
+//!   cross-cutting: the structured payload must not drift between render
+//!   modes.
 //! - I4: a failure message must not claim non-indexing ("not indexed",
 //!   "outside the indexed workspace", "external crate/module") when
 //!   `search_symbols` finds an in-workspace declaration with that name.
@@ -1189,7 +1192,9 @@ fn derive_follow_ups(
                                     probe.symbol_path
                                 ),
                                 tool: "get_symbol_sources",
-                                arguments: json!({"symbols": [symbol]}),
+                                arguments: json!({
+                                    "symbols": [format!("{path}#{symbol}")]
+                                }),
                                 symbol_fq: symbol.to_string(),
                                 symbol_path: path.to_string(),
                                 kind: ProbeKind::SummaryElementSource {
@@ -1198,29 +1203,6 @@ fn derive_follow_ups(
                                 outcome: None,
                                 elapsed_ms: None,
                             });
-                            // Owner-qualified elements (TanstackLitQueryDemo.properties)
-                            // of unexported classes cannot resolve globally by
-                            // design; the listing's own path is the agent's
-                            // guided re-call, so probe it too — the checker
-                            // accepts either spelling resolving (tier-4
-                            // TanStack query).
-                            if symbol.contains('.') {
-                                follow.push(ProbeRecord {
-                                    id: format!(
-                                        "i3a:get_symbol_sources:{}:{path}#{symbol}",
-                                        probe.symbol_path
-                                    ),
-                                    tool: "get_symbol_sources",
-                                    arguments: json!({"symbols": [format!("{path}#{symbol}")]}),
-                                    symbol_fq: symbol.to_string(),
-                                    symbol_path: path.to_string(),
-                                    kind: ProbeKind::SummaryElementSource {
-                                        element_path: path.to_string(),
-                                    },
-                                    outcome: None,
-                                    elapsed_ms: None,
-                                });
-                            }
                             taken += 1;
                         }
                     }
@@ -1633,15 +1615,42 @@ fn line_slice(text: &str, start_line: usize, end_line: usize) -> Option<Vec<&str
 /// How one spelling fared, for I2 comparisons.
 #[derive(Debug)]
 enum SpellingOutcome {
-    /// The symbol resolved; `identity` is the declaration's (path, start_line)
-    /// when the response pins it down.
+    /// The symbol resolved; `identity` prefers the product's canonical semantic
+    /// selector and falls back to the physical (path, start_line) location.
     Resolved {
-        identity: Option<(String, u64)>,
+        identity: Option<SpellingIdentity>,
         status: String,
     },
     Ambiguous,
     NotFound,
     Error,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SpellingIdentity {
+    CanonicalSelector(String),
+    PhysicalLocation(String, u64),
+}
+
+fn spelling_identity(value: &Value) -> Option<SpellingIdentity> {
+    if let Some(selector) = value.get("canonical_selector").and_then(Value::as_str) {
+        return Some(SpellingIdentity::CanonicalSelector(selector.to_string()));
+    }
+    Some(SpellingIdentity::PhysicalLocation(
+        value.get("path").and_then(Value::as_str)?.to_string(),
+        value.get("start_line").and_then(Value::as_u64)?,
+    ))
+}
+
+fn spelling_identity_evidence(identity: &SpellingIdentity) -> Value {
+    match identity {
+        SpellingIdentity::CanonicalSelector(selector) => {
+            json!({ "canonical_selector": selector })
+        }
+        SpellingIdentity::PhysicalLocation(path, start_line) => {
+            json!({ "path": path, "start_line": start_line })
+        }
+    }
 }
 
 impl SpellingOutcome {
@@ -1666,12 +1675,9 @@ fn classify_spelling(tool: &str, record: &ProbeRecord) -> SpellingOutcome {
     match tool {
         "get_symbol_sources" => {
             if array_field(structured, "sources").next().is_some() {
-                let identity = array_field(structured, "sources").next().and_then(|block| {
-                    Some((
-                        block.get("path").and_then(Value::as_str)?.to_string(),
-                        block.get("start_line").and_then(Value::as_u64)?,
-                    ))
-                });
+                let identity = array_field(structured, "sources")
+                    .next()
+                    .and_then(spelling_identity);
                 SpellingOutcome::Resolved {
                     identity,
                     status: "resolved".to_string(),
@@ -1708,12 +1714,9 @@ fn classify_spelling(tool: &str, record: &ProbeRecord) -> SpellingOutcome {
                     }
                 }
                 "resolved" => {
-                    let identity = array_field(result, "definitions").next().and_then(|def| {
-                        Some((
-                            def.get("path").and_then(Value::as_str)?.to_string(),
-                            def.get("start_line").and_then(Value::as_u64)?,
-                        ))
-                    });
+                    let identity = array_field(result, "definitions")
+                        .next()
+                        .and_then(spelling_identity);
                     SpellingOutcome::Resolved { identity, status }
                 }
                 // invalid_location, no_definition, unresolvable_import_boundary:
@@ -1812,7 +1815,7 @@ pub fn check_i2(
         // consistently. Class/companion spellings legitimately resolve to
         // their own declarations, so identities only compare within a
         // partition.
-        let mut last_by_partition: [Option<(usize, &(String, u64))>; 2] = [None, None];
+        let mut last_by_partition: [Option<(usize, &SpellingIdentity)>; 2] = [None, None];
         for (index, outcome) in outcomes.iter().enumerate() {
             let SpellingOutcome::Resolved {
                 identity: Some(identity),
@@ -1839,8 +1842,8 @@ pub fn check_i2(
                     json!({
                         "first": spelling_evidence(group[first_index], &outcomes[first_index]),
                         "second": spelling_evidence(group[index], &outcomes[index]),
-                        "first_identity": { "path": first_identity.0, "start_line": first_identity.1 },
-                        "second_identity": { "path": identity.0, "start_line": identity.1 },
+                        "first_identity": spelling_identity_evidence(first_identity),
+                        "second_identity": spelling_identity_evidence(identity),
                         "expected": "all resolved spellings name the same declaration",
                     }),
                 ));
@@ -2015,52 +2018,76 @@ fn spelling_reference_site(record: &ProbeRecord) -> (&str, &str) {
         .unwrap_or(("", ""))
 }
 
-/// I3(a): a symbol `get_summaries` lists under file F must resolve via
-/// `get_symbol_sources`, and its reported path must be F. Owner-qualified
-/// elements also get an anchored (`F#symbol`) probe at generation time;
-/// either spelling resolving makes the element consistent — the listing
-/// itself supplies the disambiguating path, which is the guided re-call an
-/// agent makes for module-private owners (TanStack's unexported lit demo).
+/// I3(a): a symbol `get_summaries` lists under file F must resolve via the
+/// physical `F#symbol` selector, and its reported path must remain F.
 pub fn check_i3a(
     records: &[&ProbeRecord],
     language: &str,
     sink: &mut ViolationSink,
     summary: &mut ProbeSummary,
 ) {
-    let mut groups: HashMap<(&str, &str), Vec<&ProbeRecord>> = HashMap::new();
     for record in records {
         let ProbeKind::SummaryElementSource { element_path } = &record.kind else {
             continue;
         };
-        groups
-            .entry((element_path.as_str(), record.symbol_fq.as_str()))
-            .or_default()
-            .push(record);
-    }
-    for ((element_path, symbol_fq), group) in groups {
-        let mut resolved_with_path = false;
-        let mut mismatch: Option<(&ProbeRecord, String)> = None;
-        let mut unresolved_record: Option<&ProbeRecord> = None;
-        for record in &group {
-            let Some(structured) = structured_outcome(record) else {
-                continue;
-            };
-            summary.i3a_summary_element_checks += 1;
-            if let Some(block) = array_field(structured, "sources").next() {
-                let reported_path = block.get("path").and_then(Value::as_str).unwrap_or("");
-                if reported_path == element_path {
-                    resolved_with_path = true;
-                } else if mismatch.is_none() {
-                    mismatch = Some((record, reported_path.to_string()));
-                }
-            } else if unresolved_record.is_none() {
-                unresolved_record = Some(record);
+        let Some(structured) = structured_outcome(record) else {
+            continue;
+        };
+        summary.i3a_summary_element_checks += 1;
+        let reported_paths: Vec<_> = array_field(structured, "sources")
+            .map(|block| {
+                block
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        if reported_paths.is_empty() {
+            // The follow-up is already anchored to the summary's physical
+            // file. Keep the candidate handling as a defensive allowance for
+            // genuine same-file ambiguity, but never exempt a different
+            // physical path.
+            let own_selector = format!("{element_path}#");
+            let candidates: Vec<&str> = array_field(structured, "ambiguous")
+                .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let resolvable_from_listing = candidates
+                .iter()
+                .any(|candidate| candidate.starts_with(&own_selector));
+            // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
+            // (selectors.rs); at the cap the list is a truncated prefix, so
+            // the listed selector's absence proves nothing — it may sort
+            // beyond the cut (livewire's global `UnitTest` behind 25
+            // namespaced `Livewire.*.UnitTest` candidates). Undecidable:
+            // never a violation.
+            let undecidable_at_match_cap =
+                candidates.len() >= crate::searchtools::AMBIGUOUS_SYMBOL_MATCH_LIMIT;
+            if !resolvable_from_listing && !undecidable_at_match_cap {
+                sink.record(violation(
+                    InvariantKind::I3,
+                    language,
+                    "get_symbol_sources",
+                    "summaries-listed-symbol-unresolvable",
+                    &record.symbol_fq,
+                    &record.symbol_path,
+                    Some(record.arguments.clone()),
+                    json!({
+                        "listed_under": element_path,
+                        "expected": "a symbol get_summaries lists resolves via get_symbol_sources from its listing context",
+                    }),
+                ));
             }
-        }
-        if resolved_with_path {
             continue;
         }
-        if let Some((record, reported_path)) = mismatch {
+        let mismatched_paths: Vec<_> = reported_paths
+            .iter()
+            .filter(|path| path.as_str() != element_path)
+            .cloned()
+            .collect();
+        if !mismatched_paths.is_empty() {
             sink.record(violation(
                 InvariantKind::I3,
                 language,
@@ -2071,58 +2098,9 @@ pub fn check_i3a(
                 Some(record.arguments.clone()),
                 json!({
                     "listed_under": element_path,
-                    "reported_path": reported_path,
-                    "expected": "get_symbol_sources reports the same path get_summaries listed the symbol under",
-                }),
-            ));
-            continue;
-        }
-        let Some(record) = unresolved_record else {
-            continue;
-        };
-        let Some(structured) = structured_outcome(record) else {
-            continue;
-        };
-        // Bare element names collide across a large workspace by design;
-        // an ambiguity answer is consistent when it offers the listed
-        // file's own `path#symbol` selector, because the listing itself
-        // supplies the disambiguating path (an agent following the
-        // summary resolves in one guided re-call). It is also consistent
-        // when the ambiguity offers the listed name itself — the element
-        // resolves by name (laravel's identical types/ stub twins).
-        // The violation is resolvability from the listing context: a hard
-        // not_found, or matches that offer only *other* names — never the
-        // listed one (the bfg shape: `LFS.Pointer` offered only
-        // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
-        let own_selector = format!("{element_path}#");
-        let candidates: Vec<&str> = array_field(structured, "ambiguous")
-            .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        let resolvable_from_listing = candidates
-            .iter()
-            .any(|candidate| candidate.starts_with(&own_selector) || *candidate == symbol_fq);
-        // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
-        // (selectors.rs); at the cap the list is a truncated prefix, so
-        // the listed selector's absence proves nothing — it may sort
-        // beyond the cut (livewire's global `UnitTest` behind 25
-        // namespaced `Livewire.*.UnitTest` candidates). Undecidable:
-        // never a violation.
-        let undecidable_at_match_cap =
-            candidates.len() >= crate::searchtools::AMBIGUOUS_SYMBOL_MATCH_LIMIT;
-        if !resolvable_from_listing && !undecidable_at_match_cap {
-            sink.record(violation(
-                InvariantKind::I3,
-                language,
-                "get_symbol_sources",
-                "summaries-listed-symbol-unresolvable",
-                symbol_fq,
-                &record.symbol_path,
-                Some(record.arguments.clone()),
-                json!({
-                    "listed_under": element_path,
-                    "expected": "a symbol get_summaries lists resolves via get_symbol_sources from its listing context",
+                    "reported_paths": reported_paths,
+                    "mismatched_paths": mismatched_paths,
+                    "expected": "every get_symbol_sources block reports the same path get_summaries listed the symbol under",
                 }),
             ));
         }

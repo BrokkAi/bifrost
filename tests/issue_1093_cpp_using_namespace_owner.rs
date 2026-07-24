@@ -99,13 +99,13 @@ int HTMLLayout::getContentType() const {
 }
 
 #[test]
-fn every_display_spelling_resolves_to_the_same_declaration_pair() {
+fn every_display_spelling_resolves_to_the_same_definition() {
     let project = html_layout_project();
 
     // Every spelling the surface can display for this member -- the display
     // fq itself, its `::` twin, the fully namespace-qualified forms, and the
-    // bare terminal name -- must resolve, unambiguously, to the *same* two
-    // declarations (header declaration + `.cpp` out-of-line definition).
+    // bare terminal name -- must resolve, unambiguously, to the same `.cpp`
+    // definition. The declaration remains physically addressable below.
     let spellings = [
         "getContentType",
         "HTMLLayout.getContentType",
@@ -127,8 +127,8 @@ fn every_display_spelling_resolves_to_the_same_declaration_pair() {
         );
         assert_eq!(
             sorted_source_paths(&result),
-            vec!["htmllayout.cpp".to_string(), "htmllayout.h".to_string()],
-            "`{spelling}` did not resolve to both the declaration and the definition: {result}"
+            vec!["htmllayout.cpp".to_string()],
+            "`{spelling}` did not resolve to the definition: {result}"
         );
     }
 
@@ -299,13 +299,13 @@ int HTMLLayout::getContentType() const {
     let result = symbol_sources(&project, "log4cxx.HTMLLayout.getContentType");
     assert_eq!(
         sorted_source_paths(&result),
-        vec!["multi.cpp".to_string(), "multi.h".to_string()],
+        vec!["multi.cpp".to_string()],
         "{result}"
     );
     let bare = symbol_sources(&project, "HTMLLayout.getContentType");
     assert_eq!(
         sorted_source_paths(&bare),
-        vec!["multi.cpp".to_string(), "multi.h".to_string()],
+        vec!["multi.cpp".to_string()],
         "{bare}"
     );
 }
@@ -387,7 +387,8 @@ int Outer::Inner::method() const {
 
     // Namespace-block variant (#1121 fixed): the header declaration and the
     // out-of-line definition unify onto `log4cxx.Outer$Inner.method`, so the
-    // canonical symbol resolves to *both* the header and the `.cpp`.
+    // canonical symbol resolves to the preferred `.cpp` definition while its
+    // identity remains anchored to the header declaration.
     let unified = symbol_sources(&with_namespace_block, "log4cxx.Outer$Inner.method");
     assert_eq!(
         unified["not_found"].as_array().unwrap().len(),
@@ -396,8 +397,12 @@ int Outer::Inner::method() const {
     );
     assert_eq!(
         sorted_source_paths(&unified),
-        vec!["nested_block.cpp".to_string(), "nested_block.h".to_string()],
+        vec!["nested_block.cpp".to_string()],
         "namespace-block nested member did not unify: {unified}"
+    );
+    assert_eq!(
+        unified["sources"][0]["canonical_selector"], "nested_block.h#log4cxx.Outer$Inner.method",
+        "{unified}"
     );
 
     // File-scope using-directive variant: still on today's behavior. The header
