@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
 mod capabilities;
 mod clone_detection;
