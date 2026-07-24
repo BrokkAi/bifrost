@@ -8,6 +8,12 @@ pub struct ScanUsagesByReferenceParams {
     pub include_tests: bool,
     #[serde(default)]
     pub paths: Option<Vec<String>>,
+    /// List the same-owner usage sites (self/this receiver and own-type static
+    /// calls) that are otherwise only counted, not shown. Default false: these
+    /// sites are excluded from external usage counts but reported as
+    /// `same_owner_sites`. See #1014 facet B.
+    #[serde(default)]
+    pub include_same_owner: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +23,9 @@ pub struct ScanUsagesByLocationParams {
     pub include_tests: bool,
     #[serde(default)]
     pub paths: Option<Vec<String>>,
+    /// See [`ScanUsagesByReferenceParams::include_same_owner`].
+    #[serde(default)]
+    pub include_same_owner: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +99,7 @@ pub struct ScanUsagesSummary {
     pub partial: bool,
     pub found: usize,
     pub verified_absent: usize,
+    pub no_external_usages: usize,
     pub unverified_absent: usize,
     pub not_found: usize,
     pub ambiguous: usize,
@@ -116,6 +126,11 @@ pub enum ScanUsagesInputKind {
 pub enum ScanUsagesStatus {
     Found,
     VerifiedAbsent,
+    /// Resolved with zero external usage sites, but one or more same-owner
+    /// (self/this receiver or own-type static) sites exist within the declaring
+    /// container. Distinct from `verified_absent` so the caller never reads a
+    /// confident "no callers" claim when internal callers exist (#1014 facet B).
+    NoExternalUsages,
     UnverifiedAbsent,
     NotFound,
     Ambiguous,
@@ -128,6 +143,7 @@ impl ScanUsagesStatus {
         match self {
             Self::Found => "found",
             Self::VerifiedAbsent => "verified_absent",
+            Self::NoExternalUsages => "no_external_usages",
             Self::UnverifiedAbsent => "unverified_absent",
             Self::NotFound => "not_found",
             Self::Ambiguous => "ambiguous",
@@ -170,10 +186,18 @@ pub struct ScanUsagesEntry {
     pub total_hits: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unproven_hits: Option<usize>,
+    /// Count of usage sites within the declaring container (self/this receiver
+    /// and own-type static calls) that are excluded from external usage counts.
+    /// Omitted when zero. Set `include_same_owner` to list them in
+    /// `same_owner_files`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_owner_sites: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendering: Option<UsageRendering>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub same_owner_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unproven_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -233,6 +257,8 @@ pub struct SymbolUsages {
     pub definition_line: Option<usize>,
     pub total_hits: usize,
     pub unproven_hits: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_owner_sites: Option<usize>,
     pub rendering: UsageRendering,
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned. Results are partial when set.
@@ -250,6 +276,8 @@ pub struct SymbolUsages {
     pub top_enclosing: Vec<UsageEnclosingCount>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub same_owner_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unproven_files: Vec<UsageFileGroup>,
 }
@@ -1282,6 +1310,7 @@ pub fn scan_usages_by_reference(
         params.paths.as_deref(),
         symbols,
         Vec::new(),
+        params.include_same_owner,
     )
 }
 
@@ -1302,9 +1331,11 @@ pub fn scan_usages_by_location(
         params.paths.as_deref(),
         Vec::new(),
         targets,
+        params.include_same_owner,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_usages_backend(
     analyzer: &dyn IAnalyzer,
     surface: ScanUsagesSurface,
@@ -1312,6 +1343,7 @@ pub(super) fn scan_usages_backend(
     paths: Option<&[String]>,
     symbols: Vec<ScanUsageRequest>,
     targets: Vec<ScanUsageRequest>,
+    include_same_owner: bool,
 ) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages_backend");
     // A batch is one read-only analyzer request. Keep the read cache alive across
@@ -1534,6 +1566,8 @@ pub(super) fn scan_usages_backend(
                     filtered_unproven.hits,
                     None,
                     reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
+                    filtered.same_owner,
+                    include_same_owner,
                 );
                 work_entries.push(ScanUsagesWorkEntry::Usage {
                     request,
@@ -1569,6 +1603,8 @@ pub(super) fn scan_usages_backend(
                         Vec::new(),
                         None,
                         reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
+                        filtered.same_owner,
+                        include_same_owner,
                     );
                     work_entries.push(ScanUsagesWorkEntry::Usage {
                         request,
@@ -1674,6 +1710,8 @@ pub(super) fn scan_usages_backend(
                     Vec::new(),
                     Some(too_many_callsites_summary_note(limit)),
                     reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
+                    filtered.same_owner,
+                    include_same_owner,
                 );
                 work_entries.push(ScanUsagesWorkEntry::TooManyCallsites {
                     request,
@@ -2054,6 +2092,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
 #[derive(Debug, Clone)]
 pub(super) struct FilteredUsageHits {
     hits: Vec<UsageHitRow>,
+    /// Same-owner usage sites (self/this receiver, own-type static) deduped like
+    /// `hits` but excluded from the external usage surface. Counted always;
+    /// listed only when the caller passes `include_same_owner`.
+    same_owner: Vec<UsageHitRow>,
     definition_sites_excluded: usize,
 }
 
@@ -2093,6 +2135,9 @@ pub(super) struct SymbolUsageRenderState {
     definition_line: Option<usize>,
     total_hits: usize,
     unproven_hits: usize,
+    same_owner_sites: usize,
+    same_owner_rows: Vec<UsageHitRow>,
+    include_same_owner: bool,
     candidate_files_truncated: bool,
     definition_sites_excluded: usize,
     hits: Vec<UsageHitRow>,
@@ -2118,8 +2163,11 @@ impl SymbolUsageRenderState {
         unproven_rows: Vec<UsageHitRow>,
         base_note: Option<String>,
         reference_only_absence_note: Option<String>,
+        same_owner_rows: Vec<UsageHitRow>,
+        include_same_owner: bool,
     ) -> Self {
         let total_hits = hits.len();
+        let same_owner_sites = same_owner_rows.len();
         let clustered_line_rows = clustered_usage_line_row_count(&hits);
         let rendering = if total_hits <= 10 {
             UsageRendering::Full
@@ -2170,6 +2218,9 @@ impl SymbolUsageRenderState {
             definition_line: resolved_definition.map(|definition| definition.line),
             total_hits,
             unproven_hits,
+            same_owner_sites,
+            same_owner_rows,
+            include_same_owner,
             candidate_files_truncated,
             definition_sites_excluded,
             hits,
@@ -2196,6 +2247,8 @@ impl SymbolUsageRenderState {
         unproven_rows: Vec<UsageHitRow>,
         base_note: Option<String>,
         reference_only_absence_note: Option<String>,
+        same_owner_rows: Vec<UsageHitRow>,
+        include_same_owner: bool,
     ) -> Self {
         let mut state = Self::new(
             symbol,
@@ -2207,6 +2260,8 @@ impl SymbolUsageRenderState {
             unproven_rows,
             base_note,
             reference_only_absence_note,
+            same_owner_rows,
+            include_same_owner,
         );
         state.total_hits = total_hits;
         state.rendering = UsageRendering::Summary;
@@ -2231,6 +2286,11 @@ pub(super) fn filter_and_dedupe_hits(
 
     let mut rows: BTreeMap<(String, usize, usize, String, UsageHitKind), UsageHitRow> =
         BTreeMap::new();
+    // Same-owner (self/this receiver, own-type static) sites, deduped by the same
+    // key. Excluded from the external usage surface (`rows`) but counted and,
+    // on request, listed — the honest-reporting half of #1014 facet B.
+    let mut same_owner_rows: BTreeMap<(String, usize, usize, String, UsageHitKind), UsageHitRow> =
+        BTreeMap::new();
     let mut source_positions: HashMap<ProjectFile, Option<(String, Vec<usize>)>> =
         HashMap::default();
     let mut definition_sites_excluded = 0usize;
@@ -2239,9 +2299,11 @@ pub(super) fn filter_and_dedupe_hits(
             definition_sites_excluded += 1;
             continue;
         }
-        // Import and self-receiver hits are for editor references, not the
-        // call-graph/relevance rendering here.
-        if !hit.kind.included_in(UsageHitSurface::ExternalUsages) {
+        // Import/re-export bindings are editor-only noise dropped here. Self/this
+        // receiver hits are also excluded from the external surface, but instead
+        // of dropping them silently we route them to `same_owner_rows`.
+        let is_same_owner = hit.kind == UsageHitKind::SelfReceiver;
+        if !is_same_owner && !hit.kind.included_in(UsageHitSurface::ExternalUsages) {
             continue;
         }
         if hit.kind == UsageHitKind::Reference
@@ -2301,7 +2363,13 @@ pub(super) fn filter_and_dedupe_hits(
             confidence: hit.confidence,
         };
         let key = (path, hit.start_offset, hit.end_offset, enclosing, hit.kind);
-        rows.entry(key)
+        let target_map = if is_same_owner {
+            &mut same_owner_rows
+        } else {
+            &mut rows
+        };
+        target_map
+            .entry(key)
             .and_modify(|existing| {
                 if row.confidence > existing.confidence
                     || (row.confidence == existing.confidence
@@ -2313,18 +2381,24 @@ pub(super) fn filter_and_dedupe_hits(
             .or_insert(row);
     }
 
+    let sort_rows = |rows: &mut Vec<UsageHitRow>| {
+        rows.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.start_offset.cmp(&right.start_offset))
+                .then_with(|| left.end_offset.cmp(&right.end_offset))
+                .then_with(|| left.enclosing.cmp(&right.enclosing))
+        });
+    };
     let mut hits: Vec<_> = rows.into_values().collect();
-    hits.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.line.cmp(&right.line))
-            .then_with(|| left.start_offset.cmp(&right.start_offset))
-            .then_with(|| left.end_offset.cmp(&right.end_offset))
-            .then_with(|| left.enclosing.cmp(&right.enclosing))
-    });
+    sort_rows(&mut hits);
+    let mut same_owner: Vec<_> = same_owner_rows.into_values().collect();
+    sort_rows(&mut same_owner);
 
     FilteredUsageHits {
         hits,
+        same_owner,
         definition_sites_excluded,
     }
 }
@@ -2395,6 +2469,7 @@ pub(super) fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsag
     let requested = results.len();
     let found = scan_usages_status_count(results, ScanUsagesStatus::Found);
     let verified_absent = scan_usages_status_count(results, ScanUsagesStatus::VerifiedAbsent);
+    let no_external_usages = scan_usages_status_count(results, ScanUsagesStatus::NoExternalUsages);
     let unverified_absent = scan_usages_status_count(results, ScanUsagesStatus::UnverifiedAbsent);
     let not_found = scan_usages_status_count(results, ScanUsagesStatus::NotFound);
     let ambiguous = scan_usages_status_count(results, ScanUsagesStatus::Ambiguous);
@@ -2407,6 +2482,7 @@ pub(super) fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsag
                 entry.status,
                 ScanUsagesStatus::Found
                     | ScanUsagesStatus::VerifiedAbsent
+                    | ScanUsagesStatus::NoExternalUsages
                     | ScanUsagesStatus::UnverifiedAbsent
                     | ScanUsagesStatus::TooManyCallsites
             )
@@ -2428,6 +2504,7 @@ pub(super) fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsag
         partial,
         found,
         verified_absent,
+        no_external_usages,
         unverified_absent,
         not_found,
         ambiguous,
@@ -2562,8 +2639,15 @@ pub(super) fn classify_usage_entry(
         caveats.push(ScanUsagesAbsenceCaveat::ReferenceOnlySiblings);
     }
 
+    // HARD RULE (#1014 facet B): never emit `verified_absent` when same-owner
+    // sites exist. Zero external hits with same-owner sites present is its own
+    // status, so a consumer never reads a confident "no callers" claim when
+    // internal callers exist. Same-owner presence also outranks the softer
+    // unverified-absence caveats.
     let status = if usage.total_hits > 0 {
         ScanUsagesStatus::Found
+    } else if usage.same_owner_sites.is_some_and(|count| count > 0) {
+        ScanUsagesStatus::NoExternalUsages
     } else if caveats.is_empty() {
         ScanUsagesStatus::VerifiedAbsent
     } else {
@@ -2607,8 +2691,10 @@ pub(super) fn populate_usage_payload(
     entry.definition_line = usage.definition_line;
     entry.total_hits = Some(usage.total_hits);
     entry.unproven_hits = Some(usage.unproven_hits);
+    entry.same_owner_sites = usage.same_owner_sites;
     entry.rendering = Some(usage.rendering);
     entry.files = usage.files;
+    entry.same_owner_files = usage.same_owner_files;
     entry.unproven_files = usage.unproven_files;
     entry.top_enclosing = usage.top_enclosing;
     entry.definition_sites_excluded = usage.definition_sites_excluded;
@@ -2642,7 +2728,9 @@ pub(super) fn scan_usages_absence_guidance(
 ) -> ScanUsagesAbsenceGuidance {
     let notes = if matches!(
         status,
-        ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::UnverifiedAbsent
+        ScanUsagesStatus::VerifiedAbsent
+            | ScanUsagesStatus::NoExternalUsages
+            | ScanUsagesStatus::UnverifiedAbsent
     ) && target_is_method
     {
         vec!["if this is a framework-invoked entrypoint (e.g. servlet filters, DI callbacks), direct callers may not exist: scan the enclosing type or search for its registration.".to_string()]
@@ -2653,6 +2741,9 @@ pub(super) fn scan_usages_absence_guidance(
         ScanUsagesStatus::VerifiedAbsent => {
             Some("resolved symbol; no external usage sites found.".to_string())
         }
+        ScanUsagesStatus::NoExternalUsages => Some(
+            "resolved symbol; no external usage sites found, but same-owner (self/this receiver or own-type static) sites exist within the declaring container.".to_string(),
+        ),
         ScanUsagesStatus::UnverifiedAbsent => {
             scan_usages_unverified_absence_message(usage, caveats, surface)
         }
@@ -2706,8 +2797,10 @@ pub(super) fn scan_usages_entry_base(
         short_name: None,
         total_hits: None,
         unproven_hits: None,
+        same_owner_sites: None,
         rendering: None,
         files: Vec::new(),
+        same_owner_files: Vec::new(),
         unproven_files: Vec::new(),
         top_enclosing: Vec::new(),
         definition_sites_excluded: None,
@@ -2887,11 +2980,32 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
         notes.push("Summary file list truncated to fit the response budget.".to_string());
     }
     let reference_only_siblings = state.reference_only_absence_note.is_some();
-    let absence_would_be_verified =
-        !state.candidate_files_truncated && state.total_hits == 0 && state.unproven_hits == 0;
+    let absence_would_be_verified = !state.candidate_files_truncated
+        && state.total_hits == 0
+        && state.unproven_hits == 0
+        && state.same_owner_sites == 0;
     if absence_would_be_verified && let Some(note) = &state.reference_only_absence_note {
         notes.push(note.clone());
     }
+    if state.same_owner_sites > 0 {
+        let sites = state.same_owner_sites;
+        let plural = if sites == 1 { "site" } else { "sites" };
+        if state.include_same_owner {
+            notes.push(format!(
+                "{sites} usage {plural} within the declaring container (self/this receiver or own-type static calls) are excluded from external usage counts and listed under same_owner_files."
+            ));
+        } else {
+            notes.push(format!(
+                "{sites} usage {plural} within the declaring container (self/this receiver or own-type static calls) are excluded from external usage counts. Re-call with include_same_owner: true to list them."
+            ));
+        }
+    }
+
+    let same_owner_files = if state.include_same_owner {
+        render_same_owner_file_groups(&state.same_owner_rows)
+    } else {
+        Vec::new()
+    };
 
     SymbolUsages {
         symbol: state.symbol.clone(),
@@ -2900,6 +3014,7 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
         definition_line: state.definition_line,
         total_hits: state.total_hits,
         unproven_hits: state.unproven_hits,
+        same_owner_sites: some_if_nonzero(state.same_owner_sites),
         rendering: state.rendering,
         candidate_files_truncated: state.candidate_files_truncated,
         reference_only_siblings,
@@ -2912,8 +3027,49 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
         },
         top_enclosing,
         files,
+        same_owner_files,
         unproven_files: render_usage_file_groups(&state.unproven_rows, true),
     }
+}
+
+/// Render same-owner usage sites as file groups, kind-tagged (`self_receiver`)
+/// so a consumer can distinguish them from external hits. Unlike
+/// [`render_usage_file_groups`], which omits the label for internal kinds, this
+/// always emits the kind so the excluded-but-listed sites are unambiguous.
+pub(super) fn render_same_owner_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
+    let mut grouped: BTreeMap<String, Vec<UsageLocation>> = BTreeMap::new();
+    for hit in hits {
+        grouped
+            .entry(hit.path.clone())
+            .or_default()
+            .push(UsageLocation {
+                line: hit.line,
+                column: hit.column,
+                end_line: hit.end_line,
+                end_column: hit.end_column,
+                line_range: None,
+                enclosing: hit.enclosing.clone(),
+                kind: Some(hit.kind.wire_label().to_string()),
+                snippet: Some(hit.snippet.clone()),
+                hit_count: None,
+                confidence: hit.confidence,
+            });
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by(|left, right| {
+                left.line
+                    .cmp(&right.line)
+                    .then_with(|| left.enclosing.cmp(&right.enclosing))
+            });
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 pub(super) fn render_usage_file_groups(

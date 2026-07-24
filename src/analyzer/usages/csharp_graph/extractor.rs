@@ -1,4 +1,6 @@
-use crate::analyzer::usages::csharp_graph::hits::{push_hit, push_unproven_hit};
+use crate::analyzer::usages::csharp_graph::hits::{
+    push_hit, push_self_receiver_hit, push_unproven_hit,
+};
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
     applicable_member_candidates_for_owner, argument_count, binding_scope_node,
@@ -416,7 +418,14 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if ctx.spec.kind == TargetKind::Method && !ordinary_call_arity_matches {
             return;
         }
-        push_hit(name.identifier, ctx);
+        // A `this.Member` receiver is the current instance — a same-owner site
+        // (#1014 facet B). `base.Member` (an inherited override) and a call
+        // through another variable of the same type stay external.
+        if receiver_node.kind() == "this_expression" || receiver_node.kind() == "this" {
+            push_self_receiver_hit(name.identifier, ctx);
+        } else {
+            push_hit(name.identifier, ctx);
+        }
         return;
     }
 
@@ -484,7 +493,13 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ) == TargetMemberResolution::MatchesTarget
             }) =>
         {
-            push_hit(name.identifier, ctx);
+            // A `this.Member` receiver resolves to the enclosing type as the
+            // current instance — a same-owner site (#1014 facet B).
+            if receiver_node.kind() == "this_expression" || receiver_node.kind() == "this" {
+                push_self_receiver_hit(name.identifier, ctx);
+            } else {
+                push_hit(name.identifier, ctx);
+            }
         }
         SymbolResolution::Ambiguous => {
             push_unproven_hit(name.identifier, ctx);
@@ -617,6 +632,10 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 UnqualifiedMethodGroupResolution::Unique(candidate)
                     if candidate == ctx.spec.target =>
                 {
+                    // A bare method-group *value* (delegate capture / event handler)
+                    // is a genuine usage even within the owning type — it is not a
+                    // self-receiver *call*, so it stays on the external surface,
+                    // matching Java (which reclassifies only method invocations).
                     push_hit(node, ctx);
                 }
                 UnqualifiedMethodGroupResolution::Ambiguous(candidates)

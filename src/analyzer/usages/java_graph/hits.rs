@@ -1,6 +1,6 @@
 use crate::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
-    usage_hit,
+    reclassify_self_receiver_hit_at, usage_hit,
 };
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::{CodeUnit, Range};
@@ -48,6 +48,15 @@ pub(super) fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 pub(super) fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_override_declaration_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+}
+
+/// Record `node` as a same-owner self/this receiver hit (#1014 facet B): a call
+/// whose receiver is the current instance (`this`, implicit-this) or the owner
+/// type itself. Excluded from the external usage surface, counted as a
+/// same-owner site.
+pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit(node, ctx);
+    reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
 
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

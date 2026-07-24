@@ -367,7 +367,9 @@ impl RenderText for ScanUsagesResult {
         if self.results.iter().any(|entry| {
             matches!(
                 entry.status,
-                ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::UnverifiedAbsent
+                ScanUsagesStatus::VerifiedAbsent
+                    | ScanUsagesStatus::NoExternalUsages
+                    | ScanUsagesStatus::UnverifiedAbsent
             )
         }) {
             let truncated_absence = self.results.iter().any(|entry| {
@@ -488,7 +490,16 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
             ));
         }
     }
+    if let Some(count) = entry.same_owner_sites {
+        lines.push(format!(
+            "  same-owner site(s): {count} (excluded from external usage counts)"
+        ));
+    }
     lines.extend(render_usage_file_groups_text(&entry.files, false));
+    if !entry.same_owner_files.is_empty() {
+        lines.push("same-owner sites (self/this receiver or own-type static):".to_string());
+        lines.extend(render_usage_file_groups_text(&entry.same_owner_files, true));
+    }
     if !entry.unproven_files.is_empty() {
         lines.push("unproven matches:".to_string());
         lines.extend(render_usage_file_groups_text(&entry.unproven_files, true));
@@ -551,6 +562,11 @@ fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
     );
     push_scan_usages_status_count(
         &mut parts,
+        summary.no_external_usages,
+        ScanUsagesStatus::NoExternalUsages,
+    );
+    push_scan_usages_status_count(
+        &mut parts,
         summary.unverified_absent,
         ScanUsagesStatus::UnverifiedAbsent,
     );
@@ -580,7 +596,9 @@ fn render_scan_usages_summary_banner(result: &ScanUsagesResult) -> String {
         .filter(|entry| {
             matches!(
                 entry.status,
-                ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::UnverifiedAbsent
+                ScanUsagesStatus::VerifiedAbsent
+                    | ScanUsagesStatus::NoExternalUsages
+                    | ScanUsagesStatus::UnverifiedAbsent
             )
         })
         .map(|entry| {

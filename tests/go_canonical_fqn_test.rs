@@ -293,6 +293,7 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
             symbols: vec!["example.com/repo/a/list.Run".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
     assert_eq!(1, canonical.results.len(), "{canonical:#?}");
@@ -311,6 +312,7 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
             symbols: vec!["list.Run".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
     assert_eq!(1, bare.results.len(), "{bare:#?}");

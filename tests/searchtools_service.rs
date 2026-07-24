@@ -4657,33 +4657,49 @@ public class OverrideChild extends Base {
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
-            r#"{"symbols":["p.Base.ping"],"include_tests":true}"#,
+            r#"{"symbols":["p.Base.ping"],"include_tests":true,"include_same_owner":true}"#,
         )
         .expect("scan succeeds");
     let value: Value = serde_json::from_str(&payload).expect("valid response");
     let usage = only_result(&value);
 
+    // The bare inherited `ping(...)` call in Child is an implicit-this same-owner
+    // site under #1014 facet B: excluded from external usages (counted as
+    // `same_owner_sites`, listed via `include_same_owner`), leaving only the
+    // OverrideChild override declaration on the external surface. The
+    // negative-self-call resolves to the override and stays unproven — never
+    // confused as a Base.ping usage (its line 6 is not a proven hit).
     assert_eq!("found", usage["status"], "{value}");
-    assert_eq!(2, usage["total_hits"], "{value}");
-    let hits: Vec<_> = usage["files"]
+    assert_eq!(1, usage["total_hits"], "{value}");
+    assert_eq!(1, usage["same_owner_sites"], "{value}");
+    assert_eq!(1, usage["unproven_hits"], "{value}");
+
+    let same_owner_hits: Vec<_> = usage["same_owner_files"]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|file| file["hits"].as_array().into_iter().flatten())
         .collect();
     assert!(
-        hits.iter()
+        same_owner_hits
+            .iter()
             .filter_map(|hit| hit["snippet"].as_str())
             .any(|snippet| snippet.contains("positive-inherited-call")),
         "{value}"
     );
+    let proven_hits: Vec<_> = usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .collect();
     assert!(
-        hits.iter()
+        proven_hits
+            .iter()
             .filter_map(|hit| hit["line"].as_u64())
             .all(|line| line != 6),
         "{value}"
     );
-    assert_eq!(1, usage["unproven_hits"], "{value}");
 }
 
 #[test]
@@ -5408,6 +5424,7 @@ product.label
                 "column": column,
             }],
             "include_tests": true,
+            "include_same_owner": true,
         });
         let payload = service
             .call_tool_json("scan_usages_by_location", &args.to_string())
@@ -5417,11 +5434,23 @@ product.label
 
         assert_eq!("found", result["status"], "payload: {value}");
         assert_eq!(symbol, result["symbol"], "payload: {value}");
-        let snippets: Vec<_> = result["files"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        // Under #1014 facet B the in-class macro references (the `alias_method
+        // :name` argument and the bare `label` call in `summary`) are same-owner
+        // sites listed under `same_owner_files`; the `product.*` calls through a
+        // local receiver are external `files`. Both are usages of the macro method.
+        let collect_hits = |key: &str| -> Vec<Value> {
+            result[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+                .cloned()
+                .collect()
+        };
+        let mut hits = collect_hits("files");
+        hits.extend(collect_hits("same_owner_files"));
+        let snippets: Vec<_> = hits
+            .iter()
             .filter_map(|hit| hit["snippet"].as_str())
             .collect();
         for expected in expected_snippets {
@@ -5431,17 +5460,11 @@ product.label
             );
         }
         if symbol == "Product.name" {
-            let exact_hits: Vec<_> = result["files"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|file| file["hits"].as_array().into_iter().flatten())
-                .collect();
             for (snippet, column, end_column) in [
                 ("alias_method :label, :name", 25, 29),
                 ("product.name", 9, 13),
             ] {
-                let hit = exact_hits
+                let hit = hits
                     .iter()
                     .find(|hit| {
                         hit["snippet"]

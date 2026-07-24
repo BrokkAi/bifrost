@@ -85,17 +85,23 @@ class Service {
 
 #[test]
 fn java_dead_code_smell_reports_one_call_wrapper() {
+    // A cross-class caller keeps a genuine external inbound edge. Under #1014
+    // facet B a same-owner (implicit-this) `leaf()` call would be excluded from
+    // proven inbound edges, so this exercises the edge-count reporting with a real
+    // external caller.
     let (_project, analyzer) = java_analyzer_with_files(&[(
         "com/example/Service.java",
         r#"
 package com.example;
 
 class Service {
-    void wrapper() {
-        leaf();
-    }
-
     void leaf() {}
+}
+
+class Caller {
+    void wrapper(Service s) {
+        s.leaf();
+    }
 }
 "#,
     )]);
@@ -112,10 +118,12 @@ class Service {
 
     assert!(report.contains("com.example.Service.leaf"), "{report}");
     assert!(
-        report.contains("one workspace inbound edge from com.example.Service.wrapper"),
+        report.contains("one workspace inbound edge from com.example.Caller.wrapper"),
         "{report}"
     );
-    assert!(report.contains("| 1 | 0 |"), "{report}");
+    // Total Usages 1, External Usages 1 — the single caller is now in a different
+    // class (a same-class same-owner caller no longer produces a proven edge).
+    assert!(report.contains("| 1 | 1 |"), "{report}");
 }
 
 #[test]
@@ -193,6 +201,50 @@ class Consumer {
 }
 
 #[test]
+fn java_same_owner_only_caller_is_inconclusive_not_used() {
+    // #1014 facet B dead-code semantics change: a method whose only caller is a
+    // same-owner receiver (`this.leaf()` here, an implicit-this call also
+    // qualifies) no longer counts as a proven external usage. Matching Rust, the
+    // method is reported as inconclusive (its receivers could not be proven
+    // external), never confidently "used" with an inbound edge.
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Service.java",
+        r#"
+package com.example;
+
+class Service {
+    void wrapper() {
+        this.leaf();
+    }
+
+    void leaf() {}
+}
+"#,
+    )]);
+    let leaf = java_definition(&analyzer, "com.example.Service.leaf");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["com/example/Service.java".to_string()],
+            fq_names: vec![leaf.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    // No proven inbound edge from the same-owner call; the evidence is
+    // inconclusive rather than a confident "one inbound edge".
+    assert!(
+        !report.contains("one workspace inbound edge"),
+        "same-owner call must not be reported as a proven inbound edge: {report}"
+    );
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "a same-owner-only caller should make the evidence inconclusive: {report}"
+    );
+}
+
+#[test]
 fn java_dead_code_smell_honors_usage_candidate_file_cap() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -231,18 +283,23 @@ fn java_dead_code_smell_honors_usage_candidate_file_cap() {
 
 #[test]
 fn java_dead_code_smell_honors_usage_cap() {
+    // Two genuine external call sites exceed the cap. Same-owner (implicit-this)
+    // calls would be excluded from proven inbound edges under #1014 facet B, so
+    // this uses a cross-class caller to exercise the call-site cap.
     let (_project, analyzer) = java_analyzer_with_files(&[(
         "com/example/Service.java",
         r#"
 package com.example;
 
 class Service {
-    void caller() {
-        helper();
-        helper();
-    }
-
     void helper() {}
+}
+
+class Caller {
+    void caller(Service s) {
+        s.helper();
+        s.helper();
+    }
 }
 "#,
     )]);

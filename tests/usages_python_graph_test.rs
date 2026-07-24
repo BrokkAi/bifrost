@@ -2676,7 +2676,8 @@ class Foo:
 
 // --- Same-file member-usage regressions (Bug 2a / Bug 2b) ---
 
-/// UsageFinder hit count for `fq` defined and used within a single file `m.py`.
+/// UsageFinder external-usage hit count for `fq` defined and used within a
+/// single file `m.py`.
 fn single_file_member_hits(src: &str, fq: &str) -> usize {
     let project = InlineTestProject::with_language(Language::Python)
         .file("m.py", src)
@@ -2689,28 +2690,47 @@ fn single_file_member_hits(src: &str, fq: &str) -> usize {
         .len()
 }
 
+/// UsageFinder editor find-references hit count for `fq` in a single file — the
+/// references surface that includes same-owner `self.member` sites (#1014 facet
+/// B), which the external-usage surface excludes.
+fn single_file_member_reference_hits(src: &str, fq: &str) -> usize {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("m.py", src)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, fq);
+    UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits_including_imports()
+        .len()
+}
+
 // Bug 2a: `self` is implicitly typed as the enclosing class, so a `self.bar()`
-// call in a sibling method counts as a usage of `bar`.
+// call in a sibling method resolves to `bar`. Under #1014 facet B it is a
+// same-owner site: excluded from external usages, present on the references
+// surface.
 #[test]
 fn self_receiver_resolves_same_file_member_usage() {
+    let src =
+        "class Foo:\n    def bar(self):\n        pass\n\n    def baz(self):\n        self.bar()\n";
+    assert_eq!(single_file_member_reference_hits(src, "m.Foo.bar"), 1);
     assert_eq!(
-        single_file_member_hits(
-            "class Foo:\n    def bar(self):\n        pass\n\n    def baz(self):\n        self.bar()\n",
-            "m.Foo.bar",
-        ),
-        1,
+        single_file_member_hits(src, "m.Foo.bar"),
+        0,
+        "a self.member call must not be an external usage",
     );
 }
 
 // Bug 2a: an inherited `self.bar()` in a subclass resolves through the hierarchy.
+// Under #1014 facet B it is a same-owner site (references surface only).
 #[test]
 fn self_receiver_resolves_inherited_member_usage() {
+    let src = "class A:\n    def bar(self):\n        pass\n\nclass B(A):\n    def baz(self):\n        self.bar()\n";
+    assert_eq!(single_file_member_reference_hits(src, "m.A.bar"), 1);
     assert_eq!(
-        single_file_member_hits(
-            "class A:\n    def bar(self):\n        pass\n\nclass B(A):\n    def baz(self):\n        self.bar()\n",
-            "m.A.bar",
-        ),
-        1,
+        single_file_member_hits(src, "m.A.bar"),
+        0,
+        "an inherited self.member call must not be an external usage",
     );
 }
 

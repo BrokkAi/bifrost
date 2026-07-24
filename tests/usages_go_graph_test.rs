@@ -1,9 +1,22 @@
 mod common;
 
 use brokk_bifrost::IAnalyzer;
-use brokk_bifrost::usages::{FuzzyResult, GoUsageGraphStrategy, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::usages::{
+    FuzzyResult, GoUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
+};
 use common::{definition, go_analyzer_with_files};
 use std::collections::BTreeSet;
+
+/// Same-owner receiver hits — a Go method accessing a target through its own
+/// receiver variable. Excluded from the external usage surface, visible to the
+/// editor find-references surface (#1014 facet B).
+fn self_receiver_hits(result: &FuzzyResult) -> Vec<UsageHit> {
+    result
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+        .collect()
+}
 
 #[test]
 fn usage_finder_routes_go_targets_through_graph_strategy() {
@@ -1023,22 +1036,28 @@ func Run() {
     );
 
     let field = definition(&analyzer, "example.com/app/example.AuditLog.Last");
-    let field_hits = strategy
-        .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
+    let field_result =
+        strategy.find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000);
+    // `a.Last = message` and `return a.Last` access the target through `Record`'s
+    // own receiver `a` — same-owner sites (#1014 facet B), editor-only. Only the
+    // promoted `worker.Last` access from `Run` (a distinct value) is external.
+    let field_self = self_receiver_hits(&field_result);
+    let field_hits = field_result
         .into_either()
         .expect("promoted embedded field usage should resolve");
-    assert_eq!(3, field_hits.len(), "field hits: {field_hits:?}");
+    assert_eq!(1, field_hits.len(), "external field hits: {field_hits:?}");
+    assert_eq!(2, field_self.len(), "same-owner field hits: {field_self:?}");
     assert!(
-        field_hits
+        field_self
             .iter()
             .any(|hit| hit.snippet.contains("a.Last = message")),
-        "internal assignment should still resolve: {field_hits:?}",
+        "internal assignment should resolve as a same-owner site: {field_self:?}",
     );
     assert!(
-        field_hits
+        field_self
             .iter()
             .any(|hit| hit.snippet.contains("return a.Last")),
-        "internal return should still resolve: {field_hits:?}",
+        "internal return should resolve as a same-owner site: {field_self:?}",
     );
     assert!(
         field_hits

@@ -1,7 +1,9 @@
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range, push_import_hit};
+use crate::analyzer::usages::php_graph::hits::{
+    push_hit, push_hit_range, push_import_hit, push_self_receiver_hit_range,
+};
 use crate::analyzer::usages::php_graph::resolver::{
     PhpHierarchyIndex, TargetKind, TargetSpec, enclosing_owner_fq_name_at,
     is_const_declaration_name, is_function_call_name, is_function_declaration_name,
@@ -700,7 +702,19 @@ fn record_member_hit(
             )
             .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy))
             {
-                push_member_hit(member_node, analyzer, file, source, line_starts, spec, hits);
+                // `$this->m()` is a same-owner instance call on the current
+                // object; a call through another object of the same type is not.
+                let same_owner = node_text(receiver_node, source) == "$this";
+                push_member_hit(
+                    member_node,
+                    analyzer,
+                    file,
+                    source,
+                    line_starts,
+                    spec,
+                    hits,
+                    same_owner,
+                );
             }
         }
         "class_constant_access_expression"
@@ -714,6 +728,7 @@ fn record_member_hit(
             {
                 return;
             }
+            let receiver_text = node_text(receiver_node, source);
             if !static_receiver_matches(
                 php,
                 analyzer,
@@ -721,14 +736,26 @@ fn record_member_hit(
                 member_node.start_byte(),
                 member_node.end_byte(),
                 line_starts,
-                node_text(receiver_node, source),
+                receiver_text,
                 owner,
                 ctx,
                 hierarchy,
             ) {
                 return;
             }
-            push_member_hit(member_node, analyzer, file, source, line_starts, spec, hits);
+            // `self::m()` / `static::m()` are same-owner own-type static calls;
+            // `parent::m()` and an explicit class name are external.
+            let same_owner = matches!(receiver_text, "self" | "static");
+            push_member_hit(
+                member_node,
+                analyzer,
+                file,
+                source,
+                line_starts,
+                spec,
+                hits,
+                same_owner,
+            );
         }
         _ => {}
     }
@@ -771,16 +798,30 @@ fn push_member_hit(
     line_starts: &[usize],
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
+    same_owner: bool,
 ) {
     let start = node.start_byte() + usize::from(node_text(node, source).starts_with('$'));
-    push_hit_range(
-        start,
-        node.end_byte(),
-        analyzer,
-        file,
-        source,
-        line_starts,
-        spec,
-        hits,
-    );
+    if same_owner {
+        push_self_receiver_hit_range(
+            start,
+            node.end_byte(),
+            analyzer,
+            file,
+            source,
+            line_starts,
+            spec,
+            hits,
+        );
+    } else {
+        push_hit_range(
+            start,
+            node.end_byte(),
+            analyzer,
+            file,
+            source,
+            line_starts,
+            spec,
+            hits,
+        );
+    }
 }

@@ -1,5 +1,7 @@
 use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::go_graph::hits::{record_hit, record_unproven_hit};
+use crate::analyzer::usages::go_graph::hits::{
+    record_hit, record_self_receiver_hit, record_unproven_hit,
+};
 use crate::analyzer::usages::go_graph::reference::go_is_top_level_decl;
 use crate::analyzer::usages::go_graph::resolver::{
     GoProjectGraph, ScanBindings, TargetSpec, TypeRef, constructor_call_type_fqns, node_text,
@@ -17,6 +19,12 @@ use tree_sitter::Node;
 pub(super) const OWNER_TOKEN: &str = "__go_target_owner__";
 pub(super) const NON_OWNER_TOKEN: &str = "__go_known_non_target_owner__";
 const FIELD_OWNER_TOKEN_PREFIX: &str = "__go_field_owner__:";
+/// Marks the enclosing method's own receiver variable. Go has no `self`/`this`
+/// keyword; a method calls its siblings through its declared receiver variable
+/// (`func (s *T) f() { s.g() }`). This token distinguishes that same-owner
+/// receiver from another owner-typed local, so `s.g()` is a same-owner site
+/// while `other.g()` (a different `*T` value) stays external (#1014 facet B).
+pub(super) const SELF_RECEIVER_TOKEN: &str = "__go_self_receiver__";
 
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
@@ -169,7 +177,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
             return;
         }
         "parameter_declaration" => {
-            seed_parameter_declaration(node, ctx, locals);
+            seed_parameter_declaration(node, ctx, locals, is_method_receiver_parameter(node));
         }
         "var_declaration" | "short_var_declaration" => {
             // A package-level `var` is not a local binding: seeding it (as a shadow
@@ -201,16 +209,30 @@ fn scan_children(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInfere
     }
 }
 
+/// Whether `node` (a `parameter_declaration`) is the receiver of a method
+/// declaration (`func (f *T) m()`), so its binding is the same-owner receiver.
+fn is_method_receiver_parameter(node: Node<'_>) -> bool {
+    node.parent()
+        .filter(|parent| parent.kind() == "parameter_list")
+        .and_then(|list| {
+            list.parent()
+                .filter(|method| method.kind() == "method_declaration")
+                .map(|method| method.child_by_field_name("receiver") == Some(list))
+        })
+        .unwrap_or(false)
+}
+
 fn seed_parameters(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
     if node.kind() == "method_declaration"
         && let Some(receiver) = node.child_by_field_name("receiver")
     {
-        seed_parameter_list(receiver, ctx, locals);
+        // Mark the method's own receiver variable as the same-owner receiver.
+        seed_parameter_list(receiver, ctx, locals, true);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "parameter_list" {
-            seed_parameter_list(child, ctx, locals);
+            seed_parameter_list(child, ctx, locals, false);
         }
     }
 }
@@ -219,11 +241,12 @@ fn seed_parameter_list(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
+    is_method_receiver: bool,
 ) {
     let mut params = node.walk();
     for param in node.named_children(&mut params) {
         if param.kind() == "parameter_declaration" {
-            seed_parameter_declaration(param, ctx, locals);
+            seed_parameter_declaration(param, ctx, locals, is_method_receiver);
         }
     }
 }
@@ -232,6 +255,7 @@ fn seed_parameter_declaration(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
+    is_method_receiver: bool,
 ) {
     let parameter_names = parameter_names(node, ctx.source);
     let Some(type_node) = node.child_by_field_name("type") else {
@@ -240,7 +264,7 @@ fn seed_parameter_declaration(
         }
         return;
     };
-    let tokens = type_ref_from_node(type_node, ctx.source)
+    let mut tokens = type_ref_from_node(type_node, ctx.source)
         .map(|ty| ctx.receiver_tokens_for_type(&ty))
         .unwrap_or_default();
     if tokens.is_empty() {
@@ -248,6 +272,15 @@ fn seed_parameter_declaration(
             locals.declare_shadow(name);
         }
         return;
+    }
+    // The method receiver variable, when it is the target owner, is the
+    // same-owner receiver: tag it so `recv.member` is classified as a same-owner
+    // site rather than an external usage.
+    if is_method_receiver
+        && tokens.iter().any(|token| token == OWNER_TOKEN)
+        && !tokens.iter().any(|token| token == SELF_RECEIVER_TOKEN)
+    {
+        tokens.push(SELF_RECEIVER_TOKEN.to_string());
     }
     for name in parameter_names {
         locals.seed_symbol_many(name, tokens.clone());
@@ -570,13 +603,23 @@ fn scan_selector_like(
     if ctx.spec.is_member() {
         let receiver = receiver_symbol_from_qualifier(&qualifier);
         let receiver_resolution = locals.resolve_symbol(receiver);
+        // A call through the enclosing method's own receiver variable is a
+        // same-owner site (#1014 facet B); a call through another owner-typed
+        // value stays an external usage.
+        let same_owner = receiver_resolution
+            .as_precise()
+            .is_some_and(|targets| targets.contains(SELF_RECEIVER_TOKEN));
         if receiver_resolution
             .as_precise()
             .is_some_and(|targets| targets.contains(OWNER_TOKEN))
             || field_receiver_matches_owner(qualifier_node, ctx, locals)
             || composite_literal_receiver_matches_owner(qualifier_node, ctx)
         {
-            record_hit(field_node, ctx);
+            if same_owner {
+                record_self_receiver_hit(field_node, ctx);
+            } else {
+                record_hit(field_node, ctx);
+            }
         } else if receiver_resolution
             .as_precise()
             .is_some_and(|targets| targets.contains(NON_OWNER_TOKEN))

@@ -1,6 +1,6 @@
 use crate::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
-    usage_hit,
+    reclassify_self_receiver_hit_at, usage_hit,
 };
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::resolver::TargetSpec;
@@ -75,6 +75,24 @@ pub(super) fn push_hit_range(
         enclosing,
         snippet_around_line(source, line_starts, range.start_line, SNIPPET_CONTEXT_LINES),
     ));
+}
+
+/// Push a hit for `[start, end)` then reclassify it as a same-owner self/this
+/// receiver hit (`$this->m()`, `self::m()`, `static::m()`) — excluded from the
+/// external usage surface, counted as a same-owner site (#1014 facet B).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_self_receiver_hit_range(
+    start: usize,
+    end: usize,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    spec: &TargetSpec,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    push_hit_range(start, end, analyzer, file, source, line_starts, spec, hits);
+    reclassify_self_receiver_hit_at(hits, file, start, end);
 }
 
 pub(super) fn push_override_declaration_hit(

@@ -266,6 +266,17 @@ fn record_reference(
             if name.is_empty() {
                 return;
             }
+            // Same-owner (self/this receiver, implicit-this, or own-type static)
+            // calls are excluded from proven usage-graph / dead-code inbound
+            // edges, uniformly with Rust/C++/JS-TS (#1014 facet B). They are
+            // recorded as unproven inbound rather than dropped, matching Rust: a
+            // method reachable only through same-owner calls is reported as
+            // inconclusive (its receivers could not be proven external), never
+            // confidently dead.
+            if method_invocation_receiver_is_same_owner(node, ctx, bindings) {
+                ctx.record_unproven(name, name_node);
+                return;
+            }
             if let Some(owner) = method_owner_fqn(node, ctx, bindings) {
                 ctx.record(format!("{owner}.{name}"), name_node);
             } else {
@@ -376,6 +387,39 @@ fn method_reference_callee(
     candidates.sort();
     candidates.dedup();
     (candidates.len() == 1).then(|| candidates[0].fq_name())
+}
+
+/// Whether a method invocation's receiver is a same-owner receiver: an
+/// unqualified (implicit-this) call, an explicit `this` receiver, or the owner
+/// type itself for an own-type static call. A `super` receiver, or a call
+/// through a differently-named variable/type, stays external (#1014 facet B).
+fn method_invocation_receiver_is_same_owner(
+    node: Node<'_>,
+    ctx: &JavaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let Some(enclosing_owner) = ctx.class_ranges.enclosing(node.start_byte()) else {
+        return false;
+    };
+    match node.child_by_field_name("object") {
+        // Unqualified call: implicit-this on the current instance.
+        None => true,
+        Some(object) => match object.kind() {
+            "this" => true,
+            "super" => false,
+            "identifier" | "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+                let name = node_text(object, ctx.source);
+                if !name.is_empty() && bindings.is_shadowed(name) {
+                    return false;
+                }
+                // Own-type static call: the receiver resolves to the enclosing
+                // class's own type.
+                ctx.resolve_type_fqn(object)
+                    .is_some_and(|receiver_fqn| receiver_fqn == enclosing_owner)
+            }
+            _ => false,
+        },
+    }
 }
 
 /// The fqn of the type that owns a method invocation: the receiver's type, or —

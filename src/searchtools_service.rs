@@ -1797,6 +1797,14 @@ impl SearchToolsService {
                 "{tool_name} requires `include_tests` to be a boolean"
             )));
         }
+        if arguments
+            .get("include_same_owner")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "{tool_name} requires `include_same_owner` to be a boolean"
+            )));
+        }
         if arguments.get("paths").is_some_and(|paths| {
             !paths
                 .as_array()

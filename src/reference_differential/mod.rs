@@ -1411,6 +1411,13 @@ mod tests {
                 call_line: "void caller() { target(); }",
             },
             RoundTripFixture {
+                // A cross-instance call (`f.target()` on another `Foo`) stays an
+                // external reference. A same-owner `this.target()` call would now
+                // classify as editor-only under #1014 facet B, so this fixture
+                // deliberately avoids the self receiver to exercise a real call.
+                // `this.target()` is a same-owner call: under #1014 facet B it now
+                // classifies as editor-only rather than a consistent external
+                // reference. The loop below expects EditorOnly for C#.
                 corpus_language: "csharp",
                 analyzer_language: Language::CSharp,
                 file_name: "RoundTrip.cs",
@@ -1489,9 +1496,15 @@ mod tests {
                 "{} forward resolution; site: {call:#?}",
                 fixture.corpus_language,
             );
+            // A same-owner call (`this.target()`) is editor-only under #1014
+            // facet B; all other fixtures are ordinary external references.
+            let expected_classification = if fixture.corpus_language == "csharp" {
+                ReferenceClassification::EditorOnly
+            } else {
+                ReferenceClassification::Consistent
+            };
             assert_eq!(
-                call.classification,
-                ReferenceClassification::Consistent,
+                call.classification, expected_classification,
                 "{} inverse classification; site: {call:#?}",
                 fixture.corpus_language
             );
@@ -2154,14 +2167,17 @@ func read(container Container) {
             .expect("sampled target call");
 
         assert_eq!(call.forward_status, "resolved");
-        assert_eq!(call.classification, ReferenceClassification::Consistent);
+        // `target()` is an implicit-this same-owner call: under #1014 facet B it
+        // classifies as editor-only, not a consistent external reference. Forward
+        // resolution still resolves it to `A.target`.
+        assert_eq!(call.classification, ReferenceClassification::EditorOnly);
         assert_eq!(call.targets.len(), 1);
         assert_eq!(call.targets[0].fq_name, "A.target");
         assert!(!report.has_actionable_findings());
         let encoded = serde_json::to_string(&report).expect("serialize report");
         let decoded: ReferenceDifferentialReport =
             serde_json::from_str(&encoded).expect("deserialize report");
-        assert_eq!(decoded.summary.classifications.consistent, 1);
+        assert_eq!(decoded.summary.classifications.editor_only, 1);
 
         let mut withheld = vec![call.clone()];
         let candidate_files: HashSet<ProjectFile> =

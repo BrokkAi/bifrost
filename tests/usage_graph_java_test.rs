@@ -108,9 +108,11 @@ fn every_edge_endpoint_is_a_node() {
 fn nested_class_calls_attribute_to_the_nested_fqn() {
     let value = usage_graph();
 
-    // An unqualified call inside `Outer.Inner` must attribute to the nested
-    // class's fqn (`com.example.Outer.Inner.helper`), built from AST nesting —
-    // not to a simple-name lookup that could hit a same-named top-level type.
+    // A call through an `Inner` receiver inside `Outer.Inner` must resolve to the
+    // nested class's fqn (`com.example.Outer.Inner.helper`), built from AST
+    // nesting — not to a simple-name lookup that could hit a same-named top-level
+    // type. (An unqualified same-owner call is excluded from edges under #1014
+    // facet B, so the fixture uses a distinct-instance receiver.)
     assert!(
         find_edge(
             &value,

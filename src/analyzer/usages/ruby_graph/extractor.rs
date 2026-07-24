@@ -9,7 +9,7 @@ use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
-use super::hits::{record_unproven_usage_hit, record_usage_hit};
+use super::hits::{record_self_receiver_usage_hit, record_unproven_usage_hit, record_usage_hit};
 use super::resolver::{
     ExplicitReceiverLookup, FactoryInferenceFrame, FactoryInferenceKey, FactoryMethodOutcome,
     ReceiverMode, ReceiverType, RubyMethodLookupMode, RubySemanticIndex, RubyTargetKind,
@@ -269,12 +269,15 @@ impl RubyWalkState<'_, '_> {
         if let Some(aliased_method) =
             alias_method_target_argument(node, self.scan.source, &self.scan.spec.member_name)
         {
+            // `alias_method :new, :old` inside a class references the class's own
+            // method — a same-owner site.
             self.record_bare_method_hit_for_receiver(
                 &self.enclosing_receiver().unwrap_or_else(|| ReceiverType {
                     owner_fq_name: String::new(),
                     mode: ReceiverMode::TopLevel,
                 }),
                 aliased_method,
+                true,
             );
             return;
         }
@@ -296,32 +299,44 @@ impl RubyWalkState<'_, '_> {
         {
             return;
         }
+        // A bare method-name reference resolves against the enclosing (implicit
+        // self) receiver — a same-owner site.
         match self.enclosing_receiver() {
-            Some(receiver) => self.record_bare_method_hit_for_receiver(&receiver, node),
+            Some(receiver) => self.record_bare_method_hit_for_receiver(&receiver, node, true),
             None => {
                 self.record_unproven_hit(node);
             }
         }
     }
 
-    fn record_bare_method_hit_for_receiver(&mut self, receiver: &ReceiverType, hit_node: Node<'_>) {
+    fn record_bare_method_hit_for_receiver(
+        &mut self,
+        receiver: &ReceiverType,
+        hit_node: Node<'_>,
+        same_owner: bool,
+    ) {
         let candidates = self.scan.semantic.resolve_bare_method_candidates(
             self.scan.support,
             &self.scan.visible_files,
             receiver,
             &self.scan.spec.member_name,
         );
-        self.record_method_hit_from_candidates(&candidates, hit_node);
+        self.record_method_hit_from_candidates(&candidates, hit_node, same_owner);
     }
 
-    fn record_explicit_receiver_method_hit(&mut self, receiver: &ReceiverType, hit_node: Node<'_>) {
+    fn record_explicit_receiver_method_hit(
+        &mut self,
+        receiver: &ReceiverType,
+        hit_node: Node<'_>,
+        same_owner: bool,
+    ) {
         let candidates = self.scan.semantic.resolve_method_candidates(
             self.scan.support,
             &self.scan.visible_files,
             receiver,
             &self.scan.spec.member_name,
         );
-        self.record_method_hit_from_candidates(&candidates, hit_node);
+        self.record_method_hit_from_candidates(&candidates, hit_node, same_owner);
     }
 
     fn record_method_hit_for_call_receiver(
@@ -331,6 +346,14 @@ impl RubyWalkState<'_, '_> {
         explicit_receiver_lookup: ExplicitReceiverLookup,
     ) {
         let receiver_node = call.child_by_field_name("receiver");
+        // A `self.method` or implicit-self (bare) call is on the current instance
+        // / own class — a same-owner site (#1014 facet B). An explicit variable /
+        // constant receiver, even of the same type, is a different instance and
+        // stays external.
+        let same_owner = match receiver_node {
+            None => true,
+            Some(receiver) => receiver.kind() == "self",
+        };
         let receiver = match receiver_node {
             Some(receiver) => self.receiver_type(receiver),
             None => self.enclosing_receiver(),
@@ -341,18 +364,27 @@ impl RubyWalkState<'_, '_> {
         };
         match (receiver_node, explicit_receiver_lookup) {
             (Some(_), ExplicitReceiverLookup::ReceiverOnly) => {
-                self.record_explicit_receiver_method_hit(&receiver, hit_node);
+                self.record_explicit_receiver_method_hit(&receiver, hit_node, same_owner);
             }
-            _ => self.record_bare_method_hit_for_receiver(&receiver, hit_node),
+            _ => self.record_bare_method_hit_for_receiver(&receiver, hit_node, same_owner),
         }
     }
 
-    fn record_method_hit_from_candidates(&mut self, candidates: &[CodeUnit], hit_node: Node<'_>) {
+    fn record_method_hit_from_candidates(
+        &mut self,
+        candidates: &[CodeUnit],
+        hit_node: Node<'_>,
+        same_owner: bool,
+    ) {
         if candidates.iter().any(|candidate| {
             candidate == &self.scan.spec.target
                 || candidate.fq_name() == self.scan.spec.target.fq_name()
         }) {
-            self.record_hit(hit_node);
+            if same_owner {
+                self.record_self_receiver_hit(hit_node);
+            } else {
+                self.record_hit(hit_node);
+            }
         } else if candidates.is_empty() {
             self.record_unproven_hit(hit_node);
         }
@@ -394,6 +426,17 @@ impl RubyWalkState<'_, '_> {
 
     fn record_hit(&mut self, node: Node<'_>) {
         record_usage_hit(
+            self.scan.analyzer,
+            self.scan.file,
+            self.scan.source,
+            self.scan.line_starts,
+            self.scan.hits,
+            node,
+        );
+    }
+
+    fn record_self_receiver_hit(&mut self, node: Node<'_>) {
+        record_self_receiver_usage_hit(
             self.scan.analyzer,
             self.scan.file,
             self.scan.source,

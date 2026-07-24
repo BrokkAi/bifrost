@@ -16,6 +16,16 @@ pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Record `node` as a same-owner self/cls receiver hit (#1014 facet B): a
+/// `self.member` / `cls.member` access whose receiver is the current instance /
+/// own class. Excluded from the external usage surface, counted as a same-owner
+/// site.
+pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.hits.insert(hit.into_self_receiver());
+    }
+}
+
 /// Record `node` as an `Import`-binding hit (the token that brings the symbol
 /// into this file), which the IDE find-references surface includes but the
 /// call-graph surfaces ignore.

@@ -4,7 +4,7 @@ use crate::analyzer::usages::local_inference::{
 };
 use crate::analyzer::usages::model::{ImportKind, UsageHit};
 use crate::analyzer::usages::python_graph::hits::{
-    record_hit, record_import_hit, record_unproven_hit,
+    record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
 };
 use crate::analyzer::usages::python_graph::resolver::{
     member_name, normalized_receiver_type, receiver_annotation_matches_target,
@@ -733,7 +733,15 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(member) = ctx.target_member
         && attribute_text == member
     {
-        if ctx.receiver_binds_target(object_text, node)
+        // A `self.member` / `cls.member` receiver is the current instance / own
+        // class — a same-owner site, excluded from external usage counts (#1014
+        // facet B). A typed local of the same type is a different instance and
+        // stays an external hit.
+        let is_same_owner_receiver =
+            matches!(object_text, "self" | "cls") && ctx.self_receiver_matches_target(node);
+        if is_same_owner_receiver {
+            record_self_receiver_hit(attribute, ctx);
+        } else if ctx.receiver_binds_target(object_text, node)
             || (object.kind() == "call" && call_result_matches_target(object, ctx))
         {
             record_hit(attribute, ctx);

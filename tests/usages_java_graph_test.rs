@@ -70,6 +70,17 @@ fn hits(result: FuzzyResult) -> Vec<UsageHit> {
         .collect()
 }
 
+/// Same-owner (self/this receiver, implicit-this) hits — excluded from the
+/// external usage surface but visible to the editor find-references surface
+/// (#1014 facet B).
+fn self_receiver_hits(result: &FuzzyResult) -> Vec<UsageHit> {
+    result
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+        .collect()
+}
+
 fn assert_hit_contains(hits: &[UsageHit], needle: &str) {
     assert!(
         hits.iter().any(|hit| hit.snippet.contains(needle)),
@@ -1548,18 +1559,26 @@ public class ClusterProcessPersistService {
         analyzer.parent_of(&target).expect("target owner").fq_name(),
         "target: {target:?}"
     );
-    let direct_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+    let result = JavaUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
         1000,
-    ));
+    );
+    // The unqualified `isReady(triggerPaths)` calls are implicit-this same-owner
+    // sites under #1014 facet B: excluded from external usages, but still proven
+    // and visible on the editor find-references surface as self-receiver hits.
+    let direct_hits = self_receiver_hits(&result);
     assert_eq!(2, direct_hits.len(), "{direct_hits:#?}");
     assert!(
         direct_hits
             .iter()
             .all(|hit| hit.snippet.contains("() -> isReady(triggerPaths)")),
         "{direct_hits:#?}"
+    );
+    assert!(
+        hits(result).is_empty(),
+        "unqualified same-owner calls must not be external usages"
     );
 
     let scan = call_search_tool_json(
@@ -1572,8 +1591,12 @@ public class ClusterProcessPersistService {
         .to_string(),
     );
     let entry = &scan["results"][0];
-    assert_eq!("found", entry["status"], "{scan}");
-    assert_eq!(2, entry["total_hits"], "{scan}");
+    // The two unqualified calls are same-owner sites: zero external usages with
+    // two same-owner sites reports `no_external_usages` (#1014 facet B), never
+    // `verified_absent`.
+    assert_eq!("no_external_usages", entry["status"], "{scan}");
+    assert_eq!(0, entry["total_hits"], "{scan}");
+    assert_eq!(2, entry["same_owner_sites"], "{scan}");
     assert_eq!(0, entry["unproven_hits"], "{scan}");
 }
 
@@ -2126,23 +2149,28 @@ public class GrandChild extends MiddleOverride {
     ]);
 
     let target = definition(&analyzer, "p.Base.ping");
-    let hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
-    let reference_hits: Vec<_> = hits
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let all_hits = hits(result.clone());
+    let reference_hits: Vec<_> = all_hits
         .iter()
         .filter(|hit| hit.kind == UsageHitKind::Reference)
         .cloned()
         .collect();
 
-    assert_eq!(
-        1,
-        reference_hits.len(),
-        "expected only the inherited bare method reference: {reference_hits:#?}"
+    // Under #1014 facet B an unqualified inherited call is an implicit-this
+    // same-owner site, so it is no longer an external Reference hit — it moves to
+    // the self-receiver (editor) surface. The wrong-owner and intermediate-override
+    // negatives remain excluded from both surfaces.
+    assert!(
+        reference_hits.is_empty(),
+        "bare same-owner call must not be an external reference: {reference_hits:#?}"
     );
-    assert_hit_contains(&reference_hits, "positive-inherited-call");
-    assert_no_hit_contains(&reference_hits, "negative-self-call");
-    assert_no_hit_contains(&reference_hits, "negative-wrong-owner");
-    assert_no_hit_contains(&reference_hits, "negative-intermediate-override");
+    let self_hits = self_receiver_hits(&result);
+    assert_hit_contains(&self_hits, "positive-inherited-call");
+    assert_no_hit_contains(&self_hits, "negative-wrong-owner");
+    assert_no_hit_contains(&self_hits, "negative-intermediate-override");
+    assert_no_hit_contains(&all_hits, "negative-wrong-owner");
+    assert_no_hit_contains(&all_hits, "negative-intermediate-override");
 }
 
 #[test]
@@ -4073,19 +4101,29 @@ public class Consumer {
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let method_target = definition(&analyzer, "com.example.Base.run");
-    let hits = JavaUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&method_target),
-            &candidates,
-            1000,
-        )
+    let result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&method_target),
+        &candidates,
+        1000,
+    );
+    // `base.run()` (a distinct instance) is an external usage; `this.run()` inside
+    // the anonymous class is a same-owner site, editor-only under #1014 facet B.
+    let external = result
+        .clone()
         .into_either()
-        .expect("anonymous typed receiver success");
+        .expect("typed receiver success");
+    assert_eq!(1, external.len(), "expected only base.run(): {external:#?}");
+    assert!(
+        external
+            .iter()
+            .all(|hit| hit.snippet.contains("base.run()")),
+        "{external:#?}"
+    );
     assert_eq!(
-        2,
-        hits.len(),
-        "expected this.run() inside anon class and base.run()"
+        1,
+        self_receiver_hits(&result).len(),
+        "expected this.run() as a same-owner hit"
     );
 }
 

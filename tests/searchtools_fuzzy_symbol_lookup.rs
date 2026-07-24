@@ -350,6 +350,7 @@ const direct = ApiClient.create("/direct");
             symbols: vec!["ApiClient.create".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 
@@ -394,6 +395,7 @@ object Service {
             symbols: vec!["src/main/scala/example/Service.scala#example.Service".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 
@@ -508,6 +510,7 @@ object Use {
                 "app/Shadowed.scala".to_string(),
                 "decoy/Use.scala".to_string(),
             ]),
+            include_same_owner: false,
         },
     );
     assert_eq!(2, result.results.len(), "{result:#?}");
@@ -650,6 +653,7 @@ object Flags {
             ],
             include_tests: true,
             paths: Some(vec!["app/Use.scala".to_string()]),
+            include_same_owner: false,
         },
     );
     assert_eq!(3, result.results.len(), "{result:#?}");
@@ -1027,6 +1031,7 @@ func caller(options *Options, box *Box[int]) bool {
                 symbols: vec![symbol.to_string()],
                 include_tests: true,
                 paths: None,
+                include_same_owner: false,
             },
         );
 
@@ -1059,6 +1064,7 @@ fn scan_usages_reports_path_qualified_symbol_selector_as_unsupported() {
             symbols: vec!["src/cli.ts::main".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 
@@ -1087,6 +1093,7 @@ fn scan_usages_reports_plain_path_symbol_with_path_guidance() {
             symbols: vec!["src/cli.ts".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 
@@ -1121,6 +1128,7 @@ fn scan_usages_bounds_ambiguous_path_qualified_selector_message() {
             symbols: vec!["index.ts::missing".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 
@@ -1905,8 +1913,10 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
             "A.java",
             r#"class A {
     void method() {}
-    void caller() {
-        method();
+}
+class B {
+    void caller(A a) {
+        a.method();
     }
 }
 "#,
@@ -1914,12 +1924,16 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
         .build();
     let analyzer = JavaAnalyzer::from_project(project.project().clone());
 
+    // A cross-instance caller keeps a genuine external usage; an implicit-this
+    // `method()` call would be a same-owner site under #1014 facet B and yield
+    // `no_external_usages` instead of `found`.
     let result = scan_usages_by_reference(
         &analyzer,
         ScanUsagesByReferenceParams {
             symbols: vec!["A::method".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 
@@ -1948,6 +1962,7 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
             symbols: vec!["initialize_the_repository".to_string()],
             include_tests: true,
             paths: None,
+            include_same_owner: false,
         },
     );
 

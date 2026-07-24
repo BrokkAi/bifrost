@@ -2,6 +2,7 @@ mod common;
 
 use brokk_bifrost::usages::{
     CSharpUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
+    UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{
     AnalyzerConfig, CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, WorkspaceAnalyzer,
@@ -236,6 +237,29 @@ fn graph_hits(
         .find_usages(analyzer, std::slice::from_ref(target), &candidates, 1000)
         .into_either()
         .unwrap_or_else(|err| panic!("{} should resolve: {err}", target.fq_name()))
+}
+
+/// The raw graph result, so callers can inspect the same-owner (self-receiver)
+/// surface alongside the external usages (#1014 facet B).
+fn graph_result(analyzer: &CSharpAnalyzer, target: &CodeUnit) -> FuzzyResult {
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    CSharpUsageGraphStrategy::new().find_usages(
+        analyzer,
+        std::slice::from_ref(target),
+        &candidates,
+        1000,
+    )
+}
+
+/// Same-owner (`this`/implicit-this receiver) hits — excluded from the external
+/// usage surface but visible to the editor find-references surface (#1014 facet
+/// B).
+fn self_receiver_hits(result: &FuzzyResult) -> Vec<UsageHit> {
+    result
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+        .collect()
 }
 
 #[test]
@@ -4627,14 +4651,8 @@ namespace Domain {
 
     let run = member_function(&analyzer, "Domain.Target", "Run");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let result = CSharpUsageGraphStrategy::new().find_usages(
-        &analyzer,
-        std::slice::from_ref(&run),
-        &candidates,
-        1000,
-    );
-
-    let hits = result
+    let hits = CSharpUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000)
         .into_either()
         .unwrap_or_else(|err| panic!("same-class unqualified call should resolve: {err}"));
     assert_eq!(1, hits.len());
@@ -5616,26 +5634,36 @@ namespace Demo {
         ),
         other => panic!("expected inherited member query success, got {other:#?}"),
     }
-    let hits = query
+    // Under #1014 facet B the explicit `this.Report(1)` and inherited
+    // `this.Report(4)` calls are same-owner sites (editor-only self-receiver
+    // hits, excluded from external usages). The unqualified `Report(2)` call stays
+    // on the external surface (C# reclassifies only explicit `this.` receivers).
+    // The parameter/local shadows and the hidden-member consumer remain excluded
+    // from both surfaces.
+    let self_hits = self_receiver_hits(&query.result);
+    let external = query
         .result
         .into_either()
         .expect("inherited member query should resolve");
-    assert_eq!(3, hits.len(), "{hits:#?}");
+    assert_eq!(2, self_hits.len(), "{self_hits:#?}");
     assert!(
-        hits.iter().any(|hit| {
+        self_hits.iter().any(|hit| {
             hit.file == consumer
                 && hit.start_offset <= use_start
                 && use_start + "Report".len() <= hit.end_offset
         }),
-        "inverse lookup should find the inherited member on the precise derived receiver: {hits:#?}"
+        "self-receiver surface should cover the inherited member on the precise derived receiver: {self_hits:#?}"
     );
     assert!(
-        hits.iter().any(|hit| hit.snippet.contains("Report(2)")),
-        "inverse lookup should find the inherited unqualified call: {hits:#?}"
+        self_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Report(4)")),
+        "self-receiver surface should follow inheritance declared on a sibling partial type: {self_hits:#?}"
     );
+    assert_eq!(1, external.len(), "{external:#?}");
     assert!(
-        hits.iter().any(|hit| hit.snippet.contains("Report(4)")),
-        "inverse lookup should follow inheritance declared on a sibling partial type: {hits:#?}"
+        external.iter().any(|hit| hit.snippet.contains("Report(2)")),
+        "the unqualified inherited call stays an external usage: {external:#?}"
     );
 }
 
@@ -5760,19 +5788,43 @@ public sealed class UnrelatedMapping {
         }));
     }
 
-    let derived_hits = graph_hits(&analyzer, &derived_target);
-    assert_eq!(derived_hits.len(), 2, "{derived_hits:#?}");
-    for expected in [this_call, unqualified_call] {
-        assert!(derived_hits.iter().any(|hit| {
-            hit.file == consumer
-                && hit.start_offset <= expected
-                && expected + "BuildBody".len() <= hit.end_offset
-        }));
-    }
+    // Under #1014 facet B the explicit `this.BuildBody(3, 4)` receiver is a
+    // same-owner site (editor-only self-receiver hit); the unqualified
+    // `BuildBody(5, 6)` call stays external (C# reclassifies only explicit `this.`
+    // receivers). (The `base.BuildBody(1, 2)` receiver above stays external too.)
+    let derived_result = graph_result(&analyzer, &derived_target);
+    let derived_external = derived_result
+        .clone()
+        .into_either()
+        .expect("derived query resolves");
+    assert_eq!(derived_external.len(), 1, "{derived_external:#?}");
+    assert!(derived_external.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= unqualified_call
+            && unqualified_call + "BuildBody".len() <= hit.end_offset
+    }));
+    let derived_self = self_receiver_hits(&derived_result);
+    assert_eq!(derived_self.len(), 1, "{derived_self:#?}");
+    assert!(derived_self.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= this_call
+            && this_call + "BuildBody".len() <= hit.end_offset
+    }));
 
-    let unrelated_hits = graph_hits(&analyzer, &unrelated_target);
-    assert_eq!(unrelated_hits.len(), 1, "{unrelated_hits:#?}");
-    assert!(unrelated_hits.iter().any(|hit| {
+    // `this.BuildBody(7, 8)` calls UnrelatedMapping's own method through `this` — a
+    // same-owner site (#1014 facet B), editor-only.
+    let unrelated_result = graph_result(&analyzer, &unrelated_target);
+    assert!(
+        unrelated_result
+            .clone()
+            .into_either()
+            .expect("unrelated query resolves")
+            .is_empty(),
+        "same-owner call must not be external: {unrelated_result:#?}"
+    );
+    let unrelated_self = self_receiver_hits(&unrelated_result);
+    assert_eq!(unrelated_self.len(), 1, "{unrelated_self:#?}");
+    assert!(unrelated_self.iter().any(|hit| {
         hit.file == consumer
             && hit.start_offset <= unrelated_call
             && unrelated_call + "BuildBody".len() <= hit.end_offset
@@ -7177,23 +7229,34 @@ public partial class HttpPipeline {
     ]);
 
     let pipeline = member_field(&analyzer, "Example.HttpPipeline", "pipeline");
-    let hits = graph_hits(&analyzer, &pipeline);
+    let result = graph_result(&analyzer, &pipeline);
+    let external = result.clone().into_either().expect("field query resolves");
+    let self_hits = self_receiver_hits(&result);
     let source = project.file("src/ISendAsync.cs").read_to_string().unwrap();
     let initializer_start = source
         .find("pipeline = this.pipeline")
         .expect("initializer assignment");
     let receiver_start = initializer_start + "pipeline = this.".len();
 
-    for expected_start in [initializer_start, receiver_start] {
-        assert!(
-            hits.iter().any(|hit| {
-                hit.file == project.file("src/ISendAsync.cs")
-                    && hit.start_offset <= expected_start
-                    && expected_start + "pipeline".len() <= hit.end_offset
-            }),
-            "both initializer-label and ordinary field references should resolve across physical parts of the same logical partial type: {hits:#?}"
-        );
-    }
+    // The object-initializer label targets a *new* HttpPipeline instance, so it is
+    // an external usage; the `this.pipeline` read is a same-owner site (#1014 facet
+    // B), visible only on the editor self-receiver surface.
+    assert!(
+        external.iter().any(|hit| {
+            hit.file == project.file("src/ISendAsync.cs")
+                && hit.start_offset <= initializer_start
+                && initializer_start + "pipeline".len() <= hit.end_offset
+        }),
+        "the initializer-label field reference should be an external usage across physical parts of the same logical partial type: {external:#?}"
+    );
+    assert!(
+        self_hits.iter().any(|hit| {
+            hit.file == project.file("src/ISendAsync.cs")
+                && hit.start_offset <= receiver_start
+                && receiver_start + "pipeline".len() <= hit.end_offset
+        }),
+        "the this.pipeline read should be a same-owner self-receiver hit: {self_hits:#?}"
+    );
 }
 
 #[test]

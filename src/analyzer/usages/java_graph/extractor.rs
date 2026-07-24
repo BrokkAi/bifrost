@@ -592,17 +592,58 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    let receiver_match = if let Some(object) = node.child_by_field_name("object") {
-        receiver_matches_target(object, ctx)
-    } else if bare_method_context_matches_target(node, ctx) || has_proven_static_import(ctx) {
-        ReceiverTargetMatch::Matched
+    // Track whether a matched receiver is a same-owner receiver (`this`,
+    // implicit-this, or the owner type itself) so the hit is classified as a
+    // same-owner site rather than an external usage (#1014 facet B).
+    let (receiver_match, same_owner) = if let Some(object) = node.child_by_field_name("object") {
+        let outcome = receiver_matches_target(object, ctx);
+        let same_owner = outcome == ReceiverTargetMatch::Matched
+            && method_receiver_object_is_same_owner(object, ctx);
+        (outcome, same_owner)
+    } else if bare_method_context_matches_target(node, ctx) {
+        // An unqualified call resolving to the enclosing type is an implicit-this
+        // (or inherited) receiver on the current instance.
+        (ReceiverTargetMatch::Matched, true)
+    } else if has_proven_static_import(ctx) {
+        // A static import resolves to another type's static member, not the owner.
+        (ReceiverTargetMatch::Matched, false)
     } else {
-        ReceiverTargetMatch::Unresolved
+        (ReceiverTargetMatch::Unresolved, false)
     };
     match receiver_match {
+        ReceiverTargetMatch::Matched if same_owner => hits::push_self_receiver_hit(name_node, ctx),
         ReceiverTargetMatch::Matched => hits::push_hit(name_node, ctx),
         ReceiverTargetMatch::Unresolved => hits::push_unproven_hit(name_node, ctx),
         ReceiverTargetMatch::Incompatible => {}
+    }
+}
+
+/// Whether a *matched* method-invocation receiver `object` is a same-owner
+/// receiver: the current instance (`this`) or the owner type itself for a static
+/// call from within that type (`Owner.staticMethod()` inside `Owner`). A call
+/// through a different variable of the same type, or `super`, stays external.
+fn method_receiver_object_is_same_owner(object: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    match object.kind() {
+        "this" => true,
+        "super" => false,
+        "identifier" | "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+            // Own-type static call: the receiver resolves to a type, and the
+            // enclosing declaration is owned by that same type. A binding to a
+            // local/parameter value is not a type receiver, so only treat it as
+            // same-owner when it is not a shadowed value binding.
+            let name = node_text(object, ctx.source);
+            if !name.is_empty() && ctx.bindings.is_shadowed(name) {
+                return false;
+            }
+            match resolve_type_from_node(object, ctx) {
+                Some(receiver_type) => {
+                    receiver_type.fq_name() == ctx.spec.owner.fq_name()
+                        && same_owner_context(object, ctx)
+                }
+                None => false,
+            }
+        }
+        _ => false,
     }
 }
 

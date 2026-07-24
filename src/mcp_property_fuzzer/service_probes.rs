@@ -1235,6 +1235,7 @@ fn derive_follow_ups(
                             status,
                             "found"
                                 | "verified_absent"
+                                | "no_external_usages"
                                 | "unverified_absent"
                                 | "too_many_callsites"
                         );

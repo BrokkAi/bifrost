@@ -78,6 +78,20 @@ pub(super) fn reclassify_override_declaration_hit_at(
     reclassify_hit_at(hits, file, start, end, UsageHit::into_override_declaration);
 }
 
+/// Reclassify an already-recorded proven hit at `[start, end)` as a same-owner
+/// self/this receiver hit. Used by the per-language extractors (#1014 facet B)
+/// so a call whose receiver is the current instance / own type is counted as a
+/// same-owner site and excluded from the external usage surface, uniformly with
+/// Rust/C++/JS-TS.
+pub(super) fn reclassify_self_receiver_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+) {
+    reclassify_hit_at(hits, file, start, end, UsageHit::into_self_receiver);
+}
+
 fn reclassify_hit_at(
     hits: &mut BTreeSet<UsageHit>,
     file: &ProjectFile,

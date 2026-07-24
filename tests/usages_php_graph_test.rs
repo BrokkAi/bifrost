@@ -42,6 +42,32 @@ fn graph_hits(
         .unwrap_or_else(|err| panic!("usage query failed for {fq_name}: {err}"))
 }
 
+/// The raw graph result, so a test can inspect the same-owner (self-receiver)
+/// surface alongside the external usages (#1014 facet B).
+fn graph_result(analyzer: &PhpAnalyzer, fq_name: &str) -> FuzzyResult {
+    let target = definition(analyzer, fq_name);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    PhpUsageGraphStrategy::new().find_usages(
+        analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    )
+}
+
+/// Same-owner (`$this->`, `self::`, `static::`) receiver hits — excluded from the
+/// external usage surface, visible to find-references (#1014 facet B).
+fn self_receiver_hits(
+    analyzer: &PhpAnalyzer,
+    fq_name: &str,
+) -> Vec<brokk_bifrost::usages::UsageHit> {
+    graph_result(analyzer, fq_name)
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+        .collect()
+}
+
 #[test]
 fn usage_finder_routes_php_targets_through_graph_strategy() {
     let (_project, analyzer) = php_analyzer_with_files(&[
@@ -368,6 +394,7 @@ class NoCandidate {
             symbols: vec!["App.Service.run".to_string()],
             include_tests: true,
             paths: Some(vec!["tests/Consumer.php".to_string()]),
+            include_same_owner: false,
         },
     );
     assert_eq!(1, scoped.results.len(), "scoped usages: {scoped:?}");
@@ -850,6 +877,7 @@ $count = Mailer::$sent;
             ],
             paths: None,
             include_tests: true,
+            include_same_owner: false,
         },
     );
     assert!(
@@ -1297,9 +1325,16 @@ class Target extends Base {
 "#,
     )]);
 
-    assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
-    assert_eq!(2, graph_hits(&analyzer, "App.Target.label").len());
-    assert_eq!(1, graph_hits(&analyzer, "App.Target.VALUE").len());
+    // `$this->run/label`, `self::VALUE`, and `static::$label` are same-owner
+    // sites (#1014 facet B): excluded from external usages, present as
+    // self-receiver hits. `parent::inherited()` targets the base type and stays
+    // external.
+    assert_eq!(0, graph_hits(&analyzer, "App.Target.run").len());
+    assert_eq!(1, self_receiver_hits(&analyzer, "App.Target.run").len());
+    assert_eq!(0, graph_hits(&analyzer, "App.Target.label").len());
+    assert_eq!(2, self_receiver_hits(&analyzer, "App.Target.label").len());
+    assert_eq!(0, graph_hits(&analyzer, "App.Target.VALUE").len());
+    assert_eq!(1, self_receiver_hits(&analyzer, "App.Target.VALUE").len());
     assert_eq!(1, graph_hits(&analyzer, "App.Base.inherited").len());
 }
 
@@ -1540,13 +1575,17 @@ $other->record("unrelated");
         ),
     ]);
 
+    // `$this->record(...)` is a same-owner site (#1014 facet B): excluded from
+    // external usages, present as a self-receiver hit. The external surface keeps
+    // the `$mailer->record(...)` call through a using-class instance.
     let record_hits = graph_hits(&analyzer, "App.Support.LogsEvents.record");
-    assert_eq!(2, record_hits.len(), "{record_hits:#?}");
+    let record_self = self_receiver_hits(&analyzer, "App.Support.LogsEvents.record");
+    assert_eq!(1, record_hits.len(), "{record_hits:#?}");
     assert!(
-        record_hits
+        record_self
             .iter()
             .any(|hit| hit.snippet.contains("$this->record($message)")),
-        "trait method usages should include in-class calls: {record_hits:#?}"
+        "in-class $this trait call is a same-owner site: {record_self:#?}"
     );
     assert!(
         record_hits
@@ -1567,12 +1606,12 @@ $other->record("unrelated");
         "trait methods should not emit override-declaration hits: {record_hits:#?}"
     );
 
-    let audit_hits = graph_hits(&analyzer, "App.Support.AuditsEvents.audit");
+    let audit_self = self_receiver_hits(&analyzer, "App.Support.AuditsEvents.audit");
     assert!(
-        audit_hits
+        audit_self
             .iter()
             .any(|hit| hit.snippet.contains("$this->audit($message)")),
-        "multi-trait use should contribute each trait: {audit_hits:#?}"
+        "multi-trait use should contribute each trait as a same-owner site: {audit_self:#?}"
     );
 }
 

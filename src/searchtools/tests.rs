@@ -507,6 +507,8 @@ fn usage_work_entry(
             unproven_rows,
             None,
             reference_only_absence_note,
+            Vec::new(),
+            false,
         ),
         candidate_files_sample: Some(ScanUsagesCandidateFilesSample {
             scanned: vec!["scanned.rs".to_string()],
@@ -694,6 +696,8 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
             Vec::new(),
             None,
             None,
+            Vec::new(),
+            false,
         ),
         short_name: "target".to_string(),
         total_callsites: 1001,

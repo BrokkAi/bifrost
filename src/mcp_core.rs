@@ -243,6 +243,11 @@ fn scan_usages_by_reference_descriptor() -> Value {
                     "default": false,
                     "description": "Include call sites in test files."
                 },
+                "include_same_owner": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "List the same-owner usage sites (self/this receiver and own-type static calls) that are excluded from external usage counts. When false these sites are only counted as `same_owner_sites`; a zero-external result with same-owner sites reports status `no_external_usages`, never `verified_absent`."
+                },
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -295,6 +300,11 @@ fn scan_usages_by_location_descriptor() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "Include call sites in test files."
+                },
+                "include_same_owner": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "List the same-owner usage sites (self/this receiver and own-type static calls) that are excluded from external usage counts. When false these sites are only counted as `same_owner_sites`; a zero-external result with same-owner sites reports status `no_external_usages`, never `verified_absent`."
                 },
                 "paths": {
                     "type": "array",

@@ -6,7 +6,7 @@ mod common;
 
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{
-    CandidateFileProvider, FuzzyResult, ImportGraphCandidateProvider, UsageFinder,
+    CandidateFileProvider, FuzzyResult, ImportGraphCandidateProvider, UsageFinder, UsageHitKind,
 };
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer, TestProject};
 use common::{InlineTestProject, ruby_analyzer_with_files};
@@ -26,12 +26,23 @@ fn definition(analyzer: &RubyAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
-fn hit_enclosing_ids(analyzer: &RubyAnalyzer, fq_name: &str) -> Vec<String> {
+/// Same-owner hits (bare implicit-self calls, `self.method`, and `alias_method`
+/// references) — excluded from the external usage surface but present on the
+/// editor find-references surface (#1014 facet B).
+fn self_receiver_hits(
+    result: &FuzzyResult,
+) -> std::collections::BTreeSet<brokk_bifrost::usages::UsageHit> {
+    result
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+        .collect()
+}
+
+/// Enclosing-declaration identifiers of the same-owner (self-receiver) hits.
+fn self_receiver_enclosing_ids(analyzer: &RubyAnalyzer, fq_name: &str) -> Vec<String> {
     let target = definition(analyzer, fq_name);
-    analyzer
-        .find_usages(&[target])
-        .into_either()
-        .expect("usage lookup should succeed")
+    self_receiver_hits(&analyzer.find_usages(&[target]))
         .iter()
         .map(|hit| hit.enclosing.identifier().to_string())
         .collect()
@@ -103,16 +114,9 @@ fn finds_method_usage_through_a_mixin() {
     let analyzer = analyzer();
     // `log` is defined on module Loggable and called inside Service (which
     // includes Loggable). Name-based resolution finds both call sites.
-    let target = definition(&analyzer, "Loggable.log");
-
-    let hits = analyzer
-        .find_usages(&[target])
-        .into_either()
-        .expect("usage lookup should succeed");
-    let enclosing: Vec<String> = hits
-        .iter()
-        .map(|h| h.enclosing.identifier().to_string())
-        .collect();
+    // The bare `log` calls are implicit-self (same-owner) sites under #1014 facet
+    // B, so they land on the self-receiver surface rather than the external one.
+    let enclosing = self_receiver_enclosing_ids(&analyzer, "Loggable.log");
     assert!(enclosing.iter().any(|id| id == "work"), "got {enclosing:?}");
     assert!(
         enclosing.iter().any(|id| id == "retry_work"),
@@ -795,7 +799,10 @@ end
 "#,
     )]);
 
-    let enclosing = hit_enclosing_ids(&analyzer, "BaseService.audit");
+    // The bare `audit` call resolves through the enclosing/super class as an
+    // implicit-self (same-owner) site under #1014 facet B: on the self-receiver
+    // surface, not the external one.
+    let enclosing = self_receiver_enclosing_ids(&analyzer, "BaseService.audit");
     assert!(enclosing.iter().any(|id| id == "run"), "{enclosing:?}");
 }
 
@@ -823,10 +830,10 @@ end
     )]);
 
     let target = definition(&analyzer, "normalize_total");
-    let hits = analyzer
-        .find_usages(&[target])
-        .into_either()
-        .expect("usage lookup should succeed");
+    // The bare `normalize_total(19)` call is an implicit-self (same-owner) site
+    // under #1014 facet B, so it lands on the self-receiver surface. The shadowed
+    // parameter in `render_shadow` and the definition itself are not usages.
+    let hits = self_receiver_hits(&analyzer.find_usages(&[target]));
     let lines = hit_source_lines(&hits);
     let enclosing: Vec<String> = hits.iter().map(|hit| hit.enclosing.fq_name()).collect();
 
@@ -864,10 +871,9 @@ end
     )]);
 
     let target = definition(&analyzer, "User.build");
-    let hits = analyzer
-        .find_usages(&[target])
-        .into_either()
-        .expect("usage lookup should succeed");
+    // Both the bare `build` and `self.build` calls inside the singleton class are
+    // same-owner sites under #1014 facet B: on the self-receiver surface.
+    let hits = self_receiver_hits(&analyzer.find_usages(&[target]));
     let lines = hit_source_lines(&hits);
 
     assert!(lines.iter().any(|line| line == "build"), "{lines:?}");
@@ -1766,18 +1772,23 @@ product.label
     );
 
     let label_target = definition(&analyzer, "Product.label");
-    let label_hits = analyzer
-        .find_usages(&[label_target])
-        .into_either()
-        .expect("alias_method usage lookup should succeed");
-    let label_lines = hit_source_lines(&label_hits);
-    assert!(
-        label_lines.iter().any(|line| line == "label"),
-        "expected Product#label internal usage, got {label_lines:?}"
+    let label_result = analyzer.find_usages(&[label_target]);
+    // The bare `label` call in `summary` is an implicit-self (same-owner) site
+    // under #1014 facet B; the `product.label` call through a local receiver is
+    // external.
+    let label_self = hit_source_lines(&self_receiver_hits(&label_result));
+    let label_external = hit_source_lines(
+        &label_result
+            .into_either()
+            .expect("alias_method usage lookup should succeed"),
     );
     assert!(
-        label_lines.iter().any(|line| line == "product.label"),
-        "expected Product#label external usage, got {label_lines:?}"
+        label_self.iter().any(|line| line == "label"),
+        "expected Product#label internal same-owner usage, got {label_self:?}"
+    );
+    assert!(
+        label_external.iter().any(|line| line == "product.label"),
+        "expected Product#label external usage, got {label_external:?}"
     );
 }
 
@@ -1821,21 +1832,29 @@ product.label
     ]);
 
     let name_target = definition(&analyzer, "Shop$Product.name");
-    let name_hits = analyzer
-        .find_usages(&[name_target])
-        .into_either()
-        .expect("namespaced attr_reader usage lookup should succeed");
-    let name_lines = hit_source_lines(&name_hits);
-    let name_texts = hit_texts(&name_hits);
-    assert!(
-        name_lines
-            .iter()
-            .any(|line| line == "alias_method :label, :name"),
-        "expected alias_method target argument usage, got {name_lines:?}"
+    let name_result = analyzer.find_usages(&[name_target]);
+    // The `:name` argument of `alias_method` references the class's own method — a
+    // same-owner site under #1014 facet B (self-receiver surface). The
+    // `product.name` call through a local receiver is external.
+    let name_self_lines = hit_source_lines(&self_receiver_hits(&name_result));
+    let name_all = name_result.all_hits_including_imports();
+    let name_texts = hit_texts(&name_all);
+    let name_external_lines = hit_source_lines(
+        &name_result
+            .into_either()
+            .expect("namespaced attr_reader usage lookup should succeed"),
     );
     assert!(
-        name_lines.iter().any(|line| line == "product.name"),
-        "expected namespaced Product#name external usage, got {name_lines:?}"
+        name_self_lines
+            .iter()
+            .any(|line| line == "alias_method :label, :name"),
+        "expected alias_method target argument usage, got {name_self_lines:?}"
+    );
+    assert!(
+        name_external_lines
+            .iter()
+            .any(|line| line == "product.name"),
+        "expected namespaced Product#name external usage, got {name_external_lines:?}"
     );
     assert!(
         name_texts.iter().all(|text| text == "name"),

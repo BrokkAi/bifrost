@@ -30,6 +30,37 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Push `node` as a same-owner `this`/own-type receiver hit (#1014 facet B):
+/// excluded from the external usage surface, counted as a same-owner site.
+pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_code_unit(node, ctx) else {
+        return;
+    };
+    if enclosing == ctx.spec.target {
+        return;
+    }
+    ctx.hits.insert(
+        usage_hit(
+            ctx.file,
+            line_idx,
+            start,
+            end,
+            enclosing,
+            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+        )
+        .into_self_receiver(),
+    );
+    if ctx.hits.len() > ctx.max_usages {
+        *ctx.limit_exceeded = true;
+    }
+}
+
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
     let end = node.end_byte();
