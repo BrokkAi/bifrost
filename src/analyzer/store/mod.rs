@@ -1229,7 +1229,10 @@ impl AnalyzerStore {
         self.parsed_blob_transaction_starts
             .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let tx = conn.transaction()?;
+        // Reserve the writer slot before reading the generation. A deferred
+        // transaction can otherwise fail while upgrading its read snapshot
+        // under concurrent pooled-reader churn, particularly on Windows.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_current_generation(&tx, lang, generation)?;
         write_parsed_blob_tx(&tx, oid, lang, generation, adapter, state)?;
         tx.commit()?;
