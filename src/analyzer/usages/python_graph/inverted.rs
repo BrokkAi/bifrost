@@ -20,7 +20,9 @@ use super::extractor::{
     call_result_types, collect_assigned_identifiers, collect_scope_facts_from_parsed_source,
     enclosing_scope_facts, is_declaration_identifier, slice,
 };
-use super::resolver::{resolve_constructor_types, resolve_receiver_type};
+use super::resolver::{
+    annotation_reference_candidates, resolve_constructor_types, resolve_receiver_type,
+};
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
@@ -277,12 +279,20 @@ fn walk<'a>(
                 // no enclosing-function facts. Methods inside re-resolve their own facts.
                 "class_definition" => push_children(node, None, &mut stack),
                 "identifier" => {
-                    handle_identifier(node, ctx, scopes);
+                    if !handle_annotation_reference(node, ctx) {
+                        handle_identifier(node, ctx, scopes);
+                    }
                     push_children(node, facts, &mut stack);
                 }
                 "attribute" => {
+                    if handle_annotation_reference(node, ctx) {
+                        continue;
+                    }
                     handle_attribute(node, ctx, scopes, facts);
                     push_children(node, facts, &mut stack);
+                }
+                "string_content" => {
+                    handle_annotation_reference(node, ctx);
                 }
                 "keyword_argument" => {
                     handle_keyword_argument(node, ctx, scopes);
@@ -354,6 +364,19 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[Functio
     if let Some(callee) = ctx.bare_callee(text) {
         ctx.record(callee, node);
     }
+}
+
+fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_, '_>) -> bool {
+    let Some(candidates) =
+        annotation_reference_candidates(ctx.analyzer, ctx.py, ctx.file, ctx.source, node, false)
+    else {
+        return false;
+    };
+
+    for candidate in candidates {
+        ctx.record(candidate.fq_name(), node);
+    }
+    true
 }
 
 fn handle_attribute<'a>(
