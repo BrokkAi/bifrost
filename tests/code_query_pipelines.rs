@@ -3466,7 +3466,7 @@ fn reference_traversal_resolves_inbound_and_outbound_across_all_adapters() {
         (
             "java",
             "Sample.java",
-            "class Sample { static void target(String payload) {} static void caller() { target(\"input\"); } }\n",
+            "class Target { static void target(String payload) {} }\nclass Caller { static void caller() { Target.target(\"input\"); } }\n",
         ),
         (
             "javascript",
@@ -3501,17 +3501,17 @@ fn reference_traversal_resolves_inbound_and_outbound_across_all_adapters() {
         (
             "scala",
             "Sample.scala",
-            "object Sample { def target(payload: String): Unit = (); def caller(): Unit = target(\"input\") }\n",
+            "object Target { def target(payload: String): Unit = () }\nobject Caller { def caller(): Unit = Target.target(\"input\") }\n",
         ),
         (
             "csharp",
             "Sample.cs",
-            "class Sample { static void target(string payload) {} static void caller() { target(\"input\"); } }\n",
+            "class Target { public static void target(string payload) {} }\nclass Caller { public static void caller() { Target.target(\"input\"); } }\n",
         ),
         (
             "ruby",
             "sample.rb",
-            "def target(payload); end\ndef caller; target(\"input\"); end\n",
+            "class Target\n  def self.target(payload); end\nend\nclass Caller\n  def self.caller; Target.target(\"input\"); end\nend\n",
         ),
     ];
 
