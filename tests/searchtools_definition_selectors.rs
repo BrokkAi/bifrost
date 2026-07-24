@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost::{Language, SearchToolsService, searchtools_render::RenderOptions};
-use common::InlineTestProject;
+use common::{InlineTestProject, call_tool};
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
 
@@ -28,16 +28,6 @@ fn scala_class_end_byte(language: tree_sitter::Language, source: &str, name: &st
         pending.extend(node.named_children(&mut cursor));
     }
     panic!("missing Scala class {name}");
-}
-
-fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
-    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
-    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
-        .expect("service");
-    let payload = service
-        .call_tool_json(tool, args)
-        .expect("tool call failed");
-    serde_json::from_str(&payload).expect("tool returned invalid JSON")
 }
 
 fn call_tool_payload(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {

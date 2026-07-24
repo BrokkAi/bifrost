@@ -472,9 +472,8 @@ fn ts_source_extensions_for_runtime_specifier(
 
 pub(crate) fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
     import
-        .alias
-        .clone()
-        .or_else(|| import.identifier.clone())
+        .local_name()
+        .map(str::to_string)
         .into_iter()
         .collect()
 }

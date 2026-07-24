@@ -2,6 +2,7 @@ pub mod dataflow_reference;
 mod inline_project;
 pub mod lsp_click;
 pub mod lsp_client;
+pub mod search_tools;
 pub mod semantic_graph;
 pub mod usage_graph;
 
@@ -49,6 +50,11 @@ fn copy_dir_recursively(source: &Path, destination: &Path) -> std::io::Result<()
 
 #[allow(unused_imports)]
 pub use inline_project::{BuiltInlineTestProject, InlineTestProject};
+
+#[allow(unused_imports)]
+pub use search_tools::{
+    call_tool, definition_reference_status, sorted_source_paths, symbol_sources,
+};
 
 #[allow(dead_code)]
 pub fn line_of(source: &str, needle: &str) -> usize {

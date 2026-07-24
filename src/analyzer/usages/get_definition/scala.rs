@@ -967,7 +967,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 );
             }
 
-            let flattened = path.segments.join(".");
+            let flattened = path.render_segments(".");
             let import_prefixes = if path.lexical_prefixes.is_empty() {
                 self.package_prefixes.as_slice()
             } else {
@@ -2343,9 +2343,9 @@ fn bounded_scala_resolve_segments(
                 .chain(std::iter::once(""))
             {
                 let base = if prefix.is_empty() {
-                    path.segments.join(".")
+                    path.render_segments(".")
                 } else {
-                    format!("{prefix}.{}", path.segments.join("."))
+                    format!("{prefix}.{}", path.render_segments("."))
                 };
                 candidate_fqns.extend(scala_nested_type_candidates(base, segments, true));
             }

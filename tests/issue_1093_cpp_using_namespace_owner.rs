@@ -9,54 +9,8 @@
 
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
-use common::InlineTestProject;
-use serde_json::Value;
-
-fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
-        .expect("service");
-    let payload = service
-        .call_tool_json(tool, args)
-        .expect("tool call failed");
-    serde_json::from_str(&payload).expect("tool returned invalid JSON")
-}
-
-fn symbol_sources(project: &common::BuiltInlineTestProject, symbol: &str) -> Value {
-    call_tool(
-        project,
-        "get_symbol_sources",
-        &serde_json::json!({ "symbols": [symbol] }).to_string(),
-    )
-}
-
-fn sorted_source_paths(result: &Value) -> Vec<String> {
-    let mut paths: Vec<String> = result["sources"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected `sources` array, got {result}"))
-        .iter()
-        .map(|source| source["path"].as_str().expect("source path").to_string())
-        .collect();
-    paths.sort();
-    paths
-}
-
-fn definition_reference_status(
-    project: &common::BuiltInlineTestProject,
-    symbol: &str,
-    context: &str,
-    target: &str,
-) -> String {
-    let args = serde_json::json!({
-        "references": [{ "symbol": symbol, "context": context, "target": target }]
-    })
-    .to_string();
-    let result = call_tool(project, "get_definitions_by_reference", &args);
-    result["results"][0]["status"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a status string, got {result}"))
-        .to_string()
-}
+use brokk_bifrost::Language;
+use common::{InlineTestProject, definition_reference_status, sorted_source_paths, symbol_sources};
 
 /// The exact shape from the issue: a header declaration inside `namespace
 /// log4cxx { ... }` and an out-of-line `.cpp` definition that relies on

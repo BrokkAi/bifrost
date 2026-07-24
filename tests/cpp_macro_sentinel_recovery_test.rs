@@ -13,29 +13,10 @@
 
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
+use brokk_bifrost::Language;
 use common::usage_graph::{find_edge, usage_graph_at};
-use common::{BuiltInlineTestProject, InlineTestProject};
+use common::{BuiltInlineTestProject, InlineTestProject, call_tool, symbol_sources};
 use serde_json::Value;
-
-fn service(project: &BuiltInlineTestProject) -> SearchToolsService {
-    SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).expect("service")
-}
-
-fn call(project: &BuiltInlineTestProject, tool: &str, args: Value) -> Value {
-    let payload = service(project)
-        .call_tool_json(tool, &args.to_string())
-        .expect("tool call failed");
-    serde_json::from_str(&payload).expect("tool returned invalid JSON")
-}
-
-fn symbol_sources(project: &BuiltInlineTestProject, symbol: &str) -> Value {
-    call(
-        project,
-        "get_symbol_sources",
-        serde_json::json!({ "symbols": [symbol] }),
-    )
-}
 
 /// The single resolved source for `symbol`, asserting no not_found/ambiguous.
 fn unique_source<'a>(result: &'a Value, symbol: &str) -> &'a Value {
@@ -74,10 +55,10 @@ fn line_of(source: &str, needle: &str) -> usize {
 }
 
 fn scan_usages(project: &BuiltInlineTestProject, symbol: &str) -> Value {
-    call(
+    call_tool(
         project,
         "scan_usages_by_reference",
-        serde_json::json!({ "symbols": [symbol], "include_tests": true }),
+        &serde_json::json!({ "symbols": [symbol], "include_tests": true }).to_string(),
     )
 }
 
@@ -157,10 +138,10 @@ fn sentinel_wrapped_namespace_struct_method_recovers() {
     );
 
     // (c) The summary nests doWork under the Widget struct with the correct owner.
-    let summaries = call(
+    let summaries = call_tool(
         &project,
         "get_summaries",
-        serde_json::json!({ "targets": ["widget.cpp"] }),
+        &serde_json::json!({ "targets": ["widget.cpp"] }).to_string(),
     );
     let elements: Vec<&Value> = summaries["summaries"]
         .as_array()
@@ -312,10 +293,10 @@ END_WRAP
     }
 
     // No type-like element (class/struct/namespace) was fabricated for the file.
-    let summaries = call(
+    let summaries = call_tool(
         &project,
         "get_summaries",
-        serde_json::json!({ "targets": ["soup.cpp"] }),
+        &serde_json::json!({ "targets": ["soup.cpp"] }).to_string(),
     );
     let fabricated_types: Vec<&Value> = summaries["summaries"]
         .as_array()
@@ -434,10 +415,10 @@ fn fragmented_multi_base_export_class_recovers_scattered_members() {
     );
 
     // (d) The summary nests both scattered members and the nested class under Widget.
-    let summaries = call(
+    let summaries = call_tool(
         &project,
         "get_summaries",
-        serde_json::json!({ "targets": ["widget.h"] }),
+        &serde_json::json!({ "targets": ["widget.h"] }).to_string(),
     );
     let elements: Vec<&Value> = summaries["summaries"]
         .as_array()
@@ -481,10 +462,10 @@ public:
     let widget_source = unique_source(&widget, "Widget");
     assert_eq!("plain.h", widget_source["path"], "{widget}");
 
-    let summaries = call(
+    let summaries = call_tool(
         &project,
         "get_summaries",
-        serde_json::json!({ "targets": ["plain.h"] }),
+        &serde_json::json!({ "targets": ["plain.h"] }).to_string(),
     );
     let elements: Vec<&Value> = summaries["summaries"]
         .as_array()

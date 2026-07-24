@@ -7,28 +7,9 @@
 
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
-use common::{BuiltInlineTestProject, InlineTestProject};
+use brokk_bifrost::Language;
+use common::{BuiltInlineTestProject, InlineTestProject, call_tool, symbol_sources};
 use serde_json::Value;
-
-fn service(project: &BuiltInlineTestProject) -> SearchToolsService {
-    SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).expect("service")
-}
-
-fn call(project: &BuiltInlineTestProject, tool: &str, args: Value) -> Value {
-    let payload = service(project)
-        .call_tool_json(tool, &args.to_string())
-        .expect("tool call failed");
-    serde_json::from_str(&payload).expect("tool returned invalid JSON")
-}
-
-fn symbol_sources(project: &BuiltInlineTestProject, symbol: &str) -> Value {
-    call(
-        project,
-        "get_symbol_sources",
-        serde_json::json!({ "symbols": [symbol] }),
-    )
-}
 
 fn searched_symbols(result: &Value) -> Vec<String> {
     const BUCKETS: [&str; 5] = ["classes", "functions", "fields", "modules", "macros"];
@@ -46,10 +27,11 @@ fn searched_symbols(result: &Value) -> Vec<String> {
 }
 
 fn search(project: &BuiltInlineTestProject, pattern: &str) -> Vec<String> {
-    let result = call(
+    let result = call_tool(
         project,
         "search_symbols",
-        serde_json::json!({ "patterns": [pattern], "include_tests": true, "limit": 20 }),
+        &serde_json::json!({ "patterns": [pattern], "include_tests": true, "limit": 20 })
+            .to_string(),
     );
     searched_symbols(&result)
 }
@@ -237,12 +219,13 @@ pub fn caller() -> u32 {
         .and_then(|line| line.find("poll_proceed"))
         .expect("terminal column")
         + 1;
-    let resolved = call(
+    let resolved = call_tool(
         &project,
         "get_definitions_by_location",
-        serde_json::json!({
+        &serde_json::json!({
             "references": [{ "path": "src/lib.rs", "line": call_line, "column": column }]
-        }),
+        })
+        .to_string(),
     );
     let result = &resolved["results"][0];
     assert_eq!("resolved", result["status"], "{resolved}");

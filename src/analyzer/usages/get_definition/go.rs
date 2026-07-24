@@ -752,7 +752,7 @@ fn go_import_paths(
         .import_infos(go, file)
         .into_iter()
         .filter_map(|import| {
-            let local = import.alias.clone().or_else(|| import.identifier.clone())?;
+            let local = import.local_name()?.to_string();
             if local == "_" {
                 return None;
             }
@@ -772,17 +772,12 @@ fn go_structured_import_path(
     {
         return None;
     }
-    let mut rendered = String::new();
     for segment in &path.segments {
         if !support.scope_step() || segment.is_empty() {
             return None;
         }
-        if !rendered.is_empty() {
-            rendered.push('/');
-        }
-        rendered.push_str(segment);
     }
-    Some(rendered)
+    Some(path.render_segments("/"))
 }
 
 fn go_import_path_is_workspace(support: &dyn GoDefinitionProvider, import_path: &str) -> bool {

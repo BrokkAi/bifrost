@@ -2344,6 +2344,17 @@ pub struct StructuredImportPath {
     pub declaration_start_byte: usize,
 }
 
+impl StructuredImportPath {
+    /// Render all path segments joined by `separator`. Shared by adapters
+    /// that reimplement plain segment-joining over this model, e.g. go's
+    /// `/`-joined package path and scala's `.`-joined qualified names. Only
+    /// a drop-in replacement for call sites that join the *whole* segment
+    /// list; slicing/prefix joins over a subset of segments stay bespoke.
+    pub fn render_segments(&self, separator: &str) -> String {
+        self.segments.join(separator)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StructuredImportPathKind {
     Namespace,
@@ -2367,6 +2378,32 @@ pub struct ImportInfo {
     /// from `raw_snippet`.
     #[serde(default)]
     pub path: Option<StructuredImportPath>,
+}
+
+impl ImportInfo {
+    /// The name this import binds in the importing scope: the explicit
+    /// `alias` if the language recorded one, otherwise the parsed
+    /// `identifier`, otherwise the tail (last segment) of the structured
+    /// import path when the parser recorded one and neither of the above is
+    /// present.
+    ///
+    /// This is the common `alias ?? identifier ?? tail-of-path` desugar shape
+    /// shared by several language adapters. It is intentionally narrow: a
+    /// site should only switch to it when its own fallback order and
+    /// tail-of-path semantics agree with this one exactly (some languages
+    /// normalize separators, split on a different delimiter, or fall back to
+    /// something other than the last path segment — those stay bespoke).
+    pub fn local_name(&self) -> Option<&str> {
+        self.alias
+            .as_deref()
+            .or(self.identifier.as_deref())
+            .or_else(|| {
+                self.path
+                    .as_ref()
+                    .and_then(|path| path.segments.last())
+                    .map(String::as_str)
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

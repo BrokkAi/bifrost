@@ -2312,12 +2312,7 @@ fn build_module_alias_routes(
                 if import.info.is_wildcard {
                     continue;
                 }
-                let Some(local_name) = import
-                    .info
-                    .alias
-                    .as_ref()
-                    .or(import.info.identifier.as_ref())
-                else {
+                let Some(local_name) = import.info.local_name() else {
                     continue;
                 };
                 let Some(domain) =
@@ -2326,7 +2321,7 @@ fn build_module_alias_routes(
                     continue;
                 };
                 let alias_package = if owner.is_empty() {
-                    local_name.clone()
+                    local_name.to_string()
                 } else {
                     format!("{owner}.{local_name}")
                 };
@@ -2398,12 +2393,7 @@ fn build_importer_reverse(
             else {
                 continue;
             };
-            let local_name = import
-                .info
-                .alias
-                .clone()
-                .or_else(|| import.info.identifier.clone())
-                .unwrap_or_default();
+            let local_name = import.info.local_name().unwrap_or_default().to_string();
             if import.info.is_wildcard {
                 for resolved in
                     module_aliases.resolve_segments(module_files, file, &owner, &import.path)

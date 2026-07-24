@@ -268,12 +268,7 @@ impl RustAnalyzer {
                     let Some(imported_name) = import.path.last().cloned() else {
                         continue;
                     };
-                    let Some(local_name) = import
-                        .info
-                        .alias
-                        .clone()
-                        .or_else(|| import.info.identifier.clone())
-                    else {
+                    let Some(local_name) = import.info.local_name().map(str::to_string) else {
                         continue;
                     };
                     let module_specifier = import.path[..import.path.len() - 1].join("::");
