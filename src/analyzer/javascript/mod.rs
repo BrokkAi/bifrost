@@ -20,7 +20,12 @@ use crate::analyzer::js_ts::imports::{
     import_info_tokens, parse_commonjs_require_import_infos_from_node,
     parse_es_import_infos_from_node, resolve_js_ts_import_paths,
 };
-use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
+use crate::analyzer::js_ts::model::{
+    add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
+    collect_function_nodes, file_scoped_field_name, module_code_unit,
+    module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
+    this_member_property, trim_statement, variable_header,
+};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::js_ts::{
     contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
@@ -687,7 +692,7 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit).or_else(|| {
-            js_module_scoped_field_uses_file_name(code_unit)
+            module_scoped_field_uses_file_name(code_unit)
                 .then(|| self.inner.top_level_file_scope_parent_of(code_unit))
                 .flatten()
         })
@@ -973,7 +978,7 @@ fn visit_js_default_export_value(
             visit_js_default_export_class(file, source, export, value, parsed);
         }
         "object" => {
-            let code_unit = add_js_default_export_unit(
+            let code_unit = add_default_export_unit(
                 file,
                 source,
                 export,
@@ -996,7 +1001,7 @@ fn visit_js_default_export_function(
     function: Node<'_>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> CodeUnit {
-    let code_unit = add_js_default_export_unit(
+    let code_unit = add_default_export_unit(
         file,
         source,
         export,
@@ -1021,7 +1026,7 @@ fn visit_js_default_export_class(
     class: Node<'_>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> CodeUnit {
-    let code_unit = add_js_default_export_unit(
+    let code_unit = add_default_export_unit(
         file,
         source,
         export,
@@ -1037,24 +1042,6 @@ fn visit_js_default_export_class(
         parsed.set_raw_supertypes(code_unit.clone(), supertypes);
     }
     visit_js_class_body(file, source, class, &code_unit, &code_unit, parsed);
-    code_unit
-}
-
-fn add_js_default_export_unit(
-    file: &ProjectFile,
-    source: &str,
-    export: Node<'_>,
-    kind: crate::analyzer::CodeUnitType,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> CodeUnit {
-    let code_unit = CodeUnit::new(file.clone(), kind, "", "default");
-    parsed.add_code_unit(
-        code_unit.clone(),
-        export,
-        source,
-        None,
-        Some(code_unit.clone()),
-    );
     code_unit
 }
 
@@ -1246,9 +1233,9 @@ fn visit_js_constructor_assigned_fields(
         }
         if node.kind() == "assignment_expression"
             && let Some(left) = node.child_by_field_name("left")
-            && let Some(property) = js_this_member_property(left, source)
+            && let Some(property) = this_member_property(left, source)
         {
-            let Some(name) = js_property_name_text(property, source) else {
+            let Some(name) = property_name_text(property, source) else {
                 continue;
             };
             let code_unit = CodeUnit::new(
@@ -1272,40 +1259,6 @@ fn visit_js_constructor_assigned_fields(
                 stack.push(child);
             }
         }
-    }
-}
-
-fn js_this_member_property<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    if node.kind() != "member_expression" {
-        return None;
-    }
-    let object = node.child_by_field_name("object")?;
-    if object.kind() != "this" {
-        return None;
-    }
-    let property = node.child_by_field_name("property")?;
-    js_property_name_text(property, source)
-        .is_some()
-        .then_some(property)
-}
-
-fn js_property_name_text(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier"
-        | "property_identifier"
-        | "shorthand_property_identifier"
-        | "shorthand_property_identifier_pattern" => {
-            let text = node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        "string" => {
-            let text = node_text(node, source)
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        _ => None,
     }
 }
 
@@ -1385,7 +1338,7 @@ fn visit_js_variable_statement(
             if let Some(parent) = parent {
                 format!("{}.{}", parent.short_name(), name)
             } else {
-                js_file_scoped_field_name(file, name)
+                file_scoped_field_name(file, name)
             }
         } else {
             parent
@@ -1458,32 +1411,6 @@ fn visit_js_variable_statement(
             }
         }
     }
-}
-
-fn js_file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
-    format!(
-        "{}.{}",
-        file.rel_path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("module"),
-        name
-    )
-}
-
-fn js_module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
-    if !code_unit.is_field() {
-        return false;
-    }
-    let Some(file_name) = code_unit
-        .source()
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        return false;
-    };
-    code_unit.short_name().starts_with(&format!("{file_name}."))
 }
 
 fn visit_js_object_literal_properties(
@@ -1735,7 +1662,7 @@ fn js_call_preserves_object_argument_shape(
     match js_call_object_argument_shape_preservation(call, source, argument_index) {
         JsShapePreservation::Preserves => true,
         JsShapePreservation::DoesNotPreserve => false,
-        JsShapePreservation::Unknown => js_call_has_likely_surface_factory_name(call, source),
+        JsShapePreservation::Unknown => call_has_likely_surface_factory_name(call, source),
     }
 }
 
@@ -1751,32 +1678,10 @@ fn js_call_object_argument_shape_preservation(
     source: &str,
     argument_index: usize,
 ) -> JsShapePreservation {
-    let Some(callee_name) = js_call_identifier_name(call, source) else {
+    let Some(callee_name) = call_identifier_name(call, source) else {
         return JsShapePreservation::Unknown;
     };
     js_source_function_preserves_parameter_shape(call, source, &callee_name, argument_index)
-}
-
-fn js_call_has_likely_surface_factory_name(call: Node<'_>, source: &str) -> bool {
-    let Some(function) = call.child_by_field_name("function") else {
-        return false;
-    };
-    let name = match function.kind() {
-        "identifier" | "property_identifier" => node_text(function, source).trim(),
-        "member_expression" => function
-            .child_by_field_name("property")
-            .map(|property| node_text(property, source).trim())
-            .unwrap_or(""),
-        _ => "",
-    };
-    name == "define" || name.starts_with("define") || name == "object"
-}
-
-fn js_call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
-    let function = call.child_by_field_name("function")?;
-    matches!(function.kind(), "identifier" | "property_identifier")
-        .then(|| node_text(function, source).trim().to_string())
-        .filter(|name| !name.is_empty())
 }
 
 fn js_source_function_preserves_parameter_shape(
@@ -1785,9 +1690,9 @@ fn js_source_function_preserves_parameter_shape(
     function_name: &str,
     parameter_index: usize,
 ) -> JsShapePreservation {
-    let root = js_root_node(anchor);
+    let root = root_node(anchor);
     let mut functions = Vec::new();
-    js_collect_function_nodes(root, source, function_name, &mut functions);
+    collect_function_nodes(root, source, function_name, &mut functions);
     if functions.is_empty() {
         return JsShapePreservation::Unknown;
     }
@@ -1798,42 +1703,6 @@ fn js_source_function_preserves_parameter_shape(
     } else {
         JsShapePreservation::DoesNotPreserve
     }
-}
-
-fn js_root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
-}
-
-fn js_collect_function_nodes<'tree>(
-    node: Node<'tree>,
-    source: &str,
-    function_name: &str,
-    out: &mut Vec<Node<'tree>>,
-) {
-    walk_named_tree_preorder(node, true, |node| {
-        if node.kind() == "function_declaration"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).trim() == function_name)
-        {
-            out.push(node);
-            return WalkControl::SkipChildren;
-        }
-        if node.kind() == "variable_declarator"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).trim() == function_name)
-            && let Some(value) = node.child_by_field_name("value")
-            && matches!(value.kind(), "arrow_function" | "function_expression")
-        {
-            out.push(value);
-            return WalkControl::SkipChildren;
-        }
-        WalkControl::Continue
-    });
 }
 
 fn js_function_node_preserves_parameter_shape(
@@ -2778,7 +2647,7 @@ fn js_variable_signature(
     source: &str,
     exported: bool,
 ) -> String {
-    let header = js_variable_header(statement, declarator, source, exported);
+    let header = variable_header(statement, declarator, source, exported);
     match declarator.child_by_field_name("value") {
         Some(value) if is_simple_js_initializer(value) => {
             let value_text = trim_statement(node_text(value, source));
@@ -2786,26 +2655,6 @@ fn js_variable_signature(
         }
         _ => header,
     }
-}
-
-fn js_variable_header(
-    statement: Node<'_>,
-    declarator: Node<'_>,
-    source: &str,
-    exported: bool,
-) -> String {
-    let keyword = statement
-        .child(0)
-        .map(|node| node_text(node, source).trim().to_string())
-        .unwrap_or_else(|| "const".to_string());
-    let declarator_text = trim_statement(node_text(declarator, source));
-    let left = declarator_text
-        .split('=')
-        .next()
-        .map(trim_statement)
-        .unwrap_or(declarator_text);
-    let export_prefix = if exported { "export " } else { "" };
-    format!("{export_prefix}{keyword} {left}")
 }
 
 fn is_simple_js_initializer(node: Node<'_>) -> bool {

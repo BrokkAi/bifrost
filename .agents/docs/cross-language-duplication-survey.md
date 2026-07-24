@@ -292,8 +292,20 @@ call_tool/symbol_sources/definition_reference_status (~14 bodies).
   medium-payoff" writeup for the full mass-per-hole arithmetic. A real (unrelated)
   Go dot-import keying bug in the existing shared-core usage was found and fixed
   in the same pass.
-- javascript/typescript twin adapters (3.4k tokens; twin-ness may be the honest
-  expression — needs the mass-per-hole arithmetic).
+- javascript/typescript twin adapters — RESOLVED: PARTIAL EXTRACT (2026-07-24).
+  ~10 byte-identical free functions moved verbatim to js_ts::model (their
+  established shared home). Leave as copies: everything driven by real grammar
+  asymmetry (TS types/interfaces/enums/namespaces ~325 LOC; JS CommonJS
+  assignment engine ~400 LOC + mutation-comment/JSX heuristics ~90 LOC) — a
+  Dialect-parameterized single adapter fails mass-per-hole. Judge separately
+  later: ImportAnalysisProvider/TypeHierarchyProvider/jsts_usage_index
+  (~800 LOC/side, same-shape, already Language-parameterized at call sites;
+  blocked on reconciling JsMemoCaches vs TS's flat cache fields). Churn
+  evidence: ~27 of ~46 commits touched both files together, AND live
+  one-directional drift found by reading (filed as an issue): TS missing JS's
+  "regex" simple-initializer case; TS classifies `const x = function(){}` as
+  Field where JS says Function; TS's zod/schema-builder detection never
+  backported to JS.
 
 **Explicitly leave as copies (divergence is the design):** scala/cpp/ruby import
 models; AST-walk owner queries (impl targets, out-of-line owners, bounded
