@@ -163,14 +163,12 @@ fn every_display_spelling_resolves_to_the_same_declaration_pair() {
         statuses.iter().all(|status| status == &statuses[0]),
         "status drift across display spellings of the same member: {statuses:?}"
     );
-    // The uniform status is currently `no_definition`, not `resolved`: a bare
-    // call to a global free function from an out-of-line member defined at
-    // file scope under a using-directive does not resolve at the call site --
-    // a separate, pre-existing lexical-resolution gap (reachable before this
-    // fix via the def-unit spelling, per the issue ledger's own
-    // `no_definition` row) tracked as #1120. Flip this expectation to
-    // `resolved` when #1120 is fixed.
-    assert_eq!(statuses[0], "no_definition", "statuses: {statuses:?}");
+    // The uniform status is `resolved`: a bare call to a global free function
+    // from an out-of-line member defined at file scope under a using-directive
+    // now resolves at the call site (#1120 fixed -- the member's true
+    // enclosing scope is recovered from its indexed definition, so unqualified
+    // lookup reaches the global namespace where `doFormat` is declared).
+    assert_eq!(statuses[0], "resolved", "statuses: {statuses:?}");
 }
 
 /// Negative control: a spelling naming the *wrong* owner must still fail

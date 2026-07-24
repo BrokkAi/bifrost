@@ -3100,7 +3100,21 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
                     relative
                 };
             }
-            LexicalTypeResolution::Missing => return LexicalScopeResolution::Missing,
+            LexicalTypeResolution::Missing => {
+                // Structural lexical resolution cannot see an owner class that
+                // is reachable only through an in-scope `using namespace`
+                // directive, so it would otherwise hard-fail here. The indexed
+                // definition already carries the true fully-qualified owner
+                // (its package reflects the directive), so recover the real
+                // enclosing scope from the analyzer graph -- exactly the scope
+                // chain real C++ unqualified lookup traverses. Only the strict
+                // callers reach this arm; the best-effort callers above keep
+                // their existing structural guess (and its query profile).
+                match indexed_enclosing_owner_scope(analyzer, file, node) {
+                    Some(indexed) => scope = indexed,
+                    None => return LexicalScopeResolution::Missing,
+                }
+            }
         }
     }
 
@@ -3156,6 +3170,47 @@ fn indexed_enclosing_class_components(
         return None;
     }
     Some(classes)
+}
+
+/// Recover the enclosing member's true lexical scope from the *indexed*
+/// definition when structural resolution cannot see the owner class.
+///
+/// An out-of-line member defined at file scope (`int HTMLLayout::method()
+/// {...}`) whose owner class is reachable only through an in-scope `using
+/// namespace X;` directive cannot be resolved by `resolve_type_components_
+/// lexically`, which walks structural lexical tiers and never consults
+/// using-directives. The definition itself, however, is indexed with its true
+/// fully-qualified identity (its package already reflects the directive), so
+/// the analyzer graph knows the real owner. Walk from the reference's indexed
+/// enclosing code unit up to the innermost enclosing class and return that
+/// class's fully-qualified scope components (e.g. `["log4cxx", "HTMLLayout"]`)
+/// -- exactly the scope chain C++ unqualified lookup traverses.
+fn indexed_enclosing_owner_scope(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Option<Vec<String>> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = analyzer.enclosing_code_unit(file, &range)?;
+    loop {
+        let is_alias = analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(&current));
+        if current.is_class() && !is_alias {
+            return Some(
+                cpp_name_for(&current)
+                    .split("::")
+                    .map(String::from)
+                    .collect(),
+            );
+        }
+        current = analyzer.parent_of(&current)?;
+    }
 }
 
 pub(in crate::analyzer::usages) fn resolve_type_node_lexically(
