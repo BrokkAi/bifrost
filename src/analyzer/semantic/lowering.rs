@@ -9,7 +9,9 @@ use crate::analyzer::lexical_definitions::FormalVariadicKind;
 use crate::hash::HashMap;
 use tree_sitter::Node;
 
-use super::cfg::{DriveError, ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
+use super::cfg::{
+    CleanupRegionId, CompletionRoute, DriveError, ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
+};
 use super::{
     AllocationId, AllocationKind, AllocationSite, ArgumentDomain, AsyncResumeKind,
     CallContinuationKind, CallSiteId, CallableTargetResolution, CancellationToken, CaptureBinding,
@@ -355,6 +357,85 @@ pub(crate) fn schedule_conditional_choice<T, W>(
 pub(crate) enum ShortCircuitKind {
     And,
     Or,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CleanupSpecialization<R> {
+    pub(crate) region: R,
+    pub(crate) entry: ProgramPointId,
+    pub(crate) next: ControlTarget,
+}
+
+pub(crate) struct CleanupRoutePlan<R> {
+    pub(crate) target: ControlTarget,
+    pub(crate) created: Vec<CleanupSpecialization<R>>,
+}
+
+/// Allocate or reuse the cleanup-specialized entries for one completion route.
+///
+/// Region lookup and source-node selection are adapter-owned. The shared plan
+/// preserves the destination edge kind and reports only newly allocated steps
+/// for adapter-specific body or opaque-boundary scheduling.
+pub(crate) fn plan_cleanup_route<'tree, R>(
+    builder: &mut ProcedureCfgBuilder,
+    session: &mut ProcedureLoweringSession<'_>,
+    route: &CompletionRoute,
+    regions: &[R],
+    region_id: impl Fn(R) -> CleanupRegionId,
+    source_node: impl Fn(R) -> Node<'tree>,
+) -> Result<CleanupRoutePlan<R>, ProcedureLoweringError>
+where
+    R: Copy,
+{
+    let destination = ControlTarget {
+        point: route.destination().target(),
+        kind: route.destination().edge_kind(),
+    };
+    if route.cleanups().is_empty() {
+        return Ok(CleanupRoutePlan {
+            target: destination,
+            created: Vec::new(),
+        });
+    }
+
+    let mut next = destination;
+    let mut first = None;
+    let mut created_steps = Vec::new();
+    for index in (0..route.cleanups().len()).rev() {
+        let expected = route.cleanups()[index];
+        let region = regions
+            .iter()
+            .copied()
+            .find(|region| region_id(*region) == expected)
+            .ok_or_else(|| ProcedureLoweringError::Invalid("missing cleanup region".into()))?;
+        let metadata = session.add_node_mapping(builder, source_node(region))?;
+        let (entry, created) =
+            builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
+        if created {
+            session.register_point(
+                entry,
+                metadata,
+                "cleanup specialization broke dense point allocation",
+            )?;
+            created_steps.push(CleanupSpecialization {
+                region,
+                entry,
+                next,
+            });
+        }
+        next = ControlTarget {
+            point: entry,
+            kind: ControlEdgeKind::Cleanup,
+        };
+        first = Some(entry);
+    }
+    Ok(CleanupRoutePlan {
+        target: ControlTarget {
+            point: first.expect("route with cleanup regions has an entry"),
+            kind: ControlEdgeKind::Cleanup,
+        },
+        created: created_steps,
+    })
 }
 
 /// Schedule a boolean short-circuit pair after the adapter has identified its
@@ -720,6 +801,17 @@ impl<'a> ProcedureLoweringSession<'a> {
         self.next_source += 1;
         self.next_evidence += 1;
         Ok(PointMetadata { source, evidence })
+    }
+
+    pub(crate) fn add_node_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+    ) -> Result<PointMetadata, ProcedureLoweringError> {
+        let range = node.byte_range();
+        let occurrence = self.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(ProcedureLoweringError::Invalid)?;
+        self.add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
     pub(crate) fn add_point(

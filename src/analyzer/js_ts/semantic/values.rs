@@ -249,11 +249,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, TsLoweringError> {
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(TsLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.session.add_node_mapping(builder, node)
     }
 
     fn value_mapping(

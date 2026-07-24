@@ -3539,66 +3539,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
-        if route.cleanups().is_empty() {
-            return self.edge(
-                builder,
-                from,
-                EdgeTarget {
-                    point: route.destination().target(),
-                    kind: route.destination().edge_kind(),
-                },
-            );
-        }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| PhpLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body)?;
-            let (cleanup_entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    cleanup_entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                let statement_next = if next.kind == ControlEdgeKind::Normal {
-                    next
-                } else {
-                    let relay = self.point(builder, region.body, Vec::new())?;
-                    self.edge(builder, relay, next)?;
-                    EdgeTarget::normal(relay)
-                };
-                stack.push(Work::Statement {
-                    node: region.body,
-                    entry: cleanup_entry,
-                    next: statement_next,
-                    scope: region.outer_scope,
-                });
-            }
-            next = EdgeTarget {
-                point: cleanup_entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(cleanup_entry);
-        }
-        self.edge(
+        let plan = plan_cleanup_route(
             builder,
-            from,
-            EdgeTarget {
-                point: first.expect("route has cleanups"),
-                kind: ControlEdgeKind::Cleanup,
-            },
-        )
+            &mut self.session,
+            route,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )?;
+        for step in plan.created {
+            let statement_next = if step.next.kind == ControlEdgeKind::Normal {
+                step.next
+            } else {
+                let relay = self.point(builder, step.region.body, Vec::new())?;
+                self.edge(builder, relay, step.next)?;
+                EdgeTarget::normal(relay)
+            };
+            stack.push(Work::Statement {
+                node: step.region.body,
+                entry: step.entry,
+                next: statement_next,
+                scope: step.region.outer_scope,
+            });
+        }
+        self.edge(builder, from, plan.target)
     }
 
     fn resolution_gaps(
@@ -3635,11 +3599,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, PhpLoweringError> {
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(PhpLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.session.add_node_mapping(builder, node)
     }
 
     fn value_mapping(

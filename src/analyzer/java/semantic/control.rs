@@ -2108,108 +2108,72 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        if route.cleanups().is_empty() {
-            return self.edge(
-                builder,
-                from,
-                EdgeTarget {
-                    point: route.destination().target(),
-                    kind: route.destination().edge_kind(),
-                },
-            );
-        }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| JavaLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body.source_node())?;
-            let (entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                match region.body {
-                    CleanupBody::Statement(body) => {
-                        let statement_next = if next.kind == ControlEdgeKind::Normal {
-                            next
-                        } else {
-                            let relay = self.point(builder, body, Vec::new())?;
-                            self.edge(builder, relay, next)?;
-                            EdgeTarget::normal(relay)
-                        };
-                        stack.push(Work::Statement {
-                            node: body,
-                            entry,
-                            next: statement_next,
-                            scope: region.outer_scope,
-                        });
-                    }
-                    CleanupBody::OpaqueResource(_) => {
-                        self.add_gap(
+        let plan = plan_cleanup_route(
+            builder,
+            &mut self.session,
+            route,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body.source_node(),
+        )?;
+        for step in plan.created {
+            match step.region.body {
+                CleanupBody::Statement(body) => {
+                    let statement_next = if step.next.kind == ControlEdgeKind::Normal {
+                        step.next
+                    } else {
+                        let relay = self.point(builder, body, Vec::new())?;
+                        self.edge(builder, relay, step.next)?;
+                        EdgeTarget::normal(relay)
+                    };
+                    stack.push(Work::Statement {
+                        node: body,
+                        entry: step.entry,
+                        next: statement_next,
+                        scope: step.region.outer_scope,
+                    });
+                }
+                CleanupBody::OpaqueResource(_) => {
+                    self.add_gap(
+                        builder,
+                        step.entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ResourceManagement,
+                        SemanticGapKind::Unsupported,
+                        "resource close order, suppression, and value effects are not yet lowered",
+                    )?;
+                    self.add_gap(
+                        builder,
+                        step.entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unsupported,
+                        "resource close can raise or suppress exceptions not yet represented",
+                    )?;
+                    self.edge(builder, step.entry, step.next)?;
+                }
+                CleanupBody::OpaqueMonitor(_) => {
+                    self.add_gap(
                             builder,
-                            entry,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::ResourceManagement,
-                            SemanticGapKind::Unsupported,
-                            "resource close order, suppression, and value effects are not yet lowered",
-                        )?;
-                        self.add_gap(
-                            builder,
-                            entry,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::ExceptionalControlFlow,
-                            SemanticGapKind::Unsupported,
-                            "resource close can raise or suppress exceptions not yet represented",
-                        )?;
-                        self.edge(builder, entry, next)?;
-                    }
-                    CleanupBody::OpaqueMonitor(_) => {
-                        self.add_gap(
-                            builder,
-                            entry,
+                            step.entry,
                             SemanticGapSubject::Point,
                             SemanticCapability::CleanupControlFlow,
                             SemanticGapKind::Unsupported,
                             "monitor release effects are represented only as an opaque cleanup boundary",
                         )?;
-                        self.add_gap(
-                            builder,
-                            entry,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::ExceptionalControlFlow,
-                            SemanticGapKind::Unsupported,
-                            "monitor release failure behavior is not yet represented",
-                        )?;
-                        self.edge(builder, entry, next)?;
-                    }
+                    self.add_gap(
+                        builder,
+                        step.entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unsupported,
+                        "monitor release failure behavior is not yet represented",
+                    )?;
+                    self.edge(builder, step.entry, step.next)?;
                 }
             }
-            next = EdgeTarget {
-                point: entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(entry);
         }
-        self.edge(
-            builder,
-            from,
-            EdgeTarget {
-                point: first.expect("route has cleanups"),
-                kind: ControlEdgeKind::Cleanup,
-            },
-        )
+        self.edge(builder, from, plan.target)
     }
 
     fn edge(

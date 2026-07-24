@@ -4171,51 +4171,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<EdgeTarget, RubyLoweringError> {
-        if route.cleanups().is_empty() {
-            return Ok(EdgeTarget {
-                point: route.destination().target(),
-                kind: route.destination().edge_kind(),
+        let plan = plan_cleanup_route(
+            builder,
+            &mut self.session,
+            route,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )?;
+        for step in plan.created {
+            stack.push(Work::Statement {
+                node: step.region.body,
+                entry: step.entry,
+                next: step.next,
+                scope: step.region.outer_scope,
             });
         }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| RubyLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body)?;
-            let (cleanup_entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    cleanup_entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                stack.push(Work::Statement {
-                    node: region.body,
-                    entry: cleanup_entry,
-                    next,
-                    scope: region.outer_scope,
-                });
-            }
-            next = EdgeTarget {
-                point: cleanup_entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(cleanup_entry);
-        }
-        Ok(EdgeTarget {
-            point: first.expect("route with cleanup regions has an entry"),
-            kind: ControlEdgeKind::Cleanup,
-        })
+        Ok(plan.target)
     }
 
     fn resolution_gaps(
@@ -4300,10 +4272,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, RubyLoweringError> {
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(RubyLoweringError::Invalid)?;
-        self.add_mapping(builder, anchor)
+        self.session.add_node_mapping(builder, node)
     }
 
     fn value_mapping(

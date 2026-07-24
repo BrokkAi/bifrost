@@ -18,7 +18,7 @@ After this change, every language will still own syntax recognition, evaluation 
 - [x] (2026-07-24 17:48Z) Milestone 1: introduced the shared procedure-inventory builder, migrated all ten adapters, corrected C++ identity double-counting, and added cross-language budget parity tests.
 - [x] (2026-07-24 18:19Z) Milestone 2: finished the syntax-free lowering kernel by sharing control targets, value interning, callable-resolution gaps, iterative-driver completion, and the identical await core.
 - [x] (2026-07-24 18:47Z) Milestone 3: extracted small structured-control combinators for conditional choices, short-circuit conditions, and C-style loops while leaving AST classification in language adapters.
-- [ ] Milestone 4: extract cleanup-route specialization and then migrate only the compatible try/finally implementations.
+- [x] (2026-07-24 19:10Z) Milestone 4: extracted cleanup-route specialization and migrated the compatible try/finally implementations.
 - [ ] Milestone 5: centralize duplicated data-flow outcome status, deterministic ordering, and cancellation-atomic budget staging without merging the distinct solver engines.
 - [ ] Milestone 6: run formatting, focused and full feature-enabled tests, clippy, CPD remeasurement, adversarial review, and publish a draft pull request.
 
@@ -68,6 +68,8 @@ Milestone 1 removed 533 net lines across the language inventories while preservi
 Milestone 2 removed another 481 net lines by moving four syntax-free invariants into `semantic::lowering`: control destinations, the iterative drive/seal/freeze lifecycle, cached semantic-value retention, and paired callable-resolution gaps. The common await helper owns only suspend/resume points, values, events, and edges; operand discovery, exceptional cleanup routing, and Rust executor uncertainty remain language-owned. Twelve focused lowering unit tests, all 137 semantic language conformance tests, and all 41 semantic CFG contract tests pass.
 
 Milestone 3 moved 335 repeated adapter lines behind typed scheduling combinators. C#, Java, and JavaScript/TypeScript now share conditional-choice and boolean short-circuit scheduling; C# and Java also share the complete C-style loop scope and work-stack topology while retaining their distinct field names and initializer classification. The shared implementation is deliberately explicit rather than macro-generated, so this architectural layer adds a small amount of net source while replacing the largest cross-language control clone with one reviewable invariant. The full semantic conformance and CFG contract suites pass.
+
+Milestone 4 centralizes cleanup-region lookup, specialization allocation, dense point registration, destination-edge preservation, and route entry selection. C#, Java, JavaScript/TypeScript, PHP, Python, Ruby, and Scala now consume the shared route plan but retain their distinct executable-body, relay, resource, monitor, fixed-region, and diagnostic behavior. The same pass consolidated exact source-node mapping across all ten adapters. This milestone removes about 190 net lines; focused normal/exceptional cleanup relay and language try/finally/ensure tests pass.
 
 ## Context and Orientation
 
@@ -211,4 +213,4 @@ In `src/analyzer/semantic/lowering.rs` or `src/analyzer/semantic/control_lowerin
 
 In `src/analyzer/dataflow`, define one semantic outcome status implementation and one cancellation-atomic staging operation on `DataflowRequest`. No new external crate dependencies are expected.
 
-Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 3 to record completed shared kernels, bounded topology extraction, regression coverage, and the host-specific Python extension link failure observed during all-feature validation.
+Plan revision note: created on 2026-07-24 after refreshing master and revalidating the issue diagnosis. The plan orders the inventory correction first because duplicated work accounting has already diverged, then proceeds from low-level shared lowering mechanics to higher-risk topology extraction. Updated after Milestones 1 through 4 to record completed shared kernels, bounded topology and cleanup extraction, regression coverage, and the host-specific Python extension link failure observed during all-feature validation.
