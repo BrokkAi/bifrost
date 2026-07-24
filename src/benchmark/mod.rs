@@ -1,3 +1,4 @@
+pub mod artifact_lifecycle;
 mod artifact_path;
 pub mod manifest;
 mod mcp_iteration;
@@ -8,6 +9,11 @@ pub mod report;
 pub mod runner;
 pub mod subset_workspace;
 
+pub use artifact_lifecycle::{
+    ArtifactPromotionEvaluation, ArtifactPromotionGateStatus, ArtifactPromotionInputError,
+    ArtifactPromotionInputKind, ArtifactPromotionMeasurement, ArtifactPromotionThresholds,
+    evaluate_artifact_promotion,
+};
 pub use manifest::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
     DefinitionQueryTarget, HierarchyQueryTarget, ManifestLanguage, ManifestLoadError,

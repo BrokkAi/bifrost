@@ -16,8 +16,8 @@ The observable outcome is a retained benchmark report over generated projects, i
 
 - [x] (2026-07-24 07:41Z) Verified the clean existing #817 branch, fetched `origin`, and fast-forwarded it from `7748331e` to current `origin/master` at `71b3d3f8`.
 - [x] (2026-07-24 07:41Z) Re-read `.agents/PLANS.md`, the live issue, the semantic roadmap, the completed CFG/ICFG and oracle lifecycle evidence, the structural snapshot implementation, and the first bounded #820 solver child.
-- [ ] Publish the artifact lifecycle matrix and checkpoint this plan.
-- [ ] Add the reusable artifact-promotion benchmark API and migrate the semantic CFG persistence gate.
+- [x] (2026-07-24 07:44Z) Published the artifact lifecycle matrix and checkpointed the plan in `b1aeef86`.
+- [x] (2026-07-24 07:49Z) Added the reusable artifact-promotion benchmark API, migrated the semantic CFG persistence gate without changing its report shape, and passed focused unit and integration tests.
 - [ ] Add the fresh-process data-flow lifecycle benchmark and runner.
 - [ ] Run the retained matrix, record the evidence and decision, and complete focused and repository-wide validation.
 - [ ] Run specialist review, resolve findings, update the retrospective, and checkpoint the reviewed result.
