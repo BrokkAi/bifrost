@@ -51,9 +51,9 @@ the analyzer tree.
       recorded in Surprises & Discoveries.
 - [ ] M1: dual representation — emission points populate `FqName` alongside the
       legacy strings, with an equivalence check (per language; check off individually).
-  - [x] rust (2026-07-24)  - [x] cpp (2026-07-24)  - [ ] java  - [ ] python
-  - [x] go (2026-07-24)  - [ ] php  - [ ] ruby  - [x] scala (2026-07-24)
-  - [ ] csharp  - [ ] javascript  - [ ] typescript
+  - [x] rust (2026-07-24)  - [x] cpp (2026-07-24)  - [x] python (2026-07-24)
+  - [x] go (2026-07-24)  - [x] php (2026-07-24)  - [x] ruby (2026-07-24)
+  - [x] scala (2026-07-24)  - [ ] java  - [ ] csharp  - [ ] javascript  - [ ] typescript
 - [ ] M2: shared services and selectors consume `FqName`; input parsing produces it.
 - [ ] M3: persistence flip — store schema carries segments; single epoch salt bump.
 - [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip.
@@ -126,6 +126,90 @@ the analyzer tree.
   (a module scope), which round-trips identically; its precise kind only matters
   once M2 walks owner chains, and can be revisited there without affecting the M1
   string equivalence.
+
+- Observation (python's `$` is NOT Scala-only): Python's legacy `short_name`
+  join is not uniformly `.`-composed. `visit_class_definition` /
+  `visit_function_definition` in `src/analyzer/python/declarations.rs` join a
+  NESTED class onto ANY parent scope (Class or Function) with a literal `$`
+  (`format!("{}${name}", parent.path)`), while a method/field owned directly by
+  a class joins with `.`. Evidence from `tests/python_analyzer_test.rs`:
+  `nested_local_classes.outer_function$OuterLocal$InnerLocal$DeepLocal` (four
+  `$`-joined class levels hanging off a function) and
+  `...$InnerLocal.inner_method` (a `.`-joined method on that same nested
+  class). The plan's working assumption that python/ruby/php "don't have a
+  Companion spelling" undercounted this: the existing `Companion` rendering
+  rule (`if cur == Companion return "$"`, unconditional on the previous
+  segment's kind) reproduces this exactly with ZERO changes to
+  `src/analyzer/fq_name.rs`'s `separator()` logic, once every `$`-preceded
+  segment is tagged `Companion` instead of `Type`/`Member`. See the Decision
+  Log entry below for the reconciliation.
+
+- Observation (ruby's whole type chain is `$`-joined, package_name is always
+  empty): `src/analyzer/ruby/declarations.rs`'s own doc comment already states
+  the convention: `package_name` is always `""`; nested namespaces/types join
+  in `short_name` with `$` (`new_segments.join("$")` in `visit_class_like`,
+  covering BOTH `module`/`class` declarations and multi-segment
+  `scope_resolution` names like `class A::B::C`), and a type's members are
+  appended after one final `.` (`member_short_name`). Since `package_name` is
+  empty the very first segment of every ruby `FqName` never gets a leading
+  separator regardless of its tag, so tagging EVERY namespace/type segment
+  `Companion` (not just nested ones, unlike python) reproduces the `$`-chain
+  exactly, including its first element.
+
+- Observation (php mirrors python's nested-type `$`, and reuses go's
+  `_module_` marker under a different literal): `src/analyzer/php/
+  declarations.rs`'s `visit_type_declaration` joins a nested type onto its
+  parent CLASS SCOPE (php has no function-nested types) with `$`
+  (`format!("{}${name}", parent.short_name())`), same `Companion` reconciliation
+  as python. Separately, `visit_const_declaration`'s module-level (no
+  `scope.class_unit`) branch emits `format!("_module_.{name}")` — a php-local
+  string literal `"_module_"`, distinct from (but textually identical to) Go's
+  `GO_MODULE_SCOPE_SEGMENT` constant in `src/analyzer/go/mod.rs`. Tagged it as
+  a `Package` segment, mirroring the go Decision Log entry above (a synthetic
+  module-scope marker, not a real type or member).
+
+- Observation (python's `package_name` field is the FULL module path, not just
+  the directory): `PythonAdapter::parse_file` (`src/analyzer/python/
+  adapter.rs`) passes `package_name: &module_fq` into `PythonVisitor`, where
+  `module_fq = python_module_name(file)` already includes the module's own
+  file-stem component (e.g. `mypkg.subpkg.mymodule`), not just the directory
+  prefix (`mypkg.subpkg`). Every python `CodeUnit`'s stored `package_name`
+  field is therefore this whole dotted path, and the declaration's own
+  name/segments are ADDED ON TOP of it in `short_name`. This matters for
+  fq-building: the "package prefix" helper must reconstruct the WHOLE
+  `module_fq`, not stop at the directory.
+
+- Observation (python/php package paths cannot contain a literal `.`/`\`
+  post-normalization, so splitting them is lossless): python module and
+  directory components are plain identifiers (Python syntax forbids a literal
+  `.` inside one); php's `determine_php_package_name` already replaces `\` with
+  `.` before storing `package_name`, and PHP identifiers cannot contain a
+  literal `.` either. Both languages therefore get a `python_module_fq` /
+  `php_package_fq` helper directly analogous to go's `go_package_fq` — split
+  the already-computed `package_name` string on `.` (or `/` for go) and intern
+  each component as one segment. This mirrors, rather than violates, the
+  landed go precedent and CLAUDE.md's "no mini string parsers" rule (which
+  targets replacing AST-derived structure with source-text splitting, not
+  re-tokenizing a delimiter-joined string this same code already built from
+  structured components).
+
+- Observation (mutation check, done once on python per the plan's M1
+  acceptance criterion): appending a bogus `Member` segment
+  `"BOGUS_MUTATION"` to a top-level python class's `fq` in
+  `visit_class_definition` made the `debug_assert_eq!` in
+  `CodeUnit::with_signature_and_fq` (`src/analyzer/model.rs:1890`) fail loudly
+  across `python_analyzer_test` before the mutation was reverted. Evidence:
+
+        thread panicked at src/analyzer/model.rs:1890:
+        assertion `left == right` failed: FqName does not round-trip to the legacy
+        qualified name (kind=Class, package_name="mypackage.packaged_functions", short_name="RegularClass")
+          left: "mypackage.packaged_functions.RegularClass.BOGUS_MUTATION"
+          right: "mypackage.packaged_functions.RegularClass"
+
+  Confirmed the same mutation trips the assertion identically across every
+  top-level class in the fixture corpus (six distinct panics from one test
+  run), then reverted; `cargo test --test python_analyzer_test` returned to
+  24/24 passing afterward.
 
 ## Decision Log
 
@@ -245,6 +329,87 @@ the analyzer tree.
   remain authoritative. The template-metadata `primary_fq_name` site keeps an
   empty-`fq` `CodeUnit::new` (it is a throwaway used only for its `.fq_name()`
   string, never indexed). Date/Author: 2026-07-24.
+- Decision (M1 python/ruby/php — `Companion` is reused for non-Scala `$`
+  spellings, not left unused): the task briefing for this wave assumed
+  "Companion only if the language has such a spelling — these three don't."
+  Empirically that is wrong for python and php (see the Surprises entries
+  above): both join a NESTED type onto ANY parent with a literal `$`, distinct
+  from the `.` used for a type's own direct members, and ruby joins its ENTIRE
+  namespace/type chain with `$`. Rather than add a new `SegmentKind` or teach
+  `src/analyzer/fq_name.rs`'s `separator()` a new (prev, cur) rule — which
+  would touch the same shared file the parallel rust/scala/cpp M1 agent is
+  also likely to touch — every `$`-preceded segment in python/ruby/php is
+  tagged `SegmentKind::Companion`, exactly reusing the existing "renders `$`
+  regardless of the previous segment's kind" rule verbatim. The ONLY edit to
+  `src/analyzer/fq_name.rs` this wave made is a doc-comment broadening on the
+  `Companion` variant (no logic change) noting it is not Scala-exclusive.
+  Rationale: `Companion`'s CODE semantics were already general ("a `$`-spelled
+  nested-scope boundary"); only its doc comment and the task briefing's mental
+  model were Scala-specific. Reusing it needs zero shared-file logic changes,
+  carries zero risk to already-landed go or to the parallel agent's cpp/scala
+  work, and every python/ruby/php suite (see Validation below) confirms the
+  legacy strings still round-trip exactly. `SegmentKind::Unknown` and new
+  `separator()` rules remain unintroduced, per the plan's M2 guidance to add
+  them "ONLY if matching genuinely needs it." Date/Author: 2026-07-24,
+  implementation (python/ruby/php M1 wave).
+- Decision (M1 python — `package_name` segments are `Package`, not `Path`):
+  python's `package_name` (really the file's whole dotted module path, e.g.
+  `mypkg.subpkg.mymodule` — see Surprises above) is `.`-joined throughout,
+  unlike go's `/`-joined import path. `FqName::display`'s only special-cased
+  adjacency rule is `Path`-`Path` → `/`; tagging python's components `Path`
+  would therefore incorrectly render `/` between them. `Package`-`Package`
+  renders `.` by default (no rule change needed) and `Package` is already
+  documented as "a namespace / package / module", which is exactly what these
+  components are. Same reasoning applies to php's namespace components (see
+  next entry). Date/Author: 2026-07-24, implementation.
+- Decision (M1 php — namespace segments are `Package`; reuses go's `_module_`
+  marker convention under php's own literal): php's `determine_php_package_name`
+  already normalizes `\`-separated namespace text to `.`-joined text before it
+  becomes `package_name`, so — like python — its components are tagged
+  `Package`, not `Path`. Separately, php's free (non-class) constant
+  declarations use their own pre-existing `"_module_"` string literal
+  (unrelated to Go's `GO_MODULE_SCOPE_SEGMENT` constant, though textually
+  identical) as a synthetic module-scope marker; it is tagged `Package`,
+  mirroring the go Decision Log entry for `GO_MODULE_SCOPE_SEGMENT` above (a
+  module-scope marker rather than a real type or member). Date/Author:
+  2026-07-24, implementation.
+- Decision (M1 python — `Scope` gained its own `fq: FqName` field, tracked
+  independent of `capture`/`code_unit`): a python local class is captured
+  (gets a `CodeUnit`) unconditionally whenever it has ANY parent scope, but a
+  local FUNCTION nested inside another function is captured only when its
+  immediate parent is a Class scope — so a function-in-function scope level
+  can have `code_unit: None` while a class nested even deeper still needs a
+  correct parent `fq` to extend. Storing `fq` on every `Scope` entry
+  (mirroring the pre-existing `path: String` field, which is already tracked
+  the same way for the legacy string) makes fq construction correct in that
+  edge case without falling back to any string reconstruction. Date/Author:
+  2026-07-24, implementation.
+- Decision (M1 ruby — `assignment_constant_fq` builds a fresh chain rather
+  than extending a lexical parent's `fq`): Ruby constant assignment can
+  re-open a namespace by explicit path (`A::B::CONST = 1` while lexically
+  inside a different `module X`), so `assignment_constant_short_name`'s owner
+  segments already come from the assignment's OWN AST-derived name path
+  (`extract_name_path`), not necessarily the lexically enclosing type. The
+  structured counterpart (`assignment_constant_fq`) mirrors this exactly:
+  it builds a new `Companion`-tagged chain from those same owner-segment
+  strings via `ruby_member_fq`, rather than reading `.fq()` off some
+  in-scope `CodeUnit` (which may not even be the right namespace).
+  Date/Author: 2026-07-24, implementation.
+
+- Decision: `SegmentKind::Nested` added for `$`-JOINED nesting (python/php nested
+  types, python local functions, ruby namespace chains); `Companion` stays
+  scala-only with its trailing-`$` SUFFIX rendering. The two parallel M1 agents
+  had implemented opposite `$` conventions on the shared `Companion` kind (scala
+  suffix vs p/r/p prefix-join), which collided at integration - they are
+  genuinely different concepts and now have different kinds. cpp/java nested
+  classes (currently Type + a cpp-native `$` rule) should migrate onto `Nested`
+  during the java M1 / M2 cleanup so one mechanism spells `$`-joins.
+  Rationale: integration finding, coordinator, 2026-07-24.
+- Decision: two usage_graph expectation flips (ruby calls_local, php
+  callsSelfMethod) were missed by the #1138 landing and surfaced during this
+  wave's validation - flipped with #1138 justifications as part of this
+  integration, not new behavior.
+  Rationale: coordinator, 2026-07-24.
 
 ## Outcomes & Retrospective
 

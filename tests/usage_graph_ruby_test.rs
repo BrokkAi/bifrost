@@ -78,9 +78,12 @@ fn resolves_locally_typed_instance_and_bare_self_calls() {
         "expected via_instance -> Service.run: {}",
         value["edges"]
     );
+    // #1138: a bare self-call inside the same class is same-owner and routes
+    // to unproven inbound - it can never prove a method alive, so it no longer
+    // appears as a proven usage-graph edge.
     assert!(
-        has_edge(&value, "Consumer.calls_local", "Consumer.local"),
-        "expected calls_local -> Consumer.local: {}",
+        !has_edge(&value, "Consumer.calls_local", "Consumer.local"),
+        "same-owner calls_local -> Consumer.local must not be a proven edge (#1138): {}",
         value["edges"]
     );
 }

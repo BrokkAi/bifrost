@@ -34,8 +34,19 @@ pub(crate) enum SegmentKind {
     Package,
     /// A class, struct, enum, trait, interface, or object.
     Type,
-    /// A Scala companion-object spelling (renders with `$`).
+    /// A nested-scope boundary spelled with a literal `$` rather than `.`:
+    /// Scala companion objects, and (reused for the same rendering, not a new
+    /// per-language meaning) Python's `$`-joined local classes/functions and
+    /// Ruby/PHP's `$`-joined nested types. Renders with `$` regardless of the
+    /// preceding segment's kind.
     Companion,
+    /// A type or scope joined to its parent with a literal `$` (python/php
+    /// nested types, python local functions, ruby namespace chains, and --
+    /// convention-compatible -- cpp/java `Outer$Inner` nested classes). The
+    /// `$` is a JOIN rendered by `separator` before this segment, unlike
+    /// [`SegmentKind::Companion`], whose `$` is a suffix on the segment's own
+    /// name (scala objects).
+    Nested,
     /// A function, method, field, const, alias, or macro.
     Member,
 }
@@ -164,6 +175,12 @@ impl FqName {
 fn separator(prev: SegmentKind, cur: SegmentKind, native: Option<Language>) -> &'static str {
     if prev == SegmentKind::Path && cur == SegmentKind::Path {
         return "/";
+    }
+    // A Nested segment is BY DEFINITION `$`-joined to whatever precedes it,
+    // in both canonical and native renderings (python/php nested types, ruby
+    // chains, cpp/java nested classes once migrated onto this kind).
+    if cur == SegmentKind::Nested {
+        return "$";
     }
     if native == Some(Language::Cpp) {
         // C++'s legacy string spelling is mixed-separator: `::` between

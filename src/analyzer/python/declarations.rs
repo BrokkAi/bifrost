@@ -2,10 +2,35 @@ use super::imports::python_import_infos_from_node;
 use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
 use super::*;
 use crate::analyzer::ParameterMetadata;
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
+
+/// Intern one qualified-name segment in the process-global interner.
+fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured module-path prefix for a Python declaration.
+///
+/// The `package_name` threaded through [`PythonVisitor`] (and the `package_name`
+/// param of [`module_code_unit`]) is actually the file's full dotted module path
+/// — directory components plus the module's own file-stem, e.g.
+/// `mypkg.subpkg.mymodule` — built by joining `Path::components()` with `.`
+/// (see `python_package_name_for_file` / `python_module_info` below). Python
+/// identifiers can never contain a literal `.`, so splitting on `.` is lossless,
+/// and each component becomes one [`SegmentKind::Package`] segment: `Package`-
+/// `Package` renders with `.` by default (unlike Go's `/`-joined import path,
+/// which needs the `Path` kind), which is exactly this convention.
+fn python_module_fq(module_fq: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in module_fq.split('.').filter(|c| !c.is_empty()) {
+        fq.push(py_segment(component, SegmentKind::Package));
+    }
+    fq
+}
 
 pub(super) fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
     if node.kind() != "decorated_definition" {
@@ -20,6 +45,13 @@ pub(super) fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
 pub(super) struct Scope {
     kind: ScopeKind,
     path: String,
+    /// The structured qualified name matching `path` (M1 dual representation;
+    /// see `.agents/plans/fqname-interned-segments.md`). Tracked independent of
+    /// whether this scope level was actually `capture`d as a `CodeUnit`, so a
+    /// nested class/function that IS captured can always extend an ancestor's
+    /// `fq` even when an intermediate scope level (e.g. a non-captured nested
+    /// function) has no `code_unit` of its own to read `.fq()` from.
+    fq: FqName,
     code_unit: Option<CodeUnit>,
     method_receiver: Option<String>,
 }
@@ -195,11 +227,26 @@ impl<'a> PythonVisitor<'a> {
             .last()
             .map(|parent| format!("{}${name}", parent.path))
             .unwrap_or_else(|| name.to_string());
-        let code_unit = CodeUnit::new(
+        // A nested class (any parent scope, Class or Function) is always joined
+        // with a literal `$` in the legacy convention above, which is exactly
+        // what `SegmentKind::Nested` renders regardless of the preceding
+        // segment's kind; a top-level class has no parent and is a plain `Type`
+        // hanging off the module-path `Package` chain.
+        let fq = match scope.last() {
+            Some(parent) => parent
+                .fq
+                .clone()
+                .with_pushed(py_segment(name, SegmentKind::Nested)),
+            None => {
+                python_module_fq(self.package_name).with_pushed(py_segment(name, SegmentKind::Type))
+            }
+        };
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
             self.package_name.to_string(),
             short_name.clone(),
+            fq.clone(),
         );
         if capture {
             self.parsed
@@ -229,6 +276,7 @@ impl<'a> PythonVisitor<'a> {
             next_scope.push(Scope {
                 kind: ScopeKind::Class,
                 path: short_name,
+                fq,
                 code_unit: Some(code_unit),
                 method_receiver: None,
             });
@@ -271,6 +319,24 @@ impl<'a> PythonVisitor<'a> {
         } else {
             name.to_string()
         };
+        // Mirrors `short_name` above segment-for-segment: a method owned
+        // directly by a class joins with `.` (`Member`), while a function
+        // nested under another function is a local/closure and joins with the
+        // literal `$` that `SegmentKind::Nested` renders.
+        let fq = if let Some(parent) = scope.last() {
+            match parent.kind {
+                ScopeKind::Class => parent
+                    .fq
+                    .clone()
+                    .with_pushed(py_segment(name, SegmentKind::Member)),
+                ScopeKind::Function => parent
+                    .fq
+                    .clone()
+                    .with_pushed(py_segment(name, SegmentKind::Nested)),
+            }
+        } else {
+            python_module_fq(self.package_name).with_pushed(py_segment(name, SegmentKind::Member))
+        };
 
         if capture {
             let code_unit_type = if python_function_has_decorator(node, self.source, "property") {
@@ -281,13 +347,14 @@ impl<'a> PythonVisitor<'a> {
             let signature = node
                 .child_by_field_name("parameters")
                 .map(|parameters| py_node_text(parameters, self.source).trim().to_string());
-            let code_unit = CodeUnit::with_signature(
+            let code_unit = CodeUnit::with_signature_and_fq(
                 self.file.clone(),
                 code_unit_type,
                 self.package_name.to_string(),
                 short_name.clone(),
                 signature,
                 false,
+                fq.clone(),
             );
             self.parsed
                 .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
@@ -315,6 +382,7 @@ impl<'a> PythonVisitor<'a> {
             next_scope.push(Scope {
                 kind: ScopeKind::Function,
                 path: short_name,
+                fq,
                 code_unit: scope_code_unit,
                 method_receiver: scope
                     .last()
@@ -336,6 +404,7 @@ impl<'a> PythonVisitor<'a> {
         next_scope.push(Scope {
             kind: ScopeKind::Function,
             path: short_name,
+            fq,
             code_unit: None,
             method_receiver: None,
         });
@@ -366,21 +435,32 @@ impl<'a> PythonVisitor<'a> {
         self.visit_instance_attribute_assignment(left, scope);
         let names = collect_assigned_names(left, self.source);
         for name in names {
-            let short_name = if let Some(parent) = scope.last() {
+            let (short_name, fq) = if let Some(parent) = scope.last() {
                 if parent.kind != ScopeKind::Class {
                     continue;
                 }
-                format!("{}.{}", parent.path, name)
+                (
+                    format!("{}.{}", parent.path, name),
+                    parent
+                        .fq
+                        .clone()
+                        .with_pushed(py_segment(&name, SegmentKind::Member)),
+                )
             } else if module_control_depth <= 1 {
-                name.clone()
+                (
+                    name.clone(),
+                    python_module_fq(self.package_name)
+                        .with_pushed(py_segment(&name, SegmentKind::Member)),
+                )
             } else {
                 continue;
             };
-            let code_unit = CodeUnit::new(
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 self.package_name.to_string(),
                 short_name,
+                fq,
             );
             self.parsed
                 .replace_code_unit(code_unit.clone(), node, self.source, None, None);
@@ -422,11 +502,15 @@ impl<'a> PythonVisitor<'a> {
             return;
         };
         for (name, node) in collect_self_assigned_attributes(left, self.source, receiver) {
-            let code_unit = CodeUnit::new(
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 self.package_name.to_string(),
                 format!("{}.{}", parent.path, name),
+                parent
+                    .fq
+                    .clone()
+                    .with_pushed(py_segment(&name, SegmentKind::Member)),
             );
             if !self.parsed.contains_declaration(&code_unit) {
                 self.parsed.replace_code_unit(
@@ -552,11 +636,12 @@ pub(super) fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<Co
     let mut parts = module_fq.rsplitn(2, '.');
     let short_name = parts.next().unwrap_or(module_fq);
     let package_name = parts.next().unwrap_or_default();
-    Some(CodeUnit::new(
+    Some(CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Module,
         package_name.to_string(),
         short_name.to_string(),
+        python_module_fq(module_fq),
     ))
 }
 

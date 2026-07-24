@@ -40,14 +40,16 @@ fn resolves_free_function_instance_static_and_self_calls() {
         "expected viaStatic -> Service.helper: {}",
         value["edges"]
     );
-    // `$this->viaInstance()` attributes to the enclosing class.
+    // #1138: `$this->viaInstance()` is a same-owner call and routes to
+    // unproven inbound - it can never prove a method alive, so it no longer
+    // appears as a proven usage-graph edge.
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "App.Consumer.callsSelfMethod",
             "App.Consumer.viaInstance"
         ),
-        "expected callsSelfMethod -> Consumer.viaInstance: {}",
+        "same-owner callsSelfMethod -> Consumer.viaInstance must not be a proven edge (#1138): {}",
         value["edges"]
     );
 }
