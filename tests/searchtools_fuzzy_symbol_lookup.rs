@@ -223,6 +223,41 @@ fn javascript_sigil_prefixed_field_is_searchable_by_literal_pattern() {
     }
 }
 
+// twitter shape (#1127): java/scala identifiers legitimately end in `$`;
+// the literal class name must be searchable — the trailing `$` used to
+// compile as an end-of-haystack regex anchor.
+#[test]
+fn java_sigil_suffixed_class_is_searchable_by_literal_pattern() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Foo$.java",
+            "public class Foo$ {\n    public static int value() { return 1; }\n}\n",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["Foo$".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    let index = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/Foo$.java")
+        .unwrap_or_else(|| panic!("missing Foo$.java for literal $-suffixed pattern: {search:#?}"));
+    assert!(
+        index
+            .classes
+            .iter()
+            .any(|hit| hit.symbol == "Foo$" && hit.line == 1),
+        "expected Foo$ in results: {search:#?}"
+    );
+}
+
 #[test]
 fn javascript_object_literal_method_is_searchable_as_function_symbol() {
     let project = InlineTestProject::with_language(Language::JavaScript)

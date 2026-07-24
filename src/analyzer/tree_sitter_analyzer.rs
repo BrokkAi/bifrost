@@ -4799,22 +4799,34 @@ where
         let mut out: BTreeSet<_> = self
             .resolve_candidate_rows(rows)
             .into_iter()
-            .filter(|unit| {
-                let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
-                !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
-            })
+            .filter(|unit| self.fq_pattern_matches(unit, &compiled))
             .collect();
-        out.extend(self.dirty_units_matching(false, |unit| {
-            let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
-            !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
-        }));
+        out.extend(
+            self.dirty_units_matching(false, |unit| self.fq_pattern_matches(unit, &compiled)),
+        );
         out.extend(
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
-                !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+                self.fq_pattern_matches(unit, &compiled)
             })?,
         );
         Some(out)
+    }
+
+    /// fq-pattern match for search: adapters may normalize identifier sigils
+    /// away (java maps `$` to `.` for nested-class display), so a literal
+    /// sigil-suffixed name (`Foo$`, twitter's `javaGlobalNoDefault$`) is
+    /// invisible when only the normalized fq is probed (#1127). Match the
+    /// raw fq as well when it differs.
+    fn fq_pattern_matches(&self, unit: &CodeUnit, compiled: &regex::Regex) -> bool {
+        let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+        if self.adapter.is_anonymous_structure(&fq_name) {
+            return false;
+        }
+        if compiled.is_match(&fq_name) {
+            return true;
+        }
+        let raw = unit.fq_name();
+        fq_name != raw && compiled.is_match(&raw)
     }
 
     fn sql_search_symbol_candidates(
@@ -4859,8 +4871,7 @@ where
             rows.into_iter()
                 .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
         ) {
-            let fq_name = self.adapter.normalize_full_name(&code_unit.fq_name());
-            if !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name) {
+            if self.fq_pattern_matches(&code_unit, &compiled) {
                 candidates
                     .entry(code_unit.clone())
                     .or_insert(SearchSymbolCandidate {
@@ -4871,10 +4882,9 @@ where
             }
         }
 
-        for code_unit in self.dirty_units_matching(false, |unit| {
-            let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
-            !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
-        }) {
+        for code_unit in
+            self.dirty_units_matching(false, |unit| self.fq_pattern_matches(unit, &compiled))
+        {
             candidates
                 .entry(code_unit.clone())
                 .or_insert_with(|| SearchSymbolCandidate {
@@ -4887,8 +4897,7 @@ where
                 });
         }
         for code_unit in self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-            let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
-            !self.adapter.is_anonymous_structure(&fq_name) && compiled.is_match(&fq_name)
+            self.fq_pattern_matches(unit, &compiled)
         })? {
             candidates
                 .entry(code_unit.clone())
@@ -5956,7 +5965,10 @@ fn literal_ascii_search_substring(pattern: &str) -> Option<&str> {
 /// (JS/PHP/Ruby sigils: `$L`, `$utils`, `$$animate`) is unsatisfiable as an
 /// end-of-haystack anchor, so escaping it cannot change any pattern that
 /// matches today; likewise a `^` directly after a word character or `^` is
-/// unsatisfiable as a start anchor. Intentional regex (groups, classes,
+/// unsatisfiable as a start anchor. A `$` directly *after* a word character
+/// gets the same treatment: java/scala identifiers legitimately end in `$`
+/// (twitter's `javaGlobalNoDefault$` classes, scala objects), and agents
+/// search those names literally (#1127). Intentional regex (groups, classes,
 /// real anchors) is left untouched.
 fn escape_sigil_anchors(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
@@ -5968,7 +5980,7 @@ fn escape_sigil_anchors(pattern: &str) -> String {
             .get(index + 1)
             .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '$'));
         let unsatisfiable = match ch {
-            '$' => next_is_word,
+            '$' => next_is_word || prev_is_word,
             '^' => prev_is_word,
             _ => false,
         };
@@ -8296,5 +8308,19 @@ mod tests {
                 && candidate.primary_range.is_some()
                 && !candidate.in_test_region
         }));
+    }
+}
+
+#[cfg(test)]
+mod sigil_anchor_tests {
+    #[test]
+    fn trailing_sigil_is_escaped_as_identifier_text() {
+        // #1127: `Foo$` (java/scala sigil-suffixed identifiers) must not
+        // compile as an end-of-haystack anchor.
+        assert_eq!(super::escape_sigil_anchors("Foo$"), "Foo\\$");
+        assert_eq!(super::escape_sigil_anchors("$L"), "\\$L");
+        assert_eq!(super::escape_sigil_anchors("$$animate"), "\\$\\$animate");
+        // Word-free anchors stay anchors.
+        assert_eq!(super::escape_sigil_anchors("foo.$"), "foo.$");
     }
 }
