@@ -197,10 +197,11 @@ fn is_annotation_reference_node(node: Node<'_>) -> bool {
             }
             _ => None,
         };
-        if let Some(annotation) = annotation {
-            if annotation.start_byte() <= start && end <= annotation.end_byte() {
-                return true;
-            }
+        if let Some(annotation) = annotation
+            && annotation.start_byte() <= start
+            && end <= annotation.end_byte()
+        {
+            return true;
         }
         current = parent;
     }
