@@ -21,8 +21,8 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 - [x] (2026-07-24 14:12+02:00) Added the evidence note and marked the broader typestate roadmap’s #819 checkpoint complete without adding persistence, dominance, or public surface.
 - [x] (2026-07-24 15:08+02:00) Completed five specialist reviews and fixed every material finding: linear checked back-edge partitioning, direct bounded adjacency consumption, shared budget-ledger reuse, SCC/loop DFS reuse, closed-region entry fidelity, cancellable path reconstruction, crate-private reverse iteration, atomic evidence output, and algorithm-only timing.
 - [x] (2026-07-24 16:02+02:00) Regenerated the retained release matrix from clean reviewed checkpoint `3582f291`, confirmed clean-tree provenance, and refreshed the evidence narrative for one-byte reachability membership and exact 1x/2x/3x DFS/SCC/loop work.
-- [ ] Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
-- [ ] Complete specialist review, resolve material findings, and record final outcomes.
+- [x] (2026-07-24) Run focused tests, the benchmark matrix, formatting, strict all-feature Clippy, and the complete `nlp,python` suite.
+- [x] (2026-07-24) Complete specialist review, resolve material findings, and record final outcomes.
 
 ## Surprises & Discoveries
 
@@ -48,7 +48,13 @@ Dominators and post-dominators are deliberately not part of this work. The prese
   Evidence: back edges were filtered once per cyclic component and SCC discarded the DFS result that loop derivation immediately recomputed. Review replaced both with one checked back-edge partition and one shared SCC/DFS result, reducing loop work from four graph passes to three.
 
 - Observation: a cyclic SCC with no incoming edge has no generic entry node.
-  Evidence: the graph view has no distinguished root. Review removed the fabricated minimum-member entry and added explicit `NoEntry` structure so closed, single-entry, and multi-entry regions remain distinct.
+  Evidence: the graph view has no distinguished root. Review removed the fabricated minimum-member entry and added an explicit no-entry structure so closed, single-entry, and multi-entry regions remain distinct.
+
+- Observation: this host resolves `cargo` and `rustc` from rustup but may resolve `cargo-clippy`, `clippy-driver`, and `rustdoc` from Homebrew first.
+  Evidence: strict Clippy passed through `/Users/dave/.cargo/bin/cargo-clippy`, and the coherent rustup-first documentation phase passed separately after the all-target feature run reached rustdoc.
+
+- Observation: the macOS Python feature build needs dynamic symbol lookup, while three MCP stderr tests need unrestricted child-process access.
+  Evidence: the restricted run passed 1,872 library tests and failed only the three process tests with `EPERM`; the unrestricted rerun passed all 1,875 library tests plus every binary and integration target, with six ignored tests.
 
 ## Decision Log
 
@@ -69,7 +75,7 @@ Dominators and post-dominators are deliberately not part of this work. The prese
   Date: 2026-07-24.
 
 - Decision: represent cyclic regions with zero external entries explicitly.
-  Rationale: choosing the minimum member for a closed SCC would invent topology and collapse closed regions into single-entry ones. `NoEntry`, `SingleEntry`, and `MultiEntry` now preserve the graph facts exactly.
+  Rationale: choosing the minimum member for a closed SCC would invent topology and collapse closed regions into single-entry ones. `LoopEntryStructure::{None, Single, Multiple}` now preserves the graph facts exactly.
   Date: 2026-07-24.
 
 - Decision: retain only the existing query-local ICFG return-mask memoization.
@@ -85,6 +91,8 @@ Dominators and post-dominators are deliberately not part of this work. The prese
 Milestones 1 through 3 are complete in checkpoints `cd0998ce`, `9283fd4a`, and `537262d7`. The algorithm layer is crate-private, iterative, deterministic, and complete-only under cancellation or node/edge exhaustion. ICFG return-gap scoping is its first production consumer and retains only the existing artifact-instance-scoped builder memo.
 
 The retained release artifact is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.json`; its interpretation is `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md`. The final matrix is from clean reviewed checkpoint `3582f291`, times only algorithm execution, retains one byte per reachability point, and confirms exact 1x/2x/3x DFS/SCC/loop work. It continues to support on-demand RPO/SCC/loop/path results, no persistence, and no dominance implementation.
+
+Final validation is complete. The focused algorithm suite passed 9 tests with the benchmark ignored, the semantic CFG, ICFG, and dataflow contracts passed 41, 25, and 11 tests, respectively, and the reviewed release benchmark passed across all eight datasets. Formatting, diff checks, and strict all-feature Clippy are clean. The unrestricted `nlp,python` run passed 1,875 library tests with six ignored tests plus every binary and integration target, and the coherent rustup documentation phase also passed.
 
 ## Context and Orientation
 
@@ -219,3 +227,5 @@ Revision note (2026-07-24): Recorded the retained clean-tree release matrix, com
 Revision note (2026-07-24): Recorded specialist review and the resulting bounded-work, lifecycle, topology, timing, and API-boundary corrections. The retained matrix is explicitly pending regeneration from the reviewed checkpoint.
 
 Revision note (2026-07-24): Replaced the stale pre-review evidence with the final clean reviewed release matrix and refreshed all affected timing, work, retention, and provenance claims.
+
+Revision note (2026-07-24): Closed the validation and review checkpoints after the focused suites, reviewed benchmark matrix, formatting, strict Clippy, full feature matrix, and separate coherent documentation phase all passed.

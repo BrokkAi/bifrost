@@ -431,9 +431,9 @@ where
                 push_edges(graph, region.back_edges.iter().copied(), &mut material);
                 material.push(u8::from(region.has_self_loop));
                 material.push(match region.entry_structure {
-                    LoopEntryStructure::NoEntry => 0,
-                    LoopEntryStructure::SingleEntry => 1,
-                    LoopEntryStructure::MultiEntry => 2,
+                    LoopEntryStructure::None => 0,
+                    LoopEntryStructure::Single => 1,
+                    LoopEntryStructure::Multiple => 2,
                 });
                 retained = retained
                     .saturating_add(bytes(region.members.len(), size_of::<G::Node>()))
@@ -785,10 +785,9 @@ fn milliseconds(duration: Duration) -> f64 {
 #[test]
 #[ignore = "release-only measurement; run scripts/run-cfg-algorithm-benchmarks.sh"]
 fn cfg_algorithm_release_measurement() {
-    assert!(
-        !cfg!(debug_assertions),
-        "CFG algorithm benchmark must run with --release"
-    );
+    if cfg!(debug_assertions) {
+        panic!("CFG algorithm benchmark must run with --release");
+    }
     let repeats = std::env::var(REPEATS_ENV)
         .ok()
         .map(|value| value.parse::<usize>().expect("positive benchmark repeats"))

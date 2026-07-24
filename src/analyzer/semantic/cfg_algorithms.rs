@@ -267,7 +267,8 @@ impl<Node: Copy> Reachability<Node> {
         self.membership
             .iter()
             .enumerate()
-            .filter_map(|(index, reachable)| reachable.then(|| required_node(graph, index)))
+            .filter(|(_, reachable)| **reachable)
+            .map(|(index, _)| required_node(graph, index))
     }
 
     pub(crate) fn membership(&self) -> &[bool] {
@@ -387,6 +388,13 @@ pub(crate) struct DepthFirstOrder<Node, Edge> {
     pub(crate) work: CfgAlgorithmWork,
 }
 
+type AlgorithmResult<T, Node> = Result<T, CfgAlgorithmError<Node>>;
+type ComponentsWithOrder<Node, Edge> = (
+    StronglyConnectedComponents<Node>,
+    DepthFirstOrder<Node, Edge>,
+);
+type ShortestPathResult<Node, Edge> = AlgorithmResult<Option<ShortestPath<Node, Edge>>, Node>;
+
 enum DfsAction<Node, Edge> {
     Enter(Node),
     Examine(Edge, Node),
@@ -396,7 +404,7 @@ enum DfsAction<Node, Edge> {
 pub(crate) fn depth_first_order<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<DepthFirstOrder<G::Node, G::Edge>, CfgAlgorithmError<G::Node>>
+) -> AlgorithmResult<DepthFirstOrder<G::Node, G::Edge>, G::Node>
 where
     G: DenseBidirectionalGraph,
 {
@@ -490,13 +498,7 @@ where
 fn strongly_connected_components_with_order<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<
-    (
-        StronglyConnectedComponents<G::Node>,
-        DepthFirstOrder<G::Node, G::Edge>,
-    ),
-    CfgAlgorithmError<G::Node>,
->
+) -> AlgorithmResult<ComponentsWithOrder<G::Node, G::Edge>, G::Node>
 where
     G: DenseBidirectionalGraph,
 {
@@ -566,9 +568,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoopEntryStructure {
-    NoEntry,
-    SingleEntry,
-    MultiEntry,
+    None,
+    Single,
+    Multiple,
 }
 
 /// One cyclic SCC described without an unsupported dominance claim.
@@ -590,7 +592,7 @@ pub(crate) struct LoopRegions<Node, Edge> {
 pub(crate) fn loop_regions<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<LoopRegions<G::Node, G::Edge>, CfgAlgorithmError<G::Node>>
+) -> AlgorithmResult<LoopRegions<G::Node, G::Edge>, G::Node>
 where
     G: DenseBidirectionalGraph,
 {
@@ -645,9 +647,9 @@ where
         let mut internal_back_edges = std::mem::take(&mut back_edges[component]);
         internal_back_edges.sort_unstable();
         let entry_structure = match entries[component].len() {
-            0 => LoopEntryStructure::NoEntry,
-            1 => LoopEntryStructure::SingleEntry,
-            _ => LoopEntryStructure::MultiEntry,
+            0 => LoopEntryStructure::None,
+            1 => LoopEntryStructure::Single,
+            _ => LoopEntryStructure::Multiple,
         };
         regions.push(LoopRegion {
             members: members.clone(),
@@ -677,7 +679,7 @@ pub(crate) fn shortest_path<G>(
     start: G::Node,
     goal: G::Node,
     request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<Option<ShortestPath<G::Node, G::Edge>>, CfgAlgorithmError<G::Node>>
+) -> ShortestPathResult<G::Node, G::Edge>
 where
     G: DenseBidirectionalGraph,
 {
@@ -729,7 +731,7 @@ fn reconstruct_path<G>(
     parent: &[Option<(G::Node, G::Edge)>],
     started: CfgAlgorithmWork,
     request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<ShortestPath<G::Node, G::Edge>, CfgAlgorithmError<G::Node>>
+) -> AlgorithmResult<ShortestPath<G::Node, G::Edge>, G::Node>
 where
     G: DenseBidirectionalGraph,
 {
@@ -1007,17 +1009,14 @@ mod tests {
         assert_eq!(&*loops.regions[0].entries, &[2, 3]);
         assert_eq!(
             loops.regions[0].entry_structure,
-            LoopEntryStructure::MultiEntry
+            LoopEntryStructure::Multiple
         );
         assert!(!loops.regions[0].has_self_loop);
         assert!(!loops.regions[0].back_edges.is_empty());
         assert_eq!(&*loops.regions[1].members, &[5]);
         assert!(loops.regions[1].entries.is_empty());
         assert!(loops.regions[1].has_self_loop);
-        assert_eq!(
-            loops.regions[1].entry_structure,
-            LoopEntryStructure::NoEntry
-        );
+        assert_eq!(loops.regions[1].entry_structure, LoopEntryStructure::None);
     }
 
     #[test]
