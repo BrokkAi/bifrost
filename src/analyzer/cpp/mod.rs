@@ -575,7 +575,10 @@ impl IAnalyzer for CppAnalyzer {
         // extraction could not reconcile with this canonical `fq_name`, but the
         // include-visible class table confirms belong here, so a header
         // declaration and its `.cpp` definition unify at resolution time.
-        let Some(reconciled) = self.reconciled_definition_index().by_canonical_fq.get(fq_name)
+        let Some(reconciled) = self
+            .reconciled_definition_index()
+            .by_canonical_fq
+            .get(fq_name)
         else {
             return Box::new(inner.into_iter());
         };
@@ -634,7 +637,11 @@ impl IAnalyzer for CppAnalyzer {
         // #1134: a re-keyed reconciled definition (canonical identity, real
         // `.cpp` source) is not itself in the store; its ranges live under the
         // provisional identity extraction assigned it.
-        if let Some(provisional) = self.reconciled_definition_index().provisional_of.get(code_unit) {
+        if let Some(provisional) = self
+            .reconciled_definition_index()
+            .provisional_of
+            .get(code_unit)
+        {
             return self.inner.ranges(provisional);
         }
         ranges
@@ -660,7 +667,11 @@ impl IAnalyzer for CppAnalyzer {
         // the `.cpp` definition are misread as an ambiguous cross-file duplicate.
         // Stored units always return non-empty here, so this never re-enters the
         // lazily-built index during its own construction.
-        if let Some(provisional) = self.reconciled_definition_index().provisional_of.get(code_unit) {
+        if let Some(provisional) = self
+            .reconciled_definition_index()
+            .provisional_of
+            .get(code_unit)
+        {
             return self.inner.signature_metadata(provisional);
         }
         metadata
@@ -696,7 +707,11 @@ impl IAnalyzer for CppAnalyzer {
         // extraction could not reconcile with this canonical `fq_name`, but the
         // include-visible class table confirms belong here (so a header
         // declaration and its `.cpp` definition unify at query time).
-        if let Some(reconciled) = self.reconciled_definition_index().by_canonical_fq.get(fq_name) {
+        if let Some(reconciled) = self
+            .reconciled_definition_index()
+            .by_canonical_fq
+            .get(fq_name)
+        {
             for unit in reconciled {
                 if !definitions.contains(unit) {
                     definitions.push(unit.clone());

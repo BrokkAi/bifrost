@@ -321,10 +321,10 @@ int HTMLLayout::getContentType() const {
 /// owner segments as the class-nesting chain they are (rather than dropping all
 /// but the last as a namespace path), so the definition unifies with the
 /// header declaration -- reproducing and fixing #1121 with no using-directive
-/// involved at all. The file-scope using-directive variant stays on today's
-/// (non-unifying) behavior -- at file scope the chain is genuinely ambiguous
-/// with no class table to resolve it -- and is only pinned here to show the
-/// #1093 fallback neither resolves nor worsens it.
+/// involved at all. The file-scope using-directive variant now *also* unifies
+/// (#1134): the resolution-time reconciliation overlay consults the
+/// include-visible class table to confirm `Outer::Inner` is a nested class in
+/// the used namespace and folds the definition onto the header identity.
 #[test]
 fn nested_class_two_segment_owner_unifies_in_namespace_block() {
     let with_namespace_block = InlineTestProject::with_language(Language::Cpp)
@@ -405,20 +405,25 @@ int Outer::Inner::method() const {
         "{unified}"
     );
 
-    // File-scope using-directive variant: still on today's behavior. The header
-    // declaration resolves on its own (single source, no crash, no spurious
-    // cross-match); the definition does not unify with it -- at file scope the
-    // `Outer::Inner::method` chain under a using-directive is genuinely
-    // ambiguous with no class table to resolve it (remaining #1121 gap).
-    let header_only = symbol_sources(&with_using_directive, "log4cxx.Outer$Inner.method");
+    // File-scope using-directive variant: now unifies (#1134). The
+    // resolution-time class-table reconciliation folds the `.cpp` definition
+    // onto the header's `log4cxx.Outer$Inner.method` identity, so the canonical
+    // symbol resolves to the preferred definition while its identity stays
+    // anchored to the header declaration.
+    let unified_using = symbol_sources(&with_using_directive, "log4cxx.Outer$Inner.method");
     assert_eq!(
-        header_only["not_found"].as_array().unwrap().len(),
+        unified_using["not_found"].as_array().unwrap().len(),
         0,
-        "using-directive variant: {header_only}"
+        "using-directive variant: {unified_using}"
     );
     assert_eq!(
-        sorted_source_paths(&header_only),
-        vec!["nested_using.h".to_string()],
-        "using-directive variant unexpectedly changed: {header_only}"
+        sorted_source_paths(&unified_using),
+        vec!["nested_using.cpp".to_string()],
+        "using-directive variant did not unify: {unified_using}"
+    );
+    assert_eq!(
+        unified_using["sources"][0]["canonical_selector"],
+        "nested_using.h#log4cxx.Outer$Inner.method",
+        "{unified_using}"
     );
 }

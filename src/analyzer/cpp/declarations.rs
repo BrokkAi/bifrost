@@ -798,7 +798,10 @@ fn cpp_using_namespace_target(node: Node<'_>, source: &str) -> Option<String> {
 /// that both confirm are treated as a genuine ambiguity by the reconciler.
 pub(crate) fn cpp_file_using_namespaces(source: &str) -> Vec<String> {
     let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
         return Vec::new();
     }
     let Some(tree) = parser.parse(source, None) else {
