@@ -446,46 +446,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::And,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false,
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("||")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::Or,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("??")) => {
@@ -535,33 +521,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let alternative = required_field(node, "alternative")?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: alternative,
-                    entry: alternative_entry,
+                schedule_conditional_choice(
+                    stack,
+                    (condition, entry),
+                    (consequence, consequence_entry),
+                    (alternative, alternative_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: consequence,
-                    entry: consequence_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: condition,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: consequence_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false: EdgeTarget {
-                        point: alternative_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             (

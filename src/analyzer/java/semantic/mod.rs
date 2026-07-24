@@ -214,6 +214,52 @@ enum Work<'tree> {
     },
 }
 
+impl<'tree> Work<'tree> {
+    const fn statement(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Statement {
+            node,
+            entry,
+            next,
+            scope,
+        }
+    }
+
+    const fn expression(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Expression {
+            node,
+            entry,
+            next,
+            scope,
+        }
+    }
+
+    const fn condition(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Condition {
+            node,
+            entry,
+            when_true,
+            when_false,
+            scope,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
     id: CleanupRegionId,

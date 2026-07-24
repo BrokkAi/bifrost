@@ -519,6 +519,52 @@ enum Work<'tree> {
     },
 }
 
+impl<'tree> Work<'tree> {
+    const fn statement(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Statement {
+            node,
+            entry,
+            next,
+            scope,
+        }
+    }
+
+    const fn expression(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Expression {
+            node,
+            entry,
+            next,
+            scope,
+        }
+    }
+
+    const fn condition(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Condition {
+            node,
+            entry,
+            when_true,
+            when_false,
+            scope,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
     id: CleanupRegionId,
@@ -1273,46 +1319,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::And,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false,
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("||")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::Or,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("??")) => {
@@ -1360,33 +1392,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let alternative = required_field(node, "alternative")?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: alternative,
-                    entry: alternative_entry,
+                schedule_conditional_choice(
+                    stack,
+                    (condition, entry),
+                    (consequence, consequence_entry),
+                    (alternative, alternative_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: consequence,
-                    entry: consequence_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: condition,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: consequence_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false: EdgeTarget {
-                        point: alternative_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("parenthesized_expression", _) => {
@@ -2183,93 +2198,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .map(|update| self.point(builder, *update, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        let continue_target = update_entries.first().copied().unwrap_or(condition_entry);
-        let loop_scope = builder.push_scope(
-            Some(scope),
-            ScopeBinding::Loop {
-                label: label.map(Box::<str>::from),
-                break_target: next.point,
-                break_edge_kind: next.kind,
-                continue_target,
-                continue_edge_kind: if updates.is_empty() {
-                    ControlEdgeKind::LoopBack
-                } else {
-                    ControlEdgeKind::Normal
-                },
-            },
-        );
-
-        for index in (0..updates.len()).rev() {
-            stack.push(Work::Expression {
-                node: updates[index],
-                entry: update_entries[index],
-                next: update_entries
-                    .get(index + 1)
-                    .copied()
-                    .map(EdgeTarget::normal)
-                    .unwrap_or(EdgeTarget {
-                        point: condition_entry,
-                        kind: ControlEdgeKind::LoopBack,
-                    }),
-                scope: loop_scope,
-            });
-        }
-        stack.push(Work::Statement {
-            node: body,
-            entry: body_entry,
-            next: EdgeTarget {
-                point: continue_target,
-                kind: if updates.is_empty() {
-                    ControlEdgeKind::LoopBack
-                } else {
-                    ControlEdgeKind::Normal
-                },
-            },
-            scope: loop_scope,
-        });
-        if let Some(condition) = condition {
-            stack.push(Work::Condition {
-                node: condition,
-                entry: condition_entry,
-                when_true: EdgeTarget {
-                    point: body_entry,
-                    kind: ControlEdgeKind::ConditionalTrue,
-                },
-                when_false: EdgeTarget {
-                    point: next.point,
-                    kind: ControlEdgeKind::ConditionalFalse,
-                },
-                scope: loop_scope,
-            });
-        } else {
-            self.edge(builder, condition_entry, EdgeTarget::normal(body_entry))?;
-        }
-
-        if initializers.is_empty() {
-            if entry != condition_entry {
-                self.edge(builder, entry, EdgeTarget::normal(condition_entry))?;
-            }
-        } else {
-            let init_entries = initializers
-                .iter()
-                .map(|initializer| self.point(builder, *initializer, Vec::new()))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.edge(builder, entry, EdgeTarget::normal(init_entries[0]))?;
-            for index in (0..initializers.len()).rev() {
-                let next = init_entries
-                    .get(index + 1)
-                    .copied()
-                    .map(EdgeTarget::normal)
-                    .unwrap_or_else(|| EdgeTarget::normal(condition_entry));
-                stack.push(Work::Expression {
-                    node: initializers[index],
-                    entry: init_entries[index],
-                    next,
-                    scope: loop_scope,
-                });
-            }
-        }
-        Ok(())
+        let initializer_entries = initializers
+            .iter()
+            .map(|initializer| self.point(builder, *initializer, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let initializers = initializers
+            .into_iter()
+            .zip(initializer_entries)
+            .collect::<Vec<_>>();
+        let updates = updates.into_iter().zip(update_entries).collect::<Vec<_>>();
+        schedule_c_style_loop(
+            builder,
+            &self.session,
+            entry,
+            next,
+            scope,
+            label.map(Box::<str>::from),
+            &initializers,
+            condition.map(|payload| (payload, condition_entry)),
+            condition_entry,
+            (body, body_entry),
+            &updates,
+            stack,
+            Work::expression,
+            Work::expression,
+            Work::statement,
+            Work::condition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

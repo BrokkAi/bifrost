@@ -306,6 +306,92 @@ pub(crate) struct AwaitScaffold {
     pub(crate) result: ValueId,
 }
 
+pub(crate) type ScheduledControlNode<T> = (T, ProgramPointId);
+
+/// Push the three opaque work items for a conditional choice in execution
+/// order: evaluate the condition first, then only the selected arm.
+pub(crate) fn schedule_conditional_choice<T, W>(
+    stack: &mut Vec<W>,
+    condition: ScheduledControlNode<T>,
+    consequence: ScheduledControlNode<T>,
+    alternative: ScheduledControlNode<T>,
+    when_true: ControlTarget,
+    when_false: ControlTarget,
+    scope: ScopeFrameId,
+    work: impl Fn(T, ProgramPointId, ControlTarget, ControlTarget, ScopeFrameId) -> W,
+) where
+    T: Copy,
+{
+    stack.push(work(
+        alternative.0,
+        alternative.1,
+        when_true,
+        when_false,
+        scope,
+    ));
+    stack.push(work(
+        consequence.0,
+        consequence.1,
+        when_true,
+        when_false,
+        scope,
+    ));
+    stack.push(work(
+        condition.0,
+        condition.1,
+        ControlTarget {
+            point: consequence.1,
+            kind: ControlEdgeKind::ConditionalTrue,
+        },
+        ControlTarget {
+            point: alternative.1,
+            kind: ControlEdgeKind::ConditionalFalse,
+        },
+        scope,
+    ));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortCircuitKind {
+    And,
+    Or,
+}
+
+/// Schedule a boolean short-circuit pair after the adapter has identified its
+/// operands and allocated the right-hand entry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_short_circuit_condition<T, W>(
+    stack: &mut Vec<W>,
+    kind: ShortCircuitKind,
+    left: ScheduledControlNode<T>,
+    right: ScheduledControlNode<T>,
+    when_true: ControlTarget,
+    when_false: ControlTarget,
+    scope: ScopeFrameId,
+    work: impl Fn(T, ProgramPointId, ControlTarget, ControlTarget, ScopeFrameId) -> W,
+) where
+    T: Copy,
+{
+    stack.push(work(right.0, right.1, when_true, when_false, scope));
+    let (left_true, left_false) = match kind {
+        ShortCircuitKind::And => (
+            ControlTarget {
+                point: right.1,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            when_false,
+        ),
+        ShortCircuitKind::Or => (
+            when_true,
+            ControlTarget {
+                point: right.1,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+        ),
+    };
+    stack.push(work(left.0, left.1, left_true, left_false, scope));
+}
+
 impl ControlTarget {
     pub(crate) const fn normal(point: ProgramPointId) -> Self {
         Self {
@@ -313,6 +399,114 @@ impl ControlTarget {
             kind: ControlEdgeKind::Normal,
         }
     }
+}
+
+/// Schedule the stable topology of a C-style loop after an adapter has
+/// identified and allocated every syntax node.
+///
+/// The adapter supplies opaque payloads and constructors for its work-item
+/// enum. This function owns only scope targets, edge kinds, and reverse stack
+/// ordering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_c_style_loop<T, W, Initializer, Expression, Statement, Condition>(
+    builder: &mut ProcedureCfgBuilder,
+    session: &ProcedureLoweringSession<'_>,
+    entry: ProgramPointId,
+    next: ControlTarget,
+    parent_scope: ScopeFrameId,
+    label: Option<Box<str>>,
+    initializers: &[ScheduledControlNode<T>],
+    condition: Option<ScheduledControlNode<T>>,
+    condition_entry: ProgramPointId,
+    body: ScheduledControlNode<T>,
+    updates: &[ScheduledControlNode<T>],
+    stack: &mut Vec<W>,
+    initializer_work: Initializer,
+    expression_work: Expression,
+    statement_work: Statement,
+    condition_work: Condition,
+) -> Result<(), ProcedureLoweringError>
+where
+    T: Copy,
+    Initializer: Fn(T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+    Expression: Fn(T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+    Statement: Fn(T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+    Condition: Fn(T, ProgramPointId, ControlTarget, ControlTarget, ScopeFrameId) -> W,
+{
+    let continue_target = updates.first().map_or(condition_entry, |update| update.1);
+    let loop_scope = builder.push_scope(
+        Some(parent_scope),
+        ScopeBinding::Loop {
+            label,
+            break_target: next.point,
+            break_edge_kind: next.kind,
+            continue_target,
+            continue_edge_kind: if updates.is_empty() {
+                ControlEdgeKind::LoopBack
+            } else {
+                ControlEdgeKind::Normal
+            },
+        },
+    );
+
+    for (index, update) in updates.iter().enumerate().rev() {
+        let next = updates
+            .get(index + 1)
+            .map(|next| ControlTarget::normal(next.1))
+            .unwrap_or(ControlTarget {
+                point: condition_entry,
+                kind: ControlEdgeKind::LoopBack,
+            });
+        stack.push(expression_work(update.0, update.1, next, loop_scope));
+    }
+    stack.push(statement_work(
+        body.0,
+        body.1,
+        ControlTarget {
+            point: continue_target,
+            kind: if updates.is_empty() {
+                ControlEdgeKind::LoopBack
+            } else {
+                ControlEdgeKind::Normal
+            },
+        },
+        loop_scope,
+    ));
+    if let Some(condition) = condition {
+        stack.push(condition_work(
+            condition.0,
+            condition.1,
+            ControlTarget {
+                point: body.1,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            ControlTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+            loop_scope,
+        ));
+    } else {
+        session.add_edge(builder, condition_entry, body.1, ControlEdgeKind::Normal)?;
+    }
+
+    if let Some(first) = initializers.first() {
+        session.add_edge(builder, entry, first.1, ControlEdgeKind::Normal)?;
+        for (index, initializer) in initializers.iter().enumerate().rev() {
+            let next = initializers
+                .get(index + 1)
+                .map_or(condition_entry, |next| next.1);
+            stack.push(initializer_work(
+                initializer.0,
+                initializer.1,
+                ControlTarget::normal(next),
+                loop_scope,
+            ));
+        }
+    } else if entry != condition_entry {
+        session.add_edge(builder, entry, condition_entry, ControlEdgeKind::Normal)?;
+    }
+    Ok(())
 }
 
 /// Target-local slot reserved for the lexical receiver capture, when present.
