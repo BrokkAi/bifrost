@@ -350,16 +350,19 @@ int ns1::ns2::Klass::method() const {
     );
 }
 
-/// The file-scope using-directive variant of the nested member remains on
-/// today's (non-unifying) behavior: at file scope with no enclosing namespace,
-/// `Outer::Inner::method` under `using namespace log4cxx;` is genuinely
-/// ambiguous between a nested class in the used namespace and a namespace path,
-/// and per-file extraction has no class table to resolve it. The header
-/// declaration still resolves cleanly on its own (no crash, no spurious
-/// cross-match); it simply does not unify with the definition. Documented as a
-/// remaining #1121 gap, not a masked failure.
+/// The file-scope using-directive variant of the nested member now unifies
+/// (#1134). At file scope with no enclosing `namespace {}` block,
+/// `Outer::Inner::method` under `using namespace log4cxx;` is ambiguous to
+/// per-file extraction between a nested class in the used namespace and a
+/// namespace path, so extraction keys the definition provisionally as
+/// `Outer.Inner.method`. The resolution-time reconciliation overlay consults the
+/// include-visible class table (`using.h` contributes `log4cxx.Outer$Inner`),
+/// confirms `Outer::Inner` is a nested class under the used namespace, and folds
+/// the definition onto the header's `log4cxx.Outer$Inner.method` identity. The
+/// bare result is definition-only, with the canonical selector anchored to the
+/// header declaration.
 #[test]
-fn file_scope_using_directive_nested_member_stays_on_todays_behavior() {
+fn file_scope_using_directive_nested_member_unifies() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
             "using.h",
@@ -389,13 +392,81 @@ int Outer::Inner::method() const {
         )
         .build();
 
-    // The header declaration resolves on its own (single source): the fix does
-    // not regress or crash this shape.
     let result = symbol_sources(&project, "log4cxx.Outer$Inner.method");
     assert_eq!(result["not_found"].as_array().unwrap().len(), 0, "{result}");
     assert_eq!(
+        result["ambiguous"].as_array().unwrap().len(),
+        0,
+        "file-scope using-directive nested member reported ambiguous: {result}"
+    );
+    assert_eq!(
         sorted_source_paths(&result),
-        vec!["using.h".to_string()],
-        "file-scope using-directive nested member unexpectedly changed: {result}"
+        vec!["using.cpp".to_string()],
+        "file-scope using-directive nested member did not unify: {result}"
+    );
+    assert_eq!(
+        result["sources"][0]["canonical_selector"], "using.h#log4cxx.Outer$Inner.method",
+        "file-scope definition did not retain the header-anchored identity: {result}"
+    );
+}
+
+/// Template-specialization twin (#1134 shape 2): an out-of-line member of a
+/// nested class *template* (`Outer::Inner<T>::method`) written inside a
+/// `namespace ns {}` block. The templated-name splitter reads every segment
+/// before the first template-id as a namespace path, so it keys the definition
+/// provisionally as `ns::Outer.Inner.method` (package `ns::Outer`, owner
+/// `Inner`) rather than `ns.Outer$Inner.method`. The resolution-time
+/// reconciliation overlay consults the include-visible class table
+/// (`tmpl.h` contributes the nested class template `ns.Outer$Inner`), folds
+/// `Outer` back into the class chain, and unifies the definition with its header
+/// declaration.
+#[test]
+fn template_specialization_nested_member_unifies() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "tmpl.h",
+            r#"
+namespace ns {
+class Outer {
+public:
+    template <typename T>
+    class Inner {
+    public:
+        int method() const;
+    };
+};
+}
+"#,
+        )
+        .file(
+            "tmpl.cpp",
+            r#"
+#include "tmpl.h"
+
+namespace ns {
+template <typename T>
+int Outer::Inner<T>::method() const {
+    return 4;
+}
+}
+"#,
+        )
+        .build();
+
+    let result = symbol_sources(&project, "ns.Outer$Inner.method");
+    assert_eq!(result["not_found"].as_array().unwrap().len(), 0, "{result}");
+    assert_eq!(
+        result["ambiguous"].as_array().unwrap().len(),
+        0,
+        "template-specialization nested member reported ambiguous: {result}"
+    );
+    assert_eq!(
+        sorted_source_paths(&result),
+        vec!["tmpl.cpp".to_string()],
+        "template-specialization nested member did not unify: {result}"
+    );
+    assert_eq!(
+        result["sources"][0]["canonical_selector"], "tmpl.h#ns.Outer$Inner.method",
+        "template-specialization definition did not retain the header-anchored identity: {result}"
     );
 }

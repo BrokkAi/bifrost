@@ -52,6 +52,13 @@ pub struct CppAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
+    /// #1134 resolution-time identity-reconciliation overlay. Maps the canonical
+    /// `fq_name` a header declaration carries to the provisional out-of-line
+    /// member definition `CodeUnit`s whose per-file identity extraction could not
+    /// reconcile with it (the file-scope-under-using-directive shape and the
+    /// template-specialization twin), keyed on the include-visible class table.
+    /// Built lazily once; see `reconciled_definition_index`.
+    reconciled_definition_index: Arc<OnceLock<ReconciledDefinitionIndex>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
@@ -65,6 +72,22 @@ pub struct CppAnalyzer {
     cpp_parent_resolution_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The #1134 resolution-time identity-reconciliation overlay (see the field
+/// docs on `CppAnalyzer::reconciled_definition_index`). For each out-of-line
+/// member definition whose per-file provisional identity the include-visible
+/// class table re-keys to a different canonical `fq_name`, it holds a *re-keyed*
+/// `CodeUnit` -- a synthetic unit carrying the canonical identity but the
+/// definition's real `.cpp` source -- so a canonical query resolves the
+/// definition alongside its header declaration across every resolution surface
+/// (`definitions`, source blocks, occurrence roles, canonical selectors). The
+/// re-keyed unit is not in the store, so `provisional_of` maps it back to the
+/// stored provisional unit for range lookups (`ranges`).
+#[derive(Default)]
+struct ReconciledDefinitionIndex {
+    by_canonical_fq: HashMap<String, Vec<CodeUnit>>,
+    provisional_of: HashMap<CodeUnit, CodeUnit>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
@@ -115,6 +138,7 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            reconciled_definition_index: Arc::new(OnceLock::new()),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -129,6 +153,118 @@ impl CppAnalyzer {
             #[cfg(test)]
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// The #1134 resolution-time identity-reconciliation overlay, built once and
+    /// cached. See the field docs on `reconciled_definition_index`.
+    fn reconciled_definition_index(&self) -> &ReconciledDefinitionIndex {
+        self.reconciled_definition_index
+            .get_or_init(|| self.build_reconciled_definition_index())
+    }
+
+    /// Scan every out-of-line member definition in the workspace and, for those
+    /// whose provisional per-file identity the include-visible class table
+    /// re-keys to a different canonical `fq_name` (the two ambiguous shapes left
+    /// by #1121), record a re-keyed `CodeUnit` under that canonical `fq_name` and
+    /// remember its provisional store identity. A definition whose reconciled
+    /// identity equals its provisional one (the overwhelming majority, including
+    /// genuine `ns1::ns2::Klass::method` namespace chains) contributes nothing.
+    fn build_reconciled_definition_index(&self) -> ReconciledDefinitionIndex {
+        let mut index = ReconciledDefinitionIndex::default();
+        let mut using_by_file: HashMap<ProjectFile, Arc<Vec<String>>> = HashMap::default();
+        for unit in self.inner.get_all_declarations() {
+            if !unit.is_callable() {
+                continue;
+            }
+            if !matches!(
+                cpp_callable_unit_role(self, &unit),
+                CppCallableUnitRole::Definition | CppCallableUnitRole::Both
+            ) {
+                continue;
+            }
+            let Some(reconciled) = self.reconcile_definition_identity(&unit, &mut using_by_file)
+            else {
+                continue;
+            };
+            let canonical_fq = reconciled.fq_name();
+            if canonical_fq == unit.fq_name() {
+                continue;
+            }
+            // Re-key onto the canonical identity while keeping the definition's
+            // real `.cpp` source and signature, so it resolves as a definition
+            // alongside its header declaration under the canonical `fq_name`.
+            let rekeyed = CodeUnit::with_signature(
+                unit.source().clone(),
+                unit.kind(),
+                reconciled.package,
+                format!("{}.{}", reconciled.owner_chain, reconciled.member),
+                unit.signature().map(str::to_string),
+                unit.is_synthetic(),
+            );
+            index
+                .by_canonical_fq
+                .entry(canonical_fq)
+                .or_default()
+                .push(rekeyed.clone());
+            index.provisional_of.insert(rekeyed, unit);
+        }
+        index
+    }
+
+    /// Reconcile one out-of-line member definition's provisional identity against
+    /// the class table visible to its file. Returns `None` for anything that is
+    /// not a re-keyable out-of-line member (free functions with no owner, single
+    /// segment qualifiers) or that the class table does not confirm.
+    fn reconcile_definition_identity(
+        &self,
+        unit: &CodeUnit,
+        using_by_file: &mut HashMap<ProjectFile, Arc<Vec<String>>>,
+    ) -> Option<reconcile::ReconciledIdentity> {
+        let (owner_chain, member) = unit.short_name().rsplit_once('.')?;
+        // Reconstruct the full source-order qualifier from the stored identity:
+        // the package (namespace path, `::`-joined) followed by the owner chain
+        // (class nesting, `$`-joined). The reconciler re-partitions this whole
+        // sequence against the class table, so extraction need not have decided
+        // where the namespace ends and the class chain begins.
+        let mut owner_segments: Vec<&str> = Vec::new();
+        if !unit.package_name().is_empty() {
+            owner_segments.extend(unit.package_name().split("::").filter(|s| !s.is_empty()));
+        }
+        owner_segments.extend(owner_chain.split('$').filter(|s| !s.is_empty()));
+        if owner_segments.len() < 2 {
+            return None;
+        }
+
+        let using = using_by_file
+            .entry(unit.source().clone())
+            .or_insert_with(|| {
+                Arc::new(
+                    self.inner
+                        .file_source(unit.source())
+                        .map(|source| declarations::cpp_file_using_namespaces(&source))
+                        .unwrap_or_default(),
+                )
+            })
+            .clone();
+        let mut namespace_candidates: Vec<&str> = vec![""];
+        namespace_candidates.extend(using.iter().map(String::as_str));
+
+        let visible = self.visible_type_units(unit.source());
+        let class_table: Vec<reconcile::VisibleClass> = visible
+            .iter()
+            .filter(|candidate| candidate.is_class())
+            .map(|candidate| reconcile::VisibleClass {
+                package: candidate.package_name(),
+                nested_short_name: candidate.short_name(),
+            })
+            .collect();
+
+        reconcile::reconcile_out_of_line_member_identity(
+            &owner_segments,
+            member,
+            &namespace_candidates,
+            &class_table,
+        )
     }
 
     fn with_updated_inner(&self, inner: TreeSitterAnalyzer<CppAdapter>) -> Self {
@@ -148,6 +284,7 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            reconciled_definition_index: Arc::new(OnceLock::new()),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -433,7 +570,22 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        self.inner.definitions(fq_name)
+        let inner: Vec<CodeUnit> = self.inner.definitions(fq_name).collect();
+        // #1134: fold in out-of-line member definitions whose per-file identity
+        // extraction could not reconcile with this canonical `fq_name`, but the
+        // include-visible class table confirms belong here, so a header
+        // declaration and its `.cpp` definition unify at resolution time.
+        let Some(reconciled) = self.reconciled_definition_index().by_canonical_fq.get(fq_name)
+        else {
+            return Box::new(inner.into_iter());
+        };
+        let mut definitions = inner;
+        for unit in reconciled {
+            if !definitions.contains(unit) {
+                definitions.push(unit.clone());
+            }
+        }
+        Box::new(definitions.into_iter())
     }
 
     fn reset_global_usage_definition_index_build_count_for_test(&self) {
@@ -475,7 +627,17 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+        let ranges = self.inner.ranges(code_unit);
+        if !ranges.is_empty() {
+            return ranges;
+        }
+        // #1134: a re-keyed reconciled definition (canonical identity, real
+        // `.cpp` source) is not itself in the store; its ranges live under the
+        // provisional identity extraction assigned it.
+        if let Some(provisional) = self.reconciled_definition_index().provisional_of.get(code_unit) {
+            return self.inner.ranges(provisional);
+        }
+        ranges
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
@@ -487,7 +649,21 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+        let metadata = self.inner.signature_metadata(code_unit);
+        if !metadata.is_empty() {
+            return metadata;
+        }
+        // #1134: a re-keyed reconciled definition carries the same signature
+        // metadata as the provisional definition it stands in for, so its
+        // callable role (`Definition`) and external linkage are visible to the
+        // decl/def unification evidence -- otherwise the header declaration and
+        // the `.cpp` definition are misread as an ambiguous cross-file duplicate.
+        // Stored units always return non-empty here, so this never re-enters the
+        // lazily-built index during its own construction.
+        if let Some(provisional) = self.reconciled_definition_index().provisional_of.get(code_unit) {
+            return self.inner.signature_metadata(provisional);
+        }
+        metadata
     }
 
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
@@ -515,7 +691,19 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+        let mut definitions = self.inner.get_definitions(fq_name);
+        // #1134: fold in out-of-line member definitions whose per-file identity
+        // extraction could not reconcile with this canonical `fq_name`, but the
+        // include-visible class table confirms belong here (so a header
+        // declaration and its `.cpp` definition unify at query time).
+        if let Some(reconciled) = self.reconciled_definition_index().by_canonical_fq.get(fq_name) {
+            for unit in reconciled {
+                if !definitions.contains(unit) {
+                    definitions.push(unit.clone());
+                }
+            }
+        }
+        definitions
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {

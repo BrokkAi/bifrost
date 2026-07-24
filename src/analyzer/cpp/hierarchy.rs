@@ -19,7 +19,7 @@ impl CppAnalyzer {
         ancestors
     }
 
-    fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
+    pub(super) fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
         self.visible_type_units_by_file.get_with_by_ref(file, || {
             let include_targets = self.include_target_index();
             let mut visited = HashSet::default();
