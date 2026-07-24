@@ -48,7 +48,9 @@ Each language remains a separately reviewable implementation and validation mile
 - [x] (2026-07-23) Closed the final publication-audit findings: Python procedure enumeration now checks cancellation and charges each named AST child before pushing it instead of materializing an unmetered wide vector, and limited import hydration requires both cap headroom and exact metadata/detail-row agreement before reporting completeness. Focused 4,096-child and inconsistent-current-epoch regressions pass.
 - [x] (2026-07-23) Rebased the eleven rollout checkpoints without conflicts onto `origin/master` at `bb95e973`. The first full-suite pass exposed one interaction with upstream #1129: its lexical C++ template-parameter fallback could select a cross-file class that was not yet included once this branch's richer C++ declaration index was present. Restricting the lexical fallback to same-source declarations preserves the template-parameter positive and the include-order negative; all 633 definition tests pass.
 - [x] (2026-07-23) Reran the strict isolated all-target/all-feature Clippy gate and complete isolated `cargo test --features nlp,python` suite after the C++ correction. Every target and the pinned-rustup doctest pass; the fresh target was removed automatically. A final source-identical rebase onto documentation-only `origin/master` commit `752e5c08` completed without conflicts.
-- [ ] Push the consolidated branch, open one pull request that closes #1107 and #1108 through #1115, wait for green CI, and squash-merge it.
+- [x] (2026-07-24) Pushed the consolidated branch and opened ready-for-review PR #1130. GitHub recognizes its `Fixes` references for #1107 and #1108 through #1115.
+- [x] (2026-07-24) Resolved the two test-helper diagnostics from CI's pinned Rust 1.96 target configuration without lint exceptions. Both affected tests, the exact local CI-mode Clippy command, formatting, diff checks, and isolated all-target/all-feature Clippy pass.
+- [ ] Push the CI correction, wait for every required check to pass, and squash-merge PR #1130.
 - [ ] Verify #1107 and #1108 through #1115 are closed, `origin/master` contains the consolidated squash merge, all final validation gates pass, and build artifacts have been cleaned.
 
 ## Surprises & Discoveries
@@ -154,6 +156,9 @@ Each language remains a separately reviewable implementation and validation mile
 
 - Observation: A language-agnostic enclosing-scope lookup is not automatically a valid C++ lexical fallback when its indexed result comes from another file.
   Evidence: After rebasing onto upstream #1129, the new template-parameter fallback resolved `endpoint::before` to `api.hpp` even though the `#include` followed the reference. Template parameters are necessarily declared in the same source file as their lexical use, so requiring `unit.source() == file` retains the intended DeepSpeed positive while restoring include-order visibility.
+
+- Observation: CI's pinned Rust 1.96 target configuration surfaced two stricter style diagnostics that the prior local gate did not report.
+  Evidence: The first PR run rejected a test assertion expressed as `sum <= limit - 1` and an explicit elidable helper lifetime. The equivalent `sum < limit` assertion and lifetime-elided signature preserve test behavior without lint exceptions.
 
 ## Decision Log
 
@@ -405,3 +410,5 @@ Revision note (2026-07-23): Recorded the final publication-audit corrections bec
 Revision note (2026-07-23): Recorded the final remote rebase and its C++ #1129 interaction. The lexical fallback is now explicitly same-source because a cross-file indexed declaration cannot bypass include activation, and the plan distinguishes the completed focused definition gate from the still-pending complete rerun.
 
 Revision note (2026-07-23): Recorded the successful final CI-equivalent rerun and the source-identical documentation-only rebase to `752e5c08`. Publication is now the only remaining implementation step before CI monitoring, squash merge, issue closure verification, and artifact cleanup.
+
+Revision note (2026-07-24): Recorded ready PR #1130 and its first CI result. The only failure was two Rust 1.96 test-helper style diagnostics; the source correction preserves semantics and keeps the strict no-warning policy without lint suppression.

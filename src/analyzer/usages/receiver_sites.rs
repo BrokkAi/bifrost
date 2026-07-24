@@ -404,7 +404,7 @@ mod tests {
         }
     }
 
-    fn text<'a>(index: &'a ReceiverSiteIndex, range: Range) -> &'a str {
+    fn text(index: &ReceiverSiteIndex, range: Range) -> &str {
         &index.source()[range.start_byte..range.end_byte]
     }
 

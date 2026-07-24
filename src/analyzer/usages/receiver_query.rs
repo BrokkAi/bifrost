@@ -4126,7 +4126,7 @@ class Caller {
                 .work
                 .setup_nodes
                 .saturating_add(bounded.work.scope_nodes)
-                <= warm_scope - 1
+                < warm_scope
         );
 
         let cold = ReceiverQueryService::from_workspace(&workspace)
