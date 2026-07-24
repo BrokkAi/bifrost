@@ -6262,12 +6262,13 @@ fn scan_usages_by_location_keeps_python_class_annotation_references() {
             .as_array()
             .expect("files array")
             .iter()
-            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
-            .any(|hit| {
-                hit["path"] == "src/shop/models.py"
-                    && hit["snippet"]
-                        .as_str()
-                        .is_some_and(|snippet| snippet.contains("-> \\\"User\\\""))
+            .any(|file| {
+                file["path"] == "src/shop/models.py"
+                    && file["hits"].as_array().into_iter().flatten().any(|hit| {
+                        hit["snippet"]
+                            .as_str()
+                            .is_some_and(|snippet| snippet.contains("-> \\\"User\\\""))
+                    })
             }),
         "quoted return annotation must remain an external class usage: {value}"
     );
