@@ -3,11 +3,11 @@
 use std::collections::VecDeque;
 
 use crate::analyzer::semantic::{
-    ControlEdgeKind, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
-    ProofStatus,
+    EvidenceCompleteness, IcfgEdgeId, IcfgNodeId, IcfgSnapshot, ProofStatus,
 };
 use crate::hash::{HashMap, HashSet};
 
+use super::transfer::{TransferEvaluation, evaluate_transfer};
 use super::{
     BoundedSnapshotDataflowProblem, DataflowCoverage, DataflowEdge, DataflowError, DataflowOutput,
     DataflowRequest, DataflowResult, DataflowSeed, DistributiveDataflowProblem, FactId,
@@ -105,61 +105,6 @@ where
         }
 
         self.values.insert(seed);
-        true
-    }
-}
-
-struct BoundedFactOutputs<'request, Fact> {
-    values: &'request mut HashSet<Fact>,
-    budget: &'request SolverBudget,
-    cancellation: &'request crate::analyzer::semantic::CancellationToken,
-    exceeded: Option<SolverBudgetExceeded>,
-}
-
-impl<'request, Fact> BoundedFactOutputs<'request, Fact>
-where
-    Fact: Copy + Eq + std::hash::Hash,
-{
-    fn new(
-        values: &'request mut HashSet<Fact>,
-        budget: &'request SolverBudget,
-        cancellation: &'request crate::analyzer::semantic::CancellationToken,
-    ) -> Self {
-        Self {
-            values,
-            budget,
-            cancellation,
-            exceeded: None,
-        }
-    }
-
-    const fn exceeded(&self) -> Option<SolverBudgetExceeded> {
-        self.exceeded
-    }
-}
-
-impl<Fact> DataflowOutput<Fact> for BoundedFactOutputs<'_, Fact>
-where
-    Fact: Copy + Eq + std::hash::Hash,
-{
-    fn emit(&mut self, value: Fact) -> bool {
-        if self.cancellation.is_cancelled() || self.exceeded.is_some() {
-            return false;
-        }
-        if self.values.contains(&value) {
-            return true;
-        }
-
-        let callback_rows = self.values.len().saturating_add(1);
-        if let Err(exceeded) = self.budget.check(SolverWork {
-            callback_rows,
-            ..SolverWork::uniform(0)
-        }) {
-            self.exceeded = Some(exceeded);
-            return false;
-        }
-
-        self.values.insert(value);
         true
     }
 }
@@ -295,7 +240,6 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
-        let mut emitted_outputs = HashSet::default();
         while let Some(queued) = self.worklist.pop_front() {
             if request.cancellation.is_cancelled() {
                 return Ok(SolverTermination::Cancelled);
@@ -316,46 +260,19 @@ where
                     return Ok(SolverTermination::Cancelled);
                 }
 
-                let staged_budget = match request.budget.staged_charge(SolverWork {
-                    flow_evaluations: 1,
-                    ..SolverWork::default()
-                }) {
-                    Ok(staged) => staged,
-                    Err(exceeded) => {
-                        return Ok(SolverTermination::ExceededBudget(exceeded));
-                    }
-                };
-                if request.cancellation.is_cancelled() {
-                    return Ok(SolverTermination::Cancelled);
-                }
-                *request.budget = staged_budget;
-
                 let descriptor = DataflowEdge::from_snapshot(self.snapshot, edge_id)
                     .expect("validated ICFG edge remains in its immutable snapshot");
-                emitted_outputs.clear();
-                let sink_exceeded = {
-                    let mut outputs = BoundedFactOutputs::new(
-                        &mut emitted_outputs,
-                        request.budget,
-                        request.cancellation,
-                    );
-                    apply_transfer(problem, descriptor, fact, &mut outputs);
-                    if queued.state.fact == ZERO_FACT_ID {
-                        let _ = outputs.emit(self.facts[ZERO_FACT_ID.index()]);
-                    }
-                    outputs.exceeded()
+                let canonical_outputs = match evaluate_transfer(
+                    problem,
+                    descriptor,
+                    fact,
+                    self.facts[ZERO_FACT_ID.index()],
+                    queued.state.fact == ZERO_FACT_ID,
+                    request,
+                ) {
+                    TransferEvaluation::Outputs(outputs) => outputs,
+                    TransferEvaluation::Terminated(termination) => return Ok(termination),
                 };
-
-                // A callback may cooperatively cancel through a shared token.
-                // Its outputs must not become visible after that checkpoint.
-                if request.cancellation.is_cancelled() {
-                    return Ok(SolverTermination::Cancelled);
-                }
-                if let Some(exceeded) = sink_exceeded {
-                    return Ok(SolverTermination::ExceededBudget(exceeded));
-                }
-                let mut canonical_outputs = emitted_outputs.iter().copied().collect::<Vec<_>>();
-                canonical_outputs.sort_unstable();
                 let output_quality = queued.quality.through_edge(edge);
                 if let Some(termination) =
                     self.publish_outputs(edge.target, output_quality, &canonical_outputs, request)?
@@ -499,27 +416,4 @@ where
     };
     let work = request.budget.used().saturating_sub(initial_work);
     Ok(state.finish(input.status(), termination, work))
-}
-
-fn apply_transfer<P>(
-    problem: &P,
-    edge: DataflowEdge<'_>,
-    fact: P::Fact,
-    out: &mut dyn DataflowOutput<P::Fact>,
-) where
-    P: DistributiveDataflowProblem,
-{
-    match edge.kind() {
-        IcfgEdgeKind::Intraprocedural(
-            ControlEdgeKind::Exceptional | ControlEdgeKind::AsyncExceptional,
-        ) => problem.exceptional_flow(edge, fact, out),
-        IcfgEdgeKind::Intraprocedural(_) => problem.normal_flow(edge, fact, out),
-        IcfgEdgeKind::Call => problem.call_flow(edge, fact, out),
-        IcfgEdgeKind::NormalReturn | IcfgEdgeKind::ExceptionalReturn => {
-            problem.return_flow(edge, fact, out);
-        }
-        IcfgEdgeKind::CallToNormalContinuation | IcfgEdgeKind::CallToExceptionalContinuation => {
-            problem.call_to_return_flow(edge, fact, out);
-        }
-    }
 }

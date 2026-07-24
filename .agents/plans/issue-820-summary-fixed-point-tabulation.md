@@ -17,9 +17,9 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
 - [x] (2026-07-24 06:20Z) Fetched the live remote and created `dave/820-summary-fixed-point-tabulation` exactly at `origin/master` commit `b594a149`.
 - [x] (2026-07-24 06:20Z) Verified live issue #820 and audited the landed bounded solver, semantic ICFG provider, recursive snapshot frontier, result/budget contracts, and source-backed test harness with three parallel specialists.
 - [x] (2026-07-24 06:20Z) Chose the demand-driven provider-backed architecture and wrote this second-child ExecPlan.
-- [ ] Extract the provider-owned procedure-exit and matched-return projection used by both snapshot expansion and summary tabulation.
-- [ ] Add summary-specific contracts, result rows, coverage, metrics, and work dimensions.
-- [ ] Implement deterministic iterative path-edge, incoming-call, end-summary, and replay tables.
+- [x] (2026-07-24 07:48Z) Extracted the provider-owned procedure-exit profile and matched-return/call-boundary projections, then kept the existing ICFG unit and contract suites green.
+- [x] (2026-07-24 07:48Z) Added summary-specific result rows, coverage, reuse metrics, and independently bounded end-summary, incoming-call, and provider-materialization work.
+- [x] (2026-07-24 07:48Z) Implemented the iterative relative path-edge, incoming-call, end-summary, and exact replay tables, and verified that the existing bounded solver/client regression suites remain green after sharing transfer evaluation.
 - [ ] Add the repeated-scan reference plus recursion, reuse, return, incompleteness, cancellation, budget, and determinism tests.
 - [ ] Run formatting, focused tests, strict all-feature Clippy, and the complete `nlp,python` suite.
 - [ ] Run five specialist reviews, fix every actionable finding, rerun validation, and update this plan with final evidence.
@@ -37,6 +37,9 @@ This child is query-local and in-memory. It does not add SQLite persistence, wit
 
 - Observation: precomputed SCCs are not required for this child.
   Evidence: finite path-edge, incoming-call, and end-summary tables grow monotonically; replaying a new summary across waiting incoming calls naturally reaches the same recursive and mutually recursive fixed point with an iterative worklist. Issue #819 graph utilities may proceed independently.
+
+- Observation: the public semantic envelope is not by itself sufficient to preserve the snapshot builder's exact internal quality precedence.
+  Evidence: an exit-local exceeded-budget gap is exposed as an available `Unknown` profile, while the bounded snapshot previously retained its internal `Truncated` quality when combining that gap with other unsupported or ambiguous gaps. The exit profile therefore privately retains its exact local quality for snapshot replay, while summary clients continue to see the stable public envelope and concrete gap evidence.
 
 ## Decision Log
 

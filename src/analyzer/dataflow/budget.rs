@@ -10,15 +10,18 @@ define_work_dimensions! {
     #[repr(u8)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum SolverBudgetDimension;
-    /// Work performed or limits applied by one bounded data-flow solve.
+    /// Work performed or limits applied by one data-flow solve.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SolverWork;
-    all: pub(crate) [5];
+    all: pub(crate) [8];
     InternedFacts => interned_facts = 100_000,
     ReachedStates => reached_states = 1_000_000,
     FlowEvaluations => flow_evaluations = 4_000_000,
     CallbackRows => callback_rows = 4_000_000,
     PropagatedOutputs => propagated_outputs = 4_000_000,
+    EndSummaries => end_summaries = 1_000_000,
+    IncomingCalls => incoming_calls = 1_000_000,
+    ProviderMaterializations => provider_materializations = 100_000,
 }
 
 /// Exact failed solver-budget charge.
@@ -67,14 +70,15 @@ impl fmt::Display for SolverBudgetExceeded {
 
 impl Error for SolverBudgetExceeded {}
 
-/// Five-dimensional request-local work budget.
+/// Eight-dimensional request-local work budget.
 ///
 /// `callback_rows` is the single deterministic cap for each unique seed or
 /// transfer relation collected from clients. If a complete relation fits that
 /// cap, the kernel sorts it and atomically checks the exact fact, state,
 /// callback-row, and propagated-output charge. Problem implementations must
 /// still stop emitting when requested and return cooperatively to bound their
-/// own CPU work.
+/// own CPU work. Summary tabulation additionally limits retained end summaries,
+/// waiting incoming calls, and semantic-provider cache misses independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverBudget {
     ledger: BudgetLedger<SolverWork>,
@@ -159,6 +163,9 @@ mod tests {
             flow_evaluations: 10,
             callback_rows: 10,
             propagated_outputs: 10,
+            end_summaries: 10,
+            incoming_calls: 10,
+            provider_materializations: 10,
         });
         budget
             .charge(SolverWork {
