@@ -58,6 +58,30 @@ fn receiver_typing_is_function_scoped_not_class_body() {
     );
 }
 
+#[test]
+fn python_annotation_edges_resolve_reexported_class_aliases() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("shop/models.py", "class User:\n    pass\n\nclass Other:\n    pass\n")
+        .file("shop/__init__.py", "from .models import User as Account\n")
+        .file(
+            "app.py",
+            "from shop import Account\nfrom shop.models import Other\n\ndef describe(value: Account) -> Account:\n    local: Account = value\n    return local\n\ndef unrelated(value: Other) -> Other:\n    return value\n",
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.describe", "shop.models.User"),
+        "parameter, return, and assignment annotations should resolve through Account: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.describe", "shop.models.Other"),
+        "Account annotations must not produce an edge to Other: {}",
+        value["edges"]
+    );
+}
+
 fn fqns(value: &Value) -> Vec<String> {
     value["nodes"]
         .as_array()
