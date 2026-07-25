@@ -49,6 +49,18 @@ pub(crate) enum SegmentKind {
     Nested,
     /// A function, method, field, const, alias, or macro.
     Member,
+    /// A segment whose denotation is not known from its spelling — the kind
+    /// assigned to every segment of a *user-supplied* symbol path parsed at the
+    /// MCP input edge (see
+    /// [`crate::analyzer::symbol_lookup::parse_symbol_path_fq`]). Users type
+    /// spellings, not kinds, so input segments are matched kind-insensitively
+    /// against extracted names; `Unknown` records "no kind claim". It renders
+    /// with an ordinary `.` join (the default), so an input `FqName` renders to
+    /// exactly the canonical `.`-joined spelling the string index is keyed by —
+    /// which is why M2's consumers can match input against the string-keyed
+    /// `definitions` index by rendering, without a kind-aware compare. See the
+    /// Decision Log entry in `.agents/plans/fqname-interned-segments.md`.
+    Unknown,
 }
 
 /// Interned `(text, kind)` pair. Process-local; never persisted.
@@ -74,12 +86,12 @@ impl FqName {
         self.segments.is_empty()
     }
 
-    // `len`, `parent`, `last`, `starts_with`, `segments`, and `display_native`
-    // are the consumer-facing surface the M2 milestone wires into the shared
-    // resolvers (owner-chain walking, enclosing-scope composition, the anchor
-    // splitter). They exist and are unit-tested now so the API is settled, but
-    // no production caller reads them until M2; the allow keeps the M1 tree
-    // green under `-D warnings` without a blanket module allow.
+    // `parent`, `segments`, and `display_native` are wired into the M2 shared
+    // resolvers (owner-chain pop, enclosing-scope composition). `len`, `last`,
+    // and `starts_with` round out the consumer-facing surface and are
+    // unit-tested so the API is settled, but no production caller reads them
+    // until later milestones; the allow keeps the tree green under `-D warnings`
+    // without a blanket module allow.
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.segments.len()
@@ -98,7 +110,6 @@ impl FqName {
 
     /// The name with its final segment removed, or `None` if empty. Allocates
     /// only the SmallVec copy, never a string.
-    #[allow(dead_code)] // consumed in M2 (see note on `len`)
     pub(crate) fn parent(&self) -> Option<FqName> {
         if self.segments.is_empty() {
             return None;
@@ -118,7 +129,6 @@ impl FqName {
         self.segments.starts_with(&prefix.segments)
     }
 
-    #[allow(dead_code)] // consumed in M2 (see note on `len`)
     pub(crate) fn segments(&self) -> &[SegmentId] {
         &self.segments
     }
@@ -281,6 +291,24 @@ impl SegmentInterner {
         // `text` is `&'static str`; returning it under `&self`'s lifetime is a
         // safe subtyping shrink, and it outlives the dropped read guard.
         (text, kind)
+    }
+
+    /// The separator that would render between two already-interned segments in
+    /// language `lang`'s native spelling. Exposed so the shrinking-scope
+    /// resolver can reproduce the legacy dot-only prefix walk exactly: it
+    /// descends across a boundary only where that boundary renders as a literal
+    /// `.` (never `::` in C++'s namespace head, `/` between path components, or
+    /// `$` before a nested segment), which is what keeps a `::`-headed C++
+    /// namespace scope from being descended (issue #1163 stays pinned until M4).
+    pub(crate) fn separator_between(
+        &self,
+        prev: SegmentId,
+        cur: SegmentId,
+        lang: Language,
+    ) -> &'static str {
+        let (_, prev_kind) = self.resolve(prev);
+        let (_, cur_kind) = self.resolve(cur);
+        separator(prev_kind, cur_kind, Some(lang))
     }
 }
 
@@ -445,6 +473,50 @@ mod tests {
             name.display_native(Language::Cpp, &interner),
             "cutlass::gemm::warp.OperandStorage.layout"
         );
+    }
+
+    #[test]
+    fn unknown_input_segments_render_dot_joined() {
+        // A user-supplied symbol path (parsed at the input edge) is a chain of
+        // `Unknown` segments; it must render to the canonical `.`-joined
+        // spelling the string index is keyed by, regardless of how the segments
+        // were originally spelled (`::`, `/`, ...), so an input FqName can be
+        // matched by rendering against the `.`-joined `definitions` index.
+        let interner = SegmentInterner::new();
+        let name = fq(
+            &interner,
+            &[
+                ("a", SegmentKind::Unknown),
+                ("b", SegmentKind::Unknown),
+                ("C", SegmentKind::Unknown),
+            ],
+        );
+        assert_eq!(name.display(&interner), "a.b.C");
+        // Native rendering agrees (Unknown is never Package, so C++'s `::` rule
+        // never fires), and appending an Unknown reference to any scope prefix
+        // joins with `.`.
+        assert_eq!(name.display_native(Language::Cpp, &interner), "a.b.C");
+        let pkg = interner.intern("ns", SegmentKind::Package);
+        assert_eq!(
+            interner.separator_between(pkg, name.segments()[0], Language::Cpp),
+            "."
+        );
+    }
+
+    #[test]
+    fn separator_between_reports_native_boundaries() {
+        let interner = SegmentInterner::new();
+        let p0 = interner.intern("cutlass", SegmentKind::Package);
+        let p1 = interner.intern("gemm", SegmentKind::Package);
+        let ty = interner.intern("Outer", SegmentKind::Type);
+        let nested = interner.intern("Inner", SegmentKind::Nested);
+        // Package->Package renders `::` in C++ (a non-dot boundary the
+        // shrinking-scope walk must not descend), `.` canonically.
+        assert_eq!(interner.separator_between(p0, p1, Language::Cpp), "::");
+        assert_eq!(interner.separator_between(p0, p1, Language::Rust), ".");
+        // Package->Type is `.` everywhere; a Nested segment is always `$`.
+        assert_eq!(interner.separator_between(p1, ty, Language::Cpp), ".");
+        assert_eq!(interner.separator_between(ty, nested, Language::Cpp), "$");
     }
 
     #[test]

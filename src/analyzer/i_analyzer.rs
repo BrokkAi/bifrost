@@ -679,21 +679,44 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        let fq_name = code_unit.fq_name();
-        let mut last_index = None;
-
-        for separator in [".", "$", "::", "->"] {
-            if let Some(index) = fq_name.rfind(separator)
-                && index + separator.len() < fq_name.len()
-                && last_index.map(|current| index > current).unwrap_or(true)
-            {
-                last_index = Some(index);
-            }
-        }
-
-        let parent_name = fq_name.get(..last_index?)?;
-        self.definitions(parent_name).next()
+        let parent_name = default_parent_fq_name(code_unit)?;
+        self.definitions(&parent_name).next()
     }
+}
+
+/// The fully-qualified name of `code_unit`'s owner (the unit with its final
+/// name segment removed), or `None` if it has no owner. Shared by the default
+/// [`IAnalyzer::parent_of`] and its dual-arm equivalence test.
+///
+/// When the unit carries a populated structured [`FqName`] (M1: every
+/// freshly-extracted unit does), the owner is a pure segment pop rendered in
+/// the unit's native spelling — the boundaries are recorded, never re-guessed.
+/// A cache-loaded unit has an empty `fq` until persistence carries segments
+/// (M3), so it falls back to the legacy separator scan over the joined string;
+/// the M1 equivalence assertion guarantees the two arms compute the identical
+/// owner name, so behavior is unchanged. The fallback arm is deleted in M4.
+fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
+    let fq = code_unit.fq();
+    if !fq.is_empty() {
+        let parent = fq.parent().filter(|parent| !parent.is_empty())?;
+        let interner = crate::analyzer::fq_name::segment_interner();
+        let language = crate::analyzer::common::language_for_file(code_unit.source());
+        return Some(parent.display_native(language, interner));
+    }
+
+    // Legacy fallback (empty-fq / cache-loaded units; deleted in M4): the owner
+    // boundary is the rightmost of the separators the joined spelling can use.
+    let fq_name = code_unit.fq_name();
+    let mut last_index = None;
+    for separator in [".", "$", "::", "->"] {
+        if let Some(index) = fq_name.rfind(separator)
+            && index + separator.len() < fq_name.len()
+            && last_index.map(|current| index > current).unwrap_or(true)
+        {
+            last_index = Some(index);
+        }
+    }
+    Some(fq_name.get(..last_index?)?.to_string())
 }
 
 /// Releases request-scoped analyzer memoization on every return path.
@@ -938,5 +961,177 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
         crate::analyzer::CodeUnitType::FileScope => 5,
+    }
+}
+
+#[cfg(test)]
+mod parent_of_tests {
+    use super::*;
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+
+    /// Build the two dual-representation forms of one declaration: a
+    /// freshly-extracted unit carrying a populated structured `FqName`, and its
+    /// cache-loaded twin whose `fq` is still empty (persistence carries segments
+    /// in M3). The two must derive the identical owner name through
+    /// `default_parent_fq_name` — the empty-fq unit takes the legacy separator
+    /// scan, the populated one takes the segment pop — which is what makes the
+    /// M2 migration a zero-behavior change while both arms coexist.
+    fn dual_units(
+        rel: &str,
+        kind: CodeUnitType,
+        package_name: &str,
+        short_name: &str,
+        segments: &[(&str, SegmentKind)],
+    ) -> (CodeUnit, CodeUnit) {
+        let source = ProjectFile::new(std::path::PathBuf::from("/repo"), rel);
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        for &(text, seg_kind) in segments {
+            let id: SegmentId = interner.intern(text, seg_kind);
+            fq.push(id);
+        }
+        // `new_fq` runs the M1 equivalence assertion, so a mis-tagged segment
+        // fails this test loudly at construction.
+        let with_fq = CodeUnit::new_fq(source.clone(), kind, package_name, short_name, fq);
+        let without_fq = CodeUnit::new(source, kind, package_name, short_name);
+        assert!(!with_fq.fq().is_empty());
+        assert!(without_fq.fq().is_empty());
+        (with_fq, without_fq)
+    }
+
+    fn assert_arms_agree(
+        rel: &str,
+        kind: CodeUnitType,
+        package_name: &str,
+        short_name: &str,
+        segments: &[(&str, SegmentKind)],
+        expected_parent: Option<&str>,
+    ) {
+        let (with_fq, without_fq) = dual_units(rel, kind, package_name, short_name, segments);
+        let popped = default_parent_fq_name(&with_fq);
+        let scanned = default_parent_fq_name(&without_fq);
+        assert_eq!(
+            popped.as_deref(),
+            expected_parent,
+            "segment-pop arm owner name mismatch for {short_name:?}"
+        );
+        assert_eq!(
+            popped, scanned,
+            "segment-pop and legacy-scan arms must derive the identical owner for {short_name:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_namespace_head_owner_is_identical_across_arms() {
+        // `::` between namespaces, `.` down the owner/member tail — the mixed
+        // separator the plan calls out. Both arms drop the trailing member.
+        assert_arms_agree(
+            "a.cpp",
+            CodeUnitType::Function,
+            "ns1::ns2",
+            "Outer.method",
+            &[
+                ("ns1", SegmentKind::Package),
+                ("ns2", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+            Some("ns1::ns2.Outer"),
+        );
+    }
+
+    #[test]
+    fn cpp_namespace_component_owner_is_identical_across_arms() {
+        // Popping into the `::`-joined namespace head: both arms agree because
+        // `::` is in the parent-of separator set (unlike the shrinking-scope
+        // walk, which deliberately never descends it).
+        assert_arms_agree(
+            "a.cpp",
+            CodeUnitType::Class,
+            "ns1::ns2",
+            "Outer",
+            &[
+                ("ns1", SegmentKind::Package),
+                ("ns2", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+            ],
+            Some("ns1::ns2"),
+        );
+    }
+
+    #[test]
+    fn dotted_package_owner_is_identical_across_arms() {
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Function,
+            "pkg.mod",
+            "Cls.method",
+            &[
+                ("pkg", SegmentKind::Package),
+                ("mod", SegmentKind::Package),
+                ("Cls", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+            Some("pkg.mod.Cls"),
+        );
+    }
+
+    #[test]
+    fn dollar_nested_owner_is_identical_across_arms() {
+        // A `$`-joined nested type: dropping the member, then dropping the
+        // nested type, agrees between the segment pop and the `$`/`.` scan.
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Field,
+            "",
+            "Owner$Inner.member",
+            &[
+                ("Owner", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
+                ("member", SegmentKind::Member),
+            ],
+            Some("Owner$Inner"),
+        );
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Class,
+            "",
+            "Owner$Inner",
+            &[("Owner", SegmentKind::Type), ("Inner", SegmentKind::Nested)],
+            Some("Owner"),
+        );
+    }
+
+    #[test]
+    fn go_import_path_member_owner_is_identical_across_arms() {
+        // Path components carry literal dots (`github.com`) and `/` joins; both
+        // arms drop only the trailing member, so the embedded dot never splits.
+        assert_arms_agree(
+            "a.go",
+            CodeUnitType::Function,
+            "github.com/foo/bar",
+            "Baz.method",
+            &[
+                ("github.com", SegmentKind::Path),
+                ("foo", SegmentKind::Path),
+                ("bar", SegmentKind::Path),
+                ("Baz", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+            Some("github.com/foo/bar.Baz"),
+        );
+    }
+
+    #[test]
+    fn single_segment_has_no_owner_in_either_arm() {
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Class,
+            "",
+            "Solo",
+            &[("Solo", SegmentKind::Type)],
+            None,
+        );
     }
 }

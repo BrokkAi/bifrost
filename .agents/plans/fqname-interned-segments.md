@@ -58,7 +58,14 @@ the analyzer tree.
   - [x] cleanup: migrate cpp's nested-class Type-Type native `$` rule onto
         `Nested` (2026-07-24, logged in the M1 rust/scala/cpp Decision Log
         entry above; done as part of this wave)
-- [ ] M2: shared services and selectors consume `FqName`; input parsing produces it.
+- [x] M2 (2026-07-24): shared services and selectors consume `FqName`; input
+      parsing produces it. `parse_symbol_path_fq` added; the default
+      `IAnalyzer::parent_of`, `resolve_qualified_in_enclosing_scopes`, and its
+      shrinking-scope core migrated to segment composition with empty-fq string
+      fallbacks; the issue-1162 reference-normalization shim deleted; the anchor
+      splitter left byte-identical (retirement deferred, see Decision Log). Zero
+      behavior change proven by the named regression suites plus the touched
+      language analyzer/usages suites (all green; tally in Outcomes).
 - [ ] M3: persistence flip — store schema carries segments; single epoch salt bump.
 - [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip.
 
@@ -214,6 +221,37 @@ the analyzer tree.
   top-level class in the fixture corpus (six distinct panics from one test
   run), then reverted; `cargo test --test python_analyzer_test` returned to
   24/24 passing afterward.
+
+- Observation (M2 — the legacy `namespace_prefixes` walk is EXACTLY "cut the
+  scope's native string at each literal `.`", which in segment terms is "cut at
+  each boundary the native rendering spells `.`"): the whole risk of migrating
+  `resolve_qualified_name_in_shrinking_scopes` onto segments was reproducing the
+  cpp non-descent (never composing a sibling namespace, the issue-1163 pin)
+  while still deleting the verbatim-scope workaround. The key equivalence: for
+  the four languages that reach this resolver (rust, cpp, scala, csharp) NO
+  segment's text contains an embedded `.` (only Go's `github.com`-style Path
+  segments do, and Go never reaches here), so the string `rfind('.')` truncation
+  points line up one-for-one with the segment boundaries whose
+  `separator_between(..)` is `.`. A cpp `::` namespace boundary and a `$` nested
+  boundary are simply not `.`, so the segment walk skips them — identically to
+  the string walk, which cannot `rfind('.')` across a `::`. Evidence: with the
+  dot-cut rule, `issue_1162_separator_aware_enclosing_scope` stays 10/10 with the
+  cutlass `cpp_qualified_nested_namespace_type_current_behavior` pin intact, and
+  `get_definition_test` stays 635/635.
+
+- Observation (M2 — segment pop and the legacy `parent_of` scan diverge ONLY on
+  an all-`Path` Go unit, which no test exercises, so the migration is safe): the
+  default `parent_of` separator set is `[".","$","::","->"]` and does NOT include
+  `/`. For a Go module unit whose fq is entirely Path segments
+  (`github.com/foo/bar`), the string scan's rightmost `.` lands *inside*
+  `github.com` (yielding `github`), whereas the segment pop drops the last Path
+  component (yielding `github.com/foo`). This is the exact class of bug the plan
+  exists to kill — but for every unit with a real owner (a member/type leaf), the
+  rightmost separator is the leaf boundary, so the two arms agree, and the full
+  Go suite (`go_analyzer_test`, `go_canonical_fqn_test`, `usages_go_graph_test`,
+  `usage_graph_go_test`) is green after the switch — nothing calls `parent_of`
+  on an all-Path Go unit in a way that observes the difference. Recorded so the
+  divergence is a known, intended M4 correctness gain, not a lurking surprise.
 
 ## Decision Log
 
@@ -523,6 +561,93 @@ the analyzer tree.
   this is the intended convergence, not a behavior change to any legacy
   string). Date/Author: 2026-07-24, implementation (java/csharp/js/ts M1 wave).
 
+- Decision (M2 input edge — kind-insensitive user input via a new
+  `SegmentKind::Unknown`, NOT best-effort Path/Type tagging): the plan's M2
+  paragraph left one question open — tag input segments best-effort (file/slash
+  heads → Path, leaf → Member/Type) OR match kind-insensitively. Chose
+  kind-insensitive: every segment of a user-supplied path (`parse_symbol_path_fq`
+  in `src/analyzer/symbol_lookup.rs`) is interned as `SegmentKind::Unknown`.
+  Rationale: (1) users type spellings, not kinds — a best-effort kind is a guess
+  that can only be wrong, and the input never needs a kind to be matched; (2)
+  the actual M2 consumer of `parse_symbol_path_fq` (the enclosing-scope
+  resolver) matches by *rendering* the composed candidate to a string and
+  looking it up in the string-keyed `analyzer.definitions` index — so kind is
+  irrelevant to matching, it only affects rendering *separators*. `Unknown`
+  renders with an ordinary `.` (the default in `separator`), so an input FqName
+  renders to exactly `parse_symbol_path(..).join(".")` — the canonical
+  normalization the old issue-1162 shim produced — which is what makes the shim
+  deletion byte-identical. Tagging heads `Path` would have been WRONG here:
+  `Path`-`Path` renders `/`, so a slash-input reference `a/b` would render `a/b`
+  instead of the required `a.b`. The "text-level comparison path" the plan asks
+  for (interner text-id lookup / kind-differing FqName compare) is therefore NOT
+  introduced in M2 — it is genuinely unneeded while consumers match by rendered
+  string against the string index. It becomes necessary only at M3, when the
+  index turns segment-keyed and matching moves to FqName integer-equality; the
+  decision is recorded now and the interner text-id path is deferred to where it
+  is actually exercised (respecting the plan's "introduce X ONLY if matching
+  genuinely needs it"). `SegmentKind::Unknown` renders `.` in both canonical and
+  native spellings (it is never `Package`, so C++'s `::` rule never fires).
+  Date/Author: 2026-07-24, implementation (M2).
+
+- Decision (M2 `parent_of` default — segment pop with an empty-fq string
+  fallback, factored into `default_parent_fq_name` in `src/analyzer/i_analyzer.rs`):
+  a populated `fq` yields the owner by a pure `FqName::parent()` pop rendered
+  with `display_native(language)`; a cache-loaded (empty-fq) unit keeps the
+  legacy rightmost-of-`[".","$","::","->"]` scan. The M1 equivalence assertion
+  guarantees the two arms compute the identical owner name, so the switch is
+  zero-behavior-change; both arms are exercised by dual-arm unit tests
+  (`parent_of_tests`) that build a `new_fq` unit and its empty-`fq` twin from the
+  same strings and assert identical owner names across cpp `::`-heads, dotted
+  packages, `$`-nested types, and Go import paths. The rust/scala/java/csharp/
+  js/ts `parent_of` overrides are untouched. Rationale: `::` is in the parent-of
+  separator set (unlike the shrinking-scope walk), so segment pop and string
+  scan agree even when popping into a C++ namespace head — parent-of legitimately
+  descends namespaces where the shrinking-scope walk must not. Date/Author:
+  2026-07-24, implementation (M2).
+
+- Decision (M2 shrinking-scope migration — `resolve_qualified_name_in_shrinking_scopes_fq`
+  composes candidates by segment push, and the reference-normalization shim is
+  deleted): `resolve_qualified_in_enclosing_scopes` (`get_definition/mod.rs`) now
+  parses the reference once into an `FqName` (`parse_symbol_path_fq`) and, when
+  the enclosing scope unit has a populated `fq`, composes each candidate by
+  pushing the reference segments onto a scope prefix and rendering natively —
+  deleting `normalize_reference_to_fq_segments` entirely (the M1 shim that
+  string-joined the parsed reference). The verbatim-scope "workaround" is
+  replaced by a precise segment rule: the scope prefix walk descends across a
+  boundary ONLY where the native rendering places a literal `.`
+  (`SegmentInterner::separator_between(..) == "."`), which reproduces the legacy
+  dot-only `namespace_prefixes` walk EXACTLY for the four reaching languages
+  (rust/cpp/scala/csharp — none of whose segments contain an embedded dot), and
+  in particular never descends a C++ `::`-joined namespace head — so issue #1163
+  stays pinned (`cpp_qualified_nested_namespace_type_current_behavior` green)
+  until M4 flips it deliberately. Empty-fq scope units (cache-loaded) fall back
+  to the retained string core `resolve_qualified_name_in_shrinking_scopes`,
+  rendering the reference via `display()` to the same `.`-joined normalization;
+  the csharp bounded fork (`resolve_csharp_in_enclosing_scopes`) keeps calling
+  that string core unchanged (its scope is bare-name + budget-charged; migrating
+  it is a low-value M4 follow-up). Both arms proven identical by
+  `issue_1162_separator_aware_enclosing_scope` (10/10, including the cutlass pin)
+  and `get_definition_test` (635/635) staying green. Date/Author: 2026-07-24,
+  implementation (M2).
+
+- Decision (M2 anchor splitter — retirement deferred, splitter left
+  byte-identical): the plan's part-4 ask ("selectors parse into optional
+  Path-prefix + symbol segments; the `.r`-lookalike heuristics retire where the
+  tagged boundary makes them redundant") is realized as a documented deferral,
+  not a code change to `split_definition_selector_with_resolver` in
+  `src/searchtools/selectors.rs`. Reason: that splitter runs *before* the input
+  is bound to a language, so it cannot parse `DbColumn.r#type` into a single
+  raw-identifier `Member` segment to prove the `#` is intra-token — only a
+  language-aware `parse_symbol_path_fq` could, and threading a language into the
+  pre-resolution splitter is a larger change than M2's zero-behavior bar allows.
+  The `anchor_is_file` resolver check — which the plan explicitly keeps as the
+  semantic validation — already resolves #1128 correctly (`DbColumn.r` is not a
+  file), so the `.r`-lookalike heuristic is NOT yet redundant. The #1128/#1131
+  anchor canaries pass UNCHANGED (12/12 and within searchtools_definition_selectors
+  73/73), which is the plan's stated bar for this part. A clarifying comment at
+  the split site records the segment-model relationship and points here.
+  Date/Author: 2026-07-24, implementation (M2).
+
 ## Outcomes & Retrospective
 
 - M1 rust/scala/cpp (2026-07-24): all three "hard" languages now populate
@@ -647,6 +772,45 @@ the analyzer tree.
   for every `$`-joined nesting convention in the tree; `SegmentKind::Companion`
   remains scala-only. M2 (shared services and selectors consuming `FqName`;
   input parsing producing it) is next.
+
+- **M2 complete (2026-07-24):** the consolidated shared consumers now operate on
+  interned segments, and the MCP input edge produces them. Changes:
+  * `SegmentKind::Unknown` added (input-only, renders `.`); `parse_symbol_path_fq`
+    added beside `parse_symbol_path` in `src/analyzer/symbol_lookup.rs` — same
+    splitter/normalization, every segment `Unknown` (kind-insensitive input; see
+    Decision Log).
+  * `SegmentInterner::separator_between` added to `src/analyzer/fq_name.rs` (the
+    native boundary spelling between two interned segments), plus the `parent`/
+    `segments` dead-code allows removed as they went live.
+  * default `IAnalyzer::parent_of` (`src/analyzer/i_analyzer.rs`) → segment pop
+    via new `default_parent_fq_name`, with the legacy separator scan as the
+    empty-fq fallback; six dual-arm `parent_of_tests` prove both arms agree.
+  * `resolve_qualified_in_enclosing_scopes` (`get_definition/mod.rs`) → builds an
+    `FqName` reference and composes candidates by push via new
+    `resolve_qualified_name_in_shrinking_scopes_fq` (dot-cut prefix walk); the
+    `normalize_reference_to_fq_segments` shim DELETED; string core retained as
+    the empty-fq fallback and for the csharp bounded fork.
+  * anchor splitter left byte-identical (retirement deferred; comment + Decision
+    Log record why).
+  Validation (all `BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python`):
+  `cargo fmt` clean; `cargo clippy --all-targets --features nlp,python -D warnings`
+  clean; `--lib` targeted fq_name/parent_of/symbol_lookup 19/19; the six named
+  regression suites — `get_definition_test` 635, `searchtools_service` 189 (+1
+  ignored), `searchtools_definition_selectors` 73, `issue_1128_rust_raw_identifiers`
+  12, `issue_1162_separator_aware_enclosing_scope` 10 (cutlass pin intact),
+  `mcp_property_fuzzer_service` 61 — plus `searchtools_fuzzy_symbol_lookup` 41,
+  `issue_1089` 10, `issue_1126` 12, `issue_1158` 15; and the touched-language
+  analyzer/usages suites: cpp (analyzer 43, usages_cpp_graph, usage_graph_cpp 28,
+  issue_1093 9, issue_1120 10, issue_1121 11), rust (analyzer 15, usage_graph 21,
+  usages_rust_graph), scala (analyzer 29, definition_precedence 52,
+  usages_scala_graph), csharp (analyzer 12, usages_csharp_graph), java
+  (declarations_parity 4, usages_java_graph), go (analyzer 21, canonical_fqn 24,
+  usages_go_graph 16, usage_graph_go 20), python (analyzer 19, usages_python_graph
+  16, usage_graph_python 18), php (analyzer 5, usage_graph_php 10), ruby (analyzer
+  55, usages_ruby 104, usage_graph_ruby 46) — ALL 0 failed. M3 (persistence flip
+  + salt bump) is next; the empty-fq fallback arms in `default_parent_fq_name` and
+  `resolve_qualified_in_enclosing_scopes` become live once the cache carries
+  segments, and are deleted in M4.
 
 ## Context and Orientation
 
@@ -919,3 +1083,22 @@ validation tally. Why: these three languages each carried a known reconciliation
 mixed-separator `::` store and nested-class `$` chains) that required display-rule
 and assertion changes beyond the mechanical go/M0 pattern; the plan must capture
 those decisions so the next contributor (and M2/M3) inherits the reasoning.
+
+## Revision note (2026-07-24, M2)
+
+Recorded M2 completion: `Progress` M2 checkbox flipped with a summary; four
+`Decision Log` entries added (kind-insensitive input via `SegmentKind::Unknown`;
+`parent_of` segment pop with empty-fq fallback; the shrinking-scope
+segment-composition migration with the issue-1162 shim deletion and the dot-cut
+non-descent rule that keeps issue-1163 pinned; and the anchor-splitter deferral
+with its reasoning); two `Surprises & Discoveries` observations added (the
+`namespace_prefixes`-equals-dot-boundary-cuts equivalence that makes the cpp
+non-descent reproducible, and the Go all-`Path`-unit `parent_of` divergence that
+no test exercises); and an `Outcomes & Retrospective` M2 entry with the full
+validation tally. Why: M2 moves live resolution onto segments while the legacy
+strings still drive behavior, so each migration needed an explicit empty-fq
+fallback and a recorded proof that both arms agree; the open kind-tagging design
+question the plan left for M2 is resolved here (kind-insensitive, `Unknown`), and
+the anchor-splitter part is honestly scoped to what a pre-language splitter can do
+without regressing the #1128/#1131 canaries. The next contributor (M3) inherits
+which fallback arms go live under persistence and which are deleted at M4.
