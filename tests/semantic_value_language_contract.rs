@@ -2609,7 +2609,21 @@ fn source_points_to_projection_is_pre_cancellable_and_budget_staged() {
         )
         .expect("large fixture materialization");
     assert!(materialized.available_value().is_some());
-    let materialization_work = materialization_budget.used();
+    let cold_materialization_work = materialization_budget.used();
+    let mut cached_materialization_budget = SemanticBudget::default();
+    let cached_materialized = analyzer
+        .materialize_program_semantics(
+            &file,
+            &mut SemanticRequest::new(&mut cached_materialization_budget, &cancellation),
+        )
+        .expect("cached large fixture materialization");
+    assert!(cached_materialized.available_value().is_some());
+    let materialization_work = cached_materialization_budget.used();
+    assert_eq!(cached_materialized.work(), materialization_work);
+    assert!(
+        cold_materialization_work.nested_entries >= materialization_work.nested_entries,
+        "cold inventory traversal may add work that a cache hit does not repeat"
+    );
 
     let mut baseline_budget = SemanticBudget::default();
     let baseline = oracle

@@ -36,14 +36,7 @@ pub(super) struct NestedProcedureTarget {
     pub(super) receiver_capture_destination: Option<MemoryLocationId>,
 }
 
-pub(super) enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-        work: SemanticWork,
-    },
-    Cancelled,
-}
+pub(super) type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -57,43 +50,27 @@ pub(super) fn enumerate_procedures<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
-    let mount = WorkspaceMountId::from_root(file.root());
-    let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
     let language = prepared.dialect();
-    let file_anchor = source_anchor(prepared.tree().root_node(), 0)
-        .map_err(SemanticProviderError::invalid_identity)?;
     let fallback_file_name = match language.language() {
         Language::JavaScript => "javascript-source",
         Language::TypeScript => "typescript-source",
         _ => unreachable!("the shared lowerer validates a JavaScript or TypeScript dialect"),
     };
-    let file_name = file
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(fallback_file_name);
-    let file_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::File, file_name, file_anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-
-    type SiblingKey = (usize, DeclarationSegmentKind, Option<Box<str>>);
-    let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
-    let mut siblings: HashMap<SiblingKey, u32> = HashMap::default();
-    let mut declaration_paths = vec![DeclarationPathEntry {
-        parent: None,
-        segment: file_segment,
-    }];
-    let mut preflight = SemanticWork::default();
     let root = prepared.tree().root_node();
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, language, root, fallback_file_name, budget)?;
+    let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
-        declaration_path: 0,
+        declaration_path: inventory.root_path(),
     }];
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
         }
         let ProcedureEnumerationFrame {
             node,
@@ -103,74 +80,51 @@ pub(super) fn enumerate_procedures<'tree>(
         let mut outer_path = declaration_path;
         if let Some(segment_kind) = declaration_container_kind(node) {
             let name = declaration_container_name(prepared.source(), node);
-            let sibling_ordinal = next_sibling_ordinal(
-                &mut siblings,
+            let anchor = source_anchor(node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            outer_path = inventory.push_container(
                 declaration_path,
                 segment_kind,
                 name.as_deref(),
-            );
-            let anchor = source_anchor(node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment =
-                declaration_segment(segment_kind, name.as_deref(), anchor, sibling_ordinal)
-                    .map_err(SemanticProviderError::invalid_identity)?;
-            outer_path = push_declaration_path(&mut declaration_paths, declaration_path, segment);
+                anchor,
+            )?;
         }
 
         let mut procedure_context = None;
         if let Some((mut kind, mut segment_kind, body, properties)) = callable_shape(node) {
-            let id = ProcedureId::try_from_index(specs.len())
-                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
             let name = callable_name(prepared.source(), node);
             if name.as_deref() == Some("constructor") {
                 kind = ProcedureKind::Constructor;
                 segment_kind = DeclarationSegmentKind::Constructor;
             }
-            let sibling_ordinal =
-                next_sibling_ordinal(&mut siblings, outer_path, segment_kind, name.as_deref());
             let anchor = source_anchor(node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment =
-                declaration_segment(segment_kind, name.as_deref(), anchor, sibling_ordinal)
-                    .map_err(SemanticProviderError::invalid_identity)?;
-            let mut segments = collect_declaration_path(&declaration_paths, outer_path);
-            segments.push(segment.clone());
-            let declaration = DeclarationLocator::new(segments)
-                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-            let locator = SemanticLocator::new(
-                mount,
-                path.clone(),
-                language,
-                declaration,
-                SemanticRole::Procedure,
+            let identity = match inventory.allocate_procedure(
+                outer_path,
+                segment_kind,
+                name.as_deref(),
                 anchor,
-            );
-            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: candidate,
-                });
-            }
-            preflight = candidate;
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
             let captures_receiver = if kind == ProcedureKind::Lambda {
                 match body_contains_free_this(body, cancellation) {
                     Ok(captures_receiver) => captures_receiver,
-                    Err(LoweringCancelled) => return Ok(ProcedureEnumeration::Cancelled),
+                    Err(LoweringCancelled) => return Ok(inventory.cancelled()),
                 }
             } else {
                 false
             };
             specs.push(ProcedureSpec {
-                id,
+                id: identity.id,
                 body,
-                locator,
+                locator: identity.locator,
                 lexical_parent,
                 kind,
                 properties,
                 callable: node,
                 captures_receiver,
             });
-            let procedure_path = push_declaration_path(&mut declaration_paths, outer_path, segment);
-            procedure_context = Some((id, procedure_path));
+            procedure_context = Some((identity.id, identity.declaration_path));
         }
 
         if node.kind() == "decorator" {
@@ -200,5 +154,5 @@ pub(super) fn enumerate_procedures<'tree>(
             });
         }
     }
-    Ok(ProcedureEnumeration::Complete(specs))
+    Ok(inventory.complete(specs))
 }

@@ -5,6 +5,8 @@ use std::{error::Error, fmt};
 use crate::analyzer::semantic::CancellationToken;
 use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
+use super::SolverTermination;
+
 define_work_dimensions! {
     /// One independently limited source of solver growth.
     #[repr(u8)]
@@ -152,6 +154,26 @@ impl<'request> DataflowRequest<'request> {
             cancellation,
         }
     }
+
+    /// Reserve solver work with cancellation checkpoints around staging.
+    ///
+    /// The second check catches cancellation observed during staging. The
+    /// token remains cooperative rather than synchronized with assignment, so
+    /// cancellation may still race immediately after the final checkpoint.
+    pub fn reserve(&mut self, work: SolverWork) -> Option<SolverTermination> {
+        if self.cancellation.is_cancelled() {
+            return Some(SolverTermination::Cancelled);
+        }
+        let staged = match self.budget.staged_charge(work) {
+            Ok(staged) => staged,
+            Err(exceeded) => return Some(SolverTermination::ExceededBudget(exceeded)),
+        };
+        if self.cancellation.is_cancelled() {
+            return Some(SolverTermination::Cancelled);
+        }
+        *self.budget = staged;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +229,35 @@ mod tests {
         assert_eq!(budget.used(), SolverWork::default());
         assert_eq!(staged.used().reached_states, 3);
         assert_eq!(staged.used().saturating_sub(budget.used()), staged.used());
+    }
+
+    #[test]
+    fn request_reservation_does_not_commit_after_cancellation() {
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+        let mut budget = SolverBudget::uniform(4);
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+
+        assert_eq!(
+            request.reserve(SolverWork {
+                reached_states: 3,
+                ..SolverWork::default()
+            }),
+            Some(SolverTermination::Cancelled)
+        );
+        assert_eq!(request.budget.used(), SolverWork::default());
+    }
+
+    #[test]
+    fn request_reservation_commits_once_when_active() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SolverBudget::uniform(4);
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+        let charge = SolverWork {
+            reached_states: 3,
+            ..SolverWork::default()
+        };
+
+        assert_eq!(request.reserve(charge), None);
+        assert_eq!(request.budget.used(), charge);
     }
 }

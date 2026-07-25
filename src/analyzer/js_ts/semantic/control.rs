@@ -130,47 +130,15 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         function_scope,
         &mut pending,
     )?;
-    let mut drive_error = None;
-    while let Some(initial) = pending.pop() {
-        if let Err(error) =
-            builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
-                context.step(builder, work, stack)
-            })
-        {
-            drive_error = Some(error);
-            break;
-        }
-    }
-    if let Some(error) = drive_error {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(TsLoweringError::Cancelled(_)) => {
-                Err(TsLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(TsLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(TsLoweringError::Budget(exceeded, _)) => {
-                Err(TsLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(TsLoweringError::Invalid(detail)) => {
-                Err(TsLoweringError::Invalid(detail))
-            }
-        };
-    }
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(TsLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    let (parts, work) = builder
-        .finish_with_work()
-        .map_err(|error| TsLoweringError::Budget(error, Box::new(work_before_freeze)))?;
-    Ok((parts, work))
+    drive_and_finish_procedure(
+        builder,
+        pending.drain(..).rev(),
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -478,46 +446,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::And,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false,
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("||")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::Or,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("??")) => {
@@ -567,33 +521,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let alternative = required_field(node, "alternative")?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: alternative,
-                    entry: alternative_entry,
+                schedule_conditional_choice(
+                    stack,
+                    (condition, entry),
+                    (consequence, consequence_entry),
+                    (alternative, alternative_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: consequence,
-                    entry: consequence_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: condition,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: consequence_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false: EdgeTarget {
-                        point: alternative_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             (
@@ -2184,54 +2121,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let awaited_node = node
             .child_by_field_name("argument")
             .or_else(|| first_named_child(node));
-        let suspend = self.point(builder, node, Vec::new())?;
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
-        let awaited = self.value(builder, suspend, SemanticValueKind::Temporary)?;
-        let result = self.value(builder, normal, SemanticValueKind::AwaitResult)?;
-        self.append_effect(
-            builder,
+        let AwaitScaffold {
             suspend,
-            SemanticEffect::AsyncSuspend {
-                awaited: Some(awaited),
-                normal_resume: ControlContinuation::Target(normal),
-                exceptional_resume: ControlContinuation::Target(exceptional),
-            },
-        )?;
-        self.append_effect(
-            builder,
-            normal,
-            SemanticEffect::AsyncResume {
-                suspend,
-                kind: AsyncResumeKind::Normal,
-                result: Some(result),
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::AsyncResume {
-                suspend,
-                kind: AsyncResumeKind::Exceptional,
-                result: None,
-            },
-        )?;
-        self.edge(
-            builder,
-            suspend,
-            EdgeTarget {
-                point: normal,
-                kind: ControlEdgeKind::AsyncNormal,
-            },
-        )?;
-        self.edge(
-            builder,
-            suspend,
-            EdgeTarget {
-                point: exceptional,
-                kind: ControlEdgeKind::AsyncExceptional,
-            },
-        )?;
+            normal_resume: normal,
+            exceptional_resume: exceptional,
+            ..
+        } = self
+            .session
+            .add_await_scaffold(builder, |session, builder| {
+                session.add_node_mapping(builder, node)
+            })?;
         self.edge(builder, normal, next)?;
         self.abrupt(
             builder,
@@ -2630,66 +2529,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
-        if route.cleanups().is_empty() {
-            return self.edge(
-                builder,
-                from,
-                EdgeTarget {
-                    point: route.destination().target(),
-                    kind: route.destination().edge_kind(),
-                },
-            );
-        }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| TsLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body)?;
-            let (entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                let body_next = if next.kind == ControlEdgeKind::Normal {
-                    next
-                } else {
-                    let relay = self.point(builder, region.body, Vec::new())?;
-                    self.edge(builder, relay, next)?;
-                    EdgeTarget::normal(relay)
-                };
-                stack.push(Work::Statement {
-                    node: region.body,
-                    entry,
-                    next: body_next,
-                    scope: region.outer_scope,
-                });
-            }
-            next = EdgeTarget {
-                point: entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(entry);
-        }
-        self.edge(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
             builder,
-            from,
-            EdgeTarget {
-                point: first.expect("route has cleanups"),
-                kind: ControlEdgeKind::Cleanup,
-            },
-        )
+            &mut self.session,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )? {
+            let body_next = if step.next.kind == ControlEdgeKind::Normal {
+                step.next
+            } else {
+                let relay = self.point(builder, step.region.body, Vec::new())?;
+                self.edge(builder, relay, step.next)?;
+                EdgeTarget::normal(relay)
+            };
+            stack.push(Work::Statement {
+                node: step.region.body,
+                entry: step.entry,
+                next: body_next,
+                scope: step.region.outer_scope,
+            });
+        }
+        self.edge(builder, from, plan.target())
     }
 
     fn add_resource_cleanup_gaps(

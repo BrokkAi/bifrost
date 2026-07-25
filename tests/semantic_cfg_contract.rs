@@ -815,6 +815,111 @@ fn typescript_loop_completions_include_labels_and_infinite_for_has_no_exit() {
     graph.assert_adjacency_symmetric();
 }
 
+fn assert_c_style_for_order(language: Language, path: &str, source: &str) {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, path);
+    graph
+        .bind(
+            "init_one",
+            PointSelector::new("initOne()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "init_two",
+            PointSelector::new("initTwo()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "condition",
+            PointSelector::new("test()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "body",
+            PointSelector::new("body()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind("continue", PointSelector::new("continue;").procedure("run"))
+        .bind(
+            "tail",
+            PointSelector::new("tail()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "update_one",
+            PointSelector::new("updateOne()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "update_two",
+            PointSelector::new("updateTwo()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "after",
+            PointSelector::new("after()")
+                .procedure("run")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("init_one", "init_two");
+    graph.assert_reachable("init_two", "condition");
+    graph.assert_reachable("condition", "body");
+    graph.assert_reachable("body", "tail");
+    graph.assert_reachable("continue", "update_one");
+    graph.assert_reachable("tail", "update_one");
+    graph.assert_reachable("update_one", "update_two");
+    graph.assert_reachable("update_two", "condition");
+    graph.assert_reachable("condition", "after");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn csharp_java_c_style_for_preserves_initializer_update_and_continue_order() {
+    assert_c_style_for_order(
+        Language::CSharp,
+        "src/Loops.cs",
+        r#"
+            class Loops {
+                static void run(bool skip) {
+                    for (initOne(), initTwo(); test(); updateOne(), updateTwo()) {
+                        body();
+                        if (skip) continue;
+                        tail();
+                    }
+                    after();
+                }
+            }
+        "#,
+    );
+    assert_c_style_for_order(
+        Language::Java,
+        "src/Loops.java",
+        r#"
+            class Loops {
+                static void run(boolean skip) {
+                    for (initOne(), initTwo(); test(); updateOne(), updateTwo()) {
+                        body();
+                        if (skip) continue;
+                        tail();
+                    }
+                    after();
+                }
+            }
+        "#,
+    );
+}
+
 #[test]
 fn typescript_nested_calls_have_matched_normal_and_exceptional_continuations() {
     let project = InlineTestProject::with_language(Language::TypeScript)

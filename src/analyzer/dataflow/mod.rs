@@ -22,7 +22,7 @@ pub use budget::{
     DataflowRequest, SolverBudget, SolverBudgetDimension, SolverBudgetExceeded, SolverWork,
 };
 pub use direct::{DirectFact, DirectFlowProblem};
-pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput};
+pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput, SemanticInputStatus};
 pub use problem::{
     BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowSeed,
     DistributiveDataflowProblem, FactId,

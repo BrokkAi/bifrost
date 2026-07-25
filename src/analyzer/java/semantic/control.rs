@@ -121,38 +121,15 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     };
     context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
-    if let Err(error) = builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
-        context.step(builder, work, stack)
-    }) {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(JavaLoweringError::Cancelled(_)) => {
-                Err(JavaLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(JavaLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(JavaLoweringError::Budget(exceeded, _)) => {
-                Err(JavaLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(JavaLoweringError::Invalid(detail)) => {
-                Err(JavaLoweringError::Invalid(detail))
-            }
-        };
-    }
-
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(JavaLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    builder
-        .finish_with_work()
-        .map_err(|error| JavaLoweringError::Budget(error, Box::new(work_before_freeze)))
+    drive_and_finish_procedure(
+        builder,
+        [initial],
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -394,46 +371,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::And,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false,
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("binary_expression", Some("||")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                schedule_short_circuit_condition(
+                    stack,
+                    ShortCircuitKind::Or,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("ternary_expression", _) => {
@@ -442,33 +405,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let alternative = required_field(node, "alternative")?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: alternative,
-                    entry: alternative_entry,
+                schedule_conditional_choice(
+                    stack,
+                    (condition, entry),
+                    (consequence, consequence_entry),
+                    (alternative, alternative_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: consequence,
-                    entry: consequence_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: condition,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: consequence_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false: EdgeTarget {
-                        point: alternative_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                    Work::condition,
+                );
                 Ok(())
             }
             ("parenthesized_expression", _) => {
@@ -1069,114 +1015,68 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
         let body = required_field(node, "body")?;
-        let initializers = children_by_field_name(node, "init");
+        let initializers = children_by_field_name(node, "init")
+            .into_iter()
+            .filter(Node::is_named)
+            .collect::<Vec<_>>();
         let condition = node.child_by_field_name("condition");
-        let updates = children_by_field_name(node, "update");
+        let updates = children_by_field_name(node, "update")
+            .into_iter()
+            .filter(Node::is_named)
+            .collect::<Vec<_>>();
         let condition_entry = match condition {
             Some(condition) => self.point(builder, condition, Vec::new())?,
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
-        let update_entries = updates
-            .iter()
-            .map(|update| self.point(builder, *update, Vec::new()))
+        let updates = updates
+            .into_iter()
+            .map(|update| {
+                self.point(builder, update, Vec::new())
+                    .map(|entry| (update, entry))
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let continue_target = update_entries.first().copied().unwrap_or(condition_entry);
-        let loop_scope = builder.push_scope(
-            Some(scope),
-            ScopeBinding::Loop {
-                label: label.map(Box::<str>::from),
-                break_target: next.point,
-                break_edge_kind: next.kind,
-                continue_target,
-                continue_edge_kind: if updates.is_empty() {
-                    ControlEdgeKind::LoopBack
-                } else {
-                    ControlEdgeKind::Normal
-                },
-            },
-        );
-
-        for index in (0..updates.len()).rev() {
-            stack.push(Work::Expression {
-                node: updates[index],
-                entry: update_entries[index],
-                next: update_entries
-                    .get(index + 1)
-                    .copied()
-                    .map(EdgeTarget::normal)
-                    .unwrap_or(EdgeTarget {
-                        point: condition_entry,
-                        kind: ControlEdgeKind::LoopBack,
-                    }),
-                scope: loop_scope,
-            });
-        }
-        stack.push(Work::Statement {
-            node: body,
-            entry: body_entry,
-            next: EdgeTarget {
-                point: continue_target,
-                kind: if updates.is_empty() {
-                    ControlEdgeKind::LoopBack
-                } else {
-                    ControlEdgeKind::Normal
-                },
-            },
-            scope: loop_scope,
-        });
-        if let Some(condition) = condition {
-            stack.push(Work::Condition {
-                node: condition,
-                entry: condition_entry,
-                when_true: EdgeTarget {
-                    point: body_entry,
-                    kind: ControlEdgeKind::ConditionalTrue,
-                },
-                when_false: EdgeTarget {
-                    point: next.point,
-                    kind: ControlEdgeKind::ConditionalFalse,
-                },
-                scope: loop_scope,
-            });
-        } else {
-            self.edge(builder, condition_entry, EdgeTarget::normal(body_entry))?;
-        }
-
-        if initializers.is_empty() {
-            if entry != condition_entry {
-                self.edge(builder, entry, EdgeTarget::normal(condition_entry))?;
-            }
-        } else {
-            let init_entries = initializers
-                .iter()
-                .map(|initializer| self.point(builder, *initializer, Vec::new()))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.edge(builder, entry, EdgeTarget::normal(init_entries[0]))?;
-            for index in (0..initializers.len()).rev() {
-                let next = init_entries
-                    .get(index + 1)
-                    .copied()
-                    .map(EdgeTarget::normal)
-                    .unwrap_or_else(|| EdgeTarget::normal(condition_entry));
-                if initializers[index].kind() == "local_variable_declaration" {
-                    stack.push(Work::Statement {
-                        node: initializers[index],
-                        entry: init_entries[index],
+        let initializers = initializers
+            .into_iter()
+            .map(|initializer| {
+                self.point(builder, initializer, Vec::new())
+                    .map(|entry| (initializer, entry))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        schedule_c_style_loop(
+            builder,
+            &self.session,
+            entry,
+            next,
+            scope,
+            label.map(Box::<str>::from),
+            &initializers,
+            condition.map(|payload| (payload, condition_entry)),
+            condition_entry,
+            (body, body_entry),
+            &updates,
+            stack,
+            |node, entry, next, scope| {
+                if node.kind() == "local_variable_declaration" {
+                    Work::Statement {
+                        node,
+                        entry,
                         next,
-                        scope: loop_scope,
-                    });
+                        scope,
+                    }
                 } else {
-                    stack.push(Work::Expression {
-                        node: initializers[index],
-                        entry: init_entries[index],
+                    Work::Expression {
+                        node,
+                        entry,
                         next,
-                        scope: loop_scope,
-                    });
+                        scope,
+                    }
                 }
-            }
-        }
-        Ok(())
+            },
+            Work::expression,
+            Work::statement,
+            Work::condition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2215,108 +2115,71 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        if route.cleanups().is_empty() {
-            return self.edge(
-                builder,
-                from,
-                EdgeTarget {
-                    point: route.destination().target(),
-                    kind: route.destination().edge_kind(),
-                },
-            );
-        }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| JavaLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body.source_node())?;
-            let (entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                match region.body {
-                    CleanupBody::Statement(body) => {
-                        let statement_next = if next.kind == ControlEdgeKind::Normal {
-                            next
-                        } else {
-                            let relay = self.point(builder, body, Vec::new())?;
-                            self.edge(builder, relay, next)?;
-                            EdgeTarget::normal(relay)
-                        };
-                        stack.push(Work::Statement {
-                            node: body,
-                            entry,
-                            next: statement_next,
-                            scope: region.outer_scope,
-                        });
-                    }
-                    CleanupBody::OpaqueResource(_) => {
-                        self.add_gap(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
+            builder,
+            &mut self.session,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body.source_node(),
+        )? {
+            match step.region.body {
+                CleanupBody::Statement(body) => {
+                    let statement_next = if step.next.kind == ControlEdgeKind::Normal {
+                        step.next
+                    } else {
+                        let relay = self.point(builder, body, Vec::new())?;
+                        self.edge(builder, relay, step.next)?;
+                        EdgeTarget::normal(relay)
+                    };
+                    stack.push(Work::Statement {
+                        node: body,
+                        entry: step.entry,
+                        next: statement_next,
+                        scope: step.region.outer_scope,
+                    });
+                }
+                CleanupBody::OpaqueResource(_) => {
+                    self.add_gap(
+                        builder,
+                        step.entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ResourceManagement,
+                        SemanticGapKind::Unsupported,
+                        "resource close order, suppression, and value effects are not yet lowered",
+                    )?;
+                    self.add_gap(
+                        builder,
+                        step.entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unsupported,
+                        "resource close can raise or suppress exceptions not yet represented",
+                    )?;
+                    self.edge(builder, step.entry, step.next)?;
+                }
+                CleanupBody::OpaqueMonitor(_) => {
+                    self.add_gap(
                             builder,
-                            entry,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::ResourceManagement,
-                            SemanticGapKind::Unsupported,
-                            "resource close order, suppression, and value effects are not yet lowered",
-                        )?;
-                        self.add_gap(
-                            builder,
-                            entry,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::ExceptionalControlFlow,
-                            SemanticGapKind::Unsupported,
-                            "resource close can raise or suppress exceptions not yet represented",
-                        )?;
-                        self.edge(builder, entry, next)?;
-                    }
-                    CleanupBody::OpaqueMonitor(_) => {
-                        self.add_gap(
-                            builder,
-                            entry,
+                            step.entry,
                             SemanticGapSubject::Point,
                             SemanticCapability::CleanupControlFlow,
                             SemanticGapKind::Unsupported,
                             "monitor release effects are represented only as an opaque cleanup boundary",
                         )?;
-                        self.add_gap(
-                            builder,
-                            entry,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::ExceptionalControlFlow,
-                            SemanticGapKind::Unsupported,
-                            "monitor release failure behavior is not yet represented",
-                        )?;
-                        self.edge(builder, entry, next)?;
-                    }
+                    self.add_gap(
+                        builder,
+                        step.entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unsupported,
+                        "monitor release failure behavior is not yet represented",
+                    )?;
+                    self.edge(builder, step.entry, step.next)?;
                 }
             }
-            next = EdgeTarget {
-                point: entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(entry);
         }
-        self.edge(
-            builder,
-            from,
-            EdgeTarget {
-                point: first.expect("route has cleanups"),
-                kind: ControlEdgeKind::Cleanup,
-            },
-        )
+        self.edge(builder, from, plan.target())
     }
 
     fn edge(
