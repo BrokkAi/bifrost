@@ -16,7 +16,7 @@ use crate::hash::{HashMap, HashSet};
 use super::transfer::{TransferEvaluation, TransferScratch, evaluate_transfer};
 use super::witness::{
     WitnessAdmission, WitnessAlternatives, WitnessArena, WitnessCandidateBudget, WitnessEvidenceId,
-    WitnessEvidenceNode,
+    WitnessEvidenceNode, WitnessStaging,
 };
 use super::{
     DataflowEdge, DataflowRequest, DistributiveDataflowProblem, FactId, PathQuality,
@@ -214,6 +214,39 @@ impl PathWitnessSource<'_> {
                 return_edge,
                 input_fact,
             } => WitnessEvidenceNode::summary_application(
+                *incoming,
+                *incoming_quality,
+                *summary,
+                *summary_quality,
+                return_edge,
+                *input_fact,
+                output_fact,
+            ),
+        }
+    }
+
+    fn matches_derivation(&self, output_fact: FactId, existing: &WitnessEvidenceNode) -> bool {
+        match self {
+            Self::Edge {
+                predecessor,
+                predecessor_quality,
+                edge,
+                input_fact,
+            } => existing.matches_edge_derivation(
+                *predecessor,
+                *predecessor_quality,
+                edge,
+                *input_fact,
+                output_fact,
+            ),
+            Self::SummaryApplication {
+                incoming,
+                incoming_quality,
+                summary,
+                summary_quality,
+                return_edge,
+                input_fact,
+            } => existing.matches_summary_application_derivation(
                 *incoming,
                 *incoming_quality,
                 *summary,
@@ -452,9 +485,9 @@ where
                             WitnessEvidenceNode::seed_retained_bytes(),
                             self.request_witness_staging_capacity(request),
                         ),
+                        |existing| existing.matches_seed_derivation(&entry_point, key.fact),
                         || WitnessEvidenceNode::seed(entry_point.clone(), key.fact),
-                        &mut staged_witness_nodes,
-                        &mut staged_witness_bytes,
+                        WitnessStaging::new(&mut staged_witness_nodes, &mut staged_witness_bytes),
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -638,9 +671,9 @@ where
                             source.retained_bytes(),
                             self.request_witness_staging_capacity(request),
                         ),
+                        |existing| source.matches_derivation(fact, existing),
                         || source.evidence_for(fact),
-                        &mut staged_witness_nodes,
-                        &mut staged_witness_bytes,
+                        WitnessStaging::new(&mut staged_witness_nodes, &mut staged_witness_bytes),
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -1471,9 +1504,9 @@ where
                             WitnessEvidenceNode::seed_retained_bytes(),
                             self.request_witness_staging_capacity(request),
                         ),
+                        |existing| existing.matches_seed_derivation(&transfer.callee_entry, fact),
                         || WitnessEvidenceNode::seed(transfer.callee_entry.clone(), fact),
-                        &mut staged_witness_nodes,
-                        &mut staged_witness_bytes,
+                        WitnessStaging::new(&mut staged_witness_nodes, &mut staged_witness_bytes),
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -1546,6 +1579,15 @@ where
                             WitnessEvidenceNode::edge_retained_bytes(call_edge),
                             self.request_witness_staging_capacity(request),
                         ),
+                        |existing| {
+                            existing.matches_edge_derivation(
+                                caller_evidence.expect("enabled call evidence was validated"),
+                                caller_quality,
+                                call_edge,
+                                caller_path.fact,
+                                fact,
+                            )
+                        },
                         || {
                             WitnessEvidenceNode::edge(
                                 caller_evidence.expect("enabled call evidence was validated"),
@@ -1555,8 +1597,7 @@ where
                                 fact,
                             )
                         },
-                        &mut staged_witness_nodes,
-                        &mut staged_witness_bytes,
+                        WitnessStaging::new(&mut staged_witness_nodes, &mut staged_witness_bytes),
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -1768,18 +1809,27 @@ where
                         WitnessEvidenceNode::end_summary_retained_bytes(),
                         self.request_witness_staging_capacity(request),
                     ),
+                    |existing| {
+                        existing.matches_end_summary_derivation(
+                            predecessor,
+                            predecessor_quality,
+                            &entry_point,
+                            path.entry.entry_fact,
+                            &exit,
+                            path.fact,
+                        )
+                    },
                     || {
                         WitnessEvidenceNode::end_summary(
                             predecessor,
                             predecessor_quality,
-                            entry_point,
+                            entry_point.clone(),
                             path.entry.entry_fact,
                             Arc::clone(&exit),
                             path.fact,
                         )
                     },
-                    &mut staged_witness_nodes,
-                    &mut staged_witness_bytes,
+                    WitnessStaging::new(&mut staged_witness_nodes, &mut staged_witness_bytes),
                 )
                 .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
             match admission {

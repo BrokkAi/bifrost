@@ -282,6 +282,28 @@ impl SummaryWitnessStep {
     fn retained_owned_bytes(&self) -> usize {
         retained_evidence_bytes(&self.proof, &self.completeness)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matches_derivation(
+        &self,
+        kind: SummaryWitnessStepKind,
+        source: &ProgramPointHandle,
+        target: Option<&ProgramPointHandle>,
+        origin: Option<&CallSiteHandle>,
+        proof: &ProofStatus,
+        completeness: &EvidenceCompleteness,
+        input_fact: FactId,
+        output_fact: FactId,
+    ) -> bool {
+        self.kind == kind
+            && &self.source == source
+            && self.target.as_ref() == target
+            && self.origin.as_ref() == origin
+            && &self.proof == proof
+            && &self.completeness == completeness
+            && self.input_fact == input_fact
+            && self.output_fact == output_fact
+    }
 }
 
 fn retained_evidence_bytes(proof: &ProofStatus, completeness: &EvidenceCompleteness) -> usize {
@@ -687,6 +709,122 @@ impl WitnessEvidenceNode {
         ))
     }
 
+    pub(crate) fn matches_seed_derivation(&self, point: &ProgramPointHandle, fact: FactId) -> bool {
+        self.quality == PathQuality::PROVEN_COMPLETE
+            && matches!(
+                &self.kind,
+                WitnessEvidenceKind::Step {
+                    predecessor: None,
+                    step,
+                } if step.matches_derivation(
+                    SummaryWitnessStepKind::Seed,
+                    point,
+                    None,
+                    None,
+                    &ProofStatus::Proven,
+                    &EvidenceCompleteness::Complete,
+                    fact,
+                    fact,
+                )
+            )
+    }
+
+    pub(crate) fn matches_edge_derivation(
+        &self,
+        predecessor: WitnessEvidenceId,
+        predecessor_quality: PathQuality,
+        edge: &ProcedureIcfgEdge,
+        input_fact: FactId,
+        output_fact: FactId,
+    ) -> bool {
+        self.quality == predecessor_quality.through_evidence(&edge.proof, &edge.completeness)
+            && matches!(
+                &self.kind,
+                WitnessEvidenceKind::Step {
+                    predecessor: Some(retained_predecessor),
+                    step,
+                } if *retained_predecessor == predecessor
+                    && step.matches_derivation(
+                        SummaryWitnessStepKind::Edge(edge.kind),
+                        &edge.source,
+                        Some(&edge.target),
+                        edge.origin.as_ref(),
+                        &edge.proof,
+                        &edge.completeness,
+                        input_fact,
+                        output_fact,
+                    )
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_summary_application_derivation(
+        &self,
+        incoming: WitnessEvidenceId,
+        incoming_quality: PathQuality,
+        summary: WitnessEvidenceId,
+        summary_quality: PathQuality,
+        return_edge: &SummaryEdge,
+        input_fact: FactId,
+        output_fact: FactId,
+    ) -> bool {
+        self.quality
+            == incoming_quality
+                .conjoin(summary_quality)
+                .through_evidence(return_edge.proof(), return_edge.completeness())
+            && matches!(
+                &self.kind,
+                WitnessEvidenceKind::SummaryApplication {
+                    incoming: retained_incoming,
+                    summary: retained_summary,
+                    return_step,
+                } if *retained_incoming == incoming
+                    && *retained_summary == summary
+                    && return_step.matches_derivation(
+                        SummaryWitnessStepKind::Edge(return_edge.kind()),
+                        return_edge.source(),
+                        Some(return_edge.target()),
+                        return_edge.origin(),
+                        return_edge.proof(),
+                        return_edge.completeness(),
+                        input_fact,
+                        output_fact,
+                    )
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_end_summary_derivation(
+        &self,
+        predecessor: WitnessEvidenceId,
+        predecessor_quality: PathQuality,
+        entry_point: &ProgramPointHandle,
+        entry_fact: FactId,
+        exit: &Arc<IcfgExitProfile>,
+        exit_fact: FactId,
+    ) -> bool {
+        let quality = if exit.has_return_affecting_gaps() {
+            predecessor_quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
+        } else {
+            predecessor_quality
+        };
+        self.quality == quality
+            && matches!(
+                &self.kind,
+                WitnessEvidenceKind::EndSummary {
+                    predecessor: retained_predecessor,
+                    entry_point: retained_entry_point,
+                    entry_fact: retained_entry_fact,
+                    exit: retained_exit,
+                    exit_fact: retained_exit_fact,
+                } if *retained_predecessor == predecessor
+                    && retained_entry_point == entry_point
+                    && *retained_entry_fact == entry_fact
+                    && retained_exit == exit
+                    && *retained_exit_fact == exit_fact
+            )
+    }
+
     fn retained_bytes(&self) -> usize {
         size_of::<Self>().saturating_add(match &self.kind {
             WitnessEvidenceKind::Step { step, .. } => step.retained_owned_bytes(),
@@ -695,10 +833,6 @@ impl WitnessEvidenceNode {
                 return_step.retained_owned_bytes()
             }
         })
-    }
-
-    fn same_derivation(&self, other: &Self) -> bool {
-        self.quality == other.quality && self.kind == other.kind
     }
 
     fn mark_alternatives_truncated(&mut self) {
@@ -812,6 +946,23 @@ impl WitnessCandidateBudget {
     }
 }
 
+pub(crate) struct WitnessStaging<'staged> {
+    nodes: &'staged mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
+    retained_bytes: &'staged mut usize,
+}
+
+impl<'staged> WitnessStaging<'staged> {
+    pub(crate) fn new(
+        nodes: &'staged mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
+        retained_bytes: &'staged mut usize,
+    ) -> Self {
+        Self {
+            nodes,
+            retained_bytes,
+        }
+    }
+}
+
 impl WitnessArena {
     pub(crate) fn new(limits: WitnessRetentionLimits) -> Self {
         Self {
@@ -842,64 +993,61 @@ impl WitnessArena {
             .and_then(|(staged_id, node)| (*staged_id == id).then_some(node))
     }
 
-    pub(crate) fn stage_candidate<Candidate>(
+    pub(crate) fn stage_candidate<Duplicate, Candidate>(
         &self,
         alternatives: &mut WitnessAlternatives,
         quality: PathQuality,
         candidate_budget: WitnessCandidateBudget,
+        mut is_duplicate: Duplicate,
         candidate: Candidate,
-        staged: &mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
-        staged_retained_bytes: &mut usize,
+        staging: WitnessStaging<'_>,
     ) -> Result<WitnessAdmission, usize>
     where
+        Duplicate: FnMut(&WitnessEvidenceNode) -> bool,
         Candidate: FnOnce() -> WitnessEvidenceNode,
     {
         debug_assert!(self.is_enabled());
-        if self.limits.is_best_effort()
-            && alternatives.ids(quality).len() >= self.max_alternatives_per_quality()
+        if alternatives
+            .ids(quality)
+            .iter()
+            .filter_map(|id| self.staged_node(*id, staging.nodes))
+            .any(&mut is_duplicate)
         {
-            alternatives.mark_truncated(quality);
-            return Ok(WitnessAdmission::Truncated);
+            return Ok(WitnessAdmission::Duplicate);
         }
         if self.limits.is_best_effort()
             && (candidate_budget
                 .request_remaining_relations
-                .is_some_and(|remaining| staged.len() >= remaining)
+                .is_some_and(|remaining| staging.nodes.len() >= remaining)
                 || self
                     .limits
                     .best_effort_max_relations()
-                    .is_some_and(|limit| self.nodes.len().saturating_add(staged.len()) >= limit)
+                    .is_some_and(|limit| {
+                        self.nodes.len().saturating_add(staging.nodes.len()) >= limit
+                    })
                 || self
                     .limits
                     .best_effort_max_retained_bytes()
                     .is_some_and(|limit| {
                         self.retained_bytes
-                            .saturating_add(*staged_retained_bytes)
+                            .saturating_add(*staging.retained_bytes)
                             .saturating_add(candidate_budget.retained_bytes)
                             > limit
                     }))
         {
             return Ok(WitnessAdmission::Exhausted);
         }
-        let candidate = candidate();
-        debug_assert_eq!(candidate.retained_bytes(), candidate_budget.retained_bytes);
-        if alternatives
-            .ids(quality)
-            .iter()
-            .filter_map(|id| self.staged_node(*id, staged))
-            .any(|existing| existing.same_derivation(&candidate))
-        {
-            return Ok(WitnessAdmission::Duplicate);
-        }
         if alternatives.ids(quality).len() >= self.max_alternatives_per_quality() {
             alternatives.mark_truncated(quality);
             return Ok(WitnessAdmission::Truncated);
         }
-        let id = self.staged_id(staged.len())?;
+        let candidate = candidate();
+        debug_assert_eq!(candidate.retained_bytes(), candidate_budget.retained_bytes);
+        let id = self.staged_id(staging.nodes.len())?;
         alternatives.push(quality, id);
-        staged.push((id, candidate));
-        *staged_retained_bytes =
-            (*staged_retained_bytes).saturating_add(candidate_budget.retained_bytes);
+        staging.nodes.push((id, candidate));
+        *staging.retained_bytes =
+            (*staging.retained_bytes).saturating_add(candidate_budget.retained_bytes);
         Ok(WitnessAdmission::Retained(id))
     }
 
@@ -1415,9 +1563,9 @@ mod tests {
                 &mut alternatives,
                 PathQuality::PROVEN_COMPLETE,
                 WitnessCandidateBudget::new(WitnessEvidenceNode::seed_retained_bytes(), None),
+                |_| panic!("byte-exhausted candidates must not inspect duplicates"),
                 || panic!("byte-exhausted candidates must remain lazy"),
-                &mut staged,
-                &mut staged_bytes,
+                WitnessStaging::new(&mut staged, &mut staged_bytes),
             )
             .unwrap();
 
@@ -1438,9 +1586,9 @@ mod tests {
                 &mut alternatives,
                 PathQuality::PROVEN_COMPLETE,
                 WitnessCandidateBudget::new(WitnessEvidenceNode::seed_retained_bytes(), Some(0)),
+                |_| panic!("request-exhausted candidates must not inspect duplicates"),
                 || panic!("request-exhausted candidates must remain lazy"),
-                &mut staged,
-                &mut staged_bytes,
+                WitnessStaging::new(&mut staged, &mut staged_bytes),
             )
             .unwrap();
 
@@ -1465,9 +1613,9 @@ mod tests {
                 &mut alternatives,
                 PathQuality::PROVEN_COMPLETE,
                 WitnessCandidateBudget::new(WitnessEvidenceNode::seed_retained_bytes(), None),
+                |_| false,
                 || panic!("full best-effort slots must not allocate candidates"),
-                &mut staged,
-                &mut staged_bytes,
+                WitnessStaging::new(&mut staged, &mut staged_bytes),
             )
             .unwrap();
 

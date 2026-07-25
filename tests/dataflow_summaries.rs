@@ -6,11 +6,12 @@ use std::{
 };
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowOutput, DataflowRequest, DirectFlowProblem, DistributiveDataflowProblem,
-    PathQuality, SolverBudget, SolverBudgetDimension, SolverTermination, SummaryBoundaryKind,
-    SummaryDataflowError, SummaryDataflowResult, SummaryReachedFact, SummarySemanticStatus,
-    SummarySolveInput, SummaryWitness, SummaryWitnessError, SummaryWitnessStepKind,
-    WitnessReconstructionLimits, WitnessRetentionLimits, solve_with_summaries,
+    DataflowEdge, DataflowOutput, DataflowRequest, DirectFact, DirectFlowProblem,
+    DistributiveDataflowProblem, PathQuality, SolverBudget, SolverBudgetDimension,
+    SolverTermination, SummaryBoundaryKind, SummaryDataflowError, SummaryDataflowResult,
+    SummaryReachedFact, SummarySemanticStatus, SummarySolveInput, SummaryWitness,
+    SummaryWitnessError, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessRetentionLimits, solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBoundary, CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken,
@@ -1626,6 +1627,28 @@ fn direct_recursion_converges_without_inheriting_snapshot_call_depth() {
         "the recursive root should acquire a reusable normal end summary",
     );
     assert_all_retained_witnesses_reconstruct(&result);
+
+    let best_effort = solve_with_witness_limit(
+        &root,
+        &[],
+        &provider,
+        &problem,
+        WitnessRetentionLimits::best_effort(1, 65_536, 64 * 1024 * 1024).unwrap(),
+    );
+    let entry = root
+        .point_handle(root.semantics().entry_point())
+        .expect("recursive root entry");
+    let entry_witness = best_effort
+        .witness_for_reached(
+            reached_fact(&best_effort, &entry, DirectFact),
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("recursive root seed witness");
+    assert!(
+        !entry_witness.alternatives_truncated(),
+        "replaying the identical recursive entry seed is a duplicate, not an omitted alternative",
+    );
 
     let mut reference_budget =
         SemanticBudget::uniform(100_000_000).expect("positive reference budget");
