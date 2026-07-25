@@ -196,6 +196,20 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     }
                 }
             }
+        } else {
+            for stage in family.originless_call_stages() {
+                for binding in self
+                    .bindings
+                    .event_bindings_at_call_program_point_all_contexts(edge.source())
+                {
+                    if call_occurrence(self.protocol, binding.event(), *stage) {
+                        if subject == Some(binding.subject()) {
+                            eligible_events.push(binding.event());
+                        }
+                        facts = self.apply_binding(facts, binding);
+                    }
+                }
+            }
         }
         eligible_events.sort_unstable();
         eligible_events.dedup();
@@ -476,6 +490,14 @@ impl TransferFamily {
                 &[CallStage::BeforeCall, CallStage::AfterExceptionalReturn]
             }
             Self::Normal | Self::Return | Self::CallToReturn | Self::Exceptional => &[],
+        }
+    }
+
+    fn originless_call_stages(self) -> &'static [CallStage] {
+        match self {
+            Self::Normal => &[CallStage::BeforeCall, CallStage::AfterNormalReturn],
+            Self::Exceptional => &[CallStage::BeforeCall, CallStage::AfterExceptionalReturn],
+            Self::Call | Self::Return | Self::CallToReturn => &[],
         }
     }
 }

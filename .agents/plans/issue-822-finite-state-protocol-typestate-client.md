@@ -114,6 +114,12 @@ required for that checkpoint.
   explicit; proven escape obeys protocol uncertainty semantics; and a binding
   plan cannot execute against a different protocol hash. All 27 protocol,
   binding, and client tests plus strict focused all-feature Clippy pass.
+- [x] (2026-07-25 15:47+02:00) Exercised the same client through the real
+  recursive-summary runner over TypeScript helper calls. Added a stable
+  call-program-point index so unresolved/origin-less continuation edges still
+  execute bound before/after endpoint phases, while materialized calls retain
+  their exact-origin call/return behavior. All 16 binding/client tests and
+  strict focused all-feature Clippy pass.
 - [ ] Implement typestate propagation, diagnostic-neutral findings, explicit
   uncertainty semantics, and consumption of #1171's generic witness API.
 - [ ] Add controlled-graph and equivalent TypeScript/Java conformance fixtures,
@@ -219,6 +225,14 @@ required for that checkpoint.
   silently reinterpret them. Event bindings now carry a per-subject/site
   ordinal with collision rejection, and canonical binding identity includes
   the compiled protocol hash.
+
+- Observation: a source call is not guaranteed to appear as an origin-bearing
+  ICFG edge.
+  Evidence: the real summary provider represents unresolved call boundaries as
+  origin-less local continuation edges; exact call handles therefore cannot be
+  recovered from `DataflowEdge::origin`. The binding plan now derives a second
+  index from each validated call handle to its program point and uses it only
+  on origin-less normal/exceptional transfers.
 
 ## Decision Log
 

@@ -624,9 +624,11 @@ pub struct TypestateBindingPlan {
     initial_seeds_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     events_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     events_by_call_all_contexts: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
+    events_by_call_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     terminals_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     terminals_by_call_all_contexts:
         HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
+    terminals_by_call_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     canonical_bytes: Box<[u8]>,
     canonical_rendering: Box<str>,
     hash: TypestateBindingPlanHash,
@@ -831,6 +833,10 @@ impl TypestateBindingPlan {
         let event_indexes = index_sites(&compiled_events, |binding| &binding.site);
         let terminal_indexes = index_sites(&compiled_terminals, |binding| &binding.site);
         let initial_seed_indexes = index_point_sites(&compiled_seeds, |binding| &binding.site);
+        let event_call_point_indexes =
+            index_call_point_sites(&compiled_events, |binding| &binding.site);
+        let terminal_call_point_indexes =
+            index_call_point_sites(&compiled_terminals, |binding| &binding.site);
 
         Ok(Self {
             protocol_hash: protocol.hash(),
@@ -846,8 +852,10 @@ impl TypestateBindingPlan {
             initial_seeds_by_point_all_contexts: initial_seed_indexes,
             events_by_point_all_contexts: event_indexes.all_points,
             events_by_call_all_contexts: event_indexes.all_calls,
+            events_by_call_point_all_contexts: event_call_point_indexes,
             terminals_by_point_all_contexts: terminal_indexes.all_points,
             terminals_by_call_all_contexts: terminal_indexes.all_calls,
+            terminals_by_call_point_all_contexts: terminal_call_point_indexes,
             canonical_bytes: canonical_bytes.into_boxed_slice(),
             canonical_rendering: canonical_rendering.into_boxed_str(),
             hash,
@@ -929,6 +937,14 @@ impl TypestateBindingPlan {
             .map(|index| &self.event_bindings[index])
     }
 
+    pub fn event_bindings_at_call_program_point_all_contexts(
+        &self,
+        point: &ProgramPointHandle,
+    ) -> impl Iterator<Item = &BoundTypestateEvent> {
+        flat_site_indexes(&self.events_by_call_point_all_contexts, point)
+            .map(|index| &self.event_bindings[index])
+    }
+
     pub fn terminal_bindings_at_program_point(
         &self,
         point: &ProgramPointHandle,
@@ -960,6 +976,14 @@ impl TypestateBindingPlan {
         call: &crate::analyzer::semantic::CallSiteHandle,
     ) -> impl Iterator<Item = &BoundTypestateTerminal> {
         flat_site_indexes(&self.terminals_by_call_all_contexts, call)
+            .map(|index| &self.terminal_bindings[index])
+    }
+
+    pub fn terminal_bindings_at_call_program_point_all_contexts(
+        &self,
+        point: &ProgramPointHandle,
+    ) -> impl Iterator<Item = &BoundTypestateTerminal> {
+        flat_site_indexes(&self.terminals_by_call_point_all_contexts, point)
             .map(|index| &self.terminal_bindings[index])
     }
 
@@ -1443,6 +1467,31 @@ fn index_point_sites<T>(
     for (index, value) in values.iter().enumerate() {
         if let TypestateObservationSite::ProgramPoint { point, .. } = site(value) {
             indexes.entry(point.clone()).or_default().push(index);
+        }
+    }
+    indexes
+        .into_iter()
+        .map(|(point, indexes)| (point, indexes.into_boxed_slice()))
+        .collect()
+}
+
+fn index_call_point_sites<T>(
+    values: &[T],
+    site: impl Fn(&T) -> &TypestateObservationSite,
+) -> HashMap<ProgramPointHandle, Box<[usize]>> {
+    let mut indexes = HashMap::<ProgramPointHandle, Vec<usize>>::new();
+    for (index, value) in values.iter().enumerate() {
+        if let TypestateObservationSite::CallSite { call, .. } = site(value) {
+            let row = call
+                .procedure()
+                .semantics()
+                .call_site(call.id())
+                .expect("call-site handles are validated at construction");
+            let point = call
+                .procedure()
+                .point_handle(row.point)
+                .expect("validated call sites retain program points");
+            indexes.entry(point).or_default().push(index);
         }
     }
     indexes

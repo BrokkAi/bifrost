@@ -1,11 +1,12 @@
 mod common;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowOutput, DistributiveDataflowProblem,
+    DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, SolverBudget,
+    SummaryDataflowResult, SummarySolveInput, solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
-    ObjectCardinality, ProcedureKind, ProofStatus, SemanticCallSite,
+    ObjectCardinality, ProcedureKind, ProofStatus, SemanticBudget, SemanticCallSite,
 };
 use brokk_bifrost::analyzer::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, ProtocolEventKey, ProtocolSpec, ProtocolStateKey,
@@ -14,16 +15,24 @@ use brokk_bifrost::analyzer::typestate::{
     TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
     TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey, TypestateUncertainty,
 };
-use brokk_bifrost::{AnalyzerConfig, Language};
+use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 
 use common::{
-    InlineTestProject,
+    BuiltInlineTestProject, InlineTestProject,
     semantic_graph::{SemanticGraph, mapped_source},
 };
 
 const RESOURCE_LIFECYCLE: &[u8] =
     include_bytes!("fixtures/typestate/resource-lifecycle.protocol.json");
 const SOURCE: &str = r#"
+function acquire() {
+  return {};
+}
+
+function use(resource: object) {}
+
+function close(resource: object) {}
+
 function lifecycle() {
   const resource = acquire();
   use(resource);
@@ -35,6 +44,7 @@ struct ClientFixture {
     protocol: CompiledProtocol,
     bindings: TypestateBindingPlan,
     subject: brokk_bifrost::analyzer::typestate::TypestateSubjectId,
+    root: brokk_bifrost::analyzer::semantic::ProcedureHandle,
     entry: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
     use_point: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
     close_point: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
@@ -66,7 +76,15 @@ fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
         .file("src/main.ts", SOURCE)
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let graph = SemanticGraph::materialize(&project, &analyzer, "src/main.ts");
+    fixture_from(&project, &analyzer, close_quality)
+}
+
+fn fixture_from(
+    project: &BuiltInlineTestProject,
+    analyzer: &WorkspaceAnalyzer,
+    close_quality: TypestateBindingQuality,
+) -> ClientFixture {
+    let graph = SemanticGraph::materialize(project, analyzer, "src/main.ts");
     let procedure = graph
         .artifact()
         .procedures()
@@ -175,6 +193,7 @@ fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
         protocol,
         bindings,
         subject,
+        root: procedure_handle,
         entry,
         use_point,
         close_point,
@@ -182,6 +201,24 @@ fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
         use_call: use_call_handle,
         close_call: close_call_handle,
     }
+}
+
+fn solve_summary(
+    fixture: &ClientFixture,
+    analyzer: &WorkspaceAnalyzer,
+) -> SummaryDataflowResult<TypestateFact> {
+    let problem = TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings).unwrap();
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    solve_with_summaries(
+        SummarySolveInput::new(&fixture.root, &[]),
+        &analyzer.icfg_provider(),
+        &problem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("typestate summary solve")
 }
 
 #[derive(Default)]
@@ -359,4 +396,25 @@ fn flow_problem_rejects_a_plan_for_another_protocol() {
         TypestateFlowProblem::try_new(&changed, &fixture.bindings),
         Err(TypestateFlowProblemError::ProtocolMismatch)
     ));
+}
+
+#[test]
+fn real_summary_solver_executes_the_same_client_contract() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+    );
+    let result = solve_summary(&fixture, &analyzer);
+    let closed = fixture
+        .protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+    assert!(result.reached_at(&fixture.exit).any(|reached| {
+        result.fact(reached.fact()) == Some(&TypestateFact::state(fixture.subject, closed))
+    }));
 }
