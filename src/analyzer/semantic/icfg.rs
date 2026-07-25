@@ -137,6 +137,11 @@ impl IcfgExitProfile {
         self.gap_reason.is_some()
     }
 
+    /// Exact structured reason this exit cannot prove a complete matched return.
+    pub fn return_affecting_gap_reason(&self) -> Option<&str> {
+        self.gap_reason.as_deref()
+    }
+
     /// Project this callee-local exit through one exact incoming call.
     pub fn project_matched_return(
         &self,

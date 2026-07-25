@@ -14,11 +14,15 @@ use crate::analyzer::semantic::{
 use crate::hash::{HashMap, HashSet};
 
 use super::transfer::{TransferEvaluation, TransferScratch, evaluate_transfer};
+use super::witness::{
+    WitnessAdmission, WitnessAlternatives, WitnessArena, WitnessEvidenceId, WitnessEvidenceNode,
+};
 use super::{
     DataflowEdge, DataflowRequest, DistributiveDataflowProblem, FactId, PathQuality,
     PathQualityFrontier, SolverTermination, SolverWork, SummaryBoundary, SummaryBoundaryKind,
     SummaryCoverage, SummaryDataflowError, SummaryDataflowResult, SummaryEdge, SummaryEntry,
     SummaryMetrics, SummaryReachedFact, SummarySemanticStatus, TabulationEndSummary,
+    WitnessRetentionLimits,
 };
 
 const ZERO_FACT_ID: FactId = FactId::new(0);
@@ -36,11 +40,16 @@ type ProviderCacheLookup<T> = Result<(T, bool), SolverTermination>;
 pub struct SummarySolveInput<'input, Fact> {
     root: &'input ProcedureHandle,
     entry_facts: &'input [Fact],
+    witness_retention: WitnessRetentionLimits,
 }
 
 impl<'input, Fact> SummarySolveInput<'input, Fact> {
     pub const fn new(root: &'input ProcedureHandle, entry_facts: &'input [Fact]) -> Self {
-        Self { root, entry_facts }
+        Self {
+            root,
+            entry_facts,
+            witness_retention: WitnessRetentionLimits::disabled(),
+        }
     }
 
     pub const fn root(self) -> &'input ProcedureHandle {
@@ -49,6 +58,18 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
 
     pub const fn entry_facts(self) -> &'input [Fact] {
         self.entry_facts
+    }
+
+    pub const fn with_witness_retention(
+        mut self,
+        witness_retention: WitnessRetentionLimits,
+    ) -> Self {
+        self.witness_retention = witness_retention;
+        self
+    }
+
+    pub const fn witness_retention(self) -> WitnessRetentionLimits {
+        self.witness_retention
     }
 }
 
@@ -70,6 +91,7 @@ struct PathEdgeKey {
 struct QueuedPath {
     key: PathEdgeKey,
     quality: PathQuality,
+    evidence: Option<WitnessEvidenceId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -84,6 +106,7 @@ struct EndSummaryRow {
     key: EndSummaryKey,
     exit: Arc<IcfgExitProfile>,
     qualities: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,6 +123,7 @@ struct IncomingCall {
     key: IncomingKey,
     origin: CallSiteHandle,
     qualities: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -122,6 +146,78 @@ struct StagedFacts<Fact> {
     ids: Vec<FactId>,
 }
 
+enum PathWitnessSource<'edge> {
+    Edge {
+        predecessor: WitnessEvidenceId,
+        predecessor_quality: PathQuality,
+        edge: &'edge ProcedureIcfgEdge,
+        input_fact: FactId,
+    },
+    SummaryApplication {
+        incoming: WitnessEvidenceId,
+        incoming_quality: PathQuality,
+        summary: WitnessEvidenceId,
+        summary_quality: PathQuality,
+        return_edge: &'edge SummaryEdge,
+        input_fact: FactId,
+    },
+}
+
+impl PathWitnessSource<'_> {
+    fn evidence_for(&self, output_fact: FactId) -> WitnessEvidenceNode {
+        match self {
+            Self::Edge {
+                predecessor,
+                predecessor_quality,
+                edge,
+                input_fact,
+            } => WitnessEvidenceNode::edge(
+                *predecessor,
+                *predecessor_quality,
+                edge,
+                *input_fact,
+                output_fact,
+            ),
+            Self::SummaryApplication {
+                incoming,
+                incoming_quality,
+                summary,
+                summary_quality,
+                return_edge,
+                input_fact,
+            } => WitnessEvidenceNode::summary_application(
+                *incoming,
+                *incoming_quality,
+                *summary,
+                *summary_quality,
+                return_edge,
+                *input_fact,
+                output_fact,
+            ),
+        }
+    }
+}
+
+struct StagedPathPublication {
+    key: PathEdgeKey,
+    frontier: PathQualityFrontier,
+    frontier_changed: bool,
+    witnesses: WitnessAlternatives,
+    witnesses_changed: bool,
+    queued_evidence: Option<WitnessEvidenceId>,
+}
+
+struct StagedIncomingPublication {
+    key: IncomingKey,
+    existing: Option<usize>,
+    frontier: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
+    frontier_changed: bool,
+    witnesses_changed: bool,
+    reused_entry: bool,
+    activated_evidence: Option<WitnessEvidenceId>,
+}
+
 struct SummaryState<Fact> {
     zero_fact: Fact,
     facts: Vec<Fact>,
@@ -129,6 +225,7 @@ struct SummaryState<Fact> {
     procedures: Vec<ProcedureHandle>,
     procedure_ids: HashMap<ProcedureHandle, usize>,
     reached: HashMap<PathEdgeKey, PathQualityFrontier>,
+    path_witnesses: HashMap<PathEdgeKey, WitnessAlternatives>,
     worklist: VecDeque<QueuedPath>,
     summaries: Vec<EndSummaryRow>,
     summary_ids: HashMap<EndSummaryKey, usize>,
@@ -145,13 +242,14 @@ struct SummaryState<Fact> {
     partial_edges: HashSet<Arc<SummaryEdge>>,
     boundaries: HashSet<SummaryBoundary>,
     metrics: SummaryMetrics,
+    witness_arena: WitnessArena,
 }
 
 impl<Fact> SummaryState<Fact>
 where
     Fact: Copy + Eq + std::hash::Hash + Ord,
 {
-    fn new(zero_fact: Fact) -> Self {
+    fn new(zero_fact: Fact, witness_retention: WitnessRetentionLimits) -> Self {
         Self {
             zero_fact,
             facts: Vec::new(),
@@ -159,6 +257,7 @@ where
             procedures: Vec::new(),
             procedure_ids: HashMap::default(),
             reached: HashMap::default(),
+            path_witnesses: HashMap::default(),
             worklist: VecDeque::new(),
             summaries: Vec::new(),
             summary_ids: HashMap::default(),
@@ -175,6 +274,7 @@ where
             partial_edges: HashSet::default(),
             boundaries: HashSet::default(),
             metrics: SummaryMetrics::default(),
+            witness_arena: WitnessArena::new(witness_retention),
         }
     }
 
@@ -255,11 +355,37 @@ where
                 }
             })
             .collect::<Vec<_>>();
+        let mut staged_witness_nodes = Vec::new();
+        let mut staged_witnesses = Vec::with_capacity(staged_states.len());
+        for key in &staged_states {
+            if self.witness_arena.is_enabled() {
+                let mut alternatives = WitnessAlternatives::default();
+                let WitnessAdmission::Retained(id) = self
+                    .witness_arena
+                    .stage_candidate(
+                        &mut alternatives,
+                        PathQuality::PROVEN_COMPLETE,
+                        WitnessEvidenceNode::seed(entry_point.clone(), key.fact),
+                        &mut staged_witness_nodes,
+                    )
+                    .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?
+                else {
+                    return Err(SummaryDataflowError::WitnessInvariant(
+                        "new root seed did not retain witness evidence",
+                    ));
+                };
+                debug_assert_eq!(alternatives.first(PathQuality::PROVEN_COMPLETE), Some(id));
+                staged_witnesses.push(Some(alternatives));
+            } else {
+                staged_witnesses.push(None);
+            }
+        }
 
         if let Some(termination) = request.reserve(SolverWork {
             interned_facts: staged_facts.len(),
             reached_states: staged_states.len(),
             callback_rows,
+            witness_relations: staged_witness_nodes.len(),
             ..SolverWork::default()
         }) {
             return Ok(Some(termination));
@@ -267,11 +393,24 @@ where
 
         self.facts = staged_facts;
         self.fact_ids = staged_fact_ids;
-        for key in staged_states {
+        for (id, node) in staged_witness_nodes {
+            self.witness_arena.commit(id, node);
+        }
+        for (key, witnesses) in staged_states.into_iter().zip(staged_witnesses) {
             let quality = PathQuality::PROVEN_COMPLETE;
             self.reached
                 .insert(key, PathQualityFrontier::singleton(quality));
-            self.worklist.push_back(QueuedPath { key, quality });
+            let evidence = witnesses
+                .as_ref()
+                .and_then(|alternatives| alternatives.first(quality));
+            if let Some(witnesses) = witnesses {
+                self.path_witnesses.insert(key, witnesses);
+            }
+            self.worklist.push_back(QueuedPath {
+                key,
+                quality,
+                evidence,
+            });
         }
         Ok(None)
     }
@@ -330,12 +469,14 @@ where
         target: ProgramPointId,
         quality: PathQuality,
         outputs: &[Fact],
+        witness_source: Option<PathWitnessSource<'_>>,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, SummaryDataflowError> {
         let Some(staged) = self.stage_facts(outputs, request)? else {
             return Ok(Some(SolverTermination::Cancelled));
         };
         let mut staged_states = Vec::new();
+        let mut staged_witness_nodes = Vec::new();
         let mut new_reached_states = 0;
 
         for &fact in &staged.ids {
@@ -346,11 +487,59 @@ where
             };
             let existing = self.reached.get(&key).copied();
             let mut prospective = existing.unwrap_or_default();
-            if prospective.insert(quality) {
-                if existing.is_none() {
-                    new_reached_states += 1;
+            let frontier_changed = prospective.insert(quality);
+            let mut witnesses = self.path_witnesses.get(&key).cloned().unwrap_or_default();
+            let before_witnesses = witnesses.clone();
+            if frontier_changed {
+                witnesses.retain_frontier(prospective);
+            }
+
+            let mut queued_evidence = None;
+            if self.witness_arena.is_enabled() && prospective.contains(quality) {
+                let source =
+                    witness_source
+                        .as_ref()
+                        .ok_or(SummaryDataflowError::WitnessInvariant(
+                            "enabled witness publication has no derivation",
+                        ))?;
+                let candidate = source.evidence_for(fact);
+                if candidate.quality() != quality {
+                    return Err(SummaryDataflowError::WitnessInvariant(
+                        "candidate witness quality does not match path publication",
+                    ));
                 }
-                staged_states.push((key, prospective));
+                if let WitnessAdmission::Retained(id) = self
+                    .witness_arena
+                    .stage_candidate(
+                        &mut witnesses,
+                        quality,
+                        candidate,
+                        &mut staged_witness_nodes,
+                    )
+                    .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?
+                {
+                    queued_evidence = Some(id);
+                }
+            }
+
+            if frontier_changed && existing.is_none() {
+                new_reached_states += 1;
+            }
+            if frontier_changed && self.witness_arena.is_enabled() && queued_evidence.is_none() {
+                return Err(SummaryDataflowError::WitnessInvariant(
+                    "new path quality did not retain witness evidence",
+                ));
+            }
+            let witnesses_changed = witnesses != before_witnesses;
+            if frontier_changed || witnesses_changed {
+                staged_states.push(StagedPathPublication {
+                    key,
+                    frontier: prospective,
+                    frontier_changed,
+                    witnesses,
+                    witnesses_changed,
+                    queued_evidence,
+                });
             }
         }
 
@@ -359,15 +548,35 @@ where
             reached_states: new_reached_states,
             callback_rows: outputs.len(),
             propagated_outputs: outputs.len(),
+            witness_relations: staged_witness_nodes.len(),
             ..SolverWork::default()
         }) {
             return Ok(Some(termination));
         }
 
         self.commit_facts(staged.new_facts);
-        for (key, frontier) in staged_states {
-            self.reached.insert(key, frontier);
-            self.worklist.push_back(QueuedPath { key, quality });
+        for (id, node) in staged_witness_nodes {
+            self.witness_arena.commit(id, node);
+        }
+        for publication in staged_states {
+            self.witness_arena
+                .mark_alternatives_truncated(&publication.witnesses);
+            if publication.frontier_changed {
+                self.reached.insert(publication.key, publication.frontier);
+            }
+            if publication.witnesses_changed {
+                self.path_witnesses
+                    .insert(publication.key, publication.witnesses);
+            }
+            if publication.frontier_changed && !self.witness_arena.is_enabled()
+                || publication.queued_evidence.is_some()
+            {
+                self.worklist.push_back(QueuedPath {
+                    key: publication.key,
+                    quality,
+                    evidence: publication.queued_evidence,
+                });
+            }
         }
         Ok(None)
     }
@@ -578,6 +787,24 @@ where
             if !frontier.contains(queued.quality) {
                 continue;
             }
+            match (self.witness_arena.is_enabled(), queued.evidence) {
+                (true, Some(evidence))
+                    if self
+                        .path_witnesses
+                        .get(&queued.key)
+                        .is_some_and(|witnesses| witnesses.contains(queued.quality, evidence)) => {}
+                (true, _) => {
+                    return Err(SummaryDataflowError::WitnessInvariant(
+                        "queued path does not have active witness evidence",
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(SummaryDataflowError::WitnessInvariant(
+                        "disabled witness retention queued an evidence ID",
+                    ));
+                }
+                (false, None) => {}
+            }
 
             let procedure = self.procedures[queued.key.entry.procedure].clone();
             let point = procedure.point_handle(queued.key.point).ok_or_else(|| {
@@ -656,12 +883,14 @@ where
         let Some(exit) = outcome.available_value().cloned() else {
             return Ok(None);
         };
-        let quality = if exit.has_return_affecting_gaps() {
-            queued.quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
-        } else {
-            queued.quality
-        };
-        self.publish_end_summary(queued.key, exit, quality, problem, request)
+        self.publish_end_summary(
+            queued.key,
+            exit,
+            queued.quality,
+            queued.evidence,
+            problem,
+            request,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -772,6 +1001,7 @@ where
                     queued.key.entry,
                     queued.key.fact,
                     queued.quality,
+                    queued.evidence,
                     edge,
                     false,
                     request,
@@ -813,8 +1043,11 @@ where
                 };
                 if let Some(termination) = self.publish_call_outputs(
                     queued.key,
+                    queued.quality,
+                    queued.evidence,
                     transfer_index,
                     transfer,
+                    &edge,
                     incoming_quality,
                     &outputs,
                     problem,
@@ -873,6 +1106,7 @@ where
                 queued.key.entry,
                 queued.key.fact,
                 queued.quality,
+                queued.evidence,
                 &owned,
                 true,
                 request,
@@ -890,6 +1124,7 @@ where
         entry: EntryKey,
         fact_id: FactId,
         input_quality: PathQuality,
+        predecessor_evidence: Option<WitnessEvidenceId>,
         edge: &ProcedureIcfgEdge,
         observe_evidence: bool,
         request: &mut DataflowRequest<'_>,
@@ -917,15 +1152,37 @@ where
                 return Ok(Some(termination));
             }
         };
-        self.publish_path_outputs(entry, target, output_quality, &outputs, request)
+        let witness_source = if self.witness_arena.is_enabled() {
+            Some(PathWitnessSource::Edge {
+                predecessor: predecessor_evidence.ok_or(SummaryDataflowError::WitnessInvariant(
+                    "enabled edge propagation has no predecessor evidence",
+                ))?,
+                predecessor_quality: input_quality,
+                edge,
+                input_fact: fact_id,
+            })
+        } else {
+            None
+        };
+        self.publish_path_outputs(
+            entry,
+            target,
+            output_quality,
+            &outputs,
+            witness_source,
+            request,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn publish_call_outputs<P>(
         &mut self,
         caller_path: PathEdgeKey,
+        caller_quality: PathQuality,
+        caller_evidence: Option<WitnessEvidenceId>,
         transfer_index: usize,
         transfer: &CallTransfer,
+        call_edge: &ProcedureIcfgEdge,
         quality: PathQuality,
         outputs: &[Fact],
         problem: &P,
@@ -936,6 +1193,11 @@ where
     {
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
+        }
+        if self.witness_arena.is_enabled() && caller_evidence.is_none() {
+            return Err(SummaryDataflowError::WitnessInvariant(
+                "enabled call propagation has no caller evidence",
+            ));
         }
         let callee_procedure = self
             .procedure_ids
@@ -1012,30 +1274,13 @@ where
         }
         debug_assert_eq!(missing_facts, new_facts);
 
-        let charge = SolverWork {
-            interned_facts: new_facts,
-            reached_states: new_reached_states,
-            callback_rows: outputs.len(),
-            propagated_outputs: outputs.len(),
-            incoming_calls: new_incoming_calls,
-            ..SolverWork::default()
-        };
-        let staged_budget = match request.budget.staged_charge(charge) {
-            Ok(staged_budget) => staged_budget,
-            Err(exceeded) => {
-                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
-            }
-        };
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
-        }
-
         let Some(staged) = self.stage_facts(outputs, request)? else {
             return Ok(Some(SolverTermination::Cancelled));
         };
         debug_assert_eq!(staged.new_facts.len(), new_facts);
         let mut staged_paths = Vec::with_capacity(outputs.len());
         let mut staged_incoming = Vec::with_capacity(outputs.len());
+        let mut staged_witness_nodes = Vec::new();
         for &fact in &staged.ids {
             if request.cancellation.is_cancelled() {
                 return Ok(Some(SolverTermination::Cancelled));
@@ -1052,8 +1297,43 @@ where
             };
             let existing_path = self.reached.get(&path).copied();
             let mut path_frontier = existing_path.unwrap_or_default();
-            if path_frontier.insert(PathQuality::PROVEN_COMPLETE) {
-                staged_paths.push((path, path_frontier));
+            let path_frontier_changed = path_frontier.insert(PathQuality::PROVEN_COMPLETE);
+            let mut path_witnesses = self.path_witnesses.get(&path).cloned().unwrap_or_default();
+            let before_path_witnesses = path_witnesses.clone();
+            if path_frontier_changed {
+                path_witnesses.retain_frontier(path_frontier);
+            }
+            let mut path_evidence = None;
+            if self.witness_arena.is_enabled() {
+                let candidate = WitnessEvidenceNode::seed(transfer.callee_entry.clone(), fact);
+                if let WitnessAdmission::Retained(id) = self
+                    .witness_arena
+                    .stage_candidate(
+                        &mut path_witnesses,
+                        PathQuality::PROVEN_COMPLETE,
+                        candidate,
+                        &mut staged_witness_nodes,
+                    )
+                    .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?
+                {
+                    path_evidence = Some(id);
+                }
+            }
+            if path_frontier_changed && self.witness_arena.is_enabled() && path_evidence.is_none() {
+                return Err(SummaryDataflowError::WitnessInvariant(
+                    "new callee entry path did not retain relative seed evidence",
+                ));
+            }
+            let path_witnesses_changed = path_witnesses != before_path_witnesses;
+            if path_frontier_changed || path_witnesses_changed {
+                staged_paths.push(StagedPathPublication {
+                    key: path,
+                    frontier: path_frontier,
+                    frontier_changed: path_frontier_changed,
+                    witnesses: path_witnesses,
+                    witnesses_changed: path_witnesses_changed,
+                    queued_evidence: path_evidence,
+                });
             }
 
             let incoming_key = IncomingKey {
@@ -1066,15 +1346,80 @@ where
             let existing_incoming = self.incoming_ids.get(&incoming_key).copied();
             let existing_frontier = existing_incoming.map(|id| self.incoming[id].qualities);
             let mut incoming_frontier = existing_frontier.unwrap_or_default();
-            let incoming_changed = incoming_frontier.insert(quality);
-            staged_incoming.push((
-                incoming_key,
-                existing_incoming,
-                incoming_frontier,
-                incoming_changed,
-                existing_path.is_some(),
-            ));
+            let incoming_frontier_changed = incoming_frontier.insert(quality);
+            let mut incoming_witnesses = existing_incoming
+                .map(|id| self.incoming[id].witnesses.clone())
+                .unwrap_or_default();
+            let before_incoming_witnesses = incoming_witnesses.clone();
+            if incoming_frontier_changed {
+                incoming_witnesses.retain_frontier(incoming_frontier);
+            }
+            let mut incoming_evidence = None;
+            if self.witness_arena.is_enabled() && incoming_frontier.contains(quality) {
+                let candidate = WitnessEvidenceNode::edge(
+                    caller_evidence.expect("enabled call evidence was validated"),
+                    caller_quality,
+                    call_edge,
+                    caller_path.fact,
+                    fact,
+                );
+                if candidate.quality() != quality {
+                    return Err(SummaryDataflowError::WitnessInvariant(
+                        "incoming call evidence quality does not match publication",
+                    ));
+                }
+                if let WitnessAdmission::Retained(id) = self
+                    .witness_arena
+                    .stage_candidate(
+                        &mut incoming_witnesses,
+                        quality,
+                        candidate,
+                        &mut staged_witness_nodes,
+                    )
+                    .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?
+                {
+                    incoming_evidence = Some(id);
+                }
+            }
+            if incoming_frontier_changed
+                && self.witness_arena.is_enabled()
+                && incoming_evidence.is_none()
+            {
+                return Err(SummaryDataflowError::WitnessInvariant(
+                    "new incoming call quality did not retain witness evidence",
+                ));
+            }
+            let incoming_witnesses_changed = incoming_witnesses != before_incoming_witnesses;
+            staged_incoming.push(StagedIncomingPublication {
+                key: incoming_key,
+                existing: existing_incoming,
+                frontier: incoming_frontier,
+                witnesses: incoming_witnesses,
+                frontier_changed: incoming_frontier_changed,
+                witnesses_changed: incoming_witnesses_changed,
+                reused_entry: existing_path.is_some(),
+                activated_evidence: incoming_evidence,
+            });
         }
+        if request.cancellation.is_cancelled() {
+            return Ok(Some(SolverTermination::Cancelled));
+        }
+
+        let charge = SolverWork {
+            interned_facts: new_facts,
+            reached_states: new_reached_states,
+            callback_rows: outputs.len(),
+            propagated_outputs: outputs.len(),
+            incoming_calls: new_incoming_calls,
+            witness_relations: staged_witness_nodes.len(),
+            ..SolverWork::default()
+        };
+        let staged_budget = match request.budget.staged_charge(charge) {
+            Ok(staged_budget) => staged_budget,
+            Err(exceeded) => {
+                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
+            }
+        };
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
         }
@@ -1085,46 +1430,77 @@ where
             debug_assert_eq!(committed, callee_procedure);
         }
         self.commit_facts(staged.new_facts);
-        for (key, frontier) in staged_paths {
-            self.reached.insert(key, frontier);
-            self.worklist.push_back(QueuedPath {
-                key,
-                quality: PathQuality::PROVEN_COMPLETE,
-            });
+        for (id, node) in staged_witness_nodes {
+            self.witness_arena.commit(id, node);
+        }
+        for publication in staged_paths {
+            self.witness_arena
+                .mark_alternatives_truncated(&publication.witnesses);
+            if publication.frontier_changed {
+                self.reached.insert(publication.key, publication.frontier);
+            }
+            if publication.witnesses_changed {
+                self.path_witnesses
+                    .insert(publication.key, publication.witnesses);
+            }
+            if (publication.frontier_changed && !self.witness_arena.is_enabled())
+                || publication.queued_evidence.is_some()
+            {
+                self.worklist.push_back(QueuedPath {
+                    key: publication.key,
+                    quality: PathQuality::PROVEN_COMPLETE,
+                    evidence: publication.queued_evidence,
+                });
+            }
         }
 
         let mut activated = Vec::new();
-        for (key, existing, frontier, changed, reused_entry) in staged_incoming {
-            let id = if let Some(id) = existing {
-                self.incoming[id].qualities = frontier;
+        for publication in staged_incoming {
+            self.witness_arena
+                .mark_alternatives_truncated(&publication.witnesses);
+            let id = if let Some(id) = publication.existing {
+                if publication.frontier_changed {
+                    self.incoming[id].qualities = publication.frontier;
+                }
+                if publication.witnesses_changed {
+                    self.incoming[id].witnesses = publication.witnesses;
+                }
                 id
             } else {
                 let id = self.incoming.len();
                 self.incoming.push(IncomingCall {
-                    key,
+                    key: publication.key,
                     origin: transfer.origin.clone(),
-                    qualities: frontier,
+                    qualities: publication.frontier,
+                    witnesses: publication.witnesses,
                 });
-                self.incoming_ids.insert(key, id);
+                self.incoming_ids.insert(publication.key, id);
                 self.incoming_by_entry
-                    .entry(key.callee)
+                    .entry(publication.key.callee)
                     .or_default()
                     .push(id);
-                if reused_entry {
+                if publication.reused_entry {
                     self.metrics.reused_entry_contexts =
                         self.metrics.reused_entry_contexts.saturating_add(1);
                 }
                 id
             };
-            if changed {
-                activated.push((id, quality));
+            if publication.frontier_changed && !self.witness_arena.is_enabled() {
+                activated.push((id, quality, None));
+            }
+            if let Some(evidence) = publication.activated_evidence {
+                activated.push((id, quality, Some(evidence)));
             }
         }
 
-        for (incoming, active_quality) in activated {
-            if let Some(termination) =
-                self.replay_existing_summaries(incoming, active_quality, problem, request)?
-            {
+        for (incoming, active_quality, active_evidence) in activated {
+            if let Some(termination) = self.replay_existing_summaries(
+                incoming,
+                active_quality,
+                active_evidence,
+                problem,
+                request,
+            )? {
                 return Ok(Some(termination));
             }
         }
@@ -1135,40 +1511,109 @@ where
         &mut self,
         path: PathEdgeKey,
         exit: Arc<IcfgExitProfile>,
-        quality: PathQuality,
+        predecessor_quality: PathQuality,
+        predecessor_evidence: Option<WitnessEvidenceId>,
         problem: &P,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, SummaryDataflowError>
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
+        let quality = if exit.has_return_affecting_gaps() {
+            predecessor_quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
+        } else {
+            predecessor_quality
+        };
         let key = EndSummaryKey {
             entry: path.entry,
             exit_point: exit.callee_exit().id(),
             exit_fact: path.fact,
         };
-        let summary_id = if let Some(id) = self.summary_ids.get(&key).copied() {
-            let mut prospective = self.summaries[id].qualities;
-            if !prospective.insert(quality) {
-                return Ok(None);
+        let existing = self.summary_ids.get(&key).copied();
+        let mut qualities = existing
+            .map(|id| self.summaries[id].qualities)
+            .unwrap_or_default();
+        let frontier_changed = qualities.insert(quality);
+        let mut witnesses = existing
+            .map(|id| self.summaries[id].witnesses.clone())
+            .unwrap_or_default();
+        let before_witnesses = witnesses.clone();
+        if frontier_changed {
+            witnesses.retain_frontier(qualities);
+        }
+
+        let mut staged_witness_nodes = Vec::new();
+        let mut activated_evidence = None;
+        if self.witness_arena.is_enabled() && qualities.contains(quality) {
+            let predecessor =
+                predecessor_evidence.ok_or(SummaryDataflowError::WitnessInvariant(
+                    "enabled end-summary publication has no predecessor evidence",
+                ))?;
+            let entry_point = self.procedures[path.entry.procedure]
+                .point_handle(path.entry.entry_point)
+                .ok_or_else(|| SemanticProviderError::internal("summary entry point is stale"))?;
+            let candidate = WitnessEvidenceNode::end_summary(
+                predecessor,
+                predecessor_quality,
+                entry_point,
+                path.entry.entry_fact,
+                Arc::clone(&exit),
+                path.fact,
+            );
+            if candidate.quality() != quality {
+                return Err(SummaryDataflowError::WitnessInvariant(
+                    "end-summary evidence quality does not match publication",
+                ));
             }
-            if request.cancellation.is_cancelled() {
-                return Ok(Some(SolverTermination::Cancelled));
+            if let WitnessAdmission::Retained(id) = self
+                .witness_arena
+                .stage_candidate(
+                    &mut witnesses,
+                    quality,
+                    candidate,
+                    &mut staged_witness_nodes,
+                )
+                .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?
+            {
+                activated_evidence = Some(id);
             }
-            self.summaries[id].qualities = prospective;
+        }
+        if frontier_changed && self.witness_arena.is_enabled() && activated_evidence.is_none() {
+            return Err(SummaryDataflowError::WitnessInvariant(
+                "new end-summary quality did not retain witness evidence",
+            ));
+        }
+        let witnesses_changed = witnesses != before_witnesses;
+        if !frontier_changed && !witnesses_changed {
+            return Ok(None);
+        }
+
+        if let Some(termination) = request.reserve(SolverWork {
+            end_summaries: usize::from(existing.is_none()),
+            witness_relations: staged_witness_nodes.len(),
+            ..SolverWork::default()
+        }) {
+            return Ok(Some(termination));
+        }
+        for (id, node) in staged_witness_nodes {
+            self.witness_arena.commit(id, node);
+        }
+        self.witness_arena.mark_alternatives_truncated(&witnesses);
+        let summary_id = if let Some(id) = existing {
+            if frontier_changed {
+                self.summaries[id].qualities = qualities;
+            }
+            if witnesses_changed {
+                self.summaries[id].witnesses = witnesses;
+            }
             id
         } else {
-            if let Some(termination) = request.reserve(SolverWork {
-                end_summaries: 1,
-                ..SolverWork::default()
-            }) {
-                return Ok(Some(termination));
-            }
             let id = self.summaries.len();
             self.summaries.push(EndSummaryRow {
                 key,
                 exit,
-                qualities: PathQualityFrontier::singleton(quality),
+                qualities,
+                witnesses,
             });
             self.summary_ids.insert(key, id);
             self.summaries_by_entry
@@ -1178,29 +1623,51 @@ where
             id
         };
 
-        let incoming_len = self.incoming_by_entry.get(&key.entry).map_or(0, Vec::len);
-        for index in 0..incoming_len {
+        let incoming_ids = self
+            .incoming_by_entry
+            .get(&key.entry)
+            .cloned()
+            .unwrap_or_default();
+        for incoming_id in incoming_ids {
             if request.cancellation.is_cancelled() {
                 return Ok(Some(SolverTermination::Cancelled));
             }
-            let incoming_id = self
-                .incoming_by_entry
-                .get(&key.entry)
-                .and_then(|ids| ids.get(index))
-                .copied()
-                .ok_or_else(|| {
-                    SemanticProviderError::internal("summary incoming index is stale")
-                })?;
             let qualities = self.incoming[incoming_id].qualities;
             for incoming_quality in qualities.iter() {
-                if let Some(termination) = self.apply_summary(
-                    incoming_id,
-                    summary_id,
-                    incoming_quality,
-                    quality,
-                    problem,
-                    request,
-                )? {
+                if self.witness_arena.is_enabled() {
+                    let Some(summary_evidence) = activated_evidence else {
+                        continue;
+                    };
+                    let incoming_evidence = self.incoming[incoming_id]
+                        .witnesses
+                        .ids(incoming_quality)
+                        .to_vec();
+                    for incoming_evidence in incoming_evidence {
+                        if let Some(termination) = self.apply_summary(
+                            incoming_id,
+                            summary_id,
+                            incoming_quality,
+                            Some(incoming_evidence),
+                            quality,
+                            Some(summary_evidence),
+                            problem,
+                            request,
+                        )? {
+                            return Ok(Some(termination));
+                        }
+                    }
+                } else if frontier_changed
+                    && let Some(termination) = self.apply_summary(
+                        incoming_id,
+                        summary_id,
+                        incoming_quality,
+                        None,
+                        quality,
+                        None,
+                        problem,
+                        request,
+                    )?
+                {
                     return Ok(Some(termination));
                 }
             }
@@ -1212,6 +1679,7 @@ where
         &mut self,
         incoming: usize,
         incoming_quality: PathQuality,
+        incoming_evidence: Option<WitnessEvidenceId>,
         problem: &P,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, SummaryDataflowError>
@@ -1221,11 +1689,21 @@ where
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
         }
+        if self.witness_arena.is_enabled()
+            && incoming_evidence.is_none_or(|evidence| {
+                !self.incoming[incoming]
+                    .witnesses
+                    .contains(incoming_quality, evidence)
+            })
+        {
+            return Err(SummaryDataflowError::WitnessInvariant(
+                "summary replay has no active incoming evidence",
+            ));
+        }
         // No applied-pair table is needed: this path runs only for one newly
-        // admitted incoming quality, while `publish_end_summary` runs only for
-        // one newly admitted summary quality. The side admitted second owns
-        // the pair exactly once. Avoiding a retained Cartesian-product table
-        // keeps query memory linear in incoming and summary rows.
+        // admitted incoming derivation, while `publish_end_summary` runs only
+        // for one newly admitted end-summary derivation. The side admitted
+        // second owns the pair exactly once.
         let entry = self.incoming[incoming].key.callee;
         let summary_len = self.summaries_by_entry.get(&entry).map_or(0, Vec::len);
         if summary_len == 0 {
@@ -1247,11 +1725,32 @@ where
                 })?;
             let qualities = self.summaries[summary].qualities;
             for summary_quality in qualities.iter() {
-                if let Some(termination) = self.apply_summary(
+                if self.witness_arena.is_enabled() {
+                    let summary_evidence = self.summaries[summary]
+                        .witnesses
+                        .ids(summary_quality)
+                        .to_vec();
+                    for summary_evidence in summary_evidence {
+                        if let Some(termination) = self.apply_summary(
+                            incoming,
+                            summary,
+                            incoming_quality,
+                            incoming_evidence,
+                            summary_quality,
+                            Some(summary_evidence),
+                            problem,
+                            request,
+                        )? {
+                            return Ok(Some(termination));
+                        }
+                    }
+                } else if let Some(termination) = self.apply_summary(
                     incoming,
                     summary,
                     incoming_quality,
+                    None,
                     summary_quality,
+                    None,
                     problem,
                     request,
                 )? {
@@ -1337,13 +1836,30 @@ where
         incoming_id: usize,
         summary_id: usize,
         incoming_quality: PathQuality,
+        incoming_evidence: Option<WitnessEvidenceId>,
         summary_quality: PathQuality,
+        summary_evidence: Option<WitnessEvidenceId>,
         problem: &P,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<SolverTermination>, SummaryDataflowError>
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
+        if self.witness_arena.is_enabled()
+            && (incoming_evidence.is_none_or(|evidence| {
+                !self.incoming[incoming_id]
+                    .witnesses
+                    .contains(incoming_quality, evidence)
+            }) || summary_evidence.is_none_or(|evidence| {
+                !self.summaries[summary_id]
+                    .witnesses
+                    .contains(summary_quality, evidence)
+            }))
+        {
+            return Err(SummaryDataflowError::WitnessInvariant(
+                "summary application evidence is not active",
+            ));
+        }
         if let Some(termination) = reserve_summary_application(request) {
             return Ok(Some(termination));
         }
@@ -1402,7 +1918,27 @@ where
                 };
                 self.metrics.summary_applications =
                     self.metrics.summary_applications.saturating_add(1);
-                self.publish_path_outputs(caller, target, quality, &outputs, request)
+                let witness_source = if self.witness_arena.is_enabled() {
+                    Some(PathWitnessSource::SummaryApplication {
+                        incoming: incoming_evidence
+                            .expect("enabled incoming evidence was validated"),
+                        incoming_quality,
+                        summary: summary_evidence.expect("enabled summary evidence was validated"),
+                        summary_quality,
+                        return_edge: edge,
+                        input_fact: exit_fact,
+                    })
+                } else {
+                    None
+                };
+                self.publish_path_outputs(
+                    caller,
+                    target,
+                    quality,
+                    &outputs,
+                    witness_source,
+                    request,
+                )
             }
         }
     }
@@ -1413,11 +1949,47 @@ where
         work: SolverWork,
         semantic_work: SemanticWork,
     ) -> SummaryDataflowResult<Fact> {
-        let mut reached_rows = self.reached.into_iter().collect::<Vec<_>>();
+        let witness_owner = self.witness_arena.is_enabled().then(|| Arc::new(()));
+        let witness_arena = std::mem::replace(
+            &mut self.witness_arena,
+            WitnessArena::new(WitnessRetentionLimits::disabled()),
+        );
+        let witness_store = if termination.is_fixed_point() {
+            let mut witness_roots = Vec::new();
+            for (key, witnesses) in &self.path_witnesses {
+                let Some(frontier) = self.reached.get(key) else {
+                    continue;
+                };
+                for quality in frontier.iter() {
+                    witness_roots.extend(witnesses.ids(quality));
+                }
+            }
+            for summary in &self.summaries {
+                for quality in summary.qualities.iter() {
+                    witness_roots.extend(summary.witnesses.ids(quality));
+                }
+            }
+            let (witness_store, witness_remap) = witness_arena.into_compact_store(witness_roots);
+            for witnesses in self.path_witnesses.values_mut() {
+                witnesses.remap(&witness_remap);
+            }
+            for summary in &mut self.summaries {
+                summary.witnesses.remap(&witness_remap);
+            }
+            witness_store
+        } else {
+            // A cancelled or budget-stopped solve must return promptly. The
+            // arena is already relation-budgeted, and preserving its dense IDs
+            // avoids an uninterruptible full traversal and peak-memory copy.
+            witness_arena.into_store()
+        };
+
+        let mut reached_rows = self.reached.drain().collect::<Vec<_>>();
         reached_rows.sort_unstable_by_key(|(key, _)| *key);
         let reached = reached_rows
             .into_iter()
             .map(|(key, qualities)| {
+                let witnesses = self.path_witnesses.remove(&key).unwrap_or_default();
                 let procedure = self.procedures[key.entry.procedure].clone();
                 let entry_point = procedure
                     .point_handle(key.entry.entry_point)
@@ -1430,11 +2002,13 @@ where
                     point,
                     key.fact,
                     qualities,
+                    witnesses,
+                    witness_owner.clone(),
                 )
             })
             .collect();
 
-        let mut summary_rows = self.summaries;
+        let mut summary_rows = std::mem::take(&mut self.summaries);
         summary_rows.sort_unstable_by_key(|row| row.key);
         let end_summaries = summary_rows
             .into_iter()
@@ -1448,6 +2022,8 @@ where
                     row.exit,
                     row.key.exit_fact,
                     row.qualities,
+                    row.witnesses,
+                    witness_owner.clone(),
                 )
             })
             .collect();
@@ -1472,6 +2048,7 @@ where
             work,
             semantic_work,
             self.metrics,
+            witness_store,
         )
     }
 }
@@ -1490,7 +2067,7 @@ where
 {
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
-    let mut state = SummaryState::new(problem.zero_fact());
+    let mut state = SummaryState::new(problem.zero_fact(), input.witness_retention());
     let termination = if let Some(termination) = state.initialize(input, request)? {
         termination
     } else {
