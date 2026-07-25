@@ -123,6 +123,13 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::Supertypes(HierarchyTraversal::Direct)
         | QueryStep::Subtypes(HierarchyTraversal::Direct)
         | QueryStep::EnclosingDecl
+        | QueryStep::ProcedureOf
+        | QueryStep::CfgEntry
+        | QueryStep::CfgExits
+        | QueryStep::CfgSuccessorEdges
+        | QueryStep::CfgPredecessorEdges
+        | QueryStep::CfgEdgeSource
+        | QueryStep::CfgEdgeTarget
         | QueryStep::FileOf
         | QueryStep::ImportsOf
         | QueryStep::ImportersOf

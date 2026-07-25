@@ -5211,6 +5211,24 @@ fn invalid_programmatic_pipeline_is_diagnostic_not_panic() {
 }
 
 #[test]
+fn cfg_pipeline_is_incomplete_not_a_panic_before_semantic_execution_is_wired() {
+    let result = run(
+        &[("src/main.rs", "fn target() {}\n")],
+        json!({
+            "schema_version": 3,
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "procedure_of" }]
+        }),
+    );
+    let value = serialized(&result);
+
+    assert_eq!(value["results"], json!([]));
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["diagnostics"][0]["code"], "semantic_results_omitted");
+    assert_eq!(value["diagnostics"][0]["impact"], "incomplete");
+}
+
+#[test]
 fn empty_seed_frontier_does_not_build_import_graph() {
     let project = InlineTestProject::new()
         .file("a.rb", "require_relative 'b'\ndef present; end\n")

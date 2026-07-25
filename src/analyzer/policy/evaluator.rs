@@ -2166,10 +2166,15 @@ fn evaluate_match_query_candidates(
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
     match query.validate_steps() {
-        Ok(QueryValueKind::ReceiverAnalysis) => {
+        Ok(
+            QueryValueKind::ReceiverAnalysis
+            | QueryValueKind::Procedure
+            | QueryValueKind::ProgramPoint
+            | QueryValueKind::ControlEdge,
+        ) => {
             return failed_before_execution(
                 PolicyFailureReason::InvalidExecutionPlan,
-                "receiver-analysis is not a positive match-policy terminal domain",
+                "analysis-only query values are not positive match-policy terminal domains",
                 budget,
             );
         }

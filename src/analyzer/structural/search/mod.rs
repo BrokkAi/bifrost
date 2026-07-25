@@ -38,8 +38,9 @@ use super::provider::{
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryExecutionMode, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryError,
-    QueryStep, ReferenceTraversalFilter, SetOperator,
+    CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
+    CodeQuerySeed, HierarchyTraversal, QueryError, QueryStep, ReferenceTraversalFilter,
+    SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -1277,6 +1278,12 @@ fn execute_internal_with_strategy(
             );
         }
     };
+    if query_plan_requires_cfg(&query.plan) {
+        return detailed_result_without_evidence(
+            cfg_execution_not_wired_result(),
+            CodeQueryExecutionBudget::default(),
+        );
+    }
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
@@ -4682,6 +4689,44 @@ fn invalid_plan_result(error: impl ToString) -> CodeQueryResult {
             message: error.to_string(),
         }],
     }
+}
+
+fn cfg_execution_not_wired_result() -> CodeQueryResult {
+    CodeQueryResult {
+        results: Vec::new(),
+        truncated: true,
+        diagnostics: vec![CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "procedure-local CFG query execution is not wired yet".to_string(),
+        }],
+    }
+}
+
+fn query_plan_requires_cfg(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if plan.steps.iter().any(|step| {
+            matches!(
+                step,
+                QueryStep::ProcedureOf
+                    | QueryStep::CfgEntry
+                    | QueryStep::CfgExits
+                    | QueryStep::CfgSuccessorEdges
+                    | QueryStep::CfgPredecessorEdges
+                    | QueryStep::CfgEdgeSource
+                    | QueryStep::CfgEdgeTarget
+            )
+        }) {
+            return true;
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches);
+        }
+    }
+    false
 }
 
 fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>) {

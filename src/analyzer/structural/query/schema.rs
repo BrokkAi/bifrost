@@ -15,11 +15,15 @@ use std::sync::OnceLock;
 
 use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
 
-const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[SchemaVersionDescriptor::new(
-    SCHEMA_VERSION as u32,
-    None,
-    true,
-)];
+const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
+const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
+    SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
+    SchemaVersionDescriptor::new(
+        SCHEMA_VERSION as u32,
+        Some(RQL_INITIAL_SCHEMA_VERSION),
+        true,
+    ),
+];
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -28,6 +32,10 @@ pub(crate) fn rql_schema_version_registry() -> &'static SchemaVersionRegistry {
         SchemaVersionRegistry::new(RQL_SCHEMA_VERSIONS)
             .expect("the compiled-in RQL schema lineage must be valid")
     })
+}
+
+pub(super) const fn oldest_rql_schema_version() -> u64 {
+    RQL_SCHEMA_VERSIONS[0].version as u64
 }
 
 pub(crate) fn resolve_rql_schema_version(
@@ -157,11 +165,22 @@ impl CodeQueryExecutionMode {
     }
 }
 
+macro_rules! minimum_schema_version {
+    () => {
+        RQL_INITIAL_SCHEMA_VERSION as u64
+    };
+    ($version:literal) => {
+        $version
+    };
+}
+
 macro_rules! query_step_ops {
     ($($variant:ident {
         label: $label:literal,
         signature: $signature:literal,
-        description: $description:literal $(,)?
+        description: $description:literal
+        $(, since: $since:literal)?
+        $(,)?
     })+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum QueryStepOp {
@@ -198,6 +217,12 @@ macro_rules! query_step_ops {
                 }
             }
 
+            pub const fn minimum_schema_version(self) -> u64 {
+                match self {
+                    $(Self::$variant => minimum_schema_version!($($since)?),)+
+                }
+            }
+
             pub fn allows_hierarchy_options(self) -> bool {
                 matches!(self, Self::Supertypes | Self::Subtypes)
             }
@@ -226,7 +251,14 @@ macro_rules! query_step_ops {
 
 query_step_ops! {
     EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    ProcedureOf { label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", since: 3, }
+    CfgEntry { label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", since: 3, }
+    CfgExits { label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", since: 3, }
+    CfgSuccessorEdges { label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", since: 3, }
+    CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", since: 3, }
+    CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", since: 3, }
+    CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", since: 3, }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -252,7 +284,9 @@ macro_rules! rql_forms {
         class: $class:ident,
         shape: $shape:ident,
         signature: $signature:literal,
-        description: $description:literal $(,)?
+        description: $description:literal
+        $(, since: $since:literal)?
+        $(,)?
     })+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum RqlForm {
@@ -307,6 +341,12 @@ macro_rules! rql_forms {
                 }
             }
 
+            pub const fn minimum_schema_version(self) -> u64 {
+                match self {
+                    $(Self::$variant => minimum_schema_version!($($since)?),)+
+                }
+            }
+
             /// Return the pattern property lowered by a predicate form.
             ///
             /// Keeping this match exhaustive makes adding a form require an
@@ -326,6 +366,13 @@ macro_rules! rql_forms {
                     | Self::Intersect
                     | Self::Except
                     | Self::EnclosingDecl
+                    | Self::ProcedureOf
+                    | Self::CfgEntry
+                    | Self::CfgExits
+                    | Self::CfgSuccessorEdges
+                    | Self::CfgPredecessorEdges
+                    | Self::CfgEdgeSource
+                    | Self::CfgEdgeTarget
                     | Self::FileOf
                     | Self::ImportsOf
                     | Self::ImportersOf
@@ -441,6 +488,62 @@ rql_forms! {
         shape: Query,
         signature: "(enclosing-decl query)",
         description: "Return the smallest real declaration enclosing each structural match.",
+    }
+    ProcedureOf {
+        labels: ["procedure-of", "procedure_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(procedure-of query)",
+        description: "Resolve each structural match or declaration to its smallest enclosing executable procedure.",
+        since: 3,
+    }
+    CfgEntry {
+        labels: ["cfg-entry", "cfg_entry"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-entry query)",
+        description: "Return the validated entry program point of each procedure.",
+        since: 3,
+    }
+    CfgExits {
+        labels: ["cfg-exits", "cfg_exits"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-exits query)",
+        description: "Return the validated normal and exceptional exit program points of each procedure.",
+        since: 3,
+    }
+    CfgSuccessorEdges {
+        labels: ["cfg-successor-edges", "cfg_successor_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-successor-edges query)",
+        description: "Return one-hop outgoing control edges from each program point.",
+        since: 3,
+    }
+    CfgPredecessorEdges {
+        labels: ["cfg-predecessor-edges", "cfg_predecessor_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-predecessor-edges query)",
+        description: "Return one-hop incoming control edges to each program point.",
+        since: 3,
+    }
+    CfgEdgeSource {
+        labels: ["cfg-edge-source", "cfg_edge_source"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-edge-source query)",
+        description: "Project each control edge to its source program point.",
+        since: 3,
+    }
+    CfgEdgeTarget {
+        labels: ["cfg-edge-target", "cfg_edge_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-edge-target query)",
+        description: "Project each control edge to its target program point.",
+        since: 3,
     }
     FileOf {
         labels: ["file-of"],
@@ -891,11 +994,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_two_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_version_three_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 2,
+                version: 3,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -906,10 +1009,17 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             }
         );
+        assert_eq!(
+            resolve_rql_schema_version(Some(3)).unwrap(),
+            SchemaVersionResolution {
+                version: 3,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2]);
+        assert_eq!(error.supported, vec![2, 3]);
     }
 
     #[test]
@@ -918,6 +1028,7 @@ mod tests {
         for form in ALL_RQL_FORMS {
             assert!(!form.signature().is_empty());
             assert!(!form.description().is_empty());
+            assert!((2..=SCHEMA_VERSION).contains(&form.minimum_schema_version()));
             for label in form.labels() {
                 assert!(forms.insert(*label), "duplicate form label {label}");
                 assert_eq!(RqlForm::from_label(label), Some(*form));
@@ -929,6 +1040,7 @@ mod tests {
             assert!(step_ops.insert(op.label()), "duplicate query step op");
             assert!(!op.signature().is_empty());
             assert!(!op.description().is_empty());
+            assert!((2..=SCHEMA_VERSION).contains(&op.minimum_schema_version()));
             assert_eq!(QueryStepOp::from_label(op.label()), Some(*op));
         }
 

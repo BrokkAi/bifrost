@@ -323,6 +323,13 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             Ok(Some(Value::Object(query)))
         }
         RqlForm::EnclosingDecl
+        | RqlForm::ProcedureOf
+        | RqlForm::CfgEntry
+        | RqlForm::CfgExits
+        | RqlForm::CfgSuccessorEdges
+        | RqlForm::CfgPredecessorEdges
+        | RqlForm::CfgEdgeSource
+        | RqlForm::CfgEdgeTarget
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
@@ -337,6 +344,13 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?;
             let op = match form {
                 RqlForm::EnclosingDecl => "enclosing_decl",
+                RqlForm::ProcedureOf => "procedure_of",
+                RqlForm::CfgEntry => "cfg_entry",
+                RqlForm::CfgExits => "cfg_exits",
+                RqlForm::CfgSuccessorEdges => "cfg_successor_edges",
+                RqlForm::CfgPredecessorEdges => "cfg_predecessor_edges",
+                RqlForm::CfgEdgeSource => "cfg_edge_source",
+                RqlForm::CfgEdgeTarget => "cfg_edge_target",
                 RqlForm::FileOf => "file_of",
                 RqlForm::ImportsOf => "imports_of",
                 RqlForm::ImportersOf => "importers_of",
@@ -720,6 +734,13 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Intersect
         | RqlForm::Except
         | RqlForm::EnclosingDecl
+        | RqlForm::ProcedureOf
+        | RqlForm::CfgEntry
+        | RqlForm::CfgExits
+        | RqlForm::CfgSuccessorEdges
+        | RqlForm::CfgPredecessorEdges
+        | RqlForm::CfgEdgeSource
+        | RqlForm::CfgEdgeTarget
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
@@ -1070,6 +1091,18 @@ mod tests {
 
         assert_eq!(error.path, "limit");
         assert_eq!(&source[error.range], "0");
+    }
+
+    #[test]
+    fn version_three_cfg_forms_reject_version_two_at_the_authored_operation() {
+        let source = "(procedure-of (function))";
+        let expr = parse_query_expr(source).unwrap();
+        let schema = resolve_rql_schema_version(Some(2)).unwrap();
+        let error = code_query_from_expr(&expr, schema).unwrap_err();
+
+        assert_eq!(error.path, "steps[0].op");
+        assert_eq!(&source[error.range], "procedure-of");
+        assert!(error.message.contains("requires schema version 3"));
     }
 
     #[test]

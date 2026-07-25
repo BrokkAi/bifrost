@@ -4,8 +4,8 @@ use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
     QueryField, QueryStepField, RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
-    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
-    usage_surface_from_label,
+    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
@@ -615,6 +615,16 @@ fn validate_wrapper(
     let Some(query) = args.last() else {
         return;
     };
+    if form.minimum_schema_version() > oldest_rql_schema_version()
+        && let Ok(lowered_query) = query_to_json(query)
+    {
+        let step_index = lowered_query
+            .get("steps")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let steps_path = rql_query_child_path(path, "steps");
+        analysis.path(format!("{steps_path}[{step_index}].op"), head_range.clone());
+    }
     match form {
         RqlForm::Where => {
             let values = &args[..args.len().saturating_sub(1)];
@@ -746,6 +756,13 @@ fn validate_wrapper(
             return;
         }
         RqlForm::EnclosingDecl
+        | RqlForm::ProcedureOf
+        | RqlForm::CfgEntry
+        | RqlForm::CfgExits
+        | RqlForm::CfgSuccessorEdges
+        | RqlForm::CfgPredecessorEdges
+        | RqlForm::CfgEdgeSource
+        | RqlForm::CfgEdgeTarget
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
@@ -3329,6 +3346,15 @@ mod tests {
         assert_eq!(diagnostic.code, "invalid-query");
         assert_eq!(&invalid[diagnostic.range], r#"{"op":"imports_of"}"#);
         assert!(diagnostic.message.contains("requires file"));
+
+        let version_two =
+            r#"{"schema_version":2,"match":{"kind":"function"},"steps":[{"op":"procedure_of"}]}"#;
+        let diagnostic = validate_query_source(version_two)
+            .pop()
+            .expect("diagnostic");
+        assert_eq!(diagnostic.code, "invalid-query");
+        assert_eq!(&version_two[diagnostic.range], r#""procedure_of""#);
+        assert!(diagnostic.message.contains("requires schema version 3"));
     }
 
     #[test]

@@ -40,7 +40,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 08:17Z) Inspected issue #824, its live dependencies, the existing umbrella plan, and the current CodeQuery, semantic artifact, policy, Python, LSP, and VS Code boundaries.
 - [x] (2026-07-25 08:17Z) Chose the initial typed domains and exact one-hop CFG algebra described in this plan.
 - [x] (2026-07-25 08:31Z) User approved implementation and requested checkpoint commits between milestones plus frequent synchronization with `origin/master`.
-- [ ] Add schema-versioned query kinds and operations with parser, decoder, validator, canonical JSON, and RQL tooling coverage.
+- [x] (2026-07-25 08:47Z) Added schema-versioned query kinds and operations with parser, decoder, validator, canonical JSON, exact JSON/RQL ranges, RQL tooling metadata, and an explicit incomplete execution result until the semantic adapter lands.
 - [ ] Add source-backed public result types and deterministic wire identities without exposing dense semantic IR IDs.
 - [ ] Implement the request-scoped CFG query adapter, semantic budgets, capability diagnostics, cancellation, and provenance.
 - [ ] Integrate planning/explain/profile reporting and all Rust result rendering/evidence paths.
@@ -64,8 +64,14 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - Observation: Direct analyzer-only execution entry points do not have a workspace semantic provider.
   Evidence: `execute_request` and its analyzer-only variants accept `IAnalyzer`; semantic materialization is exposed by `WorkspaceAnalyzer`.
 
-- Observation: CodeQuery's public schema version is currently 2, and policy fixtures deliberately pin version 2. Removing version 2 would cause unrelated policy identity churn.
-  Evidence: `src/analyzer/structural/query/ir.rs` declares `SCHEMA_VERSION = 2`; checked `.rqlp` and normalized policy fixtures contain explicit version-2 selectors.
+- Observation: Before this slice, CodeQuery's public schema version was 2, and policy fixtures deliberately pinned version 2. Removing version 2 would cause unrelated policy identity churn.
+  Evidence: The version-3 registry retains version 2 as its exact predecessor; checked `.rqlp` and normalized policy fixtures still contain explicit version-2 selectors.
+
+- Observation: The configured Bifrost code-intelligence skills did not expose callable Bifrost tools in this worktree after tool discovery, so implementation navigation used exact `rg` searches and narrow source reads.
+  Evidence: Tool discovery returned no `search_symbols`, `query_code`, `get_summaries`, or `get_symbol_sources` callables; no Bifrost result was replaced by an inferred answer.
+
+- Observation: The milestone's historical `rql_diagnostics` and `rql_tooling` integration-test targets no longer exist as standalone files. The same behavior now lives in structural-query unit tests and the focused `bifrost_lsp_server` RQL tests.
+  Evidence: `rg --files tests` found no matching test targets; `cargo test --lib analyzer::structural::query` and `bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_source` exercise the current boundaries.
 
 ## Decision Log
 
@@ -109,9 +115,15 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
   Rationale: The user explicitly requested frequent synchronization and reviewable checkpoint history. Reviewing after the core execution slice catches API and architecture mistakes before they spread across clients, while a final branch review covers integration drift.
   Date/Author: 2026-07-25 / User and Codex
 
+- Decision: Until the request-scoped semantic adapter lands, an otherwise valid CFG pipeline returns an incomplete `semantic_results_omitted` response instead of reaching the executor's impossible-domain panic.
+  Rationale: Checkpoint commits must remain safe to execute. The temporary diagnostic makes the staged public parser honest and is removed when Milestone 3 wires real semantic rows.
+  Date/Author: 2026-07-25 / Codex
+
 ## Outcomes & Retrospective
 
-No implementation milestones are complete yet. The design phase established a narrow public contract that exercises real semantic services while leaving value flow, taint, typestate, policy compilation, and witnesses for later #824 plans. Update this section after each milestone with what worked, what changed, and what remains.
+Milestone 1 established schema version 3 while preserving exact version-2 pins. JSON and RQL now lower to the same seven-operation CFG algebra, validate procedure/point/edge domains before execution, and map version errors back to the authored operation. The compatible head also flows through LSP schema completion and policy documentation. Execution deliberately remains incomplete, not panicking, until the typed result contracts and semantic adapter land.
+
+Validation at this checkpoint passed `cargo test --lib analyzer::structural::query` (93 tests), the focused CFG no-panic pipeline test, the focused RQLP schema-completion LSP test, the policy documentation suite (8 tests), and the inferred-version policy renderer test.
 
 ## Context and Orientation
 
