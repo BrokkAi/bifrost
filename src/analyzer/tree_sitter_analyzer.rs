@@ -6859,29 +6859,15 @@ where
         code_unit: &CodeUnit,
         max_ranges: usize,
         cancellation: &crate::CancellationToken,
-    ) -> (Vec<Range>, bool) {
-        if cancellation.is_cancelled() {
-            return (Vec::new(), true);
+    ) -> (Vec<Range>, usize, bool) {
+        if max_ranges == 0 || cancellation.is_cancelled() {
+            return (Vec::new(), 0, true);
         }
-        let Some(state) = self
-            .source_snapshot_file_state(code_unit.source())
-            .or_else(|| self.fetch_file_state(code_unit.source()))
-        else {
-            return (Vec::new(), false);
-        };
-        let Some(ranges) = state.ranges.get(code_unit) else {
-            return (Vec::new(), false);
-        };
-        let mut bounded = Vec::with_capacity(ranges.len().min(max_ranges));
-        for range in ranges.iter().take(max_ranges) {
-            if cancellation.is_cancelled() {
-                return (bounded, true);
-            }
-            bounded.push(*range);
-        }
+        let limited = self.ranges_limited(code_unit, max_ranges);
         (
-            bounded,
-            ranges.len() > max_ranges || cancellation.is_cancelled(),
+            limited.rows,
+            limited.inspected,
+            !limited.complete || cancellation.is_cancelled(),
         )
     }
 

@@ -895,7 +895,7 @@ impl IAnalyzer for MultiAnalyzer {
         code_unit: &CodeUnit,
         max_ranges: usize,
         cancellation: &crate::CancellationToken,
-    ) -> (Vec<Range>, bool) {
+    ) -> (Vec<Range>, usize, bool) {
         self.delegate_for_code_unit(code_unit)
             .map(|delegate| {
                 delegate

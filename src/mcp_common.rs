@@ -342,6 +342,7 @@ pub fn run_stdio_server(
 
     let stdin = io::stdin();
     let mut read_error = None;
+    let mut writer_backpressured = false;
     'requests: for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) => line,
@@ -403,7 +404,8 @@ pub fn run_stdio_server(
                                             id, code, message,
                                         )),
                                     ) {
-                                        read_error = Some(error);
+                                        writer_backpressured |= error.writer_backpressured;
+                                        read_error = Some(error.message);
                                         break 'requests;
                                     }
                                     continue;
@@ -446,13 +448,18 @@ pub fn run_stdio_server(
             && let Err(error) =
                 try_queue_response(&response_sender, OutboundMcpResponse::unscoped(response))
         {
-            read_error = Some(error);
+            writer_backpressured |= error.writer_backpressured;
+            read_error = Some(error.message);
             break;
         }
     }
 
     cancellations.cancel_all();
     drop(response_sender);
+    if writer_backpressured {
+        drop(writer);
+        return Err(read_error.expect("response backpressure records an error"));
+    }
     let writer_result = writer
         .join()
         .map_err(|_| "MCP response writer panicked".to_string())?;
@@ -540,18 +547,30 @@ fn spawn_cancellable_tool_call(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct McpResponseQueueError {
+    message: String,
+    writer_backpressured: bool,
+}
+
 fn try_queue_response(
     sender: &mpsc::SyncSender<OutboundMcpResponse>,
     response: OutboundMcpResponse,
-) -> Result<(), String> {
+) -> Result<(), McpResponseQueueError> {
     match sender.try_send(response) {
         Ok(()) => Ok(()),
-        Err(mpsc::TrySendError::Full(_)) => Err(format!(
-            "MCP response queue reached its fixed capacity of {MAX_PENDING_MCP_RESPONSES}; closing the connection to preserve bounded memory"
-        )),
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            Err("MCP response writer stopped unexpectedly".to_string())
-        }
+        Err(mpsc::TrySendError::Full(_)) => Err(McpResponseQueueError {
+            message: format!(
+                "MCP response queue reached its fixed capacity of {MAX_PENDING_MCP_RESPONSES}; closing the connection to preserve bounded memory"
+            ),
+            // A full channel means the writer may be blocked in stdout. Joining
+            // it would turn the fail-fast path into an unbounded shutdown wait.
+            writer_backpressured: true,
+        }),
+        Err(mpsc::TrySendError::Disconnected(_)) => Err(McpResponseQueueError {
+            message: "MCP response writer stopped unexpectedly".to_string(),
+            writer_backpressured: false,
+        }),
     }
 }
 
@@ -2145,7 +2164,8 @@ mod uri_tests {
             OutboundMcpResponse::unscoped(success_response(json!(2), json!({}))),
         )
         .expect_err("a full response queue must fail fast");
-        assert!(error.contains("fixed capacity"));
+        assert!(error.message.contains("fixed capacity"));
+        assert!(error.writer_backpressured);
     }
 
     #[test]

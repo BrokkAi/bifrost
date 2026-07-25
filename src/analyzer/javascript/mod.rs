@@ -650,7 +650,7 @@ impl IAnalyzer for JavascriptAnalyzer {
         code_unit: &CodeUnit,
         max_ranges: usize,
         cancellation: &crate::CancellationToken,
-    ) -> (Vec<crate::analyzer::Range>, bool) {
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
         self.inner
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }

@@ -1629,9 +1629,9 @@ pub(crate) fn procedures_for_definition_with_limits(
     if let Err(status) = progress.examine() {
         return progress.failed(status);
     }
-    let (ranges, range_lookup_incomplete) =
+    let (ranges, inspected_ranges, range_lookup_incomplete) =
         analyzer.ranges_with_limit(definition, progress.remaining(), cancellation);
-    for _ in &ranges {
+    for _ in 0..inspected_ranges {
         if let Err(status) = progress.examine() {
             return progress.failed(status);
         }
