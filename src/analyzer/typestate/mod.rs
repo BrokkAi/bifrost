@@ -30,9 +30,9 @@ pub use client::{
 pub use finding::{
     MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS, MAX_TYPESTATE_FINDINGS,
     MAX_TYPESTATE_WITNESS_EXPANSIONS, MAX_TYPESTATE_WITNESS_STEPS, TypestateFinding,
-    TypestateFindingCertainty, TypestateFindingEvidence, TypestateFindingKind, TypestateFindingLimits,
-    TypestateFindingReport, TypestateWitness, TypestateWitnessStep, collect_summary_findings,
-    collect_summary_findings_with_limits,
+    TypestateFindingCertainty, TypestateFindingEvidence, TypestateFindingKind,
+    TypestateFindingLimits, TypestateFindingReport, TypestateFindingWitness, TypestateWitness,
+    TypestateWitnessStep, collect_summary_findings, collect_summary_findings_with_limits,
 };
 pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
 pub use protocol::{

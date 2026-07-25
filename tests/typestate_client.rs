@@ -4,6 +4,7 @@ use std::cell::Cell;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, SolverBudget,
+    WitnessReconstructionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
@@ -1604,11 +1605,14 @@ fn summary_findings_retain_error_and_terminal_semantics() {
             )
     }));
     assert!(report.findings().iter().all(|finding| {
-        let witness = finding.witness();
-        !witness.steps().is_empty()
-            && witness.quality().is_proven()
-            && !witness.truncated()
-            && witness.omitted_steps_lower_bound() == 0
+        !finding.witnesses().is_empty()
+            && finding.witnesses().iter().all(|finding_witness| {
+                let witness = finding_witness.witness();
+                witness.step_count() > 0
+                    && witness.quality().is_proven()
+                    && !witness.truncated()
+                    && witness.omitted_steps_lower_bound() == 0
+            })
     }));
 }
 
@@ -1653,7 +1657,7 @@ fn finding_collection_observes_its_budget_and_cancellation() {
         &analyzer,
         TypestateBindingQuality::proven_unique(),
         TypestateBindingQuality::proven_unique(),
-        false,
+        true,
         false,
     );
     let result = solve_summary(&fixture, &analyzer);
@@ -1676,6 +1680,24 @@ fn finding_collection_observes_its_budget_and_cancellation() {
             &fixture.bindings,
             &result,
             TypestateFindingLimits::new(1_000_000, 1).unwrap(),
+            &cancellation,
+        ),
+        Err(TypestateFlowProblemError::FindingBudgetExceeded)
+    ));
+
+    assert!(matches!(
+        collect_summary_findings_with_limits(
+            &fixture.protocol,
+            &fixture.bindings,
+            &result,
+            TypestateFindingLimits::with_witness_limits(
+                1_000_000,
+                8_192,
+                WitnessReconstructionLimits::new(64, 4_096).unwrap(),
+                1_000_000,
+                1,
+            )
+            .unwrap(),
             &cancellation,
         ),
         Err(TypestateFlowProblemError::FindingBudgetExceeded)

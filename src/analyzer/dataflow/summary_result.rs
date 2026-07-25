@@ -578,16 +578,29 @@ impl<Fact> SummaryDataflowResult<Fact> {
         quality: PathQuality,
         limits: WitnessReconstructionLimits,
     ) -> Result<SummaryWitness, SummaryWitnessError> {
-        let reached = self
+        let reached_index = self
             .reached
             .iter()
-            .find(|candidate| {
-                *candidate == reached
+            .position(|candidate| {
+                candidate == reached
                     && witness_owners_match(
                         candidate.witness_owner.as_ref(),
                         reached.witness_owner.as_ref(),
                     )
             })
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        self.witness_for_reached_index(reached_index, quality, limits)
+    }
+
+    pub(crate) fn witness_for_reached_index(
+        &self,
+        reached_index: usize,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let reached = self
+            .reached
+            .get(reached_index)
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
         if !reached.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
