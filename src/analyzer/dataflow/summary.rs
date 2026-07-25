@@ -164,6 +164,33 @@ enum PathWitnessSource<'edge> {
 }
 
 impl PathWitnessSource<'_> {
+    fn quality(&self) -> PathQuality {
+        match self {
+            Self::Edge {
+                predecessor_quality,
+                edge,
+                ..
+            } => predecessor_quality.through_evidence(&edge.proof, &edge.completeness),
+            Self::SummaryApplication {
+                incoming_quality,
+                summary_quality,
+                return_edge,
+                ..
+            } => incoming_quality
+                .conjoin(*summary_quality)
+                .through_evidence(return_edge.proof(), return_edge.completeness()),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Edge { edge, .. } => WitnessEvidenceNode::edge_retained_bytes(edge),
+            Self::SummaryApplication { return_edge, .. } => {
+                WitnessEvidenceNode::summary_application_retained_bytes(return_edge)
+            }
+        }
+    }
+
     fn evidence_for(&self, output_fact: FactId) -> WitnessEvidenceNode {
         match self {
             Self::Edge {
@@ -401,9 +428,13 @@ where
             })
             .collect::<Vec<_>>();
         let mut staged_witness_nodes = Vec::new();
+        let mut staged_witness_bytes = 0usize;
         let mut staged_witnesses = Vec::with_capacity(staged_states.len());
         let mut witness_exhausted = false;
         for key in &staged_states {
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
             if self.witness_arena.is_enabled() {
                 let mut alternatives = WitnessAlternatives::default();
                 let admission = self
@@ -411,8 +442,10 @@ where
                     .stage_candidate(
                         &mut alternatives,
                         PathQuality::PROVEN_COMPLETE,
-                        WitnessEvidenceNode::seed(entry_point.clone(), key.fact),
+                        WitnessEvidenceNode::seed_retained_bytes(),
+                        || WitnessEvidenceNode::seed(entry_point.clone(), key.fact),
                         &mut staged_witness_nodes,
+                        &mut staged_witness_bytes,
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -552,10 +585,14 @@ where
         };
         let mut staged_states = Vec::new();
         let mut staged_witness_nodes = Vec::new();
+        let mut staged_witness_bytes = 0usize;
         let mut new_reached_states = 0;
         let mut witness_exhausted = false;
 
         for &fact in &staged.ids {
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
             let key = PathEdgeKey {
                 entry,
                 point: target,
@@ -578,8 +615,7 @@ where
                         .ok_or(SummaryDataflowError::WitnessInvariant(
                             "enabled witness publication has no derivation",
                         ))?;
-                let candidate = source.evidence_for(fact);
-                if candidate.quality() != quality {
+                if source.quality() != quality {
                     return Err(SummaryDataflowError::WitnessInvariant(
                         "candidate witness quality does not match path publication",
                     ));
@@ -589,8 +625,10 @@ where
                     .stage_candidate(
                         &mut witnesses,
                         quality,
-                        candidate,
+                        source.retained_bytes(),
+                        || source.evidence_for(fact),
                         &mut staged_witness_nodes,
+                        &mut staged_witness_bytes,
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -1386,6 +1424,7 @@ where
         let mut staged_paths = Vec::with_capacity(outputs.len());
         let mut staged_incoming = Vec::with_capacity(outputs.len());
         let mut staged_witness_nodes = Vec::new();
+        let mut staged_witness_bytes = 0usize;
         let mut witness_exhausted = false;
         for &fact in &staged.ids {
             if request.cancellation.is_cancelled() {
@@ -1411,14 +1450,15 @@ where
             }
             let mut path_evidence = None;
             if self.witness_arena.is_enabled() {
-                let candidate = WitnessEvidenceNode::seed(transfer.callee_entry.clone(), fact);
                 let admission = self
                     .witness_arena
                     .stage_candidate(
                         &mut path_witnesses,
                         PathQuality::PROVEN_COMPLETE,
-                        candidate,
+                        WitnessEvidenceNode::seed_retained_bytes(),
+                        || WitnessEvidenceNode::seed(transfer.callee_entry.clone(), fact),
                         &mut staged_witness_nodes,
+                        &mut staged_witness_bytes,
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -1475,14 +1515,9 @@ where
             }
             let mut incoming_evidence = None;
             if self.witness_arena.is_enabled() && incoming_frontier.contains(quality) {
-                let candidate = WitnessEvidenceNode::edge(
-                    caller_evidence.expect("enabled call evidence was validated"),
-                    caller_quality,
-                    call_edge,
-                    caller_path.fact,
-                    fact,
-                );
-                if candidate.quality() != quality {
+                if caller_quality.through_evidence(&call_edge.proof, &call_edge.completeness)
+                    != quality
+                {
                     return Err(SummaryDataflowError::WitnessInvariant(
                         "incoming call evidence quality does not match publication",
                     ));
@@ -1492,8 +1527,18 @@ where
                     .stage_candidate(
                         &mut incoming_witnesses,
                         quality,
-                        candidate,
+                        WitnessEvidenceNode::edge_retained_bytes(call_edge),
+                        || {
+                            WitnessEvidenceNode::edge(
+                                caller_evidence.expect("enabled call evidence was validated"),
+                                caller_quality,
+                                call_edge,
+                                caller_path.fact,
+                                fact,
+                            )
+                        },
                         &mut staged_witness_nodes,
+                        &mut staged_witness_bytes,
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
@@ -1685,6 +1730,7 @@ where
         }
 
         let mut staged_witness_nodes = Vec::new();
+        let mut staged_witness_bytes = 0usize;
         let mut activated_evidence = None;
         let mut witness_exhausted = false;
         if self.witness_arena.is_enabled() && qualities.contains(quality) {
@@ -1695,26 +1741,24 @@ where
             let entry_point = self.procedures[path.entry.procedure]
                 .point_handle(path.entry.entry_point)
                 .ok_or_else(|| SemanticProviderError::internal("summary entry point is stale"))?;
-            let candidate = WitnessEvidenceNode::end_summary(
-                predecessor,
-                predecessor_quality,
-                entry_point,
-                path.entry.entry_fact,
-                Arc::clone(&exit),
-                path.fact,
-            );
-            if candidate.quality() != quality {
-                return Err(SummaryDataflowError::WitnessInvariant(
-                    "end-summary evidence quality does not match publication",
-                ));
-            }
             let admission = self
                 .witness_arena
                 .stage_candidate(
                     &mut witnesses,
                     quality,
-                    candidate,
+                    WitnessEvidenceNode::end_summary_retained_bytes(),
+                    || {
+                        WitnessEvidenceNode::end_summary(
+                            predecessor,
+                            predecessor_quality,
+                            entry_point,
+                            path.entry.entry_fact,
+                            Arc::clone(&exit),
+                            path.fact,
+                        )
+                    },
                     &mut staged_witness_nodes,
+                    &mut staged_witness_bytes,
                 )
                 .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
             match admission {

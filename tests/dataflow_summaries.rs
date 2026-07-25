@@ -1388,15 +1388,20 @@ fn best_effort_witness_exhaustion_does_not_change_semantic_results() {
     let baseline = solve(&[MarkerFact::Seed], WitnessRetentionLimits::disabled(), 0);
     let request_exhausted = solve(
         &[MarkerFact::Seed],
-        WitnessRetentionLimits::best_effort(1, 64).unwrap(),
+        WitnessRetentionLimits::best_effort(1, 64, 64 * 1024 * 1024).unwrap(),
         0,
     );
     let local_exhausted = solve(
         &[MarkerFact::Seed],
-        WitnessRetentionLimits::best_effort(1, 1).unwrap(),
+        WitnessRetentionLimits::best_effort(1, 1, 64 * 1024 * 1024).unwrap(),
         64,
     );
-    for candidate in [&request_exhausted, &local_exhausted] {
+    let byte_exhausted = solve(
+        &[MarkerFact::Seed],
+        WitnessRetentionLimits::best_effort(1, 64, 1).unwrap(),
+        64,
+    );
+    for candidate in [&request_exhausted, &local_exhausted, &byte_exhausted] {
         assert_eq!(candidate.facts(), baseline.facts());
         assert_eq!(candidate.reached(), baseline.reached());
         assert_eq!(candidate.end_summaries(), baseline.end_summaries());
@@ -1428,8 +1433,16 @@ fn best_effort_witness_exhaustion_does_not_change_semantic_results() {
     }
 
     let late_baseline = solve(&[], WitnessRetentionLimits::disabled(), 0);
-    let late_exhausted = solve(&[], WitnessRetentionLimits::best_effort(1, 1).unwrap(), 64);
-    let late_request_exhausted = solve(&[], WitnessRetentionLimits::best_effort(1, 64).unwrap(), 1);
+    let late_exhausted = solve(
+        &[],
+        WitnessRetentionLimits::best_effort(1, 1, 64 * 1024 * 1024).unwrap(),
+        64,
+    );
+    let late_request_exhausted = solve(
+        &[],
+        WitnessRetentionLimits::best_effort(1, 64, 64 * 1024 * 1024).unwrap(),
+        1,
+    );
     for candidate in [&late_exhausted, &late_request_exhausted] {
         assert_eq!(candidate.facts(), late_baseline.facts());
         assert_eq!(candidate.reached(), late_baseline.reached());

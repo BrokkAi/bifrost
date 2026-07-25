@@ -46,12 +46,15 @@ impl Error for WitnessLimitError {}
 /// preserves the historical behavior: exceeding the request's
 /// [`super::SolverBudgetDimension::WitnessRelations`] limit terminates the
 /// solve. Best-effort retention instead drops the entire witness sidecar when
-/// either that request limit or its local relation cap is reached, without
-/// changing semantic reachability or termination.
+/// either that request limit or its local relation/byte cap is reached, without
+/// changing semantic reachability or termination. The byte cap covers arena
+/// nodes and proof/completeness strings cloned into the sidecar; shared
+/// semantic handles are excluded.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WitnessRetentionLimits {
     max_alternatives_per_quality: Option<NonZeroUsize>,
     best_effort_max_relations: Option<NonZeroUsize>,
+    best_effort_max_retained_bytes: Option<NonZeroUsize>,
 }
 
 impl WitnessRetentionLimits {
@@ -59,6 +62,7 @@ impl WitnessRetentionLimits {
         Self {
             max_alternatives_per_quality: None,
             best_effort_max_relations: None,
+            best_effort_max_retained_bytes: None,
         }
     }
 
@@ -66,12 +70,14 @@ impl WitnessRetentionLimits {
         Self::validate_alternatives(max_alternatives_per_quality).map(|limit| Self {
             max_alternatives_per_quality: Some(limit),
             best_effort_max_relations: None,
+            best_effort_max_retained_bytes: None,
         })
     }
 
     pub fn best_effort(
         max_alternatives_per_quality: usize,
         max_retained_relations: usize,
+        max_retained_bytes: usize,
     ) -> Result<Self, WitnessLimitError> {
         let max_alternatives_per_quality =
             Self::validate_alternatives(max_alternatives_per_quality)?;
@@ -92,9 +98,15 @@ impl WitnessRetentionLimits {
                 maximum: Some(u32::MAX as usize),
             });
         }
+        let max_retained_bytes =
+            NonZeroUsize::new(max_retained_bytes).ok_or(WitnessLimitError {
+                field: "max_retained_bytes",
+                maximum: None,
+            })?;
         Ok(Self {
             max_alternatives_per_quality: Some(max_alternatives_per_quality),
             best_effort_max_relations: Some(max_retained_relations),
+            best_effort_max_retained_bytes: Some(max_retained_bytes),
         })
     }
 
@@ -127,11 +139,18 @@ impl WitnessRetentionLimits {
     }
 
     pub const fn is_best_effort(self) -> bool {
-        self.best_effort_max_relations.is_some()
+        self.best_effort_max_relations.is_some() && self.best_effort_max_retained_bytes.is_some()
     }
 
     const fn best_effort_max_relations(self) -> Option<usize> {
         match self.best_effort_max_relations {
+            Some(limit) => Some(limit.get()),
+            None => None,
+        }
+    }
+
+    const fn best_effort_max_retained_bytes(self) -> Option<usize> {
+        match self.best_effort_max_retained_bytes {
             Some(limit) => Some(limit.get()),
             None => None,
         }
@@ -261,16 +280,20 @@ impl SummaryWitnessStep {
     }
 
     fn retained_owned_bytes(&self) -> usize {
-        let proof_bytes = match &self.proof {
-            ProofStatus::Proven => 0,
-            ProofStatus::Unproven(reason) => reason.len(),
-        };
-        let completeness_bytes = match &self.completeness {
-            EvidenceCompleteness::Complete => 0,
-            EvidenceCompleteness::Partial(reason) => reason.len(),
-        };
-        proof_bytes.saturating_add(completeness_bytes)
+        retained_evidence_bytes(&self.proof, &self.completeness)
     }
+}
+
+fn retained_evidence_bytes(proof: &ProofStatus, completeness: &EvidenceCompleteness) -> usize {
+    let proof_bytes = match proof {
+        ProofStatus::Proven => 0,
+        ProofStatus::Unproven(reason) => reason.len(),
+    };
+    let completeness_bytes = match completeness {
+        EvidenceCompleteness::Complete => 0,
+        EvidenceCompleteness::Partial(reason) => reason.len(),
+    };
+    proof_bytes.saturating_add(completeness_bytes)
 }
 
 /// Work performed while reconstructing one retained witness.
@@ -541,6 +564,10 @@ enum WitnessEvidenceKind {
 }
 
 impl WitnessEvidenceNode {
+    pub(crate) const fn seed_retained_bytes() -> usize {
+        size_of::<Self>()
+    }
+
     pub(crate) fn seed(point: ProgramPointHandle, fact: FactId) -> Self {
         Self {
             quality: PathQuality::PROVEN_COMPLETE,
@@ -587,6 +614,10 @@ impl WitnessEvidenceNode {
         }
     }
 
+    pub(crate) fn edge_retained_bytes(edge: &ProcedureIcfgEdge) -> usize {
+        size_of::<Self>().saturating_add(retained_evidence_bytes(&edge.proof, &edge.completeness))
+    }
+
     pub(crate) fn end_summary(
         predecessor: WitnessEvidenceId,
         predecessor_quality: PathQuality,
@@ -611,6 +642,10 @@ impl WitnessEvidenceNode {
                 exit_fact,
             },
         }
+    }
+
+    pub(crate) const fn end_summary_retained_bytes() -> usize {
+        size_of::<Self>()
     }
 
     pub(crate) fn summary_application(
@@ -645,8 +680,21 @@ impl WitnessEvidenceNode {
         }
     }
 
-    pub(crate) const fn quality(&self) -> PathQuality {
-        self.quality
+    pub(crate) fn summary_application_retained_bytes(return_edge: &SummaryEdge) -> usize {
+        size_of::<Self>().saturating_add(retained_evidence_bytes(
+            return_edge.proof(),
+            return_edge.completeness(),
+        ))
+    }
+
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(match &self.kind {
+            WitnessEvidenceKind::Step { step, .. } => step.retained_owned_bytes(),
+            WitnessEvidenceKind::EndSummary { .. } => 0,
+            WitnessEvidenceKind::SummaryApplication { return_step, .. } => {
+                return_step.retained_owned_bytes()
+            }
+        })
     }
 
     fn same_derivation(&self, other: &Self) -> bool {
@@ -743,6 +791,7 @@ impl WitnessEvidenceNode {
 pub(crate) struct WitnessArena {
     limits: WitnessRetentionLimits,
     nodes: Vec<WitnessEvidenceNode>,
+    retained_bytes: usize,
 }
 
 impl WitnessArena {
@@ -750,6 +799,7 @@ impl WitnessArena {
         Self {
             limits,
             nodes: Vec::new(),
+            retained_bytes: 0,
         }
     }
 
@@ -774,14 +824,38 @@ impl WitnessArena {
             .and_then(|(staged_id, node)| (*staged_id == id).then_some(node))
     }
 
-    pub(crate) fn stage_candidate(
+    pub(crate) fn stage_candidate<Candidate>(
         &self,
         alternatives: &mut WitnessAlternatives,
         quality: PathQuality,
-        candidate: WitnessEvidenceNode,
+        candidate_retained_bytes: usize,
+        candidate: Candidate,
         staged: &mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
-    ) -> Result<WitnessAdmission, usize> {
+        staged_retained_bytes: &mut usize,
+    ) -> Result<WitnessAdmission, usize>
+    where
+        Candidate: FnOnce() -> WitnessEvidenceNode,
+    {
         debug_assert!(self.is_enabled());
+        if self.limits.is_best_effort()
+            && (self
+                .limits
+                .best_effort_max_relations()
+                .is_some_and(|limit| self.nodes.len().saturating_add(staged.len()) >= limit)
+                || self
+                    .limits
+                    .best_effort_max_retained_bytes()
+                    .is_some_and(|limit| {
+                        self.retained_bytes
+                            .saturating_add(*staged_retained_bytes)
+                            .saturating_add(candidate_retained_bytes)
+                            > limit
+                    }))
+        {
+            return Ok(WitnessAdmission::Exhausted);
+        }
+        let candidate = candidate();
+        debug_assert_eq!(candidate.retained_bytes(), candidate_retained_bytes);
         if alternatives
             .ids(quality)
             .iter()
@@ -794,16 +868,10 @@ impl WitnessArena {
             alternatives.mark_truncated(quality);
             return Ok(WitnessAdmission::Truncated);
         }
-        if self
-            .limits
-            .best_effort_max_relations()
-            .is_some_and(|limit| self.nodes.len().saturating_add(staged.len()) >= limit)
-        {
-            return Ok(WitnessAdmission::Exhausted);
-        }
         let id = self.staged_id(staged.len())?;
         alternatives.push(quality, id);
         staged.push((id, candidate));
+        *staged_retained_bytes = (*staged_retained_bytes).saturating_add(candidate_retained_bytes);
         Ok(WitnessAdmission::Retained(id))
     }
 
@@ -814,6 +882,7 @@ impl WitnessArena {
 
     pub(crate) fn commit(&mut self, expected: WitnessEvidenceId, node: WitnessEvidenceNode) {
         debug_assert_eq!(expected.index(), self.nodes.len());
+        self.retained_bytes = self.retained_bytes.saturating_add(node.retained_bytes());
         self.nodes.push(node);
     }
 
@@ -1255,20 +1324,26 @@ mod tests {
         assert!(enabled.is_enabled());
         assert!(!enabled.is_best_effort());
         assert_eq!(enabled.max_alternatives_per_quality(), 3);
-        let best_effort = WitnessRetentionLimits::best_effort(1, 64).unwrap();
+        let best_effort = WitnessRetentionLimits::best_effort(1, 64, 1024).unwrap();
         assert!(best_effort.is_enabled());
         assert!(best_effort.is_best_effort());
         assert_eq!(
-            WitnessRetentionLimits::best_effort(1, 0)
+            WitnessRetentionLimits::best_effort(1, 0, 1024)
                 .unwrap_err()
                 .field(),
             "max_retained_relations"
         );
         assert_eq!(
-            WitnessRetentionLimits::best_effort(2, 64)
+            WitnessRetentionLimits::best_effort(2, 64, 1024)
                 .unwrap_err()
                 .to_string(),
             "max_alternatives_per_quality must be at most 1"
+        );
+        assert_eq!(
+            WitnessRetentionLimits::best_effort(1, 64, 0)
+                .unwrap_err()
+                .field(),
+            "max_retained_bytes"
         );
         assert_eq!(
             WitnessRetentionLimits::new(MAX_WITNESS_ALTERNATIVES_PER_QUALITY + 1)
@@ -1298,5 +1373,28 @@ mod tests {
         let limits = WitnessReconstructionLimits::new(2, 5).unwrap();
         assert_eq!(limits.max_steps(), 2);
         assert_eq!(limits.max_expansions(), 5);
+    }
+
+    #[test]
+    fn best_effort_byte_admission_is_checked_before_candidate_allocation() {
+        let arena = WitnessArena::new(WitnessRetentionLimits::best_effort(1, 64, 1).unwrap());
+        let mut alternatives = WitnessAlternatives::default();
+        let mut staged = Vec::new();
+        let mut staged_bytes = 0usize;
+
+        let admission = arena
+            .stage_candidate(
+                &mut alternatives,
+                PathQuality::PROVEN_COMPLETE,
+                WitnessEvidenceNode::seed_retained_bytes(),
+                || panic!("byte-exhausted candidates must remain lazy"),
+                &mut staged,
+                &mut staged_bytes,
+            )
+            .unwrap();
+
+        assert_eq!(admission, WitnessAdmission::Exhausted);
+        assert!(staged.is_empty());
+        assert_eq!(staged_bytes, 0);
     }
 }
