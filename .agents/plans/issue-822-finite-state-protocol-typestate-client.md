@@ -172,13 +172,47 @@ required for that checkpoint.
   edges and `DataflowEdge::from_snapshot`; a deferred Rust conformance case now
   proves bounded and summary clients receive the same structured cause.
 - [x] (2026-07-25) Added controlled source-backed TypeScript/Java conformance.
-  One compiled lifecycle protocol and one transfer client resolve aliased
-  subjects and reach the same closed state without language branches.
+  One compiled lifecycle protocol and one transfer client execute the same
+  pre-resolved reference-alias subject and reach the same closed state without
+  language branches.
+- [x] (2026-07-25) Merged the landed #1171 witness implementation from
+  `origin/master` (`c8df49d3`, PR #1176) and consumed its index-based bounded
+  reconstruction API. Typestate finding projection now attaches bounded
+  state-keyed source witnesses without rescanning the reached relation.
+- [x] (2026-07-25) Bounded witness reporting to 16 witnesses per finding, 64
+  steps and 4,096 reconstruction expansions per witness, 65,536 retained
+  relations, 64 MiB of retained sidecar evidence, and aggregate finding-level
+  expansion/byte budgets. Best-effort witness exhaustion cannot change solver
+  reachability or termination.
+- [x] (2026-07-25) Ran the final client/witness guided review and automatically
+  fixed every accepted finding: proven-partial May evidence, semantic
+  May/Inconclusive merging, request/byte/relation preflight, lazy full-slot
+  admission, and truthful duplicate-versus-truncation metadata.
+- [x] (2026-07-25) Strengthened the TypeScript/Java conformance fixture so a
+  reference alias and observable `use -> used -> close` path must produce the
+  same canonical exit-state/path-quality frontier. The fixture rejects any
+  violation row, requires fixed-point termination, and records the current
+  conservative TypeScript coverage gap explicitly.
+- [x] (2026-07-26 00:18+02:00) Added direct client acceptance fixtures for a
+  branch-dependent close/May finding, recursive Java helper summary replay,
+  and an event on an exceptional matched return. Focused typestate tests pass
+  28/28 and generic summary-dataflow tests pass 27/27.
+- [x] (2026-07-26 00:44+02:00) The final intent recheck found that the first
+  recursive fixture could observe its state change without recursive carryback
+  and that the exceptional-return fixture used same-procedure synthetic
+  topology. Commit `321e160f` now changes state only in the recursive base
+  case, consumes it after recursive return, reaches `closed` at lifecycle exit,
+  and verifies a real callee exceptional-exit witness to the exact caller
+  handler. The focused 28-test client suite and strict client Clippy pass; the
+  specialist recheck reports no remaining finding.
 - [x] Implement typestate propagation, diagnostic-neutral findings, and
   explicit uncertainty semantics.
-- [ ] Consume #1171's generic witness API after it lands on `origin/master`.
+- [x] Consume #1171's generic witness API after it lands on `origin/master`.
 - [x] Add controlled-graph and equivalent TypeScript/Java conformance fixtures.
-- [ ] Complete repository validation and final guided review.
+- [ ] Complete repository validation and final guided review (completed:
+  guided architecture/intent/robustness pass, automatic fixes, and post-fix
+  intent recheck; remaining: final all-target/all-feature Clippy and full
+  `nlp,python` test gate).
 
 ## Surprises & Discoveries
 
@@ -216,9 +250,9 @@ required for that checkpoint.
 - Observation: generic witness reconstruction is already active parallel work.
   Evidence: issue #1171 owns a language-neutral predecessor/evidence IR,
   bounded iterative reconstruction across summary replay, and a downstream
-  adapter seam for #822 and #709. Its branch is checked out in
-  `/Users/dave/.codex/worktrees/1b57/bifrost`. #822 must consume the landed API,
-  not edit the same solver tables independently.
+  adapter seam for #822 and #709. It landed through PR #1176 at `c8df49d3`;
+  #822 consumes the result-owned, index-based reconstruction seam rather than
+  duplicating solver predecessor tables.
 
 - Observation: #1172 may offer a more compact protocol-state representation but
   is not required to define protocol semantics.
@@ -332,6 +366,40 @@ required for that checkpoint.
   binding; complete analysis can promote an error marker to Must only when no
   such marker reaches the observation point.
 
+- Observation: witness reconstruction is a best-effort reporting sidecar, so
+  its admission path must not allocate after any witness budget is exhausted
+  or change semantic reachability when evidence cannot be retained.
+  Evidence: request-level relation capacity, per-result retained-byte/relation
+  limits, and per-finding reconstruction budgets are checked before candidate
+  construction. A borrowed exact-derivation match distinguishes replay of an
+  already retained witness from a genuinely dropped alternative, preserving
+  truthful truncation metadata without cloning.
+
+- Observation: one witness slot cannot represent every evidentiary purpose of
+  a finding.
+  Evidence: a proven-partial clean path is sufficient to support a May finding,
+  while Must needs proven-complete evidence and an uncertain proven-complete
+  path may be the best explanation of an inconclusive result. Finding
+  aggregation therefore retains separate definitive, May-supporting, and
+  uncertain witness candidates.
+
+- Observation: equivalent canonical state outcomes do not imply equivalent
+  whole-program coverage across language frontends.
+  Evidence: the controlled TypeScript and Java fixtures reach the same
+  `used -> closed` state/path-quality frontier with the same protocol hash, but
+  TypeScript still exposes conservative unresolved-call coverage while Java is
+  complete. The fixture asserts both the shared outcome and each frontend's
+  current completeness explicitly.
+
+- Observation: a recursive carryback fixture must make the post-recursion
+  observation depend on state produced in the recursive base case.
+  Evidence: placing `use` before recursion allowed the outer frame to satisfy
+  the test without consuming a recursive summary. The final Java fixture puts
+  `use` only in the base branch, observes `used` at the outer close point, and
+  observes `closed` at the lifecycle exit. Its incomplete-analysis behavior
+  preserves explicit uncertainty because the current recursive semantic
+  coverage is intentionally not claimed complete.
+
 ## Decision Log
 
 - Decision: keep the internal typestate module independent of
@@ -397,10 +465,44 @@ required for that checkpoint.
 
 - Decision: do not implement generic predecessor/witness storage in this
   branch.
-  Rationale: active issue #1171 owns exactly that solver infrastructure.
+  Rationale: issue #1171 owns exactly that solver infrastructure.
   #822's finding layer will consume its generic result and translate it into
   diagnostic-neutral typestate witnesses without importing public policy
   types.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: consume #1171 through the result-owned O(1) reached-index API and
+  keep typestate witness projection read-only over generic summary evidence.
+  Rationale: per-finding linear rediscovery of reached rows can multiply into
+  billions of comparisons, while separate typestate predecessor storage would
+  duplicate the generic solver and risk divergent call/return matching.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: make witness retention and reconstruction semantically optional.
+  Rationale: relation, byte, request, per-witness, aggregate-expansion, or
+  aggregate-byte exhaustion may truncate/drop the reporting sidecar, but must
+  never alter solver facts, reachability, completeness, or termination.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: retain purpose-specific definitive, May-supporting, and uncertain
+  witness candidates before deterministic finding merge.
+  Rationale: the evidence lattice for certainty is not one total ordering. A
+  clean proven-partial path can justify May even beside uncertain evidence,
+  while Must and inconclusive explanations require different qualities.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: test TypeScript/Java reuse with a pre-resolved alias identity and
+  do not claim that #822 resolves source aliases itself.
+  Rationale: #822 consumes a bounded binding plan; #824 owns public endpoint
+  lowering and oracle-backed binding construction. The conformance test proves
+  language-neutral protocol/client execution at that seam.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: check borrowed derivation equality before witness capacity checks
+  and owned candidate construction.
+  Rationale: exact replay is not a dropped alternative and must not set
+  truncation. Comparing every constructor field against retained alternatives
+  first avoids both false metadata and allocation on a full best-effort slot.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: defer the fact-product versus IDE representation choice until the
@@ -509,17 +611,18 @@ required for that checkpoint.
 ## Outcomes & Retrospective
 
 The protocol, pre-resolved binding plan, reusable summary client, uncertainty
-execution, bounded diagnostic-neutral finding aggregation, and controlled
-TypeScript/Java reuse case are implemented. The protocol checkpoint and the
-client/finding checkpoint have each completed guided review and automatic
-review-fix milestones. The current code also closes the follow-up review's
-correctness, identity, cancellation, aggregation, and snapshot-parity findings.
+execution, bounded diagnostic-neutral finding aggregation, generic bounded
+source witnesses, and controlled TypeScript/Java reuse case are implemented.
+#1171 landed through PR #1176 and the client consumes its result-owned
+reconstruction seam without typestate-specific predecessor storage. Protocol,
+client/finding, and witness checkpoints completed guided specialist review;
+every relevant blocker and reasonably scoped finding was fixed and committed.
 
-Focused typestate, protocol, binding, generic dataflow, ICFG, and deferred-call
-conformance suites pass, as does strict test-target Clippy. Remaining work is
-the final guided review and full all-target/all-feature validation. Bounded
-source-backed path witnesses cannot be completed until #1171 lands; the client
-will consume that API rather than duplicating predecessor storage here.
+Focused typestate, protocol, binding, generic dataflow, ICFG, deferred-call,
+branch, recursion, and real exceptional-return conformance suites pass, as does
+strict focused Clippy. The only remaining work is the final isolated
+all-target/all-feature Clippy and full `nlp,python` repository test gate,
+followed by recording exact evidence and a final remote-state check.
 
 ## Context and Orientation
 
@@ -677,7 +780,7 @@ Post-solve aggregation emits:
 - explicit inconclusive outcomes when coverage, binding, escape, budgets, or
   uncertainty cannot support a complete negative or must result.
 
-Consume #1171's generic witness reconstruction once it lands. Translate generic
+Consume #1171's landed generic witness reconstruction. Translate generic
 solver steps into bounded, source-backed diagnostic-neutral typestate witness
 steps. Witness truncation downgrades witness/finding evidence but does not
 change solver reachability, termination, or protocol state.
@@ -690,9 +793,9 @@ permutation determinism.
 
 ### Milestone 4: prove cross-language reuse and downstream seams
 
-Add `tests/typestate_language_contract.rs` using `InlineTestProject` and the
-real workspace semantic provider/oracles. Equivalent TypeScript and Java
-fixtures use the same `CompiledProtocol` and assert equal protocol hashes.
+Use `tests/typestate_client.rs` with `InlineTestProject` and the real workspace
+semantic provider/oracles. Equivalent TypeScript and Java fixtures use the same
+`CompiledProtocol` and assert equal protocol hashes.
 They cover acquire/open, repeated use, close, use-before-open, use-after-close,
 double-close, branch-dependent close, helper calls/returns, an alias, recursive
 helper reuse, normal exit while open, and one exceptional path.
@@ -749,9 +852,9 @@ For the binding/client checkpoint:
 For cross-language and final acceptance:
 
     cargo fmt
-    cargo test --test typestate_protocol --test typestate_binding --test typestate_client --test typestate_language_contract
+    cargo test --test typestate_protocol --test typestate_binding --test typestate_client --test dataflow_summaries --no-default-features
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
-    scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
+    BIFROST_SEMANTIC_INDEX=off scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
 
 The exact test counts are recorded after the test binaries exist. Every focused
 command must end with `test result: ok`; strict Clippy must emit no warnings.
@@ -830,10 +933,10 @@ commit.
 ## Artifacts and Notes
 
 - Issue #822: internal finite-state protocol and reusable typestate client.
-- Issue #1171: generic bounded witness reconstruction; active parallel
-  dependency.
-- Issue #1172: generic IDE edge-function/value propagation; representation
-  gate before client implementation.
+- Issue #1171 / PR #1176 / commit `c8df49d3`: landed generic bounded witness
+  reconstruction consumed by this client.
+- Issue #1172: generic IDE edge-function/value propagation; evaluated as a
+  future representation option, not an implementation dependency for #822.
 - Issue #823: reusable cross-query semantic/taint/protocol summaries; excluded.
 - Issue #824: public CodeQuery/RQL compiler, registry, and policy adapters;
   excluded except for preserving the internal seam.
@@ -842,3 +945,9 @@ commit.
 
 Record milestone commit hashes, review outcomes, and exact final test counts
 here as work proceeds.
+
+Revision note (2026-07-26): updated the plan after #1171 landed and the
+client/witness milestones completed. Recorded the bounded witness architecture,
+specialist-review fixes, cross-language coverage boundary, branch/recursion/
+exceptional acceptance fixtures, and the remaining final repository gates so
+the living plan matches the implemented branch.
