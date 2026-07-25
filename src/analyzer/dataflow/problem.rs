@@ -108,14 +108,18 @@ impl<'graph> DataflowEdge<'graph> {
         let edge = snapshot.edge(edge_id)?;
         let source = snapshot.node(edge.source)?;
         let target = snapshot.node(edge.target)?;
-        Some(Self::new(
+        let descriptor = Self::new(
             edge.kind,
             edge.origin.as_ref(),
             source.point(),
             target.point(),
             &edge.proof,
             &edge.completeness,
-        ))
+        );
+        Some(match edge.boundary.as_ref() {
+            Some(boundary) => descriptor.with_boundary(boundary),
+            None => descriptor,
+        })
     }
 
     pub const fn kind(self) -> IcfgEdgeKind {

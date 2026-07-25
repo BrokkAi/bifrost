@@ -183,6 +183,7 @@ mod tests {
             origin: None,
             proof: ProofStatus::Unproven("test suffix".into()),
             completeness: EvidenceCompleteness::Complete,
+            boundary: None,
         };
 
         let mut after_edge = PathQualityFrontier::default();
