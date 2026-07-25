@@ -15,8 +15,8 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::analyzer::canonical_hash::{CanonicalHasher, hash_domain_bytes, write_lower_hex};
-pub use crate::analyzer::typestate::TypestateProtocolHash;
+use crate::analyzer::canonical_hash::{CanonicalHasher, write_lower_hex};
+pub use crate::analyzer::typestate::{TypestateBindingPlanHash, TypestateProtocolHash};
 
 use super::budget::PolicyBudget;
 use super::classification::{MAX_REPORT_PROSE_BYTES, TextValidationError, validate_required_text};
@@ -49,7 +49,6 @@ const MAX_REPORT_WITNESS_REFS: usize = 64;
 const SOURCE_SCENARIO_SET_DOMAIN: &[u8] = b"bifrost-source-scenario-set/v1";
 const TAINT_PROJECTION_FACTS_DOMAIN: &[u8] = b"bifrost-taint-projection-facts/v1";
 const TYPESTATE_SCENARIO_SET_DOMAIN: &[u8] = b"bifrost-typestate-scenario-set/v1";
-const TYPESTATE_BINDING_PLAN_DOMAIN: &[u8] = b"bifrost-typestate-binding-plan/v1";
 const TYPESTATE_PROJECTION_FACTS_DOMAIN: &[u8] = b"bifrost-typestate-projection-facts/v1";
 const TYPESTATE_VIOLATION_DOMAIN: &[u8] = b"bifrost-typestate-violation/v1";
 const CVSS_STATIC_EVIDENCE_DOMAIN: &[u8] = b"bifrost-cvss-static-evidence/v1";
@@ -99,7 +98,6 @@ macro_rules! define_digest {
 
 define_digest!(TaintProjectionFactsHash);
 define_digest!(TypestateScenarioSetHash);
-define_digest!(TypestateBindingPlanHash);
 define_digest!(TypestateProjectionFactsHash);
 define_digest!(TypestateViolationHash);
 
@@ -109,10 +107,9 @@ impl RetainedSize for TypestateProtocolHash {
     }
 }
 
-impl TypestateBindingPlanHash {
-    /// Hash the canonical dominance-resolved #824 binding plan bytes.
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        Self(hash_domain_bytes(TYPESTATE_BINDING_PLAN_DOMAIN, bytes))
+impl RetainedSize for TypestateBindingPlanHash {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
     }
 }
 

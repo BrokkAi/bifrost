@@ -7,7 +7,7 @@
 mod hash;
 mod protocol;
 
-pub use hash::TypestateProtocolHash;
+pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
 pub use protocol::{
     CompiledProtocol, CompiledProtocolEvent, CompiledProtocolGuard, CompiledProtocolTransition,
     CompiledTerminalExpectation, MAX_PROTOCOL_EVENTS, MAX_PROTOCOL_EXPECTATIONS,

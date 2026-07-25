@@ -93,9 +93,15 @@ required for that checkpoint.
   fixtures are LF-pinned; and parse errors retain bounded escaped text plus
   separate line/column metadata. All 12 focused protocol tests and strict
   all-target/all-feature Clippy pass.
-- [ ] Define the pre-resolved subject/event binding plan and choose the
-  fact-product or IDE client representation after synchronizing the live #1172
-  result.
+- [x] (2026-07-25 14:58+02:00) Fetched `origin/master` after the reviewed
+  checkpoint and confirmed this branch contains it. Live coordination shows
+  substantial uncommitted #1171 witness work isolated in its own worktree,
+  while #1172 has no active branch or worktree.
+- [x] (2026-07-25 15:17+02:00) Chose the existing finite IFDS fact-product
+  representation for the typestate client. Moved
+  `TypestateBindingPlanHash` ownership to the internal typestate layer while
+  preserving the policy re-export.
+- [ ] Define the pre-resolved subject/event binding plan.
 - [ ] Implement typestate propagation, diagnostic-neutral findings, explicit
   uncertainty semantics, and consumption of #1171's generic witness API.
 - [ ] Add controlled-graph and equivalent TypeScript/Java conformance fixtures,
@@ -170,6 +176,21 @@ required for that checkpoint.
   resolved for that site; treating allocation, field, escape, and unrelated
   call events as candidates invented transitions. The executable API now
   requires a bounded eligible-event slice supplied by the binding/client layer.
+
+- Observation: #1172 is not an implementation dependency for the first
+  reusable client.
+  Evidence: its issue remains open with no active branch/worktree, while the
+  current summary solver already accepts finite copyable ordered client facts.
+  A fact product over object, protocol state, and uncertainty implements the
+  required semantics without solver changes and without waiting on an
+  unstarted generic IDE layer.
+
+- Observation: Bifrost structured symbol/source reads succeeded, but the
+  related-file ranking and a later broad symbol search each timed out at the
+  five-minute MCP limit and created a local `.brokk/` cache.
+  Evidence: both calls returned `timed out awaiting tools/call after 300s`.
+  Their generated caches were moved out of the worktree and no generated files
+  were retained or staged.
 
 ## Decision Log
 
@@ -247,6 +268,14 @@ required for that checkpoint.
   Rationale: both representations can implement the same `CompiledProtocol`
   semantics. Choosing before the generic IDE contract stabilizes risks either
   duplicating #1172 or constraining it from a single client.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: use an IFDS-style finite fact product for the #822 client.
+  Rationale: #1172 is open and inactive, while the existing solver can encode
+  `(object, protocol state, uncertainty)` directly. This preserves the
+  protocol/binding/finding contracts and avoids either blocking on or
+  duplicating the generic IDE work. A future IDE adapter may reuse the same
+  contracts without changing schema-v1 identity.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: commit after every plan step and review-fix checkpoint, fetch
