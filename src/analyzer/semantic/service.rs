@@ -235,6 +235,7 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     file: &ProjectFile,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+    let started_work = request.budget.used();
     if request.cancellation.is_cancelled() {
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
@@ -339,6 +340,7 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
         lowerer.capabilities(),
         lowered,
         source_work,
+        started_work,
         staged_budget,
         request,
     );
@@ -431,6 +433,7 @@ fn publish_lowered(
     capabilities: SemanticCapabilities,
     lowered: SemanticOutcome<Vec<ProcedureSemanticsParts>>,
     source_work: SemanticWork,
+    started_work: SemanticWork,
     mut staged_budget: super::SemanticBudget,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
@@ -454,8 +457,22 @@ fn publish_lowered(
         }};
     }
 
+    macro_rules! reconcile_observed {
+        ($work:expr) => {
+            if let Err(exceeded) = reconcile_observed_work(&mut staged_budget, started_work, $work)
+            {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work: $work,
+                });
+            }
+        };
+    }
+
     macro_rules! commit_non_cancelled {
         ($work:expr, $outcome:expr) => {{
+            reconcile_observed!($work);
             if request.cancellation.is_cancelled() {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
@@ -473,6 +490,7 @@ fn publish_lowered(
             let total_work = source_work
                 .component_max(work)
                 .component_max(artifact.work());
+            reconcile_observed!(total_work);
             if request.cancellation.is_cancelled() {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
@@ -613,6 +631,7 @@ fn publish_lowered(
             let total_work = source_work.component_max(work).component_max(artifact_work);
             match partial {
                 Some(partial) => {
+                    reconcile_observed!(total_work);
                     *request.budget = staged_budget;
                     Ok(SemanticOutcome::Cancelled {
                         partial: Some(partial),
@@ -626,6 +645,16 @@ fn publish_lowered(
             }
         }
     }
+}
+
+fn reconcile_observed_work(
+    staged_budget: &mut super::SemanticBudget,
+    started_work: SemanticWork,
+    observed_work: SemanticWork,
+) -> Result<(), super::SemanticBudgetExceeded> {
+    let charged_work = staged_budget.used().saturating_sub(started_work);
+    let uncharged_work = observed_work.saturating_sub(charged_work);
+    staged_budget.charge(uncharged_work)
 }
 
 enum Publication {

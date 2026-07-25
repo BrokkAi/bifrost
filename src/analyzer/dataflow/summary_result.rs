@@ -1,23 +1,16 @@
 //! Deterministic public results for in-memory summary tabulation.
 
-use std::{
-    cmp::Ordering,
-    error::Error,
-    fmt,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{cmp::Ordering, error::Error, fmt, sync::Arc};
 
 use crate::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, ControlContinuation, ControlEdgeKind, DispatchBoundary,
     DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind, IcfgEdgeKind, IcfgExitProfile,
     IcfgLimitKind, OracleRelationHandle, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge,
-    ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticBudgetExceeded,
-    SemanticCapability, SemanticOutcome, SemanticProviderError, SemanticWork,
+    ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticProviderError, SemanticWork,
     compare_relation_provenance,
 };
 
-use super::{FactId, PathQualityFrontier, SolverTermination, SolverWork};
+use super::{FactId, PathQualityFrontier, SemanticInputStatus, SolverTermination, SolverWork};
 
 /// One procedure entry and fact whose relative path edges share an end-summary
 /// relation.
@@ -230,116 +223,8 @@ impl SummaryEdge {
     }
 }
 
-/// Aggregate semantic-provider quality observed while materializing a summary
-/// solve.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum SummarySemanticStatus {
-    #[default]
-    Complete,
-    Ambiguous,
-    Unknown,
-    Unsupported {
-        capability: SemanticCapability,
-    },
-    Unproven,
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-    },
-    Cancelled,
-}
-
-impl SummarySemanticStatus {
-    pub fn from_outcome<T>(outcome: &SemanticOutcome<T>) -> Self {
-        match outcome {
-            SemanticOutcome::Complete { .. } => Self::Complete,
-            SemanticOutcome::Ambiguous { .. } => Self::Ambiguous,
-            SemanticOutcome::Unknown { .. } => Self::Unknown,
-            SemanticOutcome::Unsupported { capability, .. } => Self::Unsupported {
-                capability: *capability,
-            },
-            SemanticOutcome::Unproven { .. } => Self::Unproven,
-            SemanticOutcome::ExceededBudget { exceeded, .. } => Self::ExceededBudget {
-                exceeded: *exceeded,
-            },
-            SemanticOutcome::Cancelled { .. } => Self::Cancelled,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::Ambiguous => "ambiguous",
-            Self::Unknown => "unknown",
-            Self::Unsupported { .. } => "unsupported",
-            Self::Unproven => "unproven",
-            Self::ExceededBudget { .. } => "exceeded_budget",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    pub const fn is_complete(self) -> bool {
-        matches!(self, Self::Complete)
-    }
-
-    pub const fn unsupported_capability(self) -> Option<SemanticCapability> {
-        match self {
-            Self::Unsupported { capability } => Some(capability),
-            _ => None,
-        }
-    }
-
-    pub const fn budget_exceeded(self) -> Option<SemanticBudgetExceeded> {
-        match self {
-            Self::ExceededBudget { exceeded } => Some(exceeded),
-            _ => None,
-        }
-    }
-
-    /// Merge statuses independently of provider traversal order.
-    pub(crate) fn merge(self, incoming: Self) -> Self {
-        use SummarySemanticStatus::{
-            Ambiguous, Cancelled, Complete, ExceededBudget, Unknown, Unproven, Unsupported,
-        };
-
-        match (self, incoming) {
-            (Cancelled, _) | (_, Cancelled) => Cancelled,
-            (ExceededBudget { exceeded: left }, ExceededBudget { exceeded: right }) => {
-                ExceededBudget {
-                    exceeded: min_budget_exceeded(left, right),
-                }
-            }
-            (ExceededBudget { exceeded }, _) | (_, ExceededBudget { exceeded }) => {
-                ExceededBudget { exceeded }
-            }
-            (Unsupported { capability: left }, Unsupported { capability: right }) => Unsupported {
-                capability: left.min(right),
-            },
-            (Unsupported { capability }, _) | (_, Unsupported { capability }) => {
-                Unsupported { capability }
-            }
-            (Unknown, _) | (_, Unknown) => Unknown,
-            (Unproven, _) | (_, Unproven) => Unproven,
-            (Ambiguous, _) | (_, Ambiguous) => Ambiguous,
-            (Complete, Complete) => Complete,
-        }
-    }
-}
-
-impl Hash for SummarySemanticStatus {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match *self {
-            Self::Unsupported { capability } => capability.hash(state),
-            Self::ExceededBudget { exceeded } => {
-                exceeded.dimension().hash(state);
-                exceeded.limit().hash(state);
-                exceeded.attempted().hash(state);
-            }
-            Self::Complete | Self::Ambiguous | Self::Unknown | Self::Unproven | Self::Cancelled => {
-            }
-        }
-    }
-}
+/// Summary-solve terminology for the shared semantic input status.
+pub type SummarySemanticStatus = SemanticInputStatus;
 
 /// Why a reachable summary point does not have complete ICFG coverage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -668,15 +553,6 @@ impl From<SemanticProviderError> for SummaryDataflowError {
     }
 }
 
-fn min_budget_exceeded(
-    left: SemanticBudgetExceeded,
-    right: SemanticBudgetExceeded,
-) -> SemanticBudgetExceeded {
-    let left_key = (left.dimension(), left.limit(), left.attempted());
-    let right_key = (right.dimension(), right.limit(), right.attempted());
-    if left_key <= right_key { left } else { right }
-}
-
 fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Ordering {
     left.artifact()
         .key()
@@ -856,35 +732,7 @@ fn compare_boundary_kinds(left: &SummaryBoundaryKind, right: &SummaryBoundaryKin
 }
 
 fn compare_semantic_status(left: SummarySemanticStatus, right: SummarySemanticStatus) -> Ordering {
-    semantic_status_rank(left)
-        .cmp(&semantic_status_rank(right))
-        .then_with(|| match (left, right) {
-            (
-                SummarySemanticStatus::Unsupported { capability: left },
-                SummarySemanticStatus::Unsupported { capability: right },
-            ) => left.cmp(&right),
-            (
-                SummarySemanticStatus::ExceededBudget { exceeded: left },
-                SummarySemanticStatus::ExceededBudget { exceeded: right },
-            ) => (left.dimension(), left.limit(), left.attempted()).cmp(&(
-                right.dimension(),
-                right.limit(),
-                right.attempted(),
-            )),
-            _ => Ordering::Equal,
-        })
-}
-
-fn semantic_status_rank(status: SummarySemanticStatus) -> u8 {
-    match status {
-        SummarySemanticStatus::Complete => 0,
-        SummarySemanticStatus::Ambiguous => 1,
-        SummarySemanticStatus::Unproven => 2,
-        SummarySemanticStatus::Unknown => 3,
-        SummarySemanticStatus::Unsupported { .. } => 4,
-        SummarySemanticStatus::ExceededBudget { .. } => 5,
-        SummarySemanticStatus::Cancelled => 6,
-    }
+    left.cmp(&right)
 }
 
 fn compare_dispatch_boundaries(

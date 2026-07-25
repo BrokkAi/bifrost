@@ -8,8 +8,8 @@ use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::cfg::{
-    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
-    ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
@@ -48,33 +48,38 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let mut specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (mut specs, initial_work, inventory_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    inventory_work,
+                } => (value, initial_work, inventory_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
         if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
-                work: SemanticWork::default(),
+                work: inventory_work,
             });
         }
         for index in 0..specs.len() {
             if cancellation.is_cancelled() {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
-                    work: SemanticWork::default(),
+                    work: inventory_work,
                 });
             }
             let can_capture_receiver = specs[index]
@@ -109,7 +114,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
@@ -177,20 +182,7 @@ use inventory::{NestedProcedureTarget, ProcedureEnumeration, ProcedureSpec, enum
 
 type JavaLoweringError = ProcedureLoweringError;
 
-#[derive(Debug, Clone, Copy)]
-struct EdgeTarget {
-    point: ProgramPointId,
-    kind: ControlEdgeKind,
-}
-
-impl EdgeTarget {
-    const fn normal(point: ProgramPointId) -> Self {
-        Self {
-            point,
-            kind: ControlEdgeKind::Normal,
-        }
-    }
-}
+type EdgeTarget = ControlTarget;
 
 #[derive(Debug, Clone, Copy)]
 enum Work<'tree> {
@@ -220,6 +212,52 @@ enum Work<'tree> {
         when_false: EdgeTarget,
         scope: ScopeFrameId,
     },
+}
+
+impl<'tree> Work<'tree> {
+    const fn statement(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Statement {
+            node,
+            entry,
+            next,
+            scope,
+        }
+    }
+
+    const fn expression(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Expression {
+            node,
+            entry,
+            next,
+            scope,
+        }
+    }
+
+    const fn condition(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Condition {
+            node,
+            entry,
+            when_true,
+            when_false,
+            scope,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -91,22 +91,12 @@ pub(crate) fn evaluate_transfer<P>(
 where
     P: DistributiveDataflowProblem,
 {
-    if request.cancellation.is_cancelled() {
-        return TransferEvaluation::Terminated(SolverTermination::Cancelled);
-    }
-    let staged_budget = match request.budget.staged_charge(SolverWork {
+    if let Some(termination) = request.reserve(SolverWork {
         flow_evaluations: 1,
         ..SolverWork::default()
     }) {
-        Ok(staged) => staged,
-        Err(exceeded) => {
-            return TransferEvaluation::Terminated(SolverTermination::ExceededBudget(exceeded));
-        }
-    };
-    if request.cancellation.is_cancelled() {
-        return TransferEvaluation::Terminated(SolverTermination::Cancelled);
+        return TransferEvaluation::Terminated(termination);
     }
-    *request.budget = staged_budget;
 
     scratch.emitted_outputs.clear();
     let sink_exceeded = {

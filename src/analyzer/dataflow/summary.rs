@@ -256,22 +256,15 @@ where
             })
             .collect::<Vec<_>>();
 
-        let staged_budget = match request.budget.staged_charge(SolverWork {
+        if let Some(termination) = request.reserve(SolverWork {
             interned_facts: staged_facts.len(),
             reached_states: staged_states.len(),
             callback_rows,
             ..SolverWork::default()
         }) {
-            Ok(staged) => staged,
-            Err(exceeded) => {
-                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
-            }
-        };
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
+            return Ok(Some(termination));
         }
 
-        *request.budget = staged_budget;
         self.facts = staged_facts;
         self.fact_ids = staged_fact_ids;
         for key in staged_states {
@@ -361,23 +354,16 @@ where
             }
         }
 
-        let staged_budget = match request.budget.staged_charge(SolverWork {
+        if let Some(termination) = request.reserve(SolverWork {
             interned_facts: staged.new_facts.len(),
             reached_states: new_reached_states,
             callback_rows: outputs.len(),
             propagated_outputs: outputs.len(),
             ..SolverWork::default()
         }) {
-            Ok(staged_budget) => staged_budget,
-            Err(exceeded) => {
-                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
-            }
-        };
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
+            return Ok(Some(termination));
         }
 
-        *request.budget = staged_budget;
         self.commit_facts(staged.new_facts);
         for (key, frontier) in staged_states {
             self.reached.insert(key, frontier);
@@ -479,20 +465,12 @@ where
         &mut self,
         request: &mut DataflowRequest<'_>,
     ) -> Option<SolverTermination> {
-        if request.cancellation.is_cancelled() {
-            return Some(SolverTermination::Cancelled);
-        }
-        let staged = match request.budget.staged_charge(SolverWork {
+        if let Some(termination) = request.reserve(SolverWork {
             provider_materializations: 1,
             ..SolverWork::default()
         }) {
-            Ok(staged) => staged,
-            Err(exceeded) => return Some(SolverTermination::ExceededBudget(exceeded)),
-        };
-        if request.cancellation.is_cancelled() {
-            return Some(SolverTermination::Cancelled);
+            return Some(termination);
         }
-        *request.budget = staged;
         self.metrics.provider_materializations =
             self.metrics.provider_materializations.saturating_add(1);
         None
@@ -1178,19 +1156,12 @@ where
             self.summaries[id].qualities = prospective;
             id
         } else {
-            let staged_budget = match request.budget.staged_charge(SolverWork {
+            if let Some(termination) = request.reserve(SolverWork {
                 end_summaries: 1,
                 ..SolverWork::default()
             }) {
-                Ok(staged) => staged,
-                Err(exceeded) => {
-                    return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
-                }
-            };
-            if request.cancellation.is_cancelled() {
-                return Ok(Some(SolverTermination::Cancelled));
+                return Ok(Some(termination));
             }
-            *request.budget = staged_budget;
             let id = self.summaries.len();
             self.summaries.push(EndSummaryRow {
                 key,
@@ -1555,18 +1526,7 @@ fn reserve_solver_work(
     work: SolverWork,
     request: &mut DataflowRequest<'_>,
 ) -> Option<SolverTermination> {
-    if request.cancellation.is_cancelled() {
-        return Some(SolverTermination::Cancelled);
-    }
-    let staged = match request.budget.staged_charge(work) {
-        Ok(staged) => staged,
-        Err(exceeded) => return Some(SolverTermination::ExceededBudget(exceeded)),
-    };
-    if request.cancellation.is_cancelled() {
-        return Some(SolverTermination::Cancelled);
-    }
-    *request.budget = staged;
-    None
+    request.reserve(work)
 }
 
 fn canonicalize_call_transfer_set(mut set: CallTransferSet) -> CallTransferSet {

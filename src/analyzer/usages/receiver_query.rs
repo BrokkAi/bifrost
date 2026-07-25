@@ -2435,7 +2435,7 @@ impl ReceiverSemanticBridge {
             events,
             control_edges,
             mut nested_entries,
-        ] = partition_receiver_limit::<{ Self::SCOPE_DIMENSIONS }>(scope - publication_reserve);
+        ] = partition_receiver_scope_limit(scope - publication_reserve);
         nested_entries += publication_reserve;
         let [call_sites, memory_locations, captures] = partition_receiver_summary_limit(summaries);
         let budget = SemanticBudget::new(SemanticWork {
@@ -2532,12 +2532,29 @@ impl ReceiverSemanticBridge {
     }
 }
 
-fn partition_receiver_limit<const DIMENSIONS: usize>(total: usize) -> [usize; DIMENSIONS] {
-    debug_assert!(DIMENSIONS > 0);
+fn partition_receiver_scope_limit(total: usize) -> [usize; 11] {
+    const DIMENSIONS: usize = ReceiverSemanticBridge::SCOPE_DIMENSIONS;
+    const NESTED_ENTRIES_INDEX: usize = DIMENSIONS - 1;
     debug_assert!(total >= DIMENSIONS);
-    let quotient = total / DIMENSIONS;
-    let remainder = total % DIMENSIONS;
-    std::array::from_fn(|index| quotient + usize::from(index < remainder))
+
+    // Semantic materialization charges syntax traversal and nested collection
+    // publication to `nested_entries`, while the other dimensions mostly
+    // represent emitted rows. Give traversal one quarter of the aggregate
+    // scope budget and distribute the rest evenly across the ten row
+    // dimensions. Every dimension remains positive and the limits still sum
+    // exactly to the receiver's aggregate scope cap.
+    let mut limits = [1; DIMENSIONS];
+    let remaining = total - DIMENSIONS;
+    let nested_extra = remaining.div_ceil(4);
+    let row_capacity = remaining - nested_extra;
+    let row_dimensions = DIMENSIONS - 1;
+    let quotient = row_capacity / row_dimensions;
+    let remainder = row_capacity % row_dimensions;
+    for (index, limit) in limits[..row_dimensions].iter_mut().enumerate() {
+        *limit += quotient + usize::from(index < remainder);
+    }
+    limits[NESTED_ENTRIES_INDEX] += nested_extra;
+    limits
 }
 
 fn partition_receiver_summary_limit(total: usize) -> [usize; 3] {
@@ -5600,7 +5617,7 @@ export function caller() {
         let semantic = bridge.budget.limits();
         assert_eq!(semantic.procedures, 2);
         assert_eq!(semantic.control_edges, 1);
-        assert_eq!(semantic.nested_entries, 4);
+        assert_eq!(semantic.nested_entries, 5);
         assert_eq!(semantic.call_sites, 4);
         assert_eq!(semantic.memory_locations, 3);
         assert_eq!(semantic.captures, 2);

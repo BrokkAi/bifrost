@@ -8,8 +8,8 @@ use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
-    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
-    ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
@@ -48,26 +48,31 @@ impl ProgramSemanticsLowerer for PhpSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (specs, initial_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    ..
+                } => (value, initial_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
@@ -128,14 +133,7 @@ struct ProcedureSpec<'tree> {
     returns_value: bool,
 }
 
-enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-        work: SemanticWork,
-    },
-    Cancelled,
-}
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -149,55 +147,35 @@ fn enumerate_procedures<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
-    let mount = WorkspaceMountId::from_root(file.root());
-    let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let language = prepared.dialect();
     let root = prepared.tree().root_node();
-    let file_anchor = source_anchor(root, 0).map_err(SemanticProviderError::invalid_identity)?;
-    let file_name = file
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("php-source");
-    let file_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::File, file_name, file_anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-
-    type SiblingKey = (usize, DeclarationSegmentKind, Option<Box<str>>);
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "php-source", budget)?;
     let mut specs = Vec::new();
-    let mut siblings: HashMap<SiblingKey, u32> = HashMap::default();
-    let mut declaration_paths = vec![DeclarationPathEntry {
-        parent: None,
-        segment: file_segment,
-    }];
-    let mut preflight = SemanticWork::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
-        declaration_path: 0,
+        declaration_path: inventory.root_path(),
     }];
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
         }
         let child_path = frame.declaration_path;
         let mut container_body_scope = None;
         if let Some(segment_kind) = declaration_container_kind(frame.node) {
             let name = declaration_container_name(prepared.source(), frame.node);
-            let ordinal = next_sibling_ordinal(
-                &mut siblings,
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            let container_path = inventory.push_container(
                 frame.declaration_path,
                 segment_kind,
                 name.as_deref(),
-            );
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let container_path =
-                push_declaration_path(&mut declaration_paths, frame.declaration_path, segment);
+                anchor,
+            )?;
             if let Some(body) = frame.node.child_by_field_name("body") {
                 container_body_scope = Some((body.id(), container_path));
             }
@@ -207,47 +185,29 @@ fn enumerate_procedures<'tree>(
         if let Some((kind, segment_kind, body, properties, returns_value)) =
             callable_shape(prepared.source(), frame.node, frame.lexical_parent)
         {
-            let id = ProcedureId::try_from_index(specs.len())
-                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
             let name = callable_name(prepared.source(), frame.node);
-            let ordinal =
-                next_sibling_ordinal(&mut siblings, child_path, segment_kind, name.as_deref());
             let anchor =
                 source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let mut segments = collect_declaration_path(&declaration_paths, child_path);
-            segments.push(segment.clone());
-            let declaration = DeclarationLocator::new(segments)
-                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-            let locator = SemanticLocator::new(
-                mount,
-                path.clone(),
-                language,
-                declaration,
-                SemanticRole::Procedure,
+            let identity = match inventory.allocate_procedure(
+                child_path,
+                segment_kind,
+                name.as_deref(),
                 anchor,
-            );
-            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: candidate,
-                });
-            }
-            preflight = candidate;
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
             specs.push(ProcedureSpec {
-                id,
+                id: identity.id,
                 callable: frame.node,
                 body,
-                locator,
+                locator: identity.locator,
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
                 returns_value,
             });
-            let callable_path = push_declaration_path(&mut declaration_paths, child_path, segment);
-            callable_body_scope = Some((body.id(), id, callable_path));
+            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
         }
 
         let mut cursor = frame.node.walk();
@@ -269,7 +229,7 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    Ok(ProcedureEnumeration::Complete(specs))
+    Ok(inventory.complete(specs))
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -527,20 +487,7 @@ fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
 
 type PhpLoweringError = ProcedureLoweringError;
 
-#[derive(Debug, Clone, Copy)]
-struct EdgeTarget {
-    point: ProgramPointId,
-    kind: ControlEdgeKind,
-}
-
-impl EdgeTarget {
-    const fn normal(point: ProgramPointId) -> Self {
-        Self {
-            point,
-            kind: ControlEdgeKind::Normal,
-        }
-    }
-}
+type EdgeTarget = ControlTarget;
 
 #[derive(Debug, Clone, Copy)]
 enum Work<'tree> {
@@ -732,44 +679,15 @@ fn lower_procedure<'tree>(
     };
     context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
-    let mut drive_error = None;
-    if let Err(error) =
-        builder.drive_iteratively(body_work, cancellation, |builder, work, stack| {
-            context.step(builder, work, stack)
-        })
-    {
-        drive_error = Some(error);
-    }
-    if let Some(error) = drive_error {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(PhpLoweringError::Cancelled(_)) => {
-                Err(PhpLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(PhpLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(PhpLoweringError::Budget(exceeded, _)) => {
-                Err(PhpLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(PhpLoweringError::Invalid(detail)) => {
-                Err(PhpLoweringError::Invalid(detail))
-            }
-        };
-    }
-
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(PhpLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    builder
-        .finish_with_work()
-        .map_err(|error| PhpLoweringError::Budget(error, Box::new(work_before_freeze)))
+    drive_and_finish_procedure(
+        builder,
+        [body_work],
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -939,10 +857,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let value = self
-            .session
-            .add_value_with_metadata(builder, metadata, kind)?;
-        self.expression_values.insert(node.id(), value);
+        let value = self.session.insert_cached_value_with_metadata(
+            builder,
+            &mut self.expression_values,
+            node.id(),
+            metadata,
+            kind,
+        )?;
         Ok(value)
     }
 
@@ -3618,66 +3539,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
-        if route.cleanups().is_empty() {
-            return self.edge(
-                builder,
-                from,
-                EdgeTarget {
-                    point: route.destination().target(),
-                    kind: route.destination().edge_kind(),
-                },
-            );
-        }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| PhpLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body)?;
-            let (cleanup_entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    cleanup_entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                let statement_next = if next.kind == ControlEdgeKind::Normal {
-                    next
-                } else {
-                    let relay = self.point(builder, region.body, Vec::new())?;
-                    self.edge(builder, relay, next)?;
-                    EdgeTarget::normal(relay)
-                };
-                stack.push(Work::Statement {
-                    node: region.body,
-                    entry: cleanup_entry,
-                    next: statement_next,
-                    scope: region.outer_scope,
-                });
-            }
-            next = EdgeTarget {
-                point: cleanup_entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(cleanup_entry);
-        }
-        self.edge(
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
             builder,
-            from,
-            EdgeTarget {
-                point: first.expect("route has cleanups"),
-                kind: ControlEdgeKind::Cleanup,
-            },
-        )
+            &mut self.session,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )? {
+            let statement_next = if step.next.kind == ControlEdgeKind::Normal {
+                step.next
+            } else {
+                let relay = self.point(builder, step.region.body, Vec::new())?;
+                self.edge(builder, relay, step.next)?;
+                EdgeTarget::normal(relay)
+            };
+            stack.push(Work::Statement {
+                node: step.region.body,
+                entry: step.entry,
+                next: statement_next,
+                scope: step.region.outer_scope,
+            });
+        }
+        self.edge(builder, from, plan.target())
     }
 
     fn resolution_gaps(
@@ -3688,28 +3572,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         call_site: CallSiteId,
         resolution: &CallableTargetResolution,
     ) -> Result<(), PhpLoweringError> {
-        let kind = match resolution {
-            CallableTargetResolution::Proven(_) => return Ok(()),
-            CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
-            CallableTargetResolution::Unknown => SemanticGapKind::Unknown,
-            CallableTargetResolution::Unsupported => SemanticGapKind::Unsupported,
-            CallableTargetResolution::Unproven(_) => SemanticGapKind::Unproven,
-            CallableTargetResolution::ExceededBudget(_) => SemanticGapKind::ExceededBudget,
-        };
-        self.add_gap(
+        self.session.add_callable_resolution_gaps(
             builder,
             point,
-            SemanticGapSubject::Value(callee),
-            SemanticCapability::CallableReferences,
-            kind,
+            callee,
+            call_site,
+            resolution,
             "callable target requires whole-program dispatch refinement",
-        )?;
-        self.add_gap(
-            builder,
-            point,
-            SemanticGapSubject::CallSite(call_site),
-            SemanticCapability::Calls,
-            kind,
             "call target requires whole-program dispatch refinement",
         )
     }
@@ -3729,11 +3598,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, PhpLoweringError> {
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(PhpLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.session.add_node_mapping(builder, node)
     }
 
     fn value_mapping(

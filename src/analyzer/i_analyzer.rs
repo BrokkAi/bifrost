@@ -971,7 +971,8 @@ mod parent_of_tests {
         short_name: &str,
         segments: &[(&str, SegmentKind)],
     ) -> (CodeUnit, CodeUnit) {
-        let source = ProjectFile::new(std::path::PathBuf::from("/repo"), rel);
+        let root = std::env::current_dir().expect("test working directory should be available");
+        let source = ProjectFile::new(root, rel);
         let interner = segment_interner();
         let mut fq = FqName::new();
         for &(text, seg_kind) in segments {

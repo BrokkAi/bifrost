@@ -2770,9 +2770,18 @@ mod tests {
             projected_work.nested_entries,
             2 + projected[0].record().evidence().len() + locator_work.nested_entries
         );
+        // Dispatch may materialize a cold target while call transfer reuses
+        // that semantic artifact, so their total work is not directly
+        // additive. The transfer must still retain at least the independently
+        // measured deferred-boundary projection; the exact one-below budget
+        // assertion below proves the complete payload is charged atomically.
         assert!(
-            transfer_outcome.work().nested_entries
-                >= dispatch_outcome.work().nested_entries.saturating_add(3)
+            transfer_outcome.work().nested_entries >= projected_work.nested_entries,
+            "deferred transfer must retain its projected nested rows"
+        );
+        assert!(
+            transfer_outcome.work().owned_text_bytes >= projected_work.owned_text_bytes,
+            "deferred transfer must retain its projected locator text"
         );
         assert_eq!(transfer_budget.used(), transfer_outcome.work());
         let semantic_call = caller
