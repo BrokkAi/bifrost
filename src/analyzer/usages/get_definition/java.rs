@@ -2430,8 +2430,33 @@ fn java_raw_type_name(type_text: &str) -> Option<String> {
         .next()
         .unwrap_or(type_text)
         .trim();
-    let name = raw.rsplit('.').next().unwrap_or(raw).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    java_terminal_segment(raw)
+}
+
+/// The final `.`-joined segment of a Java-spelled qualified name (an import
+/// path or type reference, with any generic argument list already stripped by
+/// the caller). Java identifiers never contain a literal `.`, so re-tokenizing
+/// with the shared structured splitter and taking the last segment reproduces
+/// `rsplit('.').next()`'s terminal split exactly.
+fn java_terminal_segment(path: &str) -> Option<String> {
+    crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path)
+        .pop()
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Splits a Java-spelled dotted qualified name into its owner prefix and
+/// final segment (`com.foo.Bar` -> (`com.foo`, `Bar`)), or `None` for a bare
+/// name with no owner. Java identifiers never contain a literal `.`, so
+/// re-tokenizing with the shared structured splitter and rejoining every part
+/// but the last with `.` reproduces `rsplit_once('.')`'s (owner, member)
+/// split exactly.
+fn java_owner_and_member(path: &str) -> Option<(String, String)> {
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
+    let (member, owner_parts) = segments.split_last()?;
+    if owner_parts.is_empty() {
+        return None;
+    }
+    Some((owner_parts.join("."), member.clone()))
 }
 
 fn java_identifier_binding_before(
@@ -2950,8 +2975,7 @@ fn java_annotation_short_name(annotation: Node<'_>, source: &str) -> Option<Stri
         java_node_text(annotation, source)
     };
     let trimmed = raw.trim().trim_start_matches('@');
-    let short = trimmed.rsplit('.').next().unwrap_or(trimmed).trim();
-    (!short.is_empty()).then(|| short.to_string())
+    java_terminal_segment(trimmed)
 }
 
 fn java_lombok_annotation_generates_accessor(name: &str, kind: JavaAccessorKind) -> bool {
@@ -2989,7 +3013,7 @@ fn java_static_import_candidates(
                 );
             }
             if owner_candidates.is_empty()
-                && let Some((outer, leaf)) = owner.rsplit_once('.')
+                && let Some((outer, leaf)) = java_owner_and_member(owner)
             {
                 // On-demand static imports may land on nested types too.
                 owner_candidates = java_filter_member_candidates(
@@ -3003,7 +3027,7 @@ fn java_static_import_candidates(
             candidates.extend(owner_candidates);
             continue;
         }
-        let Some((owner, imported_member)) = path.rsplit_once('.') else {
+        let Some((owner, imported_member)) = java_owner_and_member(path) else {
             continue;
         };
         if imported_member != member {
@@ -3015,14 +3039,17 @@ fn java_static_import_candidates(
             // (`import static com.x.Tacos.Burritos`).
             imported = java_filter_member_candidates(support.fqn(path), JavaMemberLookupKind::Type);
         }
-        if imported.is_empty()
-            && let Some((outer, leaf)) = path.rsplit_once('.')
-        {
+        if imported.is_empty() {
             // The index keys nested types with `$`, not `.` (tier-4
-            // spoon/mockito static-import claims).
-            imported = java_filter_member_candidates(support.fqn(&format!("{outer}${leaf}")), kind);
+            // spoon/mockito static-import claims). `owner`/`imported_member`
+            // are the same (owner, member) split as above — `path` never
+            // changed, so re-splitting it here would just reproduce them.
+            imported = java_filter_member_candidates(
+                support.fqn(&format!("{owner}${imported_member}")),
+                kind,
+            );
         }
-        if imported.is_empty() && !java_workspace_fqn_exists(support, owner) {
+        if imported.is_empty() && !java_workspace_fqn_exists(support, &owner) {
             saw_external = true;
         }
         candidates.extend(imported);
@@ -3074,12 +3101,14 @@ fn java_import_boundary_for_type(
             }
             continue;
         }
-        if path.rsplit('.').next() == Some(name) {
-            let package = path
-                .rsplit_once('.')
-                .map(|(package, _)| package)
-                .unwrap_or("");
-            return !java_workspace_package_exists(support, package);
+        // Java identifiers never contain a literal `.`, so re-tokenizing with
+        // the shared structured splitter and rejoining every part but the
+        // last with `.` reproduces the string's (package, terminal) split
+        // exactly, including the no-owner case (`package` stays empty).
+        let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
+        if segments.last().map(String::as_str) == Some(name) {
+            let package = segments[..segments.len().saturating_sub(1)].join(".");
+            return !java_workspace_package_exists(support, &package);
         }
     }
     false

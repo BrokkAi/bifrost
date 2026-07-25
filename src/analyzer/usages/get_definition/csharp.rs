@@ -2977,7 +2977,14 @@ fn csharp_import_boundary_for_type(
     if csharp_alias_using_boundary_for_type(csharp, definitions, file, reference) {
         return true;
     }
-    let simple = reference.rsplit('.').next().unwrap_or(reference);
+    // `reference` is source-written C# reference text (dot-qualified, never
+    // `$`-nested at the syntax level — that spelling is an internal
+    // short_name storage convention, not source syntax); re-tokenizing with
+    // the shared structured splitter and taking the last segment reproduces
+    // `rsplit('.').next()`'s terminal split exactly.
+    let simple = crate::analyzer::symbol_lookup::parse_symbol_path(Language::CSharp, reference)
+        .pop()
+        .unwrap_or_else(|| reference.to_string());
     definitions
         .using_namespaces(file)
         .into_iter()

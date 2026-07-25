@@ -518,8 +518,10 @@ impl ScalaQueryTargetCatalog {
 /// structured splitter and taking the last segment reproduces
 /// `short_name.rsplit('.').next()`'s terminal-segment split exactly, for any
 /// unit kind (function, field, type, or type alias) — unlike `identifier()`,
-/// this never additionally trims a `$` nesting marker.
-pub(super) fn scala_short_name_terminal_segment(short_name: &str) -> String {
+/// this never additionally trims a `$` nesting marker. `pub(crate)` (not
+/// `pub(super)`): also reused by `scala_simple_type_name` in
+/// `src/analyzer/scala/mod.rs`, outside `usages::scala_graph`.
+pub(crate) fn scala_short_name_terminal_segment(short_name: &str) -> String {
     crate::analyzer::symbol_lookup::parse_symbol_path(Language::Scala, short_name)
         .pop()
         .unwrap_or_else(|| short_name.to_string())

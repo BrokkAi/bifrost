@@ -1919,10 +1919,15 @@ fn python_member_outcome(
 }
 
 fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
-    let Some((module, _)) = fqn.rsplit_once('.') else {
-        return !python_workspace_module_exists(support, "");
-    };
-    !python_workspace_module_exists(support, module)
+    // Python module paths are `.`-joined and identifiers never contain a
+    // literal `.`, so re-tokenizing `fqn` with the shared structured splitter
+    // and rejoining every part but the last with `.` reproduces
+    // `rsplit_once('.')`'s (module, _) split exactly, including the no-dot
+    // case (an empty module, which `python_workspace_module_exists` always
+    // rejects).
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, fqn);
+    let module = segments[..segments.len().saturating_sub(1)].join(".");
+    !python_workspace_module_exists(support, &module)
 }
 
 fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
