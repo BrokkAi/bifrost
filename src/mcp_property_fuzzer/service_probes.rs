@@ -298,6 +298,10 @@ pub struct ProbeSummary {
     /// include/import directive, whose "symbol" is a file path rather than
     /// a resolvable code symbol.
     pub skipped_include_summary_element: usize,
+    /// I3(a) follow-ups skipped because the summary element's name is not
+    /// identifier-shaped (`operator<<`, `~Foo`, `<init>`), so no selector
+    /// spelling can address it.
+    pub skipped_non_ident_name: usize,
     /// Summary probes skipped for empty files (e.g. 0-byte `__init__.py`):
     /// an all-empty response is a valid result there, not a refusal.
     pub skipped_empty_file_summaries: usize,
@@ -1190,6 +1194,15 @@ fn derive_follow_ups(
                             // mismatches between files.
                             if terminal_of(symbol) == "_" {
                                 summary.symbols_excluded_blank_identifier += 1;
+                                continue;
+                            }
+                            // Non-identifier element names (`operator<<`,
+                            // `~Foo`, `<init>`) are not addressable by any
+                            // selector spelling per the fuzzer's own ident
+                            // convention — probing them not_founds by
+                            // construction (googletest's `operator<<`).
+                            if !is_ident_like(terminal_of(symbol)) {
+                                summary.skipped_non_ident_name += 1;
                                 continue;
                             }
                             follow.push(ProbeRecord {
