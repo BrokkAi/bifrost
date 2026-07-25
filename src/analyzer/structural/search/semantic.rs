@@ -1264,6 +1264,13 @@ fn control_edge_wire_id(handle: &ControlEdgeHandle) -> String {
         .expect("validated control edge has evidence");
     let mut digest = semantic_wire_digest(procedure.artifact().as_ref(), b"control_edge");
     push_locator(&mut digest, procedure.semantics().locator());
+    // Source and evidence rows are allowed to carry distinct provenance even
+    // when their public content is otherwise identical. Keep their local IDs
+    // private, but include them in the artifact-scoped digest: validation
+    // rejects an otherwise-identical edge with the same pair, making this
+    // injective without tying the wire identity to control-edge storage order.
+    digest.push(&edge.source.get().to_le_bytes());
+    digest.push(&edge.evidence.get().to_le_bytes());
     push_locator(&mut digest, &mapping.locator);
     digest.push(edge.kind.label().as_bytes());
     digest.push(program_point_wire_id(&source).as_bytes());
@@ -1328,4 +1335,237 @@ fn push_evidence(
 
 fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::analyzer::semantic::{
+        AdapterSemanticsVersion, BasicBlock, BlockId, ConfigurationFingerprint, ContentIdentity,
+        ControlEdgeId, ControlEdgeKind, DeclarationLocator, DeclarationSegment,
+        DeclarationSegmentKind, DependencyFingerprint, EvidenceId, ProcedureId, ProcedureKind,
+        ProcedureSemanticsParts, ProgramPointId, SemanticArtifactKey, SemanticCapabilities,
+        SemanticEvent, SemanticIrVersion, SemanticLanguage, SemanticRole, SourceAnchor,
+        SourceMappingId, SourceMappingKind, SourcePosition, SourceRevision, SourceSpan,
+        WorkspaceMountId, WorkspaceRelativePath,
+    };
+
+    fn test_anchor(offset: u32) -> SourceAnchor {
+        SourceAnchor::new(
+            SourceSpan::new(
+                SourcePosition::new(offset, 0, offset),
+                SourcePosition::new(offset + 1, 0, offset + 1),
+            )
+            .expect("ordered test span"),
+            0,
+        )
+    }
+
+    fn parallel_edge_artifact(reverse_edges: bool) -> Arc<SemanticArtifact> {
+        let key = SemanticArtifactKey::new(
+            WorkspaceMountId::hash_bytes(b"test mount"),
+            WorkspaceRelativePath::new("src/Test.java").expect("valid test path"),
+            SemanticLanguage::Standard(Language::Java),
+            SourceRevision::Disk {
+                content: ContentIdentity::hash_bytes(b"class Test {}"),
+            },
+            AdapterSemanticsVersion::hash_bytes("test-java", b"adapter")
+                .expect("non-empty adapter version"),
+            SemanticIrVersion::hash_bytes(b"semantic-ir-test"),
+            ConfigurationFingerprint::hash_bytes(b"configuration"),
+            DependencyFingerprint::hash_bytes(b"dependencies"),
+        );
+        let procedure_anchor = test_anchor(1);
+        let declaration = DeclarationLocator::new(vec![
+            DeclarationSegment::named(DeclarationSegmentKind::File, "Test.java", test_anchor(0), 0)
+                .expect("valid file segment"),
+            DeclarationSegment::named(
+                DeclarationSegmentKind::Function,
+                "target",
+                procedure_anchor,
+                0,
+            )
+            .expect("valid procedure segment"),
+        ])
+        .expect("non-empty declaration");
+        let locator = SemanticLocator::new(
+            key.mount(),
+            key.path().clone(),
+            key.language(),
+            declaration,
+            SemanticRole::Procedure,
+            procedure_anchor,
+        );
+        let source = SourceMappingId::new(0);
+        let evidence = EvidenceId::new(0);
+        let mut procedure = ProcedureSemanticsParts::new(
+            ProcedureId::new(0),
+            locator.clone(),
+            ProcedureKind::Function,
+            source,
+            evidence,
+        );
+        procedure.source_mappings.extend([
+            SourceMapping {
+                id: source,
+                locator: locator.clone(),
+                kind: SourceMappingKind::Exact,
+            },
+            SourceMapping {
+                id: SourceMappingId::new(1),
+                locator,
+                kind: SourceMappingKind::Exact,
+            },
+        ]);
+        procedure.evidence_rows.extend([
+            Evidence {
+                id: evidence,
+                proof: ProofStatus::Proven,
+                completeness: EvidenceCompleteness::Complete,
+                sources: Box::new([source]),
+            },
+            Evidence {
+                id: EvidenceId::new(1),
+                proof: ProofStatus::Proven,
+                completeness: EvidenceCompleteness::Complete,
+                sources: Box::new([SourceMappingId::new(1)]),
+            },
+        ]);
+
+        let entry = ProgramPointId::new(0);
+        let normal_exit = ProgramPointId::new(1);
+        let exceptional_exit = ProgramPointId::new(2);
+        procedure.blocks.push(BasicBlock {
+            id: BlockId::new(0),
+            points: Box::new([entry, normal_exit, exceptional_exit]),
+            source,
+            evidence,
+        });
+        procedure.points.extend([
+            ProgramPoint {
+                id: entry,
+                block: BlockId::new(0),
+                events: Box::new([SemanticEvent::new(
+                    crate::analyzer::semantic::SemanticEffect::Entry,
+                    source,
+                    evidence,
+                )]),
+                source,
+                evidence,
+            },
+            ProgramPoint {
+                id: normal_exit,
+                block: BlockId::new(0),
+                events: Box::new([SemanticEvent::new(
+                    crate::analyzer::semantic::SemanticEffect::NormalExit,
+                    source,
+                    evidence,
+                )]),
+                source,
+                evidence,
+            },
+            ProgramPoint {
+                id: exceptional_exit,
+                block: BlockId::new(0),
+                events: Box::new([SemanticEvent::new(
+                    crate::analyzer::semantic::SemanticEffect::ExceptionalExit,
+                    source,
+                    evidence,
+                )]),
+                source,
+                evidence,
+            },
+        ]);
+        procedure.control_edges.extend([
+            ControlEdge {
+                source_point: entry,
+                target_point: normal_exit,
+                kind: ControlEdgeKind::Normal,
+                source,
+                evidence,
+            },
+            ControlEdge {
+                source_point: entry,
+                target_point: normal_exit,
+                kind: ControlEdgeKind::Normal,
+                source: SourceMappingId::new(1),
+                evidence: EvidenceId::new(1),
+            },
+            ControlEdge {
+                source_point: entry,
+                target_point: exceptional_exit,
+                kind: ControlEdgeKind::Exceptional,
+                source,
+                evidence,
+            },
+        ]);
+        if reverse_edges {
+            procedure.control_edges.reverse();
+        }
+
+        let capabilities = SemanticCapabilities::builder()
+            .complete(SemanticCapability::Procedures)
+            .complete(SemanticCapability::EntryBoundary)
+            .complete(SemanticCapability::NormalExitBoundary)
+            .complete(SemanticCapability::ExceptionalExitBoundary)
+            .complete(SemanticCapability::BasicBlocks)
+            .complete(SemanticCapability::ProgramPoints)
+            .complete(SemanticCapability::NormalControlFlow)
+            .complete(SemanticCapability::ExceptionalControlFlow)
+            .build();
+        Arc::new(
+            SemanticArtifact::try_new(key, capabilities, vec![procedure])
+                .expect("parallel edges with distinct provenance are valid"),
+        )
+    }
+
+    #[test]
+    fn parallel_control_edges_have_distinct_public_wire_ids() {
+        let artifact = parallel_edge_artifact(false);
+        let procedure = artifact
+            .procedure_handle(ProcedureId::new(0))
+            .expect("test procedure exists");
+        let first = procedure
+            .control_edge_handle(ControlEdgeId::new(0))
+            .expect("first parallel edge exists");
+        let second = procedure
+            .control_edge_handle(ControlEdgeId::new(1))
+            .expect("second parallel edge exists");
+
+        assert_ne!(
+            control_edge_wire_id(&first),
+            control_edge_wire_id(&second),
+            "valid parallel edges must not collide on the public wire"
+        );
+
+        let reversed = parallel_edge_artifact(true);
+        let reversed_procedure = reversed
+            .procedure_handle(ProcedureId::new(0))
+            .expect("reordered test procedure exists");
+        let mut original_ids = (0..3)
+            .map(|id| {
+                control_edge_wire_id(
+                    &procedure
+                        .control_edge_handle(ControlEdgeId::new(id))
+                        .expect("original edge exists"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut reordered_ids = (0..3)
+            .map(|id| {
+                control_edge_wire_id(
+                    &reversed_procedure
+                        .control_edge_handle(ControlEdgeId::new(id))
+                        .expect("reordered edge exists"),
+                )
+            })
+            .collect::<Vec<_>>();
+        original_ids.sort_unstable();
+        reordered_ids.sort_unstable();
+        assert_eq!(
+            original_ids, reordered_ids,
+            "edge storage order must not affect public identities"
+        );
+    }
 }
