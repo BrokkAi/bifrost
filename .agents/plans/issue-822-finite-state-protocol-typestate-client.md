@@ -107,6 +107,13 @@ required for that checkpoint.
   separate schema-v1 canonical binding hash. Stable subject, site, and context
   identity is derived from validated semantic handles rather than accepted
   from callers. Focused behavior tests and strict all-feature Clippy pass.
+- [x] (2026-07-25 15:38+02:00) Implemented the first reusable
+  `DistributiveDataflowProblem` client over the finite subject/state/uncertainty
+  fact product. Ordered bindings execute at local, before-call,
+  actual-to-formal, return, and continuation phases; partial evidence remains
+  explicit; proven escape obeys protocol uncertainty semantics; and a binding
+  plan cannot execute against a different protocol hash. All 27 protocol,
+  binding, and client tests plus strict focused all-feature Clippy pass.
 - [ ] Implement typestate propagation, diagnostic-neutral findings, explicit
   uncertainty semantics, and consumption of #1171's generic witness API.
 - [ ] Add controlled-graph and equivalent TypeScript/Java conformance fixtures,
@@ -205,6 +212,14 @@ required for that checkpoint.
   now derives a stable structural object/site/context key from each validated
   handle, including call-result contexts and source-backed capture ports.
 
+- Observation: semantic effect order and protocol/plan pairing are executable
+  binding semantics, not incidental serialization details.
+  Evidence: sorting co-located events by event ID can change a non-commutative
+  automaton, while pairing compiled event IDs with a different protocol can
+  silently reinterpret them. Event bindings now carry a per-subject/site
+  ordinal with collision rejection, and canonical binding identity includes
+  the compiled protocol hash.
+
 ## Decision Log
 
 - Decision: keep the internal typestate module independent of
@@ -298,6 +313,15 @@ required for that checkpoint.
   stale-plan reuse. Deriving source locators, port keys, and bounded call
   contexts from validated handles makes the runtime and canonical domains agree
   by construction.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: keep uncertainty in the client fact domain rather than inferring it
+  only during finding projection.
+  Rationale: ambiguous dispatch, incomplete edges, escape, unmatched events,
+  and abstention change which state transitions are sound during propagation.
+  Retaining a compact uncertainty set and abstention bit on each finite fact
+  makes those semantics distributive and prevents incomplete paths from later
+  appearing definitive.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: commit after every plan step and review-fix checkpoint, fetch

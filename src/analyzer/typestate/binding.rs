@@ -16,7 +16,7 @@ use super::{
     CompiledProtocol, ProtocolEventId, ProtocolEventKey, ProtocolEventOccurrence,
     ProtocolExpectationId, ProtocolExpectationKey, ProtocolObjectCardinality,
     ProtocolObservationPhase, ProtocolProcedureExitKind, ProtocolStateId, ProtocolStateKey,
-    ProtocolTerminalObservationSpec, TypestateBindingPlanHash,
+    ProtocolTerminalObservationSpec, TypestateBindingPlanHash, TypestateProtocolHash,
 };
 
 pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -208,6 +208,19 @@ impl TypestateBindingQuality {
 
     pub const fn multiplicity(&self) -> TypestateBindingMultiplicity {
         self.multiplicity
+    }
+
+    pub const fn is_proven(&self) -> bool {
+        matches!(self.proof, ProofStatus::Proven)
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.completeness, EvidenceCompleteness::Complete)
+            && self.multiplicity.coverage.is_exhaustive()
+    }
+
+    pub const fn is_definitive(&self) -> bool {
+        self.is_proven() && self.is_complete() && !self.multiplicity.is_ambiguous()
     }
 }
 
@@ -405,6 +418,7 @@ pub struct TypestateEventBindingSpec {
     event: ProtocolEventKey,
     subject: TypestateSubjectKey,
     site: TypestateObservationSite,
+    order: u32,
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
 }
@@ -414,6 +428,7 @@ impl TypestateEventBindingSpec {
         event: ProtocolEventKey,
         subject: TypestateSubjectKey,
         site: TypestateObservationSite,
+        order: u32,
         role: TypestateObjectRole,
         quality: TypestateBindingQuality,
     ) -> Self {
@@ -421,6 +436,7 @@ impl TypestateEventBindingSpec {
             event,
             subject,
             site,
+            order,
             role,
             quality,
         }
@@ -524,6 +540,7 @@ pub struct BoundTypestateEvent {
     event: ProtocolEventId,
     subject: TypestateSubjectId,
     site: TypestateObservationSite,
+    order: u32,
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
 }
@@ -539,6 +556,10 @@ impl BoundTypestateEvent {
 
     pub fn site(&self) -> &TypestateObservationSite {
         &self.site
+    }
+
+    pub const fn order(&self) -> u32 {
+        self.order
     }
 
     pub const fn role(&self) -> TypestateObjectRole {
@@ -583,6 +604,7 @@ impl BoundTypestateTerminal {
 
 #[derive(Debug)]
 pub struct TypestateBindingPlan {
+    protocol_hash: TypestateProtocolHash,
     subjects: Box<[BoundTypestateSubject]>,
     initial_seeds: Box<[BoundTypestateInitialSeed]>,
     event_bindings: Box<[BoundTypestateEvent]>,
@@ -599,6 +621,12 @@ pub struct TypestateBindingPlan {
         crate::analyzer::semantic::CallSiteHandle,
         HashMap<OracleCallContext, Box<[usize]>>,
     >,
+    initial_seeds_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
+    events_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
+    events_by_call_all_contexts: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
+    terminals_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
+    terminals_by_call_all_contexts:
+        HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
     canonical_bytes: Box<[u8]>,
     canonical_rendering: Box<str>,
     hash: TypestateBindingPlanHash,
@@ -645,6 +673,12 @@ impl TypestateBindingPlan {
             compare_event_specs,
             TypestateBindingPlanError::DuplicateEventBinding,
         )?;
+        if event_bindings
+            .windows(2)
+            .any(|pair| compare_event_order_keys(&pair[0], &pair[1]) == Ordering::Equal)
+        {
+            return Err(TypestateBindingPlanError::ConflictingEventOrder);
+        }
         terminal_bindings.sort_by(compare_terminal_specs);
         reject_adjacent_duplicates(
             &terminal_bindings,
@@ -708,6 +742,7 @@ impl TypestateBindingPlan {
                 event,
                 subject,
                 site: binding.site.clone(),
+                order: binding.order,
                 role: binding.role,
                 quality: binding.quality.clone(),
             });
@@ -745,6 +780,7 @@ impl TypestateBindingPlan {
 
         let canonical = CanonicalBindingPlan {
             schema_version: BINDING_PLAN_SCHEMA_VERSION,
+            protocol_hash: protocol.hash(),
             subjects: subjects.iter().map(canonical_subject).collect(),
             initial_seeds: initial_seeds
                 .iter()
@@ -762,6 +798,7 @@ impl TypestateBindingPlan {
                     event: binding.event.as_str(),
                     subject: canonical_subject_key(&binding.subject),
                     site: canonical_site(&binding.site),
+                    order: binding.order,
                     role: binding.role,
                     quality: canonical_quality(&binding.quality),
                 })
@@ -793,8 +830,10 @@ impl TypestateBindingPlan {
         }
         let event_indexes = index_sites(&compiled_events, |binding| &binding.site);
         let terminal_indexes = index_sites(&compiled_terminals, |binding| &binding.site);
+        let initial_seed_indexes = index_point_sites(&compiled_seeds, |binding| &binding.site);
 
         Ok(Self {
+            protocol_hash: protocol.hash(),
             subjects: compiled_subjects.into_boxed_slice(),
             initial_seeds: compiled_seeds.into_boxed_slice(),
             event_bindings: compiled_events.into_boxed_slice(),
@@ -804,6 +843,11 @@ impl TypestateBindingPlan {
             events_by_call: event_indexes.calls,
             terminals_by_point: terminal_indexes.points,
             terminals_by_call: terminal_indexes.calls,
+            initial_seeds_by_point_all_contexts: initial_seed_indexes,
+            events_by_point_all_contexts: event_indexes.all_points,
+            events_by_call_all_contexts: event_indexes.all_calls,
+            terminals_by_point_all_contexts: terminal_indexes.all_points,
+            terminals_by_call_all_contexts: terminal_indexes.all_calls,
             canonical_bytes: canonical_bytes.into_boxed_slice(),
             canonical_rendering: canonical_rendering.into_boxed_str(),
             hash,
@@ -812,6 +856,10 @@ impl TypestateBindingPlan {
 
     pub fn subjects(&self) -> &[BoundTypestateSubject] {
         &self.subjects
+    }
+
+    pub const fn protocol_hash(&self) -> TypestateProtocolHash {
+        self.protocol_hash
     }
 
     pub fn subject(&self, id: TypestateSubjectId) -> Option<&BoundTypestateSubject> {
@@ -831,6 +879,14 @@ impl TypestateBindingPlan {
 
     pub fn initial_seeds(&self) -> &[BoundTypestateInitialSeed] {
         &self.initial_seeds
+    }
+
+    pub fn initial_seeds_at_program_point_all_contexts(
+        &self,
+        point: &ProgramPointHandle,
+    ) -> impl Iterator<Item = &BoundTypestateInitialSeed> {
+        flat_site_indexes(&self.initial_seeds_by_point_all_contexts, point)
+            .map(|index| &self.initial_seeds[index])
     }
 
     pub fn event_bindings(&self) -> &[BoundTypestateEvent] {
@@ -857,6 +913,22 @@ impl TypestateBindingPlan {
         site_indexes(&self.events_by_call, call, context).map(|index| &self.event_bindings[index])
     }
 
+    pub fn event_bindings_at_program_point_all_contexts(
+        &self,
+        point: &ProgramPointHandle,
+    ) -> impl Iterator<Item = &BoundTypestateEvent> {
+        flat_site_indexes(&self.events_by_point_all_contexts, point)
+            .map(|index| &self.event_bindings[index])
+    }
+
+    pub fn event_bindings_at_call_site_all_contexts(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+    ) -> impl Iterator<Item = &BoundTypestateEvent> {
+        flat_site_indexes(&self.events_by_call_all_contexts, call)
+            .map(|index| &self.event_bindings[index])
+    }
+
     pub fn terminal_bindings_at_program_point(
         &self,
         point: &ProgramPointHandle,
@@ -872,6 +944,22 @@ impl TypestateBindingPlan {
         context: &OracleCallContext,
     ) -> impl Iterator<Item = &BoundTypestateTerminal> {
         site_indexes(&self.terminals_by_call, call, context)
+            .map(|index| &self.terminal_bindings[index])
+    }
+
+    pub fn terminal_bindings_at_program_point_all_contexts(
+        &self,
+        point: &ProgramPointHandle,
+    ) -> impl Iterator<Item = &BoundTypestateTerminal> {
+        flat_site_indexes(&self.terminals_by_point_all_contexts, point)
+            .map(|index| &self.terminal_bindings[index])
+    }
+
+    pub fn terminal_bindings_at_call_site_all_contexts(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+    ) -> impl Iterator<Item = &BoundTypestateTerminal> {
+        flat_site_indexes(&self.terminals_by_call_all_contexts, call)
             .map(|index| &self.terminal_bindings[index])
     }
 
@@ -902,6 +990,7 @@ pub enum TypestateBindingPlanError {
     DuplicateSubject,
     DuplicateInitialSeed,
     DuplicateEventBinding,
+    ConflictingEventOrder,
     DuplicateTerminalBinding,
     UnknownSubject,
     UnknownState,
@@ -936,6 +1025,9 @@ impl fmt::Display for TypestateBindingPlanError {
             Self::DuplicateEventBinding => {
                 formatter.write_str("binding plan contains a duplicate event binding")
             }
+            Self::ConflictingEventOrder => formatter.write_str(
+                "binding plan assigns more than one event to the same subject/site order",
+            ),
             Self::DuplicateTerminalBinding => {
                 formatter.write_str("binding plan contains a duplicate terminal binding")
             }
@@ -969,6 +1061,7 @@ impl std::error::Error for TypestateBindingPlanError {
             | Self::DuplicateSubject
             | Self::DuplicateInitialSeed
             | Self::DuplicateEventBinding
+            | Self::ConflictingEventOrder
             | Self::DuplicateTerminalBinding
             | Self::UnknownSubject
             | Self::UnknownState
@@ -1255,11 +1348,20 @@ fn compare_event_specs(
     left: &TypestateEventBindingSpec,
     right: &TypestateEventBindingSpec,
 ) -> Ordering {
-    left.event
-        .cmp(&right.event)
+    compare_sites(&left.site, &right.site)
+        .then_with(|| left.order.cmp(&right.order))
         .then_with(|| left.subject.cmp(&right.subject))
-        .then_with(|| compare_sites(&left.site, &right.site))
+        .then_with(|| left.event.cmp(&right.event))
         .then_with(|| left.role.cmp(&right.role))
+}
+
+fn compare_event_order_keys(
+    left: &TypestateEventBindingSpec,
+    right: &TypestateEventBindingSpec,
+) -> Ordering {
+    compare_sites(&left.site, &right.site)
+        .then_with(|| left.order.cmp(&right.order))
+        .then_with(|| left.subject.cmp(&right.subject))
 }
 
 fn compare_terminal_specs(
@@ -1293,6 +1395,8 @@ struct SiteIndexes {
         crate::analyzer::semantic::CallSiteHandle,
         HashMap<OracleCallContext, Box<[usize]>>,
     >,
+    all_points: HashMap<ProgramPointHandle, Box<[usize]>>,
+    all_calls: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
 }
 
 fn index_sites<T>(values: &[T], site: impl Fn(&T) -> &TypestateObservationSite) -> SiteIndexes {
@@ -1321,10 +1425,50 @@ fn index_sites<T>(values: &[T], site: impl Fn(&T) -> &TypestateObservationSite) 
             }
         }
     }
+    let all_points = flatten_site_indexes(&points);
+    let all_calls = flatten_site_indexes(&calls);
     SiteIndexes {
         points: box_site_indexes(points),
         calls: box_site_indexes(calls),
+        all_points,
+        all_calls,
     }
+}
+
+fn index_point_sites<T>(
+    values: &[T],
+    site: impl Fn(&T) -> &TypestateObservationSite,
+) -> HashMap<ProgramPointHandle, Box<[usize]>> {
+    let mut indexes = HashMap::<ProgramPointHandle, Vec<usize>>::new();
+    for (index, value) in values.iter().enumerate() {
+        if let TypestateObservationSite::ProgramPoint { point, .. } = site(value) {
+            indexes.entry(point.clone()).or_default().push(index);
+        }
+    }
+    indexes
+        .into_iter()
+        .map(|(point, indexes)| (point, indexes.into_boxed_slice()))
+        .collect()
+}
+
+fn flatten_site_indexes<K>(
+    indexes: &HashMap<K, HashMap<OracleCallContext, Vec<usize>>>,
+) -> HashMap<K, Box<[usize]>>
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    indexes
+        .iter()
+        .map(|(site, contexts)| {
+            let mut flattened = contexts
+                .values()
+                .flat_map(|indexes| indexes.iter().copied())
+                .collect::<Vec<_>>();
+            flattened.sort_unstable();
+            flattened.dedup();
+            (site.clone(), flattened.into_boxed_slice())
+        })
+        .collect()
 }
 
 fn box_site_indexes<K>(
@@ -1362,9 +1506,23 @@ where
         .flat_map(|indexes| indexes.iter().copied())
 }
 
+fn flat_site_indexes<'plan, K>(
+    indexes: &'plan HashMap<K, Box<[usize]>>,
+    site: &K,
+) -> impl Iterator<Item = usize> + 'plan
+where
+    K: Eq + std::hash::Hash,
+{
+    indexes
+        .get(site)
+        .into_iter()
+        .flat_map(|indexes| indexes.iter().copied())
+}
+
 #[derive(Serialize)]
 struct CanonicalBindingPlan<'a> {
     schema_version: u32,
+    protocol_hash: TypestateProtocolHash,
     subjects: Vec<CanonicalSubject<'a>>,
     initial_seeds: Vec<CanonicalSeed<'a>>,
     event_bindings: Vec<CanonicalEventBinding<'a>>,
@@ -1449,6 +1607,7 @@ struct CanonicalEventBinding<'a> {
     event: &'a str,
     subject: CanonicalSubjectKey<'a>,
     site: CanonicalSite<'a>,
+    order: u32,
     role: TypestateObjectRole,
     quality: CanonicalQuality,
 }

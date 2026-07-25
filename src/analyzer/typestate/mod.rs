@@ -5,6 +5,7 @@
 //! the client-side analysis contracts that consume them.
 
 mod binding;
+mod client;
 mod hash;
 mod protocol;
 
@@ -19,6 +20,10 @@ pub use binding::{
     TypestateObservationSite, TypestateProcedurePortKey, TypestateSubjectClassError,
     TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey,
     TypestateTerminalBindingSpec,
+};
+pub use client::{
+    TypestateFact, TypestateFlowProblem, TypestateFlowProblemError, TypestateUncertainty,
+    TypestateUncertaintySet,
 };
 pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
 pub use protocol::{

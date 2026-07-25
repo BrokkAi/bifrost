@@ -148,6 +148,7 @@ fn build_plan(
             ProtocolEventKey::new("use").unwrap(),
             fixture.subject.clone(),
             fixture.use_site.clone(),
+            0,
             TypestateObjectRole::Argument,
             quality.clone(),
         ),
@@ -155,6 +156,7 @@ fn build_plan(
             ProtocolEventKey::new("close").unwrap(),
             fixture.subject.clone(),
             fixture.close_site.clone(),
+            0,
             TypestateObjectRole::Argument,
             quality.clone(),
         ),
@@ -263,6 +265,7 @@ fn incompatible_event_site_is_rejected_before_propagation() {
             ProtocolEventKey::new("close").unwrap(),
             fixture.subject,
             fixture.seed_site,
+            0,
             TypestateObjectRole::Argument,
             TypestateBindingQuality::proven_unique(),
         )],
@@ -273,5 +276,45 @@ fn incompatible_event_site_is_rejected_before_propagation() {
     assert!(matches!(
         error,
         TypestateBindingPlanError::InvalidObservationShape
+    ));
+}
+
+#[test]
+fn one_subject_site_order_cannot_name_two_events() {
+    let protocol = protocol();
+    let fixture = binding_fixture();
+    let error = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.class,
+            fixture.object,
+            TypestateBindingQuality::proven_unique(),
+        )],
+        Vec::new(),
+        vec![
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("use").unwrap(),
+                fixture.subject.clone(),
+                fixture.use_site.clone(),
+                0,
+                TypestateObjectRole::Argument,
+                TypestateBindingQuality::proven_unique(),
+            ),
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("close").unwrap(),
+                fixture.subject,
+                fixture.use_site,
+                0,
+                TypestateObjectRole::Argument,
+                TypestateBindingQuality::proven_unique(),
+            ),
+        ],
+        Vec::new(),
+    )
+    .expect_err("event order must be total for each subject and site");
+
+    assert!(matches!(
+        error,
+        TypestateBindingPlanError::ConflictingEventOrder
     ));
 }
