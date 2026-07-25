@@ -74,6 +74,10 @@ required for that checkpoint.
   unknown/external calls, escape, and incomplete analysis resolve to a
   reflexive transitive relation; preserve and abstain are explicit outcomes.
   The compiled iterative traversal is bounded by protocol states/transitions.
+- [x] (2026-07-25 13:09+02:00) Added exact compact-canonical,
+  pretty-rendering, and SHA-256 golden fixtures for the schema-v1 lifecycle
+  protocol. All twelve first-review findings are now addressed; strict
+  checkpoint validation and the automatic follow-up review remain.
 - [ ] Run the guided specialist review over the first protocol checkpoint and
   resolve every actionable finding.
 - [ ] Define the pre-resolved subject/event binding plan and choose the

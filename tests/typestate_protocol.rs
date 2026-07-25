@@ -9,6 +9,12 @@ use brokk_bifrost::analyzer::typestate::{
 
 const RESOURCE_LIFECYCLE: &[u8] =
     include_bytes!("fixtures/typestate/resource-lifecycle.protocol.json");
+const RESOURCE_LIFECYCLE_CANONICAL: &str =
+    include_str!("fixtures/typestate/resource-lifecycle.canonical.json");
+const RESOURCE_LIFECYCLE_CANONICAL_PRETTY: &str =
+    include_str!("fixtures/typestate/resource-lifecycle.canonical.pretty.json");
+const RESOURCE_LIFECYCLE_HASH: &str =
+    "352d2bec298b892db1b70a62b8fcb7dbd15760e75a6455c00dd574bea5447ef6";
 
 fn fixture() -> ProtocolSpec {
     ProtocolSpec::from_json(RESOURCE_LIFECYCLE).expect("resource lifecycle fixture should parse")
@@ -116,6 +122,17 @@ fn resource_lifecycle_fixture_exposes_diagnostic_neutral_semantics() {
 #[test]
 fn canonical_protocol_identity_is_independent_of_declaration_order() {
     let first = fixture().compile().expect("fixture should compile");
+    assert_eq!(
+        first.canonical_bytes(),
+        RESOURCE_LIFECYCLE_CANONICAL
+            .trim_end_matches('\n')
+            .as_bytes()
+    );
+    assert_eq!(
+        first.canonical_rendering(),
+        RESOURCE_LIFECYCLE_CANONICAL_PRETTY.trim_end_matches('\n')
+    );
+    assert_eq!(first.hash().to_string(), RESOURCE_LIFECYCLE_HASH);
     let mut reordered = fixture();
     reordered.states.reverse();
     reordered.accepting_states.reverse();
