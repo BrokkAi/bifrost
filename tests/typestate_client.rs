@@ -48,6 +48,42 @@ function lifecycle() {
 }
 "#;
 
+const TYPE_SCRIPT_CONFORMANCE_SOURCE: &str = r#"
+function acquire(): object {
+  return {};
+}
+
+function use(resource: object): void {}
+
+function close(resource: object): void {}
+
+function lifecycle(recurse: boolean): void {
+  const resource = acquire();
+  const alias = resource;
+  close(alias);
+  return;
+}
+"#;
+
+const JAVA_CONFORMANCE_SOURCE: &str = r#"
+final class LifecycleFixture {
+  static Object acquire() {
+    return new Object();
+  }
+
+  static void use(Object resource) {}
+
+  static void close(Object resource) {}
+
+  static void lifecycle(boolean recurse) {
+    Object resource = acquire();
+    Object alias = resource;
+    close(alias);
+    return;
+  }
+}
+"#;
+
 struct ClientFixture {
     protocol: CompiledProtocol,
     bindings: TypestateBindingPlan,
@@ -67,11 +103,19 @@ fn call_named<'procedure>(
     procedure: &'procedure brokk_bifrost::analyzer::semantic::ProcedureSemantics,
     name: &str,
 ) -> &'procedure SemanticCallSite {
+    call_containing(procedure, SOURCE, name)
+}
+
+fn call_containing<'procedure>(
+    procedure: &'procedure brokk_bifrost::analyzer::semantic::ProcedureSemantics,
+    source: &str,
+    text: &str,
+) -> &'procedure SemanticCallSite {
     procedure
         .call_sites()
         .iter()
-        .find(|call| mapped_source(procedure, SOURCE, call.source).contains(name))
-        .unwrap_or_else(|| panic!("missing call containing {name:?}"))
+        .find(|call| mapped_source(procedure, source, call.source).contains(text))
+        .unwrap_or_else(|| panic!("missing call containing {text:?}"))
 }
 
 fn protocol() -> CompiledProtocol {
@@ -1048,6 +1092,188 @@ fn real_summary_solver_executes_the_same_client_contract() {
         report.findings()[0].kind(),
         TypestateFindingKind::TerminalExpectation { .. }
     ));
+}
+
+#[test]
+fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
+    let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
+    for event in &mut spec.events {
+        if matches!(event.id.as_str(), "use" | "close") {
+            event.observation.occurrence = ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AtMatch,
+            };
+        }
+    }
+    let protocol = spec.compile().unwrap();
+    let expected_hash = protocol.hash();
+
+    for (language, path, source) in [
+        (
+            Language::TypeScript,
+            "src/main.ts",
+            TYPE_SCRIPT_CONFORMANCE_SOURCE,
+        ),
+        (
+            Language::Java,
+            "src/LifecycleFixture.java",
+            JAVA_CONFORMANCE_SOURCE,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(language)
+            .file(path, source)
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let graph = SemanticGraph::materialize(&project, &analyzer, path);
+        let procedure = |name: &str| {
+            graph
+                .artifact()
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("{language:?} fixture missing {name}"))
+        };
+        let lifecycle = procedure("lifecycle");
+        let lifecycle_handle = graph
+            .artifact()
+            .procedure_handle(lifecycle.id())
+            .expect("lifecycle handle");
+        let close_call = call_containing(lifecycle, source, "close(alias)");
+        let subject_object = AbstractObject::new(
+            AccessPathRoot::Value(
+                lifecycle_handle
+                    .value_handle(close_call.arguments[0].value)
+                    .expect("aliased close argument"),
+            ),
+            ObjectCardinality::Singleton,
+        )
+        .expect("conformance subject");
+        let subject_class = TypestateSubjectClassKey::new("resource").unwrap();
+        let subject_key = TypestateSubjectKey::for_object(subject_class.clone(), &subject_object);
+        let context = TypestateBindingContext::root();
+        let exact = TypestateBindingQuality::proven_unique();
+        let entry = lifecycle_handle
+            .point_handle(lifecycle.entry_point())
+            .expect("lifecycle entry");
+        let exit = lifecycle_handle
+            .point_handle(lifecycle.normal_exit_point())
+            .expect("lifecycle normal exit");
+        let close_point = lifecycle_handle
+            .point_handle(close_call.point)
+            .expect("close point");
+        let event_binding = |event: &str,
+                             point: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+                             phase_order: u32| {
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new(event).unwrap(),
+                subject_key.clone(),
+                TypestateObservationSite::program_point(point, context.clone()),
+                phase_order,
+                TypestateObjectRole::MatchedValue,
+                exact.clone(),
+            )
+        };
+        let bindings = TypestateBindingPlan::try_new(
+            &protocol,
+            vec![BoundTypestateSubjectSpec::new(
+                subject_class,
+                subject_object,
+                exact.clone(),
+            )],
+            vec![TypestateInitialSeedSpec::new(
+                subject_key.clone(),
+                ProtocolStateKey::new("unallocated").unwrap(),
+                TypestateObservationSite::program_point(entry.clone(), context.clone()),
+                TypestateObjectRole::MatchedValue,
+                exact.clone(),
+            )],
+            vec![
+                TypestateEventBindingSpec::new(
+                    ProtocolEventKey::new("acquire").unwrap(),
+                    subject_key.clone(),
+                    TypestateObservationSite::program_point(entry.clone(), context.clone()),
+                    0,
+                    TypestateObjectRole::AllocationResult,
+                    exact.clone(),
+                ),
+                event_binding("close", close_point.clone(), 0),
+            ],
+            vec![TypestateTerminalBindingSpec::new(
+                ProtocolExpectationKey::new("normal-exit-closed").unwrap(),
+                subject_key.clone(),
+                TypestateObservationSite::program_point(exit.clone(), context),
+                TypestateObjectRole::CurrentObject,
+                exact,
+            )],
+        )
+        .expect("language-neutral lifecycle binding plan");
+        let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+        let proven = ProofStatus::Proven;
+        let complete = EvidenceCompleteness::Complete;
+        let opened = transfer(
+            &problem,
+            DataflowEdge::new(
+                IcfgEdgeKind::Intraprocedural(
+                    brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+                ),
+                None,
+                &entry,
+                &close_point,
+                &proven,
+                &complete,
+            ),
+            TypestateFact::zero(),
+            TestTransfer::Normal,
+        );
+        let open = protocol
+            .state_id(&ProtocolStateKey::new("open").unwrap())
+            .unwrap();
+        let open_fact = opened
+            .iter()
+            .copied()
+            .find(|fact| fact.protocol_state() == Some(open) && fact.violation().is_none())
+            .unwrap_or_else(|| panic!("{language:?} did not acquire the aliased resource"));
+        let closed_facts = transfer(
+            &problem,
+            DataflowEdge::new(
+                IcfgEdgeKind::Intraprocedural(
+                    brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+                ),
+                None,
+                &close_point,
+                &exit,
+                &proven,
+                &complete,
+            ),
+            open_fact,
+            TestTransfer::Normal,
+        );
+        let closed = protocol
+            .state_id(&ProtocolStateKey::new("closed").unwrap())
+            .unwrap();
+        assert_eq!(protocol.hash(), expected_hash);
+        assert!(
+            closed_facts
+                .iter()
+                .any(|fact| fact.protocol_state() == Some(closed)),
+            "{language:?} did not carry the aliased lifecycle to closed: {closed_facts:#?}"
+        );
+        assert!(
+            closed_facts
+                .iter()
+                .filter_map(|fact| fact.violation())
+                .next()
+                .is_none(),
+            "{language:?} produced an error transition"
+        );
+    }
 }
 
 #[test]
