@@ -20,6 +20,7 @@ use rusqlite::{
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
+use crate::analyzer::fq_name::{FqName, package_prefix_fq, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
@@ -3150,6 +3151,10 @@ struct PreparedUnitRow {
     in_declarations: i64,
     in_definition_lookup: i64,
     in_test_region: i64,
+    /// Serialized `FqName` segments (see `FqName::encode_segments`), or `None`
+    /// when the unit's `fq` is empty (synthetic file-scope units, etc.). Written
+    /// to `code_units.fq_segments` and re-interned on load.
+    fq_segments: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -3355,6 +3360,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             in_declarations: bool_to_i64(stored.in_declarations),
             in_definition_lookup: bool_to_i64(stored.in_definition_lookup),
             in_test_region: bool_to_i64(stored.in_test_region),
+            fq_segments: encode_unit_fq_segments(&stored.unit),
         });
     }
 
@@ -3572,8 +3578,8 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name, signature, synthetic,
                is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
-               in_test_region
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+               in_test_region, fq_segments
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )?;
         for row in &blob.units {
             stmt.execute(params![
@@ -3594,6 +3600,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
                 row.in_declarations,
                 row.in_definition_lookup,
                 row.in_test_region,
+                row.fq_segments,
             ])?;
         }
     }
@@ -3761,8 +3768,8 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name,
                signature, synthetic, is_type_alias, top_level_ordinal,
-               in_declarations, in_definition_lookup, in_test_region
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+               in_declarations, in_definition_lookup, in_test_region, fq_segments
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )?;
         for stored in &units {
             let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
@@ -3790,6 +3797,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                 bool_to_i64(stored.in_declarations),
                 bool_to_i64(stored.in_definition_lookup),
                 bool_to_i64(stored.in_test_region),
+                encode_unit_fq_segments(&stored.unit),
             ])?;
         }
     }
@@ -4283,6 +4291,9 @@ struct RawUnitRow {
     in_declarations: bool,
     in_definition_lookup: bool,
     in_test_region: bool,
+    /// Serialized `FqName` segments (see `FqName::decode_segments`); `None` for
+    /// rows written before the segments column existed.
+    fq_segments: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4531,15 +4542,18 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             continue;
         }
         let mut by_key = HashMap::default();
+        let file_lang = crate::analyzer::common::language_for_file(file);
         for raw in raw_units {
             let package_name = adapter.hydrate_content_qualifier(&raw.content_qualifier, file);
-            let unit = CodeUnit::with_signature(
+            let fq = hydrate_unit_fq(raw.fq_segments.as_deref(), &package_name, file_lang)?;
+            let unit = CodeUnit::with_signature_and_fq(
                 file.clone(),
                 raw.kind,
                 package_name,
                 raw.short_name,
                 raw.signature,
                 raw.synthetic,
+                fq,
             );
             by_key.insert(
                 raw.key,
@@ -4944,7 +4958,7 @@ fn read_unit_rows_bulk(
         let sql = format!(
             "SELECT blob_oid, unit_key, kind, short_name, content_qualifier, signature, synthetic,
                     is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
-                    in_test_region
+                    in_test_region, fq_segments
              FROM code_units
              WHERE lang = ? AND blob_oid IN ({placeholders})
              ORDER BY blob_oid, unit_key"
@@ -4976,6 +4990,7 @@ fn read_unit_rows_bulk(
                     in_declarations: row.get::<_, i64>(9)? != 0,
                     in_definition_lookup: row.get::<_, i64>(10)? != 0,
                     in_test_region: row.get::<_, i64>(11)? != 0,
+                    fq_segments: row.get::<_, Option<Vec<u8>>>(12)?,
                 },
             ))
         })?;
@@ -5854,7 +5869,7 @@ fn read_unit_rows<A: LanguageAdapter>(
     let mut stmt = conn.prepare_cached(
         "SELECT unit_key, kind, short_name, content_qualifier, signature, synthetic,
                 is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
-                in_test_region
+                in_test_region, fq_segments
          FROM code_units
          WHERE blob_oid = ?1 AND lang = ?2
          ORDER BY unit_key",
@@ -5873,6 +5888,7 @@ fn read_unit_rows<A: LanguageAdapter>(
         let in_declarations = row.get::<_, i64>(8)? != 0;
         let in_definition_lookup = row.get::<_, i64>(9)? != 0;
         let in_test_region = row.get::<_, i64>(10)? != 0;
+        let fq_segments = row.get::<_, Option<Vec<u8>>>(11)?;
         Ok((
             key,
             kind_raw,
@@ -5885,6 +5901,7 @@ fn read_unit_rows<A: LanguageAdapter>(
             in_declarations,
             in_definition_lookup,
             in_test_region,
+            fq_segments,
         ))
     })?;
 
@@ -5902,16 +5919,23 @@ fn read_unit_rows<A: LanguageAdapter>(
             in_declarations,
             in_definition_lookup,
             in_test_region,
+            fq_segments,
         ) = row?;
         let kind = code_unit_kind_from_i64(kind_raw)?;
         let package_name = adapter.hydrate_content_qualifier(&content_qualifier, file);
-        let unit = CodeUnit::with_signature(
+        let fq = hydrate_unit_fq(
+            fq_segments.as_deref(),
+            &package_name,
+            crate::analyzer::common::language_for_file(file),
+        )?;
+        let unit = CodeUnit::with_signature_and_fq(
             file.clone(),
             kind,
             package_name,
             short_name,
             signature,
             synthetic,
+            fq,
         );
         out.push(UnitRow {
             key,
@@ -7059,6 +7083,58 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
 fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     bincode::serialize(value)
         .map_err(|err| StoreError::new(format!("analyzer store serialization error: {err}")))
+}
+
+/// Serialize the CONTENT-STABLE tail of a unit's structured `FqName` for the
+/// `code_units.fq_segments` column, or `None` when the unit has no populated
+/// `fq` (so the column stays NULL, matching pre-migration rows and synthetic
+/// file-scope units).
+///
+/// A declaration's `fq` is `[package prefix] ++ [short_name tail]`. The package
+/// prefix is DERIVED FROM THE FILE PATH for some languages (Go import paths,
+/// Python/Rust module paths) and is recomputed per-path on load, while the same
+/// content blob can be shared across paths (git dedups identical content). So
+/// only the content-stable tail is persisted; the prefix is rebuilt on load from
+/// the per-path `package_name` (see `hydrate_unit_fq` / `package_prefix_fq`).
+/// Interner IDs are process-local; only each segment's text+kind are written.
+fn encode_unit_fq_segments(unit: &CodeUnit) -> Option<Vec<u8>> {
+    let fq = unit.fq();
+    if fq.is_empty() {
+        return None;
+    }
+    let interner = segment_interner();
+    let lang = crate::analyzer::common::language_for_file(unit.source());
+    let prefix = package_prefix_fq(lang, unit.package_name(), interner);
+    debug_assert!(
+        fq.starts_with(&prefix),
+        "package_prefix_fq did not reproduce the extractor's leading fq segments \
+         (lang={lang:?}, package_name={:?}, short_name={:?})",
+        unit.package_name(),
+        unit.short_name(),
+    );
+    Some(fq.suffix_from(prefix.len()).encode_segments(interner))
+}
+
+/// Reconstruct a loaded unit's full `FqName` from its persisted content-stable
+/// tail and the per-path `package_name`. A NULL/absent/empty column yields an
+/// empty `FqName`, which keeps the load-side fallback arms (that read the legacy
+/// strings) valid for rows written before the segments column existed. The
+/// path-dependent package prefix is rebuilt from `package_name` and the
+/// content-stable tail appended, so a content blob shared across paths hydrates
+/// with the correct per-path qualified name.
+fn hydrate_unit_fq(persisted: Option<&[u8]>, package_name: &str, lang: Language) -> Result<FqName> {
+    let interner = segment_interner();
+    let tail = match persisted {
+        Some(bytes) if !bytes.is_empty() => {
+            FqName::decode_segments(bytes, interner).map_err(|err| {
+                StoreError::new(format!("analyzer store fq segment decode error: {err}"))
+            })?
+        }
+        _ => return Ok(FqName::new()),
+    };
+    let mut fq = package_prefix_fq(lang, package_name, interner);
+    fq.extend_from(&tail);
+    Ok(fq)
 }
 
 fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {

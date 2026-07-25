@@ -66,8 +66,26 @@ the analyzer tree.
       splitter left byte-identical (retirement deferred, see Decision Log). Zero
       behavior change proven by the named regression suites plus the touched
       language analyzer/usages suites (all green; tally in Outcomes).
-- [ ] M3: persistence flip — store schema carries segments; single epoch salt bump.
-- [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip.
+- [x] M3 (2026-07-24): persistence flip. Migration `0012-fq-segments.sql` adds a
+      nullable `code_units.fq_segments` BLOB (length-prefixed `(kind, text)`
+      pairs); both `code_units` write paths persist each unit's segments and both
+      FileState load paths (`read_unit_rows`, `read_unit_rows_bulk`) re-intern
+      them into the loaded `CodeUnit`'s `fq`, so FileState-hydrated cache units
+      now carry populated `fq`. Every language's epoch `SALT` gained
+      `;fq-interned-segments-2026-07` (one sweep). Round-trip proven by
+      `tests/analyzer_persistence.rs::warm_fq_segments_survive_store_roundtrip_across_languages`
+      (cpp `::`-head + scala Companion + python; 0 warm re-parses) and the
+      pre-column upgrade by `cache_db::tests::fq_segments_migration_upgrades_pre_column_database`.
+      The string-keyed `get_all_declarations`/candidate-row reconstruction path
+      (`sql_all_declarations_vec`, and the `CandidateRow`→`CodeUnit` builders at
+      `tree_sitter_analyzer.rs:3958`/`4555`) DELIBERATELY stays string-based
+      (empty `fq`) — M4 worklist, not widened here.
+- [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip. Also fold
+      the candidate-row `CodeUnit` reconstruction (`sql_all_declarations_vec` and
+      the two `CandidateRow`→`CodeUnit` builders) onto segments so
+      `get_all_declarations` units carry `fq` too, and delete the now-dead
+      empty-fq fallback arms in `default_parent_fq_name` /
+      `resolve_qualified_in_enclosing_scopes`.
 
 ## Surprises & Discoveries
 
@@ -252,6 +270,37 @@ the analyzer tree.
   `usage_graph_go_test`) is green after the switch — nothing calls `parent_of`
   on an all-Path Go unit in a way that observes the difference. Recorded so the
   divergence is a known, intended M4 correctness gain, not a lurking surprise.
+
+- Observation (M3 — a content-addressed blob shared across paths cannot carry a
+  verbatim path-derived fq prefix; caught by three existing store tests): the
+  first M3 cut persisted each unit's WHOLE `fq` and decoded it verbatim on load.
+  Three `--lib` tests failed immediately —
+  `analyzer::store::tests::identical_go_blob_hydrates_with_live_import_paths`,
+  `identical_python_blob_hydrates_with_live_path_names`, and a rust
+  `cargo_routes` shadowing test — all with the M1 equivalence assertion firing on
+  the LOAD-side construction. Evidence:
+
+        FqName does not round-trip to the legacy qualified name
+        (kind=Class, language=Go, package_name="example.com/demo/beta", short_name="Client")
+          left: "example.com/demo/alpha.Client"    (decoded verbatim fq)
+         right: "example.com/demo/beta.Client"     (per-path package_name.short_name)
+
+  The store keys blobs by CONTENT (git-style): two files with identical bytes at
+  different import paths (`alpha/client.go`, `beta/client.go`) share ONE persisted
+  blob, and `LanguageAdapter::hydrate_content_qualifier` recomputes each unit's
+  `package_name` PER PATH on load (Go import path, Python/Rust module path are
+  file-derived; `storage_content_qualifier` deliberately stores `""` for them).
+  A verbatim fq bakes in the write-path's package prefix, so hydrating the shared
+  blob for the other path yields the wrong qualified name — the exact class of
+  bug this plan exists to kill, resurfacing at the persistence boundary. Python
+  made it starker: `pkg_a.mod` (2 prefix segments) vs `pkg_b.sub.mod` (3), so the
+  prefix isn't even the same LENGTH — a text swap can't fix it. Resolution in the
+  Decision Log (persist only the content-stable `short_name` tail; rebuild the
+  path-dependent package prefix from the per-path `package_name` on load via
+  `package_prefix_fq`). After the fix all three tests pass and `--lib` is
+  1892/1892. This is precisely the "does the store mutate package_name after
+  load?" caution the M3 brief flagged — the answer is yes (per-path re-derivation),
+  and the fq had to mirror it.
 
 ## Decision Log
 
@@ -648,7 +697,92 @@ the analyzer tree.
   the split site records the segment-model relationship and points here.
   Date/Author: 2026-07-24, implementation (M2).
 
-## Outcomes & Retrospective
+- Decision (M3 encoding — a length-prefixed binary BLOB, not JSON): the
+  `code_units.fq_segments` column is a compact self-describing binary blob —
+  for each segment a one-byte kind tag, a little-endian `u32` text length, then
+  the UTF-8 segment text (`FqName::encode_segments`/`decode_segments` in
+  `src/analyzer/fq_name.rs`). Chosen over a JSON array of `(kind, text)` because
+  (1) segment text is free-form and routinely contains the very delimiters the
+  system used to split on (`.`, `::`, `$`, `#`) plus quotes/backslashes, so an
+  explicit length prefix makes decode unambiguous with ZERO escaping, where JSON
+  would need escaping and be bulkier; (2) it needs no serde derive on
+  `SegmentKind` and no bincode framing, staying a small dedicated codec that is
+  unit-tested in isolation (`encode_decode_round_trips_kind_and_text`,
+  `decode_rejects_malformed_blobs`); (3) it matches the store's existing
+  "compact binary payload" convention for side tables (which use bincode) while
+  being simpler and self-contained. The kind→tag mapping is a persistence
+  contract (`SegmentKind::persist_tag`/`from_persist_tag`): tags are appended,
+  never renumbered. Interner IDs are process-local and NEVER written — only text
+  and kind — so the blob re-interns cleanly in any later process. The column is
+  nullable: an empty `fq` (synthetic file-scope units) and any pre-migration row
+  store NULL, which decodes to an empty `FqName`. `short_name`/`content_qualifier`
+  stay populated (indexes + human inspection); the structured column is
+  authoritative for the `FqName` on load. Date/Author: 2026-07-24, implementation
+  (M3).
+
+- Decision (M3 load-side scope — `fq` is attached only on the FileState
+  hydration path, NOT the candidate-row `get_all_declarations` path): the two
+  `code_units` write paths (`write_prepared_blob_unchecked_tx` and the direct
+  writer) persist `fq_segments` for every unit, but only the two FileState load
+  paths — `read_unit_rows` and `read_unit_rows_bulk` in
+  `src/analyzer/store/mod.rs` — decode and re-intern them into the loaded
+  `CodeUnit` (via `CodeUnit::with_signature_and_fq`). The separate string-keyed
+  enumeration `sql_all_declarations_vec` and the `CandidateRow`→`CodeUnit`
+  builders (`src/analyzer/tree_sitter_analyzer.rs:3958` and `:4555`) that back
+  `IAnalyzer::get_all_declarations`/definition-candidate resolution
+  DELIBERATELY keep building empty-`fq` units from the persisted strings. Those
+  rows re-derive from `code_units` (or re-extract via the salt) and were called
+  out by the M3 brief as out of scope; folding them onto segments (and deleting
+  the empty-fq fallback arms) is M4 worklist. Consequence for testing: the
+  round-trip proof observes loaded `fq` through `IAnalyzer::get_declarations(file)`
+  (FileState), not `get_all_declarations` — the latter still returns empty-`fq`
+  units by design. Date/Author: 2026-07-24, implementation (M3).
+
+- Decision (M3 equivalence-on-load holds for free, given the pre-existing
+  package_name round-trip invariant): the M1 debug/test assertion in
+  `CodeUnit::with_signature_and_fq` compares `fq.display_native(language)` to
+  `package_name.short_name`. On load, `short_name` is the stored column and
+  `package_name = adapter.hydrate_content_qualifier(storage_content_qualifier(..))`.
+  The cache's correctness ALREADY depends on `hydrate∘storage` reproducing the
+  extraction-time `package_name` exactly (otherwise a loaded unit's identity
+  would differ from the extracted one and every `HashMap<CodeUnit,..>` lookup
+  would break) — so the decoded `fq`, which round-trips to the extraction-time
+  `package_name.short_name`, round-trips to the loaded pair too. No store path
+  mutates `short_name`/`package_name` after load beyond that hydrate step. The
+  assertion therefore fires during the warm-build load in the round-trip test
+  (debug build), and the test passing is the verification that it holds on
+  loaded units. Date/Author: 2026-07-24, implementation (M3).
+
+- Decision (M3 — persist the content-stable `short_name` TAIL only; rebuild the
+  path-derived package prefix on load): a declaration's `fq` is
+  `[package prefix] ++ [short_name tail]`. For Go (import paths) and Python/Rust
+  (module paths) the package prefix is FILE-PATH-derived and is recomputed
+  per-path on load (`hydrate_content_qualifier`), while the content-addressed
+  blob store shares one blob across identical-content files at different paths.
+  Persisting the whole `fq` therefore bakes in the write-path's prefix and
+  mis-hydrates the shared blob at any other path (see the Surprises entry). So
+  `code_units.fq_segments` stores ONLY the tail (`encode_unit_fq_segments` strips
+  the leading `package_prefix_fq(lang, unit.package_name())` segments), and load
+  (`hydrate_unit_fq`) rebuilds the prefix from the PER-PATH `package_name` and
+  appends the decoded tail. New shared free fn `package_prefix_fq(lang,
+  package_name, interner)` in `src/analyzer/fq_name.rs` splits the already-joined
+  `package_name` by language spelling (Go `/`→`Path`; C++ `::`→`Package`; every
+  other package-bearing language `.`→`Package`; Ruby/JS/TS carry no package). The
+  write side `debug_assert!(fq.starts_with(&prefix))` proves — by interned-ID
+  equality, not string compare — that the reconstruction reproduces the
+  extractor's leading segments byte-for-byte for every unit across every suite,
+  so `package_prefix_fq` is a self-verified mirror of the M1 per-language package
+  split, not a drifting second parser. This is the load-side counterpart of the
+  sanctioned M1 construction bridge (re-tokenizing a delimiter-joined string the
+  code itself built from structured components), not the banned "regex instead of
+  tree-sitter": there is no richer AST for an already-collapsed path string and
+  path components cannot contain their own separator. For source-derived-package
+  languages (java/scala/cpp/csharp/php) `hydrate == storage == extraction
+  package_name`, so the rebuilt prefix equals the persisted one and the whole
+  thing is a no-op; only the file-path-derived languages actually exercise the
+  reconstruction. M4 could move `package_prefix_fq` behind a `LanguageAdapter`
+  method delegating to each extractor's existing `*_package_fq` helper to retire
+  even this shared split. Date/Author: 2026-07-24, implementation (M3).
 
 - M1 rust/scala/cpp (2026-07-24): all three "hard" languages now populate
   `FqName` at every `CodeUnit` emission point, with the live equivalence
@@ -811,6 +945,50 @@ the analyzer tree.
   + salt bump) is next; the empty-fq fallback arms in `default_parent_fq_name` and
   `resolve_qualified_in_enclosing_scopes` become live once the cache carries
   segments, and are deleted in M4.
+
+- **M3 complete (2026-07-24):** the cache now carries structured segments and
+  FileState-hydrated cache units restore a populated `fq`. Changes:
+  * Schema: `migrations/cache/0012-fq-segments.sql` adds a nullable
+    `code_units.fq_segments` BLOB; `CURRENT_MIGRATION_VERSION` 11→12 and the new
+    const/array/`CURRENT_SCHEMA_OBJECTS` registration in `src/cache_db.rs`.
+  * Codec: `FqName::encode_segments`/`decode_segments` (length-prefixed
+    `(kind_tag, u32 len, utf8)` per segment) + `SegmentKind::persist_tag`/
+    `from_persist_tag` in `src/analyzer/fq_name.rs`; unit-tested round-trip and
+    malformed-blob rejection.
+  * Content-stable persistence: `package_prefix_fq(lang, package_name, interner)`
+    added; `encode_unit_fq_segments` persists only the `short_name` tail (strips
+    the `package_prefix_fq` prefix, asserting `starts_with`), `hydrate_unit_fq`
+    rebuilds the per-path prefix + appends the tail. Both `code_units` write
+    paths and both FileState load paths (`read_unit_rows`, `read_unit_rows_bulk`)
+    in `src/analyzer/store/mod.rs` wired.
+  * Salt: `;fq-interned-segments-2026-07` appended to all 11 languages'
+    `lang_epoch!` SALTs in `src/analyzer/store/epoch.rs` (one sweep).
+  * Debug/test accessor `CodeUnit::fq_segments_debug` (kind-name + text) added for
+    the round-trip integration test without leaking `SegmentKind`.
+  Equivalence-on-load VERIFIED live: the M1 `debug_assert` in
+  `with_signature_and_fq` fired on the load-side construction the moment the first
+  cut mis-hydrated a content-shared blob (3 store tests), then went green once the
+  tail/prefix split landed — direct evidence the assertion guards loaded units.
+  Validation (all `BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python`,
+  ALL 0 failed): `cargo fmt` clean; `cargo clippy --all-targets --all-features
+  -D warnings` clean; `--lib` 1892/1892 (incl. the three `identical_*_blob` /
+  `cargo_routes` content-addressing regressions and the new fq_name codec +
+  cache_db upgrade tests); `analyzer_persistence` 45 (new
+  `warm_fq_segments_survive_store_roundtrip_across_languages`),
+  `structural_facts_persistence` 3, `unified_cache` 4, `parse_errors_cache` 6,
+  `java_parallel_and_cache` 2, `get_definition_test` 635, `searchtools_service`
+  189, `searchtools_definition_selectors` 73, `mcp_property_fuzzer_service` 61;
+  canaries `issue_1128` 12, `issue_1162` 10 (cutlass pin intact), `issue_1158` 15,
+  `issue_1126` 12, `issue_1089` 10, `issue_1093` 9, `issue_1120` 10, `issue_1121`
+  11, `issue_1142` 11; spot languages cpp (`cpp_analyzer` 43, `usages_cpp_graph`
+  145, `usage_graph_cpp` 28) and scala (`scala_analyzer` 29, `usages_scala_graph`
+  148, `usage_graph_scala` 55). Consumers still string-based for M4: the
+  `get_all_declarations`/candidate-row reconstruction path
+  (`sql_all_declarations_vec` and the two `CandidateRow`→`CodeUnit` builders at
+  `tree_sitter_analyzer.rs:3958`/`:4555`) — it re-derives from `code_units` and
+  was out of M3 scope; the definition-lookup/usage-fact rows carry candidate
+  identities as strings and re-derive or re-extract via the salt. M4 folds those
+  onto segments and deletes the now-live-but-still-present empty-fq fallback arms.
 
 ## Context and Orientation
 
@@ -1102,3 +1280,25 @@ question the plan left for M2 is resolved here (kind-insensitive, `Unknown`), an
 the anchor-splitter part is honestly scoped to what a pre-language splitter can do
 without regressing the #1128/#1131 canaries. The next contributor (M3) inherits
 which fallback arms go live under persistence and which are deleted at M4.
+
+## Revision note (2026-07-24, M3)
+
+Recorded M3 completion: the `Progress` M3 checkbox flipped (with the M4 worklist
+extended to fold the candidate-row reconstruction onto segments), a
+`Surprises & Discoveries` entry (the content-addressed-blob shared-across-paths
+failure and how three existing store tests caught it), four `Decision Log`
+entries (length-prefixed-binary encoding vs JSON; load-side scope limited to the
+FileState hydration path with the candidate-row path left string-based for M4;
+equivalence-on-load holding for free via the pre-existing package_name
+round-trip invariant; and persisting the content-stable short_name tail while
+rebuilding the path-derived package prefix on load via `package_prefix_fq`), and
+an `Outcomes & Retrospective` M3 entry with the full validation tally. Why: M3
+is the one-way persistence step, and the single non-obvious risk it carried --
+that a content-addressed blob shared across paths recomputes package_name
+per-path on load -- turned a naive verbatim-fq persist into a correctness bug
+that the load-side M1 equivalence assertion caught immediately; the fix
+(persist the tail, rebuild the prefix) and its self-verifying `starts_with`
+guard are the load-side mirror of the sanctioned M1 construction bridge, and the
+next contributor (M4) inherits exactly which string-based consumers remain and
+why the empty-fq fallback arms cannot be deleted until the candidate-row path is
+also migrated.

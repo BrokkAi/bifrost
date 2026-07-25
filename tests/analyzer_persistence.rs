@@ -452,6 +452,143 @@ fn warm_csharp_factory_return_receiver_query_is_candidate_bounded() {
     );
 }
 
+/// The structured `FqName` segments (interned `(kind, text)` pairs) persisted
+/// to `code_units.fq_segments` in M3 must survive a close/reopen byte-for-byte:
+/// a cache-loaded unit's segments — KIND and TEXT — must equal the
+/// freshly-extracted unit's. The fixture deliberately includes the two
+/// spelling-hard languages: C++ (a `::`-headed namespace `Package` chain) and
+/// Scala (a `Companion` object whose name carries a trailing `$`). Because the
+/// warm build re-parses nothing (`parsed_file_count == 0`), its units are purely
+/// cache-loaded, so equality proves the round-trip and not a re-extraction. The
+/// load path also runs the debug/test equivalence assertion in
+/// `CodeUnit::with_signature_and_fq`, so a segments blob that did not round-trip
+/// to the legacy `package_name.short_name` string would panic the warm build
+/// outright.
+#[test]
+fn warm_fq_segments_survive_store_roundtrip_across_languages() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "widget.cpp",
+        r#"
+namespace ns {
+namespace inner {
+class Widget {
+public:
+    int compute();
+};
+int Widget::compute() { return 1; }
+}
+}
+"#,
+    );
+    write_file(
+        root,
+        "Registry.scala",
+        r#"
+package demo
+
+object Registry {
+  def create(): Int = 1
+}
+
+class Registry {
+  def use(): Int = 2
+}
+"#,
+    );
+    write_file(
+        root,
+        "mod.py",
+        "class Holder:\n    def value(self):\n        return 1\n",
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "fq segment roundtrip fixture");
+    let canonical_root = root.canonicalize().unwrap();
+    let project: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+        canonical_root.clone(),
+        BTreeSet::from([Language::Cpp, Language::Scala, Language::Python]),
+    ));
+    let files: Vec<ProjectFile> = ["widget.cpp", "Registry.scala", "mod.py"]
+        .iter()
+        .map(|rel| ProjectFile::new(canonical_root.clone(), *rel))
+        .collect();
+
+    // Cold build extracts + persists; the per-file FileState it serves carries
+    // the freshly-interned `fq` on every declaration.
+    let cold = build_persisted(project.clone(), AnalyzerConfig::default());
+    let fresh_segments = fq_segments_by_name(cold.analyzer(), &files);
+    drop(cold);
+
+    // Warm build reopens from cache and must not re-parse a single file.
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    assert_eq!(
+        parsed_file_count(&warm_events.lock().unwrap()),
+        0,
+        "warm build must serve purely from cache so segment equality proves a round-trip"
+    );
+    let loaded_segments = fq_segments_by_name(warm.analyzer(), &files);
+
+    assert_eq!(
+        loaded_segments, fresh_segments,
+        "cache-loaded fq segments (kind AND text) must equal the freshly-extracted ones"
+    );
+
+    // Prove the two spelling-hard cases are actually present and structured, not
+    // silently empty (which would make the equality above vacuous for them).
+    assert_eq!(
+        loaded_segments.get("ns::inner.Widget.compute"),
+        Some(&vec![
+            ("Package".to_string(), "ns".to_string()),
+            ("Package".to_string(), "inner".to_string()),
+            ("Type".to_string(), "Widget".to_string()),
+            ("Member".to_string(), "compute".to_string()),
+        ]),
+        "cpp `::`-headed namespace chain must round-trip as Package/Type/Member segments; \
+         got {loaded_segments:#?}"
+    );
+    assert_eq!(
+        loaded_segments.get("demo.Registry$.create"),
+        Some(&vec![
+            ("Package".to_string(), "demo".to_string()),
+            ("Companion".to_string(), "Registry".to_string()),
+            ("Member".to_string(), "create".to_string()),
+        ]),
+        "scala companion object must round-trip as a Companion segment; got {loaded_segments:#?}"
+    );
+}
+
+/// Map each file's declarations (drawn from the per-file FileState, which is the
+/// path M3 wired `fq` through on load — as opposed to the string-keyed
+/// `get_all_declarations` candidate-row path, which stays string-based for M4)
+/// to their structured segment `(kind_name, text)` pairs. Skips units whose `fq`
+/// is empty (synthetic file-scope units). Keyed by `fq_name()` so a
+/// freshly-extracted map and a cache-loaded map compare directly.
+fn fq_segments_by_name(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    let mut out = std::collections::BTreeMap::new();
+    for file in files {
+        for unit in analyzer.get_declarations(file) {
+            let segments: Vec<(String, String)> = unit
+                .fq_segments_debug()
+                .into_iter()
+                .map(|(kind, text)| (kind.to_string(), text))
+                .collect();
+            if !segments.is_empty() {
+                out.insert(unit.fq_name(), segments);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn warm_csharp_unconstrained_extension_receiver_metadata_survives_store_roundtrip() {
     let temp = tempfile::tempdir().unwrap();

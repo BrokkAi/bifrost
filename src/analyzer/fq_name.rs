@@ -63,6 +63,57 @@ pub(crate) enum SegmentKind {
     Unknown,
 }
 
+impl SegmentKind {
+    /// Stable on-disk tag for the cache's `code_units.fq_segments` blob. These
+    /// numbers are a persistence contract: never renumber an existing variant
+    /// (append new ones), or previously-cached rows would decode to the wrong
+    /// kind. The analysis-epoch salt (`src/analyzer/store/epoch.rs`) guards
+    /// against a format change slipping past by forcing re-extraction, but the
+    /// tags themselves must stay stable so a mixed-vintage cache never
+    /// misinterprets a byte.
+    pub(crate) const fn persist_tag(self) -> u8 {
+        match self {
+            SegmentKind::Path => 0,
+            SegmentKind::Package => 1,
+            SegmentKind::Type => 2,
+            SegmentKind::Companion => 3,
+            SegmentKind::Nested => 4,
+            SegmentKind::Member => 5,
+            SegmentKind::Unknown => 6,
+        }
+    }
+
+    /// Stable, human-readable name for the kind. Used by the debug/test-only
+    /// `CodeUnit::fq_segments_debug` cross-check so a test can compare kinds
+    /// without the (crate-private) `SegmentKind` type leaking into `tests/`.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            SegmentKind::Path => "Path",
+            SegmentKind::Package => "Package",
+            SegmentKind::Type => "Type",
+            SegmentKind::Companion => "Companion",
+            SegmentKind::Nested => "Nested",
+            SegmentKind::Member => "Member",
+            SegmentKind::Unknown => "Unknown",
+        }
+    }
+
+    /// Inverse of [`Self::persist_tag`]; `None` for an unrecognized tag byte.
+    pub(crate) const fn from_persist_tag(tag: u8) -> Option<SegmentKind> {
+        match tag {
+            0 => Some(SegmentKind::Path),
+            1 => Some(SegmentKind::Package),
+            2 => Some(SegmentKind::Type),
+            3 => Some(SegmentKind::Companion),
+            4 => Some(SegmentKind::Nested),
+            5 => Some(SegmentKind::Member),
+            6 => Some(SegmentKind::Unknown),
+            _ => None,
+        }
+    }
+}
+
 /// Interned `(text, kind)` pair. Process-local; never persisted.
 ///
 /// The `u32` encodes both the owning interner shard and the entry index within
@@ -131,6 +182,74 @@ impl FqName {
 
     pub(crate) fn segments(&self) -> &[SegmentId] {
         &self.segments
+    }
+
+    /// Serialize to the compact, self-describing byte blob persisted in the
+    /// cache's `code_units.fq_segments` column. Interner IDs are process-local
+    /// and are NEVER written; each segment's `(text, kind)` pair is resolved
+    /// through `interner` and encoded as a one-byte kind tag, a little-endian
+    /// `u32` text length, then the UTF-8 text. Segment text is free-form (it can
+    /// contain `.`, `::`, `$`, `#`), so the explicit length prefix keeps decode
+    /// unambiguous with zero escaping. An empty `FqName` encodes to an empty
+    /// `Vec` (persisted as SQL NULL). See `FqName::decode_segments` for the
+    /// inverse and `migrations/cache/0012-fq-segments.sql` for the column.
+    pub(crate) fn encode_segments(&self, interner: &SegmentInterner) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &id in &self.segments {
+            let (text, kind) = interner.resolve(id);
+            out.push(kind.persist_tag());
+            out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        out
+    }
+
+    /// Re-intern the segments encoded by [`Self::encode_segments`] into a fresh
+    /// `FqName` bound to this process's interner (IDs differ every run, so the
+    /// text+kind are re-interned rather than trusted from disk). An empty slice
+    /// yields an empty `FqName`. Returns an error string on a malformed blob.
+    pub(crate) fn decode_segments(
+        bytes: &[u8],
+        interner: &SegmentInterner,
+    ) -> Result<FqName, String> {
+        let mut fq = FqName::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let tag = bytes[offset];
+            offset += 1;
+            let kind = SegmentKind::from_persist_tag(tag)
+                .ok_or_else(|| format!("unknown fq segment kind tag {tag}"))?;
+            let len_end = offset
+                .checked_add(4)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| "truncated fq segment length prefix".to_string())?;
+            let len = u32::from_le_bytes(bytes[offset..len_end].try_into().unwrap()) as usize;
+            offset = len_end;
+            let text_end = offset
+                .checked_add(len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| "truncated fq segment text".to_string())?;
+            let text = std::str::from_utf8(&bytes[offset..text_end])
+                .map_err(|err| format!("invalid utf8 in fq segment text: {err}"))?;
+            offset = text_end;
+            fq.push(interner.intern(text, kind));
+        }
+        Ok(fq)
+    }
+
+    /// Append every segment of `tail` after this name's segments.
+    pub(crate) fn extend_from(&mut self, tail: &FqName) {
+        self.segments.extend_from_slice(&tail.segments);
+    }
+
+    /// The suffix of this name after its first `prefix_len` segments, as an owned
+    /// `FqName`. Used at persistence time to keep only the content-stable
+    /// `short_name` tail (the path-derived package prefix is rebuilt on load; see
+    /// `package_prefix_fq`).
+    pub(crate) fn suffix_from(&self, prefix_len: usize) -> FqName {
+        FqName {
+            segments: SmallVec::from_slice(&self.segments[prefix_len.min(self.segments.len())..]),
+        }
     }
 
     /// Canonical display: `.`-joined, `/` between adjacent [`SegmentKind::Path`]
@@ -322,6 +441,51 @@ impl SegmentInterner {
 pub(crate) fn segment_interner() -> &'static SegmentInterner {
     static INTERNER: OnceLock<SegmentInterner> = OnceLock::new();
     INTERNER.get_or_init(SegmentInterner::new)
+}
+
+/// Rebuild the package-prefix segments of a qualified name from its already
+/// joined `package_name` string, in language `lang`'s spelling.
+///
+/// This is the load-side counterpart of the M1 construction bridge: a
+/// declaration's `FqName` is `[package prefix] ++ [short_name tail]`, and for
+/// languages whose `package_name` is derived from the FILE PATH (Go import
+/// paths, Python/Rust module paths) the store recomputes `package_name`
+/// per-path on load (`LanguageAdapter::hydrate_content_qualifier`) while the
+/// same content blob may be shared across paths. The `short_name` tail is
+/// content-stable and is what gets persisted; this function reconstructs the
+/// path-dependent prefix from the live `package_name` so the loaded `FqName`
+/// matches the extraction-time one for THAT path.
+///
+/// Re-tokenizing the already-joined `package_name` (which the extractor itself
+/// built from structured components) is the sanctioned bridge, NOT the banned
+/// "regex instead of tree-sitter": there is no richer AST for a
+/// already-collapsed path string, the components cannot contain their own
+/// separator (Go path steps have no `/`, dotted module/namespace components no
+/// `.`), and the write side asserts (`starts_with`) that the reconstruction
+/// reproduces the extractor's leading segments byte-for-byte. Separator/kind by
+/// language, mirroring each extractor's package segmentation:
+/// Go splits `/` into [`SegmentKind::Path`]; C++ splits `::` into
+/// [`SegmentKind::Package`]; every other package-bearing language splits `.`
+/// into [`SegmentKind::Package`]; Ruby/JavaScript/TypeScript never carry a
+/// package (`package_name` is always empty) so the prefix is empty.
+pub(crate) fn package_prefix_fq(
+    lang: Language,
+    package_name: &str,
+    interner: &SegmentInterner,
+) -> FqName {
+    let mut fq = FqName::new();
+    if package_name.is_empty() {
+        return fq;
+    }
+    let (delimiter, kind): (&str, SegmentKind) = match lang {
+        Language::Go => ("/", SegmentKind::Path),
+        Language::Cpp => ("::", SegmentKind::Package),
+        _ => (".", SegmentKind::Package),
+    };
+    for component in package_name.split(delimiter) {
+        fq.push(interner.intern(component, kind));
+    }
+    fq
 }
 
 #[cfg(test)]
@@ -572,6 +736,72 @@ mod tests {
             }
         }
         assert_eq!(rendered, vec!["a.B.c", "a.B", "a"]);
+    }
+
+    #[test]
+    fn encode_decode_round_trips_kind_and_text() {
+        // Every SegmentKind, plus free-form text containing the delimiters the
+        // system used to split on (`.`, `::`, `$`, `#`), must survive the cache
+        // encode/decode with kind AND text intact. Decoding re-interns into the
+        // same interner, so the round-tripped FqName is integer-equal to the
+        // original.
+        let interner = SegmentInterner::new();
+        let name = fq(
+            &interner,
+            &[
+                ("github.com", SegmentKind::Path),
+                ("cutlass::gemm", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
+                ("Companion", SegmentKind::Companion),
+                ("r#type", SegmentKind::Member),
+                ("anything", SegmentKind::Unknown),
+            ],
+        );
+        let encoded = name.encode_segments(&interner);
+        let decoded = FqName::decode_segments(&encoded, &interner).expect("decode");
+        assert_eq!(decoded, name);
+        // Text and kind are individually preserved, not just the joined string.
+        let pairs: Vec<_> = decoded
+            .segments()
+            .iter()
+            .map(|&id| interner.resolve(id))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("github.com", SegmentKind::Path),
+                ("cutlass::gemm", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
+                ("Companion", SegmentKind::Companion),
+                ("r#type", SegmentKind::Member),
+                ("anything", SegmentKind::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_decode_empty_is_empty() {
+        let interner = SegmentInterner::new();
+        let empty = FqName::new();
+        assert!(empty.encode_segments(&interner).is_empty());
+        assert!(
+            FqName::decode_segments(&[], &interner)
+                .expect("decode empty")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn decode_rejects_malformed_blobs() {
+        let interner = SegmentInterner::new();
+        // Unknown kind tag.
+        assert!(FqName::decode_segments(&[200, 0, 0, 0, 0], &interner).is_err());
+        // Truncated length prefix.
+        assert!(FqName::decode_segments(&[0, 1, 2], &interner).is_err());
+        // Length claims more text than is present.
+        assert!(FqName::decode_segments(&[0, 4, 0, 0, 0, b'x'], &interner).is_err());
     }
 
     /// Memory/size measurement (M0). Builds a representative corpus from this

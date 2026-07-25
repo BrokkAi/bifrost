@@ -1961,6 +1961,26 @@ impl CodeUnit {
         &self.0.fq
     }
 
+    /// Debug/test-only view of the structured `fq` as ordered `(kind_name,
+    /// text)` pairs. Public so integration tests in `tests/` (compiled against
+    /// the lib in debug builds, where `debug_assertions` is on) can assert that
+    /// a cache round-trip preserved every segment's KIND and TEXT — not merely
+    /// the joined string — without leaking the crate-private `SegmentKind` or
+    /// interner types. See `tests/analyzer_persistence.rs`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn fq_segments_debug(&self) -> Vec<(&'static str, String)> {
+        let interner = crate::analyzer::fq_name::segment_interner();
+        self.0
+            .fq
+            .segments()
+            .iter()
+            .map(|&id| {
+                let (text, kind) = interner.resolve(id);
+                (kind.name(), text.to_string())
+            })
+            .collect()
+    }
+
     pub fn signature(&self) -> Option<&str> {
         self.0.signature.as_deref()
     }
