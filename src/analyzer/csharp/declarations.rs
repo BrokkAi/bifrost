@@ -1,3 +1,4 @@
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
@@ -10,6 +11,26 @@ use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
 use super::imports::csharp_import_info_from_using_directive;
+
+/// Intern one qualified-name segment in the process-global interner.
+fn cs_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured namespace-path prefix for a C# declaration.
+///
+/// `scope.package_name` (built by `csharp_join_namespace`) is already the
+/// `.`-joined dotted namespace path; C# identifiers can never contain a
+/// literal `.`, so splitting on `.` is lossless. Each component becomes one
+/// [`SegmentKind::Package`] segment, mirroring java/python's `Package`-tagged
+/// (not `Path`-tagged) namespace/module prefixes.
+fn csharp_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name.split('.').filter(|c| !c.is_empty()) {
+        fq.push(cs_segment(component, SegmentKind::Package));
+    }
+    fq
+}
 
 pub(super) fn parse_csharp_file(
     file: &ProjectFile,
@@ -201,11 +222,25 @@ impl<'a> CSharpVisitor<'a> {
         } else {
             identity_name.clone()
         };
-        let code_unit = CodeUnit::new(
+        // A nested type joins its parent with a literal `$` in C#'s legacy
+        // convention (issue #1121-style nesting, same spelling as cpp/java's
+        // JVM-derived binary names), which is exactly what `SegmentKind::Nested`
+        // renders regardless of the preceding segment's kind; a top-level type
+        // hangs off the namespace-path `Package` chain as a plain `Type`.
+        let fq = match &scope.class_unit {
+            Some(parent) => parent
+                .fq()
+                .clone()
+                .with_pushed(cs_segment(&identity_name, SegmentKind::Nested)),
+            None => csharp_package_fq(&scope.package_name)
+                .with_pushed(cs_segment(&identity_name, SegmentKind::Type)),
+        };
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
             scope.package_name.clone(),
             short_name,
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -251,13 +286,18 @@ impl<'a> CSharpVisitor<'a> {
             return;
         }
         let signature_key = csharp_method_signature_key(node, self.source);
-        let code_unit = CodeUnit::with_signature(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
             scope.package_name.clone(),
             format!("{}.{}", parent.short_name(), name),
             Some(signature_key),
             false,
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -284,13 +324,18 @@ impl<'a> CSharpVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let code_unit = CodeUnit::with_signature(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
             scope.package_name.clone(),
             format!("{}.{}", parent.short_name(), name),
             Some(csharp_parameter_key(node, self.source)),
             false,
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -317,11 +362,16 @@ impl<'a> CSharpVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let code_unit = CodeUnit::new(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             scope.package_name.clone(),
             format!("{}.{}", parent.short_name(), name),
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -370,11 +420,16 @@ impl<'a> CSharpVisitor<'a> {
             if name.is_empty() {
                 continue;
             }
-            let code_unit = CodeUnit::new(
+            let fq = parent
+                .fq()
+                .clone()
+                .with_pushed(cs_segment(name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), name),
+                fq,
             );
             self.parsed.add_code_unit(
                 code_unit.clone(),
@@ -406,11 +461,16 @@ impl<'a> CSharpVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let code_unit = CodeUnit::new(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             scope.package_name.clone(),
             format!("{}.{}", parent.short_name(), name),
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),

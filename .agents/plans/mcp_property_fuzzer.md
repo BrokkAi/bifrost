@@ -203,7 +203,9 @@ Beyond per-milestone acceptance: `cargo test` must stay green; new tests live be
 
 ## Outcomes & Retrospective
 
-Nothing yet recorded. Filled in at major milestones and at completion, per `.agents/PLANS.md`.
+**Performance (2026-07-23, measured).** The #1054 single-connection ceiling was the real bottleneck until the WAL reader pool landed (`77506f4e`, #1054 M1): the same deterministic shard (Terminal.Gui 1/10) went 3327s → 1944s at `--jobs 2` — a 1.71× speedup from the pool alone. The `--jobs` curve on the pooled binary (sequential, clean): 1944s / 1827s / 1980s / 2058s / 1732s at jobs 2 / 4 / 8 / 16 / 24 — flat, with a contention dip at 8–16 and a slight recovery at 24 when every thread gets a dedicated core. Conclusions: (a) `--jobs 4` single-process captures essentially all available throughput; more workers buy noise. (b) `--shard`'s value is now fault isolation and memory bounding, not speed; multi-repo campaigns scale naturally via `--repo-jobs`. (c) The tier-3/4 5×5 sharded model was the right call pre-pool and remains a fine shape, but single-process `--jobs 4` is the cheap default for one-off big repos. Curve data: `/tmp/t4-jobs-curve-*.jsonl`.
+
+Nothing further recorded. Filled in at major milestones and at completion, per `.agents/PLANS.md`.
 
 
 ---

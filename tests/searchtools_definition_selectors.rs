@@ -3225,3 +3225,135 @@ fn issue_1075_get_definitions_by_reference_agrees_on_bare_and_fq_rust_field_owne
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1139: a bare Rust field name (the terminal spelling of a real
+// indexed field, e.g. DioxusLabs/dioxus's
+// `packages.asset-resolver.src.WebAssetResolveError.error`) that also shares
+// its terminal identifier with a JavaScript "definition-lookup-only" member
+// must still ambiguate with every real candidate and carry a corrective
+// note, never fall through to a note-less, candidate-less `not_found` (I5).
+//
+// Root cause: `RustAnalyzer` (and, identically, `CppAnalyzer`) never
+// overrode `IAnalyzer::lookup_candidates_by_identifier`, so both silently
+// fell back to the default trait implementation (`i_analyzer.rs`), which
+// returns an empty set unconditionally. Every other language wrapper (Go,
+// Java, C#, Python, JavaScript, TypeScript, Scala, Ruby, PHP) delegates this
+// to the shared `TreeSitterAnalyzer::lookup_declarations_by_identifier`
+// store query. In a pure-Rust project this was invisible: bare-name
+// resolution's identifier-index union came back empty for Rust, and
+// resolution fell through to the exhaustive declarations-scan fallback
+// stages, which still found the Rust field by terminal-name suffix matching
+// (independent of the identifier index) -- this is why #1075's Rust-only
+// fixture passed and stayed green. But in a mixed-language workspace where
+// JavaScript *also* has a same-terminal-identifier candidate -- as in
+// dioxus's real `packages/interpreter/src/js/patch_console.js`, whose
+// `console.error = function (...) {}` (after `let console = window.console`)
+// registers a definition-lookup-only `console.error` unit purely to keep
+// fully-qualified resolution consistent -- the identifier-index union came
+// back with exactly that ONE JS entry, since Rust contributed nothing.
+// `resolution_from_matches` then declared it uniquely `Resolved` and
+// short-circuited before ever reaching the fallback stages that would have
+// surfaced the real Rust field. Definition-lookup-only units are
+// intentionally unrenderable through `get_symbol_sources` (they exist only
+// to make bare-name *resolution* agree with the fully-qualified spelling,
+// not to be listed), so rendering the sole JS winner produced empty source
+// blocks, which `get_symbol_sources` reported through the note-less
+// `renderable_not_found_input` builder identified by #1075's audit -- an
+// empty `not_found` violating I5.
+//
+// Fixed by adding the missing `lookup_candidates_by_identifier` overrides to
+// `RustAnalyzer` and `CppAnalyzer` (matching every other language wrapper),
+// and by giving `renderable_not_found_input` (plus the sibling no-provider
+// path in `get_symbol_ancestors`) a real corrective note, so any other
+// "resolved but unrenderable" escape through that shared builder still
+// satisfies I5 rather than depending solely on the analyzer-wiring fix.
+// ---------------------------------------------------------------------------
+
+fn issue_1139_cross_language_collision_project() -> common::BuiltInlineTestProject {
+    InlineTestProject::new()
+        .file(
+            "packages/asset-resolver/src/lib.rs",
+            "pub struct WebAssetResolveError {\n    error: String,\n}\n",
+        )
+        .file(
+            "packages/interpreter/src/js/patch_console.js",
+            "function monkeyPatchConsole(ws) {\n  let console = window.console, error = console.error;\n  console.error = function (...args) {\n    error.apply(console, args);\n  };\n}\nexport { monkeyPatchConsole };\n",
+        )
+        .build()
+}
+
+#[test]
+fn issue_1139_bare_rust_field_ambiguates_across_js_identifier_collision() {
+    let project = issue_1139_cross_language_collision_project();
+
+    let bare = call_tool(&project, "get_symbol_sources", r#"{"symbols":["error"]}"#);
+
+    // Never a note-less, candidate-less `not_found` (I5): the real Rust
+    // field must surface, ambiguated with the colliding JS
+    // definition-lookup-only unit rather than silently losing to it.
+    assert_eq!(0, bare["not_found"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(1, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    let matches = string_array(&bare["ambiguous"][0]["matches"]);
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.ends_with("WebAssetResolveError.error")),
+        "the real Rust field must be offered as a candidate: {bare}"
+    );
+    assert!(
+        !string_value(&bare["ambiguous"][0]["note"]).is_empty(),
+        "{bare}"
+    );
+
+    // The offered Rust selector resolves cleanly on its own.
+    let resolved = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["packages.asset-resolver.src.WebAssetResolveError.error"]}"#,
+    );
+    assert_eq!(
+        0,
+        resolved["not_found"].as_array().unwrap().len(),
+        "{resolved}"
+    );
+    assert_eq!(
+        0,
+        resolved["ambiguous"].as_array().unwrap().len(),
+        "{resolved}"
+    );
+    assert!(
+        resolved["sources"][0]["text"]
+            .as_str()
+            .expect("source text")
+            .contains("error: String"),
+        "{resolved}"
+    );
+}
+
+// Pin: even when a bare name resolves uniquely to a definition-lookup-only
+// unit with no renderable source (the shape that, pre-fix, produced the
+// empty `not_found` in the mixed-language repro above), `get_symbol_sources`
+// must still attach a corrective note (I5). This isolates the
+// `renderable_not_found_input` fix from the `RustAnalyzer`/`CppAnalyzer`
+// wiring fix: with no Rust file in play at all, the JS definition-lookup-only
+// unit is the *only* candidate, so it wins uniquely and the note-less
+// `renderable_not_found_input` path is exactly what fires.
+#[test]
+fn issue_1139_resolved_but_unrenderable_symbol_still_carries_corrective_note() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "packages/interpreter/src/js/patch_console.js",
+            "function monkeyPatchConsole(ws) {\n  let console = window.console, error = console.error;\n  console.error = function (...args) {\n    error.apply(console, args);\n  };\n}\nexport { monkeyPatchConsole };\n",
+        )
+        .build();
+
+    let bare = call_tool(&project, "get_symbol_sources", r#"{"symbols":["error"]}"#);
+
+    assert_eq!(0, bare["ambiguous"].as_array().unwrap().len(), "{bare}");
+    assert_eq!(1, bare["not_found"].as_array().unwrap().len(), "{bare}");
+    assert!(
+        !not_found_note(&bare["not_found"][0]).is_empty(),
+        "a not_found response must always carry a corrective note (I5): {bare}"
+    );
+}

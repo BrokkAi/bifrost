@@ -3955,14 +3955,23 @@ where
                 {
                     continue;
                 }
-                resolved.push(CodeUnit::with_signature(
+                let package_name = self
+                    .adapter
+                    .hydrate_content_qualifier(&row.content_qualifier, &file);
+                let fq = crate::analyzer::store::hydrate_unit_fq(
+                    row.fq_segments.as_deref(),
+                    &package_name,
+                    crate::analyzer::common::language_for_file(&file),
+                )
+                .unwrap_or_default();
+                resolved.push(CodeUnit::with_signature_and_fq(
                     file.clone(),
                     row.kind,
-                    self.adapter
-                        .hydrate_content_qualifier(&row.content_qualifier, &file),
+                    package_name,
                     row.short_name.clone(),
                     row.signature.clone(),
                     row.flags.synthetic,
+                    fq,
                 ));
             }
         }
@@ -4552,14 +4561,23 @@ where
             .rows
             .into_iter()
             .map(|row| {
-                CodeUnit::with_signature(
+                let package_name = self
+                    .adapter
+                    .hydrate_content_qualifier(&row.content_qualifier, file);
+                let fq = crate::analyzer::store::hydrate_unit_fq(
+                    row.fq_segments.as_deref(),
+                    &package_name,
+                    crate::analyzer::common::language_for_file(file),
+                )
+                .unwrap_or_default();
+                CodeUnit::with_signature_and_fq(
                     file.clone(),
                     row.kind,
-                    self.adapter
-                        .hydrate_content_qualifier(&row.content_qualifier, file),
+                    package_name,
                     row.short_name,
                     row.signature,
                     row.flags.synthetic,
+                    fq,
                 )
             })
             .collect();

@@ -546,7 +546,18 @@ fn record_call(
                         }
                         return;
                     }
-                    EnclosingMemberOwnerResolution::Owner(_) => return,
+                    EnclosingMemberOwnerResolution::Owner(_) => {
+                        // Bare `m(..)` resolving to a method whose owner IS the
+                        // enclosing class is a same-owner call (#1161, mirroring
+                        // the `this->m()` fix at #1138): record it as unproven
+                        // inbound rather than dropping it, so a member reachable
+                        // only through bare implicit-this calls reads
+                        // INCONCLUSIVE, never confidently dead — uniformly with
+                        // the other languages and with the explicit-`this->m()`
+                        // site above.
+                        ctx.record_unproven(name, function);
+                        return;
+                    }
                     EnclosingMemberOwnerResolution::Ambiguous => {
                         ctx.record_unproven(name, function);
                         return;

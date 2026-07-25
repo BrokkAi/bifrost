@@ -144,6 +144,70 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         })
 }
 
+/// Resolve a class reference written in a structured Python annotation.
+///
+/// Only AST nodes that occur inside a function return type, parameter type, or
+/// annotated-assignment type are considered. In particular, string contents are
+/// accepted only in those annotation positions; arbitrary string literals are
+/// never interpreted as type expressions.
+pub(in crate::analyzer::usages) fn annotation_reference_candidates(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    target_self_file: bool,
+) -> Option<Vec<CodeUnit>> {
+    if !is_annotation_reference_node(node) {
+        return None;
+    }
+    eprintln!("ANNOTATION {:?} {:?}", node.kind(), node_text(node, source));
+
+    let mut candidates = match node.kind() {
+        "identifier" | "string_content" => resolve_receiver_type(
+            analyzer,
+            py,
+            file,
+            node_text(node, source),
+            target_self_file,
+        )
+        .into_iter()
+        .collect(),
+        "attribute" => resolve_constructor_types(analyzer, py, file, source, node),
+        _ => Vec::new(),
+    };
+    candidates.sort();
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn is_annotation_reference_node(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "attribute" | "string_content") {
+        return false;
+    }
+
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let annotation = match parent.kind() {
+            "function_definition" => parent.child_by_field_name("return_type"),
+            "typed_parameter" | "typed_default_parameter" | "assignment" => {
+                parent.child_by_field_name("type")
+            }
+            _ => None,
+        };
+        if let Some(annotation) = annotation
+            && annotation.start_byte() <= start
+            && end <= annotation.end_byte()
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 /// Resolve the class constructed by a Python call callee without interpreting
 /// source text. Bare callees use the import binder or same-file declarations;
 /// qualified callees walk tree-sitter's `attribute` fields back to a namespace

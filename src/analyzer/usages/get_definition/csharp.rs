@@ -682,9 +682,19 @@ fn resolve_csharp_in_session(
             if outcome.status == DefinitionLookupStatus::NoDefinition
                 && csharp_static_using_boundary_for_member(csharp, definitions, file)
             {
-                return boundary(format!(
-                    "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
-                ));
+                // The unindexed-static-using signal is member-blind (any
+                // unresolved `using static` trips it). Tie the confident claim to
+                // this member: if a static-using target the workspace *does*
+                // index declares `member`, the missing resolution is a
+                // workspace-internal gap, never an external boundary (#1158).
+                return gated_boundary(
+                    || csharp_member_declared_by_indexed_static_using(definitions, file, member),
+                    format!(
+                        "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
+                    ),
+                    "no_indexed_definition",
+                    format!("`{member}` did not resolve to an indexed C# member"),
+                );
             }
             outcome
         }
@@ -1839,12 +1849,11 @@ fn csharp_type_outcome(
     ) {
         return candidates_outcome(vec![unit]);
     }
-    if csharp_import_boundary_for_type(csharp, definitions, file, reference) {
-        return boundary(format!(
-            "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+    // `csharp_import_boundary_for_type` fuses the unresolved-using signal with
+    // the workspace type/namespace check; its negation is the workspace gate.
+    gated_boundary(
+        || !csharp_import_boundary_for_type(csharp, definitions, file, reference),
+        format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# type"),
     )
@@ -1871,18 +1880,17 @@ fn csharp_attribute_outcome(
         }
         return outcome;
     }
-    if csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
-        || names
-            .iter()
-            .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name))
-    {
-        let reference = names.first().map(String::as_str).unwrap_or_default();
-        return boundary(format!(
-            "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
-        ));
-    }
     let reference = names.first().map(String::as_str).unwrap_or_default();
-    no_definition(
+    // Both disjuncts are workspace-fused boundary predicates (alias target /
+    // using target the workspace does not index); their negation is the gate.
+    gated_boundary(
+        || {
+            !(csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
+                || names
+                    .iter()
+                    .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name)))
+        },
+        format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# attribute type"),
     )
@@ -2884,37 +2892,26 @@ fn csharp_enclosing_class(
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    if definitions.session().is_some() {
-        let range = Range {
-            start_byte: byte,
-            end_byte: byte.saturating_add(1),
-            start_line: 0,
-            end_line: 0,
-        };
-        let mut current =
-            definitions.query_optional(|| analyzer.enclosing_code_unit(file, &range))?;
-        while !current.is_class() {
-            current = definitions.parent_of(analyzer, &current)?;
-        }
-        return Some(current);
-    }
-    if let Some(unit) = ClassRangeIndex::build(analyzer, file).enclosing_unit(byte) {
-        return Some(unit.clone());
-    }
-
     let range = Range {
         start_byte: byte,
         end_byte: byte.saturating_add(1),
         start_line: 0,
         end_line: 0,
     };
-    let mut current = analyzer.enclosing_code_unit(file, &range)?;
-    loop {
-        if current.is_class() {
-            return Some(current);
-        }
-        current = analyzer.parent_of(&current)?;
+    if definitions.session().is_some() {
+        let start = definitions.query_optional(|| analyzer.enclosing_code_unit(file, &range))?;
+        return crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            definitions.parent_of(analyzer, unit)
+        })
+        .find(CodeUnit::is_class);
     }
+    if let Some(unit) = ClassRangeIndex::build(analyzer, file).enclosing_unit(byte) {
+        return Some(unit.clone());
+    }
+
+    let start = analyzer.enclosing_code_unit(file, &range)?;
+    crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| analyzer.parent_of(unit))
+        .find(CodeUnit::is_class)
 }
 
 fn resolve_csharp_in_enclosing_scopes(
@@ -2933,26 +2930,16 @@ fn resolve_csharp_in_enclosing_scopes(
         start_line: 0,
         end_line: 0,
     };
-    let mut scope = definitions
+    let scope = definitions
         .query_optional(|| analyzer.enclosing_code_unit(file, &range))?
         .fq_name();
-    loop {
-        if scope.is_empty() || !definitions.scope_step() {
-            return None;
-        }
-        let child_fqn = format!("{scope}.{name}");
-        if let Some(child) = definitions
-            .fqn(&child_fqn)
-            .into_iter()
-            .find(CodeUnit::is_class)
-        {
-            return Some(child);
-        }
-        match scope.rfind('.') {
-            Some(index) => scope.truncate(index),
-            None => return None,
-        }
-    }
+    resolve_qualified_name_in_shrinking_scopes(
+        &scope,
+        name,
+        || definitions.scope_step(),
+        |fqn| definitions.fqn(fqn),
+        CodeUnit::is_class,
+    )
 }
 
 fn resolve_csharp_nested_type_in_enclosing_classes(
@@ -2965,25 +2952,20 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
     if name.is_empty() || name.contains('.') {
         return None;
     }
-    let mut enclosing = csharp_enclosing_class(analyzer, definitions, file, byte)?;
-    loop {
-        if !definitions.scope_step() {
-            return None;
-        }
-        let child_fqn = format!("{}.{}", enclosing.fq_name(), name);
-        if let Some(child) = definitions
+    let enclosing = csharp_enclosing_class(analyzer, definitions, file, byte)?;
+    crate::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
+        definitions
+            .parent_of(analyzer, unit)
+            .filter(CodeUnit::is_class)
+    })
+    .map_while(|owner| definitions.scope_step().then_some(owner))
+    .find_map(|owner| {
+        let child_fqn = format!("{}.{}", owner.fq_name(), name);
+        definitions
             .fqn(&child_fqn)
             .into_iter()
             .find(CodeUnit::is_class)
-        {
-            return Some(child);
-        }
-        let parent = definitions.parent_of(analyzer, &enclosing)?;
-        if !parent.is_class() {
-            return None;
-        }
-        enclosing = parent;
-    }
+    })
 }
 
 fn csharp_import_boundary_for_type(
@@ -3022,15 +3004,48 @@ fn csharp_static_using_boundary_for_member(
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
 ) -> bool {
-    definitions.import_statements(file).iter().any(|raw| {
-        raw.trim()
-            .trim_start_matches("global ")
-            .trim_start_matches("using ")
-            .trim_end_matches(';')
-            .trim()
-            .strip_prefix("static ")
-            .is_some_and(|target| !definitions.type_exists(target.trim()))
+    csharp_static_using_targets(definitions, file).any(|target| !definitions.type_exists(&target))
+}
+
+/// True when `member` is declared by a `using static` target the workspace
+/// actually indexes — e.g. `using static Workspace.MathUtils;` where `MathUtils`
+/// exists and declares the member. The unindexed-static-using signal above is
+/// member-blind (it trips on any unresolved static using), so this ties the
+/// confident boundary to the specific member: a member a workspace static-using
+/// provides is workspace-internal, never an external boundary (#1158).
+fn csharp_member_declared_by_indexed_static_using(
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    member: &str,
+) -> bool {
+    csharp_static_using_targets(definitions, file).any(|target| {
+        definitions.type_exists(&target)
+            && !definitions
+                .members_for_owner_name(&target, member)
+                .is_empty()
     })
+}
+
+/// The `using static <target>;` targets declared in `file`, one per static-using
+/// directive (global or file-scoped). Shared by the static-using boundary
+/// predicates so the member-blind and member-specific checks agree on which
+/// directives count.
+fn csharp_static_using_targets(
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+) -> impl Iterator<Item = String> {
+    definitions
+        .import_statements(file)
+        .into_iter()
+        .filter_map(|raw| {
+            raw.trim()
+                .trim_start_matches("global ")
+                .trim_start_matches("using ")
+                .trim_end_matches(';')
+                .trim()
+                .strip_prefix("static ")
+                .map(|target| target.trim().to_string())
+        })
 }
 
 const CSHARP_SCOPE_NODES: &[&str] = &[

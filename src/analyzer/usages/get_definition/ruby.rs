@@ -1129,6 +1129,7 @@ fn ruby_field_outcome(
     let mut candidates = Vec::new();
     for owner in owners {
         let segments: Vec<String> = owner
+            // fqname-M4: `owner` is a `&str` owner name from an import/reference chain, not a CodeUnit; ruby joins its whole type chain with `$`
             .split('$')
             .filter(|segment| !segment.is_empty())
             .map(str::to_string)

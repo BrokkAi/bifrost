@@ -188,6 +188,7 @@ impl RubyAnalyzer {
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let Some(identifier) = fqn
+            // fqname-M4: leaf identifier of a `&str` fqn parameter (no CodeUnit/fq at this query boundary)
             .rsplit(['.', '$'])
             .next()
             .filter(|name| !name.is_empty())

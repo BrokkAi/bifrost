@@ -1062,7 +1062,16 @@ pub fn get_symbol_ancestors(
                 .symbols
                 .into_iter()
                 .filter(|symbol| !symbol.trim().is_empty())
-                .map(renderable_not_found_input)
+                .map(|symbol| {
+                    not_found_input(
+                        symbol,
+                        Some(
+                            "no analyzer in this workspace supports ancestor (type hierarchy) \
+                             queries for this symbol's language"
+                                .to_string(),
+                        ),
+                    )
+                })
                 .collect(),
             ambiguous: Vec::new(),
         };

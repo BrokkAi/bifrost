@@ -98,13 +98,24 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
         let package_name = self
             .adapter
             .hydrate_content_qualifier(&row.content_qualifier, file);
-        CodeUnit::with_signature(
+        // Rebuild the loaded unit's structured `fq` from the persisted
+        // content-stable tail + the per-path package prefix, exactly like the
+        // FileState load path — so candidate-row-derived units carry `fq` and
+        // the owner/enclosing-scope resolvers never fall back to string scanning.
+        let fq = crate::analyzer::store::hydrate_unit_fq(
+            row.fq_segments.as_deref(),
+            &package_name,
+            crate::analyzer::common::language_for_file(file),
+        )
+        .unwrap_or_default();
+        CodeUnit::with_signature_and_fq(
             file.clone(),
             row.kind,
             package_name,
             row.short_name.clone(),
             row.signature.clone(),
             row.flags.synthetic,
+            fq,
         )
     }
 }

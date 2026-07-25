@@ -49,7 +49,10 @@ const CORPUS_LANGUAGES: [&str; 11] = [
 ];
 
 const DEFAULT_MAX_SYMBOLS: usize = 5_000;
-const DEFAULT_PARALLELISM: usize = 8;
+// The measured --jobs curve on the pooled store (Terminal.Gui shard 1/10:
+// 1944/1827/1980/2058/1732s at 2/4/8/16/24) flattens at 4 with a contention
+// dip beyond it; 4 is the sweet spot.
+const DEFAULT_PARALLELISM: usize = 4;
 /// Repositories audited concurrently in corpus mode. Kept low: each worker
 /// already fans out over `--jobs` analyzer threads and clones can be large.
 const DEFAULT_REPO_JOBS: usize = 2;

@@ -105,7 +105,7 @@ pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<Stri
     } else {
         target.short_name()
     };
-    let cut = short.rfind(['.', '$'])?;
+    let cut = short.rfind(['.', '$'])?; // fqname-M4: parent-of on the raw short_name string; runs on targets whose fq is not threaded to this display helper
     let parent_short = &short[..cut];
     if parent_short.is_empty() {
         return None;

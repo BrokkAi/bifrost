@@ -124,7 +124,7 @@ impl<'a> JavaResolutionSession<'a> {
         file: &ProjectFile,
         byte: usize,
     ) -> Option<CodeUnit> {
-        let mut unit = self.query_optional_row(|| {
+        let start = self.query_optional_row(|| {
             analyzer.enclosing_code_unit(
                 file,
                 &Range {
@@ -135,10 +135,10 @@ impl<'a> JavaResolutionSession<'a> {
                 },
             )
         })?;
-        while !unit.is_class() {
-            unit = self.parent_of(analyzer, &unit)?;
-        }
-        Some(unit)
+        crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            self.parent_of(analyzer, unit)
+        })
+        .find(CodeUnit::is_class)
     }
 
     fn structured_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
@@ -762,12 +762,13 @@ fn resolve_java_type_reference(
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return candidates_outcome(vec![unit]);
     }
-    if java_import_boundary_for_type(java, session, file, normalized) {
-        return boundary(format!(
+    // `java_import_boundary_for_type` fuses the unresolved-import signal with the
+    // workspace-type check; its negation is the workspace-internal gate.
+    gated_boundary(
+        || !java_import_boundary_for_type(java, session, file, normalized),
+        format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     )
@@ -797,7 +798,10 @@ fn java_explicit_scoped_type_reference(
         return Some(candidates_outcome(vec![unit]));
     }
     if session.type_name_resolves_with_external(java, file, normalized) {
-        return Some(boundary(format!(
+        // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
+        // above return early for any workspace-internal type; reaching here means
+        // the name only resolves once external imports are considered.
+        return Some(boundary_unchecked(format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         )));
     }
@@ -809,13 +813,16 @@ fn java_explicit_scoped_type_reference(
     }
     let qualifier_is_in_workspace = java_scoped_type_qualifier_text(session, scoped, source)
         .is_some_and(|qualifier| java_workspace_package_exists(support, qualifier));
-    if java_import_boundary_for_type(java, session, file, normalized) || !qualifier_is_in_workspace
-    {
-        return Some(boundary(format!(
+    // The `!qualifier_is_in_workspace` disjunct is the #1089 workspace-namespace
+    // check, so the negation of the whole condition is the workspace gate.
+    Some(gated_boundary(
+        || {
+            !java_import_boundary_for_type(java, session, file, normalized)
+                && qualifier_is_in_workspace
+        },
+        format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
-        )));
-    }
-    Some(no_definition(
+        ),
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     ))
@@ -1324,12 +1331,10 @@ fn resolve_java_bare_identifier(
     if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
-    if java_import_boundary_for_type(java, session, file, name) {
-        return boundary(format!(
-            "`{name}` appears to cross a Java import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+    // Workspace gate is the negation of the fused import-boundary predicate.
+    gated_boundary(
+        || !java_import_boundary_for_type(java, session, file, name),
+        format!("`{name}` appears to cross a Java import boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{name}` did not resolve to an indexed Java definition"),
     )
@@ -3031,12 +3036,14 @@ fn java_static_import_candidates(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if saw_external {
-        return boundary(format!(
+    // `saw_external` is set only when an import target is both unindexed and
+    // `!java_workspace_fqn_exists(owner)`, so `!saw_external` is the workspace
+    // gate (no double work — the flag already carries the check).
+    gated_boundary(
+        || !saw_external,
+        format!(
             "`{member}` appears to cross a Java static import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+        ),
         "no_static_import_match",
         format!("`{member}` did not match an indexed Java static import"),
     )

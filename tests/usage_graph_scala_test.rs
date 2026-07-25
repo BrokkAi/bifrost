@@ -594,6 +594,11 @@ class Competing extends CompetingLeft with CompetingRight {
   override def competing(first: Boolean, second: Boolean): Int = 1
   def none: Int = competing()
 }
+class OverrideCallers {
+  def directOne(target: Direct): Int = target.direct(true)
+  def directTwo(target: Direct): Int = target.direct(true, false)
+  def leafOne(target: Leaf): Int = target.transitive(true)
+}
 "#,
         )
         .file("shadow/Boolean.scala", "package shadow\nclass Boolean\n")
@@ -629,19 +634,23 @@ class Use extends Base {
         .build();
     let value = usage_graph_at(project.root(), "{}");
 
+    // Callers are in a separate class (external, typed receivers) so the resolved
+    // concrete override is observable as a proven edge. The same-class `one`/`two`
+    // callers are now same-owner (unproven) under #1014/#1138; a typed exact-owner
+    // receiver exercises the same override-family resolution.
     for (caller, concrete, ancestor) in [
         (
-            "defaults.Direct.one",
+            "defaults.OverrideCallers.directOne",
             "defaults.Direct.direct",
             "defaults.DirectBase.direct",
         ),
         (
-            "defaults.Direct.two",
+            "defaults.OverrideCallers.directTwo",
             "defaults.Direct.direct",
             "defaults.DirectBase.direct",
         ),
         (
-            "defaults.Leaf.one",
+            "defaults.OverrideCallers.leafOne",
             "defaults.Leaf.transitive",
             "defaults.Root.transitive",
         ),
@@ -658,7 +667,11 @@ class Use extends Base {
         );
     }
     assert!(
-        !has_edge(&value, "defaults.Leaf.one", "defaults.Mid.transitive"),
+        !has_edge(
+            &value,
+            "defaults.OverrideCallers.leafOne",
+            "defaults.Mid.transitive"
+        ),
         "transitive inherited default substituted the intermediate override: {}",
         value["edges"]
     );
@@ -1096,14 +1109,17 @@ fn resolves_instance_object_and_unqualified_calls() {
         "expected viaObject -> Helpers$.help: {}",
         value["edges"]
     );
-    // Unqualified `local()` attributes to the enclosing class.
+    // Unqualified `local()` resolves to the enclosing class's own member — an
+    // implicit-`this` same-owner call, now routed to *unproven* inbound rather
+    // than a proven caller->callee edge (#1014 facet B / #1138), so it does not
+    // appear on the proven-edge surface.
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "example.Consumer.callsLocal",
             "example.Consumer.local"
         ),
-        "expected callsLocal -> Consumer.local: {}",
+        "same-owner implicit-this call must not be a proven edge: {}",
         value["edges"]
     );
 }
@@ -1384,15 +1400,17 @@ fn every_edge_endpoint_is_a_node() {
 fn scala3_indented_this_and_block_scoping() {
     let value = usage_graph();
 
-    // `this.help()` (Scala's `this` is a plain identifier) attributes to the
-    // enclosing class.
+    // `this.help()` (Scala's `this` is a plain identifier) is an explicit
+    // self-receiver call on the current instance — a same-owner reference now
+    // routed to *unproven* inbound rather than a proven edge (#1014/#1138), so it
+    // does not appear on the proven-edge surface.
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "example.Indented.callsThis",
             "example.Indented.help"
         ),
-        "expected callsThis -> Indented.help: {}",
+        "explicit this-receiver call must not be a proven edge: {}",
         value["edges"]
     );
     // A `val svc` shadow inside a Scala 3 `indented_block` branch must not leak
@@ -2209,6 +2227,9 @@ class LocalWins {
   def Projected(value: Int): Int = value
   def value = Projected(9)
 }
+class LocalWinsCaller {
+  def call(target: LocalWins): Int = target.Projected(9)
+}
 class NestedWins {
   class LexicalCollision(val value: Int)
   def value = LexicalCollision(7)
@@ -2227,7 +2248,10 @@ class NestedWins {
         ("app.Use$.explicitlyPlain", "model.Plain"),
         ("app.Use$.zero", "model.Zero"),
         ("app.Use$.grow", "model.Growable.+="),
-        ("app.LocalWins.value", "app.LocalWins.Projected"),
+        // Same-class `LocalWins.value = Projected(9)` is now same-owner (unproven);
+        // an external typed receiver observes the same "local method wins over the
+        // imported `model.Projected`" resolution as a proven edge.
+        ("app.LocalWinsCaller.call", "app.LocalWins.Projected"),
         ("app.NestedWins.value", "app.NestedWins.LexicalCollision"),
         (
             "model.NestedFactory$.nested",
@@ -2246,8 +2270,8 @@ class NestedWins {
     }
     for (caller, callee) in [
         ("app.Use$.plain", "model.Plain"),
-        ("app.LocalWins.value", "model.Projected"),
-        ("app.LocalWins.value", "model.Projected$.apply"),
+        ("app.LocalWinsCaller.call", "model.Projected"),
+        ("app.LocalWinsCaller.call", "model.Projected$.apply"),
         ("app.NestedWins.value", "model.LexicalCollision$.apply"),
     ] {
         assert!(

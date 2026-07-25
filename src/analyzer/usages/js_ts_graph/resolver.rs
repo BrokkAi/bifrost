@@ -684,7 +684,7 @@ pub(super) fn target_language(target: &CodeUnit) -> Language {
 pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
     // Anything past the first dot is treated as the member chain. We strip TS-specific
     // `$static` suffix to align with the original syntactic name.
-    let parts: Vec<&str> = target.short_name().split('.').collect();
+    let parts: Vec<&str> = target.short_name().split('.').collect(); // fqname-M4: enumerates the package-less short_name segments; fq segments include the package prefix, changing this JS/TS member walk
     if parts.len() <= 1 {
         return None;
     }
@@ -698,7 +698,7 @@ pub(in crate::analyzer::usages) fn browser_global_property_shape(
     if !target.is_field() && !target.is_function() {
         return None;
     }
-    let (object, property) = target.short_name().split_once('.')?;
+    let (object, property) = target.short_name().split_once('.')?; // fqname-M4: object/property from the package-less short_name; fq.segments() carry the package prefix, changing this split
     (object == "window" && !property.is_empty() && !property.contains('.'))
         .then_some((object, property))
 }

@@ -9,9 +9,11 @@
 //!   never the confident `verified_absent` lie both tokio repros hit;
 //! - `include_same_owner: true` lists the sites, kind-tagged `self_receiver`.
 //!
-//! Scala is intentionally not in the uniformity matrix below: its usage graph
-//! uses an event-driven catalog that does not carry receiver shape to the record
-//! site, so its same-owner classification is deferred (see the facet-B report).
+//! All eleven languages participate in the uniformity matrix below, including
+//! Scala: its event-driven usage graph threads the receiver shape through the
+//! shared `hit_kind` slot so `this.m()`, an implicit bare `m()`, and an
+//! own-object `Obj.m()` classify as same-owner while `super.m()` and a call
+//! through a different variable stay external (#1014 facet B / #1138).
 
 mod common;
 
@@ -203,6 +205,11 @@ const CPP: &[(&str, &str)] = &[(
     "class Foo {\npublic:\n  void target() {}\n  void caller() { this->target(); }\n  void uncalled() {}\n};\n",
 )];
 
+const SCALA: &[(&str, &str)] = &[(
+    "Foo.scala",
+    "class Foo {\n  def target(): Unit = {}\n  def caller(): Unit = this.target()\n  def uncalled(): Unit = {}\n}\n",
+)];
+
 macro_rules! uniformity_case {
     ($name:ident, $lang:expr, $files:expr) => {
         #[test]
@@ -222,6 +229,7 @@ uniformity_case!(rust_same_owner_only, Language::Rust, RUST);
 uniformity_case!(typescript_same_owner_only, Language::TypeScript, TYPESCRIPT);
 uniformity_case!(javascript_same_owner_only, Language::JavaScript, JAVASCRIPT);
 uniformity_case!(cpp_same_owner_only, Language::Cpp, CPP);
+uniformity_case!(scala_same_owner_only, Language::Scala, SCALA);
 
 // Go's fq_name is import-path-qualified; resolve the method by its owner-scoped
 // name.
@@ -269,6 +277,7 @@ inconclusive_case!(
     JAVASCRIPT
 );
 inconclusive_case!(go_same_owner_only_inconclusive, Language::Go, GO);
+inconclusive_case!(scala_same_owner_only_inconclusive, Language::Scala, SCALA);
 
 // C++ member candidates route through the precise per-symbol path (no bulk usage
 // graph for members), which reports them as inconclusive (the precise strategy is
@@ -443,4 +452,83 @@ fn verified_absent_gate_repro_b_shape() {
     );
     assert_eq!(entry.total_hits, Some(0), "{entry:#?}");
     assert_eq!(entry.same_owner_sites, Some(1), "{entry:#?}");
+}
+
+// --- Scala-specific same-owner receiver shapes (#1014 facet B / #1138). --------
+
+#[test]
+fn scala_bare_implicit_this_call_is_same_owner() {
+    // A bare `target()` with no receiver is an implicit-this call on the current
+    // instance — a same-owner site, not an external usage.
+    let files: &[(&str, &str)] = &[(
+        "Foo.scala",
+        "class Foo {\n  def target(): Unit = {}\n  def caller(): Unit = target()\n}\n",
+    )];
+    assert_same_owner_only(Language::Scala, files, "Foo.target");
+}
+
+#[test]
+fn scala_own_object_call_is_same_owner() {
+    // `Obj.target()` from within `Obj` names the enclosing singleton object as the
+    // receiver — a same-owner site, mirroring Java/C#'s own-type-static rule.
+    let files: &[(&str, &str)] = &[(
+        "Obj.scala",
+        "object Obj {\n  def target(): Unit = {}\n  def caller(): Unit = Obj.target()\n}\n",
+    )];
+    assert_same_owner_only(Language::Scala, files, "Obj.target");
+}
+
+#[test]
+fn scala_super_call_stays_external() {
+    // `super.render()` is a deliberate up-call to a supertype's member on the
+    // current instance — an external usage, never a same-owner site.
+    let files: &[(&str, &str)] = &[(
+        "Foo.scala",
+        "class Base {\n  def render(): Unit = {}\n}\nclass Foo extends Base {\n  override def render(): Unit = super.render()\n}\n",
+    )];
+    let entry = scan(Language::Scala, files, "Base.render", false);
+    assert_eq!(
+        entry.same_owner_sites, None,
+        "a super call must not be classified same-owner: {entry:#?}"
+    );
+    assert_eq!(
+        entry.status,
+        ScanUsagesStatus::Found,
+        "a super call is an external usage: {entry:#?}"
+    );
+}
+
+#[test]
+fn scala_different_instance_of_same_type_stays_external() {
+    // Within `Foo`, a call through a *different* `Foo` parameter is an external
+    // usage, not a same-owner site.
+    let files: &[(&str, &str)] = &[(
+        "Foo.scala",
+        "class Foo {\n  def target(): Unit = {}\n  def caller(other: Foo): Unit = other.target()\n}\n",
+    )];
+    let entry = scan(Language::Scala, files, "Foo.target", false);
+    assert_eq!(entry.status, ScanUsagesStatus::Found, "{entry:#?}");
+    assert_eq!(entry.total_hits, Some(1), "{entry:#?}");
+    assert_eq!(
+        entry.same_owner_sites, None,
+        "a different instance is not a same-owner site: {entry:#?}"
+    );
+}
+
+#[test]
+fn scala_include_same_owner_lists_kind_tagged_site() {
+    let listed = scan(Language::Scala, SCALA, "Foo.target", true);
+    assert_eq!(listed.status, ScanUsagesStatus::NoExternalUsages);
+    assert_eq!(listed.same_owner_sites, Some(1));
+    let locations: Vec<_> = listed
+        .same_owner_files
+        .iter()
+        .flat_map(|group| group.hits.iter())
+        .collect();
+    assert_eq!(locations.len(), 1, "one listed site: {listed:#?}");
+    assert_eq!(
+        locations[0].kind.as_deref(),
+        Some("self_receiver"),
+        "listed same-owner site must be kind-tagged: {listed:#?}"
+    );
 }

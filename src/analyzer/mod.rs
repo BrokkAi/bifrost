@@ -14,6 +14,7 @@ mod csharp;
 pub mod dataflow;
 pub(crate) mod declaration_range;
 mod dense_id;
+pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;

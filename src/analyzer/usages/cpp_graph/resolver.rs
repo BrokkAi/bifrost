@@ -6726,7 +6726,7 @@ fn exact_structural_type_parent(
     if !code_unit.is_function() && !code_unit.is_field() {
         return None;
     }
-    let encoded_owner = code_unit.short_name().rsplit_once('.')?.0;
+    let encoded_owner = code_unit.short_name().rsplit_once('.')?.0; // fqname-M4: package-less short_name owner used as an encoded key; fq.parent() would render the `::`-headed package-qualified owner
     let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
     let parent = cpp.structural_parent_of(code_unit)?;
     (!parent.is_module()

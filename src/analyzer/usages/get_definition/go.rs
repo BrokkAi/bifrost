@@ -319,29 +319,25 @@ pub(super) fn resolve_go(
                 // "workspace package namespace", never a boundary claim whose
                 // tail implies it may be outside the workspace (issue #1089 go
                 // cousin: rclone `fs.Debugf`).
-                if go_import_path_is_workspace(support, package) {
-                    return no_definition(
-                        "workspace_package_namespace",
-                        format!(
-                            "`{reference}` names a Go package in this workspace, not a single indexed declaration"
-                        ),
-                    );
-                }
-                return boundary(format!(
-                    "`{reference}` is a Go import namespace rather than an indexed declaration"
-                ));
+                return gated_boundary(
+                    || go_import_path_is_workspace(support, package),
+                    format!(
+                        "`{reference}` is a Go import namespace rather than an indexed declaration"
+                    ),
+                    "workspace_package_namespace",
+                    format!(
+                        "`{reference}` names a Go package in this workspace, not a single indexed declaration"
+                    ),
+                );
             }
             if let Some(outcome) =
                 go_package_selector_chain_outcome(support, package, source, selector)
             {
                 return outcome;
             }
-            if !go_import_path_is_workspace(support, package) {
-                return boundary(format!(
-                    "`{package}` is outside this partial Go workspace analysis"
-                ));
-            }
-            return no_definition(
+            return gated_boundary(
+                || go_import_path_is_workspace(support, package),
+                format!("`{package}` is outside this partial Go workspace analysis"),
                 "no_indexed_definition",
                 format!("`{reference}` is not indexed in Go package `{package}`"),
             );
@@ -351,7 +347,9 @@ pub(super) fn resolve_go(
             .iter()
             .find(|package| !go_import_path_is_workspace(support, package))
         {
-            return boundary(format!(
+            // gated upstream: the `find` predicate is the workspace gate — only a
+            // package that is NOT a workspace import path reaches here.
+            return boundary_unchecked(format!(
                 "`{package}` is outside this partial Go workspace analysis"
             ));
         }
@@ -371,12 +369,9 @@ pub(super) fn resolve_go(
             {
                 return outcome;
             }
-            if !go_import_path_is_workspace(support, import_path) {
-                return boundary(format!(
-                    "`{import_path}` is outside this partial Go workspace analysis"
-                ));
-            }
-            return no_definition(
+            return gated_boundary(
+                || go_import_path_is_workspace(support, import_path),
+                format!("`{import_path}` is outside this partial Go workspace analysis"),
                 "no_indexed_definition",
                 format!("`{name}` is not indexed in Go package `{import_path}`"),
             );
@@ -433,7 +428,9 @@ pub(super) fn resolve_go(
         .into_iter()
         .find(|import_path| !go_import_path_is_workspace(support, import_path))
     {
-        return boundary(format!(
+        // gated upstream: the `find` predicate is the workspace gate — only a
+        // non-workspace dot-import path reaches here.
+        return boundary_unchecked(format!(
             "`{import_path}` is outside this partial Go workspace analysis"
         ));
     }

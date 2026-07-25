@@ -971,8 +971,13 @@ fn import_binder_of(
         };
         match import.alias.as_deref() {
             Some(".") => {
+                // Keyed per module (mirroring Rust's `*:{module}` glob-binding
+                // convention in lexical_scope.rs), not a single shared "*" key —
+                // Go permits multiple dot-imports in one file, and each must
+                // survive independently. A fixed "*" key let a second dot-import
+                // silently clobber the first in `binder.bindings`.
                 binder.bindings.insert(
-                    "*".to_string(),
+                    format!("*:{path}"),
                     ImportBinding {
                         module_specifier: path,
                         namespace_imported_module: None,

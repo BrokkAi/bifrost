@@ -1,7 +1,30 @@
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
 };
 use tree_sitter::{Node, Point, Tree};
+
+/// Intern one qualified-name segment in the process-global interner.
+fn php_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured namespace prefix for a PHP declaration.
+///
+/// `determine_php_package_name` (below) already turns the namespace's `\`-
+/// separated AST text into a `.`-joined string (`replace('\\', ".")`) before it
+/// ever becomes `package_name`; PHP identifiers can never contain a literal
+/// `.`, so splitting that string back into components is lossless. Each
+/// component becomes one [`SegmentKind::Package`] segment: `Package`-`Package`
+/// renders with `.` by default, matching this convention exactly (unlike Go's
+/// `/`-joined import path, which needs the `Path` kind).
+fn php_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name.split('.').filter(|c| !c.is_empty()) {
+        fq.push(php_segment(component, SegmentKind::Package));
+    }
+    fq
+}
 
 pub(super) fn parse_php_file(
     file: &ProjectFile,
@@ -153,13 +176,26 @@ impl<'a> PhpVisitor<'a> {
         let short_name = if let Some(parent) = &scope.class_unit {
             format!("{}${name}", parent.short_name())
         } else {
-            name
+            name.clone()
         };
-        let code_unit = CodeUnit::new(
+        // A nested type (class/interface/trait/enum inside another type) is
+        // always `$`-joined in the legacy convention above; `Nested` is the tag whose
+        // join IS a literal `$` regardless of the previous segment's kind. A top-level type has no parent and is a
+        // plain `Type` hanging off the namespace `Package` chain.
+        let fq = match &scope.class_unit {
+            Some(parent) => parent
+                .fq()
+                .clone()
+                .with_pushed(php_segment(&name, SegmentKind::Nested)),
+            None => php_package_fq(&scope.package_name)
+                .with_pushed(php_segment(&name, SegmentKind::Type)),
+        };
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
             scope.package_name.clone(),
             short_name,
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -194,13 +230,22 @@ impl<'a> PhpVisitor<'a> {
         let short_name = if let Some(parent) = &scope.class_unit {
             format!("{}.{}", parent.short_name(), name)
         } else {
-            name
+            name.clone()
         };
-        let code_unit = CodeUnit::new(
+        let fq = match &scope.class_unit {
+            Some(parent) => parent
+                .fq()
+                .clone()
+                .with_pushed(php_segment(&name, SegmentKind::Member)),
+            None => php_package_fq(&scope.package_name)
+                .with_pushed(php_segment(&name, SegmentKind::Member)),
+        };
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Function,
             scope.package_name.clone(),
             short_name,
+            fq,
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -245,11 +290,15 @@ impl<'a> PhpVisitor<'a> {
                 continue;
             }
             let stripped_name = raw_name.trim_start_matches('$');
-            let code_unit = CodeUnit::new(
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), stripped_name),
+                parent
+                    .fq()
+                    .clone()
+                    .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
             );
             self.parsed.add_code_unit(
                 code_unit.clone(),
@@ -298,11 +347,27 @@ impl<'a> PhpVisitor<'a> {
             } else {
                 format!("_module_.{name}")
             };
-            let code_unit = CodeUnit::new(
+            // Mirrors `short_name`: a class constant extends its owning type's
+            // `fq`; a free (module-level) constant gets the same synthetic
+            // `_module_` scope marker Go uses for package-level `var`/`const`
+            // (see `GO_MODULE_SCOPE_SEGMENT` in `src/analyzer/go/mod.rs` and the
+            // matching Decision Log entry) — a `Package` segment, since it is a
+            // module-scope marker rather than a real type or member.
+            let fq = match &scope.class_unit {
+                Some(parent) => parent
+                    .fq()
+                    .clone()
+                    .with_pushed(php_segment(&name, SegmentKind::Member)),
+                None => php_package_fq(&scope.package_name)
+                    .with_pushed(php_segment("_module_", SegmentKind::Package))
+                    .with_pushed(php_segment(&name, SegmentKind::Member)),
+            };
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
                 short_name,
+                fq,
             );
             self.parsed.add_code_unit(
                 code_unit.clone(),
@@ -337,11 +402,15 @@ impl<'a> PhpVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let code_unit = CodeUnit::new(
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             scope.package_name.clone(),
             format!("{}.{}", parent.short_name(), name),
+            parent
+                .fq()
+                .clone()
+                .with_pushed(php_segment(&name, SegmentKind::Member)),
         );
         self.parsed.add_code_unit(
             code_unit.clone(),
@@ -378,11 +447,15 @@ impl<'a> PhpVisitor<'a> {
                 continue;
             }
             let stripped_name = raw_name.trim_start_matches('$');
-            let code_unit = CodeUnit::new(
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), stripped_name),
+                parent
+                    .fq()
+                    .clone()
+                    .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
             );
             self.parsed.add_code_unit(
                 code_unit.clone(),

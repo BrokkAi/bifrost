@@ -1,8 +1,40 @@
 use super::imports::parse_ruby_require_call;
 use super::*;
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
+
+/// Intern one qualified-name segment in the process-global interner.
+fn ruby_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured type/namespace chain for a sequence of Ruby class/
+/// module name segments (already atomic AST-derived strings — see
+/// [`extract_name_segments`], which walks `scope_resolution` nodes rather than
+/// splitting `A::B` text). Ruby's `package_name` is always empty and its legacy
+/// `short_name` joins EVERY namespace segment with a literal `$` (see this
+/// module's doc comment on [`RubyVisitor`]): `module A; class B` yields `A$B`.
+/// [`SegmentKind::Nested`] is the tag whose join renders a leading
+/// `$` regardless of the previous segment's kind, and the very first segment of
+/// a qualified name never gets a leading separator at all (there is no
+/// preceding segment) — so tagging every namespace segment `Companion`
+/// reproduces the `$`-joined chain exactly, including its first element.
+fn ruby_type_chain_fq(segments: &[String]) -> FqName {
+    let mut fq = FqName::new();
+    for segment in segments {
+        fq.push(ruby_segment(segment, SegmentKind::Nested));
+    }
+    fq
+}
+
+/// Extends a type/namespace chain with one trailing `Member` segment — the
+/// structured counterpart of [`member_short_name`], which appends `.name`
+/// after the `$`-joined chain.
+fn ruby_member_fq(type_segments: &[String], name: &str) -> FqName {
+    ruby_type_chain_fq(type_segments).with_pushed(ruby_segment(name, SegmentKind::Member))
+}
 
 /// Parses Ruby source into a tree-sitter tree, or `None` if parsing fails.
 pub(crate) fn parse_ruby_tree(source: &str) -> Option<Tree> {
@@ -129,7 +161,13 @@ impl RubyVisitor<'_> {
         } else {
             CodeUnitType::Class
         };
-        let code_unit = CodeUnit::new(self.file.clone(), kind, String::new(), short_name);
+        let code_unit = CodeUnit::new_fq(
+            self.file.clone(),
+            kind,
+            String::new(),
+            short_name,
+            ruby_type_chain_fq(&new_segments),
+        );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
         self.parsed
@@ -190,13 +228,14 @@ impl RubyVisitor<'_> {
         let signature = node
             .child_by_field_name("parameters")
             .map(|params| ruby_node_text(params, self.source).trim().to_string());
-        let code_unit = CodeUnit::with_signature(
+        let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
             String::new(),
             short_name,
             signature,
             false,
+            ruby_member_fq(segments, name),
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
@@ -238,11 +277,12 @@ impl RubyVisitor<'_> {
             return;
         }
         let short_name = assignment_constant_short_name(segments, &name_path);
-        let code_unit = CodeUnit::new(
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             String::new(),
             short_name,
+            assignment_constant_fq(segments, &name_path),
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
@@ -293,11 +333,13 @@ impl RubyVisitor<'_> {
         else {
             return;
         };
-        let code_unit = CodeUnit::new(
+        let fq = ruby_field_fq(segments, left, self.source, field_scope).unwrap_or_default();
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             String::new(),
             short_name,
+            fq,
         );
         if self
             .parsed
@@ -355,11 +397,13 @@ impl RubyVisitor<'_> {
             let Some(name) = literal_symbol_or_string_name(arg, self.source) else {
                 continue;
             };
-            let code_unit = CodeUnit::new(
+            let member_name = attr_field_member_name(node, &name);
+            let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 String::new(),
-                member_short_name(segments, &attr_field_member_name(node, &name)),
+                member_short_name(segments, &member_name),
+                ruby_member_fq(segments, &member_name),
             );
             self.parsed.replace_code_unit(
                 code_unit.clone(),
@@ -411,11 +455,12 @@ impl RubyVisitor<'_> {
         parent: &CodeUnit,
         name: &str,
     ) {
-        let code_unit = CodeUnit::new(
+        let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Function,
             String::new(),
             member_short_name(segments, name),
+            ruby_member_fq(segments, name),
         );
         self.parsed.replace_code_unit(
             code_unit.clone(),
@@ -462,6 +507,20 @@ pub(crate) fn ruby_variable_field_name(node: Node<'_>, source: &str) -> Option<S
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The single opaque member name shared by [`ruby_field_short_name`] and
+/// [`ruby_field_fq`]. Ruby's singleton-scoped field spelling embeds a literal
+/// `$singleton.` prefix inside ONE atomic member name (mirroring
+/// `attr_field_member_name` below) rather than a separately-tagged segment, so
+/// both the legacy string and the structured `Member` segment carry it as one
+/// piece of text.
+fn ruby_field_member_name(node: Node<'_>, source: &str, scope: RubyFieldScope) -> Option<String> {
+    let name = ruby_variable_field_name(node, source)?;
+    Some(match scope {
+        RubyFieldScope::Instance | RubyFieldScope::ClassVariable => name,
+        RubyFieldScope::SingletonClass => format!("$singleton.{name}"),
+    })
+}
+
 pub(crate) fn ruby_field_short_name(
     segments: &[String],
     node: Node<'_>,
@@ -471,12 +530,22 @@ pub(crate) fn ruby_field_short_name(
     if segments.is_empty() {
         return None;
     }
-    let name = ruby_variable_field_name(node, source)?;
-    let member = match scope {
-        RubyFieldScope::Instance | RubyFieldScope::ClassVariable => name,
-        RubyFieldScope::SingletonClass => format!("$singleton.{name}"),
-    };
+    let member = ruby_field_member_name(node, source, scope)?;
     Some(member_short_name(segments, &member))
+}
+
+/// The structured counterpart of [`ruby_field_short_name`].
+fn ruby_field_fq(
+    segments: &[String],
+    node: Node<'_>,
+    source: &str,
+    scope: RubyFieldScope,
+) -> Option<FqName> {
+    if segments.is_empty() {
+        return None;
+    }
+    let member = ruby_field_member_name(node, source, scope)?;
+    Some(ruby_member_fq(segments, &member))
 }
 
 pub(crate) fn ruby_field_scope_for_assignment_left(
@@ -625,6 +694,29 @@ fn assignment_constant_short_name(lexical_segments: &[String], name_path: &RubyN
     resolved_owner.extend_from_slice(lexical_segments);
     resolved_owner.extend_from_slice(owner_segments);
     member_short_name(&resolved_owner, name)
+}
+
+/// The structured counterpart of [`assignment_constant_short_name`] — mirrors
+/// its branches exactly, building an [`FqName`] from the same owner segments
+/// instead of a `$`-joined string. The owner segments come from the constant
+/// reference's own AST-derived name path (`extract_name_path`), which may name
+/// a different (re-opened) namespace than the lexically enclosing one, so this
+/// builds a fresh chain rather than extending a `parent` `CodeUnit`'s `fq`.
+fn assignment_constant_fq(lexical_segments: &[String], name_path: &RubyNamePath) -> FqName {
+    let Some((name, owner_segments)) = name_path.segments.split_last() else {
+        return FqName::new();
+    };
+    if owner_segments.is_empty() {
+        return ruby_member_fq(lexical_segments, name);
+    }
+    if name_path.absolute || owner_segments.len() > 1 || lexical_segments.is_empty() {
+        return ruby_member_fq(owner_segments, name);
+    }
+
+    let mut resolved_owner = Vec::new();
+    resolved_owner.extend_from_slice(lexical_segments);
+    resolved_owner.extend_from_slice(owner_segments);
+    ruby_member_fq(&resolved_owner, name)
 }
 
 pub(crate) struct RubyNamePath {

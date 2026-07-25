@@ -42,6 +42,78 @@ pub(crate) fn analyzed_files_for_language(
     files
 }
 
+/// Lazily walks a [`CodeUnit`]'s enclosing-owner chain outward, starting at
+/// `start` itself and stepping via caller-supplied `step` on every
+/// subsequent pull. `step` is ordinarily a direct or budget-charging wrapper
+/// over `analyzer.parent_of` (dynamic dispatch, so per-language overrides —
+/// e.g. rust's and scala's opposite structural-vs-fqn precedence — apply
+/// automatically); the walk never reimplements the fqn-split default itself.
+///
+/// This is the shared shape behind ~10 per-language "find/collect enclosing
+/// owners" copies that differ only in what happens once a candidate is in
+/// hand:
+/// - `.find(accept)` — the innermost owner `accept` approves (java's/csharp's
+///   enclosing-class lookup, python's/php's self-receiver owner).
+/// - `.take_while(accept).collect()` — the contiguous run of approved owners
+///   from `start` outward, stopping at the first rejection (cpp's enclosing
+///   class chain).
+/// - `.filter(accept).collect()` — every approved owner anywhere in the
+///   chain, walking all the way to the root regardless of what's skipped in
+///   between (cpp's indexed enclosing components; scala's template-owner
+///   walk over non-CodeUnit intermediate scopes).
+///
+/// Deliberately lazy: `step` is called only when a consumer actually pulls
+/// the next item (never speculatively), so a `.find`/`.take_while` that
+/// stops after `k` accepted owners calls `step` exactly `k` times — the same
+/// number of `parent_of` hops the hand-written `while` loops it replaces
+/// would have charged.
+pub(crate) fn enclosing_owner_chain<S>(start: CodeUnit, step: S) -> EnclosingOwnerChain<S>
+where
+    S: FnMut(&CodeUnit) -> Option<CodeUnit>,
+{
+    EnclosingOwnerChain {
+        last: Some(start),
+        step,
+        started: false,
+    }
+}
+
+pub(crate) struct EnclosingOwnerChain<S> {
+    last: Option<CodeUnit>,
+    step: S,
+    started: bool,
+}
+
+impl<S> Iterator for EnclosingOwnerChain<S>
+where
+    S: FnMut(&CodeUnit) -> Option<CodeUnit>,
+{
+    type Item = CodeUnit;
+
+    fn next(&mut self) -> Option<CodeUnit> {
+        if self.started {
+            let previous = self.last.as_ref()?;
+            self.last = (self.step)(previous);
+        } else {
+            self.started = true;
+        }
+        self.last.clone()
+    }
+}
+
+/// Yields `fqn`, then each progressively shorter dot-truncated prefix down to
+/// (and including) the last single segment — `"a.b.c"` → `"a.b.c"`, `"a.b"`,
+/// `"a"` — never descending to the bare empty string unless `fqn` itself is
+/// empty. Mirrors the `rfind('.') / truncate` idiom duplicated by every
+/// "try the nearest enclosing scope, then its parent scope, ..." qualified-
+/// name resolver (csharp's enclosing-namespace search, the shared
+/// enclosing-scope resolver); callers that must skip the bare top level
+/// entirely (see `resolve_in_enclosing_scopes`'s doc comment) add their own
+/// `.take_while(|prefix| !prefix.is_empty())`.
+pub(crate) fn namespace_prefixes(fqn: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(fqn), |scope| scope.rfind('.').map(|idx| &scope[..idx]))
+}
+
 /// Whether `left` and `right` are the same syntax node, by tree-sitter node
 /// identity. Exact where a byte-range comparison can collide a unit/wrapper node
 /// with its sole child (which share an identical span); both nodes must come from

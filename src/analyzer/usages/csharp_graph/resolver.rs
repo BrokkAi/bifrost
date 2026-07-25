@@ -1854,19 +1854,14 @@ fn resolve_in_enclosing_namespace(
     namespace: &str,
     name: &str,
 ) -> Option<CodeUnit> {
-    let mut namespace = namespace.to_string();
-    loop {
-        let candidate_fqn = if namespace.is_empty() {
+    crate::analyzer::usages::common::namespace_prefixes(namespace).find_map(|scope| {
+        let candidate_fqn = if scope.is_empty() {
             name.to_string()
         } else {
-            format!("{namespace}.{name}")
+            format!("{scope}.{name}")
         };
-        if let Some(candidate) = class_unit_for_fq_name(csharp, &candidate_fqn) {
-            return Some(candidate);
-        }
-        let separator = namespace.rfind('.')?;
-        namespace.truncate(separator);
-    }
+        class_unit_for_fq_name(csharp, &candidate_fqn)
+    })
 }
 
 fn type_parameter_shadows_reference(node: Node<'_>, source: &str, reference: &str) -> bool {

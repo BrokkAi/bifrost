@@ -971,7 +971,10 @@ fn resolve_rust_unscoped(
                     ) {
                         return candidates_outcome(vec![unit]);
                     }
-                    return boundary(format!(
+                    // gated upstream: the enclosing-scope member fallback and the
+                    // current-module candidates just above are the workspace
+                    // check; only a genuinely-unindexed import reaches here.
+                    return boundary_unchecked(format!(
                         "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
                     ));
                 }
@@ -1019,7 +1022,23 @@ fn resolve_rust_unscoped(
         return candidates_outcome(candidates);
     }
     if rust_reference_looks_external(reference) {
-        return boundary(format!(
+        // A `::`-qualified reference reaches here only after the scoped-
+        // associated-item and visible-import paths above are exhausted. Before a
+        // confident boundary claim, consult the enclosing lexical scope: now that
+        // the shared resolver is separator-aware (#1162), the member fallback can
+        // match a `::`-qualified path (`inner::Config` -> a workspace-declared
+        // enclosing-scope `inner.Config`) instead of being inert as the ff08191a
+        // NOTE recorded. Rust's own scoped-associated resolution already catches
+        // every enclosing-qualified workspace shape upstream (see
+        // issue_1162's rust pin), so this fires only as the #1126 safety net for
+        // a future upstream regression — a genuinely-external `::` path yields
+        // `None` here and still draws the boundary.
+        if let Some(unit) =
+            rust_enclosing_scope_member_fallback(analyzer, file, reference, site.focus_start_byte)
+        {
+            return candidates_outcome(vec![unit]);
+        }
+        return boundary_unchecked(format!(
             "`{reference}` appears to cross a Rust crate/module boundary not indexed in this workspace"
         ));
     }
@@ -1438,7 +1457,23 @@ fn rust_macro_name_outcome(
             RustVisibleImportResolution::Resolved(candidates)
             | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
             RustVisibleImportResolution::BoundButUnindexed => {
-                return Some(boundary(format!(
+                // An unresolvable macro import must not blind the reference to a
+                // workspace-declared macro of the same name in an enclosing
+                // scope: macros keep their own namespace, so consult it before
+                // claiming an unindexed boundary (#1158, the macro-namespace
+                // analogue of the type-namespace fallback its siblings run).
+                if let Some(unit) = resolve_in_enclosing_scopes(
+                    analyzer,
+                    file,
+                    name,
+                    site.focus_start_byte,
+                    CodeUnit::is_macro,
+                ) {
+                    return Some(candidates_outcome(vec![unit]));
+                }
+                // gated upstream: the macro-namespace enclosing-scope fallback
+                // above is the workspace check.
+                return Some(boundary_unchecked(format!(
                     "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
                 )));
             }
@@ -2565,17 +2600,18 @@ fn rust_focused_prefix_resolution_outcome(
                 ) {
                     return candidates_outcome(vec![unit]);
                 }
-                if rust_focused_is_workspace_module_namespace(rust, file, focused_text) {
-                    return no_definition(
-                        "workspace_module_namespace",
-                        format!(
-                            "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
-                        ),
-                    );
-                }
-                return boundary(format!(
-                    "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
-                ));
+                // The enclosing-scope fallback above already returned early; the
+                // remaining gate is the #1089 workspace-module-namespace check.
+                return gated_boundary(
+                    || rust_focused_is_workspace_module_namespace(rust, file, focused_text),
+                    format!(
+                        "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
+                    ),
+                    "workspace_module_namespace",
+                    format!(
+                        "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+                    ),
+                );
             }
             RustVisibleImportResolution::Unbound => {}
         }
@@ -2632,7 +2668,10 @@ fn rust_focused_prefix_resolution_outcome(
             if !routed.is_empty() {
                 return candidates_outcome(routed);
             }
-            return boundary(format!(
+            // gated upstream: reached only inside a resolved Cargo library route
+            // whose crate root the workspace does not index — the route
+            // resolution itself is the workspace check.
+            return boundary_unchecked(format!(
                 "focused Rust owner `{focused_text}` resolves through Cargo but its crate root is not indexed"
             ));
         }
@@ -2712,19 +2751,22 @@ fn rust_focused_prefix_resolution_outcome(
         // extern-prelude crate that an inline `mod <name>` shadows (`mod
         // serde_json { serde_json::… }`), which is genuinely unindexed — keep the
         // boundary there.
-        if !enclosing_module_self_root
-            && rust_focused_is_workspace_module_namespace(rust, file, focused_text)
-        {
-            return no_definition(
-                "workspace_module_namespace",
-                format!(
-                    "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
-                ),
-            );
-        }
-        return boundary(format!(
-            "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
-        ));
+        // Enclosing-scope fallback above returned early; the residual gate is the
+        // #1089 workspace-module check (except for an inline `mod <name>` self-
+        // root shadow, which stays a genuine boundary).
+        return gated_boundary(
+            || {
+                !enclosing_module_self_root
+                    && rust_focused_is_workspace_module_namespace(rust, file, focused_text)
+            },
+            format!(
+                "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
+            ),
+            "workspace_module_namespace",
+            format!(
+                "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+            ),
+        );
     }
     no_definition(
         "no_indexed_definition",

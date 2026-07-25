@@ -1070,6 +1070,7 @@ fn ruby_tail_expression(node: Node<'_>) -> Option<Node<'_>> {
 
 fn ruby_lexical_stack_for_owner(owner_fq_name: &str) -> Vec<String> {
     let segments: Vec<_> = owner_fq_name
+        // fqname-M4: builds the ruby lexical-scope stack from a `&str` owner fq-name (no CodeUnit/fq at this call site)
         .split('$')
         .filter(|segment| !segment.is_empty())
         .collect();
