@@ -44,6 +44,7 @@ pub(crate) mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 pub(crate) mod type_relations;
 mod typescript;
+pub mod typestate;
 mod usage_facts;
 pub mod usages;
 mod work_budget;

@@ -42,6 +42,13 @@ required for that checkpoint.
   implementation from #822 and recorded an explicit solver-backend gate before
   client propagation.
 - [x] (2026-07-25 10:28+02:00) Wrote this issue-specific ExecPlan.
+- [x] (2026-07-25 10:31+02:00) Committed the plan as `ea604505` after
+  fast-forwarding the issue branch to the fetched `origin/master`.
+- [x] (2026-07-25 11:08+02:00) Implemented the bounded, versioned internal
+  protocol model, dense compiled IDs, validation diagnostics, linear guard
+  determinism checks, canonical rendering/hash, and the policy-layer hash
+  compatibility re-export. Existing policy hash tests and strict library
+  clippy pass.
 - [ ] Implement and validate the internal protocol model, compiler,
   canonicalization, typed hash, deterministic rendering, and lifecycle fixture.
 - [ ] Run the guided specialist review over the first protocol checkpoint and
@@ -101,6 +108,13 @@ required for that checkpoint.
   value lattices and edge-function composition. The protocol checkpoint can
   proceed independently; client representation is a named gate after syncing
   the live solver work.
+
+- Observation: the shell resolves `cargo` and `rustc` through rustup but
+  resolves `clippy-driver` from Homebrew, producing an incompatible-crate
+  failure despite matching version strings.
+  Evidence: both isolated and ordinary `cargo clippy` failed in `build.rs`
+  until the rustup toolchain directory was prepended to `PATH`; the corrected
+  strict library clippy invocation then passed.
 
 ## Decision Log
 
