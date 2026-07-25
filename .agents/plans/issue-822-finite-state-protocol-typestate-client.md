@@ -101,7 +101,12 @@ required for that checkpoint.
   representation for the typestate client. Moved
   `TypestateBindingPlanHash` ownership to the internal typestate layer while
   preserving the policy re-export.
-- [ ] Define the pre-resolved subject/event binding plan.
+- [x] (2026-07-25 15:21+02:00) Defined the bounded pre-resolved binding-plan
+  contract: deterministic subject IDs, semantic object roles, exact
+  point/call/context indexes, proof/completeness/multiplicity retention, and a
+  separate schema-v1 canonical binding hash. Stable subject, site, and context
+  identity is derived from validated semantic handles rather than accepted
+  from callers. Focused behavior tests and strict all-feature Clippy pass.
 - [ ] Implement typestate propagation, diagnostic-neutral findings, explicit
   uncertainty semantics, and consumption of #1171's generic witness API.
 - [ ] Add controlled-graph and equivalent TypeScript/Java conformance fixtures,
@@ -192,6 +197,14 @@ required for that checkpoint.
   Their generated caches were moved out of the worktree and no generated files
   were retained or staged.
 
+- Observation: accepting caller-supplied semantic locators beside runtime
+  handles makes a canonical binding hash unsound even when scope validation
+  succeeds.
+  Evidence: a locator can belong to the same artifact yet name a different
+  value, point, call, or context than the paired handle. The binding contract
+  now derives a stable structural object/site/context key from each validated
+  handle, including call-result contexts and source-backed capture ports.
+
 ## Decision Log
 
 - Decision: keep the internal typestate module independent of
@@ -276,6 +289,15 @@ required for that checkpoint.
   protocol/binding/finding contracts and avoids either blocking on or
   duplicating the generic IDE work. A future IDE adapter may reuse the same
   contracts without changing schema-v1 identity.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: make semantic runtime handles the sole source of canonical binding
+  identity.
+  Rationale: independently supplied locators allow a valid runtime index and a
+  different persisted identity to coexist, which can cause cache collisions or
+  stale-plan reuse. Deriving source locators, port keys, and bounded call
+  contexts from validated handles makes the runtime and canonical domains agree
+  by construction.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: commit after every plan step and review-fix checkpoint, fetch

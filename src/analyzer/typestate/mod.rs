@@ -4,9 +4,22 @@
 //! This module owns only diagnostic-neutral executable protocol semantics and
 //! the client-side analysis contracts that consume them.
 
+mod binding;
 mod hash;
 mod protocol;
 
+pub use binding::{
+    BINDING_PLAN_SCHEMA_VERSION, BoundTypestateEvent, BoundTypestateInitialSeed,
+    BoundTypestateSubject, BoundTypestateSubjectSpec, BoundTypestateTerminal,
+    MAX_TYPESTATE_CONTEXT_DEPTH, MAX_TYPESTATE_EVENT_BINDINGS, MAX_TYPESTATE_INITIAL_SEEDS,
+    MAX_TYPESTATE_SUBJECT_CLASS_BYTES, MAX_TYPESTATE_SUBJECTS, MAX_TYPESTATE_TERMINAL_BINDINGS,
+    TypestateBindingContext, TypestateBindingMultiplicity, TypestateBindingPlan,
+    TypestateBindingPlanError, TypestateBindingQuality, TypestateContextKey,
+    TypestateEventBindingSpec, TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole,
+    TypestateObservationSite, TypestateProcedurePortKey, TypestateSubjectClassError,
+    TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey,
+    TypestateTerminalBindingSpec,
+};
 pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
 pub use protocol::{
     CompiledProtocol, CompiledProtocolEvent, CompiledProtocolGuard, CompiledProtocolTransition,
