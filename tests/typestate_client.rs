@@ -1,5 +1,7 @@
 mod common;
 
+use std::cell::Cell;
+
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, SolverBudget,
 };
@@ -363,6 +365,46 @@ fn expansion_protocol(state_count: usize) -> CompiledProtocol {
     .unwrap()
 }
 
+fn error_expansion_protocol(state_count: usize) -> CompiledProtocol {
+    ProtocolSpec {
+        schema_version: 1,
+        states: (0..state_count).map(|index| format!("s{index}")).collect(),
+        initial_state: "s0".into(),
+        accepting_states: vec!["s0".into()],
+        error_states: (1..state_count).map(|index| format!("s{index}")).collect(),
+        events: vec![ProtocolEventSpec {
+            id: "tick".into(),
+            observation: ProtocolObservationSpec {
+                occurrence: ProtocolEventOccurrence::Endpoint {
+                    phase: ProtocolObservationPhase::BeforeCall,
+                },
+            },
+        }],
+        transitions: (0..state_count - 1)
+            .map(|index| ProtocolTransitionSpec {
+                from: format!("s{index}"),
+                on: "tick".into(),
+                to: format!("s{}", index + 1),
+                guard: ProtocolGuardSpec::Always,
+            })
+            .collect(),
+        terminal_expectations: Vec::new(),
+        semantics: ProtocolSemantics {
+            analysis_mode: ProtocolAnalysisMode::May,
+            unmatched_event: ProtocolUnmatchedEventBehavior::PreserveState,
+            uncertainty: ProtocolUncertaintySemantics {
+                ambiguous_dispatch: ProtocolUncertaintyBehavior::ConservativeTransition,
+                unknown_call: ProtocolUncertaintyBehavior::ConservativeTransition,
+                external_call: ProtocolUncertaintyBehavior::ConservativeTransition,
+                escape: ProtocolUncertaintyBehavior::Abstain,
+                incomplete_analysis: ProtocolUncertaintyBehavior::ConservativeTransition,
+            },
+        },
+    }
+    .compile()
+    .unwrap()
+}
+
 fn solve_summary(fixture: &ClientFixture, analyzer: &WorkspaceAnalyzer) -> TypestateSummaryResult {
     let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
     let mut solver_budget = SolverBudget::default();
@@ -402,6 +444,25 @@ impl DataflowOutput<TypestateFact> for StoppedOutput {
     fn emit(&mut self, _fact: TypestateFact) -> bool {
         self.emitted += 1;
         false
+    }
+}
+
+struct PollingOutput {
+    polls: Cell<usize>,
+    stop_after: usize,
+    emitted: usize,
+}
+
+impl DataflowOutput<TypestateFact> for PollingOutput {
+    fn should_continue(&self) -> bool {
+        let polls = self.polls.get().saturating_add(1);
+        self.polls.set(polls);
+        polls <= self.stop_after
+    }
+
+    fn emit(&mut self, _fact: TypestateFact) -> bool {
+        self.emitted = self.emitted.saturating_add(1);
+        true
     }
 }
 
@@ -916,6 +977,131 @@ fn callback_expansion_limit_collapses_to_an_explicit_inconclusive_state() {
             .uncertainty()
             .contains(TypestateUncertainty::IncompleteAnalysis)
     );
+}
+
+#[test]
+fn retained_safe_outcomes_do_not_consume_quadratic_expansion_work() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let protocol = expansion_protocol(2);
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        Vec::new(),
+        (0..512)
+            .map(|order| {
+                TypestateEventBindingSpec::new(
+                    ProtocolEventKey::new("tick").unwrap(),
+                    fixture.subject_key.clone(),
+                    TypestateObservationSite::program_point(
+                        fixture.entry.clone(),
+                        TypestateBindingContext::root(),
+                    ),
+                    order,
+                    TypestateObjectRole::MatchedValue,
+                    exact.clone(),
+                )
+            })
+            .collect(),
+        Vec::new(),
+    )
+    .unwrap();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+    let final_state = protocol
+        .state_id(&ProtocolStateKey::new("s1").unwrap())
+        .unwrap();
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::Intraprocedural(
+                brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+            ),
+            None,
+            &fixture.entry,
+            &fixture.use_point,
+            &proven,
+            &complete,
+        ),
+        problem
+            .state_fact(&fixture.subject_key, &ProtocolStateKey::new("s0").unwrap())
+            .unwrap(),
+        TestTransfer::Normal,
+    );
+
+    assert!(result.iter().any(|fact| {
+        fact.protocol_state() == Some(final_state)
+            && !fact.abstained()
+            && fact.uncertainty().is_empty()
+    }));
+}
+
+#[test]
+fn conservative_witness_products_observe_mid_expansion_cancellation() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let protocol = error_expansion_protocol(400);
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        Vec::new(),
+        (0..400)
+            .map(|order| {
+                TypestateEventBindingSpec::new(
+                    ProtocolEventKey::new("tick").unwrap(),
+                    fixture.subject_key.clone(),
+                    TypestateObservationSite::call_site(
+                        fixture.close_call.clone(),
+                        TypestateBindingContext::root(),
+                    ),
+                    order,
+                    TypestateObjectRole::Argument,
+                    exact.clone(),
+                )
+            })
+            .collect(),
+        Vec::new(),
+    )
+    .unwrap();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+    let boundary = brokk_bifrost::analyzer::semantic::DispatchBoundaryKind::Unresolved;
+    let mut output = PollingOutput {
+        polls: Cell::new(0),
+        stop_after: 405,
+        emitted: 0,
+    };
+
+    problem.call_to_return_flow(
+        DataflowEdge::new(
+            IcfgEdgeKind::CallToNormalContinuation,
+            Some(&fixture.close_call),
+            &fixture.use_point,
+            &fixture.close_point,
+            &proven,
+            &complete,
+        )
+        .with_boundary(&boundary),
+        problem
+            .state_fact(&fixture.subject_key, &ProtocolStateKey::new("s0").unwrap())
+            .unwrap(),
+        &mut output,
+    );
+
+    assert!(output.polls.get() > 400);
+    assert!(output.polls.get() <= output.stop_after + 2);
+    assert_eq!(output.emitted, 0);
 }
 
 #[test]

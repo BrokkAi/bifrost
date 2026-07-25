@@ -652,18 +652,19 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     ProtocolUncertaintyCause::UnknownCall
                 }
             };
-            if !facts.map(out, |fact| {
-                self.apply_uncertainty(fact, cause, &eligible_events)
+            if !facts.map_stream(out, |fact, emit| {
+                self.emit_uncertainty(fact, cause, &eligible_events, emit)
             }) {
                 return facts.emit(out);
             }
         } else if (!matches!(edge.proof(), ProofStatus::Proven)
             || !matches!(edge.completeness(), EvidenceCompleteness::Complete))
-            && !facts.map(out, |fact| {
-                self.apply_uncertainty(
+            && !facts.map_stream(out, |fact, emit| {
+                self.emit_uncertainty(
                     fact,
                     ProtocolUncertaintyCause::IncompleteAnalysis,
                     &eligible_events,
+                    emit,
                 )
             })
         {
@@ -735,17 +736,18 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     .occurrence,
                 ProtocolEventOccurrence::Escape
             ) {
-                return facts.map(out, |fact| {
+                return facts.map_stream(out, |fact, emit| {
                     if !matches!(fact.0, TypestateFactKind::State { .. })
                         || fact.subject() != Some(binding.subject())
                         || fact.abstained()
                     {
-                        vec![fact]
+                        emit(fact)
                     } else {
-                        self.apply_uncertainty(
+                        self.emit_uncertainty(
                             fact,
                             ProtocolUncertaintyCause::Escape,
                             &[EligibleEvent::from_binding(binding)],
+                            emit,
                         )
                     }
                 });
@@ -766,17 +768,18 @@ impl<'plan> TypestateFlowProblem<'plan> {
         let call_site = binding.site().call_site_handle().is_some();
         if retained_multiple
             && call_site
-            && !facts.map(out, |fact| {
+            && !facts.map_stream(out, |fact, emit| {
                 if !matches!(fact.0, TypestateFactKind::State { .. })
                     || fact.subject() != Some(binding.subject())
                     || fact.abstained()
                 {
-                    vec![fact]
+                    emit(fact)
                 } else {
-                    self.apply_uncertainty(
+                    self.emit_uncertainty(
                         fact,
                         ProtocolUncertaintyCause::AmbiguousDispatch,
                         &[EligibleEvent::from_binding(binding)],
+                        emit,
                     )
                 }
             })
@@ -784,17 +787,18 @@ impl<'plan> TypestateFlowProblem<'plan> {
             return false;
         }
         if (!quality.is_proven() || !quality.is_complete() || (retained_multiple && !call_site))
-            && !facts.map(out, |fact| {
+            && !facts.map_stream(out, |fact, emit| {
                 if !matches!(fact.0, TypestateFactKind::State { .. })
                     || fact.subject() != Some(binding.subject())
                     || fact.abstained()
                 {
-                    vec![fact]
+                    emit(fact)
                 } else {
-                    self.apply_uncertainty(
+                    self.emit_uncertainty(
                         fact,
                         ProtocolUncertaintyCause::IncompleteAnalysis,
                         &[EligibleEvent::from_binding(binding)],
+                        emit,
                     )
                 }
             })
@@ -980,6 +984,22 @@ impl<'plan> TypestateFlowProblem<'plan> {
         cause: ProtocolUncertaintyCause,
         eligible_events: &[EligibleEvent],
     ) -> Vec<TypestateFact> {
+        let mut facts = Vec::new();
+        let emitted_all = self.emit_uncertainty(fact, cause, eligible_events, &mut |fact| {
+            facts.push(fact);
+            true
+        });
+        debug_assert!(emitted_all, "Vec-backed uncertainty sink cannot stop");
+        facts
+    }
+
+    fn emit_uncertainty(
+        &self,
+        fact: TypestateFact,
+        cause: ProtocolUncertaintyCause,
+        eligible_events: &[EligibleEvent],
+        emit: &mut dyn FnMut(TypestateFact) -> bool,
+    ) -> bool {
         let uncertainty_kind = uncertainty_kind(cause);
         match fact.0 {
             TypestateFactKind::Violation {
@@ -989,13 +1009,13 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 uncertainty,
                 abstained,
             } => {
-                return vec![TypestateFact(TypestateFactKind::Violation {
+                return emit(TypestateFact(TypestateFactKind::Violation {
                     plan,
                     subject,
                     violation,
                     uncertainty: uncertainty.with(uncertainty_kind),
                     abstained,
-                })];
+                }));
             }
             TypestateFactKind::NonViolation {
                 plan,
@@ -1004,13 +1024,13 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 uncertainty,
                 abstained,
             } => {
-                return vec![TypestateFact(TypestateFactKind::NonViolation {
+                return emit(TypestateFact(TypestateFactKind::NonViolation {
                     plan,
                     subject,
                     event_binding,
                     uncertainty: uncertainty.with(uncertainty_kind),
                     abstained,
-                })];
+                }));
             }
             TypestateFactKind::Terminal {
                 plan,
@@ -1020,14 +1040,14 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 uncertainty,
                 abstained,
             } => {
-                return vec![TypestateFact(TypestateFactKind::Terminal {
+                return emit(TypestateFact(TypestateFactKind::Terminal {
                     plan,
                     subject,
                     terminal_binding,
                     state,
                     uncertainty: uncertainty.with(uncertainty_kind),
                     abstained,
-                })];
+                }));
             }
             TypestateFactKind::Zero | TypestateFactKind::State { .. } => {}
         }
@@ -1039,7 +1059,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
             abstained,
         } = fact.0
         else {
-            return Vec::new();
+            return true;
         };
         let cardinality = self
             .bindings
@@ -1052,36 +1072,34 @@ impl<'plan> TypestateFlowProblem<'plan> {
             cardinality,
             eligible_events.iter().map(|eligible| eligible.event),
         ) else {
-            return vec![TypestateFact(TypestateFactKind::State {
+            return emit(TypestateFact(TypestateFactKind::State {
                 plan,
                 subject,
                 state,
                 uncertainty: uncertainty.with(TypestateUncertainty::IncompleteAnalysis),
                 abstained: true,
-            })];
+            }));
         };
         let uncertainty = uncertainty.with(uncertainty_kind);
         match resolution {
             ProtocolUncertaintyResolution::StateSet(states) => {
-                let mut facts = states
-                    .states()
-                    .iter()
-                    .map(|state| {
-                        TypestateFact(TypestateFactKind::State {
-                            plan,
-                            subject,
-                            state: *state,
-                            uncertainty,
-                            abstained,
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                for state in states.states() {
+                    if !emit(TypestateFact(TypestateFactKind::State {
+                        plan,
+                        subject,
+                        state: *state,
+                        uncertainty,
+                        abstained,
+                    })) {
+                        return false;
+                    }
+                }
                 for witness in states.error_witnesses() {
                     for binding in eligible_events
                         .iter()
                         .filter(|eligible| eligible.event == witness.event())
                     {
-                        facts.push(TypestateFact(TypestateFactKind::Violation {
+                        if !emit(TypestateFact(TypestateFactKind::Violation {
                             plan,
                             subject,
                             violation: TypestateViolation {
@@ -1091,28 +1109,30 @@ impl<'plan> TypestateFlowProblem<'plan> {
                             },
                             uncertainty,
                             abstained,
-                        }));
+                        })) {
+                            return false;
+                        }
                     }
                 }
-                facts
+                true
             }
             ProtocolUncertaintyResolution::PreserveUncertainty { state } => {
-                vec![TypestateFact(TypestateFactKind::State {
+                emit(TypestateFact(TypestateFactKind::State {
                     plan,
                     subject,
                     state,
                     uncertainty,
                     abstained,
-                })]
+                }))
             }
             ProtocolUncertaintyResolution::Abstain => {
-                vec![TypestateFact(TypestateFactKind::State {
+                emit(TypestateFact(TypestateFactKind::State {
                     plan,
                     subject,
                     state,
                     uncertainty,
                     abstained: true,
-                })]
+                }))
             }
         }
     }
@@ -1261,24 +1281,64 @@ impl TransferFactSet {
         out: &dyn DataflowOutput<TypestateFact>,
         mut mapper: impl FnMut(TypestateFact) -> Vec<TypestateFact>,
     ) -> bool {
+        self.map_stream(out, |fact, emit| {
+            for output in mapper(fact) {
+                if !emit(output) {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    fn map_stream(
+        &mut self,
+        out: &dyn DataflowOutput<TypestateFact>,
+        mut mapper: impl FnMut(TypestateFact, &mut dyn FnMut(TypestateFact) -> bool) -> bool,
+    ) -> bool {
         if self.overflowed {
             return false;
         }
         let current = std::mem::take(&mut self.facts);
+        let mut next = BTreeSet::new();
+        let mut expansions = self.expansions;
+        let mut outputs = 0usize;
+        let mut overflowed = false;
         for fact in current {
             if !out.should_continue() {
+                self.facts = next;
                 return false;
             }
-            for output in mapper(fact) {
-                if self.expansions.is_multiple_of(256) && !out.should_continue() {
+            let mut emit = |output| {
+                outputs = outputs.saturating_add(1);
+                if outputs.is_multiple_of(256) && !out.should_continue() {
                     return false;
                 }
-                if !self.insert(output) {
+                if output != fact {
+                    expansions = expansions.saturating_add(1);
+                    if expansions > MAX_TYPESTATE_CALLBACK_EXPANSIONS {
+                        overflowed = true;
+                        return false;
+                    }
+                }
+                if !next.contains(&output) && next.len() >= MAX_TYPESTATE_CALLBACK_FACTS {
+                    overflowed = true;
+                    return false;
+                }
+                next.insert(output);
+                true
+            };
+            if !mapper(fact, &mut emit) {
+                self.expansions = expansions;
+                self.facts = next;
+                if overflowed {
                     self.collapse();
-                    return false;
                 }
+                return false;
             }
         }
+        self.expansions = expansions;
+        self.facts = next;
         true
     }
 
@@ -1565,5 +1625,50 @@ const fn uncertainty_kind(cause: ProtocolUncertaintyCause) -> TypestateUncertain
         ProtocolUncertaintyCause::ExternalCall => TypestateUncertainty::ExternalCall,
         ProtocolUncertaintyCause::Escape => TypestateUncertainty::Escape,
         ProtocolUncertaintyCause::IncompleteAnalysis => TypestateUncertainty::IncompleteAnalysis,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct PollingOutput {
+        polls: Cell<usize>,
+    }
+
+    impl DataflowOutput<TypestateFact> for PollingOutput {
+        fn should_continue(&self) -> bool {
+            let polls = self.polls.get().saturating_add(1);
+            self.polls.set(polls);
+            polls <= 2
+        }
+
+        fn emit(&mut self, _value: TypestateFact) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn streamed_mapper_stops_generation_during_expansion() {
+        let mut facts = TransferFactSet::new(vec![TypestateFact::zero()]);
+        let output = PollingOutput {
+            polls: Cell::new(0),
+        };
+        let generated = Cell::new(0usize);
+
+        let completed = facts.map_stream(&output, |_fact, emit| {
+            for _ in 0..1_000_000 {
+                generated.set(generated.get().saturating_add(1));
+                if !emit(TypestateFact::zero()) {
+                    return false;
+                }
+            }
+            true
+        });
+
+        assert!(!completed);
+        assert_eq!(generated.get(), 512);
     }
 }
