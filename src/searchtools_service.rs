@@ -1,8 +1,8 @@
 #[cfg(feature = "nlp")]
 use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
-    AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
-    WorkspaceAnalyzer,
+    AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
+    ProjectFile, WorkspaceAnalyzer,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
@@ -542,6 +542,16 @@ impl SearchToolsService {
         arguments: Value,
         render_options: RenderOptions,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.call_tool_output_with_cancellation(name, arguments, render_options, None)
+    }
+
+    pub(crate) fn call_tool_output_with_cancellation(
+        &self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         // Lifecycle tools bypass watcher delta application: refresh rebuilds
         // explicitly, activate replaces the whole workspace, and get is cheap.
         match name {
@@ -672,7 +682,8 @@ impl SearchToolsService {
                 |workspace, params| usage_graph(workspace.analyzer(), params),
             ),
             "query_code" => {
-                let output = Self::query_code_result_for_snapshot(&snapshot, arguments)?;
+                let output =
+                    Self::query_code_result_for_snapshot(&snapshot, arguments, cancellation)?;
                 let rendered_text = output.render_text();
                 let structured = serde_json::to_value(&output).map_err(|err| {
                     SearchToolsServiceError::internal(format!(
@@ -782,17 +793,26 @@ impl SearchToolsService {
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let arguments = self.normalize_arguments_for_current_workspace("query_code", arguments)?;
         let snapshot = self.snapshot_for_query()?;
-        let result = Self::query_code_result_for_snapshot(&snapshot, arguments);
+        let result = Self::query_code_result_for_snapshot(&snapshot, arguments, None);
         snapshot.finish("query_code", result)
     }
 
     fn query_code_result_for_snapshot(
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(crate::analyzer::structural::execute_workspace_request(
-            snapshot, &query,
+        Ok(cancellation.map_or_else(
+            || crate::analyzer::structural::execute_workspace_request(snapshot, &query),
+            |cancellation| {
+                crate::analyzer::structural::execute_workspace_request_with_cancellation(
+                    snapshot,
+                    &query,
+                    crate::analyzer::structural::CodeQueryExecutionLimits::default(),
+                    cancellation,
+                )
+            },
         ))
     }
 

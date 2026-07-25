@@ -1,6 +1,6 @@
 use crate::{
-    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
-    analyzer::policy::escape_terminal_text, searchtools_render::RenderOptions,
+    CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+    ToolOutput, analyzer::policy::escape_terminal_text, searchtools_render::RenderOptions,
     tool_arguments::normalize_tool_arguments,
 };
 use serde::Serialize;
@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -66,6 +68,59 @@ struct McpConnectionState {
     pending_roots_request: Option<String>,
     roots_refresh_requested: bool,
     next_request_id: u64,
+}
+
+#[derive(Clone, Default)]
+struct McpRequestCancellations {
+    active: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl McpRequestCancellations {
+    fn register(&self, id: &Value) -> Option<CancellationToken> {
+        let key = request_id_key(id);
+        let token = CancellationToken::default();
+        let mut active = self.active.lock().expect("MCP cancellation lock poisoned");
+        if active.contains_key(&key) {
+            return None;
+        }
+        active.insert(key, token.clone());
+        Some(token)
+    }
+
+    fn complete(&self, id: &Value) {
+        self.active
+            .lock()
+            .expect("MCP cancellation lock poisoned")
+            .remove(&request_id_key(id));
+    }
+
+    fn cancel(&self, id: &Value) -> bool {
+        let token = self
+            .active
+            .lock()
+            .expect("MCP cancellation lock poisoned")
+            .get(&request_id_key(id))
+            .cloned();
+        token.is_some_and(|token| {
+            token.cancel();
+            true
+        })
+    }
+
+    fn cancel_all(&self) {
+        for token in self
+            .active
+            .lock()
+            .expect("MCP cancellation lock poisoned")
+            .values()
+        {
+            token.cancel();
+        }
+    }
+}
+
+fn request_id_key(id: &Value) -> String {
+    serde_json::to_string(id).expect("JSON-RPC request IDs always serialize")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,20 +220,39 @@ pub fn run_stdio_server(
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
     let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
-    let service = match (root, watch_files) {
+    let service = Arc::new(match (root, watch_files) {
         (Some(root), true) => SearchToolsService::new_deferred(root)?,
         (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
-    };
+    });
     let mut connection = McpConnectionState::new(accepts_client_roots);
+    let cancellations = McpRequestCancellations::default();
+    let (response_sender, response_receiver) = mpsc::channel::<Value>();
+    let writer = thread::Builder::new()
+        .name("bifrost-mcp-writer".to_string())
+        .spawn(move || -> Result<(), String> {
+            let mut stdout = io::stdout();
+            for response in response_receiver {
+                let encoded = serde_json::to_string(&response)
+                    .map_err(|err| format!("Failed to serialize MCP response: {err}"))?;
+                writeln!(stdout, "{encoded}")
+                    .and_then(|_| stdout.flush())
+                    .map_err(|err| format!("Failed to write MCP response: {err}"))?;
+            }
+            Ok(())
+        })
+        .map_err(|err| format!("Failed to start MCP response writer: {err}"))?;
 
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let mut read_error = None;
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) => line,
-            Err(err) => return Err(format!("Failed to read MCP request: {err}")),
+            Err(err) => {
+                read_error = Some(format!("Failed to read MCP request: {err}"));
+                break;
+            }
         };
 
         if line.trim().is_empty() {
@@ -187,7 +261,54 @@ pub fn run_stdio_server(
 
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(message) => {
-                dispatch_message(&service, &mut connection, message, render_options, spec)
+                if let Some((id, params)) = cancellable_query_request(&message, spec) {
+                    match prepare_tool_call(
+                        service.as_ref(),
+                        &mut connection,
+                        params,
+                        render_options,
+                        spec,
+                    ) {
+                        Ok(ToolCallPreparation::Reply(result)) => {
+                            Some(success_response(id, result))
+                        }
+                        Ok(ToolCallPreparation::Ready(call)) => {
+                            let Some(cancellation) = cancellations.register(&id) else {
+                                response_sender
+                                    .send(error_response(
+                                        id,
+                                        INVALID_REQUEST,
+                                        "duplicate in-flight JSON-RPC request id".to_string(),
+                                    ))
+                                    .map_err(|_| {
+                                        "MCP response writer stopped unexpectedly".to_string()
+                                    })?;
+                                continue;
+                            };
+                            let service = Arc::clone(&service);
+                            let response_sender = response_sender.clone();
+                            spawn_cancellable_tool_call(
+                                service,
+                                call,
+                                id,
+                                cancellation,
+                                cancellations.clone(),
+                                response_sender,
+                            )?;
+                            None
+                        }
+                        Err((code, message)) => Some(error_response(id, code, message)),
+                    }
+                } else {
+                    dispatch_message(
+                        service.as_ref(),
+                        &mut connection,
+                        &cancellations,
+                        message,
+                        render_options,
+                        spec,
+                    )
+                }
             }
             Err(err) => Some(error_response(
                 Value::Null,
@@ -197,12 +318,20 @@ pub fn run_stdio_server(
         };
 
         if let Some(response) = response {
-            let encoded = serde_json::to_string(&response)
-                .map_err(|err| format!("Failed to serialize MCP response: {err}"))?;
-            writeln!(stdout, "{encoded}")
-                .and_then(|_| stdout.flush())
-                .map_err(|err| format!("Failed to write MCP response: {err}"))?;
+            response_sender
+                .send(response)
+                .map_err(|_| "MCP response writer stopped unexpectedly".to_string())?;
         }
+    }
+
+    cancellations.cancel_all();
+    drop(response_sender);
+    let writer_result = writer
+        .join()
+        .map_err(|_| "MCP response writer panicked".to_string())?;
+    writer_result?;
+    if let Some(error) = read_error {
+        return Err(error);
     }
 
     // Normal shutdown (stdin reached EOF): the process is about to exit, so skip
@@ -230,9 +359,53 @@ fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     }
 }
 
+fn cancellable_query_request(message: &Value, spec: &McpServerSpec) -> Option<(Value, Value)> {
+    let object = message.as_object()?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION)
+        || object.get("method").and_then(Value::as_str) != Some("tools/call")
+        || message.pointer("/params/name").and_then(Value::as_str) != Some("query_code")
+        || !spec.tool_names.contains("query_code")
+    {
+        return None;
+    }
+    Some((
+        object.get("id")?.clone(),
+        object.get("params").cloned().unwrap_or(Value::Null),
+    ))
+}
+
+fn spawn_cancellable_tool_call(
+    service: Arc<SearchToolsService>,
+    call: PreparedToolCall,
+    id: Value,
+    cancellation: CancellationToken,
+    cancellations: McpRequestCancellations,
+    response_sender: mpsc::Sender<Value>,
+) -> Result<(), String> {
+    let cleanup_id = id.clone();
+    let cleanup_cancellations = cancellations.clone();
+    let spawn_result = thread::Builder::new()
+        .name("bifrost-mcp-query-code".to_string())
+        .spawn(move || {
+            let response =
+                match execute_prepared_tool_call(service.as_ref(), call, Some(&cancellation)) {
+                    Ok(result) => success_response(id.clone(), result),
+                    Err((code, message)) => error_response(id.clone(), code, message),
+                };
+            cancellations.complete(&id);
+            let _ = response_sender.send(response);
+        });
+    if let Err(err) = spawn_result {
+        cleanup_cancellations.complete(&cleanup_id);
+        return Err(format!("Failed to start cancellable MCP request: {err}"));
+    }
+    Ok(())
+}
+
 fn dispatch_message(
     service: &SearchToolsService,
     connection: &mut McpConnectionState,
+    cancellations: &McpRequestCancellations,
     message: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
@@ -318,7 +491,7 @@ fn dispatch_message(
                 spec,
             ))
         }
-        None => handle_notification(service, connection, method, params),
+        None => handle_notification(service, connection, cancellations, method, params),
     }
 }
 
@@ -478,8 +651,9 @@ fn write_benchmark_profile_boundary() -> Result<Value, (i64, String)> {
 fn handle_notification(
     service: &SearchToolsService,
     connection: &mut McpConnectionState,
+    cancellations: &McpRequestCancellations,
     method: &str,
-    _params: Value,
+    params: Value,
 ) -> Option<Value> {
     match method {
         "notifications/initialized" => {
@@ -502,6 +676,12 @@ fn handle_notification(
             } else {
                 connection.roots_request()
             }
+        }
+        "notifications/cancelled" => {
+            if let Some(request_id) = params.get("requestId") {
+                cancellations.cancel(request_id);
+            }
+            None
         }
         _ => None,
     }
@@ -589,6 +769,30 @@ fn handle_tool_call(
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
 ) -> Result<Value, (i64, String)> {
+    match prepare_tool_call(service, connection, params, render_options, spec)? {
+        ToolCallPreparation::Ready(call) => execute_prepared_tool_call(service, call, None),
+        ToolCallPreparation::Reply(result) => Ok(result),
+    }
+}
+
+struct PreparedToolCall {
+    name: String,
+    arguments: Value,
+    render_options: RenderOptions,
+}
+
+enum ToolCallPreparation {
+    Ready(PreparedToolCall),
+    Reply(Value),
+}
+
+fn prepare_tool_call(
+    service: &SearchToolsService,
+    connection: &mut McpConnectionState,
+    params: Value,
+    render_options: McpRenderOptions,
+    spec: &McpServerSpec,
+) -> Result<ToolCallPreparation, (i64, String)> {
     let Some(object) = params.as_object() else {
         return Err((
             INVALID_PARAMS,
@@ -601,7 +805,9 @@ fn handle_tool_call(
     };
 
     if !spec.tool_names.contains(name) {
-        return Ok(tool_error_result(format!("Unknown tool: {name}")));
+        return Ok(ToolCallPreparation::Reply(tool_error_result(format!(
+            "Unknown tool: {name}"
+        ))));
     }
 
     reconcile_codex_sandbox_workspace(service, connection, object)?;
@@ -623,23 +829,39 @@ fn handle_tool_call(
             WorkspaceBindingSource::None | WorkspaceBindingSource::ExplicitRoot => None,
         };
         if let Some(authority) = authority {
-            return Ok(tool_error_result(format!(
+            return Ok(ToolCallPreparation::Reply(tool_error_result(format!(
                 "activate_workspace is unavailable while the workspace is controlled by {authority}; update the client-provided workspace instead"
-            )));
+            ))));
         }
     }
     let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
-        Err(message) => return Ok(tool_error_result(message)),
+        Err(message) => return Ok(ToolCallPreparation::Reply(tool_error_result(message))),
     };
 
-    let render_options = RenderOptions {
-        render_line_numbers: render_options.render_line_numbers,
-    };
-    match service.call_tool_output(name, arguments.clone(), render_options) {
+    Ok(ToolCallPreparation::Ready(PreparedToolCall {
+        name: name.to_string(),
+        arguments,
+        render_options: RenderOptions {
+            render_line_numbers: render_options.render_line_numbers,
+        },
+    }))
+}
+
+fn execute_prepared_tool_call(
+    service: &SearchToolsService,
+    call: PreparedToolCall,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Value, (i64, String)> {
+    match service.call_tool_output_with_cancellation(
+        &call.name,
+        call.arguments,
+        call.render_options,
+        cancellation,
+    ) {
         Ok(output) => {
-            let output = if name == "get_summaries" {
-                fit_get_summaries_output_to_budget(service, output, render_options)
+            let output = if call.name == "get_summaries" {
+                fit_get_summaries_output_to_budget(service, output, call.render_options)
                     .map_err(|err| map_service_error(err.code, err.message))?
             } else {
                 output
@@ -1646,6 +1868,7 @@ mod uri_tests {
     fn roots_changes_during_a_request_are_coalesced() {
         let service = SearchToolsService::new_unbound();
         let mut connection = McpConnectionState::new(true);
+        let cancellations = McpRequestCancellations::default();
         connection.client_supports_roots = true;
         connection.initialized = true;
         let first = connection.roots_request().expect("first roots request");
@@ -1654,6 +1877,7 @@ mod uri_tests {
             handle_notification(
                 &service,
                 &mut connection,
+                &cancellations,
                 "notifications/roots/list_changed",
                 Value::Null,
             )
@@ -1666,5 +1890,87 @@ mod uri_tests {
 
         assert_ne!(first["id"], second["id"]);
         assert_eq!(second["method"], "roots/list");
+    }
+
+    #[test]
+    fn cancelled_notification_reaches_the_registered_request_token() {
+        let service = SearchToolsService::new_unbound();
+        let mut connection = McpConnectionState::new(true);
+        let cancellations = McpRequestCancellations::default();
+        let request_id = json!("cfg-request");
+        let token = cancellations
+            .register(&request_id)
+            .expect("unique request registers");
+
+        assert!(
+            handle_notification(
+                &service,
+                &mut connection,
+                &cancellations,
+                "notifications/cancelled",
+                json!({ "requestId": request_id }),
+            )
+            .is_none()
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_notification_propagates_through_background_query_response() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "export function target(): void {}\n",
+        )
+        .expect("write source");
+        let service = Arc::new(
+            SearchToolsService::new_deferred_manual(dir.path().to_path_buf()).expect("service"),
+        );
+        let cancellations = McpRequestCancellations::default();
+        let request_id = json!(42);
+        let cancellation = cancellations
+            .register(&request_id)
+            .expect("unique request registers");
+        let mut connection = McpConnectionState::new(false);
+        assert!(
+            handle_notification(
+                service.as_ref(),
+                &mut connection,
+                &cancellations,
+                "notifications/cancelled",
+                json!({ "requestId": request_id }),
+            )
+            .is_none()
+        );
+        let (response_sender, response_receiver) = mpsc::channel();
+        spawn_cancellable_tool_call(
+            Arc::clone(&service),
+            PreparedToolCall {
+                name: "query_code".to_string(),
+                arguments: json!({
+                    "schema_version": 3,
+                    "match": { "kind": "function", "name": "target" },
+                    "steps": [
+                        { "op": "procedure_of" },
+                        { "op": "cfg_entry" }
+                    ]
+                }),
+                render_options: RenderOptions::default(),
+            },
+            request_id,
+            cancellation,
+            cancellations,
+            response_sender,
+        )
+        .expect("background request starts");
+        let response = response_receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("background request responds");
+
+        assert_eq!(
+            response["result"]["structuredContent"]["diagnostics"][0]["code"],
+            "cancelled"
+        );
+        assert_eq!(response["result"]["structuredContent"]["truncated"], true);
     }
 }
