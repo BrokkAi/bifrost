@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use brokk_bifrost::analyzer::structural::SCHEMA_VERSION as RQL_SCHEMA_VERSION;
 use brokk_bifrost::policy::{
     EndpointRole, InlineLocalSemanticProjectionError, ParsedRqlpDocument, PolicyAnalysis,
     PolicyFormatOptions, PolicyMessageSpec, PolicySelector, PolicySemanticEvent,
@@ -234,7 +235,7 @@ fn inline_local_semantic_json_matches_golds_and_drops_authoring_only_tags() {
         );
         assert_eq!(
             actual.pointer(&format!("{selector_path}/schema_version")),
-            Some(&Value::from(2)),
+            Some(&Value::from(RQL_SCHEMA_VERSION)),
         );
     }
 
@@ -268,12 +269,16 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
     let PolicySelector::Inline { schema, .. } = &spec.selector else {
         panic!("expected inline selector")
     };
-    assert_eq!(schema.version, 2);
+    assert_eq!(schema.version, RQL_SCHEMA_VERSION as u32);
     assert_eq!(schema.origin, SchemaVersionOrigin::ImplicitCompatible);
 
     let explicit_source = fixture_source("dynamic-eval.rqlp")
         .replacen("(policy", "(policy\n  :schema-version 1", 1)
-        .replacen("(rql", "(rql :schema-version 2", 1);
+        .replacen(
+            "(rql",
+            &format!("(rql :schema-version {RQL_SCHEMA_VERSION}"),
+            1,
+        );
     let explicit = parse(&explicit_source, "explicit.rqlp").expect("explicit policy should parse");
     assert_eq!(explicit.schema_resolution().version, 1);
     assert_eq!(
@@ -289,7 +294,7 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
     let PolicySelector::Inline { schema, .. } = &spec.selector else {
         panic!("expected explicit inline selector")
     };
-    assert_eq!(schema.version, 2);
+    assert_eq!(schema.version, RQL_SCHEMA_VERSION as u32);
     assert_eq!(schema.origin, SchemaVersionOrigin::Explicit);
     let implicit_document = RqlpDocument::Policy {
         definition: implicit_definition,
@@ -304,6 +309,22 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
         implicit_semantic,
         "explicit and inferred version origins do not change semantic meaning",
     );
+
+    let legacy_explicit_source =
+        fixture_source("dynamic-eval.rqlp").replacen("(rql", "(rql :schema-version 2", 1);
+    let legacy_explicit = parse(&legacy_explicit_source, "legacy-explicit.rqlp")
+        .expect("version 2 should remain exact");
+    let RqlpDocument::Policy { definition } = legacy_explicit.document() else {
+        panic!("expected legacy explicit policy")
+    };
+    let PolicyAnalysis::Match { spec } = &definition.analysis else {
+        panic!("expected legacy explicit match policy")
+    };
+    let PolicySelector::Inline { schema, .. } = &spec.selector else {
+        panic!("expected legacy explicit inline selector")
+    };
+    assert_eq!(schema.version, 2);
+    assert_eq!(schema.origin, SchemaVersionOrigin::Explicit);
 
     let unsupported_policy = "(policy :schema-version 999 :id \"p\" :unknown-field true)";
     let error = parse_rqlp_source(
@@ -340,7 +361,7 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
         error
             .diagnostic
             .message
-            .contains("supported exact versions: 2")
+            .contains("supported exact versions: 2, 3")
     );
 }
 
@@ -352,11 +373,11 @@ fn inline_selector_projection_and_source_map_are_semantic_and_range_exact() {
     let normalized = parsed.document().to_normalized_authored_json();
     assert_eq!(
         normalized.pointer("/analysis/selector/schema_version"),
-        Some(&Value::from(2))
+        Some(&Value::from(RQL_SCHEMA_VERSION))
     );
     assert_eq!(
         normalized.pointer("/analysis/selector/query/schema_version"),
-        Some(&Value::from(2))
+        Some(&Value::from(RQL_SCHEMA_VERSION))
     );
     assert!(
         normalized

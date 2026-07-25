@@ -1301,6 +1301,9 @@ fn run_rql_query_result(
                 let path = match &result.value {
                     CodeQueryResultValue::StructuralMatch { value } => &value.path,
                     CodeQueryResultValue::Declaration { value } => &value.path,
+                    CodeQueryResultValue::Procedure { value } => &value.path,
+                    CodeQueryResultValue::ProgramPoint { value } => &value.path,
+                    CodeQueryResultValue::ControlEdge { value } => &value.path,
                     CodeQueryResultValue::File { value } => &value.path,
                     CodeQueryResultValue::ReferenceSite { value } => &value.path,
                     CodeQueryResultValue::CallSite { value } => &value.path,

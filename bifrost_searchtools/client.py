@@ -208,10 +208,15 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        Version 2 starts with normalized syntactic structure or a typed set of
-        complete query branches, then optionally
+        The compatible head is schema version 3; pass ``schema_version=2`` to
+        pin the pre-CFG vocabulary. A query starts with normalized syntactic
+        structure or a typed set of complete query branches, then optionally
         applies typed semantic ``steps`` such as ``enclosing_decl``, ``file_of``,
         ``imports_of``, ``supertypes``, ``subtypes``, ``members``, and ``owner``.
+        Version 3 also provides ``procedure_of``, ``cfg_entry``, ``cfg_exits``,
+        ``cfg_successor_edges``, ``cfg_predecessor_edges``,
+        ``cfg_edge_source``, and ``cfg_edge_target`` for bounded,
+        procedure-local control-flow inspection.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
         indexed by the workspace analyzer. Pass exactly one of ``pattern``,

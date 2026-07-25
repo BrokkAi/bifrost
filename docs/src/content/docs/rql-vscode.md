@@ -49,11 +49,14 @@ This Play action is a VS Code language-server feature. It does not start an MCP 
     (function :name "handle_run_rql_query_request")))
 ```
 
-The **Bifrost Query Results** Explorer view groups tagged structural-match,
-declaration, and file results by path. Select a structural match or declaration
-to open its file and highlight the source range; selecting a file result opens
-the file at its first line. Pipeline wrappers such as `enclosing-decl` and
-`file-of` therefore remain navigable from the same view.
+The **Bifrost Query Results** Explorer view groups every tagged result by path,
+including structural matches, declarations, procedures, program points,
+control edges, and files. Select a source-backed result to open its file and
+highlight its range; control edges navigate to their source mapping and show
+both endpoint IDs and ranges in the tooltip. Selecting a file result opens the
+file at its first line. Pipeline wrappers such as `enclosing-decl`,
+`cfg-successor-edges`, and `file-of` therefore remain navigable from the same
+view.
 
 ![An RQL query in VS Code, grouped query results in Explorer, and the selected Rust match.](../../assets/rql-vscode-query-results.png)
 

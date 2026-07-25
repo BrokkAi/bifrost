@@ -19,6 +19,7 @@ from bifrost_searchtools import (
     CodeQueryCacheLayerKind,
     CodeQueryCacheMetricsKind,
     CodeQueryCallSite,
+    CodeQueryControlEdge,
     CodeQueryCompletionKind,
     CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact,
@@ -30,9 +31,13 @@ from bifrost_searchtools import (
     CodeQueryMatch,
     CodeQueryOperatorDisposition,
     CodeQueryPhysicalOperator,
+    CodeQueryProcedure,
+    CodeQueryProgramPoint,
+    CodeQueryProgramPointBoundary,
     CodeQueryProfile,
     CodeQueryProfileCacheCounters,
     CodeQueryReferenceSite,
+    CodeQueryReceiverAnalysis,
     CodeQueryResult,
     CodeQueryStructuralFactsCacheCounters,
     ContainerKind,
@@ -165,6 +170,18 @@ def _code_query_profile_payload() -> dict:
             "provenance_steps": 1,
             "import_files_resolved": 0,
             "import_edges_resolved": 0,
+            "semantic": {
+                "materialization_attempts": 1,
+                "unique_materialized_files": 1,
+                "request_cache_hits": 2,
+                "source_bytes": 120,
+                "procedures": 1,
+                "program_points": 3,
+                "control_edges": 2,
+                "retained_bytes": 4096,
+                "traversal_steps": 4,
+                "budget_exhausted": False,
+            },
         },
         "cache_layers": [
             {
@@ -288,6 +305,138 @@ def _code_query_profile_payload() -> dict:
 
 
 class CodeQueryModelTest(unittest.TestCase):
+    def test_schema_v3_semantic_results_are_typed_and_renderable(self) -> None:
+        source_range = {
+            "start_line": 2,
+            "start_column": 4,
+            "end_line": 2,
+            "end_column": 12,
+        }
+        evidence = {"proof": "proven", "completeness": "complete"}
+        point_ref = {
+            "id": "point-a",
+            "procedure_id": "procedure-a",
+            "path": "src/run.ts",
+            "range": source_range,
+            "boundary": "entry",
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "procedure",
+                        "id": "procedure-a",
+                        "artifact_id": "artifact-a",
+                        "path": "src/run.ts",
+                        "language": "typescript",
+                        "procedure_kind": "function",
+                        "range": source_range,
+                        "evidence": evidence,
+                    },
+                    {
+                        "result_type": "program_point",
+                        "id": "point-a",
+                        "procedure_id": "procedure-a",
+                        "path": "src/run.ts",
+                        "language": "typescript",
+                        "range": source_range,
+                        "boundary": "entry",
+                        "event_count": 1,
+                        "evidence": evidence,
+                    },
+                    {
+                        "result_type": "control_edge",
+                        "id": "edge-a",
+                        "procedure_id": "procedure-a",
+                        "path": "src/run.ts",
+                        "language": "typescript",
+                        "range": source_range,
+                        "edge_kind": "normal",
+                        "source": point_ref,
+                        "target": {
+                            **point_ref,
+                            "id": "point-b",
+                            "boundary": "normal_exit",
+                        },
+                        "evidence": evidence,
+                        "provenance": [
+                            {
+                                "seed": {
+                                    "result_type": "structural_match",
+                                    "path": "src/run.ts",
+                                    "kind": "function",
+                                    "start_line": 2,
+                                    "end_line": 2,
+                                },
+                                "steps": [
+                                    {
+                                        "op": "cfg_successor_edges",
+                                        "result": {
+                                            "result_type": "control_edge",
+                                            "id": "edge-a",
+                                            "procedure_id": "procedure-a",
+                                            "path": "src/run.ts",
+                                            "range": source_range,
+                                            "edge_kind": "normal",
+                                            "source_id": "point-a",
+                                            "target_id": "point-b",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        self.assertIsInstance(result.results[0], CodeQueryProcedure)
+        self.assertIsInstance(result.results[1], CodeQueryProgramPoint)
+        self.assertIs(
+            result.results[1].boundary, CodeQueryProgramPointBoundary.ENTRY
+        )
+        self.assertIsInstance(result.results[2], CodeQueryControlEdge)
+        self.assertEqual(result.results[2].target.id, "point-b")
+        self.assertEqual(
+            result.results[2].provenance[0].steps[0].result.target_id,
+            "point-b",
+        )
+        self.assertIn("control edge; normal; proven/complete", result.render_text())
+
+    def test_schema_v3_semantic_results_reject_missing_or_invalid_evidence(self) -> None:
+        base = {
+            "result_type": "procedure",
+            "id": "procedure-a",
+            "artifact_id": "artifact-a",
+            "path": "src/run.ts",
+            "language": "typescript",
+            "procedure_kind": "function",
+            "range": {
+                "start_line": 1,
+                "start_column": 0,
+                "end_line": 1,
+                "end_column": 3,
+            },
+        }
+        with self.assertRaises(KeyError):
+            CodeQueryResult.from_dict({"results": [base], "truncated": False})
+        with self.assertRaises(ValueError):
+            CodeQueryResult.from_dict(
+                {
+                    "results": [
+                        {
+                            **base,
+                            "evidence": {
+                                "proof": "guessed",
+                                "completeness": "complete",
+                            },
+                        }
+                    ],
+                    "truncated": False,
+                }
+            )
+
     def test_execution_mode_alias_is_reexported_from_public_import_paths(self) -> None:
         self.assertIs(CodeQueryExecutionMode, ModelCodeQueryExecutionMode)
         self.assertIs(ClientCodeQueryExecutionMode, ModelCodeQueryExecutionMode)
@@ -297,8 +446,14 @@ class CodeQueryModelTest(unittest.TestCase):
         )
 
     def test_explain_response_parses_typed_plan_layers(self) -> None:
+        payload = _code_query_explain_payload()
+        payload["physical_plan"]["nodes"][1]["semantic_request"] = {
+            "procedures": True,
+            "program_points": True,
+            "control_edges": False,
+        }
         response = parse_code_query_response(
-            _code_query_explain_payload(), rendered_text="server explain"
+            payload, rendered_text="server explain"
         )
 
         self.assertIsInstance(response, CodeQueryExplain)
@@ -314,6 +469,12 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertIs(
             response.physical_plan.nodes[1].operator,
             CodeQueryPhysicalOperator.LIMIT,
+        )
+        self.assertTrue(
+            response.physical_plan.nodes[1].semantic_request.procedures
+        )
+        self.assertFalse(
+            response.physical_plan.nodes[1].semantic_request.control_edges
         )
         self.assertTrue(
             response.physical_plan.nodes[1].extra["future_physical_fact"]
@@ -344,6 +505,8 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertEqual(response.explain.parsed_query.execution_mode, "profile")
         self.assertEqual(response.timings_ns.total, 66)
         self.assertEqual(response.work.scanned_source_bytes, 120)
+        self.assertEqual(response.work.semantic.program_points, 3)
+        self.assertEqual(response.work.semantic.request_cache_hits, 2)
         self.assertEqual(response.access_path.selected, "posting:kind+name")
         self.assertEqual(response.access_path.candidate_facts, 1)
         self.assertEqual(response.access_path.selected_terms[0].label, "name")
@@ -1019,6 +1182,63 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual(result.results[0].arguments[0].formal_name, "payload")
         self.assertIsInstance(result.results[1], CodeQueryExpressionSite)
         self.assertEqual(result.results[1].text, '"value"')
+
+    def test_query_code_parses_recursive_receiver_analysis(self) -> None:
+        declaration = lambda kind, fq_name: {
+            "path": "sample.ts",
+            "language": "typescript",
+            "kind": kind,
+            "fq_name": fq_name,
+            "start_line": 1,
+            "end_line": 3,
+        }
+        source_range = {
+            "start_line": 4,
+            "start_column": 4,
+            "end_line": 4,
+            "end_column": 11,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "receiver_analysis",
+                        "analysis_kind": "points_to",
+                        "path": "sample.ts",
+                        "language": "typescript",
+                        "range": source_range,
+                        "text": "service",
+                        "input_kind": "identifier",
+                        "capture": "service",
+                        "outcome": "precise",
+                        "values": [
+                            {
+                                "receiver_value_kind": "factory_return",
+                                "factory": declaration("function", "makeService"),
+                                "returned_value": {
+                                    "receiver_value_kind": "allocation_site",
+                                    "type_declaration": declaration("class", "Service"),
+                                    "allocation_site": {
+                                        "path": "sample.ts",
+                                        "range": source_range,
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "truncated": False,
+            }
+        )
+
+        analysis = result.results[0]
+        self.assertIsInstance(analysis, CodeQueryReceiverAnalysis)
+        self.assertEqual(analysis.capture, "service")
+        self.assertEqual(
+            analysis.values[0].returned_value.type_declaration.fq_name,
+            "Service",
+        )
+        self.assertIn("factory makeService -> allocation Service", result.render_text())
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

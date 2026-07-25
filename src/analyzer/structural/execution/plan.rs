@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::hash::HashMap;
 
+use super::super::query::schema::QuerySemanticFacet;
 use super::super::query::{
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, QueryError, QueryStep,
     QueryValueKind, SetOperator,
@@ -301,6 +302,7 @@ pub(crate) struct PhysicalQueryNode {
     operator: PhysicalQueryOperator,
     dependencies: Box<[PhysicalQueryNodeId]>,
     derived_layer_request: Option<DerivedLayerRequest>,
+    semantic_request: Option<CodeQuerySemanticRequest>,
 }
 
 impl PhysicalQueryNode {
@@ -318,6 +320,10 @@ impl PhysicalQueryNode {
 
     pub(crate) const fn derived_layer_request(&self) -> Option<DerivedLayerRequest> {
         self.derived_layer_request
+    }
+
+    pub(crate) const fn semantic_request(&self) -> Option<CodeQuerySemanticRequest> {
+        self.semantic_request
     }
 }
 
@@ -376,11 +382,18 @@ impl PhysicalQueryPlan {
                     } => Some(DerivedLayerRequest::complete_direct_import_topology()),
                     _ => None,
                 };
+                let semantic_request = match node.operator() {
+                    LogicalQueryOperator::Step { step, .. } => {
+                        CodeQuerySemanticRequest::from_facets(step.op().semantic_facets())
+                    }
+                    _ => None,
+                };
                 PhysicalQueryNode {
                     logical_node,
                     operator,
                     dependencies,
                     derived_layer_request,
+                    semantic_request,
                 }
             })
             .collect();
@@ -424,6 +437,7 @@ impl PhysicalQueryPlan {
                     output_kind: self.logical.node(node.logical_node()).output_kind().label(),
                     dependencies: node.dependencies().to_vec(),
                     derived_layer_request: node.derived_layer_request(),
+                    semantic_request: node.semantic_request(),
                 })
                 .collect(),
         }
@@ -457,6 +471,8 @@ pub(crate) struct PhysicalQueryNodeExplain {
     dependencies: Vec<PhysicalQueryNodeId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     derived_layer_request: Option<DerivedLayerRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_request: Option<CodeQuerySemanticRequest>,
 }
 
 /// The complete semantic payload of one logical operator in an explain node.
@@ -575,6 +591,7 @@ impl CodeQueryExplain {
                     operator: CodeQueryPhysicalOperator::from_internal(node.operator),
                     output_kind: node.output_kind,
                     dependencies: physical_dependencies,
+                    semantic_request: node.semantic_request,
                 };
                 (logical, physical)
             })
@@ -651,6 +668,37 @@ pub struct CodeQueryPhysicalNode {
     pub operator: CodeQueryPhysicalOperator,
     pub output_kind: &'static str,
     pub dependencies: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_request: Option<CodeQuerySemanticRequest>,
+}
+
+/// Semantic IR facets a physical query operator must access when executed.
+///
+/// Explain mode publishes this request without constructing a semantic
+/// artifact. Every field is explicit so clients can distinguish procedure-only
+/// lookup from point or control-edge traversal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQuerySemanticRequest {
+    pub procedures: bool,
+    pub program_points: bool,
+    pub control_edges: bool,
+}
+
+impl CodeQuerySemanticRequest {
+    fn from_facets(facets: &[QuerySemanticFacet]) -> Option<Self> {
+        if facets.is_empty() {
+            return None;
+        }
+        let mut request = Self::default();
+        for facet in facets {
+            match facet {
+                QuerySemanticFacet::Procedures => request.procedures = true,
+                QuerySemanticFacet::ProgramPoints => request.program_points = true,
+                QuerySemanticFacet::ControlEdges => request.control_edges = true,
+            }
+        }
+        Some(request)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1000,6 +1048,48 @@ mod tests {
                     }
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn public_explain_reports_each_pipeline_steps_semantic_facets() {
+        let query = query(branch(
+            seed("run"),
+            vec![
+                QueryStep::ProcedureOf,
+                QueryStep::CfgEntry,
+                QueryStep::CfgSuccessorEdges,
+            ],
+        ));
+        let physical =
+            PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
+        let public = physical.public_explain(&query, 1);
+        let requests = public
+            .physical_plan
+            .nodes
+            .iter()
+            .filter_map(|node| node.semantic_request)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            requests,
+            vec![
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: false,
+                    control_edges: false,
+                },
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: true,
+                    control_edges: false,
+                },
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: true,
+                    control_edges: true,
+                },
+            ]
         );
     }
 

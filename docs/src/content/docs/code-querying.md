@@ -3,9 +3,9 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, exact source references and semantic users, resolved call edges and call-site inputs, direct import-file edges, indexed type hierarchies, declaration ownership, and bounded receiver analysis over adapter-provided structured facts. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “what may this receiver denote,” “which exact member does it select,” and “which types derive from this type” across the active workspace.
+Bifrost's composable code-query engine is `query_code`. The compatible head is schema version 3: it searches normalized syntactic structure, retains version 2's declaration/reference/call/import/hierarchy and bounded receiver steps, and adds source-backed procedure-local CFG inspection. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “what may this receiver denote,” “which exact member does it select,” “which types derive from this type,” and “which control edge leaves this procedure entry?” across the active workspace.
 
-The broader name is intentional. Future versions may add more steps backed by future control-flow and data-flow analyses. Version 2 does not resolve arbitrary aliases or prove control/data flow. `call_input` projects only the expression written directly at the call site. When the selected adapter exposes structured receiver facts, `points_to` may analyze that exact expression through bounded receiver analysis, but it does not become whole-program points-to or general value flow.
+Version 3's CFG surface is deliberately procedure-local. It exposes procedures, program points, and explicit one-hop control edges; it does not resolve arbitrary aliases or provide ICFG, data-flow, taint, typestate, findings, or witnesses. `call_input` still projects only the expression written directly at the call site. When the selected adapter exposes structured receiver facts, `points_to` may analyze that exact expression through bounded receiver analysis, but it does not become whole-program points-to or general value flow. Explicit version-2 pins remain supported and reject the new CFG operations.
 
 ## Choose The Right Tool
 
@@ -16,7 +16,7 @@ Use the narrowest tool that directly answers the question:
 | “Where is `Parser.parse` declared?” | `search_symbols` | Searches indexed declarations by name. |
 | “Who references this exact symbol?” | `scan_usages_by_reference` or `scan_usages_by_location` | Resolves a known declaration to reference sites from a symbol or source location. |
 | “What is the workspace caller/callee graph?” | `usage_graph` | Returns the existing whole-workspace resolved usage graph. |
-| “Which code has this shape, enclosing declaration, import relationship, or indexed type/member relationship?” | `query_code` | Matches normalized kinds and applies typed declaration/file steps. |
+| “Which code has this shape, enclosing declaration, import/type relationship, or procedure-local control-flow relationship?” | `query_code` | Matches normalized kinds and applies typed structural and semantic steps. |
 | “Which code is conceptually about retry policy?” | `semantic_search` | Retrieves code by meaning rather than exact structure. |
 | “Where does this literal text occur?” | `search_file_contents` | Searches source text without structural interpretation. |
 
@@ -28,15 +28,22 @@ Language adapters map grammar-specific tree-sitter nodes and fields into **Rune 
 
 See [Rune IR](/rune-ir/) for the representation, `.rune` files and VS Code previews, query-by-example workflow, limits, and the complete per-language adapter mapping.
 
-## Version 2 Typed Pipelines
+## Version 3 Typed Pipelines
 
-`query_code` validates the structural seed query, lowers it to a shared logical dependency graph, selects physical operators, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. Complete compatible pipelines can be combined with `union`, `intersect`, and `except`, then passed through another common typed suffix. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `callers`, `callees`, and the call-site steps traverse only AST-confirmed calls; `receiver_targets`, `points_to`, and `member_targets` produce terminal receiver-analysis rows; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance, including the contributing branch path after composition.
+`query_code` validates the structural seed query, lowers it to a shared logical dependency graph, selects physical operators, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. Complete compatible pipelines can be combined with `union`, `intersect`, and `except`, then passed through another common typed suffix. `enclosing_decl` returns exact indexed declarations; `procedure_of` enters the source-backed semantic domain; the `cfg_*` steps traverse procedure-local boundaries and edges; reference, call, receiver, import, hierarchy, and ownership steps retain their version-2 behavior. Derived results retain seed-and-edge provenance, including the contributing branch path after composition.
 
 Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
 | RQL wrapper | JSON step | Input → output | Use it to |
 | --- | --- | --- | --- |
 | `enclosing-decl` | `enclosing_decl` | structural match → indexed declaration | Find the smallest real declaration that contains a matching expression. |
+| `procedure-of` | `procedure_of` | structural match or declaration → procedure | Resolve the unique smallest executable procedure enclosing the exact input range. |
+| `cfg-entry` | `cfg_entry` | procedure → program point | Return the validated entry boundary. |
+| `cfg-exits` | `cfg_exits` | procedure → program point | Return normal then exceptional exits. |
+| `cfg-successor-edges` | `cfg_successor_edges` | program point → control edge | Return one-hop outgoing edges. |
+| `cfg-predecessor-edges` | `cfg_predecessor_edges` | program point → control edge | Return one-hop incoming edges. |
+| `cfg-edge-source` | `cfg_edge_source` | control edge → program point | Project an edge to its source. |
+| `cfg-edge-target` | `cfg_edge_target` | control edge → program point | Project an edge to its target. |
 | `references-of` | `references_of` | declaration → reference site | Return exact structured sites targeting a declaration. |
 | `used-by` | `used_by` | declaration → declaration | Return each smallest exact semantic user, with its proving site under `via`. |
 | `uses` | `uses` | declaration → declaration | Return exact indexed targets used by one semantic declaration, with `via`. |
@@ -53,6 +60,8 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
 
 For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The schema-v2 `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Typed Set Composition](/code-query-tutorials/set-composition/) for executable union, intersection, and subtraction over import traversal, and [Reference Traversal](/code-query-tutorials/reference-traversal/) for exact declaration edges. For bounded receiver values and members, see the executable [Receiver Traversal](/code-query-tutorials/receiver-traversal/) cookbook.
+
+For CFG inspection, `(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function :name "run")))))` returns the target point of every edge leaving `run`'s entry. Procedure, point, and edge rows carry checkout-independent content-scoped IDs, exact ranges, proof/completeness, and ordinary CodeQuery provenance. Each edge step is one hop and shares a separate finite semantic file/source/row/retained-byte/traversal budget. Explain mode shows the requested semantic facets without materialization; profile mode attributes actual semantic work to the physical pipeline steps.
 
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 

@@ -235,6 +235,18 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: CodeQueryDeclaration,
     },
+    Procedure {
+        #[serde(flatten)]
+        value: CodeQueryProcedure,
+    },
+    ProgramPoint {
+        #[serde(flatten)]
+        value: CodeQueryProgramPoint,
+    },
+    ControlEdge {
+        #[serde(flatten)]
+        value: Box<CodeQueryControlEdge>,
+    },
     File {
         #[serde(flatten)]
         value: CodeQueryFile,
@@ -293,6 +305,114 @@ pub struct CodeQueryDeclaration {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryProcedure {
+    pub id: String,
+    pub artifact_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub procedure_kind: &'static str,
+    pub range: CodeQueryRange,
+    pub evidence: CodeQuerySemanticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryProgramPoint {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<CodeQueryProgramPointBoundary>,
+    pub event_count: usize,
+    pub evidence: CodeQuerySemanticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryControlEdge {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub edge_kind: &'static str,
+    pub source: CodeQueryProgramPointRef,
+    pub target: CodeQueryProgramPointRef,
+    pub evidence: CodeQuerySemanticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryProgramPointRef {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<CodeQueryProgramPointBoundary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryProgramPointBoundary {
+    Entry,
+    NormalExit,
+    ExceptionalExit,
+}
+
+impl CodeQueryProgramPointBoundary {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::NormalExit => "normal_exit",
+            Self::ExceptionalExit => "exceptional_exit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQuerySemanticEvidence {
+    pub proof: CodeQuerySemanticProof,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_reason: Option<String>,
+    pub completeness: CodeQuerySemanticCompleteness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness_reason: Option<String>,
+}
+
+impl CodeQuerySemanticEvidence {
+    pub const fn status_label(&self) -> &'static str {
+        match (self.proof, self.completeness) {
+            (CodeQuerySemanticProof::Proven, CodeQuerySemanticCompleteness::Complete) => {
+                "proven/complete"
+            }
+            (CodeQuerySemanticProof::Proven, CodeQuerySemanticCompleteness::Partial) => {
+                "proven/partial"
+            }
+            (CodeQuerySemanticProof::Unproven, CodeQuerySemanticCompleteness::Complete) => {
+                "unproven/complete"
+            }
+            (CodeQuerySemanticProof::Unproven, CodeQuerySemanticCompleteness::Partial) => {
+                "unproven/partial"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQuerySemanticProof {
+    Proven,
+    Unproven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQuerySemanticCompleteness {
+    Complete,
+    Partial,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -515,6 +635,29 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         node_range: Option<CodeQueryRange>,
     },
+    Procedure {
+        id: String,
+        path: String,
+        procedure_kind: &'static str,
+        range: CodeQueryRange,
+    },
+    ProgramPoint {
+        id: String,
+        procedure_id: String,
+        path: String,
+        range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        boundary: Option<CodeQueryProgramPointBoundary>,
+    },
+    ControlEdge {
+        id: String,
+        procedure_id: String,
+        path: String,
+        range: CodeQueryRange,
+        edge_kind: &'static str,
+        source_id: String,
+        target_id: String,
+    },
     File {
         path: String,
     },
@@ -584,6 +727,12 @@ pub enum CodeQueryDiagnosticCode {
     MissingStructuralAdapter,
     UnsupportedImportAnalysis,
     SemanticResultsOmitted,
+    SemanticWorkspaceRequired,
+    NoEnclosingProcedure,
+    SemanticCapabilityUnsupported,
+    SemanticAnalysisPartial,
+    SemanticBudgetExhausted,
+    SemanticProviderFailed,
     ReceiverAnalysisPartial,
     ReceiverAnalysisFailed,
     CallRelationBudgetExhausted,
@@ -618,6 +767,12 @@ impl CodeQueryDiagnosticCode {
             Self::MissingStructuralAdapter => "missing_structural_adapter",
             Self::UnsupportedImportAnalysis => "unsupported_import_analysis",
             Self::SemanticResultsOmitted => "semantic_results_omitted",
+            Self::SemanticWorkspaceRequired => "semantic_workspace_required",
+            Self::NoEnclosingProcedure => "no_enclosing_procedure",
+            Self::SemanticCapabilityUnsupported => "semantic_capability_unsupported",
+            Self::SemanticAnalysisPartial => "semantic_analysis_partial",
+            Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
+            Self::SemanticProviderFailed => "semantic_provider_failed",
             Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
             Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
             Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
@@ -692,6 +847,26 @@ pub struct CodeQueryExecutionLimits {
     pub max_scanned_source_bytes: usize,
     pub max_fact_nodes: usize,
     pub max_pipeline_rows: usize,
+    pub semantic: CodeQuerySemanticLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CodeQuerySemanticLimits {
+    pub max_materialized_files: usize,
+    pub max_source_bytes: usize,
+    pub max_rows_per_dimension: usize,
+    pub max_retained_bytes: usize,
+    pub max_traversal_steps: usize,
+}
+
+impl CodeQuerySemanticLimits {
+    pub const fn all_positive(self) -> bool {
+        self.max_materialized_files > 0
+            && self.max_source_bytes > 0
+            && self.max_rows_per_dimension > 0
+            && self.max_retained_bytes > 0
+            && self.max_traversal_steps > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -701,6 +876,21 @@ pub struct CodeQueryExecutionWork {
     pub fact_nodes: u64,
     pub pipeline_rows: u64,
     pub examined_references: u64,
+    pub semantic: CodeQuerySemanticWork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQuerySemanticWork {
+    pub materialization_attempts: u64,
+    pub unique_materialized_files: u64,
+    pub request_cache_hits: u64,
+    pub source_bytes: u64,
+    pub procedures: u64,
+    pub program_points: u64,
+    pub control_edges: u64,
+    pub retained_bytes: u64,
+    pub traversal_steps: u64,
+    pub budget_exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -777,12 +967,16 @@ pub(crate) struct CodeQueryStableOwnerCandidate {
 pub(crate) enum CodeQueryStableOwnerDerivation {
     AnalyzerDeclarationId,
     CanonicalAstIdentity,
+    SemanticWireId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetailedCodeQueryDomain {
     StructuralMatch,
     Declaration,
+    Procedure,
+    ProgramPoint,
+    ControlEdge,
     File,
     ReferenceSite,
     CallSite,
@@ -800,6 +994,17 @@ pub(crate) enum DetailedCodeQueryKey {
         kind: String,
         fq_name: String,
         analyzer_id: Option<String>,
+    },
+    Procedure {
+        id: String,
+    },
+    ProgramPoint {
+        id: String,
+        procedure_id: String,
+    },
+    ControlEdge {
+        id: String,
+        procedure_id: String,
     },
     File,
     ReferenceSite {
@@ -829,6 +1034,19 @@ impl Default for CodeQueryExecutionLimits {
             max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
             max_fact_nodes: MAX_FACT_NODES,
             max_pipeline_rows: MAX_PIPELINE_ROWS,
+            semantic: CodeQuerySemanticLimits::default(),
+        }
+    }
+}
+
+impl Default for CodeQuerySemanticLimits {
+    fn default() -> Self {
+        Self {
+            max_materialized_files: MAX_SEMANTIC_MATERIALIZED_FILES,
+            max_source_bytes: MAX_SEMANTIC_SOURCE_BYTES,
+            max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION,
+            max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES,
+            max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS,
         }
     }
 }
@@ -862,6 +1080,11 @@ impl DetailedCodeQueryResult {
                 evidence.result_index, result_index,
                 "detailed CodeQuery evidence index must equal its vector index"
             );
+            if let Some((expected_domain, expected_key)) = detailed_semantic_identity(&result.value)
+            {
+                assert_eq!(evidence.domain, expected_domain);
+                assert_eq!(evidence.key, expected_key);
+            }
             assert!(
                 matches!(
                     (evidence.domain, &evidence.key),
@@ -871,6 +1094,15 @@ impl DetailedCodeQueryResult {
                     ) | (
                         DetailedCodeQueryDomain::Declaration,
                         DetailedCodeQueryKey::Declaration { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::Procedure,
+                        DetailedCodeQueryKey::Procedure { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::ProgramPoint,
+                        DetailedCodeQueryKey::ProgramPoint { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::ControlEdge,
+                        DetailedCodeQueryKey::ControlEdge { .. }
                     ) | (DetailedCodeQueryDomain::File, DetailedCodeQueryKey::File)
                         | (
                             DetailedCodeQueryDomain::ReferenceSite,
@@ -907,8 +1139,20 @@ impl DetailedCodeQueryResult {
                 assert!(!candidate.semantic_key.is_empty());
                 match candidate.derivation {
                     CodeQueryStableOwnerDerivation::AnalyzerDeclarationId
-                    | CodeQueryStableOwnerDerivation::CanonicalAstIdentity => {}
+                    | CodeQueryStableOwnerDerivation::CanonicalAstIdentity
+                    | CodeQueryStableOwnerDerivation::SemanticWireId => {}
                 }
+            }
+            if let Some(wire_id) = semantic_wire_id(&evidence.key) {
+                let candidate = evidence
+                    .stable_owner_candidate
+                    .as_ref()
+                    .expect("semantic CodeQuery evidence requires its wire identity");
+                assert_eq!(
+                    candidate.derivation,
+                    CodeQueryStableOwnerDerivation::SemanticWireId
+                );
+                assert_eq!(candidate.semantic_key, wire_id);
             }
             assert_detailed_terminal_identities(evidence.domain, &evidence.identities);
             let _ = &evidence.file;
@@ -931,6 +1175,40 @@ impl DetailedCodeQueryResult {
                 }
             }
         }
+    }
+}
+
+fn detailed_semantic_identity(
+    value: &CodeQueryResultValue,
+) -> Option<(DetailedCodeQueryDomain, DetailedCodeQueryKey)> {
+    match value {
+        CodeQueryResultValue::Procedure { value } => Some((
+            DetailedCodeQueryDomain::Procedure,
+            DetailedCodeQueryKey::Procedure {
+                id: value.id.clone(),
+            },
+        )),
+        CodeQueryResultValue::ProgramPoint { value } => Some((
+            DetailedCodeQueryDomain::ProgramPoint,
+            DetailedCodeQueryKey::ProgramPoint {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::ControlEdge { value } => Some((
+            DetailedCodeQueryDomain::ControlEdge,
+            DetailedCodeQueryKey::ControlEdge {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::StructuralMatch { .. }
+        | CodeQueryResultValue::Declaration { .. }
+        | CodeQueryResultValue::File { .. }
+        | CodeQueryResultValue::ReferenceSite { .. }
+        | CodeQueryResultValue::CallSite { .. }
+        | CodeQueryResultValue::ExpressionSite { .. }
+        | CodeQueryResultValue::ReceiverAnalysis { .. } => None,
     }
 }
 
@@ -957,7 +1235,11 @@ fn assert_detailed_terminal_identities(
     assert!(matches!(
         (domain, identities),
         (
-            DetailedCodeQueryDomain::StructuralMatch | DetailedCodeQueryDomain::Declaration,
+            DetailedCodeQueryDomain::StructuralMatch
+                | DetailedCodeQueryDomain::Declaration
+                | DetailedCodeQueryDomain::Procedure
+                | DetailedCodeQueryDomain::ProgramPoint
+                | DetailedCodeQueryDomain::ControlEdge,
             DetailedCodeQueryProvenanceIdentities::Primary(_),
         ) | (
             DetailedCodeQueryDomain::File
@@ -974,6 +1256,21 @@ fn assert_detailed_terminal_identities(
     ));
 }
 
+fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
+    match key {
+        DetailedCodeQueryKey::Procedure { id }
+        | DetailedCodeQueryKey::ProgramPoint { id, .. }
+        | DetailedCodeQueryKey::ControlEdge { id, .. } => Some(id),
+        DetailedCodeQueryKey::StructuralMatch { .. }
+        | DetailedCodeQueryKey::Declaration { .. }
+        | DetailedCodeQueryKey::File
+        | DetailedCodeQueryKey::ReferenceSite { .. }
+        | DetailedCodeQueryKey::CallSite { .. }
+        | DetailedCodeQueryKey::ExpressionSite { .. }
+        | DetailedCodeQueryKey::ReceiverAnalysis { .. } => None,
+    }
+}
+
 impl CodeQueryResult {
     pub fn structural_matches(&self) -> Vec<&CodeQueryMatch> {
         self.results
@@ -981,6 +1278,9 @@ impl CodeQueryResult {
             .filter_map(|result| match &result.value {
                 CodeQueryResultValue::StructuralMatch { value } => Some(value),
                 CodeQueryResultValue::Declaration { .. }
+                | CodeQueryResultValue::Procedure { .. }
+                | CodeQueryResultValue::ProgramPoint { .. }
+                | CodeQueryResultValue::ControlEdge { .. }
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
@@ -1038,6 +1338,45 @@ impl CodeQueryResult {
                             out.push_str(&format!(" `{signature}`"));
                         }
                         out.push('\n');
+                    }
+                    CodeQueryResultValue::Procedure { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [procedure; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.procedure_kind,
+                            value.evidence.status_label(),
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::ProgramPoint { value } => {
+                        let boundary = value
+                            .boundary
+                            .map_or("interior", CodeQueryProgramPointBoundary::label);
+                        out.push_str(&format!(
+                            "{}:{}:{} [program point; {}; {}; {} event{}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            boundary,
+                            value.evidence.status_label(),
+                            value.event_count,
+                            if value.event_count == 1 { "" } else { "s" },
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::ControlEdge { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [control edge; {}; {}] {} -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.edge_kind,
+                            value.evidence.status_label(),
+                            value.source.id,
+                            value.target.id,
+                        ));
                     }
                     CodeQueryResultValue::File { value } => {
                         out.push_str(&format!("{} [file; {}]\n", value.path, value.language));
