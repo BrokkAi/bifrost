@@ -97,6 +97,8 @@ pub(super) fn normalize_java_full_name(fq_name: &str) -> String {
 fn strip_trailing_numeric_suffix(input: &str) -> String {
     let colon_split = input.rsplit_once(':');
     let candidate = colon_split.map(|(head, _)| head).unwrap_or(input);
+    // fqname-M4: parses a JVM bytecode-derived synthetic name (anonymous `$<digits>` suffix),
+    // not a CodeUnit's structured short_name — the `$anon`/binary-name subsystem, not fq inference.
     let Some((prefix, suffix)) = candidate.rsplit_once('$') else {
         return input.to_string();
     };
@@ -194,6 +196,7 @@ fn looks_like_pascal_identifier(name: &str) -> bool {
 pub(super) fn is_java_anonymous_structure(fq_name: &str) -> bool {
     fq_name.contains("$anon$")
         || fq_name
+            // fqname-M4: classifies a JVM bytecode-derived anonymous-structure name, not a CodeUnit fq
             .rsplit_once('$')
             .map(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
             .unwrap_or(false)

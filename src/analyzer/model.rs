@@ -2017,7 +2017,7 @@ impl CodeUnit {
         {
             member_name
         } else {
-            member_name.rsplit('$').next().unwrap_or(member_name)
+            member_name.rsplit('$').next().unwrap_or(member_name) // fqname-M4: identifier() strips a nested-type prefix from short_name's leaf; a bare string accessor called on synthetic lookup units that carry no fq
         }
     }
 

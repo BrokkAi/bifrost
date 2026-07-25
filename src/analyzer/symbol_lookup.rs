@@ -696,7 +696,7 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
         .iter()
         .flat_map(|segment| {
             segment
-                .split('$')
+                .split('$') // fqname-M4: input-edge splitter of a client-supplied symbol path (pre-language, no CodeUnit/fq yet); the sanctioned MCP input boundary
                 .filter(|part| !part.is_empty())
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()

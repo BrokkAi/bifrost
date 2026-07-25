@@ -227,27 +227,19 @@ pub(super) fn resolve_qualified_in_enclosing_scopes(
     };
     let scope_unit = analyzer.enclosing_code_unit(file, &range)?;
 
-    if !scope_unit.fq().is_empty() {
-        return resolve_qualified_name_in_shrinking_scopes_fq(
-            language,
-            scope_unit.fq(),
-            &reference_fq,
-            interner,
-            || true,
-            |fqn| analyzer.definitions(fqn).collect(),
-            accept,
-        );
+    // The enclosing scope unit always comes from FileState declarations, which
+    // carry a populated structured `fq` (extracted at M1, rehydrated from
+    // persisted segments at M3), so the composition is a pure segment push. The
+    // M2-era empty-fq string fallback (which walked the verbatim scope string and
+    // rendered the reference via `display`) is deleted; both sides are segments.
+    if scope_unit.fq().is_empty() {
+        return None;
     }
-
-    // Fallback: cache-loaded scope unit with an empty structured fq (deleted in
-    // M4). `display` renders the reference to the canonical `.`-joined
-    // normalization; the scope string is walked verbatim so a C++ `::`-headed
-    // namespace head keeps matching the indexed string.
-    let scope = scope_unit.fq_name();
-    let normalized = reference_fq.display(interner);
-    resolve_qualified_name_in_shrinking_scopes(
-        &scope,
-        &normalized,
+    resolve_qualified_name_in_shrinking_scopes_fq(
+        language,
+        scope_unit.fq(),
+        &reference_fq,
+        interner,
         || true,
         |fqn| analyzer.definitions(fqn).collect(),
         accept,

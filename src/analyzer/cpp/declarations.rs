@@ -37,6 +37,9 @@ fn cpp_push_package(fq: &mut FqName, package_name: &str) {
 /// cpp-specific native rendering rule is needed for this chain.
 fn cpp_push_type_chain(fq: &mut FqName, chain: &str) {
     let mut first = true;
+    // fqname-M4: sanctioned M1 construction bridge — this BUILDS the FqName's Type/Nested
+    // segments from the legacy `$`-joined nested-class chain at emission; it is the interning
+    // entry point, not re-inference of an already-structured name.
     for component in chain.split('$').filter(|c| !c.is_empty()) {
         let kind = if first {
             SegmentKind::Type

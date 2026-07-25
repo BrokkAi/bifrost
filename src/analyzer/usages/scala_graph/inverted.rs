@@ -4131,6 +4131,7 @@ impl ProjectTypes {
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
+        // fqname-M4: leaf identifier of a package-less short_name; a name-suffix test, fq not needed
         if !target.is_function() || target.short_name().rsplit('.').next() != Some("apply") {
             return None;
         }
@@ -6154,7 +6155,7 @@ fn visible_imports_at_byte(
 }
 
 fn owner_fqn(unit: &CodeUnit) -> Option<String> {
-    let (owner_short, _) = unit.short_name().rsplit_once('.')?;
+    let (owner_short, _) = unit.short_name().rsplit_once('.')?; // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
     Some(if unit.package_name().is_empty() {
         owner_short.to_string()
     } else {

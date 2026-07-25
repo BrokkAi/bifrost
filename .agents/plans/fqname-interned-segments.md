@@ -80,12 +80,20 @@ the analyzer tree.
       (`sql_all_declarations_vec`, and the `CandidateRow`→`CodeUnit` builders at
       `tree_sitter_analyzer.rs:3958`/`4555`) DELIBERATELY stays string-based
       (empty `fq`) — M4 worklist, not widened here.
-- [ ] M4: retire string inference; grep-gate; issue-1163 pilot flip. Also fold
-      the candidate-row `CodeUnit` reconstruction (`sql_all_declarations_vec` and
-      the two `CandidateRow`→`CodeUnit` builders) onto segments so
-      `get_all_declarations` units carry `fq` too, and delete the now-dead
-      empty-fq fallback arms in `default_parent_fq_name` /
-      `resolve_qualified_in_enclosing_scopes`.
+- [x] M4 (2026-07-24): retire string inference; grep-gate; issue-1163 pilot flip
+      landed. Candidate-row `CodeUnit` reconstruction folded onto segments
+      (`CandidateRow` carries `fq_segments`, hydrated via `hydrate_unit_fq` in all
+      three builders — `QueryResolver::code_unit_for_row`,
+      `resolve_candidate_rows_limited`, `direct_children_limited`), so
+      `get_all_declarations`/candidate units now carry `fq`. Both empty-fq fallback
+      arms DELETED (`default_parent_fq_name`'s legacy separator scan;
+      `resolve_qualified_in_enclosing_scopes`' verbatim-string arm). Grep-gate
+      `tests/no_stringly_name_parsing.rs` locks the door on the two sharpest
+      name-parsing shapes (CodeUnit name-accessor splits; any `$`-separator split),
+      mutation-verified. Issue #1163 CLOSED: `cpp_qualified_nested_namespace_type_*`
+      flips from pinning a false boundary to asserting real RESOLUTION of the
+      sibling-namespace shape, via the new segment-based namespace-outward net
+      `cpp_resolve_qualified_via_enclosing_namespaces`. Census + decisions below.
 
 ## Surprises & Discoveries
 
@@ -990,6 +998,158 @@ the analyzer tree.
   identities as strings and re-derive or re-extract via the salt. M4 folds those
   onto segments and deletes the now-live-but-still-present empty-fq fallback arms.
 
+- Decision (M4 candidate-row hydration — a uniform `fq_segments` column at index
+  12 in EVERY candidate projection, read by the shared `candidate_row_from_row`):
+  `CandidateRow` gained `fq_segments: Option<Vec<u8>>`, populated from
+  `code_units.fq_segments` — the same persisted content-stable tail the FileState
+  load path reads. Every candidate SQL projection (the shared
+  `candidate_rows_sql_with_membership_and_projection` and
+  `limited_candidate_rows_sql_with_membership`, plus the five hand-written
+  candidate SELECTs: search-by-lang ×2, primary-range-by-kind, usage-fact,
+  bulk-by-oids) now selects `fq_segments` at column index 12, directly after
+  `in_definition_lookup`; any per-query extra columns shifted to 13+, and their
+  decoders (`definition_order`, `candidate_primary_range`, `usage_fact`,
+  `search_candidate`, both limited row-byte gates) were re-indexed. Rationale:
+  the query.rs `code_unit_for_row` builder that backs
+  `IAnalyzer::get_all_declarations` is fed by ~20 diverse candidate queries, so
+  the ONLY way to guarantee every candidate-derived unit carries `fq` is a uniform
+  column-12 invariant read once by the shared decoder — a per-query decoder split
+  would have missed sources. The FileState-vs-candidate choice the M4 brief left
+  open was resolved toward the join-free column read (not FileState hydration):
+  candidate rows already `SELECT ... FROM code_units`, so the blob is one more
+  projected column at zero extra query cost, whereas hydrating the full owning
+  FileState per candidate would defeat the cold-persisted candidate scan the rows
+  exist to avoid. All three builders
+  (`QueryResolver::code_unit_for_row`, `resolve_candidate_rows_limited`,
+  `direct_children_limited`) now call `hydrate_unit_fq(row.fq_segments, &package_name,
+  language_for_file(file))` → `CodeUnit::with_signature_and_fq`, identical to the
+  FileState path (`hydrate_unit_fq` promoted to `pub(crate)`). Date/Author:
+  2026-07-24, implementation (M4).
+
+- Decision (M4 fallback-arm deletion — empty `fq` now genuinely means "no owner",
+  not "not yet migrated"): `default_parent_fq_name` (`i_analyzer.rs`) dropped its
+  legacy rightmost-of-`[".","$","::","->"]` scan; it is now a pure
+  `fq().parent()` segment pop rendered natively. `resolve_qualified_in_enclosing_scopes`
+  (`get_definition/mod.rs`) dropped its verbatim-scope-string arm (which walked the
+  scope string and rendered the reference via `display()`); the scope unit always
+  comes from `enclosing_code_unit` → FileState declarations, which carry `fq`
+  post-M3, so the segment-composition arm is the only path. The dual-arm
+  `parent_of_tests` were retargeted: the segment-pop owner is still asserted, and
+  the empty-fq twin now asserts `None` (the new contract). Rationale: with the
+  candidate-row path migrated, the only remaining empty-fq units are synthetic
+  file-scope units (no owner) and in-memory synthetic lookup keys that never reach
+  these resolvers as owned declarations; the full validation suite (below) is the
+  empirical proof no owned declaration reaches either resolver empty-fq.
+  Date/Author: 2026-07-24, implementation (M4).
+
+- Decision (M4 grep-gate — ban the two SHARPEST name-parsing shapes, not the whole
+  `split` family; refine per the census): `tests/no_stringly_name_parsing.rs` walks
+  `src/analyzer/**/*.rs` and fails on (A) a `CodeUnit` name accessor
+  (`.short_name()`/`.package_name()`/`.fq_name()`) immediately split, and (B) any
+  split-family call on a `$`-containing separator literal. It deliberately does
+  NOT ban the general `.split('.')`/`.split("::")` family. Rationale: the census
+  (below) found ~354 production split sites; the overwhelming majority split
+  *source syntax* (call-target text, signatures, import paths, module specifiers
+  read straight off the AST) — legitimate, structured, source-derived parsing that
+  CLAUDE.md's rule explicitly permits (it bans replacing the tree-sitter AST with
+  string scanning, not tokenizing source). The plan's "refine the pattern list
+  against what the census shows is name-parsing-shaped" is honored by narrowing to
+  the exact bug surface behind issues #1126/#1128/#1162/#1163: re-splitting a
+  CodeUnit's own rendered name, and any `$` split (`$` is *only* ever a
+  name-nesting boundary in this tree). This keeps the gate precise — a legitimate
+  signature/path split never trips it, so the bulk of the tree needs no allowlist —
+  while still failing the build on the shapes that actually caused the bugs. The 22
+  matching sites today are each exempted with an inline `// fqname-M4: <reason>`
+  comment (the plan's category (c)); mutation-verified by injecting an
+  un-annotated `rsplit_once('$')` (gate failed, naming the line) and reverting.
+  Date/Author: 2026-07-24, implementation (M4).
+
+- Decision (M4 issue-#1163 flip — a self-contained C++ namespace-outward net,
+  NOT a change to the shared shrinking-scope resolver): the pinned false-boundary
+  shape (`inner::Gizmo` from inside `outer::deep` resolving to
+  `outer::inner::Gizmo`) is fixed by a new cpp-local helper
+  `cpp_resolve_qualified_via_enclosing_namespaces` (`usages/get_definition/cpp.rs`),
+  wired into both formerly-pinned `boundary_unchecked` sites as a resolution probe
+  ahead of a now-`gated_boundary` claim. The helper re-interns the `::`-qualified
+  reference with C++ namespace-aware kinds (interior segments `Package`, leaf
+  `Type`), walks the enclosing scope's leading `Package` (namespace) prefix from
+  innermost to global, composes prefix+reference, renders `display_native(Cpp)`
+  (which spells the exact stored key `outer::inner.Gizmo`), and matches it against
+  the string-keyed `definitions` index. Rationale: the shared
+  `resolve_qualified_name_in_shrinking_scopes_fq` is deliberately dot-only and
+  reference-kind-insensitive (`Unknown`); making IT descend `::` and carry
+  namespace kinds would ripple through rust/scala/csharp with regression risk,
+  whereas C++'s namespace-outward lookup with a namespace-vs-type-tagged reference
+  is genuinely C++-specific. The interior-`Package` interpretation is the common
+  `::`-qualified shape (a `Class::Nested` nested-type reference is `$`-spelled in
+  the store and left to the owner/member paths); a hit is a real indexed
+  declaration matched against the index, never a guess. Result: the shape now
+  fully RESOLVES (status `resolved`, definition `outer::inner.Gizmo`) — stronger
+  than the "not a boundary" the plan's minimum asked; `gated_boundary` still makes
+  the workspace-internal check structural for the residual. Date/Author:
+  2026-07-24, implementation (M4).
+
+- **M4 complete (2026-07-24):** string inference retired, the door locked, issue
+  #1163 closed. What changed:
+  * Candidate-row path folded onto segments (`CandidateRow.fq_segments`; three
+    builders hydrate via `hydrate_unit_fq`), so `get_all_declarations` and
+    candidate/definition/direct-children units carry `fq`.
+  * Both empty-fq fallback arms deleted (`default_parent_fq_name` legacy scan;
+    `resolve_qualified_in_enclosing_scopes` verbatim arm). Empty `fq` ⇒ no owner.
+  * Grep-gate `tests/no_stringly_name_parsing.rs` added (bans CodeUnit
+    name-accessor splits and `$`-separator splits; mutation-verified).
+  * Issue #1163 flip: `cpp_qualified_nested_namespace_type_resolves` now asserts
+    real resolution (was pinning a false boundary), via the segment-based
+    `cpp_resolve_qualified_via_enclosing_namespaces` net; the two pinned
+    `boundary_unchecked` sites in `usages/get_definition/cpp.rs` became live
+    `gated_boundary` closures.
+  * Split-site census (production `src/analyzer/**`, excluding tests): ~354
+    split-family sites. Handled: 3 shared consumers already migrated to segments
+    across M2–M4 (`parent_of`/`default_parent_fq_name`,
+    `resolve_qualified_in_enclosing_scopes`, and the candidate-row builders) — the
+    highest-leverage name-structure re-inferers; ~145 category-(b) legitimate
+    source-syntax/signature/path/message splits that don't match the (refined)
+    banned patterns and need no annotation; 22 category-(c) name-adjacent sites
+    matched by the gate and each exempted with a `// fqname-M4: <reason>` comment
+    (short_name-owner splits where `fq.parent()` would render the package-qualified
+    owner and change a hot-resolver string comparison; `$`-chain splits on `&str`
+    reference/owner names where the `FqName` is not threaded to that surface; the
+    sanctioned M1 construction bridge `cpp_push_type_chain` and the MCP input-edge
+    `split_segments_on_dollar`; JVM bytecode-name post-processing). The remaining
+    ~185 census category-(a) sites split *source-derived* reference/import/module
+    strings (not a CodeUnit's own name) — legitimate structured parsing that the
+    refined gate intentionally does not target; a full mechanical migration of
+    those to segment ops is a larger follow-up beyond a single milestone's safe
+    green-at-every-step scope, recorded here rather than rushed.
+  * Validation (all `BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python`,
+    ALL 0 failed): `cargo fmt` clean; `cargo clippy --all-targets --features
+    nlp,python -D warnings` clean; `--lib` 1892; `get_definition_test` 635,
+    `searchtools_service` 189, `searchtools_definition_selectors` 73,
+    `searchtools_fuzzy_symbol_lookup` 41, `mcp_property_fuzzer_service` 61,
+    `no_stringly_name_parsing` 1 (the new grep-gate); canaries `issue_1128` 12,
+    `issue_1162` 10 (the flipped `cpp_qualified_nested_namespace_type_resolves`),
+    `issue_1089_crate_name_directory_mapping` 45, `issue_1093` 10, `issue_1120` 9,
+    `issue_1121` 10, `issue_1126_import_boundary_claims` 11,
+    `issue_1142_rust_inline_mod_items` 12, `issue_1158_boundary_claim_gate` 11;
+    persistence `analyzer_persistence` 45; every touched language pair —
+    cpp (`cpp_analyzer` 43, `usages_cpp_graph` 145, `usage_graph_cpp` 29),
+    scala (`scala_analyzer` 52, `usages_scala_graph` 28, `usage_graph_scala` 55,
+    `scala_definition_precedence` 52, `scala_definition_scope_residual` 8,
+    `intellij_scala_goto_definition` green), rust (`rust_analyzer` 21,
+    `usages_rust_graph` 20, `usage_graph_rust` 24), go (`go_analyzer` 19,
+    `usages_go_graph` 15, `usage_graph_go` 16), python (`python_analyzer` 5,
+    `usages_python_graph` 21, `usage_graph_python` 55), ruby (`ruby_analyzer` 104),
+    php (`php_analyzer` 202, `usages_php_graph` 23), java (`usages_java_graph` 27,
+    `usage_graph_java` 21), csharp (`csharp_analyzer` 12, `usages_csharp_graph`
+    25), js/ts (`javascript_analyzer` 107, `typescript_analyzer` 74,
+    `usage_graph_ts` 51). One mid-run regression caught and fixed: the #1163
+    namespace-outward probe initially ignored visibility and over-resolved a
+    negative-before-include case in `usages_cpp_graph`; gating the probe's `accept`
+    on `visibility.external_type_candidate_visible_at` fixed it (145/0) while
+    keeping #1163 resolving. Mutation checks (both reverted): the grep-gate failed
+    on an injected un-annotated `rsplit_once('$')`; the deleted `default_parent_fq_name`
+    scan arm's twin now yields `None` for an empty-fq unit.
+
 ## Context and Orientation
 
 Bifrost is a Rust code analyzer and MCP server. Each source declaration becomes a
@@ -1302,3 +1462,33 @@ guard are the load-side mirror of the sanctioned M1 construction bridge, and the
 next contributor (M4) inherits exactly which string-based consumers remain and
 why the empty-fq fallback arms cannot be deleted until the candidate-row path is
 also migrated.
+
+## Revision note (2026-07-24, M4)
+
+Recorded M4 completion — the plan's user-visible payoff and final milestone. The
+`Progress` M4 checkbox is flipped with a summary; four `Decision Log` entries were
+added (the uniform `fq_segments`-at-index-12 candidate-row column and why the
+join-free column read beat FileState hydration; the empty-fq fallback-arm deletion
+and the new "empty fq ⇒ no owner" contract; the deliberately-narrow grep-gate that
+bans only CodeUnit name-accessor splits and `$`-splits rather than the whole split
+family, refined against the census; and the self-contained C++ namespace-outward
+net that closes issue #1163 without perturbing the shared shrinking-scope
+resolver); and an `M4 complete` outcomes entry carries the split-site census
+(~354 production sites: 3 shared consumers migrated across M2–M4, ~145 legitimate
+source-syntax splits untouched, 22 name-adjacent sites exempted with
+`// fqname-M4:` reasons, ~185 source-derived reference/import splits recorded as a
+deferred follow-up) and the full green validation tally. Why: M4 both retires the
+string inference (candidate-row hydration + fallback deletion) and locks the door
+(grep-gate), and delivers the acceptance payoff — the pinned false-boundary test
+`cpp_qualified_nested_namespace_type_current_behavior` becomes
+`cpp_qualified_nested_namespace_type_resolves`, asserting the sibling-namespace
+shape now RESOLVES (status `resolved`, `outer::inner.Gizmo`) rather than drawing a
+confident boundary, closing issue #1163. The census came in well above the plan's
+~227 estimate (~354), so the honest scope call — migrate the highest-leverage
+shared consumers and the candidate-row path, guard the sharpest shapes, and record
+the long tail of source-syntax splits as a bounded follow-up rather than rush a
+200-site mechanical migration through a milestone that must stay green at every
+step — is documented in the Decision Log and outcomes entry rather than papered
+over. The one mid-implementation regression (the #1163 probe ignoring visibility)
+and its fix (gating on `external_type_candidate_visible_at`) are recorded in the
+validation tally.

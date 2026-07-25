@@ -370,6 +370,14 @@ pub struct CandidateRow {
     pub content_qualifier: String,
     pub signature: Option<String>,
     pub flags: CandidateFlags,
+    /// The persisted content-stable `short_name`-tail segments of the unit's
+    /// `FqName` (the `code_units.fq_segments` blob), or `None` for a NULL column
+    /// (synthetic file-scope units and pre-M3 rows). Every candidate projection
+    /// selects this column at index 12 (see `candidate_row_from_row`), so a
+    /// candidate-row builder can rebuild the loaded unit's full structured `fq`
+    /// via `hydrate_unit_fq` exactly like the FileState load path — no longer an
+    /// empty-`fq` reconstruction (M4).
+    pub fq_segments: Option<Vec<u8>>,
 }
 
 /// A provider-owned row batch whose work was capped before materialization.
@@ -2471,7 +2479,7 @@ impl AnalyzerStore {
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, units.in_test_region,
+                    units.in_definition_lookup, units.fq_segments, units.in_test_region,
                     primary_range.start_byte, primary_range.end_byte,
                     primary_range.start_line, primary_range.end_line
              FROM code_units AS units
@@ -2608,7 +2616,7 @@ impl AnalyzerStore {
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup,
+                    units.in_definition_lookup, units.fq_segments,
                     primary_range.start_byte, primary_range.end_byte,
                     primary_range.start_line, primary_range.end_line
              FROM code_units AS units
@@ -2969,7 +2977,8 @@ fn limited_candidate_rows_sql_with_membership(
          + length(CAST({candidate_alias}.lang AS BLOB))
          + length(CAST({candidate_alias}.short_name AS BLOB))
          + length(CAST({candidate_alias}.content_qualifier AS BLOB))
-         + COALESCE(length(CAST({candidate_alias}.signature AS BLOB)), 0)"
+         + COALESCE(length(CAST({candidate_alias}.signature AS BLOB)), 0)
+         + COALESCE(length(CAST({candidate_alias}.fq_segments AS BLOB)), 0)"
     );
     let admitted = |column: &str| {
         format!(
@@ -2985,7 +2994,7 @@ fn limited_candidate_rows_sql_with_membership(
                 {}, {},
                 {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
                 {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
-                {candidate_alias}.in_definition_lookup,
+                {candidate_alias}.in_definition_lookup, {},
                 ({row_bytes})
          {from_clause}
          WHERE {predicate} AND {membership}
@@ -2996,6 +3005,7 @@ fn limited_candidate_rows_sql_with_membership(
         admitted("short_name"),
         admitted("content_qualifier"),
         admitted("signature"),
+        admitted("fq_segments"),
     )
 }
 
@@ -3013,7 +3023,7 @@ fn candidate_rows_sql_with_membership_and_projection(
                 {candidate_alias}.content_qualifier, {candidate_alias}.signature,
                 {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
                 {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
-                {candidate_alias}.in_definition_lookup{extra_projection}
+                {candidate_alias}.in_definition_lookup, {candidate_alias}.fq_segments{extra_projection}
          {from_clause}
          WHERE {predicate} AND {membership}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
@@ -3083,7 +3093,8 @@ fn candidate_rows_for_languages_limited<'a>(
         let mut query = statement.query(params_from_iter(params))?;
         while let Some(row) = query.next()? {
             inspected = inspected.saturating_add(1);
-            let row_bytes = row.get::<_, i64>(12)?;
+            // `fq_segments` occupies index 12; the row-byte budget column follows.
+            let row_bytes = row.get::<_, i64>(13)?;
             if !bytes.admit_sqlite_bytes(row_bytes)? {
                 return Ok(LimitedQueryRows::incomplete(rows, inspected));
             }
@@ -5515,14 +5526,18 @@ fn candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate
             in_declarations: row.get::<_, i64>(10)? != 0,
             in_definition_lookup: row.get::<_, i64>(11)? != 0,
         },
+        // Every candidate projection selects `fq_segments` at index 12, directly
+        // after `in_definition_lookup`; any extra per-query columns follow at 13+.
+        fq_segments: row.get::<_, Option<Vec<u8>>>(12)?,
     })
 }
 
 fn definition_order_candidate_row_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<DefinitionOrderCandidateRow> {
+    // `fq_segments` occupies index 12; the definition-order extra column follows.
     let first_start_byte = row
-        .get::<_, Option<i64>>(12)?
+        .get::<_, Option<i64>>(13)?
         .map(i64_to_usize)
         .transpose()
         .map_err(rusqlite_error_from_store)?;
@@ -5535,11 +5550,12 @@ fn definition_order_candidate_row_from_row(
 fn candidate_primary_range_row_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<CandidatePrimaryRangeRow> {
+    // `fq_segments` occupies index 12; the primary-range columns follow at 13-16.
     let primary_range = match (
-        row.get::<_, Option<i64>>(12)?,
         row.get::<_, Option<i64>>(13)?,
         row.get::<_, Option<i64>>(14)?,
         row.get::<_, Option<i64>>(15)?,
+        row.get::<_, Option<i64>>(16)?,
     ) {
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
             start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
@@ -5582,7 +5598,8 @@ where
 }
 
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
-    let metadata_len = row.get::<_, Option<i64>>(13)?;
+    // `fq_segments` occupies index 12; the usage-fact extras follow at 13-15.
+    let metadata_len = row.get::<_, Option<i64>>(14)?;
     if metadata_len
         .map(i64_to_usize)
         .transpose()
@@ -5594,23 +5611,25 @@ fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFac
         ))));
     }
     let metadata = row
-        .get::<_, Option<Vec<u8>>>(14)?
+        .get::<_, Option<Vec<u8>>>(15)?
         .map(|bytes| deserialize_signature_metadata_blob(&bytes).map_err(rusqlite_error_from_store))
         .transpose()?;
     Ok(UsageFactRow {
         candidate: candidate_row_from_row(row)?,
-        signature: row.get(12)?,
+        signature: row.get(13)?,
         signature_metadata: metadata,
     })
 }
 
 fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchCandidateRow> {
     let candidate = candidate_row_from_row(row)?;
+    // `fq_segments` occupies index 12; `in_test_region` moves to 13 and the
+    // primary-range columns to 14-17.
     let primary_range = match (
-        row.get::<_, Option<i64>>(13)?,
         row.get::<_, Option<i64>>(14)?,
         row.get::<_, Option<i64>>(15)?,
         row.get::<_, Option<i64>>(16)?,
+        row.get::<_, Option<i64>>(17)?,
     ) {
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
             start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
@@ -5623,7 +5642,7 @@ fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
     Ok(SearchCandidateRow {
         candidate,
         primary_range,
-        in_test_region: row.get::<_, i64>(12)? != 0,
+        in_test_region: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -5670,7 +5689,7 @@ fn search_candidate_rows_by_lang_conn(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, units.in_test_region,
+                units.in_definition_lookup, units.fq_segments, units.in_test_region,
                 primary_range.start_byte, primary_range.end_byte,
                 primary_range.start_line, primary_range.end_line
          FROM code_units AS units
@@ -5695,7 +5714,7 @@ fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<Usa
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, signature.text,
+                units.in_definition_lookup, units.fq_segments, signature.text,
                 length(metadata.metadata),
                 CASE
                     WHEN length(metadata.metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
@@ -5795,7 +5814,7 @@ fn definition_lookup_candidate_rows_by_oids_conn(
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup
+                    units.in_definition_lookup, units.fq_segments
              FROM code_units AS units
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -6116,7 +6135,8 @@ fn direct_children_for_unit_limited_conn(
     let mut bytes = LimitedQueryByteBudget::default();
     while let Some(row) = query.next()? {
         inspected = inspected.saturating_add(1);
-        if !bytes.admit_sqlite_bytes(row.get::<_, i64>(12)?)? {
+        // `fq_segments` occupies index 12; the row-byte budget column follows.
+        if !bytes.admit_sqlite_bytes(row.get::<_, i64>(13)?)? {
             return Ok(LimitedQueryRows::incomplete(rows, inspected));
         }
         rows.push(candidate_row_from_row(row)?);
@@ -7122,7 +7142,11 @@ fn encode_unit_fq_segments(unit: &CodeUnit) -> Option<Vec<u8>> {
 /// path-dependent package prefix is rebuilt from `package_name` and the
 /// content-stable tail appended, so a content blob shared across paths hydrates
 /// with the correct per-path qualified name.
-fn hydrate_unit_fq(persisted: Option<&[u8]>, package_name: &str, lang: Language) -> Result<FqName> {
+pub(crate) fn hydrate_unit_fq(
+    persisted: Option<&[u8]>,
+    package_name: &str,
+    lang: Language,
+) -> Result<FqName> {
     let interner = segment_interner();
     let tail = match persisted {
         Some(bytes) if !bytes.is_empty() => {

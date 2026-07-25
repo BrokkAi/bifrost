@@ -685,38 +685,25 @@ pub trait IAnalyzer: Send + Sync + Any {
 }
 
 /// The fully-qualified name of `code_unit`'s owner (the unit with its final
-/// name segment removed), or `None` if it has no owner. Shared by the default
-/// [`IAnalyzer::parent_of`] and its dual-arm equivalence test.
+/// name segment removed), or `None` if it has no owner (a top-level or
+/// synthetic file-scope unit).
 ///
-/// When the unit carries a populated structured [`FqName`] (M1: every
-/// freshly-extracted unit does), the owner is a pure segment pop rendered in
-/// the unit's native spelling — the boundaries are recorded, never re-guessed.
-/// A cache-loaded unit has an empty `fq` until persistence carries segments
-/// (M3), so it falls back to the legacy separator scan over the joined string;
-/// the M1 equivalence assertion guarantees the two arms compute the identical
-/// owner name, so behavior is unchanged. The fallback arm is deleted in M4.
+/// The owner is a pure segment pop on the unit's structured [`FqName`], rendered
+/// in its native spelling — the boundaries were recorded at construction and are
+/// never re-guessed from the joined string. Every unit that reaches here carries
+/// a populated `fq`: freshly-extracted units populate it at emission (M1),
+/// FileState- and candidate-row-loaded cache units rebuild it from the persisted
+/// segments (M3/M4). The M2-era legacy separator-scan fallback (which split the
+/// joined name on the rightmost of `.`/`$`/`::`/`->`) is deleted; an empty `fq`
+/// now genuinely means "no owner" rather than "not yet migrated".
 fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
-    let fq = code_unit.fq();
-    if !fq.is_empty() {
-        let parent = fq.parent().filter(|parent| !parent.is_empty())?;
-        let interner = crate::analyzer::fq_name::segment_interner();
-        let language = crate::analyzer::common::language_for_file(code_unit.source());
-        return Some(parent.display_native(language, interner));
-    }
-
-    // Legacy fallback (empty-fq / cache-loaded units; deleted in M4): the owner
-    // boundary is the rightmost of the separators the joined spelling can use.
-    let fq_name = code_unit.fq_name();
-    let mut last_index = None;
-    for separator in [".", "$", "::", "->"] {
-        if let Some(index) = fq_name.rfind(separator)
-            && index + separator.len() < fq_name.len()
-            && last_index.map(|current| index > current).unwrap_or(true)
-        {
-            last_index = Some(index);
-        }
-    }
-    Some(fq_name.get(..last_index?)?.to_string())
+    let parent = code_unit
+        .fq()
+        .parent()
+        .filter(|parent| !parent.is_empty())?;
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let language = crate::analyzer::common::language_for_file(code_unit.source());
+    Some(parent.display_native(language, interner))
 }
 
 /// Releases request-scoped analyzer memoization on every return path.
@@ -970,13 +957,13 @@ mod parent_of_tests {
     use crate::analyzer::ProjectFile;
     use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 
-    /// Build the two dual-representation forms of one declaration: a
-    /// freshly-extracted unit carrying a populated structured `FqName`, and its
-    /// cache-loaded twin whose `fq` is still empty (persistence carries segments
-    /// in M3). The two must derive the identical owner name through
-    /// `default_parent_fq_name` — the empty-fq unit takes the legacy separator
-    /// scan, the populated one takes the segment pop — which is what makes the
-    /// M2 migration a zero-behavior change while both arms coexist.
+    /// Build the two representations of one declaration: a unit carrying a
+    /// populated structured `FqName`, and a twin whose `fq` is empty. Since M4
+    /// deleted the legacy separator-scan fallback, `default_parent_fq_name`
+    /// derives the owner purely from segments: the populated unit pops its last
+    /// segment, and the empty-fq twin now has *no* owner (empty `fq` genuinely
+    /// means "no owner", e.g. a synthetic file-scope unit). The tests assert both
+    /// the popped owner name and that the empty twin yields `None`.
     fn dual_units(
         rel: &str,
         kind: CodeUnitType,
@@ -1010,15 +997,15 @@ mod parent_of_tests {
     ) {
         let (with_fq, without_fq) = dual_units(rel, kind, package_name, short_name, segments);
         let popped = default_parent_fq_name(&with_fq);
-        let scanned = default_parent_fq_name(&without_fq);
         assert_eq!(
             popped.as_deref(),
             expected_parent,
-            "segment-pop arm owner name mismatch for {short_name:?}"
+            "segment-pop owner name mismatch for {short_name:?}"
         );
         assert_eq!(
-            popped, scanned,
-            "segment-pop and legacy-scan arms must derive the identical owner for {short_name:?}"
+            default_parent_fq_name(&without_fq),
+            None,
+            "an empty-fq unit has no owner now that the legacy scan is deleted ({short_name:?})"
         );
     }
 

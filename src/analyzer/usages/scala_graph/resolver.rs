@@ -626,6 +626,7 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
         return owner.is_class().then_some(owner);
     }
 
+    // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
     if let Some((owner_short, _)) = target.short_name().rsplit_once('.') {
         let owner_fq = if target.package_name().is_empty() {
             owner_short.to_string()
