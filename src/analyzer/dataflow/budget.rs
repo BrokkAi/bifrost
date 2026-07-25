@@ -176,6 +176,39 @@ impl<'request> DataflowRequest<'request> {
         *self.budget = staged;
         None
     }
+
+    /// Atomically reserve required work while treating one independent charge
+    /// as best-effort.
+    ///
+    /// `Ok(true)` means both charges were committed, while `Ok(false)` means
+    /// only the required charge was committed because the optional charge did
+    /// not fit. Cancellation and required-budget failures commit neither.
+    pub(crate) fn reserve_optional_witness_relations(
+        &mut self,
+        required: SolverWork,
+        witness_relations: usize,
+    ) -> Result<bool, SolverTermination> {
+        if self.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        let required = self
+            .budget
+            .staged_charge(required)
+            .map_err(SolverTermination::ExceededBudget)?;
+        let optional = SolverWork {
+            witness_relations,
+            ..SolverWork::default()
+        };
+        let (staged, optional_retained) = match required.staged_charge(optional) {
+            Ok(combined) => (combined, true),
+            Err(_) => (required, false),
+        };
+        if self.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        *self.budget = staged;
+        Ok(optional_retained)
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +295,29 @@ mod tests {
 
         assert_eq!(request.reserve(charge), None);
         assert_eq!(request.budget.used(), charge);
+    }
+
+    #[test]
+    fn optional_reservation_commits_required_work_when_optional_work_does_not_fit() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SolverBudget::new(SolverWork {
+            reached_states: 1,
+            witness_relations: 0,
+            ..SolverWork::uniform(10)
+        });
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+
+        assert_eq!(
+            request.reserve_optional_witness_relations(
+                SolverWork {
+                    reached_states: 1,
+                    ..SolverWork::default()
+                },
+                1,
+            ),
+            Ok(false)
+        );
+        assert_eq!(request.budget.used().reached_states, 1);
+        assert_eq!(request.budget.used().witness_relations, 0);
     }
 }

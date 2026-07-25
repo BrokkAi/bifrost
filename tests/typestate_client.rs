@@ -1617,6 +1617,80 @@ fn summary_findings_retain_error_and_terminal_semantics() {
 }
 
 #[test]
+fn typestate_witness_budget_exhaustion_preserves_findings_and_reachability() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
+        true,
+        false,
+    );
+    let baseline = solve_summary(&fixture, &analyzer);
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut limits = SolverBudget::default().limits();
+    limits.witness_relations = 0;
+    let mut solver_budget = SolverBudget::new(limits);
+    let mut semantic_budget = SemanticBudget::default();
+    let exhausted = solve_typestate_with_summaries(
+        &fixture.root,
+        &[],
+        &analyzer.icfg_provider(),
+        &fixture.protocol,
+        &fixture.bindings,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("best-effort witnesses cannot stop a typestate solve");
+
+    assert_eq!(exhausted.result().facts(), baseline.result().facts());
+    assert_eq!(exhausted.result().reached(), baseline.result().reached());
+    assert_eq!(
+        exhausted.result().end_summaries(),
+        baseline.result().end_summaries()
+    );
+    assert_eq!(
+        exhausted.result().coverage().semantic_status(),
+        baseline.result().coverage().semantic_status()
+    );
+    assert_eq!(
+        exhausted.result().coverage().unproven_edges().len(),
+        baseline.result().coverage().unproven_edges().len()
+    );
+    assert_eq!(
+        exhausted.result().coverage().partial_edges().len(),
+        baseline.result().coverage().partial_edges().len()
+    );
+    assert_eq!(
+        exhausted.result().coverage().boundaries().len(),
+        baseline.result().coverage().boundaries().len()
+    );
+    assert_eq!(
+        exhausted.result().termination(),
+        baseline.result().termination()
+    );
+    let mut baseline_work = baseline.result().work();
+    baseline_work.witness_relations = 0;
+    assert_eq!(exhausted.result().work(), baseline_work);
+    assert!(exhausted.result().witness_retention_truncated());
+
+    let report =
+        collect_summary_findings(&fixture.protocol, &fixture.bindings, &exhausted).unwrap();
+    assert!(!report.findings().is_empty());
+    assert!(report.findings().iter().all(|finding| {
+        !finding.witnesses().is_empty()
+            && finding
+                .witnesses()
+                .iter()
+                .all(|witness| witness.witness().retention_truncated())
+    }));
+}
+
+#[test]
 fn finding_collection_rejects_a_result_from_another_binding_plan() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("src/main.ts", SOURCE)

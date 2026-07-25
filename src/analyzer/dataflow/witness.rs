@@ -42,23 +42,59 @@ impl Error for WitnessLimitError {}
 
 /// Query-local witness storage requested from the summary solver.
 ///
-/// Disabled retention performs no predecessor allocation. When enabled, the
-/// solver retains at most `max_alternatives_per_quality` derivations for one
-/// concrete `(state, PathQuality)` pair. Total retained growth is independently
-/// bounded by [`super::SolverBudgetDimension::WitnessRelations`].
+/// Disabled retention performs no predecessor allocation. Strict retention
+/// preserves the historical behavior: exceeding the request's
+/// [`super::SolverBudgetDimension::WitnessRelations`] limit terminates the
+/// solve. Best-effort retention instead drops the entire witness sidecar when
+/// either that request limit or its local relation cap is reached, without
+/// changing semantic reachability or termination.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WitnessRetentionLimits {
     max_alternatives_per_quality: Option<NonZeroUsize>,
+    best_effort_max_relations: Option<NonZeroUsize>,
 }
 
 impl WitnessRetentionLimits {
     pub const fn disabled() -> Self {
         Self {
             max_alternatives_per_quality: None,
+            best_effort_max_relations: None,
         }
     }
 
     pub fn new(max_alternatives_per_quality: usize) -> Result<Self, WitnessLimitError> {
+        Self::validate_alternatives(max_alternatives_per_quality).map(|limit| Self {
+            max_alternatives_per_quality: Some(limit),
+            best_effort_max_relations: None,
+        })
+    }
+
+    pub fn best_effort(
+        max_alternatives_per_quality: usize,
+        max_retained_relations: usize,
+    ) -> Result<Self, WitnessLimitError> {
+        let max_alternatives_per_quality =
+            Self::validate_alternatives(max_alternatives_per_quality)?;
+        let max_retained_relations =
+            NonZeroUsize::new(max_retained_relations).ok_or(WitnessLimitError {
+                field: "max_retained_relations",
+                maximum: None,
+            })?;
+        if max_retained_relations.get() > u32::MAX as usize {
+            return Err(WitnessLimitError {
+                field: "max_retained_relations",
+                maximum: Some(u32::MAX as usize),
+            });
+        }
+        Ok(Self {
+            max_alternatives_per_quality: Some(max_alternatives_per_quality),
+            best_effort_max_relations: Some(max_retained_relations),
+        })
+    }
+
+    fn validate_alternatives(
+        max_alternatives_per_quality: usize,
+    ) -> Result<NonZeroUsize, WitnessLimitError> {
         let max_alternatives_per_quality =
             NonZeroUsize::new(max_alternatives_per_quality).ok_or(WitnessLimitError {
                 field: "max_alternatives_per_quality",
@@ -70,9 +106,7 @@ impl WitnessRetentionLimits {
                 maximum: Some(MAX_WITNESS_ALTERNATIVES_PER_QUALITY),
             });
         }
-        Ok(Self {
-            max_alternatives_per_quality: Some(max_alternatives_per_quality),
-        })
+        Ok(max_alternatives_per_quality)
     }
 
     pub const fn is_enabled(self) -> bool {
@@ -83,6 +117,17 @@ impl WitnessRetentionLimits {
         match self.max_alternatives_per_quality {
             Some(limit) => limit.get(),
             None => 0,
+        }
+    }
+
+    pub const fn is_best_effort(self) -> bool {
+        self.best_effort_max_relations.is_some()
+    }
+
+    const fn best_effort_max_relations(self) -> Option<usize> {
+        match self.best_effort_max_relations {
+            Some(limit) => Some(limit.get()),
+            None => None,
         }
     }
 }
@@ -254,6 +299,7 @@ pub struct SummaryWitness {
     truncated: bool,
     omitted_steps_lower_bound: usize,
     alternatives_truncated: bool,
+    retention_truncated: bool,
     retained_bytes: usize,
     work: WitnessReconstructionWork,
 }
@@ -275,8 +321,22 @@ impl SummaryWitness {
             truncated,
             omitted_steps_lower_bound,
             alternatives_truncated,
+            retention_truncated: false,
             retained_bytes,
             work,
+        }
+    }
+
+    pub(crate) fn retention_truncated_marker(quality: PathQuality) -> Self {
+        Self {
+            steps: Box::new([]),
+            quality,
+            truncated: true,
+            omitted_steps_lower_bound: 1,
+            alternatives_truncated: true,
+            retention_truncated: true,
+            retained_bytes: size_of::<Self>(),
+            work: WitnessReconstructionWork::default(),
         }
     }
 
@@ -298,6 +358,14 @@ impl SummaryWitness {
 
     pub const fn alternatives_truncated(&self) -> bool {
         self.alternatives_truncated
+    }
+
+    /// Whether best-effort retention exhausted its independent sidecar budget.
+    ///
+    /// In this state the zero-step witness is an explicit availability marker,
+    /// not evidence that the target was reached without semantic steps.
+    pub const fn retention_truncated(&self) -> bool {
+        self.retention_truncated
     }
 
     /// Bytes exclusively retained by this value.
@@ -436,6 +504,7 @@ pub(crate) enum WitnessAdmission {
     Retained(WitnessEvidenceId),
     Duplicate,
     Truncated,
+    Exhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,6 +787,13 @@ impl WitnessArena {
         if alternatives.ids(quality).len() >= self.max_alternatives_per_quality() {
             alternatives.mark_truncated(quality);
             return Ok(WitnessAdmission::Truncated);
+        }
+        if self
+            .limits
+            .best_effort_max_relations()
+            .is_some_and(|limit| self.nodes.len().saturating_add(staged.len()) >= limit)
+        {
+            return Ok(WitnessAdmission::Exhausted);
         }
         let id = self.staged_id(staged.len())?;
         alternatives.push(quality, id);
@@ -1171,7 +1247,17 @@ mod tests {
 
         let enabled = WitnessRetentionLimits::new(3).unwrap();
         assert!(enabled.is_enabled());
+        assert!(!enabled.is_best_effort());
         assert_eq!(enabled.max_alternatives_per_quality(), 3);
+        let best_effort = WitnessRetentionLimits::best_effort(1, 64).unwrap();
+        assert!(best_effort.is_enabled());
+        assert!(best_effort.is_best_effort());
+        assert_eq!(
+            WitnessRetentionLimits::best_effort(1, 0)
+                .unwrap_err()
+                .field(),
+            "max_retained_relations"
+        );
         assert_eq!(
             WitnessRetentionLimits::new(MAX_WITNESS_ALTERNATIVES_PER_QUALITY + 1)
                 .unwrap_err()

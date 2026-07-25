@@ -32,6 +32,7 @@ pub enum TypestateUncertainty {
 
 pub const MAX_TYPESTATE_CALLBACK_FACTS: usize = 8_192;
 pub const MAX_TYPESTATE_CALLBACK_EXPANSIONS: usize = 65_536;
+const MAX_TYPESTATE_RETAINED_WITNESS_RELATIONS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypestateUncertaintySet(u8);
@@ -1178,7 +1179,8 @@ where
     problem.validate_analysis_root(root)?;
     problem.validate_entry_facts(entry_facts)?;
     let witness_retention =
-        WitnessRetentionLimits::new(1).expect("one typestate witness alternative is valid");
+        WitnessRetentionLimits::best_effort(1, MAX_TYPESTATE_RETAINED_WITNESS_RELATIONS)
+            .expect("typestate best-effort witness limits are valid");
     let result = solve_with_summaries(
         SummarySolveInput::new(root, entry_facts).with_witness_retention(witness_retention),
         provider,

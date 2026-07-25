@@ -481,6 +481,7 @@ pub struct SummaryDataflowResult<Fact> {
     semantic_work: SemanticWork,
     metrics: SummaryMetrics,
     witness_store: WitnessStore,
+    witness_retention_truncated: bool,
 }
 
 impl<Fact> SummaryDataflowResult<Fact> {
@@ -495,6 +496,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
         semantic_work: SemanticWork,
         metrics: SummaryMetrics,
         witness_store: WitnessStore,
+        witness_retention_truncated: bool,
     ) -> Self {
         reached.sort_by(compare_reached_facts);
         reached.dedup();
@@ -511,6 +513,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
             semantic_work,
             metrics,
             witness_store,
+            witness_retention_truncated,
         }
     }
 
@@ -548,6 +551,10 @@ impl<Fact> SummaryDataflowResult<Fact> {
 
     pub const fn metrics(&self) -> SummaryMetrics {
         self.metrics
+    }
+
+    pub const fn witness_retention_truncated(&self) -> bool {
+        self.witness_retention_truncated
     }
 
     pub fn is_complete(&self) -> bool {
@@ -605,10 +612,13 @@ impl<Fact> SummaryDataflowResult<Fact> {
         if !reached.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
         }
-        let evidence = reached
-            .witnesses
-            .first(quality)
-            .ok_or(SummaryWitnessError::RetentionDisabled)?;
+        let Some(evidence) = reached.witnesses.first(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
         self.witness_store.reconstruct(
             evidence,
             quality,
@@ -643,10 +653,13 @@ impl<Fact> SummaryDataflowResult<Fact> {
         if !summary.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
         }
-        let evidence = summary
-            .witnesses
-            .first(quality)
-            .ok_or(SummaryWitnessError::RetentionDisabled)?;
+        let Some(evidence) = summary.witnesses.first(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
         self.witness_store.reconstruct(
             evidence,
             quality,

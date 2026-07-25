@@ -292,6 +292,10 @@ impl TypestateWitness {
         self.summary.alternatives_truncated()
     }
 
+    pub const fn retention_truncated(&self) -> bool {
+        self.summary.retention_truncated()
+    }
+
     pub const fn retained_bytes(&self) -> usize {
         self.summary.retained_bytes()
     }
