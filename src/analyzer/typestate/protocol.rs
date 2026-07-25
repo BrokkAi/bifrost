@@ -348,7 +348,7 @@ impl ProtocolUncertaintySemantics {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolUncertaintyResolution {
-    StateSet(Box<[ProtocolStateId]>),
+    StateSet(ProtocolUncertaintyStateSet),
     PreserveUncertainty { state: ProtocolStateId },
     Abstain,
 }
@@ -356,9 +356,46 @@ pub enum ProtocolUncertaintyResolution {
 impl ProtocolUncertaintyResolution {
     pub fn states(&self) -> Option<&[ProtocolStateId]> {
         match self {
-            Self::StateSet(states) => Some(states),
+            Self::StateSet(states) => Some(states.states()),
             Self::PreserveUncertainty { .. } | Self::Abstain => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolUncertaintyStateSet {
+    states: Box<[ProtocolStateId]>,
+    error_witnesses: Box<[ProtocolUncertaintyViolation]>,
+}
+
+impl ProtocolUncertaintyStateSet {
+    pub fn states(&self) -> &[ProtocolStateId] {
+        &self.states
+    }
+
+    pub fn error_witnesses(&self) -> &[ProtocolUncertaintyViolation] {
+        &self.error_witnesses
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProtocolUncertaintyViolation {
+    event: ProtocolEventId,
+    from: ProtocolStateId,
+    to: ProtocolStateId,
+}
+
+impl ProtocolUncertaintyViolation {
+    pub const fn event(self) -> ProtocolEventId {
+        self.event
+    }
+
+    pub const fn from(self) -> ProtocolStateId {
+        self.from
+    }
+
+    pub const fn to(self) -> ProtocolStateId {
+        self.to
     }
 }
 
@@ -625,12 +662,24 @@ impl CompiledProtocol {
         cardinality: ProtocolObjectCardinality,
         eligible_events: &[ProtocolEventId],
     ) -> Option<ProtocolUncertaintyResolution> {
+        self.resolve_uncertainty_events(cause, state, cardinality, eligible_events.iter().copied())
+    }
+
+    pub(crate) fn resolve_uncertainty_events(
+        &self,
+        cause: ProtocolUncertaintyCause,
+        state: ProtocolStateId,
+        cardinality: ProtocolObjectCardinality,
+        eligible_events: impl ExactSizeIterator<Item = ProtocolEventId>,
+    ) -> Option<ProtocolUncertaintyResolution> {
         self.state_keys.get(state.index())?;
         if eligible_events.len() > MAX_PROTOCOL_EVENTS {
             return None;
         }
+        let mut eligible = vec![false; self.events.len()];
         for event in eligible_events {
             self.events.get(event.index())?;
+            eligible[event.index()] = true;
         }
         match self.semantics.uncertainty.behavior(cause) {
             ProtocolUncertaintyBehavior::PreserveUncertainty => {
@@ -639,10 +688,6 @@ impl CompiledProtocol {
             ProtocolUncertaintyBehavior::Abstain => Some(ProtocolUncertaintyResolution::Abstain),
             ProtocolUncertaintyBehavior::ConservativeTransition => {
                 let transitive = cause != ProtocolUncertaintyCause::AmbiguousDispatch;
-                let mut eligible = vec![false; self.events.len()];
-                for event in eligible_events {
-                    eligible[event.index()] = true;
-                }
                 Some(ProtocolUncertaintyResolution::StateSet(
                     self.conservative_uncertainty_targets(
                         state,
@@ -661,8 +706,9 @@ impl CompiledProtocol {
         cardinality: ProtocolObjectCardinality,
         eligible_events: &[bool],
         transitive: bool,
-    ) -> Box<[ProtocolStateId]> {
+    ) -> ProtocolUncertaintyStateSet {
         let mut reached = vec![false; self.state_keys.len()];
+        let mut predecessor = vec![None; self.state_keys.len()];
         reached[state.index()] = true;
         let mut stack = vec![state];
         while let Some(source) = stack.pop() {
@@ -675,6 +721,7 @@ impl CompiledProtocol {
                 let target = transition.to;
                 if !reached[target.index()] {
                     reached[target.index()] = true;
+                    predecessor[target.index()] = Some((source, transition.on, transition.to));
                     if transitive {
                         stack.push(target);
                     }
@@ -684,7 +731,7 @@ impl CompiledProtocol {
                 break;
             }
         }
-        reached
+        let states = reached
             .into_iter()
             .enumerate()
             .filter(|(_, present)| *present)
@@ -693,7 +740,24 @@ impl CompiledProtocol {
                     .expect("compiled protocol state count fits in u32")
             })
             .collect::<Vec<_>>()
-            .into_boxed_slice()
+            .into_boxed_slice();
+        let mut error_witnesses =
+            states
+                .iter()
+                .filter_map(|target| {
+                    if !self.is_error(*target) {
+                        return None;
+                    }
+                    predecessor[target.index()]
+                        .map(|(from, event, to)| ProtocolUncertaintyViolation { event, from, to })
+                })
+                .collect::<Vec<_>>();
+        error_witnesses.sort_unstable();
+        error_witnesses.dedup();
+        ProtocolUncertaintyStateSet {
+            states,
+            error_witnesses: error_witnesses.into_boxed_slice(),
+        }
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::analyzer::dataflow::{
@@ -27,6 +28,9 @@ pub enum TypestateUncertainty {
     IncompleteAnalysis = 4,
     UnmatchedEvent = 5,
 }
+
+pub const MAX_TYPESTATE_CALLBACK_FACTS: usize = 8_192;
+pub const MAX_TYPESTATE_CALLBACK_EXPANSIONS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypestateUncertaintySet(u8);
@@ -264,6 +268,7 @@ pub struct TypestateSummaryResult {
     protocol_hash: TypestateProtocolHash,
     binding_plan_hash: TypestateBindingPlanHash,
     bindings_complete: bool,
+    execution_complete: bool,
     result: SummaryDataflowResult<TypestateFact>,
 }
 
@@ -285,7 +290,7 @@ impl TypestateSummaryResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bindings_complete && self.result.is_complete()
+        self.bindings_complete && self.execution_complete && self.result.is_complete()
     }
 }
 
@@ -448,10 +453,11 @@ impl<'plan> TypestateFlowProblem<'plan> {
         &self,
         edge: DataflowEdge<'_>,
         family: TransferFamily,
-        mut facts: Vec<TypestateFact>,
+        facts: Vec<TypestateFact>,
         out: &mut dyn DataflowOutput<TypestateFact>,
     ) -> bool {
-        let subject = facts.first().and_then(|fact| fact.subject());
+        let mut facts = TransferFactSet::new(facts);
+        let subject = facts.subject();
         let mut eligible_events = Vec::new();
         for binding in self
             .bindings
@@ -459,17 +465,21 @@ impl<'plan> TypestateFlowProblem<'plan> {
         {
             if point_occurrence(self.protocol, binding.event()) {
                 if subject == Some(binding.subject()) {
-                    eligible_events.push(binding.event());
+                    eligible_events.push(EligibleEvent::from_binding(binding));
                 }
-                facts = self.apply_binding(facts, binding);
+                if !self.apply_binding(&mut facts, binding) {
+                    return facts.emit(out);
+                }
             }
         }
         for binding in self
             .bindings
             .terminal_bindings_at_program_point_all_contexts(edge.source())
         {
-            if terminal_point_occurrence(self.protocol, binding) {
-                self.append_terminal_observations(&mut facts, binding);
+            if terminal_point_occurrence(self.protocol, binding)
+                && !self.append_terminal_observations(&mut facts, binding)
+            {
+                return facts.emit(out);
             }
         }
 
@@ -479,17 +489,21 @@ impl<'plan> TypestateFlowProblem<'plan> {
         {
             if exit_point_occurrence(self.protocol, binding.event(), edge.target()) {
                 if subject == Some(binding.subject()) {
-                    eligible_events.push(binding.event());
+                    eligible_events.push(EligibleEvent::from_binding(binding));
                 }
-                facts = self.apply_binding(facts, binding);
+                if !self.apply_binding(&mut facts, binding) {
+                    return facts.emit(out);
+                }
             }
         }
         for binding in self
             .bindings
             .terminal_bindings_at_program_point_all_contexts(edge.target())
         {
-            if terminal_exit_point_occurrence(self.protocol, binding, edge.target()) {
-                self.append_terminal_observations(&mut facts, binding);
+            if terminal_exit_point_occurrence(self.protocol, binding, edge.target())
+                && !self.append_terminal_observations(&mut facts, binding)
+            {
+                return facts.emit(out);
             }
         }
 
@@ -498,10 +512,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 for binding in self.bindings.event_bindings_at_call_site_all_contexts(call) {
                     if call_occurrence(self.protocol, binding.event(), *stage) {
                         if subject == Some(binding.subject()) {
-                            eligible_events.push(binding.event());
+                            eligible_events.push(EligibleEvent::from_binding(binding));
                         }
-                        if edge.boundary().is_none() {
-                            facts = self.apply_binding(facts, binding);
+                        if edge.boundary().is_none() && !self.apply_binding(&mut facts, binding) {
+                            return facts.emit(out);
                         }
                     }
                 }
@@ -509,8 +523,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     .bindings
                     .terminal_bindings_at_call_site_all_contexts(call)
                 {
-                    if terminal_call_occurrence(self.protocol, binding, *stage) {
-                        self.append_terminal_observations(&mut facts, binding);
+                    if terminal_call_occurrence(self.protocol, binding, *stage)
+                        && !self.append_terminal_observations(&mut facts, binding)
+                    {
+                        return facts.emit(out);
                     }
                 }
             }
@@ -522,10 +538,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 {
                     if call_occurrence(self.protocol, binding.event(), *stage) {
                         if subject == Some(binding.subject()) {
-                            eligible_events.push(binding.event());
+                            eligible_events.push(EligibleEvent::from_binding(binding));
                         }
-                        if edge.boundary().is_none() {
-                            facts = self.apply_binding(facts, binding);
+                        if edge.boundary().is_none() && !self.apply_binding(&mut facts, binding) {
+                            return facts.emit(out);
                         }
                     }
                 }
@@ -533,8 +549,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     .bindings
                     .terminal_bindings_at_call_program_point_all_contexts(edge.source())
                 {
-                    if terminal_call_occurrence(self.protocol, binding, *stage) {
-                        self.append_terminal_observations(&mut facts, binding);
+                    if terminal_call_occurrence(self.protocol, binding, *stage)
+                        && !self.append_terminal_observations(&mut facts, binding)
+                    {
+                        return facts.emit(out);
                     }
                 }
             }
@@ -554,33 +572,23 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     ProtocolUncertaintyCause::UnknownCall
                 }
             };
-            facts = facts
-                .into_iter()
-                .flat_map(|fact| self.apply_uncertainty(fact, cause, &eligible_events))
-                .collect();
-            canonicalize_facts(&mut facts);
-        } else if !matches!(edge.proof(), ProofStatus::Proven)
-            || !matches!(edge.completeness(), EvidenceCompleteness::Complete)
+            if !facts.map(|fact| self.apply_uncertainty(fact, cause, &eligible_events)) {
+                return facts.emit(out);
+            }
+        } else if (!matches!(edge.proof(), ProofStatus::Proven)
+            || !matches!(edge.completeness(), EvidenceCompleteness::Complete))
+            && !facts.map(|fact| {
+                self.apply_uncertainty(
+                    fact,
+                    ProtocolUncertaintyCause::IncompleteAnalysis,
+                    &eligible_events,
+                )
+            })
         {
-            facts = facts
-                .into_iter()
-                .flat_map(|fact| {
-                    self.apply_uncertainty(
-                        fact,
-                        ProtocolUncertaintyCause::IncompleteAnalysis,
-                        &eligible_events,
-                    )
-                })
-                .collect();
-            canonicalize_facts(&mut facts);
+            return facts.emit(out);
         }
 
-        for fact in facts {
-            if !out.emit(fact) {
-                return false;
-            }
-        }
-        true
+        facts.emit(out)
     }
 
     fn apply_seed_quality(
@@ -596,73 +604,84 @@ impl<'plan> TypestateFlowProblem<'plan> {
         }
     }
 
-    fn apply_binding(
-        &self,
-        facts: Vec<TypestateFact>,
-        binding: &BoundTypestateEvent,
-    ) -> Vec<TypestateFact> {
-        let mut next = Vec::new();
-        for fact in facts {
-            if !matches!(fact, TypestateFact::State { .. }) {
-                next.push(fact);
-                continue;
+    fn apply_binding(&self, facts: &mut TransferFactSet, binding: &BoundTypestateEvent) -> bool {
+        let quality = binding.quality();
+        if self.effective_quality_is_definitive(binding.subject(), quality) {
+            if matches!(
+                self.protocol
+                    .event(binding.event())
+                    .expect("binding-plan events retain valid protocol IDs")
+                    .observation()
+                    .occurrence,
+                ProtocolEventOccurrence::Escape
+            ) {
+                return facts.map(|fact| {
+                    if !matches!(fact, TypestateFact::State { .. })
+                        || fact.subject() != Some(binding.subject())
+                        || fact.abstained()
+                    {
+                        vec![fact]
+                    } else {
+                        self.apply_uncertainty(
+                            fact,
+                            ProtocolUncertaintyCause::Escape,
+                            &[EligibleEvent::from_binding(binding)],
+                        )
+                    }
+                });
             }
-            if fact.subject() != Some(binding.subject()) || fact.abstained() {
-                next.push(fact);
-                continue;
-            }
-            let quality = binding.quality();
-            if self.effective_quality_is_definitive(binding.subject(), quality) {
-                if matches!(
-                    self.protocol
-                        .event(binding.event())
-                        .expect("binding-plan events retain valid protocol IDs")
-                        .observation()
-                        .occurrence,
-                    ProtocolEventOccurrence::Escape
-                ) {
-                    next.extend(self.apply_uncertainty(
-                        fact,
-                        ProtocolUncertaintyCause::Escape,
-                        &[binding.event()],
-                    ));
+            return facts.map(|fact| {
+                if !matches!(fact, TypestateFact::State { .. })
+                    || fact.subject() != Some(binding.subject())
+                    || fact.abstained()
+                {
+                    vec![fact]
                 } else {
-                    next.extend(self.apply_event(fact, binding));
+                    self.apply_event(fact, binding)
                 }
-                continue;
-            }
-
-            let retained_multiple = quality.multiplicity().retained() > 1;
-            let call_site = binding.site().call_site_handle().is_some();
-            let mut uncertain = vec![fact];
-            if retained_multiple && call_site {
-                uncertain = uncertain
-                    .into_iter()
-                    .flat_map(|fact| {
-                        self.apply_uncertainty(
-                            fact,
-                            ProtocolUncertaintyCause::AmbiguousDispatch,
-                            &[binding.event()],
-                        )
-                    })
-                    .collect();
-            }
-            if !quality.is_proven() || !quality.is_complete() || (retained_multiple && !call_site) {
-                uncertain = uncertain
-                    .into_iter()
-                    .flat_map(|fact| {
-                        self.apply_uncertainty(
-                            fact,
-                            ProtocolUncertaintyCause::IncompleteAnalysis,
-                            &[binding.event()],
-                        )
-                    })
-                    .collect();
-            }
-            next.extend(uncertain);
+            });
         }
-        canonicalize_facts(&mut next);
-        next
+
+        let retained_multiple = quality.multiplicity().retained() > 1;
+        let call_site = binding.site().call_site_handle().is_some();
+        if retained_multiple
+            && call_site
+            && !facts.map(|fact| {
+                if !matches!(fact, TypestateFact::State { .. })
+                    || fact.subject() != Some(binding.subject())
+                    || fact.abstained()
+                {
+                    vec![fact]
+                } else {
+                    self.apply_uncertainty(
+                        fact,
+                        ProtocolUncertaintyCause::AmbiguousDispatch,
+                        &[EligibleEvent::from_binding(binding)],
+                    )
+                }
+            })
+        {
+            return false;
+        }
+        if (!quality.is_proven() || !quality.is_complete() || (retained_multiple && !call_site))
+            && !facts.map(|fact| {
+                if !matches!(fact, TypestateFact::State { .. })
+                    || fact.subject() != Some(binding.subject())
+                    || fact.abstained()
+                {
+                    vec![fact]
+                } else {
+                    self.apply_uncertainty(
+                        fact,
+                        ProtocolUncertaintyCause::IncompleteAnalysis,
+                        &[EligibleEvent::from_binding(binding)],
+                    )
+                }
+            })
+        {
+            return false;
+        }
+        true
     }
 
     fn effective_quality_is_definitive(
@@ -679,11 +698,12 @@ impl<'plan> TypestateFlowProblem<'plan> {
 
     fn append_terminal_observations(
         &self,
-        facts: &mut Vec<TypestateFact>,
+        facts: &mut TransferFactSet,
         binding: &BoundTypestateTerminal,
-    ) {
+    ) -> bool {
         let definitive = self.effective_quality_is_definitive(binding.subject(), binding.quality());
         let observations = facts
+            .facts()
             .iter()
             .filter_map(|fact| match *fact {
                 TypestateFact::State {
@@ -738,8 +758,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 | TypestateFact::Terminal { .. } => None,
             })
             .collect::<Vec<_>>();
-        facts.extend(observations);
-        canonicalize_facts(facts);
+        facts.extend(observations)
     }
 
     fn apply_event(
@@ -809,7 +828,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
         &self,
         fact: TypestateFact,
         cause: ProtocolUncertaintyCause,
-        eligible_events: &[ProtocolEventId],
+        eligible_events: &[EligibleEvent],
     ) -> Vec<TypestateFact> {
         let uncertainty_kind = uncertainty_kind(cause);
         match fact {
@@ -862,10 +881,12 @@ impl<'plan> TypestateFlowProblem<'plan> {
             .subject(subject)
             .expect("binding-plan facts retain valid subject IDs")
             .cardinality();
-        let Some(resolution) =
-            self.protocol
-                .resolve_uncertainty(cause, state, cardinality, eligible_events)
-        else {
+        let Some(resolution) = self.protocol.resolve_uncertainty_events(
+            cause,
+            state,
+            cardinality,
+            eligible_events.iter().map(|eligible| eligible.event),
+        ) else {
             return vec![TypestateFact::State {
                 plan,
                 subject,
@@ -876,16 +897,39 @@ impl<'plan> TypestateFlowProblem<'plan> {
         };
         let uncertainty = uncertainty.with(uncertainty_kind);
         match resolution {
-            ProtocolUncertaintyResolution::StateSet(states) => states
-                .iter()
-                .map(|state| TypestateFact::State {
-                    plan,
-                    subject,
-                    state: *state,
-                    uncertainty,
-                    abstained,
-                })
-                .collect(),
+            ProtocolUncertaintyResolution::StateSet(states) => {
+                let mut facts = states
+                    .states()
+                    .iter()
+                    .map(|state| TypestateFact::State {
+                        plan,
+                        subject,
+                        state: *state,
+                        uncertainty,
+                        abstained,
+                    })
+                    .collect::<Vec<_>>();
+                for witness in states.error_witnesses() {
+                    let Some(binding) = eligible_events
+                        .iter()
+                        .find(|eligible| eligible.event == witness.event())
+                    else {
+                        continue;
+                    };
+                    facts.push(TypestateFact::Violation {
+                        plan,
+                        subject,
+                        violation: TypestateViolation {
+                            event_binding: binding.binding,
+                            from: witness.from(),
+                            to: witness.to(),
+                        },
+                        uncertainty,
+                        abstained,
+                    });
+                }
+                facts
+            }
             ProtocolUncertaintyResolution::PreserveUncertainty { state } => {
                 vec![TypestateFact::State {
                     plan,
@@ -929,10 +973,15 @@ where
         semantic_budget,
         request,
     )?;
+    let execution_complete = result
+        .facts()
+        .iter()
+        .all(|fact| fact.uncertainty().is_empty() && !fact.abstained());
     Ok(TypestateSummaryResult {
         protocol_hash: protocol.hash(),
         binding_plan_hash: bindings.hash(),
         bindings_complete: problem.bindings_complete(),
+        execution_complete,
         result,
     })
 }
@@ -987,6 +1036,124 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         self.transfer(edge, fact, TransferFamily::Exceptional, out);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EligibleEvent {
+    event: ProtocolEventId,
+    binding: TypestateEventBindingId,
+}
+
+impl EligibleEvent {
+    const fn from_binding(binding: &BoundTypestateEvent) -> Self {
+        Self {
+            event: binding.event(),
+            binding: binding.id(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TransferFactSet {
+    facts: BTreeSet<TypestateFact>,
+    fallback: Option<TypestateFact>,
+    expansions: usize,
+    overflowed: bool,
+}
+
+impl TransferFactSet {
+    fn new(facts: Vec<TypestateFact>) -> Self {
+        let fallback = facts
+            .iter()
+            .copied()
+            .find(|fact| matches!(fact, TypestateFact::State { .. }));
+        let mut set = Self {
+            facts: BTreeSet::new(),
+            fallback,
+            expansions: 0,
+            overflowed: false,
+        };
+        if !set.extend(facts) {
+            set.collapse();
+        }
+        set
+    }
+
+    fn subject(&self) -> Option<TypestateSubjectId> {
+        self.fallback.and_then(TypestateFact::subject)
+    }
+
+    fn facts(&self) -> &BTreeSet<TypestateFact> {
+        &self.facts
+    }
+
+    fn map(&mut self, mut mapper: impl FnMut(TypestateFact) -> Vec<TypestateFact>) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        let current = std::mem::take(&mut self.facts);
+        for fact in current {
+            for output in mapper(fact) {
+                if !self.insert(output) {
+                    self.collapse();
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn extend(&mut self, facts: impl IntoIterator<Item = TypestateFact>) -> bool {
+        for fact in facts {
+            if !self.insert(fact) {
+                self.collapse();
+                return false;
+            }
+        }
+        true
+    }
+
+    fn insert(&mut self, fact: TypestateFact) -> bool {
+        self.expansions = self.expansions.saturating_add(1);
+        if self.expansions > MAX_TYPESTATE_CALLBACK_EXPANSIONS {
+            return false;
+        }
+        if !self.facts.contains(&fact) && self.facts.len() >= MAX_TYPESTATE_CALLBACK_FACTS {
+            return false;
+        }
+        self.facts.insert(fact);
+        true
+    }
+
+    fn collapse(&mut self) {
+        self.overflowed = true;
+        self.facts.clear();
+        if let Some(TypestateFact::State {
+            plan,
+            subject,
+            state,
+            uncertainty,
+            ..
+        }) = self.fallback
+        {
+            self.facts.insert(TypestateFact::State {
+                plan,
+                subject,
+                state,
+                uncertainty: uncertainty.with(TypestateUncertainty::IncompleteAnalysis),
+                abstained: true,
+            });
+        }
+    }
+
+    fn emit(self, out: &mut dyn DataflowOutput<TypestateFact>) -> bool {
+        for fact in self.facts {
+            if !out.emit(fact) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1191,11 +1358,6 @@ fn point_has_exit_kind(
 
 fn is_root_context(site: &super::TypestateObservationSite) -> bool {
     site.context().runtime().calls().is_empty() && !site.context().was_truncated()
-}
-
-fn canonicalize_facts(facts: &mut Vec<TypestateFact>) {
-    facts.sort_unstable();
-    facts.dedup();
 }
 
 const fn uncertainty_kind(cause: ProtocolUncertaintyCause) -> TypestateUncertainty {

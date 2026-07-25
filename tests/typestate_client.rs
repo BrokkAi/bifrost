@@ -9,11 +9,14 @@ use brokk_bifrost::analyzer::semantic::{
     SemanticCallSite,
 };
 use brokk_bifrost::analyzer::typestate::{
-    BoundTypestateSubjectSpec, CompiledProtocol, ProtocolEventKey, ProtocolExpectationKey,
-    ProtocolSpec, ProtocolStateKey, TypestateBindingContext, TypestateBindingMultiplicity,
-    TypestateBindingPlan, TypestateBindingQuality, TypestateEventBindingSpec, TypestateFact,
-    TypestateFindingCertainty, TypestateFindingKind, TypestateFlowProblem,
-    TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
+    BoundTypestateSubjectSpec, CompiledProtocol, ProtocolAnalysisMode, ProtocolEventKey,
+    ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey, ProtocolGuardSpec,
+    ProtocolObservationPhase, ProtocolObservationSpec, ProtocolSemantics, ProtocolSpec,
+    ProtocolStateKey, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
+    ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
+    TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
+    TypestateEventBindingSpec, TypestateFact, TypestateFindingCertainty, TypestateFindingKind,
+    TypestateFlowProblem, TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
     TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
     TypestateSummaryResult, TypestateTerminalBindingSpec, TypestateUncertainty,
     collect_summary_findings, solve_typestate_with_summaries,
@@ -266,6 +269,50 @@ fn exit_protocol() -> CompiledProtocol {
     .unwrap()
 }
 
+fn expansion_protocol(state_count: usize) -> CompiledProtocol {
+    let states = (0..state_count)
+        .map(|index| format!("s{index}"))
+        .collect::<Vec<_>>();
+    let transitions = (0..state_count - 1)
+        .map(|index| ProtocolTransitionSpec {
+            from: format!("s{index}"),
+            on: "tick".into(),
+            to: format!("s{}", index + 1),
+            guard: ProtocolGuardSpec::Always,
+        })
+        .collect();
+    ProtocolSpec {
+        schema_version: 1,
+        states,
+        initial_state: "s0".into(),
+        accepting_states: vec![format!("s{}", state_count - 1)],
+        error_states: Vec::new(),
+        events: vec![ProtocolEventSpec {
+            id: "tick".into(),
+            observation: ProtocolObservationSpec {
+                occurrence: ProtocolEventOccurrence::Endpoint {
+                    phase: ProtocolObservationPhase::AtMatch,
+                },
+            },
+        }],
+        transitions,
+        terminal_expectations: Vec::new(),
+        semantics: ProtocolSemantics {
+            analysis_mode: ProtocolAnalysisMode::May,
+            unmatched_event: ProtocolUnmatchedEventBehavior::PreserveState,
+            uncertainty: ProtocolUncertaintySemantics {
+                ambiguous_dispatch: ProtocolUncertaintyBehavior::ConservativeTransition,
+                unknown_call: ProtocolUncertaintyBehavior::ConservativeTransition,
+                external_call: ProtocolUncertaintyBehavior::ConservativeTransition,
+                escape: ProtocolUncertaintyBehavior::Abstain,
+                incomplete_analysis: ProtocolUncertaintyBehavior::ConservativeTransition,
+            },
+        },
+    }
+    .compile()
+    .unwrap()
+}
+
 fn solve_summary(fixture: &ClientFixture, analyzer: &WorkspaceAnalyzer) -> TypestateSummaryResult {
     let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
     let mut solver_budget = SolverBudget::default();
@@ -512,6 +559,151 @@ fn ambiguous_call_binding_preserves_explicit_uncertainty() {
             .contains(TypestateUncertainty::AmbiguousDispatch)
     );
     assert!(!result[0].abstained());
+}
+
+#[test]
+fn conservative_uncertainty_retains_error_transition_provenance() {
+    let multiplicity = TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 2).unwrap();
+    let ambiguous = TypestateBindingQuality::new(
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        multiplicity,
+    );
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let source = String::from_utf8(RESOURCE_LIFECYCLE.to_vec())
+        .unwrap()
+        .replace(
+            "\"ambiguous_dispatch\": \"preserve_uncertainty\"",
+            "\"ambiguous_dispatch\": \"conservative_transition\"",
+        );
+    let protocol = ProtocolSpec::from_json(source.as_bytes())
+        .unwrap()
+        .compile()
+        .unwrap();
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        Vec::new(),
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("close").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::call_site(
+                fixture.close_call.clone(),
+                TypestateBindingContext::root(),
+            ),
+            0,
+            TypestateObjectRole::Argument,
+            ambiguous,
+        )],
+        Vec::new(),
+    )
+    .unwrap();
+    let subject = bindings.subjects()[0].id();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+    let violated = protocol
+        .state_id(&ProtocolStateKey::new("violated").unwrap())
+        .unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::NormalReturn,
+            Some(&fixture.close_call),
+            &fixture.exit,
+            &fixture.close_point,
+            &proven,
+            &complete,
+        ),
+        problem.state_fact(subject, closed).unwrap(),
+        TestTransfer::Return,
+    );
+
+    let violation = result
+        .iter()
+        .find(|fact| fact.violation().is_some())
+        .expect("conservative error reachability remains reportable");
+    assert_eq!(violation.protocol_state(), Some(violated));
+    assert!(
+        violation
+            .uncertainty()
+            .contains(TypestateUncertainty::AmbiguousDispatch)
+    );
+}
+
+#[test]
+fn callback_expansion_limit_collapses_to_an_explicit_inconclusive_state() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let protocol = expansion_protocol(400);
+    let exact = TypestateBindingQuality::proven_unique();
+    let partial = TypestateBindingQuality::new(
+        ProofStatus::Unproven("adversarial binding".into()),
+        EvidenceCompleteness::Partial("adversarial binding".into()),
+        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1).unwrap(),
+    );
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact,
+        )],
+        Vec::new(),
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("tick").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::program_point(
+                fixture.entry.clone(),
+                TypestateBindingContext::root(),
+            ),
+            0,
+            TypestateObjectRole::MatchedValue,
+            partial,
+        )],
+        Vec::new(),
+    )
+    .unwrap();
+    let subject = bindings.subjects()[0].id();
+    let initial = protocol
+        .state_id(&ProtocolStateKey::new("s0").unwrap())
+        .unwrap();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let unproven = ProofStatus::Unproven("adversarial edge".into());
+    let partial = EvidenceCompleteness::Partial("adversarial edge".into());
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::Intraprocedural(
+                brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+            ),
+            None,
+            &fixture.entry,
+            &fixture.use_point,
+            &unproven,
+            &partial,
+        ),
+        problem.state_fact(subject, initial).unwrap(),
+        TestTransfer::Normal,
+    );
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].protocol_state(), Some(initial));
+    assert!(result[0].abstained());
+    assert!(
+        result[0]
+            .uncertainty()
+            .contains(TypestateUncertainty::IncompleteAnalysis)
+    );
 }
 
 #[test]

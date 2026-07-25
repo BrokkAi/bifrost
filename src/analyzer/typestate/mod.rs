@@ -44,5 +44,5 @@ pub use protocol::{
     ProtocolStateId, ProtocolStateKey, ProtocolTerminalExpectationSpec,
     ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
     ProtocolUncertaintyCause, ProtocolUncertaintyResolution, ProtocolUncertaintySemantics,
-    ProtocolUnmatchedEventBehavior,
+    ProtocolUncertaintyStateSet, ProtocolUncertaintyViolation, ProtocolUnmatchedEventBehavior,
 };
