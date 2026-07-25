@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, PathQuality,
-    SolverBudget, WitnessReconstructionLimits,
+    SolverBudget, SummaryWitnessStepKind, WitnessReconstructionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
@@ -104,16 +104,31 @@ final class RecursiveFixture {
   static void close(RecursiveResource resource) {}
 
   static void walk(RecursiveResource resource, int depth) {
-    use(resource);
-    if (depth > 0) {
-      walk(resource, depth - 1);
+    if (depth <= 0) {
+      use(resource);
+      return;
     }
+    walk(resource, depth - 1);
+    close(resource);
   }
 
   static void lifecycle() {
     RecursiveResource resource = acquire();
     walk(resource, 1);
-    close(resource);
+  }
+}
+"#;
+
+const EXCEPTIONAL_RETURN_SOURCE: &str = r#"
+function fail(resource: object): never {
+  throw resource;
+}
+
+function lifecycle(resource: object): void {
+  try {
+    fail(resource);
+  } catch {
+    return;
   }
 }
 "#;
@@ -179,6 +194,12 @@ fn protocol() -> CompiledProtocol {
 }
 
 fn observable_lifecycle_protocol() -> CompiledProtocol {
+    observable_lifecycle_protocol_with_incomplete_analysis(ProtocolUncertaintyBehavior::Abstain)
+}
+
+fn observable_lifecycle_protocol_with_incomplete_analysis(
+    incomplete_analysis: ProtocolUncertaintyBehavior,
+) -> CompiledProtocol {
     let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
     spec.states.push("used".to_owned());
     for transition in &mut spec.transitions {
@@ -195,6 +216,7 @@ fn observable_lifecycle_protocol() -> CompiledProtocol {
             };
         }
     }
+    spec.semantics.uncertainty.incomplete_analysis = incomplete_analysis;
     spec.compile().unwrap()
 }
 
@@ -680,7 +702,64 @@ fn bound_events_execute_in_their_dataflow_phase() {
 
 #[test]
 fn exceptional_return_event_executes_on_matched_return_flow() {
-    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/ExceptionalReturn.ts", EXCEPTIONAL_RETURN_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/ExceptionalReturn.ts");
+    let procedure = |name: &str| {
+        graph
+            .artifact()
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("exceptional-return fixture missing {name}"))
+    };
+    let lifecycle = procedure("lifecycle");
+    let fail = procedure("fail");
+    let lifecycle_handle = graph
+        .artifact()
+        .procedure_handle(lifecycle.id())
+        .expect("lifecycle handle");
+    let fail_handle = graph
+        .artifact()
+        .procedure_handle(fail.id())
+        .expect("fail handle");
+    let fail_call = call_containing(lifecycle, EXCEPTIONAL_RETURN_SOURCE, "fail(resource)");
+    let exceptional_continuation = lifecycle_handle
+        .point_handle(
+            fail_call
+                .exceptional_continuation
+                .target()
+                .expect("fail call exceptional continuation"),
+        )
+        .expect("exceptional continuation handle");
+    let fail_exceptional_exit = fail_handle
+        .point_handle(fail.exceptional_exit_point())
+        .expect("fail exceptional exit");
+    let entry = lifecycle_handle
+        .point_handle(lifecycle.entry_point())
+        .expect("lifecycle entry");
+    let subject_object = AbstractObject::new(
+        AccessPathRoot::Value(
+            lifecycle_handle
+                .value_handle(fail_call.arguments[0].value)
+                .expect("fail argument"),
+        ),
+        ObjectCardinality::Singleton,
+    )
+    .expect("exceptional-return subject");
+    let subject_class = TypestateSubjectClassKey::new("resource").unwrap();
+    let subject_key = TypestateSubjectKey::for_object(subject_class.clone(), &subject_object);
+
     let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
     spec.events
         .iter_mut()
@@ -695,16 +774,24 @@ fn exceptional_return_event_executes_on_matched_return_flow() {
     let bindings = TypestateBindingPlan::try_new(
         &protocol,
         vec![BoundTypestateSubjectSpec::new(
-            fixture.subject_class.clone(),
-            fixture.subject_object.clone(),
+            subject_class,
+            subject_object,
             exact.clone(),
         )],
-        Vec::new(),
+        vec![TypestateInitialSeedSpec::new(
+            subject_key.clone(),
+            ProtocolStateKey::new("open").unwrap(),
+            TypestateObservationSite::program_point(entry, TypestateBindingContext::root()),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
         vec![TypestateEventBindingSpec::new(
             ProtocolEventKey::new("close").unwrap(),
-            fixture.subject_key.clone(),
+            subject_key.clone(),
             TypestateObservationSite::call_site(
-                fixture.close_call.clone(),
+                lifecycle_handle
+                    .call_site_handle(fail_call.id)
+                    .expect("fail call handle"),
                 TypestateBindingContext::root(),
             ),
             0,
@@ -714,39 +801,51 @@ fn exceptional_return_event_executes_on_matched_return_flow() {
         Vec::new(),
     )
     .unwrap();
-    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
-    let proven = ProofStatus::Proven;
-    let complete = EvidenceCompleteness::Complete;
-
-    let result = transfer(
-        &problem,
-        DataflowEdge::new(
-            IcfgEdgeKind::ExceptionalReturn,
-            Some(&fixture.close_call),
-            &fixture.exit,
-            &fixture.close_point,
-            &proven,
-            &complete,
-        ),
-        problem
-            .state_fact(
-                &fixture.subject_key,
-                &ProtocolStateKey::new("open").unwrap(),
-            )
-            .unwrap(),
-        TestTransfer::Return,
-    );
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let summary = solve_typestate_with_summaries(
+        &lifecycle_handle,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("exceptional-return typestate summary solve");
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+    let reached = summary
+        .result()
+        .reached_at(&exceptional_continuation)
+        .find(|reached| {
+            summary
+                .result()
+                .fact(reached.fact())
+                .is_some_and(|fact| fact.protocol_state() == Some(closed))
+        })
+        .expect("close event must execute at the matched exceptional continuation");
+    let quality = reached
+        .path_qualities()
+        .iter()
+        .next()
+        .expect("reached exceptional state retains path quality");
+    let witness = summary
+        .result()
+        .witness_for_reached(reached, quality, WitnessReconstructionLimits::default())
+        .expect("exceptional-return witness");
 
     assert!(
-        result.contains(
-            &problem
-                .state_fact(
-                    &fixture.subject_key,
-                    &ProtocolStateKey::new("closed").unwrap(),
-                )
-                .unwrap()
-        )
+        witness.steps().iter().any(|step| {
+            step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::ExceptionalReturn)
+                && step.source() == &fail_exceptional_exit
+                && step.target() == Some(&exceptional_continuation)
+        }),
+        "witness must cross the callee exceptional exit back to the exact caller continuation"
     );
+    assert!(summary.result().metrics().summary_applications > 0);
 }
 
 #[test]
@@ -1613,7 +1712,9 @@ fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
 
 #[test]
 fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
-    let protocol = observable_lifecycle_protocol();
+    let protocol = observable_lifecycle_protocol_with_incomplete_analysis(
+        ProtocolUncertaintyBehavior::PreserveUncertainty,
+    );
     let project = InlineTestProject::with_language(Language::Java)
         .file("src/RecursiveFixture.java", RECURSIVE_HELPER_SOURCE)
         .build();
@@ -1645,13 +1746,14 @@ fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
         .artifact()
         .procedure_handle(walk.id())
         .expect("walk handle");
+    let walk_call = call_containing(lifecycle, RECURSIVE_HELPER_SOURCE, "walk(resource, 1)");
     let use_call = call_containing(walk, RECURSIVE_HELPER_SOURCE, "use(resource)");
-    let close_call = call_containing(lifecycle, RECURSIVE_HELPER_SOURCE, "close(resource)");
+    let close_call = call_containing(walk, RECURSIVE_HELPER_SOURCE, "close(resource)");
     let subject_object = AbstractObject::new(
         AccessPathRoot::Value(
             lifecycle_handle
-                .value_handle(close_call.arguments[0].value)
-                .expect("close argument"),
+                .value_handle(walk_call.arguments[0].value)
+                .expect("walk argument"),
         ),
         ObjectCardinality::Singleton,
     )
@@ -1667,9 +1769,9 @@ fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
     let use_point = walk_handle
         .point_handle(use_call.point)
         .expect("recursive use point");
-    let close_point = lifecycle_handle
+    let close_point = walk_handle
         .point_handle(close_call.point)
-        .expect("lifecycle close point");
+        .expect("recursive close point");
     let context = TypestateBindingContext::root();
     let exact = TypestateBindingQuality::proven_unique();
     let event = |event: &str, point: brokk_bifrost::analyzer::semantic::ProgramPointHandle| {
@@ -1706,7 +1808,7 @@ fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
                 exact.clone(),
             ),
             event("use", use_point),
-            event("close", close_point),
+            event("close", close_point.clone()),
         ],
         vec![TypestateTerminalBindingSpec::new(
             ProtocolExpectationKey::new("normal-exit-closed").unwrap(),
@@ -1733,10 +1835,38 @@ fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
     let used = protocol
         .state_id(&ProtocolStateKey::new("used").unwrap())
         .unwrap();
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
 
     assert!(summary.result().termination().is_fixed_point());
     assert!(summary.result().metrics().summary_applications > 0);
     assert!(summary.result().metrics().reused_entry_contexts > 0);
+    let close_rows = summary
+        .result()
+        .reached_at(&close_point)
+        .collect::<Vec<_>>();
+    let close_facts = close_rows
+        .iter()
+        .filter_map(|reached| summary.result().fact(reached.fact()))
+        .map(|fact| {
+            (
+                fact.protocol_state(),
+                fact.uncertainty(),
+                fact.abstained(),
+                fact.violation(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        close_rows.iter().any(|reached| {
+            summary
+                .result()
+                .fact(reached.fact())
+                .is_some_and(|fact| fact.protocol_state() == Some(used))
+        }),
+        "the base-case use transition must return through the recursive summary to the caller continuation: {close_facts:#?}",
+    );
     let exit_rows = summary.result().reached_at(&exit).collect::<Vec<_>>();
     let exit_facts = exit_rows
         .iter()
@@ -1755,17 +1885,11 @@ fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
             summary
                 .result()
                 .fact(reached.fact())
-                .is_some_and(|fact| fact.protocol_state() == Some(used))
+                .is_some_and(|fact| fact.protocol_state() == Some(closed))
         }),
-        "the recursive helper summary must carry its use transition back to the caller: {exit_facts:#?}",
+        "close must transition the recursively returned used state to closed: {exit_facts:#?}",
     );
     assert!(!summary.is_complete());
-    assert!(summary.result().reached().iter().all(|reached| {
-        summary
-            .result()
-            .fact(reached.fact())
-            .is_none_or(|fact| fact.violation().is_none())
-    }));
 }
 
 #[test]
