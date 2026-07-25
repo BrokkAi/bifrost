@@ -14,7 +14,7 @@ impl PathQuality {
     pub const PROVEN_PARTIAL: Self = Self::new(true, false);
     pub const UNPROVEN_COMPLETE: Self = Self::new(false, true);
     pub const UNPROVEN_PARTIAL: Self = Self::new(false, false);
-    const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::PROVEN_COMPLETE,
         Self::PROVEN_PARTIAL,
         Self::UNPROVEN_COMPLETE,
@@ -31,6 +31,10 @@ impl PathQuality {
 
     pub const fn is_complete(self) -> bool {
         self.complete
+    }
+
+    pub(crate) const fn ordinal(self) -> usize {
+        (self.proven as usize) * 2 + self.complete as usize
     }
 
     /// Conjoin the proof and completeness of two concrete path segments.
@@ -134,8 +138,7 @@ impl PathQualityFrontier {
 }
 
 const fn quality_bit(quality: PathQuality) -> u8 {
-    let index = (quality.proven as u8) * 2 + quality.complete as u8;
-    1 << index
+    1 << quality.ordinal()
 }
 
 #[cfg(test)]

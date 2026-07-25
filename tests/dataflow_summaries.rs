@@ -7,17 +7,19 @@ use std::{
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DirectFlowProblem, DistributiveDataflowProblem,
-    SolverBudget, SolverBudgetDimension, SolverTermination, SummaryBoundaryKind,
-    SummaryDataflowError, SummaryDataflowResult, SummarySemanticStatus, SummarySolveInput,
-    solve_with_summaries,
+    PathQuality, SolverBudget, SolverBudgetDimension, SolverTermination, SummaryBoundaryKind,
+    SummaryDataflowError, SummaryDataflowResult, SummaryReachedFact, SummarySemanticStatus,
+    SummarySolveInput, SummaryWitness, SummaryWitnessError, SummaryWitnessStepKind,
+    WitnessReconstructionLimits, WitnessRetentionLimits, solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBoundary, CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken,
-    ControlContinuation, DispatchBoundaryKind, DispatchOracle, DispatchResult, IcfgBoundaryKind,
-    IcfgExitProfile, IcfgLimitKind, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, OracleLimits,
-    OracleRelationArena, OracleRelationId, ProcedureHandle, ReturnTransferKind, SemanticBudget,
-    SemanticBudgetDimension, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
-    WorkspaceIcfgProvider,
+    ControlContinuation, DispatchBoundaryKind, DispatchOracle, DispatchResult,
+    EvidenceCompleteness, IcfgBoundaryKind, IcfgEdgeKind, IcfgExitProfile, IcfgLimitKind,
+    IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, OracleLimits, OracleRelationArena,
+    OracleRelationId, ProcedureHandle, ProgramPointHandle, ProofStatus, ReturnTransferKind,
+    SemanticBudget, SemanticBudgetDimension, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticWork, WorkspaceIcfgProvider,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -491,6 +493,7 @@ struct TransformingProvider<'workspace> {
     inner: WorkspaceIcfgProvider<'workspace>,
     reverse: bool,
     weaken_calls: bool,
+    incomparable_calls: bool,
     corruption: Option<CallTransferCorruption>,
 }
 
@@ -510,6 +513,7 @@ impl<'workspace> TransformingProvider<'workspace> {
             inner,
             reverse: false,
             weaken_calls: false,
+            incomparable_calls: false,
             corruption: None,
         }
     }
@@ -521,6 +525,11 @@ impl<'workspace> TransformingProvider<'workspace> {
 
     const fn weakening_calls(mut self) -> Self {
         self.weaken_calls = true;
+        self
+    }
+
+    const fn with_incomparable_call_evidence(mut self) -> Self {
+        self.incomparable_calls = true;
         self
     }
 
@@ -623,6 +632,20 @@ impl IcfgProvider for TransformingProvider<'_> {
             if let Some(partial) = outcome.available_value().cloned() {
                 return Ok(SemanticOutcome::Unproven { partial, work });
             }
+        }
+        if self.incomparable_calls {
+            outcome = outcome.map(|mut transfers| {
+                assert!(
+                    transfers.transfers.len() >= 2,
+                    "incomparable fixture needs two call targets",
+                );
+                transfers.transfers[0].proof = ProofStatus::Proven;
+                transfers.transfers[0].completeness =
+                    EvidenceCompleteness::Partial("test partial target".into());
+                transfers.transfers[1].proof = ProofStatus::Unproven("test unproven target".into());
+                transfers.transfers[1].completeness = EvidenceCompleteness::Complete;
+                transfers
+            });
         }
         Ok(outcome)
     }
@@ -963,6 +986,172 @@ where
     .expect("valid summary fixture")
 }
 
+fn solve_with_witnesses<P, Provider>(
+    root: &ProcedureHandle,
+    entry_facts: &[P::Fact],
+    provider: &Provider,
+    problem: &P,
+) -> SummaryDataflowResult<P::Fact>
+where
+    P: DistributiveDataflowProblem,
+    Provider: IcfgProvider + ?Sized,
+{
+    solve_with_witness_limit(
+        root,
+        entry_facts,
+        provider,
+        problem,
+        WitnessRetentionLimits::new(2).unwrap(),
+    )
+}
+
+fn solve_with_witness_limit<P, Provider>(
+    root: &ProcedureHandle,
+    entry_facts: &[P::Fact],
+    provider: &Provider,
+    problem: &P,
+    witness_retention: WitnessRetentionLimits,
+) -> SummaryDataflowResult<P::Fact>
+where
+    P: DistributiveDataflowProblem,
+    Provider: IcfgProvider + ?Sized,
+{
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    solve_with_summaries(
+        SummarySolveInput::new(root, entry_facts).with_witness_retention(witness_retention),
+        provider,
+        problem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("valid summary witness fixture")
+}
+
+fn reached_fact<'result, F>(
+    result: &'result SummaryDataflowResult<F>,
+    point: &'result ProgramPointHandle,
+    fact: F,
+) -> &'result SummaryReachedFact
+where
+    F: Copy + Eq,
+{
+    result
+        .reached_at(point)
+        .find(|reached| result.fact(reached.fact()).copied() == Some(fact))
+        .expect("requested fact reaches the selected point")
+}
+
+fn assert_all_retained_witnesses_reconstruct<F>(result: &SummaryDataflowResult<F>) {
+    for reached in result.reached() {
+        for quality in reached.path_qualities().iter() {
+            let witness = result
+                .witness_for_reached(reached, quality, WitnessReconstructionLimits::default())
+                .expect("every active reached quality has valid evidence");
+            assert_eq!(witness.quality(), quality);
+            if !witness.truncated() {
+                assert_eq!(fold_witness_quality(&witness), quality);
+            }
+        }
+    }
+    for summary in result.end_summaries() {
+        for quality in summary.path_qualities().iter() {
+            let witness = result
+                .witness_for_end_summary(summary, quality, WitnessReconstructionLimits::default())
+                .expect("every active end-summary quality has valid evidence");
+            assert_eq!(witness.quality(), quality);
+            if !witness.truncated() {
+                assert_eq!(fold_witness_quality(&witness), quality);
+            }
+        }
+    }
+}
+
+fn fold_witness_quality(witness: &SummaryWitness) -> PathQuality {
+    let proven = witness
+        .steps()
+        .iter()
+        .all(|step| matches!(step.proof(), ProofStatus::Proven));
+    let complete = witness
+        .steps()
+        .iter()
+        .all(|step| matches!(step.completeness(), EvidenceCompleteness::Complete));
+    match (proven, complete) {
+        (true, true) => PathQuality::PROVEN_COMPLETE,
+        (true, false) => PathQuality::PROVEN_PARTIAL,
+        (false, true) => PathQuality::UNPROVEN_COMPLETE,
+        (false, false) => PathQuality::UNPROVEN_PARTIAL,
+    }
+}
+
+fn complete_snapshot<Provider>(root: &ProcedureHandle, provider: &Provider) -> IcfgSnapshot
+where
+    Provider: IcfgProvider + ?Sized,
+{
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = provider
+        .snapshot(
+            root,
+            IcfgSnapshotLimits::default(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("valid witness-validation snapshot");
+    outcome
+        .available_value()
+        .cloned()
+        .expect("complete snapshot retains its graph")
+}
+
+fn assert_witness_matches_snapshot(witness: &SummaryWitness, snapshot: &IcfgSnapshot) {
+    for step in witness.steps() {
+        match step.kind() {
+            SummaryWitnessStepKind::Seed => assert!(
+                snapshot
+                    .nodes()
+                    .iter()
+                    .any(|node| node.point() == step.source()),
+                "witness seed must be a real snapshot program point",
+            ),
+            SummaryWitnessStepKind::Edge(kind) => {
+                let target = step.target().expect("edge witness has a target");
+                assert!(
+                    snapshot.edges().iter().any(|edge| {
+                        edge.kind == kind
+                            && edge.origin.as_ref() == step.origin()
+                            && &edge.proof == step.proof()
+                            && &edge.completeness == step.completeness()
+                            && snapshot
+                                .node(edge.source)
+                                .is_some_and(|node| node.point() == step.source())
+                            && snapshot
+                                .node(edge.target)
+                                .is_some_and(|node| node.point() == target)
+                    }),
+                    "witness edge must match an independently materialized semantic ICFG edge: {step:?}",
+                );
+            }
+            SummaryWitnessStepKind::EndSummaryGap(_) => {
+                assert!(step.target().is_none());
+                assert!(step.origin().is_none());
+                assert!(matches!(step.proof(), ProofStatus::Unproven(_)));
+                assert!(matches!(
+                    step.completeness(),
+                    EvidenceCompleteness::Partial(_)
+                ));
+                assert!(
+                    snapshot
+                        .nodes()
+                        .iter()
+                        .any(|node| node.point() == step.source()),
+                    "end-summary gap must be attached to a real exit point",
+                );
+            }
+        }
+    }
+}
+
 fn reached_projection<F>(
     result: &SummaryDataflowResult<F>,
 ) -> HashSet<(brokk_bifrost::analyzer::semantic::ProgramPointHandle, F)>
@@ -1000,6 +1189,257 @@ where
 
 fn direct_problem() -> DirectFlowProblem {
     DirectFlowProblem::new(std::iter::empty())
+}
+
+#[test]
+fn intraprocedural_witness_is_opt_in_source_backed_and_bounded() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+                pub fn root(value: i32) -> i32 {
+                    let incremented = value + 1;
+                    incremented
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let exit = root
+        .point_handle(root.semantics().normal_exit_point())
+        .expect("root normal exit");
+    let provider = analyzer.icfg_provider();
+
+    let without_witnesses = solve_default(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
+    let reached = reached_fact(&without_witnesses, &exit, MarkerFact::Seed);
+    assert_eq!(
+        without_witnesses
+            .witness_for_reached(
+                reached,
+                PathQuality::PROVEN_COMPLETE,
+                WitnessReconstructionLimits::default(),
+            )
+            .unwrap_err(),
+        SummaryWitnessError::RetentionDisabled,
+    );
+
+    let result = solve_with_witnesses(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
+    let reached = reached_fact(&result, &exit, MarkerFact::Seed);
+    let witness = result
+        .witness_for_reached(
+            reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("intraprocedural witness");
+    assert_eq!(witness.quality(), PathQuality::PROVEN_COMPLETE);
+    assert!(!witness.truncated());
+    assert_eq!(witness.omitted_steps_lower_bound(), 0);
+    assert!(witness.work().evidence_expansions() >= witness.steps().len());
+    assert_eq!(
+        witness.steps().first().map(|step| step.kind()),
+        Some(SummaryWitnessStepKind::Seed),
+    );
+    assert_eq!(
+        witness.steps().last().and_then(|step| step.target()),
+        Some(&exit),
+    );
+    assert!(witness.steps().iter().skip(1).all(|step| matches!(
+        step.kind(),
+        SummaryWitnessStepKind::Edge(IcfgEdgeKind::Intraprocedural(_))
+    )));
+    assert_witness_matches_snapshot(&witness, &complete_snapshot(&root, &provider));
+    let end_summary = result
+        .end_summaries()
+        .iter()
+        .find(|summary| {
+            summary.entry().procedure() == &root
+                && summary.exit_kind() == ReturnTransferKind::Normal
+                && result.fact(summary.exit_fact()) == Some(&MarkerFact::Seed)
+        })
+        .expect("root seed has a normal end summary");
+    let end_witness = result
+        .witness_for_end_summary(
+            end_summary,
+            end_summary
+                .path_qualities()
+                .iter()
+                .next()
+                .expect("end summary retains one quality"),
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("end-summary witness");
+    let last_end_step = end_witness.steps().last().expect("non-empty end witness");
+    match last_end_step.kind() {
+        SummaryWitnessStepKind::EndSummaryGap(ReturnTransferKind::Normal) => {
+            assert_eq!(last_end_step.source(), &exit);
+            assert_eq!(last_end_step.target(), None);
+        }
+        SummaryWitnessStepKind::Edge(_) => assert_eq!(last_end_step.target(), Some(&exit)),
+        other => panic!("unexpected terminal end-summary witness step: {other:?}"),
+    }
+    assert_eq!(fold_witness_quality(&end_witness), end_witness.quality());
+    let shallow_end_witness_bytes = std::mem::size_of_val(&end_witness)
+        + end_witness
+            .steps()
+            .iter()
+            .map(std::mem::size_of_val)
+            .sum::<usize>();
+    if matches!(
+        last_end_step.kind(),
+        SummaryWitnessStepKind::EndSummaryGap(_)
+    ) {
+        assert!(
+            end_witness.retained_bytes() > shallow_end_witness_bytes,
+            "owned gap reasons must be included in retained-byte accounting",
+        );
+    }
+
+    let cloned_reached = reached.clone();
+    result
+        .witness_for_reached(
+            &cloned_reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("a cloned row retains this result's witness ownership");
+    let other_result = solve_with_witnesses(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
+    assert_eq!(
+        other_result
+            .witness_for_reached(
+                reached,
+                PathQuality::PROVEN_COMPLETE,
+                WitnessReconstructionLimits::default(),
+            )
+            .unwrap_err(),
+        SummaryWitnessError::TargetNotInResult,
+    );
+
+    let truncated = result
+        .witness_for_reached(
+            reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::new(1, 64).unwrap(),
+        )
+        .expect("bounded witness prefix");
+    assert!(truncated.truncated());
+    assert_eq!(truncated.steps().len(), 1);
+    assert!(truncated.omitted_steps_lower_bound() > 0);
+    let expansion_limited = result
+        .witness_for_reached(
+            reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::new(64, 1).unwrap(),
+        )
+        .expect("expansion-bounded witness prefix");
+    assert!(expansion_limited.truncated());
+    assert_eq!(expansion_limited.work().evidence_expansions(), 1);
+    assert!(expansion_limited.omitted_steps_lower_bound() > 0);
+}
+
+#[test]
+fn witness_alternative_retention_reports_its_strict_cap() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+                pub fn root(flag: bool) -> i32 {
+                    let value;
+                    if flag {
+                        value = 1;
+                    } else {
+                        value = 2;
+                    }
+                    value
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let exit = root
+        .point_handle(root.semantics().normal_exit_point())
+        .expect("root normal exit");
+    let provider = analyzer.icfg_provider();
+    let result = solve_with_witness_limit(
+        &root,
+        &[MarkerFact::Seed],
+        &provider,
+        &MarkerProblem,
+        WitnessRetentionLimits::new(1).unwrap(),
+    );
+    let witness = result
+        .witness_for_reached(
+            reached_fact(&result, &exit, MarkerFact::Seed),
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("one retained branch witness");
+    assert!(
+        witness.alternatives_truncated(),
+        "the second branch must be reported rather than retained beyond the cap",
+    );
+}
+
+#[test]
+fn witness_budget_stop_preserves_a_reconstructable_published_prefix() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn root() -> i32 { 1 }\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let cancellation = CancellationToken::default();
+    let mut limits = SolverBudget::default().limits();
+    limits.witness_relations = 2;
+    let mut solver_budget = SolverBudget::new(limits);
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_with_summaries(
+        SummarySolveInput::new(&root, &[MarkerFact::Seed])
+            .with_witness_retention(WitnessRetentionLimits::new(2).unwrap()),
+        &analyzer.icfg_provider(),
+        &MarkerProblem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("witness budget is a typed partial result");
+
+    let exceeded = result
+        .termination()
+        .budget_exceeded()
+        .expect("the first propagated witness relation exceeds the exact cap");
+    assert_eq!(
+        exceeded.dimension(),
+        SolverBudgetDimension::WitnessRelations
+    );
+    assert_eq!(result.work().witness_relations, 2);
+    assert_eq!(
+        result.reached().len(),
+        2,
+        "both atomically admitted root seeds remain visible",
+    );
+    assert_all_retained_witnesses_reconstruct(&result);
 }
 
 #[test]
@@ -1050,7 +1490,7 @@ fn direct_recursion_converges_without_inheriting_snapshot_call_depth() {
     );
 
     let problem = direct_problem();
-    let result = solve_default(&root, &[], &provider, &problem);
+    let result = solve_with_witnesses(&root, &[], &provider, &problem);
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     assert!(
         result
@@ -1072,6 +1512,7 @@ fn direct_recursion_converges_without_inheriting_snapshot_call_depth() {
         }),
         "the recursive root should acquire a reusable normal end summary",
     );
+    assert_all_retained_witnesses_reconstruct(&result);
 
     let mut reference_budget =
         SemanticBudget::uniform(100_000_000).expect("positive reference budget");
@@ -1120,7 +1561,7 @@ fn recursive_summary_deltas_replay_until_a_multi_fact_fixed_point() {
         )
         .expect("root continuation remains valid");
     let provider = analyzer.icfg_provider();
-    let result = solve_default(
+    let result = solve_with_witnesses(
         &root,
         &[ReplayWaveFact::Wave0],
         &provider,
@@ -1136,6 +1577,21 @@ fn recursive_summary_deltas_replay_until_a_multi_fact_fixed_point() {
         result.metrics().summary_applications >= 3,
         "the recursive incoming row must consume successive Wave0, Wave1, and Wave2 summaries",
     );
+    let wave_two_witness = result
+        .witness_for_reached(
+            reached_fact(&result, &continuation, ReplayWaveFact::Wave2),
+            reached_fact(&result, &continuation, ReplayWaveFact::Wave2)
+                .path_qualities()
+                .iter()
+                .next()
+                .expect("Wave2 retains one concrete quality"),
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("multi-wave summary replay witness");
+    assert!(wave_two_witness.steps().iter().any(|step| {
+        step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn)
+            && step.target() == Some(&continuation)
+    }));
 
     let mut reference_budget =
         SemanticBudget::uniform(100_000_000).expect("positive reference budget");
@@ -1179,7 +1635,7 @@ fn mutual_recursion_matches_the_repeated_scan_reference() {
     );
     let provider = analyzer.icfg_provider();
     let problem = direct_problem();
-    let result = solve_default(&root, &[], &provider, &problem);
+    let result = solve_with_witnesses(&root, &[], &provider, &problem);
 
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     let summarized_procedures = result
@@ -1193,6 +1649,7 @@ fn mutual_recursion_matches_the_repeated_scan_reference() {
         "even and odd should each contribute one relative summary context",
     );
     assert!(result.metrics().summary_applications >= 2);
+    assert_all_retained_witnesses_reconstruct(&result);
 
     let mut reference_budget =
         SemanticBudget::uniform(100_000_000).expect("positive reference budget");
@@ -1266,7 +1723,7 @@ fn shared_callee_reuses_entries_without_crossing_return_sites() {
         second: calls[1].id,
     };
     let provider = CountingProvider::new(analyzer.icfg_provider());
-    let result = solve_default(&root, &[CallIdentityFact::Root], &provider, &problem);
+    let result = solve_with_witnesses(&root, &[CallIdentityFact::Root], &provider, &problem);
 
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     assert!(
@@ -1289,6 +1746,55 @@ fn shared_callee_reuses_entries_without_crossing_return_sites() {
         1,
         "the exact leaf entry/normal-exit profile must be provider-materialized once",
     );
+
+    let first_reached = reached_fact(&result, &first_continuation, CallIdentityFact::First);
+    let second_reached = reached_fact(&result, &second_continuation, CallIdentityFact::Second);
+    let first_witness = result
+        .witness_for_reached(
+            first_reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("first continuation witness");
+    let second_witness = result
+        .witness_for_reached(
+            second_reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("second continuation witness");
+    let first_origin = root
+        .call_site_handle(calls[0].id)
+        .expect("first call remains scoped");
+    let second_origin = root
+        .call_site_handle(calls[1].id)
+        .expect("second call remains scoped");
+    let first_return = first_witness
+        .steps()
+        .iter()
+        .rev()
+        .find(|step| step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn))
+        .expect("first witness contains a matched normal return");
+    assert_eq!(first_return.origin(), Some(&first_origin));
+    assert_eq!(first_return.target(), Some(&first_continuation));
+    let second_return = second_witness
+        .steps()
+        .iter()
+        .rev()
+        .find(|step| step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn))
+        .expect("second witness contains a matched normal return");
+    assert_eq!(second_return.origin(), Some(&second_origin));
+    assert_eq!(second_return.target(), Some(&second_continuation));
+    assert!(
+        first_witness
+            .steps()
+            .iter()
+            .all(|step| step.origin() != Some(&second_origin)),
+        "the first summary application must not cross-return through the second call",
+    );
+    let snapshot = complete_snapshot(&root, &provider);
+    assert_witness_matches_snapshot(&first_witness, &snapshot);
+    assert_witness_matches_snapshot(&second_witness, &snapshot);
 }
 
 #[test]
@@ -1327,7 +1833,7 @@ fn normal_and_exceptional_returns_match_the_repeated_scan_reference() {
             .effect("entry"),
     );
     let provider = analyzer.icfg_provider();
-    let result = solve_default(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
+    let result = solve_with_witnesses(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
 
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     assert!(result.facts().contains(&MarkerFact::NormalReturn));
@@ -1356,6 +1862,54 @@ fn normal_and_exceptional_returns_match_the_repeated_scan_reference() {
     )
     .expect("return-family reference fixed point");
     assert_eq!(reached_projection(&result), *reference.reached());
+
+    let calls = root.semantics().call_sites();
+    assert_eq!(calls.len(), 2, "fixture has leaf and fail calls");
+    let normal_continuation = root
+        .point_handle(
+            calls[0]
+                .normal_continuation
+                .target()
+                .expect("leaf call has a normal continuation"),
+        )
+        .expect("leaf continuation remains valid");
+    let exceptional_continuation = root
+        .point_handle(
+            calls[1]
+                .exceptional_continuation
+                .target()
+                .expect("fail call has an exceptional continuation"),
+        )
+        .expect("fail continuation remains valid");
+    let normal_witness = result
+        .witness_for_reached(
+            reached_fact(&result, &normal_continuation, MarkerFact::NormalReturn),
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("normal-return witness");
+    assert!(normal_witness.steps().iter().any(|step| {
+        step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn)
+            && step.target() == Some(&normal_continuation)
+    }));
+    let exceptional_witness = result
+        .witness_for_reached(
+            reached_fact(
+                &result,
+                &exceptional_continuation,
+                MarkerFact::ExceptionalReturn,
+            ),
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("exceptional-return witness");
+    assert!(exceptional_witness.steps().iter().any(|step| {
+        step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::ExceptionalReturn)
+            && step.target() == Some(&exceptional_continuation)
+    }));
+    let snapshot = complete_snapshot(&root, &provider);
+    assert_witness_matches_snapshot(&normal_witness, &snapshot);
+    assert_witness_matches_snapshot(&exceptional_witness, &snapshot);
 }
 
 #[test]
@@ -1403,7 +1957,7 @@ fn deferred_invocation_uses_explicit_call_to_return_flow() {
         )
         .expect("deferred continuation remains valid");
     let provider = CountingProvider::new(analyzer.icfg_provider());
-    let result = solve_default(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
+    let result = solve_with_witnesses(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
 
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     assert_eq!(
@@ -1452,6 +2006,26 @@ fn deferred_invocation_uses_explicit_call_to_return_flow() {
             brokk_bifrost::analyzer::semantic::EvidenceCompleteness::Partial(_)
         )
     }));
+    let witness = result
+        .witness_for_reached(
+            reached_fact(&result, &continuation, MarkerFact::CallToNormalReturn),
+            PathQuality::PROVEN_PARTIAL,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("explicit call-to-return witness");
+    assert!(witness.steps().iter().any(|step| {
+        step.kind() == SummaryWitnessStepKind::Edge(IcfgEdgeKind::CallToNormalContinuation)
+            && step.target() == Some(&continuation)
+    }));
+    assert!(witness.steps().iter().all(|step| {
+        !matches!(
+            step.kind(),
+            SummaryWitnessStepKind::Edge(
+                IcfgEdgeKind::Call | IcfgEdgeKind::NormalReturn | IcfgEdgeKind::ExceptionalReturn
+            )
+        )
+    }));
+    assert_witness_matches_snapshot(&witness, &complete_snapshot(&root, &provider));
 }
 
 #[test]
@@ -1604,7 +2178,8 @@ fn cooperative_callback_cancellation_discards_unpublished_outputs() {
     let mut solver_budget = SolverBudget::default();
     let mut semantic_budget = SemanticBudget::default();
     let result = solve_with_summaries(
-        SummarySolveInput::new(&root, &[CancellationFact::Seed]),
+        SummarySolveInput::new(&root, &[CancellationFact::Seed])
+            .with_witness_retention(WitnessRetentionLimits::new(2).unwrap()),
         &analyzer.icfg_provider(),
         &problem,
         &mut semantic_budget,
@@ -1628,6 +2203,7 @@ fn cooperative_callback_cancellation_discards_unpublished_outputs() {
         "the exact transfer target must not publish the staged fact",
     );
     assert!(result.end_summaries().is_empty());
+    assert_all_retained_witnesses_reconstruct(&result);
 }
 
 #[test]
@@ -1666,7 +2242,8 @@ fn return_flow_cancellation_does_not_publish_application_metrics() {
     let mut solver_budget = SolverBudget::default();
     let mut semantic_budget = SemanticBudget::default();
     let result = solve_with_summaries(
-        SummarySolveInput::new(&root, &[CancellationFact::Seed]),
+        SummarySolveInput::new(&root, &[CancellationFact::Seed])
+            .with_witness_retention(WitnessRetentionLimits::new(2).unwrap()),
         &analyzer.icfg_provider(),
         &problem,
         &mut semantic_budget,
@@ -1693,6 +2270,7 @@ fn return_flow_cancellation_does_not_publish_application_metrics() {
         !facts_at(&result, &continuation).contains(&CancellationFact::Staged),
         "the exact matched-return continuation must not publish the staged fact",
     );
+    assert_all_retained_witnesses_reconstruct(&result);
 }
 
 #[test]
@@ -1990,6 +2568,11 @@ fn summary_specific_budget_dimensions_stop_at_exact_publication_boundaries() {
         &leaf_analyzer.icfg_provider(),
         SolverBudgetDimension::EndSummaries,
     );
+    assert_budget_dimension(
+        &leaf_root,
+        &leaf_analyzer.icfg_provider(),
+        SolverBudgetDimension::WitnessRelations,
+    );
 
     let call_project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -2042,13 +2625,20 @@ fn assert_budget_dimension<Provider>(
         SolverBudgetDimension::ProviderMaterializations => limits.provider_materializations = 0,
         SolverBudgetDimension::SummaryApplications => limits.summary_applications = 0,
         SolverBudgetDimension::CoverageRows => limits.coverage_rows = 0,
+        SolverBudgetDimension::WitnessRelations => limits.witness_relations = 0,
         other => panic!("not a summary-specific dimension: {other:?}"),
     }
     let mut solver_budget = SolverBudget::new(limits);
     let cancellation = CancellationToken::default();
     let mut semantic_budget = SemanticBudget::default();
+    let input = if dimension == SolverBudgetDimension::WitnessRelations {
+        SummarySolveInput::new(root, &[])
+            .with_witness_retention(WitnessRetentionLimits::new(1).unwrap())
+    } else {
+        SummarySolveInput::new(root, &[])
+    };
     let result = solve_with_summaries(
-        SummarySolveInput::new(root, &[]),
+        input,
         provider,
         &direct_problem(),
         &mut semantic_budget,
@@ -2101,6 +2691,13 @@ fn assert_budget_dimension<Provider>(
             assert!(result.coverage().boundaries().is_empty());
             assert!(result.coverage().unproven_edges().is_empty());
             assert!(result.coverage().partial_edges().is_empty());
+        }
+        SolverBudgetDimension::WitnessRelations => {
+            assert!(
+                result.facts().is_empty(),
+                "a rejected seed witness must not publish its reached row",
+            );
+            assert_eq!(result.work().witness_relations, 0);
         }
         other => panic!("not a summary-specific dimension: {other:?}"),
     }
@@ -2164,6 +2761,82 @@ fn multi_output_incoming_budget_rejects_the_entire_staged_prefix() {
 }
 
 #[test]
+fn incomparable_path_qualities_reconstruct_separate_concrete_witnesses() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Incomparable.java",
+            r#"
+                class Incomparable {
+                    static int left(String value) { return 1; }
+                    static int left(Object value) { return 2; }
+                    static int root() { return left("x"); }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/Incomparable.java",
+        PointSelector::new("static int root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let call = root
+        .semantics()
+        .call_sites()
+        .first()
+        .expect("fixture retains one overloaded call");
+    let continuation = root
+        .point_handle(
+            call.normal_continuation
+                .target()
+                .expect("overloaded call has a normal continuation"),
+        )
+        .expect("continuation remains valid");
+    let provider =
+        TransformingProvider::new(analyzer.icfg_provider()).with_incomparable_call_evidence();
+    let result = solve_with_witnesses(&root, &[], &provider, &direct_problem());
+    let reached = result
+        .reached_at(&continuation)
+        .next()
+        .expect("both call targets reach the same continuation");
+
+    assert!(
+        reached
+            .path_qualities()
+            .contains(PathQuality::PROVEN_PARTIAL)
+    );
+    assert!(
+        reached
+            .path_qualities()
+            .contains(PathQuality::UNPROVEN_COMPLETE)
+    );
+    assert!(!reached.path_qualities().has_proven_complete_path());
+    for quality in [PathQuality::PROVEN_PARTIAL, PathQuality::UNPROVEN_COMPLETE] {
+        let witness = result
+            .witness_for_reached(reached, quality, WitnessReconstructionLimits::default())
+            .expect("quality-specific witness");
+        assert_eq!(witness.quality(), quality);
+        assert_eq!(
+            witness
+                .steps()
+                .iter()
+                .all(|step| matches!(step.proof(), ProofStatus::Proven)),
+            quality.is_proven(),
+        );
+        assert_eq!(
+            witness
+                .steps()
+                .iter()
+                .all(|step| matches!(step.completeness(), EvidenceCompleteness::Complete)),
+            quality.is_complete(),
+        );
+    }
+}
+
+#[test]
 fn provider_and_callback_permutations_produce_the_same_result() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -2211,15 +2884,15 @@ fn provider_and_callback_permutations_produce_the_same_result() {
             > 1,
         "the reversal must exercise a genuinely multi-target provider relation",
     );
-    let forward = solve_default(
+    let forward = solve_with_witnesses(
         &root,
-        &[PermutedFact::Seed],
+        &[PermutedFact::Seed, PermutedFact::Alpha, PermutedFact::Beta],
         &forward_provider,
         &PermutedProblem { reverse: false },
     );
-    let reverse = solve_default(
+    let reverse = solve_with_witnesses(
         &root,
-        &[PermutedFact::Seed],
+        &[PermutedFact::Beta, PermutedFact::Alpha, PermutedFact::Seed],
         &reverse_provider,
         &PermutedProblem { reverse: true },
     );
@@ -2231,6 +2904,48 @@ fn provider_and_callback_permutations_produce_the_same_result() {
     assert_eq!(forward.termination(), reverse.termination());
     assert_eq!(forward.work(), reverse.work());
     assert_eq!(forward.metrics(), reverse.metrics());
+    for (forward_reached, reverse_reached) in forward.reached().iter().zip(reverse.reached()) {
+        for quality in forward_reached.path_qualities().iter() {
+            assert_eq!(
+                forward
+                    .witness_for_reached(
+                        forward_reached,
+                        quality,
+                        WitnessReconstructionLimits::default(),
+                    )
+                    .expect("forward witness"),
+                reverse
+                    .witness_for_reached(
+                        reverse_reached,
+                        quality,
+                        WitnessReconstructionLimits::default(),
+                    )
+                    .expect("reverse witness"),
+            );
+        }
+    }
+    for (forward_summary, reverse_summary) in
+        forward.end_summaries().iter().zip(reverse.end_summaries())
+    {
+        for quality in forward_summary.path_qualities().iter() {
+            assert_eq!(
+                forward
+                    .witness_for_end_summary(
+                        forward_summary,
+                        quality,
+                        WitnessReconstructionLimits::default(),
+                    )
+                    .expect("forward end-summary witness"),
+                reverse
+                    .witness_for_end_summary(
+                        reverse_summary,
+                        quality,
+                        WitnessReconstructionLimits::default(),
+                    )
+                    .expect("reverse end-summary witness"),
+            );
+        }
+    }
 }
 
 #[test]

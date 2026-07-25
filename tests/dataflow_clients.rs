@@ -409,6 +409,7 @@ fn budget_with_limit(dimension: SolverBudgetDimension, limit: usize) -> SolverBu
         }
         SolverBudgetDimension::SummaryApplications => limits.summary_applications = limit,
         SolverBudgetDimension::CoverageRows => limits.coverage_rows = limit,
+        SolverBudgetDimension::WitnessRelations => limits.witness_relations = limit,
     }
     SolverBudget::new(limits)
 }
