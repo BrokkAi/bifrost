@@ -81,6 +81,19 @@ fn resource_lifecycle_fixture_exposes_diagnostic_neutral_semantics() {
             .iter()
             .any(|expectation| expectation.on() == TerminalExitKind::ExceptionalAnalysisRoot)
     );
+    let normal_expectation =
+        brokk_bifrost::analyzer::typestate::ProtocolExpectationKey::new("normal-exit-closed")
+            .unwrap();
+    let normal_expectation_id = protocol
+        .expectation_id(&normal_expectation)
+        .expect("durable expectation key lookup");
+    assert_eq!(
+        protocol
+            .terminal_expectation(normal_expectation_id)
+            .unwrap()
+            .key(),
+        &normal_expectation
+    );
     assert_eq!(protocol.hash().to_string().len(), 64);
     assert_eq!(
         protocol.hash(),
@@ -212,4 +225,32 @@ fn invalid_event_binding_shape_is_rejected() {
             .expect_err("invalid binding shape should fail"),
     );
     assert!(codes.contains(&ProtocolDiagnosticCode::InvalidEventShape));
+}
+
+#[test]
+fn guard_normalization_is_bounded_by_the_cardinality_domain() {
+    let mut spec = fixture();
+    spec.transitions[0].guard = ProtocolGuardSpec::ObjectCardinality {
+        allowed: vec![ProtocolObjectCardinality::Singleton; 4],
+    };
+
+    let codes = diagnostics(spec.compile().expect_err("oversized guard should fail"));
+    assert!(codes.contains(&ProtocolDiagnosticCode::TooManyGuardValues));
+}
+
+#[test]
+fn invalid_key_diagnostics_escape_terminal_control_characters() {
+    let mut spec = fixture();
+    spec.initial_state = "bad\n\u{1b}[2J".to_owned();
+
+    let error = spec.compile().expect_err("invalid key should fail");
+    let diagnostic = error
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == ProtocolDiagnosticCode::InvalidKey)
+        .expect("invalid-key diagnostic");
+    assert!(diagnostic.message().contains(r"\n"));
+    assert!(diagnostic.message().contains(r"\u{1b}"));
+    assert!(!diagnostic.message().contains('\n'));
+    assert!(!diagnostic.message().contains('\u{1b}'));
 }

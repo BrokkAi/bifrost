@@ -55,6 +55,14 @@ required for that checkpoint.
   and exceptional exits, invalid bindings/graphs, and hard source bounds.
 - [x] Implement and validate the internal protocol model, compiler,
   canonicalization, typed hash, deterministic rendering, and lifecycle fixture.
+- [x] (2026-07-25 12:04+02:00) Ran the first guided specialist review over
+  `origin/master...7bc66c0c`; it produced two high, seven medium, and three low
+  findings. The user authorized automatic triage, and all twelve were judged
+  relevant and tractable.
+- [x] (2026-07-25 12:20+02:00) Resolved the review's input/shared-infrastructure
+  findings: bounded-only top-level deserialization, fixed-domain guard
+  normalization, randomized untrusted-key maps, escaped diagnostics, durable
+  expectation lookup, and shared policy-neutral identifier/hash primitives.
 - [ ] Run the guided specialist review over the first protocol checkpoint and
   resolve every actionable finding.
 - [ ] Define the pre-resolved subject/event binding plan and choose the
@@ -194,6 +202,13 @@ required for that checkpoint.
   Rationale: this is the user's explicit execution instruction and preserves
   inspectable milestones while respecting the repository's current-branch
   workflow.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: guided-review findings are automatically fixed when they are
+  relevant blockers or reasonably scoped improvements; only dependency-blocked
+  or genuinely out-of-scope findings are deferred, with the reason recorded.
+  Rationale: this is the user's requested review policy. It preserves
+  adversarial review value without pausing for finding-by-finding confirmation.
   Date/Author: 2026-07-25 / Codex
 
 ## Outcomes & Retrospective

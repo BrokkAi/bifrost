@@ -1,6 +1,7 @@
 #[cfg(test)]
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
+pub(crate) mod canonical_hash;
 mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
@@ -18,6 +19,7 @@ pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
+pub(crate) mod identifier;
 mod java;
 mod javascript;
 mod js_ts;

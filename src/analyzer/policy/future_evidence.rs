@@ -15,6 +15,7 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+use crate::analyzer::canonical_hash::{CanonicalHasher, hash_domain_bytes, write_lower_hex};
 pub use crate::analyzer::typestate::TypestateProtocolHash;
 
 use super::budget::PolicyBudget;
@@ -2120,62 +2121,12 @@ fn hash_string_ids<T: AsRef<str>>(hasher: &mut CanonicalHasher, field: &'static 
     });
 }
 
-struct CanonicalHasher(Sha256);
-
-impl CanonicalHasher {
-    fn new(domain: &[u8]) -> Self {
-        let mut hasher = Self(Sha256::new());
-        hasher.value(domain);
-        hasher
-    }
-
-    fn field(&mut self, name: &str, value: &[u8]) {
-        self.value(name.as_bytes());
-        self.value(value);
-    }
-
-    fn value(&mut self, value: &[u8]) {
-        let length = u64::try_from(value.len()).expect("usize fits u64 on supported targets");
-        self.0.update(length.to_be_bytes());
-        self.0.update(value);
-    }
-
-    fn sequence<T>(&mut self, name: &str, values: &[T], mut update: impl FnMut(&mut Self, &T)) {
-        self.value(name.as_bytes());
-        self.value(
-            &u64::try_from(values.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        for value in values {
-            update(self, value);
-        }
-    }
-
-    fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
-    }
-}
-
-fn hash_domain_bytes(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = CanonicalHasher::new(domain);
-    hasher.value(bytes);
-    hasher.finish()
-}
-
 fn tighten_string(value: &mut String) {
     *value = std::mem::take(value).into_boxed_str().into_string();
 }
 
 fn tighten_vec<T>(values: &mut Vec<T>) {
     *values = std::mem::take(values).into_boxed_slice().into_vec();
-}
-
-fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(formatter, "{byte:02x}")?;
-    }
-    Ok(())
 }
 
 macro_rules! serialize_string_identifier {

@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::dense_id::define_dense_id;
-use crate::hash::{HashMap, HashSet};
+use crate::analyzer::identifier::define_identifier;
 
 use super::TypestateProtocolHash;
 
@@ -49,110 +50,17 @@ define_dense_id! {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProtocolKeyError {
-    Empty,
-    TooLong { max_bytes: usize },
-    NonAscii,
-    InvalidStart,
-    InvalidEnd,
-    InvalidCharacter { index: usize },
-}
-
-impl fmt::Display for ProtocolKeyError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("protocol key must not be empty"),
-            Self::TooLong { max_bytes } => {
-                write!(formatter, "protocol key must be at most {max_bytes} bytes")
-            }
-            Self::NonAscii => {
-                formatter.write_str("protocol key must contain only ASCII characters")
-            }
-            Self::InvalidStart => {
-                formatter.write_str("protocol key must begin with a lowercase ASCII alphanumeric")
-            }
-            Self::InvalidEnd => {
-                formatter.write_str("protocol key must end with a lowercase ASCII alphanumeric")
-            }
-            Self::InvalidCharacter { index } => {
-                write!(
-                    formatter,
-                    "protocol key has an invalid character at byte {index}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProtocolKeyError {}
-
-fn validate_protocol_key(value: &str) -> Result<(), ProtocolKeyError> {
-    if value.is_empty() {
-        return Err(ProtocolKeyError::Empty);
-    }
-    if value.len() > MAX_PROTOCOL_KEY_BYTES {
-        return Err(ProtocolKeyError::TooLong {
-            max_bytes: MAX_PROTOCOL_KEY_BYTES,
-        });
-    }
-    if !value.is_ascii() {
-        return Err(ProtocolKeyError::NonAscii);
-    }
-    let bytes = value.as_bytes();
-    if !is_lower_alphanumeric(bytes[0]) {
-        return Err(ProtocolKeyError::InvalidStart);
-    }
-    if !is_lower_alphanumeric(bytes[bytes.len() - 1]) {
-        return Err(ProtocolKeyError::InvalidEnd);
-    }
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if !(is_lower_alphanumeric(byte) || matches!(byte, b'-' | b'_')) {
-            return Err(ProtocolKeyError::InvalidCharacter { index });
-        }
-    }
-    Ok(())
-}
-
-const fn is_lower_alphanumeric(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit()
-}
+pub type ProtocolKeyError = crate::analyzer::identifier::IdentifierError;
 
 macro_rules! define_protocol_key {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-        #[serde(transparent)]
-        pub struct $name(Box<str>);
-
-        impl $name {
-            pub fn new(value: impl AsRef<str>) -> Result<Self, ProtocolKeyError> {
-                let value = value.as_ref();
-                validate_protocol_key(value)?;
-                Ok(Self(value.into()))
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                self.as_str()
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(self.as_str())
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = ProtocolKeyError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Self::new(value)
+        define_identifier! {
+            #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+            #[serde(transparent)]
+            pub struct $name {
+                max_bytes: MAX_PROTOCOL_KEY_BYTES,
+                allow_dot: false,
+                error: ProtocolKeyError,
             }
         }
     };
@@ -167,8 +75,7 @@ define_protocol_key!(ProtocolViolationKey);
 ///
 /// Public `.rqlp` authoring types are intentionally separate and are lowered
 /// into this shape by the future #824 adapter.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct ProtocolSpec {
     pub schema_version: u32,
     pub states: Vec<String>,
@@ -181,6 +88,36 @@ pub struct ProtocolSpec {
     pub semantics: ProtocolSemantics,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtocolSpecWire {
+    schema_version: u32,
+    states: Vec<String>,
+    initial_state: String,
+    accepting_states: Vec<String>,
+    error_states: Vec<String>,
+    events: Vec<ProtocolEventSpec>,
+    transitions: Vec<ProtocolTransitionSpec>,
+    terminal_expectations: Vec<ProtocolTerminalExpectationSpec>,
+    semantics: ProtocolSemantics,
+}
+
+impl From<ProtocolSpecWire> for ProtocolSpec {
+    fn from(wire: ProtocolSpecWire) -> Self {
+        Self {
+            schema_version: wire.schema_version,
+            states: wire.states,
+            initial_state: wire.initial_state,
+            accepting_states: wire.accepting_states,
+            error_states: wire.error_states,
+            events: wire.events,
+            transitions: wire.transitions,
+            terminal_expectations: wire.terminal_expectations,
+            semantics: wire.semantics,
+        }
+    }
+}
+
 impl ProtocolSpec {
     pub fn from_json(source: &[u8]) -> Result<Self, ProtocolSpecParseError> {
         if source.len() > MAX_PROTOCOL_SOURCE_BYTES {
@@ -189,7 +126,9 @@ impl ProtocolSpec {
                 max_bytes: MAX_PROTOCOL_SOURCE_BYTES,
             });
         }
-        serde_json::from_slice(source).map_err(ProtocolSpecParseError::InvalidJson)
+        serde_json::from_slice::<ProtocolSpecWire>(source)
+            .map(Into::into)
+            .map_err(ProtocolSpecParseError::InvalidJson)
     }
 
     pub fn compile(&self) -> Result<CompiledProtocol, ProtocolCompileError> {
@@ -310,6 +249,20 @@ pub enum ProtocolObjectCardinality {
     Singleton,
     Summary,
     Unknown,
+}
+
+const PROTOCOL_OBJECT_CARDINALITIES: [ProtocolObjectCardinality; 3] = [
+    ProtocolObjectCardinality::Singleton,
+    ProtocolObjectCardinality::Summary,
+    ProtocolObjectCardinality::Unknown,
+];
+
+const fn cardinality_index(cardinality: ProtocolObjectCardinality) -> usize {
+    match cardinality {
+        ProtocolObjectCardinality::Singleton => 0,
+        ProtocolObjectCardinality::Summary => 1,
+        ProtocolObjectCardinality::Unknown => 2,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -576,6 +529,13 @@ impl CompiledProtocol {
         &self.terminal_expectations
     }
 
+    pub fn expectation_id(&self, key: &ProtocolExpectationKey) -> Option<ProtocolExpectationId> {
+        self.terminal_expectations
+            .binary_search_by(|expectation| expectation.key.cmp(key))
+            .ok()
+            .and_then(|index| ProtocolExpectationId::try_from_index(index).ok())
+    }
+
     pub fn terminal_expectation(
         &self,
         id: ProtocolExpectationId,
@@ -616,6 +576,7 @@ pub enum ProtocolDiagnosticCode {
     DuplicateEvent,
     InvalidEventShape,
     EmptyGuard,
+    TooManyGuardValues,
     DuplicateGuardValue,
     UnknownEvent,
     InvalidViolationKey,
@@ -648,6 +609,7 @@ impl ProtocolDiagnosticCode {
             Self::DuplicateEvent => "duplicate_event",
             Self::InvalidEventShape => "invalid_event_shape",
             Self::EmptyGuard => "empty_guard",
+            Self::TooManyGuardValues => "too_many_guard_values",
             Self::DuplicateGuardValue => "duplicate_guard_value",
             Self::UnknownEvent => "unknown_event",
             Self::InvalidViolationKey => "invalid_violation_key",
@@ -880,7 +842,7 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
         ProtocolDiagnosticCode::TooManyTerminalExpectations,
     );
 
-    let mut state_sources = HashMap::default();
+    let mut state_sources = HashMap::new();
     for (index, value) in spec.states.iter().take(MAX_PROTOCOL_STATES).enumerate() {
         let path = format!("states[{index}]");
         if let Some(key) = parse_key::<ProtocolStateKey>(value, &path, &mut diagnostics)
@@ -926,7 +888,7 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
         ));
     }
 
-    let mut event_sources = HashMap::default();
+    let mut event_sources = HashMap::new();
     let mut valid_events = Vec::new();
     for (index, event) in spec.events.iter().take(MAX_PROTOCOL_EVENTS).enumerate() {
         let path = format!("events[{index}].id");
@@ -1038,7 +1000,7 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
     }
     validate_transition_determinism(&valid_transitions, &mut diagnostics);
 
-    let mut expectation_sources = HashMap::default();
+    let mut expectation_sources = HashMap::new();
     let mut valid_expectations = Vec::new();
     for (index, expectation) in spec
         .terminal_expectations
@@ -1142,24 +1104,27 @@ where
             diagnostics.push(ProtocolDiagnostic::new(
                 ProtocolDiagnosticCode::InvalidKey,
                 path,
-                format!("`{}`: {error}", bounded_value(value)),
+                format!("`{}`: {error}", bounded_debug_value(value)),
             ));
             None
         }
     }
 }
 
-fn bounded_value(value: &str) -> String {
-    if value.len() <= MAX_DIAGNOSTIC_VALUE_BYTES {
-        return value.to_owned();
+fn bounded_debug_value(value: &str) -> String {
+    let mut bounded = String::with_capacity(MAX_DIAGNOSTIC_VALUE_BYTES + 3);
+    let mut truncated = false;
+    for character in value.escape_debug() {
+        if bounded.len() + character.len_utf8() > MAX_DIAGNOSTIC_VALUE_BYTES {
+            truncated = true;
+            break;
+        }
+        bounded.push(character);
     }
-    let boundary = value
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= MAX_DIAGNOSTIC_VALUE_BYTES)
-        .last()
-        .unwrap_or(0);
-    format!("{}...", &value[..boundary])
+    if truncated {
+        bounded.push_str("...");
+    }
+    bounded
 }
 
 fn parse_state_set(
@@ -1168,7 +1133,7 @@ fn parse_state_set(
     states: &HashMap<ProtocolStateKey, usize>,
     diagnostics: &mut DiagnosticCollector,
 ) -> HashSet<ProtocolStateKey> {
-    let mut retained = HashSet::default();
+    let mut retained = HashSet::new();
     for (index, value) in values.iter().take(MAX_PROTOCOL_STATES).enumerate() {
         let path = format!("{field}[{index}]");
         let Some(key) = parse_key::<ProtocolStateKey>(value, &path, diagnostics) else {
@@ -1240,17 +1205,38 @@ fn normalize_guard(
                 ));
                 return None;
             }
-            let mut normalized = allowed.clone();
-            normalized.sort_unstable();
-            let original_len = normalized.len();
-            normalized.dedup();
-            if normalized.len() != original_len {
+            if allowed.len() > PROTOCOL_OBJECT_CARDINALITIES.len() {
+                diagnostics.push(ProtocolDiagnostic::new(
+                    ProtocolDiagnosticCode::TooManyGuardValues,
+                    format!("{transition_path}.guard.allowed"),
+                    format!(
+                        "object-cardinality guard contains {} values; maximum is {}",
+                        allowed.len(),
+                        PROTOCOL_OBJECT_CARDINALITIES.len()
+                    ),
+                ));
+                return None;
+            }
+            let mut retained = [false; PROTOCOL_OBJECT_CARDINALITIES.len()];
+            let mut duplicate = false;
+            for cardinality in allowed {
+                let already_present = &mut retained[cardinality_index(*cardinality)];
+                duplicate |= *already_present;
+                *already_present = true;
+            }
+            if duplicate {
                 diagnostics.push(ProtocolDiagnostic::new(
                     ProtocolDiagnosticCode::DuplicateGuardValue,
                     format!("{transition_path}.guard.allowed"),
                     "object-cardinality guard contains a duplicate value",
                 ));
             }
+            let normalized: Vec<_> = PROTOCOL_OBJECT_CARDINALITIES
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(index, cardinality)| retained[index].then_some(cardinality))
+                .collect();
             Some(CompiledProtocolGuard::ObjectCardinality {
                 allowed: normalized.into_boxed_slice(),
             })
@@ -1262,12 +1248,6 @@ fn validate_transition_determinism(
     transitions: &[ValidTransition],
     diagnostics: &mut DiagnosticCollector,
 ) {
-    const CARDINALITIES: [ProtocolObjectCardinality; 3] = [
-        ProtocolObjectCardinality::Singleton,
-        ProtocolObjectCardinality::Summary,
-        ProtocolObjectCardinality::Unknown,
-    ];
-
     let mut ordered: Vec<_> = transitions.iter().collect();
     ordered.sort_unstable_by(|left, right| {
         left.from
@@ -1287,8 +1267,8 @@ fn validate_transition_determinism(
             group_end += 1;
         }
 
-        let mut cardinality_owners: [Option<&ValidTransition>; CARDINALITIES.len()] =
-            [None; CARDINALITIES.len()];
+        let mut cardinality_owners: [Option<&ValidTransition>;
+            PROTOCOL_OBJECT_CARDINALITIES.len()] = [None; PROTOCOL_OBJECT_CARDINALITIES.len()];
         let mut previous: Option<&ValidTransition> = None;
         for transition in &ordered[group_start..group_end] {
             if let Some(prior) = previous
@@ -1309,7 +1289,7 @@ fn validate_transition_determinism(
                 ));
             }
 
-            let overlapping = CARDINALITIES
+            let overlapping = PROTOCOL_OBJECT_CARDINALITIES
                 .iter()
                 .enumerate()
                 .filter(|(_, cardinality)| transition.guard.applies_to(**cardinality))
@@ -1326,7 +1306,7 @@ fn validate_transition_determinism(
                 ));
             }
 
-            for (index, cardinality) in CARDINALITIES.iter().enumerate() {
+            for (index, cardinality) in PROTOCOL_OBJECT_CARDINALITIES.iter().enumerate() {
                 if transition.guard.applies_to(*cardinality) {
                     cardinality_owners[index] = Some(transition);
                 }
@@ -1359,7 +1339,7 @@ fn parse_expected_states(
         ));
         return Vec::new();
     }
-    let mut retained = HashSet::default();
+    let mut retained = HashSet::new();
     for (index, value) in values.iter().take(MAX_PROTOCOL_STATES).enumerate() {
         let item_path = format!("{path}[{index}]");
         let Some(key) = parse_key::<ProtocolStateKey>(value, &item_path, diagnostics) else {
@@ -1396,14 +1376,14 @@ fn validate_reachability(
     transitions: &[ValidTransition],
     diagnostics: &mut DiagnosticCollector,
 ) {
-    let mut outgoing = HashMap::<ProtocolStateKey, Vec<ProtocolStateKey>>::default();
+    let mut outgoing = HashMap::<ProtocolStateKey, Vec<ProtocolStateKey>>::new();
     for transition in transitions {
         outgoing
             .entry(transition.from.clone())
             .or_default()
             .push(transition.to.clone());
     }
-    let mut reached = HashSet::default();
+    let mut reached = HashSet::new();
     let mut stack = vec![initial.clone()];
     while let Some(state) = stack.pop() {
         if !reached.insert(state.clone()) {

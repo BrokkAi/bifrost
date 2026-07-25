@@ -1,7 +1,8 @@
 use std::fmt;
 
 use serde::{Serialize, Serializer};
-use sha2::{Digest, Sha256};
+
+use crate::analyzer::canonical_hash::{hash_domain_bytes, write_lower_hex};
 
 const TYPESTATE_PROTOCOL_DOMAIN: &[u8] = b"bifrost-typestate-protocol/v1";
 
@@ -25,25 +26,13 @@ impl TypestateProtocolHash {
 
     /// Hash canonical protocol bytes under the schema-version-1 domain.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        update_value(&mut hasher, TYPESTATE_PROTOCOL_DOMAIN);
-        update_value(&mut hasher, bytes);
-        Self(hasher.finalize().into())
+        Self(hash_domain_bytes(TYPESTATE_PROTOCOL_DOMAIN, bytes))
     }
-}
-
-fn update_value(hasher: &mut Sha256, value: &[u8]) {
-    let length = u64::try_from(value.len()).expect("usize fits u64 on supported targets");
-    hasher.update(length.to_be_bytes());
-    hasher.update(value);
 }
 
 impl fmt::Display for TypestateProtocolHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        write_lower_hex(&self.0, formatter)
     }
 }
 
