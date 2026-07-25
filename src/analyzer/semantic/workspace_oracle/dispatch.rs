@@ -1580,21 +1580,92 @@ pub(crate) fn procedures_for_definition(
     definition: &CodeUnit,
     artifact: &Arc<SemanticArtifact>,
 ) -> Vec<ProcedureHandle> {
+    let cancellation = CancellationToken::default();
+    let lookup = procedures_for_definition_with_limits(
+        analyzer,
+        definition,
+        artifact,
+        usize::MAX,
+        &cancellation,
+    );
+    if lookup.status == ProcedureRangeLookupStatus::Complete {
+        lookup.handles
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn procedures_for_definition_with_limits(
+    analyzer: &dyn IAnalyzer,
+    definition: &CodeUnit,
+    artifact: &Arc<SemanticArtifact>,
+    max_examined: usize,
+    cancellation: &CancellationToken,
+) -> ProcedureRangeLookup {
     let Some(indexed_source) = analyzer.indexed_source(definition.source()) else {
-        return Vec::new();
+        return ProcedureRangeLookup {
+            handles: Vec::new(),
+            examined: 0,
+            status: ProcedureRangeLookupStatus::SourceChanged,
+        };
     };
     if ContentIdentity::hash_bytes(indexed_source.as_bytes()) != artifact.key().revision().content()
     {
-        return Vec::new();
+        return ProcedureRangeLookup {
+            handles: Vec::new(),
+            examined: 0,
+            status: ProcedureRangeLookupStatus::SourceChanged,
+        };
     }
-    let mut ranges = analyzer.ranges_of(definition);
-    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
-    let compatible = artifact
-        .procedures()
-        .iter()
-        .filter(|procedure| procedure_matches_definition(procedure, definition))
-        .collect::<Vec<_>>();
-    procedure_handles_for_ranges(artifact, compatible, &ranges)
+    let ranges = analyzer.ranges_of(definition);
+    let mut progress = ProcedureLookupProgress::new(max_examined, cancellation);
+    let mut exact = Vec::new();
+    let mut enclosing = Vec::new();
+    for procedure in artifact.procedures() {
+        if let Err(status) = progress.examine() {
+            return progress.failed(status);
+        }
+        if !procedure_matches_definition(procedure, definition) {
+            continue;
+        }
+        let span = procedure.locator().anchor().span();
+        let mut exact_match = false;
+        let mut enclosing_match = false;
+        for range in &ranges {
+            if let Err(status) = progress.examine() {
+                return progress.failed(status);
+            }
+            if range.start_byte == span.start_byte() as usize
+                && range.end_byte == span.end_byte() as usize
+            {
+                exact_match = true;
+                break;
+            }
+            enclosing_match |= (range.start_byte <= span.start_byte() as usize
+                && range.end_byte >= span.end_byte() as usize)
+                || (span.start_byte() as usize <= range.start_byte
+                    && span.end_byte() as usize >= range.end_byte);
+        }
+        let target = if exact_match {
+            &mut exact
+        } else if enclosing_match {
+            &mut enclosing
+        } else {
+            continue;
+        };
+        if let Err(status) = insert_procedure_by_locator(target, procedure, &mut progress) {
+            return progress.failed(status);
+        }
+    }
+    let matches = if exact.is_empty() { enclosing } else { exact };
+    ProcedureRangeLookup {
+        handles: matches
+            .into_iter()
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .collect(),
+        examined: progress.examined,
+        status: ProcedureRangeLookupStatus::Complete,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1602,12 +1673,68 @@ pub(crate) enum ProcedureRangeLookupStatus {
     Complete,
     BudgetExhausted,
     Cancelled,
+    SourceChanged,
 }
 
 pub(crate) struct ProcedureRangeLookup {
     pub(crate) handles: Vec<ProcedureHandle>,
     pub(crate) examined: usize,
     pub(crate) status: ProcedureRangeLookupStatus,
+}
+
+struct ProcedureLookupProgress<'a> {
+    max_examined: usize,
+    cancellation: &'a CancellationToken,
+    examined: usize,
+}
+
+impl<'a> ProcedureLookupProgress<'a> {
+    const fn new(max_examined: usize, cancellation: &'a CancellationToken) -> Self {
+        Self {
+            max_examined,
+            cancellation,
+            examined: 0,
+        }
+    }
+
+    fn examine(&mut self) -> Result<(), ProcedureRangeLookupStatus> {
+        if self.cancellation.is_cancelled() {
+            return Err(ProcedureRangeLookupStatus::Cancelled);
+        }
+        if self.examined >= self.max_examined {
+            return Err(ProcedureRangeLookupStatus::BudgetExhausted);
+        }
+        self.examined = self.examined.saturating_add(1);
+        Ok(())
+    }
+
+    fn failed(&self, status: ProcedureRangeLookupStatus) -> ProcedureRangeLookup {
+        ProcedureRangeLookup {
+            handles: Vec::new(),
+            examined: self.examined,
+            status,
+        }
+    }
+}
+
+fn insert_procedure_by_locator<'a>(
+    procedures: &mut Vec<&'a ProcedureSemantics>,
+    procedure: &'a ProcedureSemantics,
+    progress: &mut ProcedureLookupProgress<'_>,
+) -> Result<(), ProcedureRangeLookupStatus> {
+    let mut start = 0;
+    let mut end = procedures.len();
+    while start < end {
+        progress.examine()?;
+        let middle = start + (end - start) / 2;
+        if procedures[middle].locator() < procedure.locator() {
+            start = middle + 1;
+        } else {
+            end = middle;
+        }
+    }
+    procedures.insert(start, procedure);
+    Ok(())
 }
 
 pub(crate) fn procedures_for_source_ranges(
@@ -1665,44 +1792,6 @@ pub(crate) fn procedures_for_source_ranges(
         examined,
         status: ProcedureRangeLookupStatus::Complete,
     }
-}
-
-fn procedure_handles_for_ranges<'a>(
-    artifact: &Arc<SemanticArtifact>,
-    candidates: impl IntoIterator<Item = &'a ProcedureSemantics>,
-    ranges: &[Range],
-) -> Vec<ProcedureHandle> {
-    let compatible = candidates.into_iter().collect::<Vec<_>>();
-    let mut matches = compatible
-        .iter()
-        .copied()
-        .filter(|procedure| {
-            let span = procedure.locator().anchor().span();
-            ranges.iter().any(|range| {
-                range.start_byte == span.start_byte() as usize
-                    && range.end_byte == span.end_byte() as usize
-            })
-        })
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
-        matches = compatible
-            .into_iter()
-            .filter(|procedure| {
-                let span = procedure.locator().anchor().span();
-                ranges.iter().any(|range| {
-                    (range.start_byte <= span.start_byte() as usize
-                        && range.end_byte >= span.end_byte() as usize)
-                        || (span.start_byte() as usize <= range.start_byte
-                            && span.end_byte() as usize >= range.end_byte)
-                })
-            })
-            .collect();
-    }
-    matches.sort_by(|left, right| left.locator().cmp(right.locator()));
-    matches
-        .into_iter()
-        .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
-        .collect()
 }
 
 fn procedure_matches_definition(procedure: &ProcedureSemantics, definition: &CodeUnit) -> bool {
@@ -1934,6 +2023,43 @@ mod tests {
 
     fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
         semantic_call_fixture().1
+    }
+
+    #[test]
+    fn declaration_procedure_lookup_charges_and_observes_cancellation_per_comparison() {
+        let (fixture, call) = semantic_call_fixture();
+        let definition = fixture
+            .analyzer
+            .analyzer()
+            .get_definitions("target")
+            .into_iter()
+            .next()
+            .expect("target definition");
+        let artifact = call.procedure().artifact();
+
+        let cancellation = CancellationToken::default();
+        let bounded = procedures_for_definition_with_limits(
+            fixture.analyzer.analyzer(),
+            &definition,
+            artifact,
+            1,
+            &cancellation,
+        );
+        assert_eq!(bounded.status, ProcedureRangeLookupStatus::BudgetExhausted);
+        assert_eq!(bounded.examined, 1);
+        assert!(bounded.handles.is_empty());
+
+        cancellation.cancel();
+        let cancelled = procedures_for_definition_with_limits(
+            fixture.analyzer.analyzer(),
+            &definition,
+            artifact,
+            usize::MAX,
+            &cancellation,
+        );
+        assert_eq!(cancelled.status, ProcedureRangeLookupStatus::Cancelled);
+        assert_eq!(cancelled.examined, 0);
+        assert!(cancelled.handles.is_empty());
     }
 
     fn locator_with_anchor(locator: &SemanticLocator, offset: u32) -> SemanticLocator {

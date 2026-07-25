@@ -10,7 +10,7 @@ use super::{
 };
 use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
 use crate::analyzer::semantic::workspace_oracle::{
-    ProcedureRangeLookupStatus, procedures_for_definition, procedures_for_source_ranges,
+    ProcedureRangeLookupStatus, procedures_for_definition_with_limits, procedures_for_source_ranges,
 };
 use crate::analyzer::semantic::{
     AllocationSite, BasicBlock, CapabilitySupport, CaptureBinding, ContentIdentity, ControlEdge,
@@ -169,7 +169,7 @@ impl<'a> SemanticQueryContext<'a> {
         CfgQueryAdapter { context: self }
     }
 
-    fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
+    pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
         let fact = seed.facts.node(seed.fact_match.node);
         let span = fact.span();
         let ranges = [Range {
@@ -181,6 +181,12 @@ impl<'a> SemanticQueryContext<'a> {
         let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
             return Vec::new();
         };
+        if ContentIdentity::hash_bytes(seed.facts.source().as_bytes())
+            != artifact.key().revision().content()
+        {
+            self.push_source_generation_changed(&seed.file);
+            return Vec::new();
+        }
         let quality = quality.combine(&self.capability_quality(
             &seed.file,
             artifact.as_ref(),
@@ -212,6 +218,10 @@ impl<'a> SemanticQueryContext<'a> {
                 );
                 Vec::new()
             }
+            ProcedureRangeLookupStatus::SourceChanged => {
+                self.push_source_generation_changed(&seed.file);
+                Vec::new()
+            }
         }
     }
 
@@ -228,16 +238,38 @@ impl<'a> SemanticQueryContext<'a> {
             artifact.as_ref(),
             &[SemanticCapability::Procedures],
         ));
-        if !self.charge_traversal(
-            file,
-            artifact.procedures().len().saturating_mul(2),
-            "declaration-to-procedure lookup",
-        ) {
-            return Vec::new();
+        let lookup = procedures_for_definition_with_limits(
+            self.workspace.analyzer(),
+            &declaration.unit,
+            &artifact,
+            self.limits
+                .max_traversal_steps
+                .saturating_sub(self.traversal_steps),
+            self.cancellation.unwrap_or(&self.uncancelled),
+        );
+        self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
+        match lookup.status {
+            ProcedureRangeLookupStatus::Complete => {
+                self.finish_procedure_lookup(file, source, lookup.handles, quality)
+            }
+            ProcedureRangeLookupStatus::BudgetExhausted => {
+                self.exhaust_traversal_budget(file, "declaration-to-procedure lookup");
+                Vec::new()
+            }
+            ProcedureRangeLookupStatus::Cancelled => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::Cancelled,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    "declaration-to-procedure lookup was cancelled",
+                );
+                Vec::new()
+            }
+            ProcedureRangeLookupStatus::SourceChanged => {
+                self.push_source_generation_changed(file);
+                Vec::new()
+            }
         }
-        let candidates =
-            procedures_for_definition(self.workspace.analyzer(), &declaration.unit, &artifact);
-        self.finish_procedure_lookup(file, source, candidates, quality)
     }
 
     fn cfg_entry(
@@ -728,30 +760,13 @@ impl<'a> SemanticQueryContext<'a> {
         Some(SemanticSourceSnapshot::new(source))
     }
 
-    fn charge_traversal(&mut self, file: &ProjectFile, steps: usize, operation: &str) -> bool {
-        if self
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::Cancelled,
-                CodeQueryDiagnosticImpact::Incomplete,
-                file,
-                &format!("{operation} was cancelled"),
-            );
-            return false;
-        }
-        if steps
-            > self
-                .limits
-                .max_traversal_steps
-                .saturating_sub(self.traversal_steps)
-        {
-            self.exhaust_traversal_budget(file, operation);
-            return false;
-        }
-        self.traversal_steps = self.traversal_steps.saturating_add(steps);
-        true
+    fn push_source_generation_changed(&mut self, file: &ProjectFile) {
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
+            "source generation changed between structural matching and semantic projection; retry the query for a coherent snapshot",
+        );
     }
 
     fn exhaust_traversal_budget(&mut self, file: &ProjectFile, operation: &str) {

@@ -28,6 +28,69 @@ fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnaly
 }
 
 #[test]
+fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
+    let original = "function target() { const first = 1; }\n";
+    let changed = "function target() { const other = 2; }\n";
+    assert_eq!(original.len(), changed.len());
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), "src/app.ts");
+    file.write(original).expect("write original source");
+    let overlay = Arc::new(OverlayProject::new(Arc::new(TestProject::new(
+        root,
+        Language::TypeScript,
+    ))));
+    let workspace = WorkspaceAnalyzer::build(
+        Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>,
+        AnalyzerConfig::default(),
+    );
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 3,
+        "match": { "kind": "function", "name": "target" },
+        "steps": [{ "op": "procedure_of" }]
+    }))
+    .expect("valid CFG query");
+    let provider = workspace
+        .analyzer()
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == Language::TypeScript)
+        .expect("TypeScript structural provider");
+    let facts = provider
+        .structural_facts(&file)
+        .expect("original structural facts");
+    let fact_match =
+        super::super::matcher::match_query(query.seed().expect("structural query seed"), &facts, 1)
+            .into_iter()
+            .next()
+            .expect("target structural match");
+    let seed = SeedMatch {
+        language: Language::TypeScript,
+        file: file.clone(),
+        facts,
+        fact_match,
+    };
+
+    assert!(overlay.set(file.abs_path(), changed.to_string()));
+    let mut semantic = SemanticQueryContext::new(
+        &workspace,
+        None,
+        CodeQueryExecutionLimits::default().semantic,
+    );
+    let procedures = semantic.procedure_of_match(&seed);
+    let diagnostics = semantic.take_diagnostics();
+
+    assert!(
+        procedures.is_empty(),
+        "a semantic row from the changed generation must not be joined to the retained seed"
+    );
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+            && diagnostic.message.contains("source generation changed")
+    }));
+}
+
+#[test]
 fn indexed_postings_match_scan_results_in_every_structural_language() {
     let cases = [
         (
