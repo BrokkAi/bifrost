@@ -35,6 +35,7 @@ use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
@@ -144,6 +145,7 @@ fn production_watcher_starter() -> WatcherStarter {
 pub struct SearchToolsService {
     root: RwLock<Option<PathBuf>>,
     session: RwLock<Option<WorkspaceSession>>,
+    workspace_generation: AtomicU64,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
     /// `ensure_ready` joins it and installs the resulting session into `session`
@@ -180,6 +182,18 @@ struct WorkspaceQueryScope {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
     context: Arc<crate::analyzer::AnalyzerQueryContext>,
+}
+
+pub(crate) struct PreparedQueryCode {
+    snapshot: WorkspaceQueryScope,
+    arguments: Value,
+    workspace_generation: u64,
+}
+
+impl PreparedQueryCode {
+    pub(crate) const fn workspace_generation(&self) -> u64 {
+        self.workspace_generation
+    }
 }
 
 impl WorkspaceQueryScope {
@@ -410,6 +424,7 @@ impl SearchToolsService {
         Ok(Self {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -465,6 +480,7 @@ impl SearchToolsService {
         Ok(Self {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -797,6 +813,52 @@ impl SearchToolsService {
         snapshot.finish("query_code", result)
     }
 
+    pub(crate) fn prepare_query_code(
+        &self,
+        arguments: Value,
+    ) -> Result<PreparedQueryCode, SearchToolsServiceError> {
+        loop {
+            let generation = self.workspace_generation();
+            let snapshot = self.snapshot_for_query()?;
+            if generation != self.workspace_generation() {
+                continue;
+            }
+            let root = snapshot.analyzer().project().root();
+            let arguments =
+                crate::tool_arguments::normalize_tool_arguments("query_code", arguments, root)
+                    .map_err(SearchToolsServiceError::invalid_params)?;
+            return Ok(PreparedQueryCode {
+                snapshot,
+                arguments,
+                workspace_generation: generation,
+            });
+        }
+    }
+
+    pub(crate) fn execute_prepared_query_code(
+        &self,
+        prepared: PreparedQueryCode,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let PreparedQueryCode {
+            snapshot,
+            arguments,
+            ..
+        } = prepared;
+        let result = (|| {
+            let output = Self::query_code_result_for_snapshot(&snapshot, arguments, cancellation)?;
+            let rendered_text = output.render_text();
+            let structured = serde_json::to_value(&output).map_err(|err| {
+                SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+            })?;
+            Ok(ToolOutput::Structured {
+                structured,
+                rendered_text: Some(rendered_text),
+            })
+        })();
+        snapshot.finish("query_code", result)
+    }
+
     fn query_code_result_for_snapshot(
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
@@ -920,6 +982,14 @@ impl SearchToolsService {
         self.root.read().map(|root| root.clone()).unwrap_or(None)
     }
 
+    pub(crate) fn workspace_generation(&self) -> u64 {
+        self.workspace_generation.load(Ordering::Acquire)
+    }
+
+    fn advance_workspace_generation(&self) {
+        self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
     // by `FilesystemProject::new`) without git-root normalization, while
     // `activate_workspace` normalizes to the nearest enclosing git root. As a
@@ -960,6 +1030,7 @@ impl SearchToolsService {
         Ok(Self {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1000,6 +1071,7 @@ impl SearchToolsService {
         Ok(Self {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1039,6 +1111,7 @@ impl SearchToolsService {
         Ok(Self {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1094,6 +1167,7 @@ impl SearchToolsService {
         Self {
             root: RwLock::new(None),
             session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(0),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1159,6 +1233,7 @@ impl SearchToolsService {
         *active_root = Some(canonical.clone());
         drop(active_root);
         drop(session);
+        self.advance_workspace_generation();
         if let Some(old_session) = old_session {
             old_session.close_semantic();
         }
@@ -1177,9 +1252,12 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
         let old_session = session.take();
-        *active_root = None;
+        let old_root = active_root.take();
         drop(active_root);
         drop(session);
+        if old_session.is_some() || old_root.is_some() {
+            self.advance_workspace_generation();
+        }
         if let Some(old_session) = old_session {
             old_session.close_semantic();
         }
@@ -1241,6 +1319,7 @@ impl SearchToolsService {
         Ok(Self {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1328,6 +1407,7 @@ impl SearchToolsService {
         let session = guard.take();
         drop(guard);
         if let Some(session) = session {
+            self.advance_workspace_generation();
             session.close_semantic();
         }
         Ok(())
@@ -1475,6 +1555,7 @@ impl SearchToolsService {
         *root = Some(resolved.clone());
         drop(guard);
         drop(root);
+        self.advance_workspace_generation();
         old_session.close_semantic();
 
         active_workspace_result(&resolved)
@@ -2610,6 +2691,7 @@ public partial class MudDialogContainer
                 #[cfg(feature = "nlp")]
                 semantic: None,
             })),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
@@ -2844,6 +2926,7 @@ mod client_roots_tests {
         let service = SearchToolsService {
             root: RwLock::new(None),
             session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(0),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -2898,6 +2981,7 @@ mod tests {
                 watcher: SessionWatcher::Disabled,
                 semantic: Some(indexer.clone()),
             })),
+            workspace_generation: AtomicU64::new(1),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,

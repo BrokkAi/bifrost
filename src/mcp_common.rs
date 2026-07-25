@@ -1,3 +1,4 @@
+use crate::searchtools_service::PreparedQueryCode;
 use crate::{
     CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
     ToolOutput, analyzer::policy::escape_terminal_text, searchtools_render::RenderOptions,
@@ -20,7 +21,9 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
+const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
+const MAX_IN_FLIGHT_QUERY_CODE_REQUESTS: usize = 4;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
@@ -72,19 +75,48 @@ struct McpConnectionState {
 
 #[derive(Clone, Default)]
 struct McpRequestCancellations {
-    active: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    active: Arc<Mutex<HashMap<String, ActiveMcpRequest>>>,
+}
+
+struct ActiveMcpRequest {
+    cancellation: CancellationToken,
+    workspace_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpRequestRegistrationError {
+    DuplicateId,
+    AtCapacity,
+    StaleWorkspace,
 }
 
 impl McpRequestCancellations {
-    fn register(&self, id: &Value) -> Option<CancellationToken> {
+    fn register(
+        &self,
+        id: &Value,
+        workspace_generation: u64,
+        current_workspace_generation: u64,
+    ) -> Result<CancellationToken, McpRequestRegistrationError> {
         let key = request_id_key(id);
         let token = CancellationToken::default();
         let mut active = self.active.lock().expect("MCP cancellation lock poisoned");
         if active.contains_key(&key) {
-            return None;
+            return Err(McpRequestRegistrationError::DuplicateId);
         }
-        active.insert(key, token.clone());
-        Some(token)
+        if active.len() >= MAX_IN_FLIGHT_QUERY_CODE_REQUESTS {
+            return Err(McpRequestRegistrationError::AtCapacity);
+        }
+        if workspace_generation != current_workspace_generation {
+            return Err(McpRequestRegistrationError::StaleWorkspace);
+        }
+        active.insert(
+            key,
+            ActiveMcpRequest {
+                cancellation: token.clone(),
+                workspace_generation,
+            },
+        );
+        Ok(token)
     }
 
     fn complete(&self, id: &Value) {
@@ -100,22 +132,60 @@ impl McpRequestCancellations {
             .lock()
             .expect("MCP cancellation lock poisoned")
             .get(&request_id_key(id))
-            .cloned();
+            .map(|request| request.cancellation.clone());
         token.is_some_and(|token| {
             token.cancel();
             true
         })
     }
 
+    fn cancel_stale(&self, current_workspace_generation: u64) {
+        for request in self
+            .active
+            .lock()
+            .expect("MCP cancellation lock poisoned")
+            .values()
+            .filter(|request| request.workspace_generation != current_workspace_generation)
+        {
+            request.cancellation.cancel();
+        }
+    }
+
     fn cancel_all(&self) {
-        for token in self
+        for request in self
             .active
             .lock()
             .expect("MCP cancellation lock poisoned")
             .values()
         {
-            token.cancel();
+            request.cancellation.cancel();
         }
+    }
+}
+
+struct OutboundMcpResponse {
+    value: Value,
+    workspace_generation: Option<u64>,
+}
+
+impl OutboundMcpResponse {
+    fn unscoped(value: Value) -> Self {
+        Self {
+            value,
+            workspace_generation: None,
+        }
+    }
+
+    fn scoped(value: Value, workspace_generation: u64) -> Self {
+        Self {
+            value,
+            workspace_generation: Some(workspace_generation),
+        }
+    }
+
+    fn is_current(&self, service: &SearchToolsService) -> bool {
+        self.workspace_generation
+            .is_none_or(|generation| generation == service.workspace_generation())
     }
 }
 
@@ -228,13 +298,17 @@ pub fn run_stdio_server(
     });
     let mut connection = McpConnectionState::new(accepts_client_roots);
     let cancellations = McpRequestCancellations::default();
-    let (response_sender, response_receiver) = mpsc::channel::<Value>();
+    let (response_sender, response_receiver) = mpsc::channel::<OutboundMcpResponse>();
+    let writer_service = Arc::clone(&service);
     let writer = thread::Builder::new()
         .name("bifrost-mcp-writer".to_string())
         .spawn(move || -> Result<(), String> {
             let mut stdout = io::stdout();
             for response in response_receiver {
-                let encoded = serde_json::to_string(&response)
+                if !response.is_current(writer_service.as_ref()) {
+                    continue;
+                }
+                let encoded = serde_json::to_string(&response.value)
                     .map_err(|err| format!("Failed to serialize MCP response: {err}"))?;
                 writeln!(stdout, "{encoded}")
                     .and_then(|_| stdout.flush())
@@ -273,17 +347,42 @@ pub fn run_stdio_server(
                             Some(success_response(id, result))
                         }
                         Ok(ToolCallPreparation::Ready(call)) => {
-                            let Some(cancellation) = cancellations.register(&id) else {
-                                response_sender
-                                    .send(error_response(
-                                        id,
-                                        INVALID_REQUEST,
-                                        "duplicate in-flight JSON-RPC request id".to_string(),
-                                    ))
-                                    .map_err(|_| {
-                                        "MCP response writer stopped unexpectedly".to_string()
-                                    })?;
-                                continue;
+                            let workspace_generation = call
+                                .workspace_generation()
+                                .expect("query_code preparation captures a workspace generation");
+                            let cancellation = match cancellations.register(
+                                &id,
+                                workspace_generation,
+                                service.workspace_generation(),
+                            ) {
+                                Ok(cancellation) => cancellation,
+                                Err(error) => {
+                                    let (code, message) = match error {
+                                        McpRequestRegistrationError::DuplicateId => (
+                                            INVALID_REQUEST,
+                                            "duplicate in-flight JSON-RPC request id".to_string(),
+                                        ),
+                                        McpRequestRegistrationError::AtCapacity => (
+                                            SERVER_BUSY,
+                                            format!(
+                                                "too many in-flight query_code requests; maximum is {MAX_IN_FLIGHT_QUERY_CODE_REQUESTS}"
+                                            ),
+                                        ),
+                                        McpRequestRegistrationError::StaleWorkspace => (
+                                            RESOURCE_NOT_FOUND,
+                                            "workspace changed before query_code could start; retry the request"
+                                                .to_string(),
+                                        ),
+                                    };
+                                    response_sender
+                                        .send(OutboundMcpResponse::unscoped(error_response(
+                                            id, code, message,
+                                        )))
+                                        .map_err(|_| {
+                                            "MCP response writer stopped unexpectedly".to_string()
+                                        })?;
+                                    continue;
+                                }
                             };
                             let service = Arc::clone(&service);
                             let response_sender = response_sender.clone();
@@ -316,10 +415,11 @@ pub fn run_stdio_server(
                 format!("Invalid JSON: {err}"),
             )),
         };
+        cancellations.cancel_stale(service.workspace_generation());
 
         if let Some(response) = response {
             response_sender
-                .send(response)
+                .send(OutboundMcpResponse::unscoped(response))
                 .map_err(|_| "MCP response writer stopped unexpectedly".to_string())?;
         }
     }
@@ -380,8 +480,11 @@ fn spawn_cancellable_tool_call(
     id: Value,
     cancellation: CancellationToken,
     cancellations: McpRequestCancellations,
-    response_sender: mpsc::Sender<Value>,
+    response_sender: mpsc::Sender<OutboundMcpResponse>,
 ) -> Result<(), String> {
+    let workspace_generation = call
+        .workspace_generation()
+        .expect("background tool calls are workspace-scoped query_code requests");
     let cleanup_id = id.clone();
     let cleanup_cancellations = cancellations.clone();
     let spawn_result = thread::Builder::new()
@@ -393,7 +496,8 @@ fn spawn_cancellable_tool_call(
                     Err((code, message)) => error_response(id.clone(), code, message),
                 };
             cancellations.complete(&id);
-            let _ = response_sender.send(response);
+            let _ =
+                response_sender.send(OutboundMcpResponse::scoped(response, workspace_generation));
         });
     if let Err(err) = spawn_result {
         cleanup_cancellations.complete(&cleanup_id);
@@ -435,7 +539,7 @@ fn dispatch_message(
         if let Some(id) = object.get("id")
             && (object.contains_key("result") || object.contains_key("error"))
         {
-            return handle_response(service, connection, id, object);
+            return handle_response(service, connection, cancellations, id, object);
         }
         let id = object.get("id").cloned().unwrap_or(Value::Null);
         return Some(error_response(
@@ -498,6 +602,7 @@ fn dispatch_message(
 fn handle_response(
     service: &SearchToolsService,
     connection: &mut McpConnectionState,
+    cancellations: &McpRequestCancellations,
     id: &Value,
     response: &serde_json::Map<String, Value>,
 ) -> Option<Value> {
@@ -542,6 +647,7 @@ fn handle_response(
         };
         match service.bind_client_workspace(path) {
             Ok(root) => {
+                cancellations.cancel_stale(service.workspace_generation());
                 connection.workspace_binding_source = WorkspaceBindingSource::ClientRoots;
                 connection.codex_sandbox_cwd_uri = None;
                 connection.codex_sandbox_root = None;
@@ -559,6 +665,7 @@ fn handle_response(
         if let Err(error) = service.unbind_client_workspace() {
             eprintln!("bifrost: failed to clear revoked MCP workspace root: {error}");
         }
+        cancellations.cancel_stale(service.workspace_generation());
         connection.workspace_binding_source = WorkspaceBindingSource::None;
         connection.codex_sandbox_cwd_uri = None;
         connection.codex_sandbox_root = None;
@@ -567,6 +674,7 @@ fn handle_response(
         if let Err(unbind_error) = service.unbind_client_workspace() {
             eprintln!("bifrost: failed to clear unusable MCP workspace roots: {unbind_error}");
         }
+        cancellations.cancel_stale(service.workspace_generation());
         connection.workspace_binding_source = WorkspaceBindingSource::None;
         connection.codex_sandbox_cwd_uri = None;
         connection.codex_sandbox_root = None;
@@ -667,6 +775,7 @@ fn handle_notification(
             if let Err(error) = service.unbind_client_workspace() {
                 eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
             }
+            cancellations.cancel_stale(service.workspace_generation());
             connection.workspace_binding_source = WorkspaceBindingSource::None;
             connection.codex_sandbox_cwd_uri = None;
             connection.codex_sandbox_root = None;
@@ -775,10 +884,22 @@ fn handle_tool_call(
     }
 }
 
-struct PreparedToolCall {
-    name: String,
-    arguments: Value,
-    render_options: RenderOptions,
+enum PreparedToolCall {
+    QueryCode(PreparedQueryCode),
+    Standard {
+        name: String,
+        arguments: Value,
+        render_options: RenderOptions,
+    },
+}
+
+impl PreparedToolCall {
+    fn workspace_generation(&self) -> Option<u64> {
+        match self {
+            Self::QueryCode(prepared) => Some(prepared.workspace_generation()),
+            Self::Standard { .. } => None,
+        }
+    }
 }
 
 enum ToolCallPreparation {
@@ -834,12 +955,19 @@ fn prepare_tool_call(
             ))));
         }
     }
+    if name == "query_code" {
+        return service
+            .prepare_query_code(arguments)
+            .map(PreparedToolCall::QueryCode)
+            .map(ToolCallPreparation::Ready)
+            .map_err(|error| map_service_error(error.code, error.message));
+    }
     let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
         Err(message) => return Ok(ToolCallPreparation::Reply(tool_error_result(message))),
     };
 
-    Ok(ToolCallPreparation::Ready(PreparedToolCall {
+    Ok(ToolCallPreparation::Ready(PreparedToolCall::Standard {
         name: name.to_string(),
         arguments,
         render_options: RenderOptions {
@@ -853,15 +981,30 @@ fn execute_prepared_tool_call(
     call: PreparedToolCall,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Value, (i64, String)> {
-    match service.call_tool_output_with_cancellation(
-        &call.name,
-        call.arguments,
-        call.render_options,
-        cancellation,
-    ) {
+    let (name, render_options, output) = match call {
+        PreparedToolCall::QueryCode(prepared) => (
+            "query_code".to_string(),
+            RenderOptions::default(),
+            service.execute_prepared_query_code(prepared, cancellation),
+        ),
+        PreparedToolCall::Standard {
+            name,
+            arguments,
+            render_options,
+        } => {
+            let output = service.call_tool_output_with_cancellation(
+                &name,
+                arguments,
+                render_options,
+                cancellation,
+            );
+            (name, render_options, output)
+        }
+    };
+    match output {
         Ok(output) => {
-            let output = if call.name == "get_summaries" {
-                fit_get_summaries_output_to_budget(service, output, call.render_options)
+            let output = if name == "get_summaries" {
+                fit_get_summaries_output_to_budget(service, output, render_options)
                     .map_err(|err| map_service_error(err.code, err.message))?
             } else {
                 output
@@ -1899,7 +2042,11 @@ mod uri_tests {
         let cancellations = McpRequestCancellations::default();
         let request_id = json!("cfg-request");
         let token = cancellations
-            .register(&request_id)
+            .register(
+                &request_id,
+                service.workspace_generation(),
+                service.workspace_generation(),
+            )
             .expect("unique request registers");
 
         assert!(
@@ -1916,6 +2063,84 @@ mod uri_tests {
     }
 
     #[test]
+    fn query_code_admission_is_bounded() {
+        let cancellations = McpRequestCancellations::default();
+        let generation = 7;
+        for request in 0..MAX_IN_FLIGHT_QUERY_CODE_REQUESTS {
+            cancellations
+                .register(&json!(request), generation, generation)
+                .expect("request within the fixed admission cap");
+        }
+
+        assert!(matches!(
+            cancellations.register(&json!("overflow"), generation, generation),
+            Err(McpRequestRegistrationError::AtCapacity)
+        ));
+        assert!(matches!(
+            cancellations.register(&json!(0), generation, generation),
+            Err(McpRequestRegistrationError::DuplicateId)
+        ));
+    }
+
+    #[test]
+    fn prepared_query_is_pinned_to_its_workspace_and_revoked_response_is_suppressed() {
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        std::fs::write(
+            first.path().join("app.ts"),
+            "export function firstTarget(): void {}\n",
+        )
+        .expect("write first source");
+        std::fs::write(
+            second.path().join("app.ts"),
+            "export function secondTarget(): void {}\n",
+        )
+        .expect("write second source");
+        let service = SearchToolsService::new_unbound_manual();
+        service
+            .bind_client_workspace(first.path().to_path_buf())
+            .expect("bind first workspace");
+        let prepared = service
+            .prepare_query_code(json!({
+                "match": { "kind": "function", "name": "firstTarget" }
+            }))
+            .expect("prepare against first workspace");
+        let accepted_generation = prepared.workspace_generation();
+        let cancellations = McpRequestCancellations::default();
+        let request_id = json!("workspace-scoped");
+        let cancellation = cancellations
+            .register(
+                &request_id,
+                accepted_generation,
+                service.workspace_generation(),
+            )
+            .expect("register first-workspace request");
+
+        service
+            .bind_client_workspace(second.path().to_path_buf())
+            .expect("bind second workspace");
+        cancellations.cancel_stale(service.workspace_generation());
+        assert!(
+            cancellation.is_cancelled(),
+            "rebinding must revoke accepted work from the old workspace"
+        );
+
+        let result =
+            execute_prepared_tool_call(&service, PreparedToolCall::QueryCode(prepared), None)
+                .expect("the immutable first-workspace snapshot remains executable");
+        assert_eq!(
+            result["structuredContent"]["results"][0]["path"], "app.ts",
+            "execution remains pinned to the first workspace snapshot"
+        );
+        let response =
+            OutboundMcpResponse::scoped(success_response(request_id, result), accepted_generation);
+        assert!(
+            !response.is_current(&service),
+            "the writer must suppress results after their workspace authority is revoked"
+        );
+    }
+
+    #[test]
     fn cancelled_notification_propagates_through_background_query_response() {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(
@@ -1928,8 +2153,9 @@ mod uri_tests {
         );
         let cancellations = McpRequestCancellations::default();
         let request_id = json!(42);
+        let workspace_generation = service.workspace_generation();
         let cancellation = cancellations
-            .register(&request_id)
+            .register(&request_id, workspace_generation, workspace_generation)
             .expect("unique request registers");
         let mut connection = McpConnectionState::new(false);
         assert!(
@@ -1943,20 +2169,19 @@ mod uri_tests {
             .is_none()
         );
         let (response_sender, response_receiver) = mpsc::channel();
+        let prepared = service
+            .prepare_query_code(json!({
+                "schema_version": 3,
+                "match": { "kind": "function", "name": "target" },
+                "steps": [
+                    { "op": "procedure_of" },
+                    { "op": "cfg_entry" }
+                ]
+            }))
+            .expect("query preparation");
         spawn_cancellable_tool_call(
             Arc::clone(&service),
-            PreparedToolCall {
-                name: "query_code".to_string(),
-                arguments: json!({
-                    "schema_version": 3,
-                    "match": { "kind": "function", "name": "target" },
-                    "steps": [
-                        { "op": "procedure_of" },
-                        { "op": "cfg_entry" }
-                    ]
-                }),
-                render_options: RenderOptions::default(),
-            },
+            PreparedToolCall::QueryCode(prepared),
             request_id,
             cancellation,
             cancellations,
@@ -1968,9 +2193,12 @@ mod uri_tests {
             .expect("background request responds");
 
         assert_eq!(
-            response["result"]["structuredContent"]["diagnostics"][0]["code"],
+            response.value["result"]["structuredContent"]["diagnostics"][0]["code"],
             "cancelled"
         );
-        assert_eq!(response["result"]["structuredContent"]["truncated"], true);
+        assert_eq!(
+            response.value["result"]["structuredContent"]["truncated"],
+            true
+        );
     }
 }
