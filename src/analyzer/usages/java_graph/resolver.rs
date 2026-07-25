@@ -9,7 +9,7 @@ use crate::analyzer::usages::java_graph::return_type::{
 };
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
-use crate::analyzer::{CallableArity, CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
+use crate::analyzer::{CallableArity, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -475,15 +475,25 @@ pub(super) fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
             continue;
         }
 
-        let Some((owner, member)) = path.rsplit_once('.') else {
+        // `path` is a raw `import static a.b.C.member;` statement's dotted
+        // target text; Java identifiers never contain a literal `.`, so
+        // re-tokenizing with the shared structured splitter and rejoining
+        // every part but the last with the same `.` reproduces
+        // `rsplit_once('.')`'s (owner, member) split exactly.
+        let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
+        let Some((member, owner_parts)) = segments.split_last() else {
             continue;
         };
-        if member != ctx.spec.member_name {
+        if owner_parts.is_empty() {
             continue;
         }
+        if member.as_str() != ctx.spec.member_name.as_str() {
+            continue;
+        }
+        let owner = owner_parts.join(".");
         if owner == target_fq_name {
             target_visible = true;
-        } else if java_static_import_owner_matches_target(owner, ctx) {
+        } else if java_static_import_owner_matches_target(&owner, ctx) {
             return false;
         }
     }

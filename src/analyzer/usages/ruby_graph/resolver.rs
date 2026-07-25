@@ -72,6 +72,11 @@ impl RubyTargetSpec {
 
 pub(crate) fn ruby_field_target(target: &CodeUnit) -> Option<RubyFieldTarget> {
     let member = target.identifier();
+    // fqname-M4: `owner` below is compared against a package-less class-name
+    // reference-text `owner` parsed at a field-reference site (see
+    // `field_reference_matches_target`); `fq.parent()`/`default_parent_fq_name`
+    // would render the package-qualified owner, a different string that would
+    // never match there.
     let short_name = target.short_name();
     if member.starts_with("@@") {
         let owner = short_name.strip_suffix(&format!(".{member}"))?;

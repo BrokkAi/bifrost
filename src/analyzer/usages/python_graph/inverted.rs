@@ -30,7 +30,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
@@ -54,8 +54,15 @@ where
     let language = tree_sitter_python::LANGUAGE.into();
     let mut targets_by_terminal: HashMap<String, Vec<String>> = HashMap::default();
     for target in targets {
+        // Python fqns are dotted module paths with no other delimiter (per the
+        // module doc comment above), so re-tokenizing with the shared structured
+        // splitter and taking the terminal segment reproduces
+        // `rsplit('.').next()`'s terminal split exactly.
+        let terminal = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, target)
+            .pop()
+            .unwrap_or_else(|| target.clone());
         targets_by_terminal
-            .entry(target.rsplit('.').next().unwrap_or(target).to_string())
+            .entry(terminal)
             .or_default()
             .push(target.clone());
     }

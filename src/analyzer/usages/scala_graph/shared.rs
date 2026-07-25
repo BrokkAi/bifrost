@@ -512,6 +512,19 @@ impl ScalaQueryTargetCatalog {
     }
 }
 
+/// The final `.`-joined segment of a Scala `short_name` (a package-less name
+/// that may still carry an owner-chain prefix, e.g. `Outer.inner`). Scala
+/// identifiers never contain a literal `.`, so re-tokenizing with the shared
+/// structured splitter and taking the last segment reproduces
+/// `short_name.rsplit('.').next()`'s terminal-segment split exactly, for any
+/// unit kind (function, field, type, or type alias) — unlike `identifier()`,
+/// this never additionally trims a `$` nesting marker.
+pub(super) fn scala_short_name_terminal_segment(short_name: &str) -> String {
+    crate::analyzer::symbol_lookup::parse_symbol_path(Language::Scala, short_name)
+        .pop()
+        .unwrap_or_else(|| short_name.to_string())
+}
+
 fn exact_descendants_including_self(
     direct_descendants: &HashMap<CodeUnit, Vec<CodeUnit>>,
     owner: &CodeUnit,
@@ -760,12 +773,13 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                 }
                 continue;
             }
-            let local_name = import
-                .identifier
-                .as_deref()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
-            let original_name = path.rsplit('.').next().unwrap_or(&path);
-            if name != local_name && name != original_name {
+            // `ImportInfo::local_name` is the shared `alias ?? identifier ??
+            // tail-of-structured-path` desugar; scala's `identifier` is already
+            // alias-resolved at construction, so this agrees with the old
+            // `identifier ?? terminal-of(path)` fallback exactly.
+            let local_name = import.local_name();
+            let original_name = scala_short_name_terminal_segment(&path);
+            if Some(name) != local_name && name != original_name {
                 continue;
             }
             for candidate in candidates {

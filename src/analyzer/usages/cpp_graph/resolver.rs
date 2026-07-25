@@ -3073,9 +3073,11 @@ impl VisibilityIndex {
     ) -> Vec<&'b CodeUnit> {
         self.visible_identifier_candidates(file, name)
             .filter(|unit| {
-                unit.fq_name()
-                    .rsplit_once('.')
-                    .is_some_and(|(parent, _)| parent == owner.fq_name())
+                // Structured owner pop on the unit's own `fq()` (shared with
+                // `IAnalyzer::parent_of`), not a re-split of its rendered fqn
+                // string.
+                crate::analyzer::default_parent_fq_name(unit)
+                    .is_some_and(|parent| parent == owner.fq_name())
             })
             .collect()
     }
@@ -3182,15 +3184,24 @@ impl VisibilityIndex {
         kind: TargetKind,
     ) -> Vec<&'b CodeUnit> {
         if normalized.contains("::") {
-            let Some(identifier) = normalized
-                .rsplit("::")
-                .find(|component| !component.is_empty())
-            else {
+            // `normalized` comes from `normalize_cpp_reference_text`, which
+            // truncates at the first `(`/`{`/`<`, leaving a plain `::`-joined
+            // qualified-id with no embedded `.`/`/`/`\` and operator tokens
+            // kept intact by the shared splitter's operator merge — the same
+            // domain `cpp_reference_fqn_candidates` below already parses with
+            // the shared splitter. Re-tokenizing and taking the last segment
+            // reproduces `rsplit("::").find(non-empty)`'s terminal-component
+            // scan exactly.
+            let Some(identifier) = crate::analyzer::symbol_lookup::parse_symbol_path(
+                crate::analyzer::Language::Cpp,
+                normalized,
+            )
+            .pop() else {
                 return Vec::new();
             };
             let fqns = cpp_reference_fqn_candidates(normalized, kind);
             return self
-                .visible_identifier_candidates(file, identifier)
+                .visible_identifier_candidates(file, &identifier)
                 .filter(|unit| {
                     #[cfg(test)]
                     self.qualified_candidate_inspections
@@ -3451,10 +3462,13 @@ pub(in crate::analyzer::usages) fn cpp_reference_fqn_candidates(
     reference: &str,
     kind: TargetKind,
 ) -> Vec<String> {
-    let parts = reference
-        .split("::")
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    // Same domain as `candidate_units` above: `reference` is a plain
+    // `::`-joined qualified-id with operator tokens kept intact by the shared
+    // splitter's operator merge.
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        reference,
+    );
     if parts.is_empty() {
         return Vec::new();
     }
@@ -3577,14 +3591,32 @@ fn resolve_static_method_call_return_binding(
         return None;
     }
     let qualified = normalize_cpp_reference_text(node_text(function, source));
-    let (owner_text, member_name) = qualified.rsplit_once("::").or_else(|| {
-        let scope = function.child_by_field_name("scope")?;
-        let name = function.child_by_field_name("name")?;
-        Some((node_text(scope, source), node_text(name, source)))
-    })?;
-    let owner = visibility.resolve_type(file, owner_text)?;
+    // A C++ qualified-id is `::`-joined with no embedded delimiters in any
+    // single component (the shared splitter's operator-token merge keeps
+    // `operator+`-style names intact), so re-tokenizing with the shared
+    // structured splitter and peeling the terminal segment reproduces
+    // `rsplit_once("::")`'s (owner, member) split exactly — same shape as
+    // `cpp_out_of_line_function_owner`'s `qualified` split above.
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &qualified,
+    );
+    let (owner_text, member_name) = match parts.split_last() {
+        Some((member, owner_parts)) if !owner_parts.is_empty() => {
+            (owner_parts.join("::"), member.clone())
+        }
+        _ => {
+            let scope = function.child_by_field_name("scope")?;
+            let name = function.child_by_field_name("name")?;
+            (
+                node_text(scope, source).to_string(),
+                node_text(name, source).to_string(),
+            )
+        }
+    };
+    let owner = visibility.resolve_type(file, &owner_text)?;
     let candidates = visibility
-        .visible_members_for_owner_name(file, &owner, member_name)
+        .visible_members_for_owner_name(file, &owner, &member_name)
         .into_iter()
         .filter(|unit| unit.is_function() && cpp_callable_arity(analyzer, unit).accepts(arity))
         .cloned()
@@ -6382,6 +6414,16 @@ pub(in crate::analyzer::usages) fn cpp_name_for(unit: &CodeUnit) -> String {
     }
 }
 
+// fqname-M4: the second stage splits on the individual chars '.', '-', '>'
+// (not the substring "->"), which deliberately reduces an `operator->`-style
+// terminal segment to an empty tail rather than keeping it intact; the shared
+// structured splitter's cpp operator-token merge would keep `operator->`
+// whole instead, changing this function's result — `name_matches_callable`'s
+// `expected.starts_with("operator")` fallback exists specifically to
+// compensate for that reduction, and a pinned regression test
+// (`operator-> must not be reduced with terminal_name-style punctuation
+// splitting`) asserts today's char-class behavior. Not equivalence-provable;
+// revisit alongside that pinned test if it is ever relaxed.
 pub(super) fn terminal_name(value: &str) -> &str {
     value
         .rsplit("::")
@@ -6569,6 +6611,15 @@ fn cpp_strip_leading_template_clause(text: &str) -> &str {
 }
 
 pub(super) fn cpp_namespace_for(unit: &CodeUnit) -> Option<String> {
+    // fqname-M4: `cpp_name_for` is a bespoke all-`::` rendering of the unit's
+    // name (it replaces every `.`/`$` in `short_name` with `::`), which is NOT
+    // the same string `default_parent_fq_name`/`fq().parent()` would render:
+    // the structured `FqName`'s native cpp display deliberately keeps `.` (not
+    // `::`) between a trailing `Package` segment and a following `Type`
+    // segment (see `separator` in `fq_name.rs`, landed for issue #1163), so
+    // popping the unit's own `fq()` segment would NOT reproduce this
+    // fully-`::`-joined string. Left as a split on the locally-built
+    // all-colon string rather than the unit's structured name.
     cpp_name_for(unit).rsplit_once("::").map(|(namespace, _)| {
         namespace
             .strip_prefix("anonymous_namespace::")
@@ -6577,12 +6628,20 @@ pub(super) fn cpp_namespace_for(unit: &CodeUnit) -> Option<String> {
     })
 }
 
-fn namespace_prefixes(namespace: &str) -> Vec<&str> {
+fn namespace_prefixes(namespace: &str) -> Vec<String> {
+    // `namespace` is built by `cpp_name_for`/`cpp_namespace_for` with every
+    // non-`::` separator already converted to `::`, so re-tokenizing it with
+    // the shared structured splitter and progressively popping the last
+    // component reproduces the `rsplit_once("::")` outward walk exactly (same
+    // shape as `cpp_qualifier_lookup_tiers`'s namespace-chain walk).
+    let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        namespace,
+    );
     let mut prefixes = Vec::new();
-    let mut current = Some(namespace);
-    while let Some(prefix) = current {
-        prefixes.push(prefix);
-        current = prefix.rsplit_once("::").map(|(parent, _)| parent);
+    while !parts.is_empty() {
+        prefixes.push(parts.join("::"));
+        parts.pop();
     }
     prefixes
 }
@@ -6648,6 +6707,11 @@ fn precise_parent_resolution(
         });
     }
     let fallback = analyzer.parent_of(code_unit);
+    // fqname-M4: `owner_name` is used both bare (passed standalone to the
+    // owner-resolution calls below) and manually recombined with
+    // `package_name()` a few lines down, so this needs the package-less
+    // `short_name` owner specifically; `default_parent_fq_name`/`fq.parent()`
+    // would render the package-qualified owner instead, changing both uses.
     let Some(owner_name) = code_unit
         .short_name()
         .rsplit_once('.')
@@ -6978,6 +7042,10 @@ pub(super) fn visible_owner_from_member_name(
     ctx: &ScanCtx<'_>,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
+    // fqname-M4: `owner_name` is used both bare and manually recombined with
+    // `package_name()` below (same package-less short_name owner shape as
+    // `precise_parent_resolution` above); `default_parent_fq_name` would
+    // render the package-qualified owner instead, changing both uses.
     let owner_name = code_unit
         .short_name()
         .rsplit_once('.')

@@ -2077,6 +2077,11 @@ fn definition_name_candidates(function: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Stri
     if !raw.contains("::") {
         return vec![format!("{namespace}::{raw}")];
     }
+    // fqname-M4: peeks at the raw first `::`-split token, including the empty
+    // token a leading-`::` absolute reference (`::Foo::Bar`) produces (same
+    // shape as rust's `rust_reference_looks_external`); the shared structured
+    // splitter filters empty segments, which would shift "which token is
+    // first" for that one lead-`::` shape and is not proven equivalent here.
     if raw
         .split("::")
         .next()
@@ -3206,7 +3211,14 @@ fn indexed_enclosing_owner_scope(
         analyzer.parent_of(unit)
     })
     .find(|unit| is_indexed_class_owner(analyzer, unit))?;
-    Some(cpp_name_for(&owner).split("::").map(String::from).collect())
+    // `cpp_name_for` converts every `.`/`$` in the unit's name to `::` before
+    // this call, so it is already a pure `::`-joined string (same guarantee
+    // `namespace_prefixes` relies on); the shared structured splitter's
+    // segments are the `::`-delimited components exactly.
+    Some(crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(&owner),
+    ))
 }
 
 pub(in crate::analyzer::usages) fn resolve_type_node_lexically(

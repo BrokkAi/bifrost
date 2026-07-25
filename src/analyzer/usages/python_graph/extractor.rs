@@ -1792,6 +1792,10 @@ fn collect_scope_facts_with_factory_returns(
         let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
+        // fqname-M4: package-less short_name owner, matched below against
+        // `class_facts_by_name` keys built from `short_name()`; `fq.parent()`
+        // (`default_parent_fq_name`) would render the package-qualified owner,
+        // a different string that would never hit in that map.
         let owner = declaration
             .short_name()
             .rsplit_once('.')
