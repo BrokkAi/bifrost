@@ -45,8 +45,11 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 09:23Z) Added the nested semantic limit and work contracts plus stable workspace, capability, partial-analysis, budget, provider, and no-procedure diagnostic codes across ordinary results, profiles, and policy completion projection.
 - [x] (2026-07-25 11:58Z) Implemented the request-scoped CFG query adapter with cached semantic outcomes, lazy semantic budgets, capability/partial/provider diagnostics, cancellation propagation, stable source-backed identities, and typed provenance.
 - [x] (2026-07-25 11:58Z) Integrated the CFG algebra with ordinary execution, explain/profile accounting, compact/full rendering, typed evidence, and analyzer-only workspace diagnostics.
-- [ ] Update the Python client, LSP/VS Code client, TextMate grammar, public docs, and executable examples.
-- [ ] Run the remaining client/documentation tests and the full `nlp,python` test gate; record results here. Core Rust formatting, all-target/all-feature clippy, structural search/profile/public API tests, and all 114 CodeQuery pipeline tests pass.
+- [x] (2026-07-25 12:28Z) Ran the requested branch-versus-`origin/master` guided review after the core Rust checkpoint and triaged eleven confirmed findings across correctness, resource bounds, public identity, profiling/explain output, schema metadata, and architecture.
+- [ ] Correct the reviewed semantic execution defects: one-way enclosing-procedure selection, character-based public ranges, bounded and cancellable materialization/traversal, branch-aware diagnostics, accurate per-operator work, stable content-scoped public IDs, and semantic policy hard caps.
+- [ ] Complete Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
+- [ ] Complete Milestone 5 by updating MCP, Python, LSP/VS Code, TextMate grammar, public docs, executable examples, and their behavior-focused tests for schema version 3.
+- [ ] Complete Milestone 6 by reconciling the umbrella roadmap, running the remaining client/documentation tests and the full `nlp,python` release gate, then performing the final guided review.
 
 ## Surprises & Discoveries
 
@@ -79,6 +82,18 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: On macOS, compiling the `python` feature's `cdylib` test artifact requires the Python-wheel job's dynamic symbol lookup linker flags; merely selecting the system Python does not provide those symbols.
   Evidence: `cargo test --tests --features nlp,python --no-run` reached the final library link and failed on unresolved `Py*` symbols. Repeating it with CI's `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'` completed every library, binary, and integration-test executable.
+
+- Observation: The core checkpoint changed the compatible default to schema version 3 before every public consumer was updated.
+  Evidence: `cargo test --lib mcp_extended::tests::query_code_schema_exposes_typed_pipeline_steps -- --exact` fails because the MCP contract test still expects only version-2 pipeline operations; the Python and VS Code result unions likewise reject or omit the three new result domains.
+
+- Observation: The shared definition-range helper deliberately accepts containment in both directions, but structural `procedure_of` needs only procedures that contain the structural match.
+  Evidence: A class match containing methods can otherwise select its shortest nested method even though that method does not enclose the class.
+
+- Observation: Semantic source positions expose UTF-8 byte columns while CodeQuery's public range contract uses character columns.
+  Evidence: The first implementation copied `SourcePosition::byte_column()` into `CodeQueryRange`; existing structural results convert byte offsets through the source snapshot.
+
+- Observation: A small terminal result limit does not bound semantic artifact retention or intermediate procedure/edge enumeration.
+  Evidence: Materialization can retain every semantic dimension before pipeline truncation, and the first `procedure_of` path repeatedly enumerates all artifact procedures without charging that lookup or checking cancellation.
 
 ## Decision Log
 
@@ -129,6 +144,10 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - Decision: Semantic result evidence serializes compact typed `proof` and `completeness` enums plus separate optional reason strings.
   Rationale: The common proven/complete case stays easy to read as `"proof": "proven", "completeness": "complete"`, while unproven or partial rows preserve their diagnostic reason without requiring clients to parse prose or a differently shaped enum payload.
   Date/Author: 2026-07-25 / Codex
+
+- Decision: Treat all eleven confirmed guided-review findings as required work in this ExecPlan rather than deferring medium or low findings.
+  Rationale: The user explicitly requested that every finding be fixed and that implementation continue until this first #824 slice is complete. Several findings affect the public shape that later clients and analysis domains would otherwise copy.
+  Date/Author: 2026-07-25 / User and Codex
 
 ## Outcomes & Retrospective
 
@@ -491,3 +510,5 @@ Do not add an external dependency. Do not add regex, substring, delimiter-scanni
 Revision note (2026-07-25 / Codex): Created the issue-specific ExecPlan after live issue and codebase diagnosis. The plan resolves the live issue's explicit `control_edge` requirement against the older umbrella plan, preserves pinned schema version 2, and limits the first implementation to real procedure-local CFG services.
 
 Revision note (2026-07-25 / Codex): Recorded implementation approval, milestone checkpoint commits, frequent `origin/master` synchronization, and guided-review gates before source changes begin.
+
+Revision note (2026-07-25 / Codex): Added the post-core guided-review findings as required corrective checkpoints, split the remaining client, planning/profile, architecture, and release work into restartable progress entries, and recorded the concrete contract and execution failures that must be fixed before the public schema rollout.
