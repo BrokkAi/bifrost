@@ -195,6 +195,7 @@ pub fn collect_summary_findings_with_limits(
     let analysis_complete = typestate_result.is_complete();
     let mut violations = HashMap::<ViolationKey, ViolationAggregate>::default();
     let mut non_violations = HashSet::<EventOutcomeKey>::default();
+    let mut violation_outcome_counts = HashMap::<EventOutcomeKey, usize>::default();
     let mut event_terminals: Vec<Option<ObservationAggregate>> =
         vec![None; bindings.terminal_bindings().len()];
     let mut needed_states = HashSet::<StateKey>::default();
@@ -245,6 +246,15 @@ pub fn collect_summary_findings_with_limits(
                 );
             } else {
                 charge_candidate(&mut retained_candidates, limits.max_candidates)?;
+                let event_key = EventOutcomeKey {
+                    point: key.point.clone(),
+                    subject,
+                    binding: violation.event_binding(),
+                };
+                violation_outcome_counts
+                    .entry(event_key)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
                 violations.insert(
                     key,
                     ViolationAggregate::new(
@@ -335,16 +345,18 @@ pub fn collect_summary_findings_with_limits(
         let binding = bindings
             .event_binding(key.binding)
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        let has_non_violation = non_violations.contains(&EventOutcomeKey {
+        let event_key = EventOutcomeKey {
             point: key.point.clone(),
             subject: key.subject,
             binding: key.binding,
-        });
+        };
+        let has_competing_outcome = non_violations.contains(&event_key)
+            || violation_outcome_counts.get(&event_key).copied() != Some(1);
         let certainty = error_transition_certainty(
             protocol.semantics().analysis_mode,
             analysis_complete,
             &aggregate,
-            has_non_violation,
+            has_competing_outcome,
         );
         findings.push(TypestateFinding {
             subject: key.subject,
@@ -546,7 +558,7 @@ fn error_transition_certainty(
     mode: ProtocolAnalysisMode,
     analysis_complete: bool,
     aggregate: &ViolationAggregate,
-    has_non_violation: bool,
+    has_competing_outcome: bool,
 ) -> TypestateFindingCertainty {
     match mode {
         ProtocolAnalysisMode::May if aggregate.has_definite_proven_path => {
@@ -555,7 +567,7 @@ fn error_transition_certainty(
         ProtocolAnalysisMode::Must
             if analysis_complete
                 && aggregate.has_definite_proven_complete_path
-                && !has_non_violation =>
+                && !has_competing_outcome =>
         {
             TypestateFindingCertainty::Must
         }
@@ -719,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn must_evidence_requires_complete_paths_and_no_safe_outcome() {
+    fn must_evidence_requires_complete_paths_and_one_exact_outcome() {
         let paths = PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE);
         let aggregate = ViolationAggregate::new(paths, TypestateUncertaintySet::default(), false);
 

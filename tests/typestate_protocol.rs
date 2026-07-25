@@ -409,6 +409,43 @@ fn uncertainty_behaviors_compile_to_bounded_state_relations() {
 }
 
 #[test]
+fn all_uncertainty_behaviors_reject_foreign_event_ids() {
+    let protocol = fixture().compile().expect("fixture should compile");
+    let mut foreign_spec = fixture();
+    foreign_spec.events.push(ProtocolEventSpec {
+        id: "zz-foreign".to_owned(),
+        observation: ProtocolObservationSpec {
+            occurrence: ProtocolEventOccurrence::FieldRead,
+        },
+    });
+    let foreign_protocol = foreign_spec
+        .compile()
+        .expect("foreign fixture should compile");
+    let foreign_event = foreign_protocol
+        .event_id(&ProtocolEventKey::new("zz-foreign").unwrap())
+        .expect("foreign event");
+    let open = protocol
+        .state_id(&ProtocolStateKey::new("open").unwrap())
+        .unwrap();
+
+    for cause in [
+        ProtocolUncertaintyCause::ExternalCall,
+        ProtocolUncertaintyCause::Escape,
+    ] {
+        assert_eq!(
+            protocol.resolve_uncertainty(
+                cause,
+                open,
+                ProtocolObjectCardinality::Singleton,
+                &[foreign_event],
+            ),
+            None,
+            "{cause:?} accepted an event ID from another protocol"
+        );
+    }
+}
+
+#[test]
 fn guard_normalization_is_bounded_by_the_cardinality_domain() {
     let mut spec = fixture();
     spec.transitions[0].guard = ProtocolGuardSpec::ObjectCardinality {

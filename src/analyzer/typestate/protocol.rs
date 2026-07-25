@@ -670,11 +670,14 @@ impl CompiledProtocol {
         cause: ProtocolUncertaintyCause,
         state: ProtocolStateId,
         cardinality: ProtocolObjectCardinality,
-        eligible_events: impl ExactSizeIterator<Item = ProtocolEventId>,
+        eligible_events: impl ExactSizeIterator<Item = ProtocolEventId> + Clone,
     ) -> Option<ProtocolUncertaintyResolution> {
         self.state_keys.get(state.index())?;
         if eligible_events.len() > MAX_PROTOCOL_EVENTS {
             return None;
+        }
+        for event in eligible_events.clone() {
+            self.events.get(event.index())?;
         }
         match self.semantics.uncertainty.behavior(cause) {
             ProtocolUncertaintyBehavior::PreserveUncertainty => {
@@ -684,7 +687,6 @@ impl CompiledProtocol {
             ProtocolUncertaintyBehavior::ConservativeTransition => {
                 let mut eligible = vec![false; self.events.len()];
                 for event in eligible_events {
-                    self.events.get(event.index())?;
                     eligible[event.index()] = true;
                 }
                 let transitive = cause != ProtocolUncertaintyCause::AmbiguousDispatch;
