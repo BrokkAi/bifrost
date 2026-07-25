@@ -953,10 +953,16 @@ fn php_direct_member_owner_fqns(
 }
 
 fn php_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
-    let Some((namespace, _)) = fqn.rsplit_once('.') else {
-        return !php_workspace_exact_namespace_exists(support, "");
-    };
-    !php_workspace_exact_namespace_exists(support, namespace)
+    // `fqn` is already a resolved, `.`-joined PHP fqn (namespace segments are
+    // `.`-joined; a nested type's `$` boundary, if present, is untouched by
+    // this splitter's delimiter set, exactly like the string `rsplit_once`
+    // it replaces). Re-tokenizing with the shared structured splitter and
+    // rejoining every part but the last with `.` reproduces
+    // `rsplit_once('.')`'s (namespace, _) split exactly, including the
+    // no-dot case (an empty namespace, which the exists-check always rejects).
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Php, fqn);
+    let namespace = segments[..segments.len().saturating_sub(1)].join(".");
+    !php_workspace_exact_namespace_exists(support, &namespace)
 }
 
 fn php_workspace_exact_namespace_exists(

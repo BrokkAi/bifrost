@@ -2,7 +2,7 @@ mod inverted;
 pub(in crate::analyzer::usages) mod local;
 pub(crate) mod namespace;
 mod resolver;
-mod shared;
+pub(crate) mod shared;
 pub(super) mod syntax;
 
 use crate::analyzer::usages::common::language_for_target;

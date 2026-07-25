@@ -139,12 +139,14 @@ pub(crate) fn scala_nested_type_candidates(
 }
 
 pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
-    unit.short_name()
-        .rsplit('.')
-        .next()
-        .unwrap_or(unit.short_name())
-        .trim_end_matches('$')
-        .to_string()
+    // Reuses the shared terminal-segment splitter (see its doc comment):
+    // Scala identifiers never contain a literal `.`, so this reproduces
+    // `short_name.rsplit('.').next()`'s terminal split exactly.
+    crate::analyzer::usages::scala_graph::shared::scala_short_name_terminal_segment(
+        unit.short_name(),
+    )
+    .trim_end_matches('$')
+    .to_string()
 }
 
 #[derive(Debug, Clone)]

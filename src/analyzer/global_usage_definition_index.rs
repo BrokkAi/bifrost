@@ -355,13 +355,27 @@ impl GlobalUsageDefinitionIndex {
                 .or_default()
                 .push(unit.clone());
         }
+        // fqname-M4: intentionally NOT `default_parent_fq_name` (a true segment
+        // pop). Verified by mutation (issue #1168 batch 3): switching to the
+        // segment pop regresses `usage_graph_csharp_test::
+        // csharp_issue701_structured_expression_type_roots_have_inverted_graph_parity`.
+        // The pop is *more* structurally correct for a `$`-nested C# type --
+        // `Demo.InheritedOuter$Nested`'s immediate owner is `Demo.InheritedOuter`,
+        // not `Demo` -- but this index's `direct_children_by_fqn`/
+        // `direct_children_by_normalized_fqn` are relied upon elsewhere to key
+        // nested types under their NAMESPACE (the naive rightmost-`.` cut,
+        // which skips over a `$` boundary) for csharp's using-namespace nested-
+        // type visibility resolution; switching to the immediate-owner cut is
+        // a real behavior change there, not merely a representation change.
+        // Revisit together with that consumer if this file is touched again.
         if let Some((parent_fqn, _)) = fqn.rsplit_once('.') {
+            let parent_fqn = parent_fqn.to_string();
             self.direct_children_by_fqn
-                .entry(parent_fqn.to_string())
+                .entry(parent_fqn.clone())
                 .or_default()
                 .push(unit.clone());
             self.direct_children_by_normalized_fqn
-                .entry(normalize(parent_fqn))
+                .entry(normalize(&parent_fqn))
                 .or_default()
                 .push(unit.clone());
         }
