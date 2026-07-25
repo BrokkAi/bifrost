@@ -159,7 +159,7 @@ fn receiver_steps_parse_canonically_and_validate_capture_domains() {
             capture: Some("service".to_string()),
         })
     );
-    assert_eq!(query.to_canonical_json()["schema_version"], 2);
+    assert_eq!(query.to_canonical_json()["schema_version"], SCHEMA_VERSION);
 
     let rql = CodeQuery::from_sexp(
         r#"(file-of (receiver-targets :capture service (call :receiver (capture "service"))))"#,
@@ -371,7 +371,7 @@ fn parses_and_rejects_schema_version() {
         "schema_version": 2,
         "match": { "kind": "call" }
     }));
-    assert_eq!(query.schema_version, SCHEMA_VERSION);
+    assert_eq!(query.schema_version, 2);
     assert_eq!(query.to_canonical_json()["schema_version"], 2);
 
     let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
@@ -382,6 +382,149 @@ fn parses_and_rejects_schema_version() {
         "match": { "kind": "call" }
     }));
     assert_eq!(error.path, "schema_version");
+}
+
+#[test]
+fn schema_version_three_adds_the_typed_cfg_algebra() {
+    let query = parse_ok(json!({
+        "schema_version": 3,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "cfg_entry" },
+            { "op": "cfg_successor_edges" },
+            { "op": "cfg_edge_target" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::CfgEntry,
+            QueryStep::CfgSuccessorEdges,
+            QueryStep::CfgEdgeTarget,
+        ]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::ProgramPoint
+    );
+
+    let rql = CodeQuery::from_sexp(
+        "(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function)))))",
+    )
+    .expect("version-three CFG RQL should lower");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+
+    let error = error_of(json!({
+        "schema_version": 2,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }]
+    }));
+    assert_eq!(error.path, "steps[0].op");
+    assert!(error.message.contains("requires schema version 3"));
+}
+
+#[test]
+fn typed_cfg_algebra_validates_each_domain_transition() {
+    for (steps, expected) in [
+        (
+            vec![json!({ "op": "procedure_of" })],
+            QueryValueKind::Procedure,
+        ),
+        (
+            vec![
+                json!({ "op": "procedure_of" }),
+                json!({ "op": "cfg_exits" }),
+            ],
+            QueryValueKind::ProgramPoint,
+        ),
+        (
+            vec![
+                json!({ "op": "procedure_of" }),
+                json!({ "op": "cfg_entry" }),
+                json!({ "op": "cfg_predecessor_edges" }),
+            ],
+            QueryValueKind::ControlEdge,
+        ),
+        (
+            vec![
+                json!({ "op": "procedure_of" }),
+                json!({ "op": "cfg_entry" }),
+                json!({ "op": "cfg_successor_edges" }),
+                json!({ "op": "cfg_edge_source" }),
+                json!({ "op": "file_of" }),
+            ],
+            QueryValueKind::File,
+        ),
+    ] {
+        let query = parse_ok(json!({
+            "schema_version": 3,
+            "match": { "kind": "function" },
+            "steps": steps
+        }));
+        assert_eq!(query.validate_steps().unwrap(), expected);
+    }
+
+    let error = error_of(json!({
+        "schema_version": 3,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "cfg_successor_edges" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1]");
+    assert!(error.message.contains("program_point"));
+    assert!(error.message.contains("procedure"));
+
+    let error = error_of(json!({
+        "schema_version": 3,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "cfg_entry" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1]");
+    assert!(error.message.contains("requires procedure"));
+    assert!(error.message.contains("declaration"));
+}
+
+#[test]
+fn typed_cfg_set_branches_must_have_compatible_domains() {
+    let query = parse_ok(json!({
+        "schema_version": 3,
+        "union": [
+            {
+                "match": { "kind": "function", "name": "left" },
+                "steps": [{ "op": "procedure_of" }]
+            },
+            {
+                "match": { "kind": "function", "name": "right" },
+                "steps": [{ "op": "procedure_of" }]
+            }
+        ],
+        "steps": [{ "op": "cfg_entry" }]
+    }));
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::ProgramPoint
+    );
+
+    let error = error_of(json!({
+        "schema_version": 3,
+        "union": [
+            {
+                "match": { "kind": "function" },
+                "steps": [{ "op": "procedure_of" }]
+            },
+            { "match": { "kind": "function" } }
+        ]
+    }));
+    assert_eq!(error.path, "union[1]");
+    assert!(error.message.contains("structural_match"));
+    assert!(error.message.contains("procedure"));
 }
 
 #[test]

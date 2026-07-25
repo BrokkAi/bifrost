@@ -413,6 +413,16 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.ranges(code_unit)
     }
 
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
+        self.inner
+            .ranges_with_limit(code_unit, max_ranges, cancellation)
+    }
+
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         self.inner.compute_cognitive_complexities(file)
     }

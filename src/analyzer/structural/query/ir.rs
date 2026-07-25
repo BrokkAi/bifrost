@@ -23,12 +23,15 @@ pub const MAX_QUERY_STEPS: usize = 16;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
     StructuralMatch,
     Declaration,
+    Procedure,
+    ProgramPoint,
+    ControlEdge,
     ReferenceSite,
     CallSite,
     ExpressionSite,
@@ -41,6 +44,9 @@ impl QueryValueKind {
         match self {
             Self::StructuralMatch => "structural_match",
             Self::Declaration => "declaration",
+            Self::Procedure => "procedure",
+            Self::ProgramPoint => "program_point",
+            Self::ControlEdge => "control_edge",
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
@@ -99,6 +105,13 @@ pub enum HierarchyTraversal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryStep {
     EnclosingDecl,
+    ProcedureOf,
+    CfgEntry,
+    CfgExits,
+    CfgSuccessorEdges,
+    CfgPredecessorEdges,
+    CfgEdgeSource,
+    CfgEdgeTarget,
     FileOf,
     ImportsOf,
     ImportersOf,
@@ -127,6 +140,13 @@ impl QueryStep {
     pub fn op(&self) -> QueryStepOp {
         match self {
             Self::EnclosingDecl => QueryStepOp::EnclosingDecl,
+            Self::ProcedureOf => QueryStepOp::ProcedureOf,
+            Self::CfgEntry => QueryStepOp::CfgEntry,
+            Self::CfgExits => QueryStepOp::CfgExits,
+            Self::CfgSuccessorEdges => QueryStepOp::CfgSuccessorEdges,
+            Self::CfgPredecessorEdges => QueryStepOp::CfgPredecessorEdges,
+            Self::CfgEdgeSource => QueryStepOp::CfgEdgeSource,
+            Self::CfgEdgeTarget => QueryStepOp::CfgEdgeTarget,
             Self::FileOf => QueryStepOp::FileOf,
             Self::ImportsOf => QueryStepOp::ImportsOf,
             Self::ImportersOf => QueryStepOp::ImportersOf,
@@ -151,6 +171,13 @@ impl QueryStep {
     pub fn from_label(label: &str) -> Option<Self> {
         match QueryStepOp::from_label(label)? {
             QueryStepOp::EnclosingDecl => Some(Self::EnclosingDecl),
+            QueryStepOp::ProcedureOf => Some(Self::ProcedureOf),
+            QueryStepOp::CfgEntry => Some(Self::CfgEntry),
+            QueryStepOp::CfgExits => Some(Self::CfgExits),
+            QueryStepOp::CfgSuccessorEdges => Some(Self::CfgSuccessorEdges),
+            QueryStepOp::CfgPredecessorEdges => Some(Self::CfgPredecessorEdges),
+            QueryStepOp::CfgEdgeSource => Some(Self::CfgEdgeSource),
+            QueryStepOp::CfgEdgeTarget => Some(Self::CfgEdgeTarget),
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -185,10 +212,25 @@ impl QueryStep {
             (Self::EnclosingDecl, QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::Declaration)
             }
+            (Self::ProcedureOf, QueryValueKind::StructuralMatch | QueryValueKind::Declaration) => {
+                Some(QueryValueKind::Procedure)
+            }
+            (Self::CfgEntry | Self::CfgExits, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::ProgramPoint)
+            }
+            (Self::CfgSuccessorEdges | Self::CfgPredecessorEdges, QueryValueKind::ProgramPoint) => {
+                Some(QueryValueKind::ControlEdge)
+            }
+            (Self::CfgEdgeSource | Self::CfgEdgeTarget, QueryValueKind::ControlEdge) => {
+                Some(QueryValueKind::ProgramPoint)
+            }
             (
                 Self::FileOf,
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::Declaration
+                | QueryValueKind::Procedure
+                | QueryValueKind::ProgramPoint
+                | QueryValueKind::ControlEdge
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
@@ -240,6 +282,7 @@ pub(super) fn validate_query_steps(
     steps: &[QueryStep],
     input: QueryValueKind,
     path: &str,
+    schema_version: u64,
 ) -> Result<QueryValueKind, QueryError> {
     if steps.len() > MAX_QUERY_STEPS {
         return Err(QueryError::new(
@@ -250,10 +293,25 @@ pub(super) fn validate_query_steps(
 
     let mut value_kind = input;
     for (index, step) in steps.iter().enumerate() {
+        let step_path = format!("{path}[{index}]");
+        let minimum_schema_version = step.op().minimum_schema_version();
+        if schema_version < minimum_schema_version {
+            return Err(QueryError::new(
+                format!("{step_path}.op"),
+                format!(
+                    "query step {} requires schema version {minimum_schema_version}, but this query uses schema version {schema_version}",
+                    step.label()
+                ),
+            ));
+        }
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
+            QueryStep::ProcedureOf => "structural_match or declaration",
+            QueryStep::CfgEntry | QueryStep::CfgExits => "procedure",
+            QueryStep::CfgSuccessorEdges | QueryStep::CfgPredecessorEdges => "program_point",
+            QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
             QueryStep::FileOf => {
-                "structural_match, declaration, reference_site, call_site, expression_site, or receiver_analysis"
+                "structural_match, declaration, procedure, program_point, control_edge, reference_site, call_site, expression_site, or receiver_analysis"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -274,7 +332,7 @@ pub(super) fn validate_query_steps(
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
-                format!("{path}[{index}]"),
+                step_path,
                 format!(
                     "step {} requires {expected_input}, but the previous stage produces {}",
                     step.label(),
@@ -397,7 +455,7 @@ impl CodeQuery {
     /// rely solely on decoder validation.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
         let mut nodes = 0;
-        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| domain.kind)
+        validate_plan(&self.plan, "", 0, &mut nodes, self.schema_version).map(|domain| domain.kind)
     }
 }
 
@@ -412,6 +470,7 @@ fn validate_plan(
     path: &str,
     depth: usize,
     nodes: &mut usize,
+    schema_version: u64,
 ) -> Result<ValidatedDomain, QueryError> {
     if depth > MAX_QUERY_PLAN_DEPTH {
         return Err(QueryError::new(
@@ -449,7 +508,13 @@ fn validate_plan(
             let mut branch_domains = Vec::with_capacity(branches.len());
             for (index, branch) in branches.iter().enumerate() {
                 let branch_path = format!("{op_path}[{index}]");
-                branch_domains.push(validate_plan(branch, &branch_path, depth + 1, nodes)?);
+                branch_domains.push(validate_plan(
+                    branch,
+                    &branch_path,
+                    depth + 1,
+                    nodes,
+                    schema_version,
+                )?);
             }
             let expected = branch_domains[0].kind;
             for (index, branch) in branch_domains.iter().enumerate().skip(1) {
@@ -489,7 +554,7 @@ fn validate_plan(
     };
 
     let steps_path = child_query_path(path, "steps");
-    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path)?;
+    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path, schema_version)?;
     let mut input = domain.kind;
     for (index, step) in plan.steps.iter().enumerate() {
         let filter = match step {

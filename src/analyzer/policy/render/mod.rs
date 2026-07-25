@@ -638,7 +638,7 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        let note = "note: policy test.render inferred policy schema 1 and RQL schema 2\n";
+        let note = "note: policy test.render inferred policy schema 1 and RQL schema 3\n";
         assert!(output.starts_with(note));
         assert_eq!(output.matches(note).count(), 1);
         assert!(!output.contains("policy rule: test.render (Render)\n"));
