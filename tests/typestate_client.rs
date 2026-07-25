@@ -70,18 +70,20 @@ function lifecycle(): void {
 "#;
 
 const JAVA_CONFORMANCE_SOURCE: &str = r#"
+final class Resource {}
+
 final class LifecycleFixture {
-  static int acquire() {
-    return 1;
+  static Resource acquire() {
+    return null;
   }
 
-  static void use(int resource) {}
+  static void use(Resource resource) {}
 
-  static void close(int resource) {}
+  static void close(Resource resource) {}
 
   static void lifecycle() {
-    int resource = acquire();
-    int alias = resource;
+    Resource resource = acquire();
+    Resource alias = resource;
     use(alias);
     close(alias);
     return;
@@ -1268,8 +1270,16 @@ fn real_summary_solver_executes_the_same_client_contract() {
 }
 
 #[test]
-fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
+fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
     let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
+    spec.states.push("used".to_owned());
+    for transition in &mut spec.transitions {
+        if transition.from == "open" && transition.on == "use" {
+            transition.to = "used".to_owned();
+        } else if transition.from == "open" && transition.on == "close" {
+            transition.from = "used".to_owned();
+        }
+    }
     for event in &mut spec.events {
         if matches!(event.id.as_str(), "use" | "close") {
             event.observation.occurrence = ProtocolEventOccurrence::Endpoint {
@@ -1279,17 +1289,22 @@ fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
     }
     let protocol = spec.compile().unwrap();
     let expected_hash = protocol.hash();
+    let mut reference_outcome = None;
 
-    for (language, path, source) in [
+    // TypeScript still retains conservative unresolved-call coverage alongside
+    // these source-resolved helpers; Java proves the same ICFG complete.
+    for (language, path, source, expected_complete) in [
         (
             Language::TypeScript,
             "src/main.ts",
             TYPE_SCRIPT_CONFORMANCE_SOURCE,
+            false,
         ),
         (
             Language::Java,
             "src/LifecycleFixture.java",
             JAVA_CONFORMANCE_SOURCE,
+            true,
         ),
     ] {
         let project = InlineTestProject::with_language(language)
@@ -1408,16 +1423,69 @@ fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
         let closed = protocol
             .state_id(&ProtocolStateKey::new("closed").unwrap())
             .unwrap();
+        let exit_rows = summary.result().reached_at(&exit).collect::<Vec<_>>();
         assert!(
-            summary.result().reached_at(&exit).any(|reached| {
+            exit_rows.iter().any(|reached| {
                 summary
                     .result()
                     .fact(reached.fact())
                     .is_some_and(|fact| fact.protocol_state() == Some(closed))
             }),
-            "{language:?} summary solve did not carry the aliased lifecycle to closed: {:#?}",
-            summary.result().reached_at(&exit).collect::<Vec<_>>()
+            "{language:?} summary solve did not carry the pre-resolved lifecycle through use to closed: {exit_rows:#?}"
         );
+        assert!(
+            exit_rows.iter().all(|reached| {
+                summary
+                    .result()
+                    .fact(reached.fact())
+                    .is_none_or(|fact| fact.violation().is_none())
+            }),
+            "{language:?} lifecycle reached a protocol violation: {exit_rows:#?}"
+        );
+        assert!(summary.result().termination().is_fixed_point());
+        assert!(summary.bindings_complete());
+        assert_eq!(
+            summary.result().is_complete(),
+            expected_complete,
+            "{language:?} summary coverage changed"
+        );
+        assert_eq!(
+            summary.is_complete(),
+            expected_complete,
+            "{language:?} typestate completeness changed"
+        );
+
+        let mut state_outcomes = exit_rows
+            .iter()
+            .filter_map(|reached| {
+                let fact = summary.result().fact(reached.fact())?;
+                let state = fact.protocol_state()?;
+                let mut qualities = reached
+                    .path_qualities()
+                    .iter()
+                    .map(|quality| (quality.is_proven(), quality.is_complete()))
+                    .collect::<Vec<_>>();
+                qualities.sort_unstable();
+                Some((state, fact.uncertainty(), fact.abstained(), qualities))
+            })
+            .collect::<Vec<_>>();
+        state_outcomes.sort();
+        state_outcomes.dedup();
+        assert!(
+            state_outcomes
+                .iter()
+                .all(|(state, _, _, _)| *state == closed),
+            "{language:?} retained a non-closed exit state: {state_outcomes:#?}"
+        );
+        let outcome = state_outcomes;
+        if let Some(reference) = reference_outcome.as_ref() {
+            assert_eq!(
+                &outcome, reference,
+                "{language:?} lifecycle outcome diverged from the TypeScript reference"
+            );
+        } else {
+            reference_outcome = Some(outcome);
+        }
         assert_eq!(protocol.hash(), expected_hash);
     }
 }
