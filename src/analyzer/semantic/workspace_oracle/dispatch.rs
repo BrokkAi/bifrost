@@ -1574,7 +1574,7 @@ fn dispatch_outcome(
     })
 }
 
-fn procedures_for_definition(
+pub(crate) fn procedures_for_definition(
     analyzer: &dyn IAnalyzer,
     definition: &CodeUnit,
     artifact: &Arc<SemanticArtifact>,
@@ -1593,7 +1593,23 @@ fn procedures_for_definition(
         .iter()
         .filter(|procedure| procedure_matches_definition(procedure, definition))
         .collect::<Vec<_>>();
-    let mut exact = compatible
+    procedure_handles_for_ranges(artifact, compatible, &ranges)
+}
+
+pub(crate) fn procedures_for_source_ranges(
+    artifact: &Arc<SemanticArtifact>,
+    ranges: &[Range],
+) -> Vec<ProcedureHandle> {
+    procedure_handles_for_ranges(artifact, artifact.procedures().iter(), ranges)
+}
+
+fn procedure_handles_for_ranges<'a>(
+    artifact: &Arc<SemanticArtifact>,
+    candidates: impl IntoIterator<Item = &'a ProcedureSemantics>,
+    ranges: &[Range],
+) -> Vec<ProcedureHandle> {
+    let compatible = candidates.into_iter().collect::<Vec<_>>();
+    let mut matches = compatible
         .iter()
         .copied()
         .filter(|procedure| {
@@ -1604,8 +1620,8 @@ fn procedures_for_definition(
             })
         })
         .collect::<Vec<_>>();
-    if exact.is_empty() {
-        exact = compatible
+    if matches.is_empty() {
+        matches = compatible
             .into_iter()
             .filter(|procedure| {
                 let span = procedure.locator().anchor().span();
@@ -1618,8 +1634,8 @@ fn procedures_for_definition(
             })
             .collect();
     }
-    exact.sort_by(|left, right| left.locator().cmp(right.locator()));
-    exact
+    matches.sort_by(|left, right| left.locator().cmp(right.locator()));
+    matches
         .into_iter()
         .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
         .collect()

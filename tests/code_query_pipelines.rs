@@ -1,8 +1,8 @@
 mod common;
 
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResult, execute,
-    execute_with_limits, execute_workspace,
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResponse,
+    CodeQueryResult, execute, execute_with_limits, execute_workspace, execute_workspace_request,
 };
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use common::InlineTestProject;
@@ -5211,7 +5211,7 @@ fn invalid_programmatic_pipeline_is_diagnostic_not_panic() {
 }
 
 #[test]
-fn cfg_pipeline_is_incomplete_not_a_panic_before_semantic_execution_is_wired() {
+fn cfg_pipeline_resolves_a_source_backed_procedure() {
     let result = run(
         &[("src/main.rs", "fn target() {}\n")],
         json!({
@@ -5222,10 +5222,310 @@ fn cfg_pipeline_is_incomplete_not_a_panic_before_semantic_execution_is_wired() {
     );
     let value = serialized(&result);
 
+    assert_eq!(value["results"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["results"][0]["result_type"], "procedure");
+    assert_eq!(value["results"][0]["path"], "src/main.rs");
+    assert_eq!(value["results"][0]["procedure_kind"], "function");
+    assert_eq!(value["results"][0]["evidence"]["proof"], "proven");
+    assert_eq!(value["results"][0]["evidence"]["completeness"], "complete");
+    assert_eq!(value["results"][0]["id"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        value["results"][0]["artifact_id"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(
+        value["results"][0]["provenance"][0]["steps"][0]["op"],
+        "procedure_of"
+    );
+    assert_eq!(value["truncated"], false);
+    assert!(value.get("diagnostics").is_none());
+}
+
+#[test]
+fn analyzer_only_cfg_pipeline_requires_workspace_semantic_services() {
+    let project = InlineTestProject::new()
+        .file("src/main.rs", "fn target() {}\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 3,
+        "match": { "kind": "function", "name": "target" },
+        "steps": [{ "op": "procedure_of" }]
+    }))
+    .unwrap();
+
+    let result = execute(workspace.analyzer(), &query);
+    let value = serialized(&result);
     assert_eq!(value["results"], json!([]));
     assert_eq!(value["truncated"], true);
-    assert_eq!(value["diagnostics"][0]["code"], "semantic_results_omitted");
+    assert_eq!(
+        value["diagnostics"][0]["code"],
+        "semantic_workspace_required"
+    );
     assert_eq!(value["diagnostics"][0]["impact"], "incomplete");
+}
+
+#[test]
+fn cfg_pipeline_traverses_entry_edges_and_preserves_typed_provenance() {
+    let result = run(
+        &[(
+            "src/main.rs",
+            "fn target(flag: bool) -> i32 {\n    if flag { 1 } else { 2 }\n}\n",
+        )],
+        json!({
+            "schema_version": 3,
+            "match": { "kind": "function", "name": "target" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "cfg_entry" },
+                { "op": "cfg_successor_edges" },
+                { "op": "cfg_edge_target" }
+            ]
+        }),
+    );
+    let value = serialized(&result);
+
+    assert!(!value["results"].as_array().unwrap().is_empty(), "{value}");
+    for row in value["results"].as_array().unwrap() {
+        assert_eq!(row["result_type"], "program_point", "{value}");
+        assert_eq!(row["path"], "src/main.rs");
+        assert_eq!(row["id"].as_str().unwrap().len(), 64);
+        assert_eq!(row["procedure_id"].as_str().unwrap().len(), 64);
+        let steps = row["provenance"][0]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 4, "{value}");
+        assert_eq!(steps[0]["op"], "procedure_of");
+        assert_eq!(steps[1]["op"], "cfg_entry");
+        assert_eq!(steps[2]["op"], "cfg_successor_edges");
+        assert_eq!(steps[2]["result"]["result_type"], "control_edge");
+        assert!(steps[2]["result"]["source_id"].is_string());
+        assert!(steps[2]["result"]["target_id"].is_string());
+        assert_eq!(steps[3]["op"], "cfg_edge_target");
+    }
+    assert_eq!(value["truncated"], false, "{value}");
+    assert!(
+        value["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["code"] == "semantic_analysis_partial")
+    );
+    assert_eq!(value["results"][0]["evidence"]["completeness"], "partial");
+}
+
+#[test]
+fn cfg_exits_are_normal_then_exceptional_with_stable_ids() {
+    let query = json!({
+        "schema_version": 3,
+        "match": { "kind": "function", "name": "target" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "cfg_exits" }
+        ]
+    });
+    let project = InlineTestProject::new()
+        .file("src/main.rs", "fn target() -> i32 { 1 }\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let first_query = CodeQuery::from_json(&query).unwrap();
+    let second_query = CodeQuery::from_json(&query).unwrap();
+    let first = serialized(&execute_workspace(&workspace, &first_query));
+    let second = serialized(&execute_workspace(&workspace, &second_query));
+
+    assert_eq!(first["results"].as_array().unwrap().len(), 2, "{first}");
+    assert_eq!(first["results"][0]["boundary"], "normal_exit");
+    assert_eq!(first["results"][1]["boundary"], "exceptional_exit");
+    assert_eq!(first["results"][0]["id"], second["results"][0]["id"]);
+    assert_eq!(first["results"][1]["id"], second["results"][1]["id"]);
+    assert_eq!(
+        first["results"][0]["procedure_id"],
+        first["results"][1]["procedure_id"]
+    );
+}
+
+#[test]
+fn cfg_profile_reports_request_cache_reuse_without_recharging_semantic_work() {
+    let project = InlineTestProject::new()
+        .file("src/main.rs", "fn first() {}\nfn second() {}\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 3,
+        "execution_mode": "profile",
+        "union": [
+            {
+                "match": { "kind": "function", "name": "first" },
+                "steps": [{ "op": "procedure_of" }]
+            },
+            {
+                "match": { "kind": "function", "name": "second" },
+                "steps": [{ "op": "procedure_of" }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let CodeQueryResponse::Profile(profile) = execute_workspace_request(&workspace, &query) else {
+        panic!("profile query should return a profile");
+    };
+    assert_eq!(profile.result.results.len(), 2);
+    assert_eq!(profile.work.semantic.materialization_attempts, 1);
+    assert_eq!(profile.work.semantic.unique_materialized_files, 1);
+    assert_eq!(profile.work.semantic.request_cache_hits, 1);
+    assert!(profile.work.semantic.source_bytes > 0);
+    assert!(profile.work.semantic.procedures >= 2);
+    assert!(!profile.work.semantic.budget_exhausted);
+}
+
+#[test]
+fn cfg_predecessor_and_edge_source_recover_the_traversed_source_point() {
+    let result = serialized(&run(
+        &[(
+            "src/main.rs",
+            "fn target(flag: bool) -> i32 {\n    if flag { 1 } else { 2 }\n}\n",
+        )],
+        json!({
+            "schema_version": 3,
+            "match": { "kind": "function", "name": "target" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "cfg_entry" },
+                { "op": "cfg_successor_edges" },
+                { "op": "cfg_edge_target" },
+                { "op": "cfg_predecessor_edges" },
+                { "op": "cfg_edge_source" }
+            ]
+        }),
+    ));
+
+    let row = &result["results"][0];
+    let steps = row["provenance"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 6, "{result}");
+    assert_eq!(steps[4]["op"], "cfg_predecessor_edges");
+    assert_eq!(steps[4]["result"]["result_type"], "control_edge");
+    assert_eq!(steps[5]["op"], "cfg_edge_source");
+    assert_eq!(row["id"], steps[1]["result"]["id"]);
+}
+
+#[test]
+fn cfg_semantic_file_budget_is_typed_and_stops_new_materializations() {
+    let project = InlineTestProject::new()
+        .file("src/first.rs", "fn first() {}\n")
+        .file("src/second.rs", "fn second() {}\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 3,
+        "execution_mode": "profile",
+        "union": [
+            {
+                "match": { "kind": "function", "name": "first" },
+                "steps": [{ "op": "procedure_of" }]
+            },
+            {
+                "match": { "kind": "function", "name": "second" },
+                "steps": [{ "op": "procedure_of" }]
+            }
+        ]
+    }))
+    .unwrap();
+    let mut limits = CodeQueryExecutionLimits::default();
+    limits.semantic.max_materialized_files = 1;
+
+    let CodeQueryResponse::Profile(profile) =
+        brokk_bifrost::analyzer::structural::execute_workspace_request_with_limits(
+            &workspace, &query, limits,
+        )
+    else {
+        panic!("profile query should return a profile");
+    };
+    assert!(profile.result.truncated);
+    assert!(
+        profile.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        })
+    );
+    assert_eq!(profile.work.semantic.materialization_attempts, 1);
+    assert_eq!(profile.work.semantic.unique_materialized_files, 1);
+    assert!(profile.work.semantic.budget_exhausted);
+}
+
+#[test]
+fn cfg_zero_semantic_limit_is_an_invalid_plan() {
+    let project = InlineTestProject::new()
+        .file("src/main.rs", "fn target() {}\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 3,
+        "match": { "kind": "function", "name": "target" },
+        "steps": [{ "op": "procedure_of" }]
+    }))
+    .unwrap();
+    let mut limits = CodeQueryExecutionLimits::default();
+    limits.semantic.max_source_bytes = 0;
+
+    let result = brokk_bifrost::analyzer::structural::execute_workspace_with_limits(
+        &workspace, &query, limits,
+    );
+    assert_eq!(
+        result.completion(),
+        brokk_bifrost::analyzer::structural::CodeQueryCompletion::Invalid {
+            codes: vec![CodeQueryDiagnosticCode::InvalidPlan],
+        }
+    );
+}
+
+#[test]
+fn procedure_of_reports_a_proven_missing_enclosing_procedure_as_advisory() {
+    let result = run(
+        &[("src/main.rs", "struct Data;\n")],
+        json!({
+            "schema_version": 3,
+            "match": { "kind": "class", "name": "Data" },
+            "steps": [{ "op": "procedure_of" }]
+        }),
+    );
+
+    assert!(result.results.is_empty());
+    assert!(!result.truncated);
+    assert_eq!(
+        result.completion(),
+        brokk_bifrost::analyzer::structural::CodeQueryCompletion::Complete
+    );
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::NoEnclosingProcedure
+            && diagnostic.impact
+                == brokk_bifrost::analyzer::structural::CodeQueryDiagnosticImpact::Advisory
+    }));
+}
+
+#[test]
+fn typescript_cfg_pipeline_returns_source_backed_points() {
+    let result = serialized(&run(
+        &[(
+            "src/app.ts",
+            "function target(flag: boolean): number {\n  return flag ? 1 : 2;\n}\n",
+        )],
+        json!({
+            "schema_version": 3,
+            "languages": ["typescript"],
+            "match": { "kind": "function", "name": "target" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "cfg_entry" }
+            ]
+        }),
+    ));
+
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["results"][0]["result_type"], "program_point");
+    assert_eq!(result["results"][0]["boundary"], "entry");
+    assert_eq!(result["results"][0]["path"], "src/app.ts");
+    assert_eq!(result["results"][0]["language"], "typescript");
+    assert_eq!(
+        result["results"][0]["provenance"][0]["steps"][0]["result"]["result_type"],
+        "procedure"
+    );
 }
 
 #[test]

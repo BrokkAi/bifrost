@@ -43,10 +43,10 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 08:47Z) Added schema-versioned query kinds and operations with parser, decoder, validator, canonical JSON, exact JSON/RQL ranges, RQL tooling metadata, and an explicit incomplete execution result until the semantic adapter lands.
 - [x] (2026-07-25 09:04Z) Added source-backed procedure, program-point, and control-edge result/reference contracts, typed semantic evidence, boundary metadata, rendering, public re-exports, and detailed-evidence wire-identity invariants without exposing dense IR IDs.
 - [x] (2026-07-25 09:23Z) Added the nested semantic limit and work contracts plus stable workspace, capability, partial-analysis, budget, provider, and no-procedure diagnostic codes across ordinary results, profiles, and policy completion projection.
-- [ ] Implement the request-scoped CFG query adapter, semantic budgets, capability diagnostics, cancellation, and provenance.
-- [ ] Integrate planning/explain/profile reporting and all Rust result rendering/evidence paths.
+- [x] (2026-07-25 11:58Z) Implemented the request-scoped CFG query adapter with cached semantic outcomes, lazy semantic budgets, capability/partial/provider diagnostics, cancellation propagation, stable source-backed identities, and typed provenance.
+- [x] (2026-07-25 11:58Z) Integrated the CFG algebra with ordinary execution, explain/profile accounting, compact/full rendering, typed evidence, and analyzer-only workspace diagnostics.
 - [ ] Update the Python client, LSP/VS Code client, TextMate grammar, public docs, and executable examples.
-- [ ] Run focused tests, formatting, clippy with all features, and the full `nlp,python` test gate; record results here.
+- [ ] Run the remaining client/documentation tests and the full `nlp,python` test gate; record results here. Core Rust formatting, all-target/all-feature clippy, structural search/profile/public API tests, and all 114 CodeQuery pipeline tests pass.
 
 ## Surprises & Discoveries
 
@@ -73,6 +73,12 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: The milestone's historical `rql_diagnostics` and `rql_tooling` integration-test targets no longer exist as standalone files. The same behavior now lives in structural-query unit tests and the focused `bifrost_lsp_server` RQL tests.
   Evidence: `rg --files tests` found no matching test targets; `cargo test --lib analyzer::structural::query` and `bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_source` exercise the current boundaries.
+
+- Observation: This host's default `clippy-driver` resolves to Homebrew while `cargo` and `rustc` resolve through rustup, and those same-version binaries have incompatible compiler metadata.
+  Evidence: The default and isolated-helper clippy runs failed before crate checking with an incompatible compiler metadata error. Prepending the active rustup toolchain's `bin` directory selected its matching driver, after which `cargo clippy --all-targets --all-features -- -D warnings` passed.
+
+- Observation: On macOS, compiling the `python` feature's `cdylib` test artifact requires the Python-wheel job's dynamic symbol lookup linker flags; merely selecting the system Python does not provide those symbols.
+  Evidence: `cargo test --tests --features nlp,python --no-run` reached the final library link and failed on unresolved `Py*` symbols. Repeating it with CI's `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'` completed every library, binary, and integration-test executable.
 
 ## Decision Log
 
@@ -137,6 +143,10 @@ Validation at this checkpoint passed `cargo check --lib`, `cargo test --lib anal
 The first Milestone 3 checkpoint established independent semantic resource controls before provider execution. `CodeQueryExecutionLimits` now carries positive file, source-byte, and per-row-dimension semantic caps; ordinary and profiled work expose a typed zero-cost-until-used semantic ledger; and every planned semantic failure mode has a stable typed diagnostic and policy completion mapping.
 
 Validation at this checkpoint passed the complete integration-test compile gate, the structural execution-profile tests (3 tests), the structural search tests (71 tests), the public API tests (6 tests), and the policy budget tests (4 tests).
+
+The core Milestone 3 execution checkpoint binds those contracts to the existing workspace semantic service without moving CFG construction into CodeQuery. A request-local adapter materializes each reached file at most once, caches exact success or failure outcomes, charges a separate semantic ledger, and traverses procedures, entries/exits, control edges, and endpoints through typed internal handles. Public rows use artifact-scoped stable IDs, source mappings, bounded evidence reasons, and provenance that survives ordinary, compact, full, and profiled result modes. Analyzer-only entry points explicitly report that workspace semantic services are required.
+
+Validation at this checkpoint passed `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, the CI-configured `cargo test --tests --features nlp,python --no-run` compile gate, all 114 `code_query_pipelines` tests, the structural search tests (71 tests), the execution-profile tests (3 tests), and the public API tests (6 tests). The focused coverage includes Rust and TypeScript CFG lowering, entry/exit ordering, successor/predecessor traversal, endpoint recovery, request-cache reuse, semantic budget exhaustion, invalid zero limits, stable same-artifact IDs, partial evidence, no-enclosing-procedure advisories, and analyzer-only workspace diagnostics.
 
 ## Context and Orientation
 
