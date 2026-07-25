@@ -1,6 +1,5 @@
+use std::mem::size_of;
 use std::sync::Arc;
-
-use sha2::{Digest, Sha256};
 
 use super::{
     CodeQueryControlEdge, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
@@ -9,18 +8,44 @@ use super::{
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
     CodeQuerySemanticWork, DeclarationValue, SeedMatch,
 };
+use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
 use crate::analyzer::semantic::workspace_oracle::{
-    procedures_for_definition, procedures_for_source_ranges,
+    ProcedureRangeLookupStatus, procedures_for_definition, procedures_for_source_ranges,
 };
 use crate::analyzer::semantic::{
-    CapabilitySupport, ControlEdgeHandle, DeclarationSegmentKind, Evidence, EvidenceCompleteness,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticBudget,
-    SemanticCapability, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticWork,
-    SourceMapping, StableDigest,
+    AllocationSite, BasicBlock, CapabilitySupport, CaptureBinding, ContentIdentity, ControlEdge,
+    ControlEdgeHandle, Evidence, EvidenceCompleteness, LengthDelimitedDigest, MemoryLocation,
+    ProcedureHandle, ProcedureSemantics, ProgramPoint, ProgramPointHandle, ProofStatus,
+    SemanticArtifact, SemanticBudget, SemanticCallSite, SemanticCapability, SemanticEvent,
+    SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork,
+    SourceMapping,
 };
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use crate::text_utils::{compute_line_starts, line_column_for_offset};
+
+#[derive(Debug, Clone)]
+struct SemanticSourceSnapshot {
+    source: Arc<str>,
+    line_starts: Arc<[usize]>,
+}
+
+impl SemanticSourceSnapshot {
+    fn new(source: String) -> Self {
+        let line_starts = compute_line_starts(&source).into();
+        Self {
+            source: Arc::from(source),
+            line_starts,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.source
+            .len()
+            .saturating_add(self.line_starts.len().saturating_mul(size_of::<usize>()))
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct CfgSemanticQuality {
@@ -66,6 +91,7 @@ impl CfgSemanticQuality {
 pub(super) struct CfgProcedureValue {
     pub(super) handle: ProcedureHandle,
     file: ProjectFile,
+    source: SemanticSourceSnapshot,
     quality: CfgSemanticQuality,
 }
 
@@ -73,6 +99,7 @@ pub(super) struct CfgProcedureValue {
 pub(super) struct CfgProgramPointValue {
     pub(super) handle: ProgramPointHandle,
     file: ProjectFile,
+    source: SemanticSourceSnapshot,
     quality: CfgSemanticQuality,
 }
 
@@ -80,14 +107,19 @@ pub(super) struct CfgProgramPointValue {
 pub(super) struct CfgControlEdgeValue {
     pub(super) handle: ControlEdgeHandle,
     file: ProjectFile,
+    source: SemanticSourceSnapshot,
     quality: CfgSemanticQuality,
 }
 
 #[derive(Debug, Clone)]
 enum CachedSemanticMaterialization {
-    Outcome(SemanticOutcome<Arc<SemanticArtifact>>),
+    Outcome {
+        outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+        source: Option<SemanticSourceSnapshot>,
+    },
     ProviderFailed(Arc<str>),
     FileBudgetExhausted,
+    RetainedBudgetExhausted,
 }
 
 pub(super) struct CfgQueryService<'a> {
@@ -100,7 +132,10 @@ pub(super) struct CfgQueryService<'a> {
     diagnostics: Vec<CodeQueryDiagnostic>,
     reported: HashSet<(CodeQueryDiagnosticCode, ProjectFile, String)>,
     attempts: usize,
+    materialized_files: usize,
     cache_hits: usize,
+    retained_bytes: usize,
+    traversal_steps: usize,
     budget_exhausted: bool,
 }
 
@@ -122,7 +157,10 @@ impl<'a> CfgQueryService<'a> {
             diagnostics: Vec::new(),
             reported: HashSet::default(),
             attempts: 0,
+            materialized_files: 0,
             cache_hits: 0,
+            retained_bytes: 0,
+            traversal_steps: 0,
             budget_exhausted: false,
         }
     }
@@ -136,7 +174,7 @@ impl<'a> CfgQueryService<'a> {
             start_line: fact.range.start_line,
             end_line: fact.range.end_line,
         }];
-        let Some((artifact, quality)) = self.materialize(&seed.file) else {
+        let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
             return Vec::new();
         };
         let quality = quality.combine(&self.capability_quality(
@@ -144,8 +182,33 @@ impl<'a> CfgQueryService<'a> {
             artifact.as_ref(),
             &[SemanticCapability::Procedures],
         ));
-        let candidates = procedures_for_source_ranges(&artifact, &ranges);
-        self.finish_procedure_lookup(&seed.file, candidates, quality)
+        let lookup = procedures_for_source_ranges(
+            &artifact,
+            &ranges,
+            self.limits
+                .max_traversal_steps
+                .saturating_sub(self.traversal_steps),
+            self.cancellation.unwrap_or(&self.uncancelled),
+        );
+        self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
+        match lookup.status {
+            ProcedureRangeLookupStatus::Complete => {
+                self.finish_procedure_lookup(&seed.file, source, lookup.handles, quality)
+            }
+            ProcedureRangeLookupStatus::BudgetExhausted => {
+                self.exhaust_traversal_budget(&seed.file, "enclosing-procedure lookup");
+                Vec::new()
+            }
+            ProcedureRangeLookupStatus::Cancelled => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::Cancelled,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    &seed.file,
+                    "enclosing-procedure lookup was cancelled",
+                );
+                Vec::new()
+            }
+        }
     }
 
     pub(super) fn procedure_of_declaration(
@@ -153,7 +216,7 @@ impl<'a> CfgQueryService<'a> {
         declaration: &DeclarationValue,
     ) -> Vec<CfgProcedureValue> {
         let file = declaration.unit.source();
-        let Some((artifact, quality)) = self.materialize(file) else {
+        let Some((artifact, source, quality)) = self.materialize(file) else {
             return Vec::new();
         };
         let quality = quality.combine(&self.capability_quality(
@@ -161,9 +224,16 @@ impl<'a> CfgQueryService<'a> {
             artifact.as_ref(),
             &[SemanticCapability::Procedures],
         ));
+        if !self.charge_traversal(
+            file,
+            artifact.procedures().len().saturating_mul(2),
+            "declaration-to-procedure lookup",
+        ) {
+            return Vec::new();
+        }
         let candidates =
             procedures_for_definition(self.workspace.analyzer(), &declaration.unit, &artifact);
-        self.finish_procedure_lookup(file, candidates, quality)
+        self.finish_procedure_lookup(file, source, candidates, quality)
     }
 
     pub(super) fn cfg_entry(
@@ -184,6 +254,7 @@ impl<'a> CfgQueryService<'a> {
             .map(|handle| CfgProgramPointValue {
                 handle,
                 file: procedure.file.clone(),
+                source: procedure.source.clone(),
                 quality,
             })
     }
@@ -210,6 +281,7 @@ impl<'a> CfgQueryService<'a> {
             .map(|handle| CfgProgramPointValue {
                 handle,
                 file: procedure.file.clone(),
+                source: procedure.source.clone(),
                 quality: quality.clone(),
             })
             .collect()
@@ -218,15 +290,17 @@ impl<'a> CfgQueryService<'a> {
     pub(super) fn cfg_successor_edges(
         &mut self,
         point: &CfgProgramPointValue,
+        max_outputs: usize,
     ) -> Vec<CfgControlEdgeValue> {
-        self.cfg_edges(point, true)
+        self.cfg_edges(point, true, max_outputs)
     }
 
     pub(super) fn cfg_predecessor_edges(
         &mut self,
         point: &CfgProgramPointValue,
+        max_outputs: usize,
     ) -> Vec<CfgControlEdgeValue> {
-        self.cfg_edges(point, false)
+        self.cfg_edges(point, false, max_outputs)
     }
 
     pub(super) fn cfg_edge_source(
@@ -244,6 +318,7 @@ impl<'a> CfgQueryService<'a> {
     }
 
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {
+        self.reported.clear();
         std::mem::take(&mut self.diagnostics)
     }
 
@@ -251,12 +326,14 @@ impl<'a> CfgQueryService<'a> {
         let used = self.budget.used();
         CodeQuerySemanticWork {
             materialization_attempts: saturating_u64(self.attempts),
-            unique_materialized_files: saturating_u64(self.attempts),
+            unique_materialized_files: saturating_u64(self.materialized_files),
             request_cache_hits: saturating_u64(self.cache_hits),
             source_bytes: saturating_u64(used.source_bytes),
             procedures: saturating_u64(used.procedures),
             program_points: saturating_u64(used.program_points),
             control_edges: saturating_u64(used.control_edges),
+            retained_bytes: saturating_u64(self.retained_bytes),
+            traversal_steps: saturating_u64(self.traversal_steps),
             budget_exhausted: self.budget_exhausted,
         }
     }
@@ -264,6 +341,7 @@ impl<'a> CfgQueryService<'a> {
     fn finish_procedure_lookup(
         &mut self,
         file: &ProjectFile,
+        source: SemanticSourceSnapshot,
         mut candidates: Vec<ProcedureHandle>,
         mut quality: CfgSemanticQuality,
     ) -> Vec<CfgProcedureValue> {
@@ -302,6 +380,7 @@ impl<'a> CfgQueryService<'a> {
             .map(|handle| CfgProcedureValue {
                 handle,
                 file: file.clone(),
+                source: source.clone(),
                 quality: quality.clone(),
             })
             .collect()
@@ -311,6 +390,7 @@ impl<'a> CfgQueryService<'a> {
         &mut self,
         point: &CfgProgramPointValue,
         successors: bool,
+        max_outputs: usize,
     ) -> Vec<CfgControlEdgeValue> {
         let quality = point.quality.combine(&self.capability_quality(
             &point.file,
@@ -324,26 +404,68 @@ impl<'a> CfgQueryService<'a> {
         ));
         let procedure = point.handle.procedure();
         let semantics = procedure.semantics();
-        let mut ids = if successors {
-            semantics
-                .successor_edges(point.handle.id())
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>()
+        if successors {
+            self.collect_cfg_edges(
+                point,
+                quality,
+                semantics.successor_edges(point.handle.id()),
+                max_outputs,
+            )
         } else {
-            semantics
-                .predecessor_edges(point.handle.id())
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>()
-        };
-        ids.sort();
-        ids.into_iter()
-            .filter_map(|id| procedure.control_edge_handle(id))
-            .map(|handle| CfgControlEdgeValue {
+            self.collect_cfg_edges(
+                point,
+                quality,
+                semantics.predecessor_edges(point.handle.id()),
+                max_outputs,
+            )
+        }
+    }
+
+    fn collect_cfg_edges<'edge>(
+        &mut self,
+        point: &CfgProgramPointValue,
+        quality: CfgSemanticQuality,
+        edges: impl ExactSizeIterator<
+            Item = (crate::analyzer::semantic::ControlEdgeId, &'edge ControlEdge),
+        >,
+        max_outputs: usize,
+    ) -> Vec<CfgControlEdgeValue> {
+        let edge_count = edges.len();
+        let remaining_traversal = self
+            .limits
+            .max_traversal_steps
+            .saturating_sub(self.traversal_steps);
+        let admitted = edge_count.min(max_outputs).min(remaining_traversal);
+        let mut output = Vec::with_capacity(admitted);
+        let procedure = point.handle.procedure();
+        for (id, _) in edges.take(admitted) {
+            if self
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::Cancelled,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    &point.file,
+                    "control-edge traversal was cancelled",
+                );
+                break;
+            }
+            self.traversal_steps = self.traversal_steps.saturating_add(1);
+            let Some(handle) = procedure.control_edge_handle(id) else {
+                continue;
+            };
+            output.push(CfgControlEdgeValue {
                 handle,
                 file: point.file.clone(),
+                source: point.source.clone(),
                 quality: quality.clone(),
-            })
-            .collect()
+            });
+        }
+        if edge_count > remaining_traversal && admitted == remaining_traversal {
+            self.exhaust_traversal_budget(&point.file, "control-edge traversal");
+        }
+        output
     }
 
     fn cfg_edge_endpoint(
@@ -371,6 +493,7 @@ impl<'a> CfgQueryService<'a> {
             .map(|handle| CfgProgramPointValue {
                 handle,
                 file: edge.file.clone(),
+                source: edge.source.clone(),
                 quality,
             })
     }
@@ -378,7 +501,11 @@ impl<'a> CfgQueryService<'a> {
     fn materialize(
         &mut self,
         file: &ProjectFile,
-    ) -> Option<(Arc<SemanticArtifact>, CfgSemanticQuality)> {
+    ) -> Option<(
+        Arc<SemanticArtifact>,
+        SemanticSourceSnapshot,
+        CfgSemanticQuality,
+    )> {
         if let Some(cached) = self.cache.get(file).cloned() {
             self.cache_hits = self.cache_hits.saturating_add(1);
             return self.cached_value(file, cached);
@@ -406,11 +533,41 @@ impl<'a> CfgQueryService<'a> {
         );
         match outcome {
             Ok(outcome) => {
-                self.cache.insert(
-                    file.clone(),
-                    CachedSemanticMaterialization::Outcome(outcome.clone()),
-                );
-                self.cached_value(file, CachedSemanticMaterialization::Outcome(outcome))
+                let source = outcome
+                    .available_value()
+                    .and_then(|artifact| self.exact_source(file, artifact));
+                if let (Some(artifact), Some(source)) = (outcome.available_value(), source.as_ref())
+                {
+                    let retained_bytes = usize::try_from(
+                        semantic_artifact_retained_bytes(artifact)
+                            .saturating_add(source.retained_bytes() as u64),
+                    )
+                    .unwrap_or(usize::MAX);
+                    if retained_bytes
+                        > self
+                            .limits
+                            .max_retained_bytes
+                            .saturating_sub(self.retained_bytes)
+                    {
+                        self.budget_exhausted = true;
+                        self.cache.insert(
+                            file.clone(),
+                            CachedSemanticMaterialization::RetainedBudgetExhausted,
+                        );
+                        self.push_diagnostic(
+                            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                            CodeQueryDiagnosticImpact::Incomplete,
+                            file,
+                            "semantic retained-artifact byte budget exhausted",
+                        );
+                        return None;
+                    }
+                    self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+                    self.materialized_files = self.materialized_files.saturating_add(1);
+                }
+                let cached = CachedSemanticMaterialization::Outcome { outcome, source };
+                self.cache.insert(file.clone(), cached.clone());
+                self.cached_value(file, cached)
             }
             Err(error) => {
                 let reason: Arc<str> = error.to_string().into();
@@ -433,9 +590,13 @@ impl<'a> CfgQueryService<'a> {
         &mut self,
         file: &ProjectFile,
         cached: CachedSemanticMaterialization,
-    ) -> Option<(Arc<SemanticArtifact>, CfgSemanticQuality)> {
+    ) -> Option<(
+        Arc<SemanticArtifact>,
+        SemanticSourceSnapshot,
+        CfgSemanticQuality,
+    )> {
         match cached {
-            CachedSemanticMaterialization::Outcome(outcome) => {
+            CachedSemanticMaterialization::Outcome { outcome, source } => {
                 let value = outcome.available_value().cloned();
                 let quality = match &outcome {
                     SemanticOutcome::Complete { .. } => CfgSemanticQuality::default(),
@@ -503,7 +664,9 @@ impl<'a> CfgQueryService<'a> {
                         return None;
                     }
                 };
-                value.map(|value| (value, quality))
+                value
+                    .zip(source)
+                    .map(|(value, source)| (value, source, quality))
             }
             CachedSemanticMaterialization::ProviderFailed(reason) => {
                 self.push_diagnostic(
@@ -523,7 +686,79 @@ impl<'a> CfgQueryService<'a> {
                 );
                 None
             }
+            CachedSemanticMaterialization::RetainedBudgetExhausted => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    "semantic retained-artifact byte budget exhausted",
+                );
+                None
+            }
         }
+    }
+
+    fn exact_source(
+        &mut self,
+        file: &ProjectFile,
+        artifact: &SemanticArtifact,
+    ) -> Option<SemanticSourceSnapshot> {
+        let Some(source) = self.workspace.analyzer().indexed_source(file) else {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticProviderFailed,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "semantic artifact source is unavailable for public range conversion",
+            );
+            return None;
+        };
+        if ContentIdentity::hash_bytes(source.as_bytes()) != artifact.key().revision().content() {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "source generation changed before semantic result projection; retry the query for a coherent snapshot",
+            );
+            return None;
+        }
+        Some(SemanticSourceSnapshot::new(source))
+    }
+
+    fn charge_traversal(&mut self, file: &ProjectFile, steps: usize, operation: &str) -> bool {
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::Cancelled,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                &format!("{operation} was cancelled"),
+            );
+            return false;
+        }
+        if steps
+            > self
+                .limits
+                .max_traversal_steps
+                .saturating_sub(self.traversal_steps)
+        {
+            self.exhaust_traversal_budget(file, operation);
+            return false;
+        }
+        self.traversal_steps = self.traversal_steps.saturating_add(steps);
+        true
+    }
+
+    fn exhaust_traversal_budget(&mut self, file: &ProjectFile, operation: &str) {
+        self.traversal_steps = self.limits.max_traversal_steps;
+        self.budget_exhausted = true;
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
+            &format!("semantic traversal-step budget exhausted during {operation}"),
+        );
     }
 
     fn capability_quality(
@@ -591,11 +826,16 @@ impl CfgProcedureValue {
         let mapping = procedure_source_mapping(&self.handle);
         CodeQueryProcedure {
             id: procedure_wire_id(&self.handle),
-            artifact_id: self.handle.artifact().key().fingerprint().to_string(),
+            artifact_id: self
+                .handle
+                .artifact()
+                .key()
+                .public_fingerprint()
+                .to_string(),
             path: mapping.locator.path().as_str().to_string(),
             language: mapping.locator.language().config_label(),
             procedure_kind: procedure.kind().label(),
-            range: public_range(mapping),
+            range: public_range(mapping, &self.source),
             evidence: public_evidence(procedure_evidence(&self.handle), &self.quality),
         }
     }
@@ -635,7 +875,7 @@ impl CfgProgramPointValue {
             procedure_id: procedure_wire_id(procedure),
             path: mapping.locator.path().as_str().to_string(),
             language: mapping.locator.language().config_label(),
-            range: public_range(mapping),
+            range: public_range(mapping, &self.source),
             boundary: point_boundary(&self.handle),
             event_count: point.events.len(),
             evidence: public_evidence(
@@ -707,6 +947,7 @@ impl CfgControlEdgeValue {
                 .point_handle(edge.source_point)
                 .expect("validated control edge source resolves"),
             file: self.file.clone(),
+            source: self.source.clone(),
             quality: self.quality.clone(),
         };
         let target = CfgProgramPointValue {
@@ -714,6 +955,7 @@ impl CfgControlEdgeValue {
                 .point_handle(edge.target_point)
                 .expect("validated control edge target resolves"),
             file: self.file.clone(),
+            source: self.source.clone(),
             quality: self.quality.clone(),
         };
         CodeQueryControlEdge {
@@ -721,7 +963,7 @@ impl CfgControlEdgeValue {
             procedure_id: procedure_wire_id(procedure),
             path: mapping.locator.path().as_str().to_string(),
             language: mapping.locator.language().config_label(),
-            range: public_range(mapping),
+            range: public_range(mapping, &self.source),
             edge_kind: edge.kind.label(),
             source: source.point_ref(),
             target: target.point_ref(),
@@ -770,23 +1012,36 @@ impl CfgControlEdgeValue {
 }
 
 fn semantic_budget_limits(limits: CodeQuerySemanticLimits) -> SemanticWork {
+    fn rows_for<T>(limits: CodeQuerySemanticLimits) -> usize {
+        const RETAINED_ROW_DIMENSIONS: usize = 15;
+        const ALLOCATION_OVERHEAD_FACTOR: usize = 2;
+        let retained_row_bytes = limits.max_retained_bytes / 2;
+        let per_dimension_bytes = retained_row_bytes / RETAINED_ROW_DIMENSIONS;
+        let conservative_row_bytes = size_of::<T>()
+            .max(1)
+            .saturating_mul(ALLOCATION_OVERHEAD_FACTOR);
+        limits
+            .max_rows_per_dimension
+            .min((per_dimension_bytes / conservative_row_bytes).max(1))
+    }
+    let retained_text_bytes = (limits.max_retained_bytes / 2).max(1);
     SemanticWork {
-        source_bytes: limits.max_source_bytes,
-        procedures: limits.max_rows_per_dimension,
-        blocks: limits.max_rows_per_dimension,
-        program_points: limits.max_rows_per_dimension,
-        values: limits.max_rows_per_dimension,
-        allocations: limits.max_rows_per_dimension,
-        call_sites: limits.max_rows_per_dimension,
-        memory_locations: limits.max_rows_per_dimension,
-        captures: limits.max_rows_per_dimension,
-        source_mappings: limits.max_rows_per_dimension,
-        evidence: limits.max_rows_per_dimension,
-        gaps: limits.max_rows_per_dimension,
-        events: limits.max_rows_per_dimension,
-        control_edges: limits.max_rows_per_dimension,
-        nested_entries: limits.max_rows_per_dimension,
-        owned_text_bytes: limits.max_source_bytes,
+        source_bytes: limits.max_source_bytes.min(retained_text_bytes),
+        procedures: rows_for::<ProcedureSemantics>(limits),
+        blocks: rows_for::<BasicBlock>(limits),
+        program_points: rows_for::<ProgramPoint>(limits),
+        values: rows_for::<SemanticValue>(limits),
+        allocations: rows_for::<AllocationSite>(limits),
+        call_sites: rows_for::<SemanticCallSite>(limits),
+        memory_locations: rows_for::<MemoryLocation>(limits),
+        captures: rows_for::<CaptureBinding>(limits),
+        source_mappings: rows_for::<SourceMapping>(limits),
+        evidence: rows_for::<Evidence>(limits),
+        gaps: rows_for::<SemanticGap>(limits),
+        events: rows_for::<SemanticEvent>(limits),
+        control_edges: rows_for::<ControlEdge>(limits),
+        nested_entries: rows_for::<SemanticLocator>(limits),
+        owned_text_bytes: limits.max_source_bytes.min(retained_text_bytes),
     }
 }
 
@@ -848,13 +1103,23 @@ fn procedure_evidence(handle: &ProcedureHandle) -> &Evidence {
         .expect("validated procedure has evidence")
 }
 
-fn public_range(mapping: &SourceMapping) -> CodeQueryRange {
+fn public_range(mapping: &SourceMapping, source: &SemanticSourceSnapshot) -> CodeQueryRange {
     let span = mapping.locator.anchor().span();
+    let (start_line, start_column) = line_column_for_offset(
+        &source.source,
+        &source.line_starts,
+        span.start_byte() as usize,
+    );
+    let (end_line, end_column) = line_column_for_offset(
+        &source.source,
+        &source.line_starts,
+        span.end_byte() as usize,
+    );
     CodeQueryRange {
-        start_line: span.start().line() as usize + 1,
-        start_column: span.start().byte_column() as usize + 1,
-        end_line: span.end().line() as usize + 1,
-        end_column: span.end().byte_column() as usize + 1,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
     }
 }
 
@@ -878,47 +1143,76 @@ fn point_boundary(handle: &ProgramPointHandle) -> Option<CodeQueryProgramPointBo
 }
 
 fn procedure_wire_id(handle: &ProcedureHandle) -> String {
-    wire_id(
-        handle.artifact().key().fingerprint().as_bytes(),
-        b"procedure",
-        handle.semantics().locator(),
-        None,
-    )
+    let mut digest = semantic_wire_digest(handle.artifact().as_ref(), b"procedure");
+    push_locator(&mut digest, handle.semantics().locator());
+    digest.finish().to_string()
 }
 
 fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
-    wire_id(
-        handle.procedure().artifact().key().fingerprint().as_bytes(),
-        b"program_point",
-        handle.procedure().semantics().locator(),
-        Some(handle.id().get()),
-    )
+    let procedure = handle.procedure();
+    let point = procedure
+        .semantics()
+        .point(handle.id())
+        .expect("validated program-point handle resolves in its procedure");
+    let mapping = procedure
+        .semantics()
+        .source_mapping(point.source)
+        .expect("validated program point has a source mapping");
+    let mut digest = semantic_wire_digest(procedure.artifact().as_ref(), b"program_point");
+    push_locator(&mut digest, procedure.semantics().locator());
+    push_locator(&mut digest, &mapping.locator);
+    digest.push(
+        point_boundary(handle)
+            .map_or("ordinary", CodeQueryProgramPointBoundary::label)
+            .as_bytes(),
+    );
+    digest.finish().to_string()
 }
 
 fn control_edge_wire_id(handle: &ControlEdgeHandle) -> String {
-    wire_id(
-        handle.procedure().artifact().key().fingerprint().as_bytes(),
-        b"control_edge",
-        handle.procedure().semantics().locator(),
-        Some(handle.id().get()),
-    )
+    let procedure = handle.procedure();
+    let edge = procedure
+        .semantics()
+        .control_edge(handle.id())
+        .expect("validated control-edge handle resolves in its procedure");
+    let mapping = procedure
+        .semantics()
+        .source_mapping(edge.source)
+        .expect("validated control edge has a source mapping");
+    let source = procedure
+        .point_handle(edge.source_point)
+        .expect("validated control edge source resolves");
+    let target = procedure
+        .point_handle(edge.target_point)
+        .expect("validated control edge target resolves");
+    let evidence = procedure
+        .semantics()
+        .evidence_row(edge.evidence)
+        .expect("validated control edge has evidence");
+    let mut digest = semantic_wire_digest(procedure.artifact().as_ref(), b"control_edge");
+    push_locator(&mut digest, procedure.semantics().locator());
+    push_locator(&mut digest, &mapping.locator);
+    digest.push(edge.kind.label().as_bytes());
+    digest.push(program_point_wire_id(&source).as_bytes());
+    digest.push(program_point_wire_id(&target).as_bytes());
+    push_evidence(&mut digest, procedure.semantics(), evidence);
+    digest.finish().to_string()
 }
 
-fn wire_id(
-    artifact: &[u8; 32],
-    domain: &[u8],
-    locator: &SemanticLocator,
-    local_id: Option<u32>,
-) -> String {
-    let mut digest = CanonicalDigest::new(b"bifrost-code-query-semantic-wire-id-v1");
-    digest.push(artifact);
+fn semantic_wire_digest(artifact: &SemanticArtifact, domain: &[u8]) -> LengthDelimitedDigest {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-code-query-semantic-wire-id-v2");
+    digest.push(artifact.key().public_fingerprint().as_bytes());
     digest.push(domain);
+    digest
+}
+
+fn push_locator(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
     digest.push(locator.path().as_str().as_bytes());
     digest.push(locator.language().stable_label().as_bytes());
     digest.push(locator.role().stable_label().as_bytes());
     digest.push_anchor(locator.anchor());
     for segment in locator.declaration().segments() {
-        digest.push(declaration_segment_kind_label(segment.kind()).as_bytes());
+        digest.push(segment.kind().stable_label().as_bytes());
         match segment.name() {
             Some(name) => {
                 digest.push(b"named");
@@ -929,61 +1223,33 @@ fn wire_id(
         digest.push_anchor(segment.anchor());
         digest.push(&segment.sibling_ordinal().to_le_bytes());
     }
-    if let Some(local_id) = local_id {
-        digest.push(&local_id.to_le_bytes());
-    }
-    digest.finish()
 }
 
-struct CanonicalDigest(Sha256);
-
-impl CanonicalDigest {
-    fn new(domain: &[u8]) -> Self {
-        let mut digest = Self(Sha256::new());
-        digest.push(domain);
-        digest
-    }
-
-    fn push(&mut self, value: &[u8]) {
-        let length = u64::try_from(value.len()).expect("semantic wire identity input fits in u64");
-        self.0.update(length.to_le_bytes());
-        self.0.update(value);
-    }
-
-    fn push_anchor(&mut self, anchor: crate::analyzer::semantic::SourceAnchor) {
-        let span = anchor.span();
-        for value in [
-            span.start().byte_offset(),
-            span.start().line(),
-            span.start().byte_column(),
-            span.end().byte_offset(),
-            span.end().line(),
-            span.end().byte_column(),
-            anchor.occurrence(),
-        ] {
-            self.push(&value.to_le_bytes());
+fn push_evidence(
+    digest: &mut LengthDelimitedDigest,
+    procedure: &ProcedureSemantics,
+    evidence: &Evidence,
+) {
+    match &evidence.proof {
+        ProofStatus::Proven => digest.push(b"proven"),
+        ProofStatus::Unproven(reason) => {
+            digest.push(b"unproven");
+            digest.push(reason.as_bytes());
         }
     }
-
-    fn finish(self) -> String {
-        let bytes: [u8; 32] = self.0.finalize().into();
-        StableDigest::from_array(bytes).to_string()
+    match &evidence.completeness {
+        EvidenceCompleteness::Complete => digest.push(b"complete"),
+        EvidenceCompleteness::Partial(reason) => {
+            digest.push(b"partial");
+            digest.push(reason.as_bytes());
+        }
     }
-}
-
-fn declaration_segment_kind_label(kind: DeclarationSegmentKind) -> &'static str {
-    match kind {
-        DeclarationSegmentKind::File => "file",
-        DeclarationSegmentKind::Namespace => "namespace",
-        DeclarationSegmentKind::Type => "type",
-        DeclarationSegmentKind::Function => "function",
-        DeclarationSegmentKind::Method => "method",
-        DeclarationSegmentKind::Constructor => "constructor",
-        DeclarationSegmentKind::Initializer => "initializer",
-        DeclarationSegmentKind::LocalFunction => "local_function",
-        DeclarationSegmentKind::Lambda => "lambda",
-        DeclarationSegmentKind::Closure => "closure",
-        DeclarationSegmentKind::AnonymousCallable => "anonymous_callable",
+    for source in evidence
+        .sources
+        .iter()
+        .filter_map(|id| procedure.source_mapping(*id))
+    {
+        push_locator(digest, &source.locator);
     }
 }
 

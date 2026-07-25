@@ -1185,16 +1185,19 @@ fn diagnostic(
 
 #[test]
 fn execution_work_snapshot_is_the_single_budget_projection() {
-    let snapshot = execution_work_snapshot(CodeQueryExecutionBudget {
-        scanned_files: 1,
-        scanned_source_bytes: 2,
-        fact_nodes: 3,
-        examined_references: 4,
-        pipeline_rows: 5,
-        provenance_steps: 6,
-        import_files_resolved: 7,
-        import_edges_resolved: 8,
-    });
+    let snapshot = execution_work_snapshot(
+        CodeQueryExecutionBudget {
+            scanned_files: 1,
+            scanned_source_bytes: 2,
+            fact_nodes: 3,
+            examined_references: 4,
+            pipeline_rows: 5,
+            provenance_steps: 6,
+            import_files_resolved: 7,
+            import_edges_resolved: 8,
+        },
+        CodeQuerySemanticWork::default(),
+    );
     assert_eq!(
         snapshot,
         QueryOperatorWorkProfile {
@@ -1238,6 +1241,14 @@ fn semantic_execution_limits_require_each_dimension_to_be_positive() {
         },
         CodeQuerySemanticLimits {
             max_rows_per_dimension: 0,
+            ..defaults
+        },
+        CodeQuerySemanticLimits {
+            max_retained_bytes: 0,
+            ..defaults
+        },
+        CodeQuerySemanticLimits {
+            max_traversal_steps: 0,
             ..defaults
         },
     ] {

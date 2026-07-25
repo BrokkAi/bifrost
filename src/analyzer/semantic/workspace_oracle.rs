@@ -12,7 +12,8 @@ pub(super) use dispatch::{
     CallableDefinitionIdentity, retain_dispatch_candidate, scoped_procedure_dispatch_gap,
 };
 pub(crate) use dispatch::{
-    exact_source_for_procedure, procedures_for_definition, procedures_for_source_ranges,
+    ProcedureRangeLookupStatus, exact_source_for_procedure, procedures_for_definition,
+    procedures_for_source_ranges,
 };
 pub use source::SourcePointsToResult;
 

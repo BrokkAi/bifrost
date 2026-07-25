@@ -5373,7 +5373,27 @@ fn cfg_profile_reports_request_cache_reuse_without_recharging_semantic_work() {
     assert_eq!(profile.work.semantic.request_cache_hits, 1);
     assert!(profile.work.semantic.source_bytes > 0);
     assert!(profile.work.semantic.procedures >= 2);
+    assert!(profile.work.semantic.retained_bytes > 0);
+    assert!(profile.work.semantic.traversal_steps >= 2);
     assert!(!profile.work.semantic.budget_exhausted);
+
+    let serialized_profile = serde_json::to_value(&profile).unwrap();
+    assert!(
+        serialized_profile["operators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|operator| operator["operator"] == "pipeline_step")
+            .any(|operator| {
+                operator["work"]["semantic"]["materialization_attempts"]
+                    .as_u64()
+                    .is_some_and(|attempts| attempts > 0)
+                    && operator["work"]["semantic"]["traversal_steps"]
+                        .as_u64()
+                        .is_some_and(|steps| steps > 0)
+            }),
+        "{serialized_profile}"
+    );
 }
 
 #[test]
@@ -5497,6 +5517,144 @@ fn procedure_of_reports_a_proven_missing_enclosing_procedure_as_advisory() {
             && diagnostic.impact
                 == brokk_bifrost::analyzer::structural::CodeQueryDiagnosticImpact::Advisory
     }));
+}
+
+#[test]
+fn procedure_of_does_not_treat_nested_methods_as_enclosing_a_class() {
+    let result = run(
+        &[("src/app.ts", "class Data {\n  nested(): void {}\n}\n")],
+        json!({
+            "schema_version": 3,
+            "languages": ["typescript"],
+            "match": { "kind": "class", "name": "Data" },
+            "steps": [{ "op": "procedure_of" }]
+        }),
+    );
+
+    assert!(result.results.is_empty(), "{:?}", result.results);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == CodeQueryDiagnosticCode::NoEnclosingProcedure })
+    );
+}
+
+#[test]
+fn cfg_public_ranges_use_character_columns_after_multibyte_text() {
+    let source = "const café = 1; function target() {}\n";
+    let result = serialized(&run(
+        &[("src/app.ts", source)],
+        json!({
+            "schema_version": 3,
+            "languages": ["typescript"],
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "procedure_of" }]
+        }),
+    ));
+    let expected_column = source[..source.find("function").unwrap()].chars().count() + 1;
+
+    assert_eq!(
+        result["results"][0]["range"]["start_column"], expected_column,
+        "{result}"
+    );
+}
+
+#[test]
+fn cfg_public_ids_are_checkout_independent_for_identical_content() {
+    let query = json!({
+        "schema_version": 3,
+        "match": { "kind": "function", "name": "target" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "cfg_entry" },
+            { "op": "cfg_successor_edges" }
+        ]
+    });
+    let run_in_new_root = || {
+        let project = InlineTestProject::new()
+            .file("src/main.rs", "fn target() { let value = 1; }\n")
+            .build();
+        let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+        let query = CodeQuery::from_json(&query).unwrap();
+        serialized(&execute_workspace(&workspace, &query))
+    };
+
+    let first = run_in_new_root();
+    let second = run_in_new_root();
+    assert_eq!(first["results"][0]["id"], second["results"][0]["id"]);
+    assert_eq!(
+        first["results"][0]["procedure_id"],
+        second["results"][0]["procedure_id"]
+    );
+}
+
+#[test]
+fn semantic_traversal_budget_bounds_procedure_lookup_work() {
+    let project = InlineTestProject::new()
+        .file("src/main.rs", "fn first() {}\nfn second() {}\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 3,
+        "execution_mode": "profile",
+        "match": { "kind": "function", "name": "second" },
+        "steps": [{ "op": "procedure_of" }]
+    }))
+    .unwrap();
+    let mut limits = CodeQueryExecutionLimits::default();
+    limits.semantic.max_traversal_steps = 1;
+
+    let CodeQueryResponse::Profile(profile) =
+        brokk_bifrost::analyzer::structural::execute_workspace_request_with_limits(
+            &workspace, &query, limits,
+        )
+    else {
+        panic!("profile query should return a profile");
+    };
+    assert!(profile.result.results.is_empty());
+    assert!(profile.result.truncated);
+    assert_eq!(profile.work.semantic.traversal_steps, 1);
+    assert!(profile.work.semantic.budget_exhausted);
+    assert!(
+        profile.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        })
+    );
+}
+
+#[test]
+fn semantic_diagnostics_retain_set_branch_provenance() {
+    let result = serialized(&run(
+        &[(
+            "src/app.ts",
+            "class Data { nested(): void {} }\nfunction target(): void {}\n",
+        )],
+        json!({
+            "schema_version": 3,
+            "union": [
+                {
+                    "languages": ["typescript"],
+                    "match": { "kind": "function", "name": "target" },
+                    "steps": [{ "op": "procedure_of" }]
+                },
+                {
+                    "languages": ["typescript"],
+                    "match": { "kind": "class", "name": "Data" },
+                    "steps": [{ "op": "procedure_of" }]
+                }
+            ]
+        }),
+    ));
+
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "no_enclosing_procedure"
+                && diagnostic["branch"] == json!([1]))
+    );
 }
 
 #[test]

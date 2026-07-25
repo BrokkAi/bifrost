@@ -8,15 +8,16 @@ use std::sync::Arc;
 
 use super::WorkspaceSemanticOracle;
 use crate::analyzer::semantic::{
-    CallSiteHandle, CandidateCoverage, ContentIdentity, DeclarationLocator, DeclarationSegment,
-    DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
-    DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    OracleLimits, OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus,
-    SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
-    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
-    SourcePosition, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+    CallSiteHandle, CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator,
+    DeclarationSegment, DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind,
+    DispatchCandidate, DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness,
+    EvidenceHandle, OracleLimits, OracleRelationArena, OracleRelationId, OracleRelationOwner,
+    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureKind,
+    ProcedureSemantics, ProofStatus, SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
+    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 use crate::analyzer::usages::{
@@ -1596,11 +1597,74 @@ pub(crate) fn procedures_for_definition(
     procedure_handles_for_ranges(artifact, compatible, &ranges)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcedureRangeLookupStatus {
+    Complete,
+    BudgetExhausted,
+    Cancelled,
+}
+
+pub(crate) struct ProcedureRangeLookup {
+    pub(crate) handles: Vec<ProcedureHandle>,
+    pub(crate) examined: usize,
+    pub(crate) status: ProcedureRangeLookupStatus,
+}
+
 pub(crate) fn procedures_for_source_ranges(
     artifact: &Arc<SemanticArtifact>,
     ranges: &[Range],
-) -> Vec<ProcedureHandle> {
-    procedure_handles_for_ranges(artifact, artifact.procedures().iter(), ranges)
+    max_examined: usize,
+    cancellation: &CancellationToken,
+) -> ProcedureRangeLookup {
+    let mut exact = Vec::new();
+    let mut enclosing = Vec::new();
+    let mut examined = 0usize;
+    for procedure in artifact.procedures() {
+        if examined >= max_examined {
+            return ProcedureRangeLookup {
+                handles: Vec::new(),
+                examined,
+                status: ProcedureRangeLookupStatus::BudgetExhausted,
+            };
+        }
+        if examined.is_multiple_of(64) && cancellation.is_cancelled() {
+            return ProcedureRangeLookup {
+                handles: Vec::new(),
+                examined,
+                status: ProcedureRangeLookupStatus::Cancelled,
+            };
+        }
+        examined = examined.saturating_add(1);
+        let span = procedure.locator().anchor().span();
+        if ranges.iter().any(|range| {
+            range.start_byte == span.start_byte() as usize
+                && range.end_byte == span.end_byte() as usize
+        }) {
+            exact.push(procedure);
+        } else if ranges.iter().any(|range| {
+            span.start_byte() as usize <= range.start_byte
+                && span.end_byte() as usize >= range.end_byte
+        }) {
+            enclosing.push(procedure);
+        }
+    }
+    if cancellation.is_cancelled() {
+        return ProcedureRangeLookup {
+            handles: Vec::new(),
+            examined,
+            status: ProcedureRangeLookupStatus::Cancelled,
+        };
+    }
+    let mut matches = if exact.is_empty() { enclosing } else { exact };
+    matches.sort_by(|left, right| left.locator().cmp(right.locator()));
+    ProcedureRangeLookup {
+        handles: matches
+            .into_iter()
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .collect(),
+        examined,
+        status: ProcedureRangeLookupStatus::Complete,
+    }
 }
 
 fn procedure_handles_for_ranges<'a>(

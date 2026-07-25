@@ -343,6 +343,14 @@ impl QueryOperatorWorkProfile {
                     .semantic
                     .control_edges
                     .saturating_add(other.semantic.control_edges),
+                retained_bytes: self
+                    .semantic
+                    .retained_bytes
+                    .saturating_add(other.semantic.retained_bytes),
+                traversal_steps: self
+                    .semantic
+                    .traversal_steps
+                    .saturating_add(other.semantic.traversal_steps),
                 budget_exhausted: self.semantic.budget_exhausted || other.semantic.budget_exhausted,
             },
         }
@@ -397,6 +405,14 @@ impl QueryOperatorWorkProfile {
                     .semantic
                     .control_edges
                     .saturating_sub(earlier.semantic.control_edges),
+                retained_bytes: self
+                    .semantic
+                    .retained_bytes
+                    .saturating_sub(earlier.semantic.retained_bytes),
+                traversal_steps: self
+                    .semantic
+                    .traversal_steps
+                    .saturating_sub(earlier.semantic.traversal_steps),
                 // A terminal state is not an arithmetic counter: retain it
                 // only when it first appeared in this interval.
                 budget_exhausted: self.semantic.budget_exhausted

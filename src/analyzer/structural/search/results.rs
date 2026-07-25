@@ -855,6 +855,8 @@ pub struct CodeQuerySemanticLimits {
     pub max_materialized_files: usize,
     pub max_source_bytes: usize,
     pub max_rows_per_dimension: usize,
+    pub max_retained_bytes: usize,
+    pub max_traversal_steps: usize,
 }
 
 impl CodeQuerySemanticLimits {
@@ -862,6 +864,8 @@ impl CodeQuerySemanticLimits {
         self.max_materialized_files > 0
             && self.max_source_bytes > 0
             && self.max_rows_per_dimension > 0
+            && self.max_retained_bytes > 0
+            && self.max_traversal_steps > 0
     }
 }
 
@@ -884,6 +888,8 @@ pub struct CodeQuerySemanticWork {
     pub procedures: u64,
     pub program_points: u64,
     pub control_edges: u64,
+    pub retained_bytes: u64,
+    pub traversal_steps: u64,
     pub budget_exhausted: bool,
 }
 
@@ -1039,6 +1045,8 @@ impl Default for CodeQuerySemanticLimits {
             max_materialized_files: MAX_SEMANTIC_MATERIALIZED_FILES,
             max_source_bytes: MAX_SEMANTIC_SOURCE_BYTES,
             max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION,
+            max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES,
+            max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS,
         }
     }
 }

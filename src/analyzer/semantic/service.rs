@@ -134,6 +134,10 @@ fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifac
         .max(1)
 }
 
+pub(crate) fn semantic_artifact_retained_bytes(artifact: &SemanticArtifact) -> u64 {
+    retained_artifact_bytes(artifact.key(), artifact)
+}
+
 fn weigh_complete_artifact(key: &SemanticArtifactKey, artifact: &Arc<SemanticArtifact>) -> u32 {
     retained_artifact_bytes(key, artifact).min(u64::from(u32::MAX)) as u32
 }

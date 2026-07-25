@@ -161,6 +161,8 @@ const MAX_PIPELINE_ROWS: usize = 50_000;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
+const MAX_SEMANTIC_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SEMANTIC_TRAVERSAL_STEPS: usize = 1_000_000;
 const MAX_PROVENANCE_TRACES: usize = 16;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 const CODE_QUERY_SCHEDULER_WORKERS: usize = 2;
@@ -1355,9 +1357,6 @@ fn execute_internal_with_strategy(
         &mut diagnostics,
         &mut profile_branch,
     );
-    if let Some(semantic) = &mut state.semantic {
-        diagnostics.extend(semantic.take_diagnostics());
-    }
     if !state
         .structural_index_session
         .selections_are_current(|generations| {
@@ -1384,11 +1383,8 @@ fn execute_internal_with_strategy(
         .semantic
         .as_ref()
         .map_or_else(CodeQuerySemanticWork::default, CfgQueryService::work);
-    let execution_work_profile = capture_profile.then(|| {
-        let mut work = execution_work_snapshot(state.budget);
-        work.semantic = semantic_work;
-        work
-    });
+    let execution_work_profile =
+        capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
     let rendering_started = capture_profile.then(Instant::now);
     let mut cancelled = execution.cancelled;
     let mut truncated = execution.truncated;
@@ -1475,8 +1471,7 @@ fn execute_internal_with_strategy(
     if !cancelled && !structural_index_stale {
         state.structural_index_session.publish_auto_observations();
     }
-    let mut total_work = execution_work_snapshot(state.budget);
-    total_work.semantic = semantic_work;
+    let total_work = execution_work_snapshot(state.budget, semantic_work);
     let work = public_execution_work(total_work);
     if let Some(profile) = &mut state.profile {
         let execution_work = execution_work_profile.unwrap_or_default();
@@ -1566,7 +1561,10 @@ fn detailed_result_without_evidence(
 ) -> DetailedCodeQueryResult {
     let detailed = DetailedCodeQueryResult {
         result,
-        work: public_execution_work(execution_work_snapshot(budget)),
+        work: public_execution_work(execution_work_snapshot(
+            budget,
+            CodeQuerySemanticWork::default(),
+        )),
         evidence: Vec::new(),
         profile: None,
     };
@@ -1585,7 +1583,10 @@ fn public_execution_work(work: QueryOperatorWorkProfile) -> CodeQueryExecutionWo
     }
 }
 
-fn execution_work_snapshot(budget: CodeQueryExecutionBudget) -> QueryOperatorWorkProfile {
+fn execution_work_snapshot(
+    budget: CodeQueryExecutionBudget,
+    semantic: CodeQuerySemanticWork,
+) -> QueryOperatorWorkProfile {
     let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
     QueryOperatorWorkProfile {
         scanned_files: as_u64(budget.scanned_files),
@@ -1596,8 +1597,18 @@ fn execution_work_snapshot(budget: CodeQueryExecutionBudget) -> QueryOperatorWor
         provenance_steps: as_u64(budget.provenance_steps),
         import_files_resolved: as_u64(budget.import_files_resolved),
         import_edges_resolved: as_u64(budget.import_edges_resolved),
-        semantic: CodeQuerySemanticWork::default(),
+        semantic,
     }
+}
+
+fn state_execution_work_snapshot(state: &QueryExecutionState<'_>) -> QueryOperatorWorkProfile {
+    execution_work_snapshot(
+        state.budget,
+        state
+            .semantic
+            .as_ref()
+            .map_or_else(CodeQuerySemanticWork::default, CfgQueryService::work),
+    )
 }
 
 fn elapsed_ns(started: Instant) -> u64 {
@@ -2491,7 +2502,7 @@ fn execute_plan(
     let mut merge_ns = 0u64;
     let mut scheduling_overhead_ns = 0u64;
     let mut terminations = profiling.then(Vec::new);
-    let mut work_started = profiling.then(|| execution_work_snapshot(state.budget));
+    let mut work_started = profiling.then(|| state_execution_work_snapshot(state));
     let mut cache_started = state.cache_profile;
     let mut own_diagnostic_start = diagnostics.len();
 
@@ -2546,7 +2557,7 @@ fn execute_plan(
                     dependency_execution_ns.saturating_add(elapsed_ns(started));
             }
             input_rows = child.rows.len();
-            work_started = profiling.then(|| execution_work_snapshot(state.budget));
+            work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
             if child.cancelled {
@@ -2627,7 +2638,7 @@ fn execute_plan(
             if self_truncated {
                 push_operator_termination(&mut terminations, QueryOperatorTermination::TerminalCap);
             }
-            work_started = profiling.then(|| execution_work_snapshot(state.budget));
+            work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
             if parallel.execution.cancelled {
@@ -2703,7 +2714,7 @@ fn execute_plan(
                     if let Some(started) = prefix_started {
                         merge_ns = merge_ns.saturating_add(elapsed_ns(started));
                     }
-                    work_started = profiling.then(|| execution_work_snapshot(state.budget));
+                    work_started = profiling.then(|| state_execution_work_snapshot(state));
                     cache_started = state.cache_profile;
                     own_diagnostic_start = diagnostics.len();
                     truncated |= child.truncated;
@@ -2776,7 +2787,7 @@ fn execute_plan(
             input_rows = child.rows.len();
             rows_visited = input_rows;
             rows_discarded = Some(0);
-            work_started = profiling.then(|| execution_work_snapshot(state.budget));
+            work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
             let dependency_cancelled = child.cancelled;
@@ -2837,10 +2848,12 @@ fn execute_plan(
         }
     }
 
+    let observed_work = profiling.then(|| state_execution_work_snapshot(state));
     if let (Some(profile), Some(started)) = (&mut state.profile, invocation_started) {
         let total_elapsed_ns = elapsed_ns(started);
-        let work =
-            execution_work_snapshot(state.budget).saturating_sub(work_started.unwrap_or_default());
+        let work = observed_work
+            .unwrap_or_default()
+            .saturating_sub(work_started.unwrap_or_default());
         let cache = state
             .cache_profile
             .unwrap_or_default()
@@ -4680,6 +4693,9 @@ fn apply_plan_step(
         &mut state.cache_profile,
         instrumentation,
     );
+    if let Some(semantic) = &mut state.semantic {
+        diagnostics.extend(semantic.take_diagnostics());
+    }
     if let Some(selected_generations) = selected_layer_generations
         && !state
             .analyzer
@@ -5150,7 +5166,7 @@ fn apply_pipeline_step(
             (PipelineValue::ProgramPoint(point), QueryStep::CfgSuccessorEdges) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_successor_edges(point)
+                .cfg_successor_edges(point, max_step_outputs.saturating_sub(output.len()))
                 .into_iter()
                 .map(PipelineValue::ControlEdge)
                 .map(pipeline_expansion)
@@ -5158,7 +5174,7 @@ fn apply_pipeline_step(
             (PipelineValue::ProgramPoint(point), QueryStep::CfgPredecessorEdges) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_predecessor_edges(point)
+                .cfg_predecessor_edges(point, max_step_outputs.saturating_sub(output.len()))
                 .into_iter()
                 .map(PipelineValue::ControlEdge)
                 .map(pipeline_expansion)

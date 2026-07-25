@@ -46,7 +46,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 11:58Z) Implemented the request-scoped CFG query adapter with cached semantic outcomes, lazy semantic budgets, capability/partial/provider diagnostics, cancellation propagation, stable source-backed identities, and typed provenance.
 - [x] (2026-07-25 11:58Z) Integrated the CFG algebra with ordinary execution, explain/profile accounting, compact/full rendering, typed evidence, and analyzer-only workspace diagnostics.
 - [x] (2026-07-25 12:28Z) Ran the requested branch-versus-`origin/master` guided review after the core Rust checkpoint and triaged eleven confirmed findings across correctness, resource bounds, public identity, profiling/explain output, schema metadata, and architecture.
-- [ ] Correct the reviewed semantic execution defects: one-way enclosing-procedure selection, character-based public ranges, bounded and cancellable materialization/traversal, branch-aware diagnostics, accurate per-operator work, stable content-scoped public IDs, and semantic policy hard caps.
+- [x] (2026-07-25 16:38 SAST) Corrected the reviewed semantic execution defects: one-way enclosing-procedure selection, character-based public ranges, bounded and cancellable materialization/traversal, branch-aware diagnostics, accurate per-operator work, stable content-scoped public IDs, and semantic policy hard caps.
 - [ ] Complete Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
 - [ ] Complete Milestone 5 by updating MCP, Python, LSP/VS Code, TextMate grammar, public docs, executable examples, and their behavior-focused tests for schema version 3.
 - [ ] Complete Milestone 6 by reconciling the umbrella roadmap, running the remaining client/documentation tests and the full `nlp,python` release gate, then performing the final guided review.
@@ -94,6 +94,12 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: A small terminal result limit does not bound semantic artifact retention or intermediate procedure/edge enumeration.
   Evidence: Materialization can retain every semantic dimension before pipeline truncation, and the first `procedure_of` path repeatedly enumerates all artifact procedures without charging that lookup or checking cancellation.
+
+- Observation: Stable semantic validity identity and stable public wire identity have different scopes.
+  Evidence: `SemanticArtifactKey::fingerprint` correctly includes the absolute workspace root and overlay snapshot for request-local cache validity, while checkout-independent public IDs require a separate fingerprint over relative path, content, language, adapter, IR, configuration, and dependency identities.
+
+- Observation: Semantic diagnostics were drained only after the complete root expression and the service-level dedupe key omitted set-branch provenance.
+  Evidence: A budget diagnostic emitted inside the second set branch surfaced without `[1]`, and successful branch work was charged only to the synthetic root profile node. Draining diagnostics and snapshotting semantic work after every physical step preserves the operator and branch that caused them.
 
 ## Decision Log
 
@@ -149,6 +155,14 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
   Rationale: The user explicitly requested that every finding be fixed and that implementation continue until this first #824 slice is complete. Several findings affect the public shape that later clients and analysis domains would otherwise copy.
   Date/Author: 2026-07-25 / User and Codex
 
+- Decision: Keep `SemanticArtifactKey::fingerprint` as the complete cache-validity identity and add `public_fingerprint` for checkout-independent wire IDs.
+  Rationale: Removing the root or overlay snapshot from the existing fingerprint would weaken cache isolation. Public identities instead need to remain equal for identical indexed content mounted at different absolute paths.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: Add explicit retained-byte and traversal-step dimensions to the semantic execution budget, and enforce every semantic dimension through policy hard caps.
+  Rationale: File and row counts alone cannot bound retained source/artifact memory or a lookup that examines many procedures but returns one row. Separate ledgers make both costs finite, observable, and reusable by later data-flow adapters.
+  Date/Author: 2026-07-25 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 established schema version 3 while preserving exact version-2 pins. JSON and RQL now lower to the same seven-operation CFG algebra, validate procedure/point/edge domains before execution, and map version errors back to the authored operation. The compatible head also flows through LSP schema completion and policy documentation. Execution deliberately remains incomplete, not panicking, until the typed result contracts and semantic adapter land.
@@ -166,6 +180,10 @@ Validation at this checkpoint passed the complete integration-test compile gate,
 The core Milestone 3 execution checkpoint binds those contracts to the existing workspace semantic service without moving CFG construction into CodeQuery. A request-local adapter materializes each reached file at most once, caches exact success or failure outcomes, charges a separate semantic ledger, and traverses procedures, entries/exits, control edges, and endpoints through typed internal handles. Public rows use artifact-scoped stable IDs, source mappings, bounded evidence reasons, and provenance that survives ordinary, compact, full, and profiled result modes. Analyzer-only entry points explicitly report that workspace semantic services are required.
 
 Validation at this checkpoint passed `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, the CI-configured `cargo test --tests --features nlp,python --no-run` compile gate, all 114 `code_query_pipelines` tests, the structural search tests (71 tests), the execution-profile tests (3 tests), and the public API tests (6 tests). The focused coverage includes Rust and TypeScript CFG lowering, entry/exit ordering, successor/predecessor traversal, endpoint recovery, request-cache reuse, semantic budget exhaustion, invalid zero limits, stable same-artifact IDs, partial evidence, no-enclosing-procedure advisories, and analyzer-only workspace diagnostics.
+
+The reviewed correctness-and-bounds checkpoint separates cache validity from public identity, converts UTF-8 offsets to public character columns, restricts `procedure_of` to true enclosing procedures, and adds cancellable traversal plus retained-memory budgets. Semantic diagnostics and work are now drained at physical-step boundaries, preserving set-branch provenance and operator attribution; policy caps cover every semantic budget dimension. Shared semantic labels and digest framing replace the duplicate CFG-local identity helpers.
+
+Validation for this correction passed `cargo fmt`, `cargo check --lib`, the policy-budget and semantic-limit unit tests, all 119 `code_query_pipelines` integration tests, and focused regressions for nested procedures, Unicode columns, checkout-independent IDs, traversal exhaustion, branch diagnostics, and semantic profile accounting.
 
 ## Context and Orientation
 
@@ -512,3 +530,5 @@ Revision note (2026-07-25 / Codex): Created the issue-specific ExecPlan after li
 Revision note (2026-07-25 / Codex): Recorded implementation approval, milestone checkpoint commits, frequent `origin/master` synchronization, and guided-review gates before source changes begin.
 
 Revision note (2026-07-25 / Codex): Added the post-core guided-review findings as required corrective checkpoints, split the remaining client, planning/profile, architecture, and release work into restartable progress entries, and recorded the concrete contract and execution failures that must be fixed before the public schema rollout.
+
+Revision note (2026-07-25 16:38 SAST / Codex): Completed the reviewed correctness-and-bounds checkpoint, recorded the separate validity/public identity scopes and per-step diagnostic/profile attribution, and added the focused and full pipeline validation evidence.
