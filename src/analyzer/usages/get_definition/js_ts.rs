@@ -3190,7 +3190,14 @@ fn ts_schema_infer_argument(text: &str) -> Option<&str> {
     let text = text.trim();
     let open = text.find('<')?;
     let head = text[..open].trim();
-    let last = head.rsplit('.').next()?;
+    // `head` is a type-annotation qualifier chain (already sliced before any
+    // generic argument list), so re-tokenizing it with the shared structured
+    // splitter and taking the last segment reproduces `rsplit('.').next()`'s
+    // terminal split exactly (TS/JS have no per-segment normalization
+    // quirks, unlike Go/Rust/Cpp).
+    let last = crate::analyzer::symbol_lookup::parse_symbol_path(Language::TypeScript, head)
+        .pop()
+        .unwrap_or_default();
     if !head.contains('.') || !(last == "infer" || last == "Infer") {
         return None;
     }

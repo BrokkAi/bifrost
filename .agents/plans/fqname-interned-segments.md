@@ -1150,6 +1150,139 @@ the analyzer tree.
     on an injected un-annotated `rsplit_once('$')`; the deleted `default_parent_fq_name`
     scan arm's twin now yields `None` for an empty-fq unit.
 
+## Outcomes & Retrospective
+
+M0–M4 delivered the plan's stated payoff: qualified names are interned,
+kind-tagged `FqName`s built once at extraction; the shared consumers
+(`parent_of`, the enclosing-scope resolver, candidate-row hydration) read
+segments instead of re-splitting strings; the grep-gate
+(`tests/no_stringly_name_parsing.rs`) locks the two sharpest re-inference
+shapes; and issue #1163's pinned false boundary
+(`cpp_qualified_nested_namespace_type_current_behavior`) flipped to asserting
+real resolution. The M4 census also found the remaining problem was bigger
+than estimated — ~354 production split sites against the plan's ~227 guess —
+and the honest call was to migrate the highest-leverage shared consumers and
+lock the door, recording the long tail (~185 source-derived reference/import/
+specifier splits, plus 22 pre-existing `// fqname-M4:` exemptions to revisit)
+as issue #1168, a bounded follow-up rather than a rushed mechanical sweep.
+
+Issue #1168 closed that follow-up in three batches, each keeping the tree green
+end to end (zero behavior change is the bar throughout — every migration is a
+structurally-equivalent rewrite of an existing split, never a semantic change):
+
+- Batch 1 (`20234e8d`) censused the four densest `get_definition` resolvers
+  (rust, cpp, scala, go): 46 sites — 26 migrated, 16 legitimate source-syntax
+  parses left unannotated, 4 deferred with `// fqname-M4:` reasons. Established
+  the two proven migration targets every later batch reused: `default_parent_fq_name`
+  (a true segment pop, for live-`CodeUnit` owner cuts) and `parse_symbol_path`
+  (the shared structured splitter, for reference/import-path owner-or-terminal
+  extraction, justified by a split-then-rejoin exactness argument). Also found
+  scala's `identifier ?? terminal-of(joined-path)` idiom was exactly
+  `ImportInfo::local_name()`, deleting a join-then-resplit round-trip outright.
+- Batch 2 (`d8e3e15f`) censused all ten `usages/*_graph` modules: ~60 sites — 24
+  migrated, 22 legitimate, 14 deferred (php_graph had zero sites). Corrected two
+  scala sites whose pre-existing `fqname-M4` exemptions were factually wrong
+  (the old bodies manually rebuilt package-qualified strings that a segment pop
+  reproduces exactly). Added `scala_short_name_terminal_segment` and
+  `csharp_namespace_parent` as further shared helpers. Identified, but did not
+  yet fix, the two out-of-scope multi-line accessor-split instances
+  (`src/analyzer/common.rs`, `src/analyzer/scala/mod.rs`) and the fact that the
+  grep-gate's exemption scanner could not walk past chain-continuation lines —
+  both carried into batch 3.
+- Batch 3 (this batch) closed out the remaining scope in three parts:
+  - Part A censused the six remaining `get_definition` resolvers (java, python,
+    php, ruby, csharp, js_ts): 40 split-family call sites — 11 migrated (java 7,
+    python 1, php 1, csharp 1, js_ts 1), 28 legitimate source-syntax parses
+    (mostly test-fixture byte-offset lookups and generic/signature-text
+    parsing) left unannotated, 1 left as a pre-existing `fqname-M4` exemption
+    (ruby's whole-chain `$`-split, already correctly deferred from the original
+    M4 landing). New shared helpers: `java_terminal_segment` and
+    `java_owner_and_member` in `src/analyzer/usages/get_definition/java.rs`
+    (the latter also let one redundant duplicate split collapse into a single
+    call). ruby.rs and mod.rs had no live migratable sites (ruby's non-`$`
+    splits were all `#[cfg(test)]` fixture code; mod.rs's `rfind`s were the
+    same).
+  - Part B fixed the two sites batch 2 found out of scope:
+    `common.rs`'s `is_scala_object_like` (a `target.short_name().split('.')`
+    chain spread across three lines) now walks `target.fq()` for a `Companion`
+    segment directly, and `scala/mod.rs`'s `scala_simple_type_name` (same
+    multi-line-chain shape) now reuses `scala_short_name_terminal_segment`
+    (widened from `pub(super)` to `pub(crate)` for this second call site).
+    Widening the gate in Part C surfaced a third, previously-invisible real
+    instance outside either named file: `global_usage_definition_index.rs`'s
+    `insert` bound `let fqn = unit.fq_name();` and split it 44 lines later to
+    build the `direct_children_by_fqn`/`direct_children_by_normalized_fqn`
+    owner-cut indexes. This one was tried as a migration to
+    `default_parent_fq_name(unit)` first — structurally the right call, and it
+    even fixes a latent correctness gap (the naive rightmost-`.` cut mis-splits
+    a Go unit whose whole `fq` is `Path` segments, per the M2 Decision Log) —
+    but the full validation sweep caught a real regression:
+    `usage_graph_csharp_test::csharp_issue701_structured_expression_type_roots_have_inverted_graph_parity`
+    failed. Bisected by toggling the two implementations behind a debug print
+    (reverted): C#'s using-namespace nested-type visibility resolution relies
+    on this index keying a `$`-nested type (`Demo.InheritedOuter$Nested`) under
+    its NAMESPACE (`Demo`, the naive cut's target, since rightmost-`.` skips
+    over the `$` boundary) rather than its immediate owning type
+    (`Demo.InheritedOuter`, what the correct segment pop produces) — a real
+    behavior dependency, not just a representation difference. Zero-behavior-
+    change is the hard bar for this issue, so the migration was reverted and
+    the site left on its original naive cut with a `// fqname-M4:` comment
+    recording exactly this finding, so a future contributor migrating C#'s
+    nested-type visibility resolution onto segments can flip this one too.
+  - Part C added the gate's third banned shape ("shape C"): a `CodeUnit` name
+    accessor's result reaching a split-family call without both appearing on
+    the same source line — either a direct method-chain continuation (the
+    exact shape Part B fixed twice) or a local-variable binding split later
+    (the exact shape the `global_usage_definition_index.rs` find was). The
+    exemption-comment scanner was rewritten to search a statement's own span
+    plus the comment block directly above the statement's *first* line
+    (computed via a backward continuation-line walk for chained calls, or the
+    `let` line itself for bindings) rather than stopping at the first
+    non-comment line above the split call — which is what let it walk past a
+    accessor call's own line without finding a comment written above the
+    whole statement. Verified by mutation twice: seven new unit tests exercise
+    the new matcher and scanner directly, and a temporary un-annotated
+    `let terminal = short.rsplit('.').next()` was inserted into
+    `common.rs`/reverted, confirming the live gate fails naming the exact
+    line and passes again once removed. Broadening the gate to scan the whole
+    `src/analyzer` tree surfaced no other live shape-C violations beyond the
+    three fixed in Part B (the two remaining hits it found on the first run,
+    in `cpp_graph/resolver.rs` and `python_graph/extractor.rs`, were false
+    negatives of the *old* exemption scanner on *already*-exempted code from
+    batches 1/2 — not new violations — and now correctly recognize their
+    existing `fqname-M4` comments).
+
+Three-batch totals for issue #1168's closure: 46 + ~60 + 43 = ~149 split-family
+sites censused (against the issue's ~185 estimate; the gap is the ~36
+site-count fuzziness already inherent in the "~" estimates batches 1/2
+recorded, not a known remaining gap) — 26 + 24 + 13 = 63 migrated onto
+`default_parent_fq_name`/`parse_symbol_path`/`ImportInfo::local_name`, ~16 + 22
++ 28 = ~66 confirmed legitimate source-syntax parses (left unannotated), and
+4 + 14 + 2 = 20 left as reviewed `// fqname-M4:` exemptions (batch 3's two are
+ruby's pre-existing whole-chain `$`-split and the newly-annotated
+`global_usage_definition_index.rs` finding above). The grep-gate now bans
+three shapes instead of two and tolerates chain-continuation formatting in its
+exemption lookup. Every batch's full validation sweep (`cargo fmt`; `cargo
+clippy --all-targets --all-features -D warnings`; `--lib`; `get_definition_test`;
+`searchtools_service`; `searchtools_definition_selectors`;
+`no_stringly_name_parsing`; `mcp_property_fuzzer_service`; the 9 issue
+canaries; every touched language's analyzer/usages suites) stayed green
+throughout, with zero behavior change — the `global_usage_definition_index.rs`
+regression caught by that sweep (and reverted before landing, see above) is
+exactly the discipline this bar is meant to enforce: a structurally-more-correct
+rewrite is still a behavior change if something downstream depends on the old
+shape, and the sweep is what catches that before it ships, not code review.
+
+What remains, for whoever next touches this area: the 20 exemptions across
+three batches are reviewed and reasoned, but not re-checked on every future
+touch of their files — CLAUDE.md's guidance to revisit `// fqname-M4:` comments
+"when its module is touched" still applies per-site, and the
+`global_usage_definition_index.rs` one specifically names the C# nested-type
+consumer that would need to move in lockstep for that site to migrate. Go's domain-dotted package
+prefixes and rust's `r#`-stripping splitter remain permanently-legitimate,
+language-specific parses, not migration debt. No further batches are planned;
+issue #1168 is closed by this batch.
+
 ## Context and Orientation
 
 Bifrost is a Rust code analyzer and MCP server. Each source declaration becomes a
