@@ -38,6 +38,13 @@ pub(super) const fn oldest_rql_schema_version() -> u64 {
     RQL_SCHEMA_VERSIONS[0].version as u64
 }
 
+pub(crate) fn supported_query_schema_versions() -> Vec<u64> {
+    RQL_SCHEMA_VERSIONS
+        .iter()
+        .map(|descriptor| descriptor.version as u64)
+        .collect()
+}
+
 pub(crate) fn resolve_rql_schema_version(
     authored_version: Option<u32>,
 ) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {

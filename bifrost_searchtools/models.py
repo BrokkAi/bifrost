@@ -224,6 +224,11 @@ class CodeQueryResultRef:
     input_kind: str | None = None
     parameter_index: int | None = None
     parameter_name: str | None = None
+    procedure_id: str | None = None
+    procedure_kind: str | None = None
+    boundary: str | None = None
+    edge_kind: str | None = None
+    source_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultRef:
@@ -252,6 +257,11 @@ class CodeQueryResultRef:
             if "parameter_index" in data
             else None,
             parameter_name=data.get("parameter_name"),
+            procedure_id=data.get("procedure_id"),
+            procedure_kind=data.get("procedure_kind"),
+            boundary=data.get("boundary"),
+            edge_kind=data.get("edge_kind"),
+            source_id=data.get("source_id"),
         )
 
 
@@ -394,6 +404,178 @@ class CodeQueryDeclaration:
         if self.signature is not None:
             rendered += f" `{self.signature}`"
         return rendered
+
+
+class CodeQuerySemanticProof(StrEnum):
+    PROVEN = "proven"
+    UNPROVEN = "unproven"
+
+
+class CodeQuerySemanticCompleteness(StrEnum):
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+
+
+class CodeQueryProgramPointBoundary(StrEnum):
+    ENTRY = "entry"
+    NORMAL_EXIT = "normal_exit"
+    EXCEPTIONAL_EXIT = "exceptional_exit"
+
+
+@dataclass(frozen=True)
+class CodeQuerySemanticEvidence:
+    proof: CodeQuerySemanticProof
+    completeness: CodeQuerySemanticCompleteness
+    proof_reason: str | None = None
+    completeness_reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQuerySemanticEvidence:
+        return cls(
+            proof=CodeQuerySemanticProof(data["proof"]),
+            completeness=CodeQuerySemanticCompleteness(data["completeness"]),
+            proof_reason=data.get("proof_reason"),
+            completeness_reason=data.get("completeness_reason"),
+        )
+
+    @property
+    def status(self) -> str:
+        return f"{self.proof.value}/{self.completeness.value}"
+
+
+@dataclass(frozen=True)
+class CodeQueryProgramPointRef:
+    id: str
+    procedure_id: str
+    path: str
+    range: CodeQueryRange
+    boundary: CodeQueryProgramPointBoundary | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryProgramPointRef:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            boundary=(
+                CodeQueryProgramPointBoundary(data["boundary"])
+                if data.get("boundary") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryProcedure:
+    id: str
+    artifact_id: str
+    path: str
+    language: str
+    procedure_kind: str
+    range: CodeQueryRange
+    evidence: CodeQuerySemanticEvidence
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryProcedure:
+        return cls(
+            id=data["id"],
+            artifact_id=data["artifact_id"],
+            path=data["path"],
+            language=data["language"],
+            procedure_kind=data["procedure_kind"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[procedure; {self.procedure_kind}; {self.evidence.status}]"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryProgramPoint:
+    id: str
+    procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    boundary: CodeQueryProgramPointBoundary | None
+    event_count: int
+    evidence: CodeQuerySemanticEvidence
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryProgramPoint:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            boundary=(
+                CodeQueryProgramPointBoundary(data["boundary"])
+                if data.get("boundary") is not None
+                else None
+            ),
+            event_count=int(data["event_count"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        boundary = self.boundary.value if self.boundary is not None else "ordinary"
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[program point; {boundary}; {self.event_count} events; "
+            f"{self.evidence.status}]"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryControlEdge:
+    id: str
+    procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    edge_kind: str
+    source: CodeQueryProgramPointRef
+    target: CodeQueryProgramPointRef
+    evidence: CodeQuerySemanticEvidence
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryControlEdge:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            edge_kind=data["edge_kind"],
+            source=CodeQueryProgramPointRef.from_dict(data["source"]),
+            target=CodeQueryProgramPointRef.from_dict(data["target"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[control edge; {self.edge_kind}; {self.evidence.status}] "
+            f"{self.source.id} -> {self.target.id}"
+        )
 
 
 @dataclass(frozen=True)
@@ -569,6 +751,9 @@ class CodeQueryExpressionSite:
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
+    | CodeQueryProcedure
+    | CodeQueryProgramPoint
+    | CodeQueryControlEdge
     | CodeQueryFile
     | CodeQueryReferenceSite
     | CodeQueryCallSite
@@ -582,6 +767,12 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryMatch.from_dict(data)
     if result_type == "declaration":
         return CodeQueryDeclaration.from_dict(data)
+    if result_type == "procedure":
+        return CodeQueryProcedure.from_dict(data)
+    if result_type == "program_point":
+        return CodeQueryProgramPoint.from_dict(data)
+    if result_type == "control_edge":
+        return CodeQueryControlEdge.from_dict(data)
     if result_type == "file":
         return CodeQueryFile.from_dict(data)
     if result_type == "reference_site":
@@ -600,7 +791,14 @@ class CodeQueryDiagnosticCode(StrEnum):
     MISSING_STRUCTURAL_ADAPTER = "missing_structural_adapter"
     UNSUPPORTED_IMPORT_ANALYSIS = "unsupported_import_analysis"
     SEMANTIC_RESULTS_OMITTED = "semantic_results_omitted"
+    SEMANTIC_WORKSPACE_REQUIRED = "semantic_workspace_required"
+    NO_ENCLOSING_PROCEDURE = "no_enclosing_procedure"
+    SEMANTIC_CAPABILITY_UNSUPPORTED = "semantic_capability_unsupported"
+    SEMANTIC_ANALYSIS_PARTIAL = "semantic_analysis_partial"
+    SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
+    SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
     RECEIVER_ANALYSIS_PARTIAL = "receiver_analysis_partial"
+    RECEIVER_ANALYSIS_FAILED = "receiver_analysis_failed"
     CALL_RELATION_BUDGET_EXHAUSTED = "call_relation_budget_exhausted"
     CALL_RELATION_PARSE_FAILED = "call_relation_parse_failed"
     CALL_RELATION_CANDIDATES_OMITTED = "call_relation_candidates_omitted"
@@ -894,23 +1092,51 @@ class CodeQueryLogicalPlan:
 
 
 @dataclass(frozen=True)
+class CodeQuerySemanticRequest:
+    procedures: bool
+    program_points: bool
+    control_edges: bool
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticRequest:
+        return cls(
+            procedures=bool(data["procedures"]),
+            program_points=bool(data["program_points"]),
+            control_edges=bool(data["control_edges"]),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQueryPhysicalNode:
     id: int
     logical_node: int
     operator: CodeQueryPhysicalOperator
     output_kind: str
     dependencies: list[int] = field(default_factory=list)
+    semantic_request: CodeQuerySemanticRequest | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQueryPhysicalNode:
-        known = {"id", "logical_node", "operator", "output_kind", "dependencies"}
+        known = {
+            "id",
+            "logical_node",
+            "operator",
+            "output_kind",
+            "dependencies",
+            "semantic_request",
+        }
         return cls(
             id=int(data["id"]),
             logical_node=int(data["logical_node"]),
             operator=CodeQueryPhysicalOperator(data["operator"]),
             output_kind=str(data["output_kind"]),
             dependencies=[int(node) for node in data.get("dependencies", [])],
+            semantic_request=(
+                CodeQuerySemanticRequest.from_dict(data["semantic_request"])
+                if data.get("semantic_request") is not None
+                else None
+            ),
             extra=_extra_fields(data, known),
         )
 
@@ -1034,6 +1260,35 @@ class CodeQueryProfileTimings:
 
 
 @dataclass(frozen=True)
+class CodeQuerySemanticWork:
+    materialization_attempts: int = 0
+    unique_materialized_files: int = 0
+    request_cache_hits: int = 0
+    source_bytes: int = 0
+    procedures: int = 0
+    program_points: int = 0
+    control_edges: int = 0
+    retained_bytes: int = 0
+    traversal_steps: int = 0
+    budget_exhausted: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticWork:
+        return cls(
+            materialization_attempts=int(data.get("materialization_attempts", 0)),
+            unique_materialized_files=int(data.get("unique_materialized_files", 0)),
+            request_cache_hits=int(data.get("request_cache_hits", 0)),
+            source_bytes=int(data.get("source_bytes", 0)),
+            procedures=int(data.get("procedures", 0)),
+            program_points=int(data.get("program_points", 0)),
+            control_edges=int(data.get("control_edges", 0)),
+            retained_bytes=int(data.get("retained_bytes", 0)),
+            traversal_steps=int(data.get("traversal_steps", 0)),
+            budget_exhausted=bool(data.get("budget_exhausted", False)),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQueryProfileWork:
     scanned_files: int = 0
     scanned_source_bytes: int = 0
@@ -1043,6 +1298,7 @@ class CodeQueryProfileWork:
     provenance_steps: int = 0
     import_files_resolved: int = 0
     import_edges_resolved: int = 0
+    semantic: CodeQuerySemanticWork = field(default_factory=CodeQuerySemanticWork)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileWork:
@@ -1055,6 +1311,7 @@ class CodeQueryProfileWork:
             provenance_steps=int(data.get("provenance_steps", 0)),
             import_files_resolved=int(data.get("import_files_resolved", 0)),
             import_edges_resolved=int(data.get("import_edges_resolved", 0)),
+            semantic=CodeQuerySemanticWork.from_dict(data.get("semantic", {})),
         )
 
 

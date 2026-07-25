@@ -883,6 +883,50 @@ class Sample {
 }
 
 #[test]
+fn bifrost_lsp_server_returns_navigable_cfg_results() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    fs::write(
+        root.join("flow.ts"),
+        r#"export function run(flag: boolean): number {
+    if (flag) {
+        return 1;
+    }
+    return 0;
+}
+"#,
+    )
+    .expect("write TypeScript CFG fixture");
+    let mut server = LspServer::start(&root);
+
+    let response = server.request(
+        "bifrost/queryCode",
+        json!({
+            "query": "(cfg-successor-edges (cfg-entry (procedure-of (language typescript (function :name \"run\")))))"
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let results = response["result"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected control-edge results: {response}"));
+    assert!(!results.is_empty(), "{response}");
+    assert!(
+        results.iter().all(|result| {
+            result["result_type"] == "control_edge"
+                && result["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.starts_with("file://"))
+                && result["range"]["start_line"].as_u64().is_some()
+                && result["source"]["id"].as_str().is_some()
+                && result["source"]["range"]["start_line"].as_u64().is_some()
+                && result["target"]["id"].as_str().is_some()
+                && result["target"]["range"]["start_line"].as_u64().is_some()
+        }),
+        "expected navigable source-backed control edges in {response}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_units() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canonical root");

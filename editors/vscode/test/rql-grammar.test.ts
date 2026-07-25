@@ -201,3 +201,29 @@ void test("highlights receiver traversal forms and capture options", async () =>
   assertScoped(tokens, ":capture", "variable.parameter.role.bifrost-rql");
   assertScoped(tokens, "member-targets", "support.function.wrapper.bifrost-rql");
 });
+
+void test("highlights schema-v3 CFG forms and aliases", async () => {
+  const forms = [
+    "procedure-of",
+    "procedure_of",
+    "cfg-entry",
+    "cfg_entry",
+    "cfg-exits",
+    "cfg_exits",
+    "cfg-successor-edges",
+    "cfg_successor_edges",
+    "cfg-predecessor-edges",
+    "cfg_predecessor_edges",
+    "cfg-edge-source",
+    "cfg_edge_source",
+    "cfg-edge-target",
+    "cfg_edge_target"
+  ];
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    forms.map((form) => `(${form} (call))`).join(" ")
+  );
+  for (const form of forms) {
+    assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
+  }
+});

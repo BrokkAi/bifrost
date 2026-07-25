@@ -61,6 +61,7 @@ const REQUIRED_JSON_EXAMPLES: &[&str] = &[
     "negative-descendant",
     "kind-union",
     "scope",
+    "cfg-entry-successor",
 ];
 
 #[derive(Debug)]
@@ -118,6 +119,10 @@ fn documented_code_queries_parse() {
     assert!(
         seen.contains(&("rql".to_string(), "complete".to_string())),
         "missing complete RQL code-query example"
+    );
+    assert!(
+        seen.contains(&("rql".to_string(), "cfg-entry-successor".to_string())),
+        "missing procedure-local CFG RQL example"
     );
 }
 

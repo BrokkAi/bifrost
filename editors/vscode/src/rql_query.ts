@@ -46,6 +46,56 @@ export interface RqlDeclarationResult extends RqlQueryResultBase {
   signature?: string;
 }
 
+export interface RqlSemanticEvidence {
+  proof: "proven" | "unproven";
+  proof_reason?: string;
+  completeness: "complete" | "partial";
+  completeness_reason?: string;
+}
+
+export type RqlProgramPointBoundary = "entry" | "normal_exit" | "exceptional_exit";
+
+export interface RqlProgramPointRef {
+  id: string;
+  procedure_id: string;
+  path: string;
+  range: RqlResultRange;
+  boundary?: RqlProgramPointBoundary;
+}
+
+export interface RqlProcedureResult extends RqlQueryResultBase {
+  result_type: "procedure";
+  id: string;
+  artifact_id: string;
+  language: string;
+  procedure_kind: string;
+  range: RqlResultRange;
+  evidence: RqlSemanticEvidence;
+}
+
+export interface RqlProgramPointResult extends RqlQueryResultBase {
+  result_type: "program_point";
+  id: string;
+  procedure_id: string;
+  language: string;
+  range: RqlResultRange;
+  boundary?: RqlProgramPointBoundary;
+  event_count: number;
+  evidence: RqlSemanticEvidence;
+}
+
+export interface RqlControlEdgeResult extends RqlQueryResultBase {
+  result_type: "control_edge";
+  id: string;
+  procedure_id: string;
+  language: string;
+  range: RqlResultRange;
+  edge_kind: string;
+  source: RqlProgramPointRef;
+  target: RqlProgramPointRef;
+  evidence: RqlSemanticEvidence;
+}
+
 export interface RqlReferenceSiteResult extends RqlQueryResultBase {
   result_type: "reference_site";
   language: string;
@@ -138,6 +188,9 @@ export interface RqlReceiverAnalysisResult extends RqlQueryResultBase {
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
+  | RqlProcedureResult
+  | RqlProgramPointResult
+  | RqlControlEdgeResult
   | RqlFileResult
   | RqlReferenceSiteResult
   | RqlCallSiteResult
@@ -233,6 +286,12 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return result.text;
     case "declaration":
       return result.fq_name;
+    case "procedure":
+      return result.procedure_kind;
+    case "program_point":
+      return result.boundary ?? "program point";
+    case "control_edge":
+      return `${result.edge_kind}: ${result.source.id} → ${result.target.id}`;
     case "file":
       return result.path;
     case "reference_site":
@@ -248,6 +307,12 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
 
 export function queryResultDescription(result: RqlQueryResultItem): string {
   switch (result.result_type) {
+    case "procedure":
+      return `${result.evidence.proof}/${result.evidence.completeness} · ${result.range.start_line}:${result.range.start_column}`;
+    case "program_point":
+      return `${result.event_count} events · ${result.evidence.proof}/${result.evidence.completeness}`;
+    case "control_edge":
+      return `${result.evidence.proof}/${result.evidence.completeness} · ${result.range.start_line}:${result.range.start_column}`;
     case "file":
       return `file · ${result.language}`;
     case "reference_site":
@@ -275,6 +340,26 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
       return (
         `**${result.kind}** at ${result.path}:${result.start_line}-${result.end_line}` +
         (result.signature ? `\n\n\`${result.signature}\`` : "")
+      );
+    case "procedure":
+      return (
+        `**${result.procedure_kind} procedure** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nArtifact: \`${result.artifact_id}\`` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}`
+      );
+    case "program_point":
+      return (
+        `**${result.boundary ?? "program point"}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nProcedure: \`${result.procedure_id}\`` +
+        `\n\nEvents: ${result.event_count}` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}`
+      );
+    case "control_edge":
+      return (
+        `**${result.edge_kind} control edge** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nSource: \`${programPointRefLabel(result.source)}\`` +
+        `\n\nTarget: \`${programPointRefLabel(result.target)}\`` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}`
       );
     case "file":
       return `**file** at ${result.path}\n\nLanguage: ${result.language}`;
@@ -316,6 +401,12 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "symbol-method";
     case "declaration":
       return "symbol-class";
+    case "procedure":
+      return "symbol-method";
+    case "program_point":
+      return "debug-breakpoint";
+    case "control_edge":
+      return "arrow-right";
     case "file":
       return "file-code";
     case "reference_site":
@@ -337,6 +428,9 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "call_site":
     case "expression_site":
     case "receiver_analysis":
+    case "procedure":
+    case "program_point":
+    case "control_edge":
       return result.range;
     case "structural_match":
     case "declaration":
@@ -347,4 +441,17 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
         end_column: 1
       };
   }
+}
+
+function semanticEvidenceLabel(evidence: RqlSemanticEvidence): string {
+  const status = `${evidence.proof}/${evidence.completeness}`;
+  const reasons = [evidence.proof_reason, evidence.completeness_reason].filter(
+    (reason): reason is string => reason !== undefined
+  );
+  return reasons.length > 0 ? `${status} — ${reasons.join("; ")}` : status;
+}
+
+function programPointRefLabel(point: RqlProgramPointRef): string {
+  const boundary = point.boundary ? ` ${point.boundary}` : "";
+  return `${point.id}${boundary} at ${point.path}:${point.range.start_line}:${point.range.start_column}`;
 }

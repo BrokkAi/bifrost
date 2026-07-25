@@ -11,6 +11,9 @@ import {
   queryResultRange,
   queryResultTooltip,
   runRqlQuery,
+  type RqlControlEdgeResult,
+  type RqlProcedureResult,
+  type RqlProgramPointResult,
   type RqlQueryRunner,
   type RqlReceiverAnalysisResult,
   type RqlReferenceSiteResult
@@ -247,6 +250,79 @@ void test("renders and navigates an exact reference-site result", () => {
   assert.equal(queryResultIcon(reference), "references");
   assert.match(queryResultTooltip(reference), /Target\.status/);
   assert.deepEqual(queryResultRange(reference), reference.range);
+});
+
+void test("renders and navigates procedure-local CFG results", () => {
+  const range = {
+    start_line: 7,
+    start_column: 4,
+    end_line: 7,
+    end_column: 12
+  };
+  const evidence = { proof: "proven" as const, completeness: "complete" as const };
+  const procedure: RqlProcedureResult = {
+    uri: "file:///workspace/src/run.ts",
+    path: "src/run.ts",
+    result_type: "procedure",
+    id: "procedure-a",
+    artifact_id: "artifact-a",
+    language: "typescript",
+    procedure_kind: "function",
+    range,
+    evidence
+  };
+  const point: RqlProgramPointResult = {
+    uri: procedure.uri,
+    path: procedure.path,
+    result_type: "program_point",
+    id: "point-a",
+    procedure_id: procedure.id,
+    language: procedure.language,
+    range,
+    boundary: "entry",
+    event_count: 2,
+    evidence
+  };
+  const edge: RqlControlEdgeResult = {
+    uri: procedure.uri,
+    path: procedure.path,
+    result_type: "control_edge",
+    id: "edge-a",
+    procedure_id: procedure.id,
+    language: procedure.language,
+    range,
+    edge_kind: "normal",
+    source: {
+      id: point.id,
+      procedure_id: procedure.id,
+      path: procedure.path,
+      range,
+      boundary: "entry"
+    },
+    target: {
+      id: "point-b",
+      procedure_id: procedure.id,
+      path: procedure.path,
+      range: { ...range, start_line: 8, end_line: 8 },
+      boundary: "normal_exit"
+    },
+    evidence
+  };
+
+  assert.equal(queryResultLabel(procedure), "function");
+  assert.equal(queryResultIcon(procedure), "symbol-method");
+  assert.match(queryResultTooltip(procedure), /artifact-a/);
+  assert.deepEqual(queryResultRange(procedure), range);
+  assert.equal(queryResultLabel(point), "entry");
+  assert.equal(queryResultDescription(point), "2 events · proven/complete");
+  assert.equal(queryResultIcon(point), "debug-breakpoint");
+  assert.match(queryResultTooltip(point), /procedure-a/);
+  assert.deepEqual(queryResultRange(point), range);
+  assert.match(queryResultLabel(edge), /point-a → point-b/);
+  assert.equal(queryResultIcon(edge), "arrow-right");
+  assert.match(queryResultTooltip(edge), /Source: `point-a entry at src\/run\.ts:7:4`/);
+  assert.match(queryResultTooltip(edge), /Target: `point-b normal_exit at src\/run\.ts:8:4`/);
+  assert.deepEqual(queryResultRange(edge), range);
 });
 
 void test("renders and navigates a receiver-analysis result", () => {

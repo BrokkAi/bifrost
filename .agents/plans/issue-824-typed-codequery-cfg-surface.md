@@ -49,7 +49,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 16:38 SAST) Corrected the reviewed semantic execution defects: one-way enclosing-procedure selection, character-based public ranges, bounded and cancellable materialization/traversal, branch-aware diagnostics, accurate per-operator work, stable content-scoped public IDs, and semantic policy hard caps.
 - [x] (2026-07-25 16:55 SAST) Published each physical step's planned semantic facets in explain output and associated every RQL pipeline wrapper with its canonical JSON operation metadata.
 - [x] (2026-07-25 16:58 SAST) Completed Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/value/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
-- [ ] Complete Milestone 5 by updating MCP, Python, LSP/VS Code, TextMate grammar, public docs, executable examples, and their behavior-focused tests for schema version 3.
+- [x] (2026-07-25 17:21 SAST) Completed Milestone 5 across the MCP schema, Python models, LSP URI transport, VS Code result/navigation UI, TextMate grammar, public documentation, and executable JSON/RQL examples.
 - [ ] Complete Milestone 6 by reconciling the umbrella roadmap, running the remaining client/documentation tests and the full `nlp,python` release gate, then performing the final guided review.
 
 ## Surprises & Discoveries
@@ -104,6 +104,9 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: The private pipeline repeated the same three semantic variants across terminal values, trace values, keys, detailed evidence, source retention, and rendering.
   Evidence: Grouping procedure, program-point, and control-edge values under `SemanticPipelineValue` reduced each generic pipeline path to one semantic branch and made terminal and provenance evidence consume the same stable projection.
+
+- Observation: The repository's Python validation entrypoint is `scripts/test_python.sh`; the older plan path `bifrost_searchtools/tests` no longer exists.
+  Evidence: The script builds the editable native extension with Python 3.12 and discovers `python_tests/test_*.py`; its complete 57-test run passed.
 
 ## Decision Log
 
@@ -200,6 +203,10 @@ Validation for this correction passed `cargo fmt`, `cargo check --lib`, the poli
 Milestone 4 now makes semantic demand visible before execution and keeps execution ownership reusable. Physical explain nodes carry explicit procedure, program-point, and control-edge requirements derived from the query-step registry; RQL wrappers reuse their paired JSON operation metadata. Runtime semantic state lives in one request-local `SemanticQueryContext`, CFG traversal is a narrow adapter, and the generic pipeline handles a single grouped semantic value whose detailed terminal and provenance identities share one projection.
 
 Validation for Milestone 4 passed `cargo check --lib`, the schema-registry and public-explain unit tests, all 20 `structural_search_planner` tests, all 119 `code_query_pipelines` tests, and all 13 `policy_match_evaluation` tests.
+
+Milestone 5 publishes one schema-v3 contract across every consumer. MCP advertises both registered schema versions and the complete declarative step vocabulary. Python exposes frozen procedure, point, point-reference, edge, evidence, explain-demand, and semantic-work models with strict required-field parsing. LSP attaches navigable file URIs to all semantic result domains, while VS Code renders their evidence, endpoint identities, ranges, icons, and navigation. RQL grammar aliases and the public JSON/RQL/docs examples now describe the same exact seven-operation algebra, finite semantic budgets, and procedure-local non-ICFG boundary.
+
+Validation for Milestone 5 passed the Python model tests (14) and complete native-extension suite (57), the VS Code formatting/typecheck/lint/build/license/unit suite (69), the MCP schema contract test, the focused real LSP CFG transport test, `code_query_docs` (3), `code_query_tutorials` (21), `cargo fmt --check`, and `git diff --check`.
 
 ## Context and Orientation
 
@@ -552,3 +559,5 @@ Revision note (2026-07-25 16:38 SAST / Codex): Completed the reviewed correctnes
 Revision note (2026-07-25 16:55 SAST / Codex): Added declarative semantic-facet planning metadata, exposed it in the public physical plan, and linked RQL pipeline wrappers to their canonical JSON operation descriptions and schema versions.
 
 Revision note (2026-07-25 16:58 SAST / Codex): Completed Milestone 4 by extracting the reusable semantic query context and CFG adapter, grouping private semantic pipeline values, and sharing the detailed semantic identity projection across terminal and provenance evidence.
+
+Revision note (2026-07-25 17:21 SAST / Codex): Completed the schema-v3 public rollout through MCP, Python, LSP/VS Code, grammar, and docs, including executable equivalent JSON/RQL examples and full client-facing validation.
