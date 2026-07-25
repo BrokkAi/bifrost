@@ -69,7 +69,6 @@ macro_rules! define_protocol_key {
 define_protocol_key!(ProtocolStateKey);
 define_protocol_key!(ProtocolEventKey);
 define_protocol_key!(ProtocolExpectationKey);
-define_protocol_key!(ProtocolViolationKey);
 
 /// Declarative, diagnostic-neutral internal protocol input.
 ///
@@ -173,9 +172,7 @@ impl std::error::Error for ProtocolSpecParseError {
 #[serde(deny_unknown_fields)]
 pub struct ProtocolEventSpec {
     pub id: String,
-    pub action: ProtocolSemanticAction,
-    pub phase: ProtocolObservationPhase,
-    pub subject: ObjectBindingRole,
+    pub observation: ProtocolObservationSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -186,35 +183,40 @@ pub struct ProtocolTransitionSpec {
     pub to: String,
     #[serde(default)]
     pub guard: ProtocolGuardSpec,
-    #[serde(default)]
-    pub violation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolTerminalExpectationSpec {
     pub id: String,
-    pub on: TerminalExitKind,
+    pub on: ProtocolTerminalObservationSpec,
     pub expected_states: Vec<String>,
-    pub violation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolObservationSpec {
+    pub occurrence: ProtocolEventOccurrence,
+    pub subject: ObjectBindingRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtocolSemanticAction {
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProtocolEventOccurrence {
     Allocation,
-    ReceiverCall,
+    Endpoint { phase: ProtocolObservationPhase },
     ActualToFormal,
     ReturnFlow,
     FieldRead,
     FieldWrite,
     Escape,
+    ProcedureExit { kind: ProtocolProcedureExitKind },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolObservationPhase {
-    AtEvent,
+    AtMatch,
     BeforeCall,
     AfterNormalReturn,
     AfterExceptionalReturn,
@@ -223,10 +225,12 @@ pub enum ProtocolObservationPhase {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObjectBindingRole {
+    CurrentObject,
+    MatchedValue,
     AllocationResult,
     Receiver,
-    Actual { index: u16 },
-    Formal { index: u16 },
+    Actual { index: u32 },
+    Formal { index: u32 },
     ReturnValue,
     FieldBase,
     FieldValue,
@@ -307,9 +311,20 @@ pub enum ProtocolUncertaintyBehavior {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TerminalExitKind {
-    NormalAnalysisRoot,
-    ExceptionalAnalysisRoot,
+pub enum ProtocolProcedureExitKind {
+    Normal,
+    Exceptional,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProtocolTerminalObservationSpec {
+    AnalysisRootExit {
+        kind: ProtocolProcedureExitKind,
+    },
+    Event {
+        observation: ProtocolObservationSpec,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -334,9 +349,7 @@ impl CompiledProtocolGuard {
 pub struct CompiledProtocolEvent {
     id: ProtocolEventId,
     key: ProtocolEventKey,
-    action: ProtocolSemanticAction,
-    phase: ProtocolObservationPhase,
-    subject: ObjectBindingRole,
+    observation: ProtocolObservationSpec,
 }
 
 impl CompiledProtocolEvent {
@@ -348,16 +361,8 @@ impl CompiledProtocolEvent {
         &self.key
     }
 
-    pub const fn action(&self) -> ProtocolSemanticAction {
-        self.action
-    }
-
-    pub const fn phase(&self) -> ProtocolObservationPhase {
-        self.phase
-    }
-
-    pub const fn subject(&self) -> &ObjectBindingRole {
-        &self.subject
+    pub const fn observation(&self) -> &ProtocolObservationSpec {
+        &self.observation
     }
 }
 
@@ -367,7 +372,6 @@ pub struct CompiledProtocolTransition {
     on: ProtocolEventId,
     to: ProtocolStateId,
     guard: CompiledProtocolGuard,
-    violation: Option<ProtocolViolationKey>,
 }
 
 impl CompiledProtocolTransition {
@@ -386,19 +390,14 @@ impl CompiledProtocolTransition {
     pub const fn guard(&self) -> &CompiledProtocolGuard {
         &self.guard
     }
-
-    pub const fn violation(&self) -> Option<&ProtocolViolationKey> {
-        self.violation.as_ref()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledTerminalExpectation {
     id: ProtocolExpectationId,
     key: ProtocolExpectationKey,
-    on: TerminalExitKind,
+    on: ProtocolTerminalObservationSpec,
     expected_states: Box<[ProtocolStateId]>,
-    violation: ProtocolViolationKey,
 }
 
 impl CompiledTerminalExpectation {
@@ -410,16 +409,12 @@ impl CompiledTerminalExpectation {
         &self.key
     }
 
-    pub const fn on(&self) -> TerminalExitKind {
-        self.on
+    pub const fn on(&self) -> &ProtocolTerminalObservationSpec {
+        &self.on
     }
 
     pub fn expected_states(&self) -> &[ProtocolStateId] {
         &self.expected_states
-    }
-
-    pub const fn violation(&self) -> &ProtocolViolationKey {
-        &self.violation
     }
 }
 
@@ -575,15 +570,14 @@ pub enum ProtocolDiagnosticCode {
     ConflictingClassification,
     DuplicateEvent,
     InvalidEventShape,
+    InvalidTerminalObservation,
     EmptyGuard,
     TooManyGuardValues,
     DuplicateGuardValue,
     UnknownEvent,
-    InvalidViolationKey,
     DuplicateTransition,
     ConflictingTransition,
     OverlappingTransitionGuards,
-    ErrorTransitionMissingViolation,
     DuplicateExpectation,
     EmptyExpectedStates,
     DuplicateExpectedState,
@@ -608,15 +602,14 @@ impl ProtocolDiagnosticCode {
             Self::ConflictingClassification => "conflicting_classification",
             Self::DuplicateEvent => "duplicate_event",
             Self::InvalidEventShape => "invalid_event_shape",
+            Self::InvalidTerminalObservation => "invalid_terminal_observation",
             Self::EmptyGuard => "empty_guard",
             Self::TooManyGuardValues => "too_many_guard_values",
             Self::DuplicateGuardValue => "duplicate_guard_value",
             Self::UnknownEvent => "unknown_event",
-            Self::InvalidViolationKey => "invalid_violation_key",
             Self::DuplicateTransition => "duplicate_transition",
             Self::ConflictingTransition => "conflicting_transition",
             Self::OverlappingTransitionGuards => "overlapping_transition_guards",
-            Self::ErrorTransitionMissingViolation => "error_transition_missing_violation",
             Self::DuplicateExpectation => "duplicate_expectation",
             Self::EmptyExpectedStates => "empty_expected_states",
             Self::DuplicateExpectedState => "duplicate_expected_state",
@@ -764,9 +757,7 @@ fn compare_diagnostics(left: &ProtocolDiagnostic, right: &ProtocolDiagnostic) ->
 #[derive(Debug, Clone)]
 struct ValidEvent {
     key: ProtocolEventKey,
-    action: ProtocolSemanticAction,
-    phase: ProtocolObservationPhase,
-    subject: ObjectBindingRole,
+    observation: ProtocolObservationSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -776,15 +767,13 @@ struct ValidTransition {
     on: ProtocolEventKey,
     to: ProtocolStateKey,
     guard: CompiledProtocolGuard,
-    violation: Option<ProtocolViolationKey>,
 }
 
 #[derive(Debug, Clone)]
 struct ValidExpectation {
     key: ProtocolExpectationKey,
-    on: TerminalExitKind,
+    on: ProtocolTerminalObservationSpec,
     expected_states: Vec<ProtocolStateKey>,
-    violation: ProtocolViolationKey,
 }
 
 fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCompileError> {
@@ -903,21 +892,19 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
             ));
             continue;
         }
-        if !valid_event_shape(event) {
+        if !valid_observation_shape(&event.observation) {
             diagnostics.push(ProtocolDiagnostic::new(
                 ProtocolDiagnosticCode::InvalidEventShape,
                 format!("events[{index}]"),
                 format!(
-                    "{:?} at {:?} cannot bind {:?}",
-                    event.action, event.phase, event.subject
+                    "{:?} cannot bind {:?}",
+                    event.observation.occurrence, event.observation.subject
                 ),
             ));
         }
         valid_events.push(ValidEvent {
             key,
-            action: event.action,
-            phase: event.phase,
-            subject: event.subject.clone(),
+            observation: event.observation.clone(),
         });
     }
 
@@ -966,35 +953,17 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
             ));
         }
         let guard = normalize_guard(&transition.guard, &base, &mut diagnostics);
-        let violation = transition.violation.as_ref().and_then(|value| {
-            parse_key::<ProtocolViolationKey>(value, &format!("{base}.violation"), &mut diagnostics)
-        });
-        if transition.violation.is_some() && violation.is_none() {
-            diagnostics.push(ProtocolDiagnostic::new(
-                ProtocolDiagnosticCode::InvalidViolationKey,
-                format!("{base}.violation"),
-                "transition violation identity is invalid",
-            ));
-        }
         if let (Some(from), Some(on), Some(to), Some(guard)) = (from, on, to, guard)
             && state_sources.contains_key(&from)
             && state_sources.contains_key(&to)
             && event_sources.contains_key(&on)
         {
-            if error_states.contains(&to) && violation.is_none() {
-                diagnostics.push(ProtocolDiagnostic::new(
-                    ProtocolDiagnosticCode::ErrorTransitionMissingViolation,
-                    base.clone(),
-                    format!("transition into error state `{to}` must name a violation"),
-                ));
-            }
             valid_transitions.push(ValidTransition {
                 source_index: index,
                 from,
                 on,
                 to,
                 guard,
-                violation,
             });
         }
     }
@@ -1025,11 +994,24 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
                 ),
             ));
         }
-        let violation = parse_key::<ProtocolViolationKey>(
-            &expectation.violation,
-            &format!("{base}.violation"),
-            &mut diagnostics,
-        );
+        let valid_observation = match &expectation.on {
+            ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => true,
+            ProtocolTerminalObservationSpec::Event { observation } => {
+                if valid_observation_shape(observation) {
+                    true
+                } else {
+                    diagnostics.push(ProtocolDiagnostic::new(
+                        ProtocolDiagnosticCode::InvalidTerminalObservation,
+                        format!("{base}.on"),
+                        format!(
+                            "{:?} cannot bind {:?}",
+                            observation.occurrence, observation.subject
+                        ),
+                    ));
+                    false
+                }
+            }
+        };
         let expected_states = parse_expected_states(
             &expectation.expected_states,
             &format!("{base}.expected_states"),
@@ -1037,15 +1019,15 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
             &accepting_states,
             &mut diagnostics,
         );
-        if let (Some(key), Some(violation)) = (key, violation)
+        if let Some(key) = key
             && expectation_sources.get(&key) == Some(&index)
             && !expected_states.is_empty()
+            && valid_observation
         {
             valid_expectations.push(ValidExpectation {
                 key,
-                on: expectation.on,
+                on: expectation.on.clone(),
                 expected_states,
-                violation,
             });
         }
     }
@@ -1156,35 +1138,45 @@ fn parse_state_set(
     retained
 }
 
-fn valid_event_shape(event: &ProtocolEventSpec) -> bool {
+fn valid_observation_shape(observation: &ProtocolObservationSpec) -> bool {
     matches!(
-        (&event.action, &event.phase, &event.subject),
+        (&observation.occurrence, &observation.subject),
         (
-            ProtocolSemanticAction::Allocation,
-            ProtocolObservationPhase::AtEvent,
+            ProtocolEventOccurrence::Allocation,
             ObjectBindingRole::AllocationResult,
         ) | (
-            ProtocolSemanticAction::ReceiverCall,
-            ProtocolObservationPhase::BeforeCall
-                | ProtocolObservationPhase::AfterNormalReturn
-                | ProtocolObservationPhase::AfterExceptionalReturn,
-            ObjectBindingRole::Receiver,
+            ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AtMatch,
+            },
+            ObjectBindingRole::MatchedValue,
         ) | (
-            ProtocolSemanticAction::ActualToFormal,
-            ProtocolObservationPhase::BeforeCall,
+            ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::BeforeCall
+                    | ProtocolObservationPhase::AfterExceptionalReturn,
+            },
+            ObjectBindingRole::Receiver | ObjectBindingRole::Actual { .. },
+        ) | (
+            ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AfterNormalReturn,
+            },
+            ObjectBindingRole::Receiver
+                | ObjectBindingRole::Actual { .. }
+                | ObjectBindingRole::ReturnValue,
+        ) | (
+            ProtocolEventOccurrence::ActualToFormal,
             ObjectBindingRole::Actual { .. } | ObjectBindingRole::Formal { .. },
         ) | (
-            ProtocolSemanticAction::ReturnFlow,
-            ProtocolObservationPhase::AfterNormalReturn,
+            ProtocolEventOccurrence::ReturnFlow,
             ObjectBindingRole::ReturnValue,
         ) | (
-            ProtocolSemanticAction::FieldRead | ProtocolSemanticAction::FieldWrite,
-            ProtocolObservationPhase::AtEvent,
+            ProtocolEventOccurrence::FieldRead | ProtocolEventOccurrence::FieldWrite,
             ObjectBindingRole::FieldBase | ObjectBindingRole::FieldValue,
         ) | (
-            ProtocolSemanticAction::Escape,
-            ProtocolObservationPhase::AtEvent,
+            ProtocolEventOccurrence::Escape,
             ObjectBindingRole::EscapedObject,
+        ) | (
+            ProtocolEventOccurrence::ProcedureExit { .. },
+            ObjectBindingRole::CurrentObject,
         )
     )
 }
@@ -1274,7 +1266,7 @@ fn validate_transition_determinism(
             if let Some(prior) = previous
                 && prior.guard == transition.guard
             {
-                let code = if prior.to == transition.to && prior.violation == transition.violation {
+                let code = if prior.to == transition.to {
                     ProtocolDiagnosticCode::DuplicateTransition
                 } else {
                     ProtocolDiagnosticCode::ConflictingTransition
@@ -1423,9 +1415,7 @@ struct CanonicalProtocol {
 #[derive(Serialize)]
 struct CanonicalEvent {
     id: ProtocolEventKey,
-    action: ProtocolSemanticAction,
-    phase: ProtocolObservationPhase,
-    subject: ObjectBindingRole,
+    observation: ProtocolObservationSpec,
 }
 
 #[derive(Serialize)]
@@ -1434,15 +1424,13 @@ struct CanonicalTransition {
     on: ProtocolEventKey,
     to: ProtocolStateKey,
     guard: CompiledProtocolGuard,
-    violation: Option<ProtocolViolationKey>,
 }
 
 #[derive(Serialize)]
 struct CanonicalExpectation {
     id: ProtocolExpectationKey,
-    on: TerminalExitKind,
+    on: ProtocolTerminalObservationSpec,
     expected_states: Vec<ProtocolStateKey>,
-    violation: ProtocolViolationKey,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1490,9 +1478,7 @@ fn build_compiled_protocol(
             id: ProtocolEventId::try_from_index(index)
                 .expect("validated protocol event count fits in u32"),
             key: event.key.clone(),
-            action: event.action,
-            phase: event.phase,
-            subject: event.subject.clone(),
+            observation: event.observation.clone(),
         })
         .collect();
 
@@ -1503,7 +1489,6 @@ fn build_compiled_protocol(
             on: event_ids[&transition.on],
             to: state_ids[&transition.to],
             guard: transition.guard.clone(),
-            violation: transition.violation.clone(),
         })
         .collect();
     compiled_transitions.sort_by(compare_compiled_transitions);
@@ -1522,9 +1507,8 @@ fn build_compiled_protocol(
                 id: ProtocolExpectationId::try_from_index(index)
                     .expect("validated protocol expectation count fits in u32"),
                 key: expectation.key.clone(),
-                on: expectation.on,
+                on: expectation.on.clone(),
                 expected_states: expected_states.into_boxed_slice(),
-                violation: expectation.violation.clone(),
             }
         })
         .collect();
@@ -1539,9 +1523,7 @@ fn build_compiled_protocol(
             .into_iter()
             .map(|event| CanonicalEvent {
                 id: event.key,
-                action: event.action,
-                phase: event.phase,
-                subject: event.subject,
+                observation: event.observation,
             })
             .collect(),
         transitions: transitions
@@ -1551,7 +1533,6 @@ fn build_compiled_protocol(
                 on: transition.on,
                 to: transition.to,
                 guard: transition.guard,
-                violation: transition.violation,
             })
             .collect::<Vec<_>>(),
         terminal_expectations: expectations
@@ -1560,7 +1541,6 @@ fn build_compiled_protocol(
                 id: expectation.key,
                 on: expectation.on,
                 expected_states: expectation.expected_states,
-                violation: expectation.violation,
             })
             .collect(),
         semantics: spec.semantics,
@@ -1613,7 +1593,6 @@ fn compare_compiled_transitions(
         .cmp(&(right.from, right.on))
         .then_with(|| left.guard.cmp(&right.guard))
         .then_with(|| left.to.cmp(&right.to))
-        .then_with(|| left.violation.cmp(&right.violation))
 }
 
 fn compare_canonical_transitions(
@@ -1624,5 +1603,4 @@ fn compare_canonical_transitions(
         .cmp(&(&right.from, &right.on))
         .then_with(|| left.guard.cmp(&right.guard))
         .then_with(|| left.to.cmp(&right.to))
-        .then_with(|| left.violation.cmp(&right.violation))
 }

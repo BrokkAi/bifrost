@@ -1,7 +1,9 @@
 use brokk_bifrost::analyzer::typestate::{
     MAX_PROTOCOL_SOURCE_BYTES, ObjectBindingRole, ProtocolCompileError, ProtocolDiagnosticCode,
-    ProtocolEventKey, ProtocolGuardSpec, ProtocolObjectCardinality, ProtocolSpec, ProtocolStateKey,
-    ProtocolTransitionSpec, ProtocolViolationKey, TerminalExitKind,
+    ProtocolEventKey, ProtocolEventOccurrence, ProtocolEventSpec, ProtocolGuardSpec,
+    ProtocolObjectCardinality, ProtocolObservationPhase, ProtocolObservationSpec,
+    ProtocolProcedureExitKind, ProtocolSpec, ProtocolStateKey, ProtocolTerminalExpectationSpec,
+    ProtocolTerminalObservationSpec, ProtocolTransitionSpec,
 };
 
 const RESOURCE_LIFECYCLE: &[u8] =
@@ -53,10 +55,7 @@ fn resource_lifecycle_fixture_exposes_diagnostic_neutral_semantics() {
         )
         .expect("use-after-close transition");
     assert_eq!(use_after_close.to(), state("violated"));
-    assert_eq!(
-        use_after_close.violation(),
-        Some(&ProtocolViolationKey::new("use-after-close").unwrap())
-    );
+    assert!(protocol.is_error(use_after_close.to()));
 
     let recovery = protocol
         .transition_for(
@@ -66,20 +65,30 @@ fn resource_lifecycle_fixture_exposes_diagnostic_neutral_semantics() {
         )
         .expect("error states are not implicitly absorbing");
     assert_eq!(recovery.to(), state("open"));
-    assert_eq!(recovery.violation(), None);
+    assert!(!protocol.is_error(recovery.to()));
 
     assert_eq!(protocol.terminal_expectations().len(), 2);
     assert!(
         protocol
             .terminal_expectations()
             .iter()
-            .any(|expectation| expectation.on() == TerminalExitKind::NormalAnalysisRoot)
+            .any(|expectation| matches!(
+                expectation.on(),
+                ProtocolTerminalObservationSpec::AnalysisRootExit {
+                    kind: ProtocolProcedureExitKind::Normal,
+                }
+            ))
     );
     assert!(
         protocol
             .terminal_expectations()
             .iter()
-            .any(|expectation| expectation.on() == TerminalExitKind::ExceptionalAnalysisRoot)
+            .any(|expectation| matches!(
+                expectation.on(),
+                ProtocolTerminalObservationSpec::AnalysisRootExit {
+                    kind: ProtocolProcedureExitKind::Exceptional,
+                }
+            ))
     );
     let normal_expectation =
         brokk_bifrost::analyzer::typestate::ProtocolExpectationKey::new("normal-exit-closed")
@@ -130,7 +139,6 @@ fn validation_reports_conflicting_and_overlapping_transitions() {
         on: "use".to_owned(),
         to: "closed".to_owned(),
         guard: ProtocolGuardSpec::Always,
-        violation: None,
     });
     spec.transitions.push(ProtocolTransitionSpec {
         from: "unallocated".to_owned(),
@@ -142,7 +150,6 @@ fn validation_reports_conflicting_and_overlapping_transitions() {
                 ProtocolObjectCardinality::Summary,
             ],
         },
-        violation: Some("close-before-open".to_owned()),
     });
     spec.transitions.push(ProtocolTransitionSpec {
         from: "unallocated".to_owned(),
@@ -154,7 +161,6 @@ fn validation_reports_conflicting_and_overlapping_transitions() {
                 ProtocolObjectCardinality::Unknown,
             ],
         },
-        violation: Some("close-before-open".to_owned()),
     });
 
     let codes = diagnostics(spec.compile().expect_err("invalid transitions should fail"));
@@ -187,9 +193,11 @@ fn one_state_protocol_is_valid_and_source_size_is_bounded() {
         "transitions": [],
         "terminal_expectations": [{
             "id": "normal-ready",
-            "on": "normal_analysis_root",
-            "expected_states": ["ready"],
-            "violation": "not-ready"
+            "on": {
+                "type": "analysis_root_exit",
+                "kind": "normal"
+            },
+            "expected_states": ["ready"]
         }],
         "semantics": {
             "analysis_mode": "must",
@@ -218,13 +226,90 @@ fn one_state_protocol_is_valid_and_source_size_is_bounded() {
 #[test]
 fn invalid_event_binding_shape_is_rejected() {
     let mut spec = fixture();
-    spec.events[0].subject = ObjectBindingRole::Receiver;
+    spec.events[0].observation.subject = ObjectBindingRole::Receiver;
 
     let codes = diagnostics(
         spec.compile()
             .expect_err("invalid binding shape should fail"),
     );
     assert!(codes.contains(&ProtocolDiagnosticCode::InvalidEventShape));
+}
+
+#[test]
+fn public_call_exit_and_terminal_observations_have_neutral_internal_shapes() {
+    let mut spec = fixture();
+    spec.events.push(ProtocolEventSpec {
+        id: "argument-after-call".to_owned(),
+        observation: ProtocolObservationSpec {
+            occurrence: ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AfterNormalReturn,
+            },
+            subject: ObjectBindingRole::Actual { index: u32::MAX },
+        },
+    });
+    spec.events.push(ProtocolEventSpec {
+        id: "argument-after-exceptional-call".to_owned(),
+        observation: ProtocolObservationSpec {
+            occurrence: ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AfterExceptionalReturn,
+            },
+            subject: ObjectBindingRole::Actual { index: 1 },
+        },
+    });
+    spec.events.push(ProtocolEventSpec {
+        id: "return-after-call".to_owned(),
+        observation: ProtocolObservationSpec {
+            occurrence: ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AfterNormalReturn,
+            },
+            subject: ObjectBindingRole::ReturnValue,
+        },
+    });
+    spec.events.push(ProtocolEventSpec {
+        id: "normal-procedure-exit".to_owned(),
+        observation: ProtocolObservationSpec {
+            occurrence: ProtocolEventOccurrence::ProcedureExit {
+                kind: ProtocolProcedureExitKind::Normal,
+            },
+            subject: ObjectBindingRole::CurrentObject,
+        },
+    });
+    spec.terminal_expectations
+        .push(ProtocolTerminalExpectationSpec {
+            id: "closed-after-endpoint".to_owned(),
+            on: ProtocolTerminalObservationSpec::Event {
+                observation: ProtocolObservationSpec {
+                    occurrence: ProtocolEventOccurrence::Endpoint {
+                        phase: ProtocolObservationPhase::AfterNormalReturn,
+                    },
+                    subject: ObjectBindingRole::Actual { index: 0 },
+                },
+            },
+            expected_states: vec!["closed".to_owned()],
+        });
+
+    let protocol = spec
+        .compile()
+        .expect("public trigger surfaces should lower without language branches");
+    assert_eq!(protocol.events().len(), 7);
+    assert_eq!(protocol.terminal_expectations().len(), 3);
+}
+
+#[test]
+fn terminal_event_observations_reuse_event_shape_validation() {
+    let mut spec = fixture();
+    spec.terminal_expectations[0].on = ProtocolTerminalObservationSpec::Event {
+        observation: ProtocolObservationSpec {
+            occurrence: ProtocolEventOccurrence::Allocation,
+            subject: ObjectBindingRole::Receiver,
+        },
+    };
+
+    let codes = diagnostics(
+        spec.compile()
+            .expect_err("invalid terminal observation should fail"),
+    );
+    assert!(codes.contains(&ProtocolDiagnosticCode::InvalidTerminalObservation));
 }
 
 #[test]

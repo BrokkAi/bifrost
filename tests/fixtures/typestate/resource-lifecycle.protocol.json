@@ -17,26 +17,37 @@
   "events": [
     {
       "id": "acquire",
-      "action": "allocation",
-      "phase": "at_event",
-      "subject": {
-        "type": "allocation_result"
+      "observation": {
+        "occurrence": {
+          "type": "allocation"
+        },
+        "subject": {
+          "type": "allocation_result"
+        }
       }
     },
     {
       "id": "use",
-      "action": "receiver_call",
-      "phase": "before_call",
-      "subject": {
-        "type": "receiver"
+      "observation": {
+        "occurrence": {
+          "type": "endpoint",
+          "phase": "before_call"
+        },
+        "subject": {
+          "type": "receiver"
+        }
       }
     },
     {
       "id": "close",
-      "action": "receiver_call",
-      "phase": "after_normal_return",
-      "subject": {
-        "type": "receiver"
+      "observation": {
+        "occurrence": {
+          "type": "endpoint",
+          "phase": "after_normal_return"
+        },
+        "subject": {
+          "type": "receiver"
+        }
       }
     }
   ],
@@ -59,20 +70,17 @@
     {
       "from": "unallocated",
       "on": "use",
-      "to": "violated",
-      "violation": "use-before-open"
+      "to": "violated"
     },
     {
       "from": "closed",
       "on": "use",
-      "to": "violated",
-      "violation": "use-after-close"
+      "to": "violated"
     },
     {
       "from": "closed",
       "on": "close",
-      "to": "violated",
-      "violation": "double-close"
+      "to": "violated"
     },
     {
       "from": "violated",
@@ -83,21 +91,25 @@
   "terminal_expectations": [
     {
       "id": "normal-exit-closed",
-      "on": "normal_analysis_root",
+      "on": {
+        "type": "analysis_root_exit",
+        "kind": "normal"
+      },
       "expected_states": [
         "unallocated",
         "closed"
-      ],
-      "violation": "resource-left-open"
+      ]
     },
     {
       "id": "exceptional-exit-closed",
-      "on": "exceptional_analysis_root",
+      "on": {
+        "type": "analysis_root_exit",
+        "kind": "exceptional"
+      },
       "expected_states": [
         "unallocated",
         "closed"
-      ],
-      "violation": "resource-left-open"
+      ]
     }
   ],
   "semantics": {

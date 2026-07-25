@@ -63,6 +63,12 @@ required for that checkpoint.
   findings: bounded-only top-level deserialization, fixed-domain guard
   normalization, randomized untrusted-key maps, escaped diagnostics, durable
   expectation lookup, and shared policy-neutral identifier/hash primitives.
+- [x] (2026-07-25 12:44+02:00) Resolved the public-lowering blockers by
+  separating neutral event occurrence from object binding, covering
+  receiver/argument/return endpoint phases and procedure exits, allowing
+  terminal checks at bound events as well as analysis-root exits, widening
+  resolved positional bindings to `u32`, and deriving violation identity from
+  transition tuples/expectation IDs instead of free-form strings.
 - [ ] Run the guided specialist review over the first protocol checkpoint and
   resolve every actionable finding.
 - [ ] Define the pre-resolved subject/event binding plan and choose the
@@ -168,10 +174,12 @@ required for that checkpoint.
   behavior. Only declared transitions change state.
   Date/Author: 2026-07-25 / Codex
 
-- Decision: terminal expectations remain separate from transitions.
-  Rationale: “still open at normal analysis-root exit” is an observation over a
-  terminal state set, not a fabricated semantic event or transition to an error
-  state. Normal and exceptional root exits remain distinct.
+- Decision: terminal expectations remain separate from transitions and carry a
+  neutral observation trigger.
+  Rationale: “still open at normal analysis-root exit” and “not closed after
+  this bound endpoint” are observations over the current state set, not
+  fabricated transitions to an error state. Root exit kinds and reusable bound
+  event observations remain explicit.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: protocol event predicates refer to neutral semantic event classes
