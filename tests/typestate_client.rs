@@ -91,6 +91,52 @@ final class LifecycleFixture {
 }
 "#;
 
+const RECURSIVE_HELPER_SOURCE: &str = r#"
+final class RecursiveResource {}
+
+final class RecursiveFixture {
+  static RecursiveResource acquire() {
+    return null;
+  }
+
+  static void use(RecursiveResource resource) {}
+
+  static void close(RecursiveResource resource) {}
+
+  static void walk(RecursiveResource resource, int depth) {
+    use(resource);
+    if (depth > 0) {
+      walk(resource, depth - 1);
+    }
+  }
+
+  static void lifecycle() {
+    RecursiveResource resource = acquire();
+    walk(resource, 1);
+    close(resource);
+  }
+}
+"#;
+
+const BRANCHING_LIFECYCLE_SOURCE: &str = r#"
+final class BranchResource {}
+
+final class BranchFixture {
+  static BranchResource acquire() {
+    return null;
+  }
+
+  static void close(BranchResource resource) {}
+
+  static void lifecycle(boolean shouldClose) {
+    BranchResource resource = acquire();
+    if (shouldClose) {
+      close(resource);
+    }
+  }
+}
+"#;
+
 struct ClientFixture {
     protocol: CompiledProtocol,
     bindings: TypestateBindingPlan,
@@ -130,6 +176,26 @@ fn protocol() -> CompiledProtocol {
         .expect("protocol fixture should parse")
         .compile()
         .expect("protocol fixture should compile")
+}
+
+fn observable_lifecycle_protocol() -> CompiledProtocol {
+    let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
+    spec.states.push("used".to_owned());
+    for transition in &mut spec.transitions {
+        if transition.from == "open" && transition.on == "use" {
+            transition.to = "used".to_owned();
+        } else if transition.from == "open" && transition.on == "close" {
+            transition.from = "used".to_owned();
+        }
+    }
+    for event in &mut spec.events {
+        if matches!(event.id.as_str(), "use" | "close") {
+            event.observation.occurrence = ProtocolEventOccurrence::Endpoint {
+                phase: ProtocolObservationPhase::AtMatch,
+            };
+        }
+    }
+    spec.compile().unwrap()
 }
 
 fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
@@ -610,6 +676,77 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .expect("error transition emits a violation marker");
     assert_eq!(violation.from(), closed_state);
     assert_eq!(violation.to(), violated_state);
+}
+
+#[test]
+fn exceptional_return_event_executes_on_matched_return_flow() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
+    spec.events
+        .iter_mut()
+        .find(|event| event.id == "close")
+        .expect("close event")
+        .observation
+        .occurrence = ProtocolEventOccurrence::Endpoint {
+        phase: ProtocolObservationPhase::AfterExceptionalReturn,
+    };
+    let protocol = spec.compile().unwrap();
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        Vec::new(),
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("close").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::call_site(
+                fixture.close_call.clone(),
+                TypestateBindingContext::root(),
+            ),
+            0,
+            TypestateObjectRole::Argument,
+            exact,
+        )],
+        Vec::new(),
+    )
+    .unwrap();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::ExceptionalReturn,
+            Some(&fixture.close_call),
+            &fixture.exit,
+            &fixture.close_point,
+            &proven,
+            &complete,
+        ),
+        problem
+            .state_fact(
+                &fixture.subject_key,
+                &ProtocolStateKey::new("open").unwrap(),
+            )
+            .unwrap(),
+        TestTransfer::Return,
+    );
+
+    assert!(
+        result.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("closed").unwrap(),
+                )
+                .unwrap()
+        )
+    );
 }
 
 #[test]
@@ -1271,23 +1408,7 @@ fn real_summary_solver_executes_the_same_client_contract() {
 
 #[test]
 fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
-    let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
-    spec.states.push("used".to_owned());
-    for transition in &mut spec.transitions {
-        if transition.from == "open" && transition.on == "use" {
-            transition.to = "used".to_owned();
-        } else if transition.from == "open" && transition.on == "close" {
-            transition.from = "used".to_owned();
-        }
-    }
-    for event in &mut spec.events {
-        if matches!(event.id.as_str(), "use" | "close") {
-            event.observation.occurrence = ProtocolEventOccurrence::Endpoint {
-                phase: ProtocolObservationPhase::AtMatch,
-            };
-        }
-    }
-    let protocol = spec.compile().unwrap();
+    let protocol = observable_lifecycle_protocol();
     let expected_hash = protocol.hash();
     let mut reference_outcome = None;
 
@@ -1488,6 +1609,297 @@ fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
         }
         assert_eq!(protocol.hash(), expected_hash);
     }
+}
+
+#[test]
+fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
+    let protocol = observable_lifecycle_protocol();
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/RecursiveFixture.java", RECURSIVE_HELPER_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/RecursiveFixture.java");
+    let procedure = |name: &str| {
+        graph
+            .artifact()
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("recursive fixture missing {name}"))
+    };
+    let lifecycle = procedure("lifecycle");
+    let walk = procedure("walk");
+    let lifecycle_handle = graph
+        .artifact()
+        .procedure_handle(lifecycle.id())
+        .expect("lifecycle handle");
+    let walk_handle = graph
+        .artifact()
+        .procedure_handle(walk.id())
+        .expect("walk handle");
+    let use_call = call_containing(walk, RECURSIVE_HELPER_SOURCE, "use(resource)");
+    let close_call = call_containing(lifecycle, RECURSIVE_HELPER_SOURCE, "close(resource)");
+    let subject_object = AbstractObject::new(
+        AccessPathRoot::Value(
+            lifecycle_handle
+                .value_handle(close_call.arguments[0].value)
+                .expect("close argument"),
+        ),
+        ObjectCardinality::Singleton,
+    )
+    .expect("recursive fixture subject");
+    let subject_class = TypestateSubjectClassKey::new("resource").unwrap();
+    let subject_key = TypestateSubjectKey::for_object(subject_class.clone(), &subject_object);
+    let entry = lifecycle_handle
+        .point_handle(lifecycle.entry_point())
+        .expect("lifecycle entry");
+    let exit = lifecycle_handle
+        .point_handle(lifecycle.normal_exit_point())
+        .expect("lifecycle normal exit");
+    let use_point = walk_handle
+        .point_handle(use_call.point)
+        .expect("recursive use point");
+    let close_point = lifecycle_handle
+        .point_handle(close_call.point)
+        .expect("lifecycle close point");
+    let context = TypestateBindingContext::root();
+    let exact = TypestateBindingQuality::proven_unique();
+    let event = |event: &str, point: brokk_bifrost::analyzer::semantic::ProgramPointHandle| {
+        TypestateEventBindingSpec::new(
+            ProtocolEventKey::new(event).unwrap(),
+            subject_key.clone(),
+            TypestateObservationSite::program_point(point, context.clone()),
+            0,
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )
+    };
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            subject_class,
+            subject_object,
+            exact.clone(),
+        )],
+        vec![TypestateInitialSeedSpec::new(
+            subject_key.clone(),
+            ProtocolStateKey::new("unallocated").unwrap(),
+            TypestateObservationSite::program_point(entry.clone(), context.clone()),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
+        vec![
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("acquire").unwrap(),
+                subject_key.clone(),
+                TypestateObservationSite::program_point(entry.clone(), context.clone()),
+                0,
+                TypestateObjectRole::AllocationResult,
+                exact.clone(),
+            ),
+            event("use", use_point),
+            event("close", close_point),
+        ],
+        vec![TypestateTerminalBindingSpec::new(
+            ProtocolExpectationKey::new("normal-exit-closed").unwrap(),
+            subject_key,
+            TypestateObservationSite::program_point(exit.clone(), context),
+            TypestateObjectRole::CurrentObject,
+            exact,
+        )],
+    )
+    .expect("recursive lifecycle binding plan");
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let summary = solve_typestate_with_summaries(
+        &lifecycle_handle,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("recursive typestate summary solve");
+    let used = protocol
+        .state_id(&ProtocolStateKey::new("used").unwrap())
+        .unwrap();
+
+    assert!(summary.result().termination().is_fixed_point());
+    assert!(summary.result().metrics().summary_applications > 0);
+    assert!(summary.result().metrics().reused_entry_contexts > 0);
+    let exit_rows = summary.result().reached_at(&exit).collect::<Vec<_>>();
+    let exit_facts = exit_rows
+        .iter()
+        .filter_map(|reached| summary.result().fact(reached.fact()))
+        .map(|fact| {
+            (
+                fact.protocol_state(),
+                fact.uncertainty(),
+                fact.abstained(),
+                fact.violation(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        exit_rows.iter().any(|reached| {
+            summary
+                .result()
+                .fact(reached.fact())
+                .is_some_and(|fact| fact.protocol_state() == Some(used))
+        }),
+        "the recursive helper summary must carry its use transition back to the caller: {exit_facts:#?}",
+    );
+    assert!(!summary.is_complete());
+    assert!(summary.result().reached().iter().all(|reached| {
+        summary
+            .result()
+            .fact(reached.fact())
+            .is_none_or(|fact| fact.violation().is_none())
+    }));
+}
+
+#[test]
+fn branch_dependent_close_reports_both_exit_states_and_a_may_finding() {
+    let protocol = protocol();
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/BranchFixture.java", BRANCHING_LIFECYCLE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/BranchFixture.java");
+    let lifecycle = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("lifecycle")
+        })
+        .expect("branching lifecycle procedure");
+    let lifecycle_handle = graph
+        .artifact()
+        .procedure_handle(lifecycle.id())
+        .expect("branching lifecycle handle");
+    let close_call = call_containing(lifecycle, BRANCHING_LIFECYCLE_SOURCE, "close(resource)");
+    let close_call_handle = lifecycle_handle
+        .call_site_handle(close_call.id)
+        .expect("branch close call");
+    let subject_object = AbstractObject::new(
+        AccessPathRoot::Value(
+            lifecycle_handle
+                .value_handle(close_call.arguments[0].value)
+                .expect("branch close argument"),
+        ),
+        ObjectCardinality::Singleton,
+    )
+    .expect("branch fixture subject");
+    let subject_class = TypestateSubjectClassKey::new("resource").unwrap();
+    let subject_key = TypestateSubjectKey::for_object(subject_class.clone(), &subject_object);
+    let entry = lifecycle_handle
+        .point_handle(lifecycle.entry_point())
+        .expect("branch lifecycle entry");
+    let exit = lifecycle_handle
+        .point_handle(lifecycle.normal_exit_point())
+        .expect("branch lifecycle normal exit");
+    let context = TypestateBindingContext::root();
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            subject_class,
+            subject_object,
+            exact.clone(),
+        )],
+        vec![TypestateInitialSeedSpec::new(
+            subject_key.clone(),
+            ProtocolStateKey::new("unallocated").unwrap(),
+            TypestateObservationSite::program_point(entry.clone(), context.clone()),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
+        vec![
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("acquire").unwrap(),
+                subject_key.clone(),
+                TypestateObservationSite::program_point(entry.clone(), context.clone()),
+                0,
+                TypestateObjectRole::AllocationResult,
+                exact.clone(),
+            ),
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("close").unwrap(),
+                subject_key.clone(),
+                TypestateObservationSite::call_site(close_call_handle, context.clone()),
+                0,
+                TypestateObjectRole::Argument,
+                exact.clone(),
+            ),
+        ],
+        vec![TypestateTerminalBindingSpec::new(
+            ProtocolExpectationKey::new("normal-exit-closed").unwrap(),
+            subject_key,
+            TypestateObservationSite::program_point(exit.clone(), context),
+            TypestateObjectRole::CurrentObject,
+            exact,
+        )],
+    )
+    .expect("branch lifecycle binding plan");
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let summary = solve_typestate_with_summaries(
+        &lifecycle_handle,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("branch typestate summary solve");
+    let open = protocol
+        .state_id(&ProtocolStateKey::new("open").unwrap())
+        .unwrap();
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+    let mut exit_states = summary
+        .result()
+        .reached_at(&exit)
+        .filter_map(|reached| summary.result().fact(reached.fact())?.protocol_state())
+        .collect::<Vec<_>>();
+    exit_states.sort_unstable();
+    exit_states.dedup();
+
+    assert!(summary.result().termination().is_fixed_point());
+    assert_eq!(exit_states, vec![closed, open]);
+    let report = collect_summary_findings(&protocol, &bindings, &summary).unwrap();
+    let terminal = report
+        .findings()
+        .iter()
+        .find(|finding| {
+            matches!(
+                finding.kind(),
+                TypestateFindingKind::TerminalExpectation { .. }
+            )
+        })
+        .expect("open branch produces a terminal finding");
+    assert_eq!(terminal.certainty(), TypestateFindingCertainty::May);
+    assert!(!terminal.witnesses().is_empty());
 }
 
 #[test]
