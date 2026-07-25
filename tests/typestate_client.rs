@@ -1434,13 +1434,13 @@ fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
             "{language:?} summary solve did not carry the pre-resolved lifecycle through use to closed: {exit_rows:#?}"
         );
         assert!(
-            exit_rows.iter().all(|reached| {
+            summary.result().reached().iter().all(|reached| {
                 summary
                     .result()
                     .fact(reached.fact())
                     .is_none_or(|fact| fact.violation().is_none())
             }),
-            "{language:?} lifecycle reached a protocol violation: {exit_rows:#?}"
+            "{language:?} lifecycle reached a protocol violation"
         );
         assert!(summary.result().termination().is_fixed_point());
         assert!(summary.bindings_complete());

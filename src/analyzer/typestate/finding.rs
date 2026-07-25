@@ -913,6 +913,7 @@ impl FindingWitnessTarget {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FindingWitnessTargets {
     definitive: Option<FindingWitnessTarget>,
+    may: Option<FindingWitnessTarget>,
     uncertain: Option<FindingWitnessTarget>,
 }
 
@@ -926,21 +927,27 @@ impl FindingWitnessTargets {
         if retained.is_none_or(|retained| candidate.preference() > retained.preference()) {
             *retained = Some(candidate);
         }
+        if candidate.supports_may()
+            && self
+                .may
+                .is_none_or(|retained| candidate.preference() > retained.preference())
+        {
+            self.may = Some(candidate);
+        }
     }
 
     const fn preferred(self) -> Option<FindingWitnessTarget> {
         match self.definitive {
             Some(target) => Some(target),
-            None => self.uncertain,
+            None => match self.may {
+                Some(target) => Some(target),
+                None => self.uncertain,
+            },
         }
     }
 
-    fn may_witness(self) -> Option<FindingWitnessTarget> {
-        [self.definitive, self.uncertain]
-            .into_iter()
-            .flatten()
-            .filter(|target| target.supports_may())
-            .max_by_key(|target| target.preference())
+    const fn may_witness(self) -> Option<FindingWitnessTarget> {
+        self.may
     }
 
     const fn uncertainty_witness(self) -> Option<FindingWitnessTarget> {
@@ -1344,18 +1351,28 @@ mod tests {
 
     #[test]
     fn proven_partial_terminal_evidence_retains_a_may_witness() {
-        let target = FindingWitnessTarget {
+        let clean_partial = FindingWitnessTarget {
             reached_index: 0,
             quality: PathQuality::PROVEN_PARTIAL,
             uncertainty: TypestateUncertaintySet::default(),
             abstained: false,
         };
+        let uncertain_complete = FindingWitnessTarget {
+            reached_index: 1,
+            quality: PathQuality::PROVEN_COMPLETE,
+            uncertainty: TypestateUncertaintySet::default()
+                .with(TypestateUncertainty::IncompleteAnalysis),
+            abstained: false,
+        };
         let mut targets = FindingWitnessTargets::default();
-        targets.insert(target);
+        targets.insert(clean_partial);
+        targets.insert(uncertain_complete);
 
-        assert!(!target.is_definitive());
-        assert!(target.supports_may());
-        assert_eq!(targets.may_witness(), Some(target));
+        assert!(!clean_partial.is_definitive());
+        assert!(clean_partial.supports_may());
+        assert_eq!(targets.uncertainty_witness(), Some(uncertain_complete));
+        assert_eq!(targets.may_witness(), Some(clean_partial));
+        assert_eq!(targets.preferred(), Some(clean_partial));
     }
 
     #[test]
