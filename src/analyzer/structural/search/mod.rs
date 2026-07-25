@@ -1308,10 +1308,12 @@ fn execute_internal_with_strategy(
             );
         }
     };
-    let requires_cfg = query_plan_requires_cfg(&query.plan);
-    if requires_cfg && !limits.semantic.all_positive() {
+    let requires_semantic = query_plan_requires_semantic(&query.plan);
+    if requires_semantic && !limits.semantic.all_positive() {
         return detailed_result_without_evidence(
-            invalid_plan_result("semantic execution limits must all be positive for a CFG query"),
+            invalid_plan_result(
+                "semantic execution limits must all be positive for a semantic query",
+            ),
             CodeQueryExecutionBudget::default(),
         );
     }
@@ -1329,7 +1331,7 @@ fn execute_internal_with_strategy(
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
         semantic: workspace
-            .filter(|_| requires_cfg)
+            .filter(|_| requires_semantic)
             .map(|workspace| CfgQueryService::new(workspace, cancellation, limits.semantic)),
         import_graph: None,
         import_graph_generations: None,
@@ -4955,10 +4957,10 @@ fn invalid_plan_result(error: impl ToString) -> CodeQueryResult {
     }
 }
 
-fn query_plan_requires_cfg(plan: &CodeQueryPlan) -> bool {
+fn query_plan_requires_semantic(plan: &CodeQueryPlan) -> bool {
     let mut pending = vec![plan];
     while let Some(plan) = pending.pop() {
-        if plan.steps.iter().any(query_step_requires_cfg) {
+        if plan.steps.iter().any(query_step_requires_semantic) {
             return true;
         }
         if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
@@ -4968,17 +4970,8 @@ fn query_plan_requires_cfg(plan: &CodeQueryPlan) -> bool {
     false
 }
 
-fn query_step_requires_cfg(step: &QueryStep) -> bool {
-    matches!(
-        step,
-        QueryStep::ProcedureOf
-            | QueryStep::CfgEntry
-            | QueryStep::CfgExits
-            | QueryStep::CfgSuccessorEdges
-            | QueryStep::CfgPredecessorEdges
-            | QueryStep::CfgEdgeSource
-            | QueryStep::CfgEdgeTarget
-    )
+fn query_step_requires_semantic(step: &QueryStep) -> bool {
+    !step.op().semantic_facets().is_empty()
 }
 
 fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>) {
@@ -5038,7 +5031,7 @@ fn apply_pipeline_step(
             ReceiverQueryService::from_workspace,
         )
     });
-    if query_step_requires_cfg(step) && semantic.is_none() {
+    if query_step_requires_semantic(step) && semantic.is_none() {
         if !diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired)

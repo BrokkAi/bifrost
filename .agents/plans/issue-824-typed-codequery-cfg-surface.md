@@ -47,6 +47,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 11:58Z) Integrated the CFG algebra with ordinary execution, explain/profile accounting, compact/full rendering, typed evidence, and analyzer-only workspace diagnostics.
 - [x] (2026-07-25 12:28Z) Ran the requested branch-versus-`origin/master` guided review after the core Rust checkpoint and triaged eleven confirmed findings across correctness, resource bounds, public identity, profiling/explain output, schema metadata, and architecture.
 - [x] (2026-07-25 16:38 SAST) Corrected the reviewed semantic execution defects: one-way enclosing-procedure selection, character-based public ranges, bounded and cancellable materialization/traversal, branch-aware diagnostics, accurate per-operator work, stable content-scoped public IDs, and semantic policy hard caps.
+- [x] (2026-07-25 16:55 SAST) Published each physical step's planned semantic facets in explain output and associated every RQL pipeline wrapper with its canonical JSON operation metadata.
 - [ ] Complete Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
 - [ ] Complete Milestone 5 by updating MCP, Python, LSP/VS Code, TextMate grammar, public docs, executable examples, and their behavior-focused tests for schema version 3.
 - [ ] Complete Milestone 6 by reconciling the umbrella roadmap, running the remaining client/documentation tests and the full `nlp,python` release gate, then performing the final guided review.
@@ -161,6 +162,10 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Decision: Add explicit retained-byte and traversal-step dimensions to the semantic execution budget, and enforce every semantic dimension through policy hard caps.
   Rationale: File and row counts alone cannot bound retained source/artifact memory or a lookup that examines many procedures but returns one row. Separate ledgers make both costs finite, observable, and reusable by later data-flow adapters.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: Store semantic facet requirements on `QueryStepOp` and associate each RQL wrapper with that operation in the declarative schema registry.
+  Rationale: Planning, workspace-service activation, JSON help, and RQL help now consume one operation identity instead of maintaining private CFG keyword lists or descriptions that can drift when a domain is added.
   Date/Author: 2026-07-25 / Codex
 
 ## Outcomes & Retrospective
@@ -532,3 +537,5 @@ Revision note (2026-07-25 / Codex): Recorded implementation approval, milestone 
 Revision note (2026-07-25 / Codex): Added the post-core guided-review findings as required corrective checkpoints, split the remaining client, planning/profile, architecture, and release work into restartable progress entries, and recorded the concrete contract and execution failures that must be fixed before the public schema rollout.
 
 Revision note (2026-07-25 16:38 SAST / Codex): Completed the reviewed correctness-and-bounds checkpoint, recorded the separate validity/public identity scopes and per-step diagnostic/profile attribution, and added the focused and full pipeline validation evidence.
+
+Revision note (2026-07-25 16:55 SAST / Codex): Added declarative semantic-facet planning metadata, exposed it in the public physical plan, and linked RQL pipeline wrappers to their canonical JSON operation descriptions and schema versions.

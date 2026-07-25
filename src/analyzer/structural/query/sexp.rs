@@ -342,22 +342,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?;
-            let op = match form {
-                RqlForm::EnclosingDecl => "enclosing_decl",
-                RqlForm::ProcedureOf => "procedure_of",
-                RqlForm::CfgEntry => "cfg_entry",
-                RqlForm::CfgExits => "cfg_exits",
-                RqlForm::CfgSuccessorEdges => "cfg_successor_edges",
-                RqlForm::CfgPredecessorEdges => "cfg_predecessor_edges",
-                RqlForm::CfgEdgeSource => "cfg_edge_source",
-                RqlForm::CfgEdgeTarget => "cfg_edge_target",
-                RqlForm::FileOf => "file_of",
-                RqlForm::ImportsOf => "imports_of",
-                RqlForm::ImportersOf => "importers_of",
-                RqlForm::Members => "members",
-                RqlForm::Owner => "owner",
-                _ => unreachable!("typed pipeline wrapper filtered above"),
-            };
+            let op = form
+                .query_step_op()
+                .expect("typed pipeline wrapper has a declarative query-step association")
+                .label();
             steps.push(json!({ "op": op }));
             Ok(Some(Value::Object(query)))
         }
