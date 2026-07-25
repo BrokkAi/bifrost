@@ -51,7 +51,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 16:58 SAST) Completed Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/value/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
 - [x] (2026-07-25 17:21 SAST) Completed Milestone 5 across the MCP schema, Python models, LSP URI transport, VS Code result/navigation UI, TextMate grammar, public documentation, and executable JSON/RQL examples.
 - [x] (2026-07-25 18:24 SAST) Reconciled the umbrella roadmap around first-class control edges, updated every omitted-schema policy expectation and golden to compatible schema v3 while retaining explicit-v2 coverage, and passed the full `nlp,python` release matrix plus all-target/all-feature Clippy.
-- [ ] Complete Milestone 6 by performing the final branch-versus-`origin/master` guided review, fixing every confirmed finding, and rerunning proportionate gates.
+- [x] (2026-07-25 23:41 SAST) Completed Milestone 6: fixed every confirmed final guided-review finding, obtained clean intent, duplication/architecture, and security/operations re-reviews, and passed the release-quality formatting, Clippy, focused regression, full-feature test, and doctest gates.
 
 ## Surprises & Discoveries
 
@@ -73,8 +73,8 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - Observation: Before this slice, CodeQuery's public schema version was 2, and policy fixtures deliberately pinned version 2. Removing version 2 would cause unrelated policy identity churn.
   Evidence: The version-3 registry retains version 2 as its exact predecessor; checked `.rqlp` and normalized policy fixtures still contain explicit version-2 selectors.
 
-- Observation: The configured Bifrost code-intelligence skills did not expose callable Bifrost tools in this worktree after tool discovery, so implementation navigation used exact `rg` searches and narrow source reads.
-  Evidence: Tool discovery returned no `search_symbols`, `query_code`, `get_summaries`, or `get_symbol_sources` callables; no Bifrost result was replaced by an inferred answer.
+- Observation: The configured Bifrost code-intelligence skills did not expose callable Bifrost tools during the initial implementation phase, but a later plugin refresh made `get_summaries` and `get_symbol_sources` available for the final remediation.
+  Evidence: Initial tool discovery returned none of the named Bifrost callables. During final review remediation, Bifrost summaries and symbol sources identified the analyzer range-delegation seam; one exact `get_symbol_sources` lookup falsely reported `IAnalyzer::ranges_of` missing even though `rg` located it in `src/analyzer/i_analyzer.rs`, so the false negative was verified rather than treated as absence.
 
 - Observation: The milestone's historical `rql_diagnostics` and `rql_tooling` integration-test targets no longer exist as standalone files. The same behavior now lives in structural-query unit tests and the focused `bifrost_lsp_server` RQL tests.
   Evidence: `rg --files tests` found no matching test targets; `cargo test --lib analyzer::structural::query` and `bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_source` exercise the current boundaries.
@@ -114,6 +114,21 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: The direct-flow client currently on `master` is a one-fact solver validation client, not the structured value-flow client required for a public `flow_endpoint` domain.
   Evidence: `DirectFlowProblem` follows every ICFG edge with one zero fact; live issue #821 remains open and owns structured direct/indirect value flow, event identities, source/sink/sanitizer binding, and witnesses. Publishing a flow domain in this slice would therefore create placeholder API rather than consume the owning analysis service.
+
+- Observation: A digest over only a semantic edge's rendered fields is not injective when a lowered procedure contains parallel edges, and source/range fields alone do not distinguish co-located program points.
+  Evidence: Final review produced collisions for parallel control edges and same-range points. Artifact-scoped private dense discriminators now participate in the domain-separated public digest without being exposed on the wire.
+
+- Observation: A request-scoped semantic cache is insufficient protection when MCP work outlives workspace removal, replacement, or connection shutdown.
+  Evidence: Final review found that a queued query could execute against a revoked root and that successful stale work could still publish after a newer workspace generation. Query dispatch now captures an immutable prepared workspace scope and generation lease, rechecks revocation before publication, propagates cancellation, and suppresses stale responses.
+
+- Observation: Bounding result rows does not bound provider-side declaration/range lookup if the provider first hydrates every file range.
+  Evidence: Final review traced `procedure_of` through declaration lookup into the analyzer's full `ranges` path. The query now delegates through `IAnalyzer::ranges_with_limit` to TreeSitter's existing `ranges_limited`, returns the provider's inspected count, charges that work, and performs no cold hydration when the remaining traversal budget is zero.
+
+- Observation: A bounded response channel can still deadlock shutdown when the stdout writer is permanently blocked and shutdown waits to join it.
+  Evidence: A paced blocked-stdout reproduction saturated the four-response queue. Saturation now cancels active work and closes the connection; shutdown detaches the potentially blocked writer rather than waiting forever, and the exact reproduction exits with an error instead of hanging.
+
+- Observation: The final full-feature run used matching rustup `cargo` and `rustc` but allowed doctests to resolve Homebrew `rustdoc`, whose same-numbered Rust 1.96 build has incompatible crate metadata.
+  Evidence: Every normal target passed, including 1,921 library tests, before doctests reported E0514 for rustup-built dependencies. Pinning `RUSTDOC` to the same rustup toolchain made the doctest gate pass with no source changes.
 
 ## Decision Log
 
@@ -185,6 +200,22 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
   Rationale: Future data-flow and typestate adapters need the same coherent request state but should not inherit a CFG-named service or expand the generic executor with another parallel set of top-level semantic variants.
   Date/Author: 2026-07-25 / Codex
 
+- Decision: Include artifact-scoped private point and edge discriminators in stable public-identity digests, while continuing to expose only source-backed opaque hashes.
+  Rationale: Source mappings and semantic kinds are not injective for co-located points or parallel edges. The private discriminator guarantees uniqueness inside the exact immutable artifact without leaking dense arena IDs as public API.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: Validate the generation of every semantic seed and composed artifact before use, not only the terminal artifact.
+  Rationale: Set/composed pipelines can otherwise join values produced from incompatible workspace generations and publish an internally incoherent provenance chain.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: Limit each MCP connection to four active queries and four pending responses, capture an immutable `WorkspaceQueryScope` plus generation lease at dispatch, and fail closed on response saturation.
+  Rationale: These finite limits prevent unbounded thread/response growth. Generation revocation and pre-publication checks prevent removed or replaced roots from leaking stale successes. Closing a saturated connection is safer than allowing the reader or shutdown path to block indefinitely.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: Reuse provider-native limited range lookup and charge the provider's inspected-row count to semantic traversal work.
+  Rationale: Applying a limit after full hydration is not a resource bound. The existing TreeSitter limited path stops at the provider boundary, while inspected-row accounting keeps comparisons, ordering, handle creation, and declaration lookup visible to the request budget.
+  Date/Author: 2026-07-25 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 established schema version 3 while preserving exact version-2 pins. JSON and RQL now lower to the same seven-operation CFG algebra, validate procedure/point/edge domains before execution, and map version errors back to the authored operation. The compatible head also flows through LSP schema completion and policy documentation. Execution deliberately remains incomplete, not panicking, until the typed result contracts and semantic adapter land.
@@ -218,6 +249,12 @@ Validation for Milestone 5 passed the Python model tests (14) and complete nativ
 The pre-review Milestone 6 checkpoint reconciles the umbrella roadmap with the implemented edge-first CFG algebra and completes schema-v3 compatibility cleanup across policy tests and goldens. Omitted versions follow the compatible v3 head; explicit v2 documents remain accepted and exact. Live dependency inspection confirms #709 and #818 are closed, while #820, #821, #822, and #823 remain open; no later flow or typestate result kind is advertised before its owning service exists.
 
 Validation at this checkpoint passed `cargo fmt --check`, `git diff --check`, `cargo test --lib` (1,866 tests in the feature set used by that focused rerun), the complete `cargo test --tests --features nlp,python` matrix (1,909 library tests plus every integration binary), the focused `policy_loading` (16) and `policy_source` (13) suites, and `cargo clippy --all-targets --all-features -- -D warnings`. The Clippy run used the matching rustup `cargo-clippy`, `cargo`, and `rustc` binaries through `scripts/with-isolated-cargo-target.sh`; the helper removed its target on success.
+
+The final guided-review remediation closes the remaining identity, composition, resource-bound, workspace-lifecycle, and transport-shutdown gaps. Public point and edge IDs are injective within an artifact; direct and composed semantic values retain coherent generation identity; cached content, hashing, declaration lookup, comparisons, sorting, and provider inspection are cancellable and charged. MCP queries are admitted through finite active/queued bounds, execute only inside an immutable accepted workspace scope, cannot publish after generation revocation, and cannot deadlock shutdown on saturated blocked stdout. The final intent, duplication/architecture, and security/operations specialist re-reviews reported no actionable high- or medium-priority findings.
+
+Final validation passed `cargo fmt --all`, the focused MCP/workspace/semantic regressions, all 119 `code_query_pipelines` tests, the five blocked-stderr benchmark tests outside the restrictive sandbox, and isolated `cargo clippy --all-targets --all-features -- -D warnings`. The authoritative full-feature run passed all normal targets, including 1,921 library tests with zero failures and every integration binary. Its final doctest process initially failed only because Homebrew `rustdoc` was mixed with rustup-built dependencies; rerunning doctests with `cargo`, `rustc`, and `rustdoc` pinned to the same rustup 1.96 toolchain passed.
+
+This plan's first independently useful typed CFG slice is complete. The umbrella issue #824 intentionally remains open: structured value flow, taint, typestate, policy compilers, findings, and witnesses belong to the still-separate owning services and must not be represented by placeholder CodeQuery domains.
 
 ## Context and Orientation
 
@@ -492,7 +529,7 @@ Use `scripts/with-isolated-cargo-target.sh` for isolated clippy and full-test ta
 The key architectural boundary is:
 
     CodeQuery seed and typed steps
-        -> request-scoped CfgQueryService
+        -> request-scoped SemanticQueryContext / CfgQueryAdapter
         -> WorkspaceAnalyzer::materialize_program_semantics
         -> immutable SemanticArtifact / ProcedureSemantics
         -> source-backed typed query rows and provenance
@@ -574,3 +611,5 @@ Revision note (2026-07-25 16:58 SAST / Codex): Completed Milestone 4 by extracti
 Revision note (2026-07-25 17:21 SAST / Codex): Completed the schema-v3 public rollout through MCP, Python, LSP/VS Code, grammar, and docs, including executable equivalent JSON/RQL examples and full client-facing validation.
 
 Revision note (2026-07-25 18:24 SAST / Codex): Reconciled the umbrella plan with the implemented edge-first algebra, updated compatible-head policy expectations and goldens without weakening explicit-v2 coverage, recorded the live dependency boundary for later flow/typestate slices, and completed the exhaustive all-feature test and Clippy gates before final guided review.
+
+Revision note (2026-07-25 23:41 SAST / Codex): Completed Milestone 6 after fixing every final guided-review finding across public identity, semantic generation coherence, bounded provider lookup, MCP workspace admission/revocation, concurrency, backpressure, cancellation, and blocked-writer shutdown; recorded clean specialist re-reviews and final release-gate evidence while leaving the broader #824 umbrella open for its unimplemented analysis domains.
