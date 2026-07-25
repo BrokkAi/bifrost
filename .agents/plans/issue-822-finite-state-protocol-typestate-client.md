@@ -127,10 +127,58 @@ required for that checkpoint.
   proven, uncertainty-free reached state sets; and incomplete successful
   terminal observations become explicit inconclusive findings. All 29 focused
   tests and strict client all-feature Clippy pass.
-- [ ] Implement typestate propagation, diagnostic-neutral findings, explicit
-  uncertainty semantics, and consumption of #1171's generic witness API.
-- [ ] Add controlled-graph and equivalent TypeScript/Java conformance fixtures,
-  complete repository validation, and final guided review.
+- [x] (2026-07-25 17:08+02:00) Ran the client/finding guided review. It found
+  context flattening, skipped procedure exits, unreachable unknown/external
+  semantics, incomplete quality composition, cross-plan dense-ID confusion,
+  callback expansion, conservative error-state loss, incorrect May/Must
+  classification, and quadratic/unbounded post-processing. All findings were
+  accepted under the user's automatic-fix policy.
+- [x] (2026-07-25 17:46+02:00) Hardened the execution contract: official
+  summary runs/results and every nonzero fact are binding-plan branded;
+  context-specific plans are rejected rather than flattened; analysis-root
+  ownership and exact exit kinds are validated; summary call-to-return edges
+  retain structured dispatch-boundary causes; and subject/row quality is
+  composed. Focused typestate and all generic dataflow regressions pass.
+- [x] (2026-07-25 18:13+02:00) Replaced repeated callback-wide
+  flat-map/sort/dedup cycles with a deterministic relation bounded by retained
+  facts and expansion attempts. Overflow collapses to an explicit abstained
+  incomplete state. Conservative uncertainty now retains canonical
+  error-transition witnesses, so possible error reachability remains
+  reportable.
+- [x] (2026-07-25 18:48+02:00) Replaced per-marker/per-terminal result rescans
+  with two bounded linear passes plus bounded candidate sorting. Finding
+  post-processing has explicit limits and cancellation; May requires a proven
+  uncertainty-free violating path; event-specific Must remains inconclusive
+  without universal marker proof; and terminal quality affects certainty and
+  end-to-end completeness. All 75 focused typestate/generic dataflow tests and
+  strict targeted Clippy pass.
+- [x] (2026-07-25) Completed the automatic follow-up review over the
+  client/finding checkpoint. It found stale exit observations, cross-path
+  evidence contamination, no universal error-transition proof for Must mode,
+  collapsed conservative error witnesses, dense-ID fact laundering,
+  cancellation/budget gaps, and bounded-snapshot boundary loss. The
+  source-backed path-witness finding remains dependency-blocked on #1171; every
+  other finding was accepted under the user's automatic-fix policy.
+- [x] (2026-07-25) Applied return/boundary effects before exit observations,
+  retained every distinct conservative error transition, and added
+  non-propagating safe-transition facts. May findings retain an independently
+  clean violating path, while Must findings now require complete proven paths
+  and the absence of any safe outcome for the same event binding.
+- [x] (2026-07-25) Made typestate facts opaque and changed the public entry-fact
+  constructor to resolve durable `TypestateSubjectKey` and `ProtocolStateKey`
+  values. Added cooperative callback checkpoints and one hard finding budget
+  across violation, safe-outcome, event-terminal, and root-state aggregates.
+- [x] (2026-07-25) Preserved typed dispatch boundaries through bounded ICFG
+  edges and `DataflowEdge::from_snapshot`; a deferred Rust conformance case now
+  proves bounded and summary clients receive the same structured cause.
+- [x] (2026-07-25) Added controlled source-backed TypeScript/Java conformance.
+  One compiled lifecycle protocol and one transfer client resolve aliased
+  subjects and reach the same closed state without language branches.
+- [x] Implement typestate propagation, diagnostic-neutral findings, and
+  explicit uncertainty semantics.
+- [ ] Consume #1171's generic witness API after it lands on `origin/master`.
+- [x] Add controlled-graph and equivalent TypeScript/Java conformance fixtures.
+- [ ] Complete repository validation and final guided review.
 
 ## Surprises & Discoveries
 
@@ -240,6 +288,49 @@ required for that checkpoint.
   recovered from `DataflowEdge::origin`. The binding plan now derives a second
   index from each validated call handle to its program point and uses it only
   on origin-less normal/exceptional transfers.
+
+- Observation: the current summary transfer descriptor is procedure-local and
+  deliberately omits a dynamic call-stack context.
+  Evidence: executing exact context-indexed bindings through its prior
+  all-context lookup produced cross-context false transitions. The client now
+  accepts only root-context plans and returns a typed error for context-specific
+  plans, leaving exact context execution to a future context-aware backend.
+
+- Observation: proof/completeness of the generic solver is necessary but not
+  sufficient for a complete typestate result.
+  Evidence: partial subject, event, or terminal bindings and runtime
+  uncertainty can coexist with a fixed-point solver result. The branded
+  typestate result now composes binding quality, uncertainty, abstention, and
+  solver coverage into end-to-end completeness.
+
+- Observation: solver callback and solver-state budgets do not bound work done
+  before the first `DataflowOutput::emit`.
+  Evidence: conservative closure expansion and repeated event/terminal rows
+  could materialize and repeatedly sort a large intermediate relation inside
+  one callback. The client now counts candidate expansions and retained facts
+  in its own deterministic scratch relation and collapses overflow explicitly.
+
+- Observation: snapshot and summary clients previously received different
+  dispatch-boundary evidence.
+  Evidence: `ProcedureIcfgEdge` retained `DispatchBoundaryKind`, but
+  `SnapshotBuilder::link` dropped it when constructing `IcfgEdge`, so
+  `DataflowEdge::from_snapshot` could expose only proof/completeness. Bounded
+  ICFG edges now own the typed boundary and validate that it appears only on
+  call-to-continuation edges.
+
+- Observation: a finite may-analysis result needs separate aggregate evidence
+  for clean and uncertain paths.
+  Evidence: unioning uncertainty before classification caused one uncertain
+  path to downgrade an independently proven violation. Aggregates now retain
+  an explicit clean-proven frontier while still unioning all uncertainty for
+  reporting and Must-mode conservatism.
+
+- Observation: Must error-transition findings need explicit safe outcomes, not
+  merely the absence of another error marker.
+  Evidence: the distributive solver retains may facts. Exact non-error
+  transitions now emit a non-propagating safe marker for the same event
+  binding; complete analysis can promote an error marker to Must only when no
+  such marker reaches the observation point.
 
 ## Decision Log
 
@@ -354,6 +445,52 @@ required for that checkpoint.
   disappear on the next transfer.
   Date/Author: 2026-07-25 / Codex
 
+- Decision: brand typestate facts and summary results with the exact canonical
+  binding-plan hash.
+  Rationale: subject, event-binding, and terminal-binding IDs are dense and
+  run-local. Branding prevents a valid result or entry fact from being
+  reinterpreted under another plan whose IDs happen to be in range.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: reject non-root binding contexts in the current summary client.
+  Rationale: the procedure-local summary callback has no exact dynamic
+  `OracleCallContext`; flattening would be unsound, while pretending the plan
+  is context-insensitive would make its canonical identity dishonest.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: bound callback expansion and finding post-processing independently
+  of generic solver budgets.
+  Rationale: both phases can perform substantial work before or after generic
+  propagation. Explicit deterministic caps and cancellation prevent valid
+  worst-case protocols/results from bypassing the solver's operational
+  envelope.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: keep public typestate facts opaque and accept durable keys at the
+  entry-fact seam.
+  Rationale: plan, subject, state, event, and terminal IDs are compact
+  execution indexes. Allowing external enum construction or accepting numeric
+  IDs and then stamping the current plan hash lets unrelated run-local
+  identities appear valid. Durable keys are resolved only by the owning
+  protocol and binding plan.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: represent exact safe event outcomes with finite non-propagating
+  facts.
+  Rationale: the may solver cannot infer universal violation from error markers
+  alone. A bounded safe marker preserves distributivity, is deduplicated by the
+  solver, and gives finding projection the negative evidence required for a
+  complete Must proof.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: treat the finding candidate limit as a hard shared aggregation
+  budget rather than partial truncation.
+  Rationale: counting only error rows allowed terminal and root-state maps to
+  bypass the limit, while counting omitted reached rows did not describe
+  unique findings. Hard failure is deterministic and prevents a partial report
+  from misrepresenting which identities were dropped.
+  Date/Author: 2026-07-25 / Codex
+
 - Decision: commit after every plan step and review-fix checkpoint, fetch
   `origin/master` frequently, and merge it without rebasing or switching the
   issue branch.
@@ -371,14 +508,18 @@ required for that checkpoint.
 
 ## Outcomes & Retrospective
 
-The first independently reviewable protocol checkpoint is implemented and has
-completed an initial and follow-up guided review. The compiled contract is
-bounded, deterministic, occurrence-only, and independent of public policy and
-binding identities. The remaining work begins with the pre-resolved binding
-plan after synchronizing the live #1171/#1172 dependency state.
+The protocol, pre-resolved binding plan, reusable summary client, uncertainty
+execution, bounded diagnostic-neutral finding aggregation, and controlled
+TypeScript/Java reuse case are implemented. The protocol checkpoint and the
+client/finding checkpoint have each completed guided review and automatic
+review-fix milestones. The current code also closes the follow-up review's
+correctness, identity, cancellation, aggregation, and snapshot-parity findings.
 
-Focused validation currently passes 12 protocol tests. Strict
-all-target/all-feature Clippy also passes after the follow-up fixes.
+Focused typestate, protocol, binding, generic dataflow, ICFG, and deferred-call
+conformance suites pass, as does strict test-target Clippy. Remaining work is
+the final guided review and full all-target/all-feature validation. Bounded
+source-backed path witnesses cannot be completed until #1171 lands; the client
+will consume that API rather than duplicating predecessor storage here.
 
 ## Context and Orientation
 
