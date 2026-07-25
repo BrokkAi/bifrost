@@ -41,7 +41,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 08:17Z) Chose the initial typed domains and exact one-hop CFG algebra described in this plan.
 - [x] (2026-07-25 08:31Z) User approved implementation and requested checkpoint commits between milestones plus frequent synchronization with `origin/master`.
 - [x] (2026-07-25 08:47Z) Added schema-versioned query kinds and operations with parser, decoder, validator, canonical JSON, exact JSON/RQL ranges, RQL tooling metadata, and an explicit incomplete execution result until the semantic adapter lands.
-- [ ] Add source-backed public result types and deterministic wire identities without exposing dense semantic IR IDs.
+- [x] (2026-07-25 09:04Z) Added source-backed procedure, program-point, and control-edge result/reference contracts, typed semantic evidence, boundary metadata, rendering, public re-exports, and detailed-evidence wire-identity invariants without exposing dense IR IDs.
 - [ ] Implement the request-scoped CFG query adapter, semantic budgets, capability diagnostics, cancellation, and provenance.
 - [ ] Integrate planning/explain/profile reporting and all Rust result rendering/evidence paths.
 - [ ] Update the Python client, LSP/VS Code client, TextMate grammar, public docs, and executable examples.
@@ -119,11 +119,19 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
   Rationale: Checkpoint commits must remain safe to execute. The temporary diagnostic makes the staged public parser honest and is removed when Milestone 3 wires real semantic rows.
   Date/Author: 2026-07-25 / Codex
 
+- Decision: Semantic result evidence serializes compact typed `proof` and `completeness` enums plus separate optional reason strings.
+  Rationale: The common proven/complete case stays easy to read as `"proof": "proven", "completeness": "complete"`, while unproven or partial rows preserve their diagnostic reason without requiring clients to parse prose or a differently shaped enum payload.
+  Date/Author: 2026-07-25 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 established schema version 3 while preserving exact version-2 pins. JSON and RQL now lower to the same seven-operation CFG algebra, validate procedure/point/edge domains before execution, and map version errors back to the authored operation. The compatible head also flows through LSP schema completion and policy documentation. Execution deliberately remains incomplete, not panicking, until the typed result contracts and semantic adapter land.
 
 Validation at this checkpoint passed `cargo test --lib analyzer::structural::query` (93 tests), the focused CFG no-panic pipeline test, the focused RQLP schema-completion LSP test, the policy documentation suite (8 tests), and the inferred-version policy renderer test.
+
+Milestone 2 established the Rust wire contract before binding it to one semantic provider implementation. Procedure rows own artifact identity; points and edges link to their procedure; edge endpoints are compact source-backed point references. Detailed evidence requires semantic rows to use the same wire ID as their stable owner, and policy conversion rejects these diagnostic-neutral domains instead of manufacturing findings.
+
+Validation at this checkpoint passed `cargo check --lib`, `cargo test --lib analyzer::structural::search` (70 tests), and `cargo test --test code_query_public_api` (6 tests).
 
 ## Context and Orientation
 

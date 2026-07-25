@@ -64,13 +64,16 @@ pub use rune_ir::{
 };
 pub use search::{
     CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryCompletion,
-    CodeQueryDeclaration, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryExpressionSite, CodeQueryFile,
-    CodeQueryMatch, CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange,
-    CodeQueryReceiverAnalysis, CodeQueryReceiverValue, CodeQueryReferenceSite, CodeQueryResponse,
-    CodeQueryResult, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
-    CodeQuerySourceSite, execute, execute_request, execute_request_with_cancellation,
-    execute_request_with_limits, execute_with_limits, execute_workspace, execute_workspace_request,
+    CodeQueryControlEdge, CodeQueryDeclaration, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
+    CodeQueryDiagnosticImpact, CodeQueryExecutionLimits, CodeQueryExecutionWork,
+    CodeQueryExpressionSite, CodeQueryFile, CodeQueryMatch, CodeQueryProcedure,
+    CodeQueryProgramPoint, CodeQueryProgramPointBoundary, CodeQueryProgramPointRef,
+    CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis,
+    CodeQueryReceiverValue, CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult,
+    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
+    CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQuerySourceSite, execute,
+    execute_request, execute_request_with_cancellation, execute_request_with_limits,
+    execute_with_limits, execute_workspace, execute_workspace_request,
     execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
     execute_workspace_with_limits,
 };

@@ -2436,6 +2436,9 @@ fn adapt_match_candidate(
                         &candidate.semantic_key,
                     )
                 }
+                CodeQueryStableOwnerDerivation::SemanticWireId => {
+                    return Err(());
+                }
             };
             match identity {
                 Ok(owner) => OwnerCandidate::Accepted(owner),
@@ -2634,7 +2637,10 @@ fn terminal_presentation(
             ProofState::Unproven,
             ProofReason::PartialWitness,
         ),
-        CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
+        CodeQueryResultValue::Procedure { .. }
+        | CodeQueryResultValue::ProgramPoint { .. }
+        | CodeQueryResultValue::ControlEdge { .. }
+        | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
         return Err(());
@@ -2785,7 +2791,31 @@ fn adapt_terminal_result(
                 false,
             ))
         }
-        (CodeQueryResultValue::ReceiverAnalysis { .. }, _, _, _)
+        (
+            CodeQueryResultValue::Procedure { .. }
+            | CodeQueryResultValue::ProgramPoint { .. }
+            | CodeQueryResultValue::ControlEdge { .. }
+            | CodeQueryResultValue::ReceiverAnalysis { .. },
+            _,
+            _,
+            _,
+        )
+        | (
+            _,
+            DetailedCodeQueryDomain::Procedure
+            | DetailedCodeQueryDomain::ProgramPoint
+            | DetailedCodeQueryDomain::ControlEdge,
+            _,
+            _,
+        )
+        | (
+            _,
+            _,
+            DetailedCodeQueryKey::Procedure { .. }
+            | DetailedCodeQueryKey::ProgramPoint { .. }
+            | DetailedCodeQueryKey::ControlEdge { .. },
+            _,
+        )
         | (_, DetailedCodeQueryDomain::ReceiverAnalysis, _, _)
         | (_, _, DetailedCodeQueryKey::ReceiverAnalysis { .. }, _) => Err(()),
         _ => Err(()),
@@ -3141,6 +3171,7 @@ fn validated_provenance_identity(
                 &candidate.candidate.semantic_key,
             )
         }
+        CodeQueryStableOwnerDerivation::SemanticWireId => return None,
     };
     identity.ok()
 }
@@ -3149,6 +3180,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
     match value {
         CodeQueryResultRef::StructuralMatch { .. } => "structural_match",
         CodeQueryResultRef::Declaration { .. } => "declaration",
+        CodeQueryResultRef::Procedure { .. } => "procedure",
+        CodeQueryResultRef::ProgramPoint { .. } => "program_point",
+        CodeQueryResultRef::ControlEdge { .. } => "control_edge",
         CodeQueryResultRef::File { .. } => "file",
         CodeQueryResultRef::ReferenceSite { .. } => "reference_site",
         CodeQueryResultRef::CallSite { .. } => "call_site",
@@ -3161,6 +3195,9 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
     match value {
         CodeQueryResultRef::StructuralMatch { path, .. }
         | CodeQueryResultRef::Declaration { path, .. }
+        | CodeQueryResultRef::Procedure { path, .. }
+        | CodeQueryResultRef::ProgramPoint { path, .. }
+        | CodeQueryResultRef::ControlEdge { path, .. }
         | CodeQueryResultRef::File { path }
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
@@ -3192,7 +3229,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::CallSite => Some(MatchResultDomain::CallSite),
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
-        DetailedCodeQueryDomain::ReceiverAnalysis => None,
+        DetailedCodeQueryDomain::Procedure
+        | DetailedCodeQueryDomain::ProgramPoint
+        | DetailedCodeQueryDomain::ControlEdge
+        | DetailedCodeQueryDomain::ReceiverAnalysis => None,
     }
 }
 
@@ -3221,6 +3261,14 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, kind.as_bytes());
             update_hash(&mut hasher, fq_name.as_bytes());
             update_optional_hash(&mut hasher, analyzer_id.as_deref());
+        }
+        DetailedCodeQueryKey::Procedure { id } => {
+            update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
+        | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
         }
         DetailedCodeQueryKey::File => {}
         DetailedCodeQueryKey::ReferenceSite {
@@ -3295,6 +3343,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
     match domain {
         DetailedCodeQueryDomain::StructuralMatch => "structural_match",
         DetailedCodeQueryDomain::Declaration => "declaration",
+        DetailedCodeQueryDomain::Procedure => "procedure",
+        DetailedCodeQueryDomain::ProgramPoint => "program_point",
+        DetailedCodeQueryDomain::ControlEdge => "control_edge",
         DetailedCodeQueryDomain::ReferenceSite => "reference_site",
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",

@@ -1468,6 +1468,228 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
 }
 
 #[test]
+fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
+    let procedure_id = "11".repeat(32);
+    let point_id = "22".repeat(32);
+    let edge_id = "33".repeat(32);
+    let target_id = "44".repeat(32);
+    let path = "src/app.ts";
+    let procedure_range = CodeQueryRange {
+        start_line: 1,
+        start_column: 1,
+        end_line: 4,
+        end_column: 2,
+    };
+    let point_range = CodeQueryRange {
+        start_line: 2,
+        start_column: 3,
+        end_line: 2,
+        end_column: 14,
+    };
+    let target_range = CodeQueryRange {
+        start_line: 3,
+        start_column: 3,
+        end_line: 3,
+        end_column: 10,
+    };
+    let complete = CodeQuerySemanticEvidence {
+        proof: CodeQuerySemanticProof::Proven,
+        proof_reason: None,
+        completeness: CodeQuerySemanticCompleteness::Complete,
+        completeness_reason: None,
+    };
+    let partial = CodeQuerySemanticEvidence {
+        proof: CodeQuerySemanticProof::Unproven,
+        proof_reason: Some("ambiguous enclosing procedure".to_string()),
+        completeness: CodeQuerySemanticCompleteness::Partial,
+        completeness_reason: Some("exceptional control flow is unsupported".to_string()),
+    };
+    let point_ref = CodeQueryProgramPointRef {
+        id: point_id.clone(),
+        procedure_id: procedure_id.clone(),
+        path: path.to_string(),
+        range: point_range,
+        boundary: Some(CodeQueryProgramPointBoundary::Entry),
+    };
+    let target_ref = CodeQueryProgramPointRef {
+        id: target_id.clone(),
+        procedure_id: procedure_id.clone(),
+        path: path.to_string(),
+        range: target_range,
+        boundary: None,
+    };
+    let result = CodeQueryResult {
+        results: vec![
+            CodeQueryResultItem {
+                value: CodeQueryResultValue::Procedure {
+                    value: CodeQueryProcedure {
+                        id: procedure_id.clone(),
+                        artifact_id: "aa".repeat(32),
+                        path: path.to_string(),
+                        language: "typescript",
+                        procedure_kind: "function",
+                        range: procedure_range,
+                        evidence: complete.clone(),
+                    },
+                },
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            },
+            CodeQueryResultItem {
+                value: CodeQueryResultValue::ProgramPoint {
+                    value: CodeQueryProgramPoint {
+                        id: point_id.clone(),
+                        procedure_id: procedure_id.clone(),
+                        path: path.to_string(),
+                        language: "typescript",
+                        range: point_range,
+                        boundary: Some(CodeQueryProgramPointBoundary::Entry),
+                        event_count: 1,
+                        evidence: partial.clone(),
+                    },
+                },
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            },
+            CodeQueryResultItem {
+                value: CodeQueryResultValue::ControlEdge {
+                    value: Box::new(CodeQueryControlEdge {
+                        id: edge_id.clone(),
+                        procedure_id: procedure_id.clone(),
+                        path: path.to_string(),
+                        language: "typescript",
+                        range: point_range,
+                        edge_kind: "conditional_true",
+                        source: point_ref,
+                        target: target_ref,
+                        evidence: complete,
+                    }),
+                },
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            },
+        ],
+        truncated: false,
+        diagnostics: Vec::new(),
+    };
+
+    let serialized = serde_json::to_value(&result).expect("semantic results serialize");
+    assert_eq!(serialized["results"][0]["result_type"], "procedure");
+    assert_eq!(serialized["results"][1]["result_type"], "program_point");
+    assert_eq!(serialized["results"][1]["boundary"], "entry");
+    assert_eq!(serialized["results"][1]["evidence"]["proof"], "unproven");
+    assert_eq!(
+        serialized["results"][1]["evidence"]["completeness"],
+        "partial"
+    );
+    assert_eq!(serialized["results"][2]["result_type"], "control_edge");
+    assert_eq!(serialized["results"][2]["edge_kind"], "conditional_true");
+    assert_eq!(serialized["results"][2]["source"]["id"], point_id);
+    assert_eq!(serialized["results"][2]["target"]["id"], target_id);
+    assert!(!serialized.to_string().contains("program_point_id"));
+    assert!(!serialized.to_string().contains("control_edge_id"));
+
+    let rendered = result.render_text();
+    assert!(rendered.contains("[procedure; function; proven/complete]"));
+    assert!(rendered.contains("[program point; entry; unproven/partial; 1 event]"));
+    assert!(rendered.contains("[control edge; conditional_true; proven/complete]"));
+
+    for reference in [
+        CodeQueryResultRef::Procedure {
+            id: procedure_id.clone(),
+            path: path.to_string(),
+            procedure_kind: "function",
+            range: procedure_range,
+        },
+        CodeQueryResultRef::ProgramPoint {
+            id: point_id.clone(),
+            procedure_id: procedure_id.clone(),
+            path: path.to_string(),
+            range: point_range,
+            boundary: Some(CodeQueryProgramPointBoundary::Entry),
+        },
+        CodeQueryResultRef::ControlEdge {
+            id: edge_id.clone(),
+            procedure_id: procedure_id.clone(),
+            path: path.to_string(),
+            range: point_range,
+            edge_kind: "conditional_true",
+            source_id: point_id.clone(),
+            target_id: target_id.clone(),
+        },
+    ] {
+        let serialized = serde_json::to_value(reference).expect("semantic reference serializes");
+        assert!(serialized["id"].as_str().is_some());
+        assert_eq!(serialized["path"], path);
+        assert!(serialized["range"].is_object());
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root, path);
+    let evidence_for = |index, domain, key: DetailedCodeQueryKey, id: &str| {
+        let candidate = CodeQueryStableOwnerCandidate {
+            namespace: "typescript".to_string(),
+            derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+            semantic_key: id.to_string(),
+        };
+        DetailedCodeQueryEvidence {
+            result_index: index,
+            domain,
+            key,
+            file: file.clone(),
+            byte_span: Some(0..1),
+            stable_owner_candidate: Some(candidate.clone()),
+            identities: DetailedCodeQueryProvenanceIdentities::Primary(Some(
+                DetailedCodeQueryIdentityCandidate {
+                    file: file.clone(),
+                    candidate,
+                },
+            )),
+            source_slice_sha256: Some([u8::try_from(index).unwrap(); 32]),
+            provenance: Vec::new(),
+        }
+    };
+    let detailed = DetailedCodeQueryResult {
+        result,
+        work: CodeQueryExecutionWork {
+            pipeline_rows: 3,
+            ..CodeQueryExecutionWork::default()
+        },
+        evidence: vec![
+            evidence_for(
+                0,
+                DetailedCodeQueryDomain::Procedure,
+                DetailedCodeQueryKey::Procedure {
+                    id: procedure_id.clone(),
+                },
+                &procedure_id,
+            ),
+            evidence_for(
+                1,
+                DetailedCodeQueryDomain::ProgramPoint,
+                DetailedCodeQueryKey::ProgramPoint {
+                    id: point_id.clone(),
+                    procedure_id: procedure_id.clone(),
+                },
+                &point_id,
+            ),
+            evidence_for(
+                2,
+                DetailedCodeQueryDomain::ControlEdge,
+                DetailedCodeQueryKey::ControlEdge {
+                    id: edge_id.clone(),
+                    procedure_id,
+                },
+                &edge_id,
+            ),
+        ],
+        profile: None,
+    };
+    detailed.assert_invariants();
+}
+
+#[test]
 fn public_profile_retains_pre_execution_cancellation_observations() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
