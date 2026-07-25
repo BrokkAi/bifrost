@@ -442,13 +442,12 @@ pub fn run_stdio_server(
         };
         cancellations.cancel_stale(service.workspace_generation());
 
-        if let Some(response) = response {
-            if let Err(error) =
+        if let Some(response) = response
+            && let Err(error) =
                 try_queue_response(&response_sender, OutboundMcpResponse::unscoped(response))
-            {
-                read_error = Some(error);
-                break;
-            }
+        {
+            read_error = Some(error);
+            break;
         }
     }
 
