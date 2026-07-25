@@ -24,6 +24,7 @@ const RESOURCE_NOT_FOUND: i64 = -32002;
 const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_QUERY_CODE_REQUESTS: usize = 4;
+const MAX_PENDING_MCP_RESPONSES: usize = 4;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
@@ -166,6 +167,7 @@ impl McpRequestCancellations {
 struct OutboundMcpResponse {
     value: Value,
     workspace_generation: Option<u64>,
+    completion_id: Option<Value>,
 }
 
 impl OutboundMcpResponse {
@@ -173,13 +175,24 @@ impl OutboundMcpResponse {
         Self {
             value,
             workspace_generation: None,
+            completion_id: None,
         }
     }
 
+    #[cfg(test)]
     fn scoped(value: Value, workspace_generation: u64) -> Self {
         Self {
             value,
             workspace_generation: Some(workspace_generation),
+            completion_id: None,
+        }
+    }
+
+    fn scoped_request(value: Value, workspace_generation: u64, completion_id: Value) -> Self {
+        Self {
+            value,
+            workspace_generation: Some(workspace_generation),
+            completion_id: Some(completion_id),
         }
     }
 
@@ -298,21 +311,30 @@ pub fn run_stdio_server(
     });
     let mut connection = McpConnectionState::new(accepts_client_roots);
     let cancellations = McpRequestCancellations::default();
-    let (response_sender, response_receiver) = mpsc::channel::<OutboundMcpResponse>();
+    let (response_sender, response_receiver) =
+        mpsc::sync_channel::<OutboundMcpResponse>(MAX_PENDING_MCP_RESPONSES);
     let writer_service = Arc::clone(&service);
+    let writer_cancellations = cancellations.clone();
     let writer = thread::Builder::new()
         .name("bifrost-mcp-writer".to_string())
         .spawn(move || -> Result<(), String> {
             let mut stdout = io::stdout();
             for response in response_receiver {
-                if !response.is_current(writer_service.as_ref()) {
-                    continue;
+                let write_result = if response.is_current(writer_service.as_ref()) {
+                    serde_json::to_string(&response.value)
+                        .map_err(|err| format!("Failed to serialize MCP response: {err}"))
+                        .and_then(|encoded| {
+                            writeln!(stdout, "{encoded}")
+                                .and_then(|_| stdout.flush())
+                                .map_err(|err| format!("Failed to write MCP response: {err}"))
+                        })
+                } else {
+                    Ok(())
+                };
+                if let Some(completion_id) = response.completion_id {
+                    writer_cancellations.complete(&completion_id);
                 }
-                let encoded = serde_json::to_string(&response.value)
-                    .map_err(|err| format!("Failed to serialize MCP response: {err}"))?;
-                writeln!(stdout, "{encoded}")
-                    .and_then(|_| stdout.flush())
-                    .map_err(|err| format!("Failed to write MCP response: {err}"))?;
+                write_result?;
             }
             Ok(())
         })
@@ -320,7 +342,7 @@ pub fn run_stdio_server(
 
     let stdin = io::stdin();
     let mut read_error = None;
-    for line in stdin.lock().lines() {
+    'requests: for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) => line,
             Err(err) => {
@@ -374,13 +396,16 @@ pub fn run_stdio_server(
                                                 .to_string(),
                                         ),
                                     };
-                                    response_sender
-                                        .send(OutboundMcpResponse::unscoped(error_response(
+                                    cancellations.cancel_stale(service.workspace_generation());
+                                    if let Err(error) = try_queue_response(
+                                        &response_sender,
+                                        OutboundMcpResponse::unscoped(error_response(
                                             id, code, message,
-                                        )))
-                                        .map_err(|_| {
-                                            "MCP response writer stopped unexpectedly".to_string()
-                                        })?;
+                                        )),
+                                    ) {
+                                        read_error = Some(error);
+                                        break 'requests;
+                                    }
                                     continue;
                                 }
                             };
@@ -418,9 +443,12 @@ pub fn run_stdio_server(
         cancellations.cancel_stale(service.workspace_generation());
 
         if let Some(response) = response {
-            response_sender
-                .send(OutboundMcpResponse::unscoped(response))
-                .map_err(|_| "MCP response writer stopped unexpectedly".to_string())?;
+            if let Err(error) =
+                try_queue_response(&response_sender, OutboundMcpResponse::unscoped(response))
+            {
+                read_error = Some(error);
+                break;
+            }
         }
     }
 
@@ -480,7 +508,7 @@ fn spawn_cancellable_tool_call(
     id: Value,
     cancellation: CancellationToken,
     cancellations: McpRequestCancellations,
-    response_sender: mpsc::Sender<OutboundMcpResponse>,
+    response_sender: mpsc::SyncSender<OutboundMcpResponse>,
 ) -> Result<(), String> {
     let workspace_generation = call
         .workspace_generation()
@@ -495,15 +523,37 @@ fn spawn_cancellable_tool_call(
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
                 };
-            cancellations.complete(&id);
-            let _ =
-                response_sender.send(OutboundMcpResponse::scoped(response, workspace_generation));
+            if response_sender
+                .send(OutboundMcpResponse::scoped_request(
+                    response,
+                    workspace_generation,
+                    id.clone(),
+                ))
+                .is_err()
+            {
+                cancellations.complete(&id);
+            }
         });
     if let Err(err) = spawn_result {
         cleanup_cancellations.complete(&cleanup_id);
         return Err(format!("Failed to start cancellable MCP request: {err}"));
     }
     Ok(())
+}
+
+fn try_queue_response(
+    sender: &mpsc::SyncSender<OutboundMcpResponse>,
+    response: OutboundMcpResponse,
+) -> Result<(), String> {
+    match sender.try_send(response) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Full(_)) => Err(format!(
+            "MCP response queue reached its fixed capacity of {MAX_PENDING_MCP_RESPONSES}; closing the connection to preserve bounded memory"
+        )),
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err("MCP response writer stopped unexpectedly".to_string())
+        }
+    }
 }
 
 fn dispatch_message(
@@ -2083,6 +2133,23 @@ mod uri_tests {
     }
 
     #[test]
+    fn immediate_response_queue_saturates_without_blocking_the_reader() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        try_queue_response(
+            &sender,
+            OutboundMcpResponse::unscoped(success_response(json!(1), json!({}))),
+        )
+        .expect("first response fits");
+
+        let error = try_queue_response(
+            &sender,
+            OutboundMcpResponse::unscoped(success_response(json!(2), json!({}))),
+        )
+        .expect_err("a full response queue must fail fast");
+        assert!(error.contains("fixed capacity"));
+    }
+
+    #[test]
     fn prepared_query_is_pinned_to_its_workspace_and_revoked_response_is_suppressed() {
         let first = tempfile::tempdir().expect("first workspace");
         let second = tempfile::tempdir().expect("second workspace");
@@ -2168,7 +2235,7 @@ mod uri_tests {
             )
             .is_none()
         );
-        let (response_sender, response_receiver) = mpsc::channel();
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let prepared = service
             .prepare_query_code(json!({
                 "schema_version": 3,

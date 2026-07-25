@@ -1229,11 +1229,11 @@ impl SearchToolsService {
             .root
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        self.advance_workspace_generation();
         let old_session = session.replace(new_session);
         *active_root = Some(canonical.clone());
         drop(active_root);
         drop(session);
-        self.advance_workspace_generation();
         if let Some(old_session) = old_session {
             old_session.close_semantic();
         }
@@ -1251,13 +1251,14 @@ impl SearchToolsService {
             .root
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
-        let old_session = session.take();
-        let old_root = active_root.take();
-        drop(active_root);
-        drop(session);
-        if old_session.is_some() || old_root.is_some() {
+        let was_bound = session.is_some() || active_root.is_some();
+        if was_bound {
             self.advance_workspace_generation();
         }
+        let old_session = session.take();
+        active_root.take();
+        drop(active_root);
+        drop(session);
         if let Some(old_session) = old_session {
             old_session.close_semantic();
         }
@@ -1405,9 +1406,11 @@ impl SearchToolsService {
     pub fn close(&self) -> Result<(), SearchToolsServiceError> {
         let mut guard = self.write_session()?;
         let session = guard.take();
+        if session.is_some() {
+            self.advance_workspace_generation();
+        }
         drop(guard);
         if let Some(session) = session {
-            self.advance_workspace_generation();
             session.close_semantic();
         }
         Ok(())
@@ -1551,11 +1554,11 @@ impl SearchToolsService {
             .root
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
         *root = Some(resolved.clone());
         drop(guard);
         drop(root);
-        self.advance_workspace_generation();
         old_session.close_semantic();
 
         active_workspace_result(&resolved)

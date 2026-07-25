@@ -260,6 +260,24 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn ranges(&self, _code_unit: &CodeUnit) -> Vec<Range> {
         Vec::new()
     }
+    /// Returns at most `max_ranges` declaration ranges and whether more work
+    /// remained (including cancellation). Production analyzers override this
+    /// so bounded semantic queries never clone an unbounded stored range set.
+    #[doc(hidden)]
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, bool) {
+        if cancellation.is_cancelled() {
+            return (Vec::new(), true);
+        }
+        let mut ranges = self.ranges(code_unit);
+        let incomplete = ranges.len() > max_ranges || cancellation.is_cancelled();
+        ranges.truncate(max_ranges);
+        (ranges, incomplete)
+    }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;

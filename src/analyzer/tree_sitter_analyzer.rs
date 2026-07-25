@@ -6854,6 +6854,37 @@ where
             .unwrap_or_default()
     }
 
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, bool) {
+        if cancellation.is_cancelled() {
+            return (Vec::new(), true);
+        }
+        let Some(state) = self
+            .source_snapshot_file_state(code_unit.source())
+            .or_else(|| self.fetch_file_state(code_unit.source()))
+        else {
+            return (Vec::new(), false);
+        };
+        let Some(ranges) = state.ranges.get(code_unit) else {
+            return (Vec::new(), false);
+        };
+        let mut bounded = Vec::with_capacity(ranges.len().min(max_ranges));
+        for range in ranges.iter().take(max_ranges) {
+            if cancellation.is_cancelled() {
+                return (bounded, true);
+            }
+            bounded.push(*range);
+        }
+        (
+            bounded,
+            ranges.len() > max_ranges || cancellation.is_cancelled(),
+        )
+    }
+
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         let Some(config) = self.adapter.cognitive_complexity_config() else {
             return Vec::new();
