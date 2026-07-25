@@ -49,7 +49,11 @@ required for that checkpoint.
   determinism checks, canonical rendering/hash, and the policy-layer hash
   compatibility re-export. Existing policy hash tests and strict library
   clippy pass.
-- [ ] Implement and validate the internal protocol model, compiler,
+- [x] (2026-07-25 11:16+02:00) Added and validated the language-neutral
+  resource-lifecycle fixture plus behavior tests covering canonical
+  order-independence, explicit violations, non-absorbing error states, normal
+  and exceptional exits, invalid bindings/graphs, and hard source bounds.
+- [x] Implement and validate the internal protocol model, compiler,
   canonicalization, typed hash, deterministic rendering, and lifecycle fixture.
 - [ ] Run the guided specialist review over the first protocol checkpoint and
   resolve every actionable finding.

@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "states": [
+    "unallocated",
+    "open",
+    "closed",
+    "violated"
+  ],
+  "initial_state": "unallocated",
+  "accepting_states": [
+    "unallocated",
+    "closed"
+  ],
+  "error_states": [
+    "violated"
+  ],
+  "events": [
+    {
+      "id": "acquire",
+      "action": "allocation",
+      "phase": "at_event",
+      "subject": {
+        "type": "allocation_result"
+      }
+    },
+    {
+      "id": "use",
+      "action": "receiver_call",
+      "phase": "before_call",
+      "subject": {
+        "type": "receiver"
+      }
+    },
+    {
+      "id": "close",
+      "action": "receiver_call",
+      "phase": "after_normal_return",
+      "subject": {
+        "type": "receiver"
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "from": "unallocated",
+      "on": "acquire",
+      "to": "open"
+    },
+    {
+      "from": "open",
+      "on": "use",
+      "to": "open"
+    },
+    {
+      "from": "open",
+      "on": "close",
+      "to": "closed"
+    },
+    {
+      "from": "unallocated",
+      "on": "use",
+      "to": "violated",
+      "violation": "use-before-open"
+    },
+    {
+      "from": "closed",
+      "on": "use",
+      "to": "violated",
+      "violation": "use-after-close"
+    },
+    {
+      "from": "closed",
+      "on": "close",
+      "to": "violated",
+      "violation": "double-close"
+    },
+    {
+      "from": "violated",
+      "on": "acquire",
+      "to": "open"
+    }
+  ],
+  "terminal_expectations": [
+    {
+      "id": "normal-exit-closed",
+      "on": "normal_analysis_root",
+      "expected_states": [
+        "unallocated",
+        "closed"
+      ],
+      "violation": "resource-left-open"
+    },
+    {
+      "id": "exceptional-exit-closed",
+      "on": "exceptional_analysis_root",
+      "expected_states": [
+        "unallocated",
+        "closed"
+      ],
+      "violation": "resource-left-open"
+    }
+  ],
+  "semantics": {
+    "analysis_mode": "may",
+    "unmatched_event": "preserve_state",
+    "uncertainty": {
+      "ambiguous_dispatch": "preserve_uncertainty",
+      "unknown_call": "preserve_uncertainty",
+      "external_call": "preserve_uncertainty",
+      "escape": "abstain",
+      "incomplete_analysis": "abstain"
+    }
+  }
+}
