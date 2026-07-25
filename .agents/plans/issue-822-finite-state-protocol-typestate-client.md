@@ -120,6 +120,13 @@ required for that checkpoint.
   execute bound before/after endpoint phases, while materialized calls retain
   their exact-origin call/return behavior. All 16 binding/client tests and
   strict focused all-feature Clippy pass.
+- [x] (2026-07-25 16:01+02:00) Added bounded diagnostic-neutral finding
+  aggregation for exact error transitions and root/event terminal
+  expectations. Non-propagating marker facts preserve exact binding identity;
+  may results survive incomplete coverage; must results require complete,
+  proven, uncertainty-free reached state sets; and incomplete successful
+  terminal observations become explicit inconclusive findings. All 29 focused
+  tests and strict client all-feature Clippy pass.
 - [ ] Implement typestate propagation, diagnostic-neutral findings, explicit
   uncertainty semantics, and consumption of #1171's generic witness API.
 - [ ] Add controlled-graph and equivalent TypeScript/Java conformance fixtures,
@@ -336,6 +343,15 @@ required for that checkpoint.
   Retaining a compact uncertainty set and abstention bit on each finite fact
   makes those semantics distributive and prevents incomplete paths from later
   appearing definitive.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: publish violation and event-terminal observations as finite
+  non-propagating solver facts.
+  Rationale: transfer callbacks cannot mutate a finding sink, and reconstructing
+  the responsible event from a later error-state fact would lose the exact
+  binding site. Marker facts preserve distributivity and boundedness, are
+  retained at the immediate target for finding aggregation, and deliberately
+  disappear on the next transfer.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: commit after every plan step and review-fix checkpoint, fetch

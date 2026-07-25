@@ -6,6 +6,7 @@
 
 mod binding;
 mod client;
+mod finding;
 mod hash;
 mod protocol;
 
@@ -16,14 +17,18 @@ pub use binding::{
     MAX_TYPESTATE_SUBJECT_CLASS_BYTES, MAX_TYPESTATE_SUBJECTS, MAX_TYPESTATE_TERMINAL_BINDINGS,
     TypestateBindingContext, TypestateBindingMultiplicity, TypestateBindingPlan,
     TypestateBindingPlanError, TypestateBindingQuality, TypestateContextKey,
-    TypestateEventBindingSpec, TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole,
-    TypestateObservationSite, TypestateProcedurePortKey, TypestateSubjectClassError,
-    TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey,
-    TypestateTerminalBindingSpec,
+    TypestateEventBindingId, TypestateEventBindingSpec, TypestateInitialSeedSpec,
+    TypestateObjectKey, TypestateObjectRole, TypestateObservationSite, TypestateProcedurePortKey,
+    TypestateSubjectClassError, TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey,
+    TypestateTerminalBindingId, TypestateTerminalBindingSpec,
 };
 pub use client::{
     TypestateFact, TypestateFlowProblem, TypestateFlowProblemError, TypestateUncertainty,
-    TypestateUncertaintySet,
+    TypestateUncertaintySet, TypestateViolation,
+};
+pub use finding::{
+    MAX_TYPESTATE_FINDINGS, TypestateFinding, TypestateFindingCertainty, TypestateFindingEvidence,
+    TypestateFindingKind, TypestateFindingReport, collect_summary_findings,
 };
 pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
 pub use protocol::{

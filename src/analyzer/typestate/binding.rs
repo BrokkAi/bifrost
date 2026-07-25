@@ -37,6 +37,26 @@ define_dense_id! {
     }
 }
 
+define_dense_id! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct TypestateEventBindingId {
+        new: pub(crate),
+        get: pub,
+        index: pub(crate),
+        try_from_index: pub(crate),
+    }
+}
+
+define_dense_id! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct TypestateTerminalBindingId {
+        new: pub(crate),
+        get: pub,
+        index: pub(crate),
+        try_from_index: pub(crate),
+    }
+}
+
 pub type TypestateSubjectClassError = crate::analyzer::identifier::IdentifierError;
 
 define_identifier! {
@@ -537,6 +557,7 @@ impl BoundTypestateInitialSeed {
 
 #[derive(Debug, Clone)]
 pub struct BoundTypestateEvent {
+    id: TypestateEventBindingId,
     event: ProtocolEventId,
     subject: TypestateSubjectId,
     site: TypestateObservationSite,
@@ -546,6 +567,10 @@ pub struct BoundTypestateEvent {
 }
 
 impl BoundTypestateEvent {
+    pub const fn id(&self) -> TypestateEventBindingId {
+        self.id
+    }
+
     pub const fn event(&self) -> ProtocolEventId {
         self.event
     }
@@ -573,6 +598,7 @@ impl BoundTypestateEvent {
 
 #[derive(Debug, Clone)]
 pub struct BoundTypestateTerminal {
+    id: TypestateTerminalBindingId,
     expectation: ProtocolExpectationId,
     subject: TypestateSubjectId,
     site: TypestateObservationSite,
@@ -581,6 +607,10 @@ pub struct BoundTypestateTerminal {
 }
 
 impl BoundTypestateTerminal {
+    pub const fn id(&self) -> TypestateTerminalBindingId {
+        self.id
+    }
+
     pub const fn expectation(&self) -> ProtocolExpectationId {
         self.expectation
     }
@@ -729,7 +759,7 @@ impl TypestateBindingPlan {
         }
 
         let mut compiled_events = Vec::with_capacity(event_bindings.len());
-        for binding in &event_bindings {
+        for (index, binding) in event_bindings.iter().enumerate() {
             let subject = subject_id(&subject_ids, &binding.subject)?;
             let event = protocol
                 .event_id(&binding.event)
@@ -741,6 +771,8 @@ impl TypestateBindingPlan {
                 .occurrence;
             validate_observation_shape(occurrence, &binding.site, binding.role)?;
             compiled_events.push(BoundTypestateEvent {
+                id: TypestateEventBindingId::try_from_index(index)
+                    .expect("validated event-binding count fits in u32"),
                 event,
                 subject,
                 site: binding.site.clone(),
@@ -751,7 +783,7 @@ impl TypestateBindingPlan {
         }
 
         let mut compiled_terminals = Vec::with_capacity(terminal_bindings.len());
-        for binding in &terminal_bindings {
+        for (index, binding) in terminal_bindings.iter().enumerate() {
             let subject = subject_id(&subject_ids, &binding.subject)?;
             let expectation = protocol
                 .expectation_id(&binding.expectation)
@@ -772,6 +804,8 @@ impl TypestateBindingPlan {
                 }
             }
             compiled_terminals.push(BoundTypestateTerminal {
+                id: TypestateTerminalBindingId::try_from_index(index)
+                    .expect("validated terminal-binding count fits in u32"),
                 expectation,
                 subject,
                 site: binding.site.clone(),
@@ -901,8 +935,19 @@ impl TypestateBindingPlan {
         &self.event_bindings
     }
 
+    pub fn event_binding(&self, id: TypestateEventBindingId) -> Option<&BoundTypestateEvent> {
+        self.event_bindings.get(id.index())
+    }
+
     pub fn terminal_bindings(&self) -> &[BoundTypestateTerminal] {
         &self.terminal_bindings
+    }
+
+    pub fn terminal_binding(
+        &self,
+        id: TypestateTerminalBindingId,
+    ) -> Option<&BoundTypestateTerminal> {
+        self.terminal_bindings.get(id.index())
     }
 
     pub fn event_bindings_at_program_point(

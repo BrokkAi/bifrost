@@ -4,10 +4,11 @@ use crate::analyzer::dataflow::{DataflowEdge, DataflowOutput, DistributiveDatafl
 use crate::analyzer::semantic::{EvidenceCompleteness, IcfgEdgeKind, ProofStatus};
 
 use super::{
-    BoundTypestateEvent, CompiledProtocol, ProtocolEventId, ProtocolEventOccurrence,
-    ProtocolObservationPhase, ProtocolStateId, ProtocolUncertaintyCause,
-    ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior, TypestateBindingPlan,
-    TypestateBindingQuality, TypestateSubjectId,
+    BoundTypestateEvent, BoundTypestateTerminal, CompiledProtocol, ProtocolEventId,
+    ProtocolEventOccurrence, ProtocolObservationPhase, ProtocolStateId,
+    ProtocolTerminalObservationSpec, ProtocolUncertaintyCause, ProtocolUncertaintyResolution,
+    ProtocolUnmatchedEventBehavior, TypestateBindingPlan, TypestateBindingQuality,
+    TypestateEventBindingId, TypestateSubjectId, TypestateTerminalBindingId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,6 +37,10 @@ impl TypestateUncertaintySet {
     const fn with(self, uncertainty: TypestateUncertainty) -> Self {
         Self(self.0 | (1 << uncertainty as u8))
     }
+
+    pub(super) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,6 +52,40 @@ pub enum TypestateFact {
         uncertainty: TypestateUncertaintySet,
         abstained: bool,
     },
+    Violation {
+        subject: TypestateSubjectId,
+        violation: TypestateViolation,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    },
+    Terminal {
+        subject: TypestateSubjectId,
+        terminal_binding: TypestateTerminalBindingId,
+        state: ProtocolStateId,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TypestateViolation {
+    event_binding: TypestateEventBindingId,
+    from: ProtocolStateId,
+    to: ProtocolStateId,
+}
+
+impl TypestateViolation {
+    pub const fn event_binding(self) -> TypestateEventBindingId {
+        self.event_binding
+    }
+
+    pub const fn from(self) -> ProtocolStateId {
+        self.from
+    }
+
+    pub const fn to(self) -> ProtocolStateId {
+        self.to
+    }
 }
 
 impl TypestateFact {
@@ -62,7 +101,9 @@ impl TypestateFact {
     pub const fn subject(self) -> Option<TypestateSubjectId> {
         match self {
             Self::Zero => None,
-            Self::State { subject, .. } => Some(subject),
+            Self::State { subject, .. }
+            | Self::Violation { subject, .. }
+            | Self::Terminal { subject, .. } => Some(subject),
         }
     }
 
@@ -70,13 +111,17 @@ impl TypestateFact {
         match self {
             Self::Zero => None,
             Self::State { state, .. } => Some(state),
+            Self::Violation { violation, .. } => Some(violation.to),
+            Self::Terminal { state, .. } => Some(state),
         }
     }
 
     pub const fn uncertainty(self) -> TypestateUncertaintySet {
         match self {
             Self::Zero => TypestateUncertaintySet(0),
-            Self::State { uncertainty, .. } => uncertainty,
+            Self::State { uncertainty, .. }
+            | Self::Violation { uncertainty, .. }
+            | Self::Terminal { uncertainty, .. } => uncertainty,
         }
     }
 
@@ -86,8 +131,34 @@ impl TypestateFact {
             Self::State {
                 abstained: true,
                 ..
+            } | Self::Violation {
+                abstained: true,
+                ..
+            } | Self::Terminal {
+                abstained: true,
+                ..
             }
         )
+    }
+
+    pub const fn violation(self) -> Option<TypestateViolation> {
+        match self {
+            Self::Violation { violation, .. } => Some(violation),
+            Self::Zero | Self::State { .. } | Self::Terminal { .. } => None,
+        }
+    }
+
+    pub const fn terminal_observation(
+        self,
+    ) -> Option<(TypestateTerminalBindingId, ProtocolStateId)> {
+        match self {
+            Self::Terminal {
+                terminal_binding,
+                state,
+                ..
+            } => Some((terminal_binding, state)),
+            Self::Zero | Self::State { .. } | Self::Violation { .. } => None,
+        }
     }
 }
 
@@ -161,6 +232,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
             fact @ TypestateFact::State { .. } => {
                 let _ = self.transfer_facts(edge, family, vec![fact], out);
             }
+            TypestateFact::Violation { .. } | TypestateFact::Terminal { .. } => {}
         }
     }
 
@@ -184,6 +256,14 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 facts = self.apply_binding(facts, binding);
             }
         }
+        for binding in self
+            .bindings
+            .terminal_bindings_at_program_point_all_contexts(edge.source())
+        {
+            if terminal_point_occurrence(self.protocol, binding) {
+                append_terminal_observations(&mut facts, binding);
+            }
+        }
 
         if let Some(call) = edge.origin() {
             for stage in family.stages(edge.kind()) {
@@ -193,6 +273,14 @@ impl<'plan> TypestateFlowProblem<'plan> {
                             eligible_events.push(binding.event());
                         }
                         facts = self.apply_binding(facts, binding);
+                    }
+                }
+                for binding in self
+                    .bindings
+                    .terminal_bindings_at_call_site_all_contexts(call)
+                {
+                    if terminal_call_occurrence(self.protocol, binding, *stage) {
+                        append_terminal_observations(&mut facts, binding);
                     }
                 }
             }
@@ -207,6 +295,14 @@ impl<'plan> TypestateFlowProblem<'plan> {
                             eligible_events.push(binding.event());
                         }
                         facts = self.apply_binding(facts, binding);
+                    }
+                }
+                for binding in self
+                    .bindings
+                    .terminal_bindings_at_call_program_point_all_contexts(edge.source())
+                {
+                    if terminal_call_occurrence(self.protocol, binding, *stage) {
+                        append_terminal_observations(&mut facts, binding);
                     }
                 }
             }
@@ -257,6 +353,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
     ) -> Vec<TypestateFact> {
         let mut next = Vec::new();
         for fact in facts {
+            if !matches!(fact, TypestateFact::State { .. }) {
+                next.push(fact);
+                continue;
+            }
             if fact.subject() != Some(binding.subject()) || fact.abstained() {
                 next.push(fact);
                 continue;
@@ -277,7 +377,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                         &[binding.event()],
                     ));
                 } else {
-                    next.extend(self.apply_event(fact, binding.event()));
+                    next.extend(self.apply_event(fact, binding));
                 }
                 continue;
             }
@@ -315,7 +415,11 @@ impl<'plan> TypestateFlowProblem<'plan> {
         next
     }
 
-    fn apply_event(&self, fact: TypestateFact, event: ProtocolEventId) -> Vec<TypestateFact> {
+    fn apply_event(
+        &self,
+        fact: TypestateFact,
+        binding: &BoundTypestateEvent,
+    ) -> Vec<TypestateFact> {
         let TypestateFact::State {
             subject,
             state,
@@ -330,13 +434,32 @@ impl<'plan> TypestateFlowProblem<'plan> {
             .subject(subject)
             .expect("binding-plan facts retain valid subject IDs")
             .cardinality();
-        if let Some(transition) = self.protocol.transition_for(state, event, cardinality) {
-            return vec![TypestateFact::State {
+        if let Some(transition) = self
+            .protocol
+            .transition_for(state, binding.event(), cardinality)
+        {
+            let target = TypestateFact::State {
                 subject,
                 state: transition.to(),
                 uncertainty,
                 abstained,
-            }];
+            };
+            if self.protocol.is_error(transition.to()) {
+                return vec![
+                    target,
+                    TypestateFact::Violation {
+                        subject,
+                        violation: TypestateViolation {
+                            event_binding: binding.id(),
+                            from: state,
+                            to: transition.to(),
+                        },
+                        uncertainty,
+                        abstained,
+                    },
+                ];
+            }
+            return vec![target];
         }
         match self.protocol.semantics().unmatched_event {
             ProtocolUnmatchedEventBehavior::PreserveState => vec![fact],
@@ -357,6 +480,38 @@ impl<'plan> TypestateFlowProblem<'plan> {
         cause: ProtocolUncertaintyCause,
         eligible_events: &[ProtocolEventId],
     ) -> Vec<TypestateFact> {
+        let uncertainty_kind = uncertainty_kind(cause);
+        match fact {
+            TypestateFact::Violation {
+                subject,
+                violation,
+                uncertainty,
+                abstained,
+            } => {
+                return vec![TypestateFact::Violation {
+                    subject,
+                    violation,
+                    uncertainty: uncertainty.with(uncertainty_kind),
+                    abstained,
+                }];
+            }
+            TypestateFact::Terminal {
+                subject,
+                terminal_binding,
+                state,
+                uncertainty,
+                abstained,
+            } => {
+                return vec![TypestateFact::Terminal {
+                    subject,
+                    terminal_binding,
+                    state,
+                    uncertainty: uncertainty.with(uncertainty_kind),
+                    abstained,
+                }];
+            }
+            TypestateFact::Zero | TypestateFact::State { .. } => {}
+        }
         let TypestateFact::State {
             subject,
             state,
@@ -382,7 +537,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 abstained: true,
             }];
         };
-        let uncertainty = uncertainty.with(uncertainty_kind(cause));
+        let uncertainty = uncertainty.with(uncertainty_kind);
         match resolution {
             ProtocolUncertaintyResolution::StateSet(states) => states
                 .iter()
@@ -557,6 +712,91 @@ fn call_occurrence(protocol: &CompiledProtocol, event: ProtocolEventId, stage: C
             CallStage::ActualToFormal
         ) | (ProtocolEventOccurrence::ReturnFlow, CallStage::ReturnFlow)
     )
+}
+
+fn terminal_point_occurrence(
+    protocol: &CompiledProtocol,
+    binding: &BoundTypestateTerminal,
+) -> bool {
+    let terminal = protocol
+        .terminal_expectation(binding.expectation())
+        .expect("binding-plan expectations retain valid protocol IDs");
+    matches!(
+        terminal.on(),
+        ProtocolTerminalObservationSpec::Event { observation }
+            if matches!(
+                observation.occurrence,
+                ProtocolEventOccurrence::Allocation
+                    | ProtocolEventOccurrence::Endpoint {
+                        phase: ProtocolObservationPhase::AtMatch
+                    }
+                    | ProtocolEventOccurrence::FieldRead
+                    | ProtocolEventOccurrence::FieldWrite
+                    | ProtocolEventOccurrence::Escape
+                    | ProtocolEventOccurrence::ProcedureExit { .. }
+            )
+    )
+}
+
+fn terminal_call_occurrence(
+    protocol: &CompiledProtocol,
+    binding: &BoundTypestateTerminal,
+    stage: CallStage,
+) -> bool {
+    let terminal = protocol
+        .terminal_expectation(binding.expectation())
+        .expect("binding-plan expectations retain valid protocol IDs");
+    match terminal.on() {
+        ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => false,
+        ProtocolTerminalObservationSpec::Event { observation } => matches!(
+            (&observation.occurrence, stage),
+            (
+                ProtocolEventOccurrence::Endpoint {
+                    phase: ProtocolObservationPhase::BeforeCall
+                },
+                CallStage::BeforeCall
+            ) | (
+                ProtocolEventOccurrence::Endpoint {
+                    phase: ProtocolObservationPhase::AfterNormalReturn
+                },
+                CallStage::AfterNormalReturn
+            ) | (
+                ProtocolEventOccurrence::Endpoint {
+                    phase: ProtocolObservationPhase::AfterExceptionalReturn
+                },
+                CallStage::AfterExceptionalReturn
+            ) | (
+                ProtocolEventOccurrence::ActualToFormal,
+                CallStage::ActualToFormal
+            ) | (ProtocolEventOccurrence::ReturnFlow, CallStage::ReturnFlow)
+        ),
+    }
+}
+
+fn append_terminal_observations(facts: &mut Vec<TypestateFact>, binding: &BoundTypestateTerminal) {
+    let observations = facts
+        .iter()
+        .filter_map(|fact| match *fact {
+            TypestateFact::State {
+                subject,
+                state,
+                uncertainty,
+                abstained,
+            } if subject == binding.subject() => Some(TypestateFact::Terminal {
+                subject,
+                terminal_binding: binding.id(),
+                state,
+                uncertainty,
+                abstained,
+            }),
+            TypestateFact::Zero
+            | TypestateFact::State { .. }
+            | TypestateFact::Violation { .. }
+            | TypestateFact::Terminal { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    facts.extend(observations);
+    canonicalize_facts(facts);
 }
 
 fn canonicalize_facts(facts: &mut Vec<TypestateFact>) {
