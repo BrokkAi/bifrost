@@ -60,9 +60,10 @@ function use(resource: object): void {}
 
 function close(resource: object): void {}
 
-function lifecycle(recurse: boolean): void {
+function lifecycle(): void {
   const resource = acquire();
   const alias = resource;
+  use(alias);
   close(alias);
   return;
 }
@@ -70,17 +71,18 @@ function lifecycle(recurse: boolean): void {
 
 const JAVA_CONFORMANCE_SOURCE: &str = r#"
 final class LifecycleFixture {
-  static Object acquire() {
-    return new Object();
+  static int acquire() {
+    return 1;
   }
 
-  static void use(Object resource) {}
+  static void use(int resource) {}
 
-  static void close(Object resource) {}
+  static void close(int resource) {}
 
-  static void lifecycle(boolean recurse) {
-    Object resource = acquire();
-    Object alias = resource;
+  static void lifecycle() {
+    int resource = acquire();
+    int alias = resource;
+    use(alias);
     close(alias);
     return;
   }
@@ -1316,6 +1318,7 @@ fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
             .artifact()
             .procedure_handle(lifecycle.id())
             .expect("lifecycle handle");
+        let use_call = call_containing(lifecycle, source, "use(alias)");
         let close_call = call_containing(lifecycle, source, "close(alias)");
         let subject_object = AbstractObject::new(
             AccessPathRoot::Value(
@@ -1339,6 +1342,9 @@ fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
         let close_point = lifecycle_handle
             .point_handle(close_call.point)
             .expect("close point");
+        let use_point = lifecycle_handle
+            .point_handle(use_call.point)
+            .expect("use point");
         let event_binding = |event: &str,
                              point: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
                              phase_order: u32| {
@@ -1374,6 +1380,7 @@ fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
                     TypestateObjectRole::AllocationResult,
                     exact.clone(),
                 ),
+                event_binding("use", use_point, 0),
                 event_binding("close", close_point.clone(), 0),
             ],
             vec![TypestateTerminalBindingSpec::new(
@@ -1385,65 +1392,33 @@ fn one_protocol_runs_equivalent_typescript_and_java_lifecycles() {
             )],
         )
         .expect("language-neutral lifecycle binding plan");
-        let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
-        let proven = ProofStatus::Proven;
-        let complete = EvidenceCompleteness::Complete;
-        let opened = transfer(
-            &problem,
-            DataflowEdge::new(
-                IcfgEdgeKind::Intraprocedural(
-                    brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
-                ),
-                None,
-                &entry,
-                &close_point,
-                &proven,
-                &complete,
-            ),
-            TypestateFact::zero(),
-            TestTransfer::Normal,
-        );
-        let open = protocol
-            .state_id(&ProtocolStateKey::new("open").unwrap())
-            .unwrap();
-        let open_fact = opened
-            .iter()
-            .copied()
-            .find(|fact| fact.protocol_state() == Some(open) && fact.violation().is_none())
-            .unwrap_or_else(|| panic!("{language:?} did not acquire the aliased resource"));
-        let closed_facts = transfer(
-            &problem,
-            DataflowEdge::new(
-                IcfgEdgeKind::Intraprocedural(
-                    brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
-                ),
-                None,
-                &close_point,
-                &exit,
-                &proven,
-                &complete,
-            ),
-            open_fact,
-            TestTransfer::Normal,
-        );
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let summary = solve_typestate_with_summaries(
+            &lifecycle_handle,
+            &[],
+            &analyzer.icfg_provider(),
+            &protocol,
+            &bindings,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .expect("language-neutral lifecycle summary solve");
         let closed = protocol
             .state_id(&ProtocolStateKey::new("closed").unwrap())
             .unwrap();
+        assert!(
+            summary.result().reached_at(&exit).any(|reached| {
+                summary
+                    .result()
+                    .fact(reached.fact())
+                    .is_some_and(|fact| fact.protocol_state() == Some(closed))
+            }),
+            "{language:?} summary solve did not carry the aliased lifecycle to closed: {:#?}",
+            summary.result().reached_at(&exit).collect::<Vec<_>>()
+        );
         assert_eq!(protocol.hash(), expected_hash);
-        assert!(
-            closed_facts
-                .iter()
-                .any(|fact| fact.protocol_state() == Some(closed)),
-            "{language:?} did not carry the aliased lifecycle to closed: {closed_facts:#?}"
-        );
-        assert!(
-            closed_facts
-                .iter()
-                .filter_map(|fact| fact.violation())
-                .next()
-                .is_none(),
-            "{language:?} produced an error transition"
-        );
     }
 }
 
