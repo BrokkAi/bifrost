@@ -1508,6 +1508,8 @@ mod public_contract_tests {
                     "procedures": 0,
                     "program_points": 0,
                     "control_edges": 0,
+                    "retained_bytes": 0,
+                    "traversal_steps": 0,
                     "budget_exhausted": false
                 }
             })

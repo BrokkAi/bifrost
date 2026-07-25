@@ -4316,9 +4316,10 @@ mod tests {
         let PolicySelector::Inline { schema, query } = spec.selector else {
             panic!("expected inline selector")
         };
-        assert_eq!(schema.version, 2);
+        let compatible_rql_version = resolve_rql_schema_version(None).unwrap().version;
+        assert_eq!(schema.version, compatible_rql_version);
         assert_eq!(schema.origin, SchemaVersionOrigin::ImplicitCompatible);
-        assert_eq!(query.schema_version, 2);
+        assert_eq!(query.schema_version, u64::from(compatible_rql_version));
     }
 
     #[test]
@@ -4816,7 +4817,11 @@ mod tests {
         let rql_offset = inline.find("(rql").unwrap() + 1;
         let help = rqlp_source_help_at(inline, rql_offset).expect("inline RQL help");
         assert!(help.description.contains("inline RQL selector"));
-        assert!(help.description.contains("currently `2`"));
+        let compatible_rql_version = resolve_rql_schema_version(None).unwrap().version;
+        assert!(
+            help.description
+                .contains(&format!("currently `{compatible_rql_version}`"))
+        );
 
         let deferred =
             r#"(policy :analysis (analysis :selector (rql-file :path "queries/q.rql")))"#;
@@ -4858,7 +4863,11 @@ mod tests {
         let completion = rqlp_source_completion_at(inline, inline.len())
             .expect("nested RQL schema-version completion");
         assert_eq!(completion.range, inline.len()..inline.len());
-        assert_eq!(completion.new_text, ":schema-version 2");
+        let compatible_rql_version = resolve_rql_schema_version(None).unwrap().version;
+        assert_eq!(
+            completion.new_text,
+            format!(":schema-version {compatible_rql_version}")
+        );
 
         let explicit = "(policy :schema-version 1 ";
         assert!(rqlp_source_completion_at(explicit, explicit.len()).is_none());

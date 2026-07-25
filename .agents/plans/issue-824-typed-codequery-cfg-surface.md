@@ -50,7 +50,8 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 16:55 SAST) Published each physical step's planned semantic facets in explain output and associated every RQL pipeline wrapper with its canonical JSON operation metadata.
 - [x] (2026-07-25 16:58 SAST) Completed Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/value/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
 - [x] (2026-07-25 17:21 SAST) Completed Milestone 5 across the MCP schema, Python models, LSP URI transport, VS Code result/navigation UI, TextMate grammar, public documentation, and executable JSON/RQL examples.
-- [ ] Complete Milestone 6 by reconciling the umbrella roadmap, running the remaining client/documentation tests and the full `nlp,python` release gate, then performing the final guided review.
+- [x] (2026-07-25 18:24 SAST) Reconciled the umbrella roadmap around first-class control edges, updated every omitted-schema policy expectation and golden to compatible schema v3 while retaining explicit-v2 coverage, and passed the full `nlp,python` release matrix plus all-target/all-feature Clippy.
+- [ ] Complete Milestone 6 by performing the final branch-versus-`origin/master` guided review, fixing every confirmed finding, and rerunning proportionate gates.
 
 ## Surprises & Discoveries
 
@@ -107,6 +108,12 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: The repository's Python validation entrypoint is `scripts/test_python.sh`; the older plan path `bifrost_searchtools/tests` no longer exists.
   Evidence: The script builds the editable native extension with Python 3.12 and discovers `python_tests/test_*.py`; its complete 57-test run passed.
+
+- Observation: Advancing the compatible CodeQuery/RQL head to schema v3 exposed 26 stale policy expectations across library tests, integration tests, and checked normalized/semantic JSON goldens.
+  Evidence: The exhaustive all-feature matrix first found 18 library expectations, then four `policy_loading` cases and four `policy_source` cases. Every omitted version now derives or records v3, while tests that intentionally exercise exact version 2 construct or retain an explicit v2 query.
+
+- Observation: The direct-flow client currently on `master` is a one-fact solver validation client, not the structured value-flow client required for a public `flow_endpoint` domain.
+  Evidence: `DirectFlowProblem` follows every ICFG edge with one zero fact; live issue #821 remains open and owns structured direct/indirect value flow, event identities, source/sink/sanitizer binding, and witnesses. Publishing a flow domain in this slice would therefore create placeholder API rather than consume the owning analysis service.
 
 ## Decision Log
 
@@ -207,6 +214,10 @@ Validation for Milestone 4 passed `cargo check --lib`, the schema-registry and p
 Milestone 5 publishes one schema-v3 contract across every consumer. MCP advertises both registered schema versions and the complete declarative step vocabulary. Python exposes frozen procedure, point, point-reference, edge, evidence, explain-demand, and semantic-work models with strict required-field parsing. LSP attaches navigable file URIs to all semantic result domains, while VS Code renders their evidence, endpoint identities, ranges, icons, and navigation. RQL grammar aliases and the public JSON/RQL/docs examples now describe the same exact seven-operation algebra, finite semantic budgets, and procedure-local non-ICFG boundary.
 
 Validation for Milestone 5 passed the Python model tests (14) and complete native-extension suite (57), the VS Code formatting/typecheck/lint/build/license/unit suite (69), the MCP schema contract test, the focused real LSP CFG transport test, `code_query_docs` (3), `code_query_tutorials` (21), `cargo fmt --check`, and `git diff --check`.
+
+The pre-review Milestone 6 checkpoint reconciles the umbrella roadmap with the implemented edge-first CFG algebra and completes schema-v3 compatibility cleanup across policy tests and goldens. Omitted versions follow the compatible v3 head; explicit v2 documents remain accepted and exact. Live dependency inspection confirms #709 and #818 are closed, while #820, #821, #822, and #823 remain open; no later flow or typestate result kind is advertised before its owning service exists.
+
+Validation at this checkpoint passed `cargo fmt --check`, `git diff --check`, `cargo test --lib` (1,866 tests in the feature set used by that focused rerun), the complete `cargo test --tests --features nlp,python` matrix (1,909 library tests plus every integration binary), the focused `policy_loading` (16) and `policy_source` (13) suites, and `cargo clippy --all-targets --all-features -- -D warnings`. The Clippy run used the matching rustup `cargo-clippy`, `cargo`, and `rustc` binaries through `scripts/with-isolated-cargo-target.sh`; the helper removed its target on success.
 
 ## Context and Orientation
 
@@ -561,3 +572,5 @@ Revision note (2026-07-25 16:55 SAST / Codex): Added declarative semantic-facet 
 Revision note (2026-07-25 16:58 SAST / Codex): Completed Milestone 4 by extracting the reusable semantic query context and CFG adapter, grouping private semantic pipeline values, and sharing the detailed semantic identity projection across terminal and provenance evidence.
 
 Revision note (2026-07-25 17:21 SAST / Codex): Completed the schema-v3 public rollout through MCP, Python, LSP/VS Code, grammar, and docs, including executable equivalent JSON/RQL examples and full client-facing validation.
+
+Revision note (2026-07-25 18:24 SAST / Codex): Reconciled the umbrella plan with the implemented edge-first algebra, updated compatible-head policy expectations and goldens without weakening explicit-v2 coverage, recorded the live dependency boundary for later flow/typestate slices, and completed the exhaustive all-feature test and Clippy gates before final guided review.

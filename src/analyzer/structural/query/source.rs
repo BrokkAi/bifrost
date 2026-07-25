@@ -3320,7 +3320,7 @@ mod tests {
         }
         let file_of_help = query_source_help_at(rql, rql.find("file-of").unwrap()).unwrap();
         assert!(file_of_help.description.contains("reference site"));
-        assert!(file_of_help.description.contains("receiver analysis"));
+        assert!(file_of_help.description.contains("receiver analyses"));
         assert!(validate_query_source(rql).is_empty());
 
         let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;

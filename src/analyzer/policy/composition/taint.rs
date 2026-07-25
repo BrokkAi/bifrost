@@ -713,13 +713,13 @@ fn merge_manifests(
 mod tests {
     use super::*;
     use crate::analyzer::policy::{EndpointAnalysisProjectionHash, EndpointSemanticHash};
-    use crate::analyzer::structural::CodeQuery;
+    use crate::analyzer::structural::{CodeQuery, SCHEMA_VERSION};
     use crate::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 
     fn selector(name: &str) -> PolicySelector {
         PolicySelector::Inline {
             schema: SchemaVersionResolution {
-                version: 2,
+                version: SCHEMA_VERSION as u32,
                 origin: SchemaVersionOrigin::Explicit,
             },
             query: CodeQuery::from_sexp(&format!(r#"(call :callee (name "{name}"))"#)).unwrap(),
@@ -828,7 +828,7 @@ mod tests {
             ))
             .unwrap(),
             SchemaVersionResolution {
-                version: 2,
+                version: SCHEMA_VERSION as u32,
                 origin: SchemaVersionOrigin::Explicit,
             },
             model,
