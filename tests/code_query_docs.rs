@@ -173,6 +173,32 @@ fn query_documentation_tracks_public_contracts() {
             "{relative} must name one of the public mode-specific usage tools"
         );
     }
+
+    let python_client = fs::read_to_string(root.join("docs/src/content/docs/python-client.md"))
+        .expect("read Python client documentation");
+    for required in [
+        "compatible-head version-3",
+        "schema_version=2",
+        "ten possible classes",
+        "CodeQueryProcedure",
+        "CodeQueryProgramPoint",
+        "CodeQueryControlEdge",
+        "CodeQueryReceiverAnalysis",
+    ] {
+        assert!(
+            python_client.contains(required),
+            "Python client documentation must track the schema-v3 result contract: missing {required:?}"
+        );
+    }
+
+    let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
+        .expect("read Python client source");
+    for required in ["schema version 3", "cfg_successor_edges", "cfg_edge_target"] {
+        assert!(
+            python_client_source.contains(required),
+            "Python query_code docstring must track the schema-v3 operation contract: missing {required:?}"
+        );
+    }
 }
 
 fn marked_examples(path: &Path, contents: &str) -> Vec<MarkedExample> {
