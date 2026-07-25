@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ pub const MAX_PROTOCOL_STATES: usize = 4_096;
 pub const MAX_PROTOCOL_EVENTS: usize = 4_096;
 pub const MAX_PROTOCOL_TRANSITIONS: usize = 16_384;
 pub const MAX_PROTOCOL_EXPECTATIONS: usize = 4_096;
+pub const MAX_PROTOCOL_EXPECTED_STATE_MEMBERSHIPS: usize = 16_384;
 const MAX_PROTOCOL_DIAGNOSTICS: usize = 256;
 const MAX_DIAGNOSTIC_VALUE_BYTES: usize = 96;
 
@@ -127,7 +129,7 @@ impl ProtocolSpec {
         }
         serde_json::from_slice::<ProtocolSpecWire>(source)
             .map(Into::into)
-            .map_err(ProtocolSpecParseError::InvalidJson)
+            .map_err(ProtocolSpecParseError::invalid_json)
     }
 
     pub fn compile(&self) -> Result<CompiledProtocol, ProtocolCompileError> {
@@ -141,7 +143,35 @@ pub enum ProtocolSpecParseError {
         actual_bytes: usize,
         max_bytes: usize,
     },
-    InvalidJson(serde_json::Error),
+    InvalidJson {
+        message: Box<str>,
+        line: usize,
+        column: usize,
+    },
+}
+
+impl ProtocolSpecParseError {
+    fn invalid_json(error: serde_json::Error) -> Self {
+        Self::InvalidJson {
+            message: bounded_debug_display(&error),
+            line: error.line(),
+            column: error.column(),
+        }
+    }
+
+    pub const fn line(&self) -> Option<usize> {
+        match self {
+            Self::TooLarge { .. } => None,
+            Self::InvalidJson { line, .. } => Some(*line),
+        }
+    }
+
+    pub const fn column(&self) -> Option<usize> {
+        match self {
+            Self::TooLarge { .. } => None,
+            Self::InvalidJson { column, .. } => Some(*column),
+        }
+    }
 }
 
 impl fmt::Display for ProtocolSpecParseError {
@@ -154,7 +184,9 @@ impl fmt::Display for ProtocolSpecParseError {
                 formatter,
                 "protocol source contains {actual_bytes} bytes; maximum is {max_bytes}"
             ),
-            Self::InvalidJson(error) => write!(formatter, "invalid protocol JSON: {error}"),
+            Self::InvalidJson { message, .. } => {
+                write!(formatter, "invalid protocol JSON: {message}")
+            }
         }
     }
 }
@@ -163,7 +195,7 @@ impl std::error::Error for ProtocolSpecParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TooLarge { .. } => None,
-            Self::InvalidJson(error) => Some(error),
+            Self::InvalidJson { .. } => None,
         }
     }
 }
@@ -197,7 +229,6 @@ pub struct ProtocolTerminalExpectationSpec {
 #[serde(deny_unknown_fields)]
 pub struct ProtocolObservationSpec {
     pub occurrence: ProtocolEventOccurrence,
-    pub subject: ObjectBindingRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -220,21 +251,6 @@ pub enum ProtocolObservationPhase {
     BeforeCall,
     AfterNormalReturn,
     AfterExceptionalReturn,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ObjectBindingRole {
-    CurrentObject,
-    MatchedValue,
-    AllocationResult,
-    Receiver,
-    Actual { index: u32 },
-    Formal { index: u32 },
-    ReturnValue,
-    FieldBase,
-    FieldValue,
-    EscapedObject,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -598,15 +614,24 @@ impl CompiledProtocol {
     /// includes the current state plus every matching one-event target.
     /// Unknown or external calls, escape, and incomplete analysis may conceal
     /// an arbitrary event sequence, so their conservative relation is the
-    /// reflexive transitive closure of matching transitions. All traversals are
-    /// iterative and bounded by the compiled protocol.
+    /// reflexive transitive closure of matching transitions. The caller
+    /// supplies the finite events that the binding site may actually observe,
+    /// preventing unrelated protocol events from entering that closure. All
+    /// traversals are iterative and bounded by the compiled protocol.
     pub fn resolve_uncertainty(
         &self,
         cause: ProtocolUncertaintyCause,
         state: ProtocolStateId,
         cardinality: ProtocolObjectCardinality,
+        eligible_events: &[ProtocolEventId],
     ) -> Option<ProtocolUncertaintyResolution> {
         self.state_keys.get(state.index())?;
+        if eligible_events.len() > MAX_PROTOCOL_EVENTS {
+            return None;
+        }
+        for event in eligible_events {
+            self.events.get(event.index())?;
+        }
         match self.semantics.uncertainty.behavior(cause) {
             ProtocolUncertaintyBehavior::PreserveUncertainty => {
                 Some(ProtocolUncertaintyResolution::PreserveUncertainty { state })
@@ -614,8 +639,17 @@ impl CompiledProtocol {
             ProtocolUncertaintyBehavior::Abstain => Some(ProtocolUncertaintyResolution::Abstain),
             ProtocolUncertaintyBehavior::ConservativeTransition => {
                 let transitive = cause != ProtocolUncertaintyCause::AmbiguousDispatch;
+                let mut eligible = vec![false; self.events.len()];
+                for event in eligible_events {
+                    eligible[event.index()] = true;
+                }
                 Some(ProtocolUncertaintyResolution::StateSet(
-                    self.conservative_uncertainty_targets(state, cardinality, transitive),
+                    self.conservative_uncertainty_targets(
+                        state,
+                        cardinality,
+                        &eligible,
+                        transitive,
+                    ),
                 ))
             }
         }
@@ -625,6 +659,7 @@ impl CompiledProtocol {
         &self,
         state: ProtocolStateId,
         cardinality: ProtocolObjectCardinality,
+        eligible_events: &[bool],
         transitive: bool,
     ) -> Box<[ProtocolStateId]> {
         let mut reached = vec![false; self.state_keys.len()];
@@ -632,7 +667,9 @@ impl CompiledProtocol {
         let mut stack = vec![state];
         while let Some(source) = stack.pop() {
             for transition in self.outgoing_transitions(source) {
-                if !transition.guard.applies_to(cardinality) {
+                if !eligible_events[transition.on.index()]
+                    || !transition.guard.applies_to(cardinality)
+                {
                     continue;
                 }
                 let target = transition.to;
@@ -686,8 +723,7 @@ pub enum ProtocolDiagnosticCode {
     DuplicateClassification,
     ConflictingClassification,
     DuplicateEvent,
-    InvalidEventShape,
-    InvalidTerminalObservation,
+    TooManyExpectedStateMemberships,
     EmptyGuard,
     TooManyGuardValues,
     DuplicateGuardValue,
@@ -718,8 +754,7 @@ impl ProtocolDiagnosticCode {
             Self::DuplicateClassification => "duplicate_classification",
             Self::ConflictingClassification => "conflicting_classification",
             Self::DuplicateEvent => "duplicate_event",
-            Self::InvalidEventShape => "invalid_event_shape",
-            Self::InvalidTerminalObservation => "invalid_terminal_observation",
+            Self::TooManyExpectedStateMemberships => "too_many_expected_state_memberships",
             Self::EmptyGuard => "empty_guard",
             Self::TooManyGuardValues => "too_many_guard_values",
             Self::DuplicateGuardValue => "duplicate_guard_value",
@@ -947,6 +982,20 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
         MAX_PROTOCOL_EXPECTATIONS,
         ProtocolDiagnosticCode::TooManyTerminalExpectations,
     );
+    let expected_state_memberships = spec
+        .terminal_expectations
+        .iter()
+        .take(MAX_PROTOCOL_EXPECTATIONS)
+        .fold(0usize, |total, expectation| {
+            total.saturating_add(expectation.expected_states.len())
+        });
+    check_count(
+        &mut diagnostics,
+        "terminal_expectations.expected_states",
+        expected_state_memberships,
+        MAX_PROTOCOL_EXPECTED_STATE_MEMBERSHIPS,
+        ProtocolDiagnosticCode::TooManyExpectedStateMemberships,
+    );
 
     let mut state_sources = HashMap::new();
     for (index, value) in spec.states.iter().take(MAX_PROTOCOL_STATES).enumerate() {
@@ -1008,16 +1057,6 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
                 format!("event `{key}` duplicates events[{previous}]"),
             ));
             continue;
-        }
-        if !valid_observation_shape(&event.observation) {
-            diagnostics.push(ProtocolDiagnostic::new(
-                ProtocolDiagnosticCode::InvalidEventShape,
-                format!("events[{index}]"),
-                format!(
-                    "{:?} cannot bind {:?}",
-                    event.observation.occurrence, event.observation.subject
-                ),
-            ));
         }
         valid_events.push(ValidEvent {
             key,
@@ -1088,6 +1127,7 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
 
     let mut expectation_sources = HashMap::new();
     let mut valid_expectations = Vec::new();
+    let mut remaining_expected_state_memberships = MAX_PROTOCOL_EXPECTED_STATE_MEMBERSHIPS;
     for (index, expectation) in spec
         .terminal_expectations
         .iter()
@@ -1111,35 +1151,17 @@ fn compile_protocol(spec: &ProtocolSpec) -> Result<CompiledProtocol, ProtocolCom
                 ),
             ));
         }
-        let valid_observation = match &expectation.on {
-            ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => true,
-            ProtocolTerminalObservationSpec::Event { observation } => {
-                if valid_observation_shape(observation) {
-                    true
-                } else {
-                    diagnostics.push(ProtocolDiagnostic::new(
-                        ProtocolDiagnosticCode::InvalidTerminalObservation,
-                        format!("{base}.on"),
-                        format!(
-                            "{:?} cannot bind {:?}",
-                            observation.occurrence, observation.subject
-                        ),
-                    ));
-                    false
-                }
-            }
-        };
         let expected_states = parse_expected_states(
             &expectation.expected_states,
             &format!("{base}.expected_states"),
             &state_sources,
             &accepting_states,
             &mut diagnostics,
+            &mut remaining_expected_state_memberships,
         );
         if let Some(key) = key
             && expectation_sources.get(&key) == Some(&index)
             && !expected_states.is_empty()
-            && valid_observation
         {
             valid_expectations.push(ValidExpectation {
                 key,
@@ -1210,20 +1232,53 @@ where
     }
 }
 
-fn bounded_debug_value(value: &str) -> String {
-    let mut bounded = String::with_capacity(MAX_DIAGNOSTIC_VALUE_BYTES + 3);
-    let mut truncated = false;
-    for character in value.escape_debug() {
-        if bounded.len() + character.len_utf8() > MAX_DIAGNOSTIC_VALUE_BYTES {
-            truncated = true;
-            break;
+struct BoundedDebugWriter {
+    output: String,
+    truncated: bool,
+}
+
+impl BoundedDebugWriter {
+    fn new() -> Self {
+        Self {
+            output: String::with_capacity(MAX_DIAGNOSTIC_VALUE_BYTES + 3),
+            truncated: false,
         }
-        bounded.push(character);
     }
-    if truncated {
-        bounded.push_str("...");
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.output.push_str("...");
+        }
+        self.output
     }
-    bounded
+}
+
+impl fmt::Write for BoundedDebugWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.truncated {
+            return Ok(());
+        }
+        for character in value.escape_debug() {
+            if self.output.len() + character.len_utf8() > MAX_DIAGNOSTIC_VALUE_BYTES {
+                self.truncated = true;
+                break;
+            }
+            self.output.push(character);
+        }
+        Ok(())
+    }
+}
+
+fn bounded_debug_display(value: &impl fmt::Display) -> Box<str> {
+    let mut writer = BoundedDebugWriter::new();
+    let _ = write!(&mut writer, "{value}");
+    writer.finish().into_boxed_str()
+}
+
+fn bounded_debug_value(value: &str) -> String {
+    let mut writer = BoundedDebugWriter::new();
+    let _ = writer.write_str(value);
+    writer.finish()
 }
 
 fn parse_state_set(
@@ -1253,49 +1308,6 @@ fn parse_state_set(
         }
     }
     retained
-}
-
-fn valid_observation_shape(observation: &ProtocolObservationSpec) -> bool {
-    matches!(
-        (&observation.occurrence, &observation.subject),
-        (
-            ProtocolEventOccurrence::Allocation,
-            ObjectBindingRole::AllocationResult,
-        ) | (
-            ProtocolEventOccurrence::Endpoint {
-                phase: ProtocolObservationPhase::AtMatch,
-            },
-            ObjectBindingRole::MatchedValue,
-        ) | (
-            ProtocolEventOccurrence::Endpoint {
-                phase: ProtocolObservationPhase::BeforeCall
-                    | ProtocolObservationPhase::AfterExceptionalReturn,
-            },
-            ObjectBindingRole::Receiver | ObjectBindingRole::Actual { .. },
-        ) | (
-            ProtocolEventOccurrence::Endpoint {
-                phase: ProtocolObservationPhase::AfterNormalReturn,
-            },
-            ObjectBindingRole::Receiver
-                | ObjectBindingRole::Actual { .. }
-                | ObjectBindingRole::ReturnValue,
-        ) | (
-            ProtocolEventOccurrence::ActualToFormal,
-            ObjectBindingRole::Actual { .. } | ObjectBindingRole::Formal { .. },
-        ) | (
-            ProtocolEventOccurrence::ReturnFlow,
-            ObjectBindingRole::ReturnValue,
-        ) | (
-            ProtocolEventOccurrence::FieldRead | ProtocolEventOccurrence::FieldWrite,
-            ObjectBindingRole::FieldBase | ObjectBindingRole::FieldValue,
-        ) | (
-            ProtocolEventOccurrence::Escape,
-            ObjectBindingRole::EscapedObject,
-        ) | (
-            ProtocolEventOccurrence::ProcedureExit { .. },
-            ObjectBindingRole::CurrentObject,
-        )
-    )
 }
 
 fn normalize_guard(
@@ -1339,6 +1351,9 @@ fn normalize_guard(
                     format!("{transition_path}.guard.allowed"),
                     "object-cardinality guard contains a duplicate value",
                 ));
+            }
+            if retained.iter().all(|present| *present) {
+                return Some(CompiledProtocolGuard::Always);
             }
             let normalized: Vec<_> = PROTOCOL_OBJECT_CARDINALITIES
                 .iter()
@@ -1432,6 +1447,7 @@ fn parse_expected_states(
     states: &HashMap<ProtocolStateKey, usize>,
     accepting: &HashSet<ProtocolStateKey>,
     diagnostics: &mut DiagnosticCollector,
+    remaining_memberships: &mut usize,
 ) -> Vec<ProtocolStateKey> {
     check_count(
         diagnostics,
@@ -1449,7 +1465,12 @@ fn parse_expected_states(
         return Vec::new();
     }
     let mut retained = HashSet::new();
-    for (index, value) in values.iter().take(MAX_PROTOCOL_STATES).enumerate() {
+    let retain_count = values
+        .len()
+        .min(MAX_PROTOCOL_STATES)
+        .min(*remaining_memberships);
+    *remaining_memberships -= retain_count;
+    for (index, value) in values.iter().take(retain_count).enumerate() {
         let item_path = format!("{path}[{index}]");
         let Some(key) = parse_key::<ProtocolStateKey>(value, &item_path, diagnostics) else {
             continue;

@@ -20,9 +20,6 @@
       "observation": {
         "occurrence": {
           "type": "allocation"
-        },
-        "subject": {
-          "type": "allocation_result"
         }
       }
     },
@@ -32,9 +29,6 @@
         "occurrence": {
           "type": "endpoint",
           "phase": "before_call"
-        },
-        "subject": {
-          "type": "receiver"
         }
       }
     },
@@ -44,9 +38,6 @@
         "occurrence": {
           "type": "endpoint",
           "phase": "after_normal_return"
-        },
-        "subject": {
-          "type": "receiver"
         }
       }
     }

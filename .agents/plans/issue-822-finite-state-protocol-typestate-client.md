@@ -78,8 +78,21 @@ required for that checkpoint.
   pretty-rendering, and SHA-256 golden fixtures for the schema-v1 lifecycle
   protocol. All twelve first-review findings are now addressed; strict
   checkpoint validation and the automatic follow-up review remain.
-- [ ] Run the guided specialist review over the first protocol checkpoint and
-  resolve every actionable finding.
+- [x] (2026-07-25 13:42+02:00) Strict all-target/all-feature Clippy passed
+  through the isolated-target helper after correcting the local rustup
+  `clippy-driver` path.
+- [x] (2026-07-25 14:18+02:00) Ran the automatic follow-up guided review. It
+  found six remaining actionable issues: binding-specific identities in the
+  protocol hash, unscoped uncertainty transitions, an aggregate expectation
+  allocation bound, equivalent full-domain guard identity, Windows golden
+  line endings, and raw JSON error rendering.
+- [x] (2026-07-25 14:41+02:00) Resolved all six follow-up findings. Protocol
+  observations now contain occurrence only; uncertainty accepts an explicit
+  bounded eligible-event set; expected-state memberships have a shared
+  aggregate budget; full-domain guards canonicalize to `always`; canonical
+  fixtures are LF-pinned; and parse errors retain bounded escaped text plus
+  separate line/column metadata. All 12 focused protocol tests and strict
+  all-target/all-feature Clippy pass.
 - [ ] Define the pre-resolved subject/event binding plan and choose the
   fact-product or IDE client representation after synchronizing the live #1172
   result.
@@ -143,6 +156,21 @@ required for that checkpoint.
   until the rustup toolchain directory was prepended to `PATH`; the corrected
   strict library clippy invocation then passed.
 
+- Observation: call-site subject selection is part of the resolved binding
+  plan, not the protocol event definition.
+  Evidence: a named argument may occupy different concrete positions at
+  different call sites while representing the same public binding. Retaining
+  `actual[index]` in `ProtocolObservationSpec` made that call-site detail alter
+  the otherwise language-neutral protocol hash. The reviewed schema-v1
+  protocol now records only occurrence and phase.
+
+- Observation: uncertainty cannot conservatively mean every event in the
+  protocol.
+  Evidence: an ambiguous call at one site may conceal only the endpoint events
+  resolved for that site; treating allocation, field, escape, and unrelated
+  call events as candidates invented transitions. The executable API now
+  requires a bounded eligible-event slice supplied by the binding/client layer.
+
 ## Decision Log
 
 - Decision: keep the internal typestate module independent of
@@ -166,6 +194,14 @@ required for that checkpoint.
   protocol hash; resolved program identities, endpoint dominance, and selected
   event sites determine a separate binding identity owned at the #822/#824
   seam.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: object roles and concrete receiver/argument/formal/return
+  selections exist only in the binding plan.
+  Rationale: protocol identity describes when a neutral event is observed,
+  while the binding plan describes which resolved program object that
+  observation applies to. Keeping these separate makes named arguments and
+  language-specific call layouts hash-independent.
   Date/Author: 2026-07-25 / Codex
 
 - Decision: canonicalize semantically unordered sets and relations before
@@ -230,13 +266,14 @@ required for that checkpoint.
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The starting branch is
-`822-epic-define-finite-state-protocol-ir-and-a-reusable-typestate-client`
-at `d8e3e15f`, equal to the fetched `origin/master` and ahead of its existing
-issue-branch upstream only by the two fast-forwarded upstream commits.
+The first independently reviewable protocol checkpoint is implemented and has
+completed an initial and follow-up guided review. The compiled contract is
+bounded, deterministic, occurrence-only, and independent of public policy and
+binding identities. The remaining work begins with the pre-resolved binding
+plan after synchronizing the live #1171/#1172 dependency state.
 
-Update this section after each reviewed checkpoint with exact commits, test
-commands, remaining acceptance gaps, and any changes to issue boundaries.
+Focused validation currently passes 12 protocol tests. Strict
+all-target/all-feature Clippy also passes after the follow-up fixes.
 
 ## Context and Orientation
 
@@ -281,8 +318,8 @@ In this plan:
   resolved receiver call, return, field access, escape, or procedure exit;
 - an observation phase says whether an event is inspected at a match, before a
   call, after a normal return, or after an exceptional return;
-- a subject binding pairs one abstract object/fact identity with an initial
-  protocol state;
+- a subject binding, owned by the later binding plan rather than the protocol,
+  pairs one abstract object/fact identity with an initial protocol state;
 - a terminal expectation requires a non-empty state set at a distinct normal
   or exceptional analysis-root exit;
 - a diagnostic-neutral finding describes an analysis fact and witness, not a
@@ -313,9 +350,10 @@ Validation is deterministic and bounded. It rejects unsupported schema
 versions, invalid/oversized keys, duplicate states/events/expectations,
 missing initial or referenced states/events, duplicate conflicting
 transitions, empty/invalid terminal expectations, unsupported event/phase or
-binding/guard combinations, unstable durable identities, and unreachable
-states under the declared reachability policy. Diagnostics are sorted by a
-stable field/key order and carry bounded paths into the internal spec.
+guard combinations, unstable durable identities, aggregate collection bounds,
+and unreachable states under the declared reachability policy. Diagnostics are
+sorted by a stable field/key order and carry bounded paths into the internal
+spec.
 
 Canonical bytes are produced only from a valid normalized protocol. Sets and
 relations are sorted explicitly. The schema version and every
