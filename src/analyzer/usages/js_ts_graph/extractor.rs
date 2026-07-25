@@ -1254,9 +1254,20 @@ fn commonjs_nested_member_matches(
     local_name: &str,
     export_name: &str,
 ) -> bool {
-    let Some((export_object, export_member)) = export_name.rsplit_once('.') else {
+    // `export_name` is a CommonJS export member NAME (`module.exports.a.b`'s
+    // trailing `a.b`), not a file/module path, so it never carries a `/` — the
+    // shared structured splitter's "everything but the last segment" rejoin
+    // reproduces `rsplit_once('.')`'s (export_object, export_member) split
+    // exactly.
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::JavaScript, export_name);
+    let Some((export_member, export_object_parts)) = segments.split_last() else {
         return false;
     };
+    if export_object_parts.is_empty() {
+        return false;
+    }
+    let export_object = export_object_parts.join(".");
     property_text == export_member && object_text == format!("{local_name}.{export_object}")
 }
 

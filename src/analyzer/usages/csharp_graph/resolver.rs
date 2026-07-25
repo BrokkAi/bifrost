@@ -24,7 +24,7 @@ use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
-    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
+    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, Language, ProjectFile,
     StructuredTypeIdentity, StructuredTypeName, csharp_callable_arity,
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
     csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
@@ -2497,11 +2497,27 @@ fn push_namespace_scopes(
         }
         scopes.push(scope);
         include_usings = false;
-        let Some((parent, _)) = current.rsplit_once('.') else {
+        let Some(parent) = csharp_namespace_parent(&current) else {
             break;
         };
-        current.truncate(parent.len());
+        current = parent;
     }
+}
+
+/// The namespace one level outward from `current` (its dotted prefix with the
+/// innermost component dropped), or `None` if `current` is already a single
+/// component. A C# namespace path is `.`-joined with no embedded delimiters in
+/// any single identifier segment, so re-tokenizing it with the shared
+/// structured splitter and dropping the innermost component reproduces
+/// `rsplit_once('.')`'s outward walk exactly (mirrors the cpp namespace-chain
+/// walk in `cpp_qualifier_lookup_tiers`).
+fn csharp_namespace_parent(current: &str) -> Option<String> {
+    let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::CSharp, current);
+    if parts.len() <= 1 {
+        return None;
+    }
+    parts.pop();
+    Some(parts.join("."))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2581,10 +2597,10 @@ fn namespace_relative_names(namespace: &str, target: &str) -> Vec<String> {
         return vec![target.trim_start_matches("global::").to_string()];
     }
     let mut names = Vec::new();
-    let mut prefix = namespace;
+    let mut prefix = namespace.to_string();
     while !prefix.is_empty() {
         names.push(format!("{prefix}.{target}"));
-        prefix = prefix.rsplit_once('.').map_or("", |(parent, _)| parent);
+        prefix = csharp_namespace_parent(&prefix).unwrap_or_default();
     }
     names.push(target);
     names

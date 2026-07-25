@@ -23,9 +23,10 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{
     add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
-    collect_function_nodes, file_scoped_field_fq, file_scoped_field_name, js_ts_segment,
-    module_code_unit, module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
-    this_member_property, trim_statement, variable_header,
+    call_is_schema_object_builder, collect_function_nodes, file_scoped_field_fq,
+    file_scoped_field_name, js_ts_segment, module_code_unit, module_scoped_field_uses_file_name,
+    node_text, property_name_text, root_node, this_member_property, trim_statement,
+    variable_header,
 };
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::js_ts::{
@@ -1675,11 +1676,8 @@ fn js_indexable_object_literal_value<'tree>(
     source: &str,
     include_factory_call: bool,
 ) -> Option<Node<'tree>> {
-    js_object_literal_value(value).or_else(|| {
-        include_factory_call
-            .then(|| js_surface_call_object_argument(value, source))
-            .flatten()
-    })
+    js_object_literal_value(value)
+        .or_else(|| js_surface_call_object_argument(value, source, include_factory_call))
 }
 
 fn js_initializer_has_surface_shape(value: Node<'_>, source: &str) -> bool {
@@ -1704,7 +1702,11 @@ fn js_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn js_surface_call_object_argument<'tree>(call: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+fn js_surface_call_object_argument<'tree>(
+    call: Node<'tree>,
+    source: &str,
+    include_factory_call: bool,
+) -> Option<Node<'tree>> {
     if call.kind() != "call_expression" {
         return None;
     }
@@ -1715,7 +1717,15 @@ fn js_surface_call_object_argument<'tree>(call: Node<'tree>, source: &str) -> Op
         .enumerate()
         .find_map(|(index, argument)| {
             let object = js_object_literal_value(argument)?;
-            js_call_preserves_object_argument_shape(call, source, index).then_some(object)
+            // The schema-builder shortcut (e.g. zod's `z.object({...})`) applies
+            // regardless of export/surface status, matching TS's
+            // `ts_call_preserves_object_argument_shape` (issue #1167, gap 3). The
+            // broader factory-name heuristic below stays surface-gated, unchanged
+            // from before.
+            let preserves = (index == 0 && call_is_schema_object_builder(call, source))
+                || (include_factory_call
+                    && js_call_preserves_object_argument_shape(call, source, index));
+            preserves.then_some(object)
         })
 }
 

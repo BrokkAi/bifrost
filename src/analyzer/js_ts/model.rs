@@ -252,3 +252,23 @@ pub(crate) fn call_has_likely_surface_factory_name(call: Node<'_>, source: &str)
     };
     name == "define" || name.starts_with("define") || name == "object"
 }
+
+/// Recognizes a schema-builder call whose first object-literal argument defines the value's
+/// navigable shape, e.g. zod's `z.object({ ... })`. Schema libraries (zod, yup, valibot,
+/// superstruct, ...) universally expose this via an `object(...)` builder, so we match the
+/// `object` member-name convention rather than a specific import alias — `z` is only a
+/// conventional name and breaks under `import * as zod` or aliased imports. Shared by both
+/// dialects (see issue #1167): this is pure tree-sitter node-shape matching with no
+/// language-specific grammar involved.
+pub(crate) fn call_is_schema_object_builder(call: Node<'_>, source: &str) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "member_expression" {
+        return false;
+    }
+    let Some(property) = function.child_by_field_name("property") else {
+        return false;
+    };
+    node_text(property, source).trim() == "object"
+}

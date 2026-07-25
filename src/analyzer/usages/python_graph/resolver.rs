@@ -1,6 +1,6 @@
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -389,9 +389,20 @@ pub(super) fn receiver_annotation_matches_target(
         return target_self_file || edges.iter().any(|edge| edge.local_name == target_short);
     }
 
-    let Some((qualifier, member)) = annotation.rsplit_once('.') else {
+    // `annotation` was already filtered above to exclude generics/unions/calls, so
+    // it is a bare dotted qualifier (Python identifiers never embed a literal
+    // `.`); re-tokenizing with the shared structured splitter and rejoining
+    // every part but the last with `.` reproduces `rsplit_once('.')`'s
+    // (qualifier, member) split exactly.
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, annotation);
+    let Some((member, qualifier_parts)) = segments.split_last() else {
         return false;
     };
+    if qualifier_parts.is_empty() {
+        return false;
+    }
+    let qualifier = qualifier_parts.join(".");
+    let member = member.as_str();
     if member != target_short {
         return false;
     }

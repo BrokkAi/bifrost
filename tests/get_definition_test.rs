@@ -9217,6 +9217,43 @@ export function Item({ provider }: Props) {
 }
 
 #[test]
+fn javascript_local_schema_builder_object_member_resolves_to_definition() {
+    // Parity with the TS schema-builder resolution above (issue #1167, gap 3):
+    // a `z.object({...})`-shaped local binding gets shape-preserving field
+    // indexing in JS too, so a same-file member access resolves to the field.
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "schema.js",
+            r#"
+const LocalSchema = z.object({
+  isEnabled: z.boolean(),
+})
+
+export function check() {
+  return LocalSchema.isEnabled
+}
+"#,
+        )
+        .build();
+
+    let line = "  return LocalSchema.isEnabled";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"schema.js","line":7,"column":{}}}]}}"#,
+            column_of(line, "isEnabled")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "schema.js.LocalSchema.isEnabled",
+        "{value}"
+    );
+}
+
+#[test]
 fn typescript_call_initialized_local_member_resolves_to_returned_object_property() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

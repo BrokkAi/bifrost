@@ -313,17 +313,29 @@ lang_epoch!(
 );
 // JS/TS salts bumped: anonymous `export default` expressions/declarations now
 // emit a synthetic `default` code unit, changing each file's persisted unit set.
+// JS salt bumped again (#1167): a `<ns>.object({...})` schema-builder call
+// (zod/yup/valibot/...) assigned to a non-exported local `const` now gets
+// shape-preserving field indexing, same as TS already did - previously such
+// locals materialized no child fields at all. Changes the persisted unit set
+// for files with local schema-builder bindings.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
 );
+// TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
+// `regex` (a regex-initialized binding renders its initializer inline in the
+// skeleton instead of dropping it, matching JS), and a module-scope
+// `const x = function(){}` is now classified as a Function instead of a
+// Field (matching JS's `arrow_function | function_expression` check).
+// The classification change alters CodeUnitType, short_name/fq shape, and
+// signature rendering for every such binding.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
 );
 lang_epoch!(
     Python,
