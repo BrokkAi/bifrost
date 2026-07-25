@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::super::query::CodeQuery;
-use super::super::search::CodeQueryResult;
+use super::super::search::{CodeQueryResult, CodeQuerySemanticWork};
 use super::plan::{
     CodeQueryExplain, CodeQueryPhysicalOperator, PhysicalQueryNodeId, PhysicalQueryOperator,
     PhysicalQueryPlan, PhysicalQueryPlanExplain,
@@ -291,6 +291,7 @@ pub(crate) struct QueryOperatorWorkProfile {
     pub(crate) provenance_steps: u64,
     pub(crate) import_files_resolved: u64,
     pub(crate) import_edges_resolved: u64,
+    pub(crate) semantic: CodeQuerySemanticWork,
 }
 
 impl QueryOperatorWorkProfile {
@@ -313,6 +314,37 @@ impl QueryOperatorWorkProfile {
             import_edges_resolved: self
                 .import_edges_resolved
                 .saturating_add(other.import_edges_resolved),
+            semantic: CodeQuerySemanticWork {
+                materialization_attempts: self
+                    .semantic
+                    .materialization_attempts
+                    .saturating_add(other.semantic.materialization_attempts),
+                unique_materialized_files: self
+                    .semantic
+                    .unique_materialized_files
+                    .saturating_add(other.semantic.unique_materialized_files),
+                request_cache_hits: self
+                    .semantic
+                    .request_cache_hits
+                    .saturating_add(other.semantic.request_cache_hits),
+                source_bytes: self
+                    .semantic
+                    .source_bytes
+                    .saturating_add(other.semantic.source_bytes),
+                procedures: self
+                    .semantic
+                    .procedures
+                    .saturating_add(other.semantic.procedures),
+                program_points: self
+                    .semantic
+                    .program_points
+                    .saturating_add(other.semantic.program_points),
+                control_edges: self
+                    .semantic
+                    .control_edges
+                    .saturating_add(other.semantic.control_edges),
+                budget_exhausted: self.semantic.budget_exhausted || other.semantic.budget_exhausted,
+            },
         }
     }
 
@@ -336,6 +368,40 @@ impl QueryOperatorWorkProfile {
             import_edges_resolved: self
                 .import_edges_resolved
                 .saturating_sub(earlier.import_edges_resolved),
+            semantic: CodeQuerySemanticWork {
+                materialization_attempts: self
+                    .semantic
+                    .materialization_attempts
+                    .saturating_sub(earlier.semantic.materialization_attempts),
+                unique_materialized_files: self
+                    .semantic
+                    .unique_materialized_files
+                    .saturating_sub(earlier.semantic.unique_materialized_files),
+                request_cache_hits: self
+                    .semantic
+                    .request_cache_hits
+                    .saturating_sub(earlier.semantic.request_cache_hits),
+                source_bytes: self
+                    .semantic
+                    .source_bytes
+                    .saturating_sub(earlier.semantic.source_bytes),
+                procedures: self
+                    .semantic
+                    .procedures
+                    .saturating_sub(earlier.semantic.procedures),
+                program_points: self
+                    .semantic
+                    .program_points
+                    .saturating_sub(earlier.semantic.program_points),
+                control_edges: self
+                    .semantic
+                    .control_edges
+                    .saturating_sub(earlier.semantic.control_edges),
+                // A terminal state is not an arithmetic counter: retain it
+                // only when it first appeared in this interval.
+                budget_exhausted: self.semantic.budget_exhausted
+                    && !earlier.semantic.budget_exhausted,
+            },
         }
     }
 }
@@ -839,6 +905,7 @@ pub struct CodeQueryProfileWork {
     pub provenance_steps: u64,
     pub import_files_resolved: u64,
     pub import_edges_resolved: u64,
+    pub semantic: CodeQuerySemanticWork,
 }
 
 impl CodeQueryProfileWork {
@@ -852,6 +919,7 @@ impl CodeQueryProfileWork {
             provenance_steps: work.provenance_steps,
             import_files_resolved: work.import_files_resolved,
             import_edges_resolved: work.import_edges_resolved,
+            semantic: work.semantic,
         }
     }
 }
@@ -1294,6 +1362,7 @@ mod public_contract_tests {
             provenance_steps: 6,
             import_files_resolved: 7,
             import_edges_resolved: 8,
+            semantic: CodeQuerySemanticWork::default(),
         };
         profile.cache.seed_result = QueryCacheLayerProfile {
             lookups: 2,
@@ -1362,6 +1431,7 @@ mod public_contract_tests {
                 provenance_steps: 3,
                 import_files_resolved: 2,
                 import_edges_resolved: 1,
+                semantic: CodeQuerySemanticWork::default(),
             },
             cache: QueryCacheProfile {
                 seed_result: QueryCacheLayerProfile {
@@ -1413,7 +1483,17 @@ mod public_contract_tests {
                 "examined_references": 5,
                 "provenance_steps": 6,
                 "import_files_resolved": 7,
-                "import_edges_resolved": 8
+                "import_edges_resolved": 8,
+                "semantic": {
+                    "materialization_attempts": 0,
+                    "unique_materialized_files": 0,
+                    "request_cache_hits": 0,
+                    "source_bytes": 0,
+                    "procedures": 0,
+                    "program_points": 0,
+                    "control_edges": 0,
+                    "budget_exhausted": false
+                }
             })
         );
         assert_eq!(

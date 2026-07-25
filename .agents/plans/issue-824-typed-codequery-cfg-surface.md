@@ -42,6 +42,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 08:31Z) User approved implementation and requested checkpoint commits between milestones plus frequent synchronization with `origin/master`.
 - [x] (2026-07-25 08:47Z) Added schema-versioned query kinds and operations with parser, decoder, validator, canonical JSON, exact JSON/RQL ranges, RQL tooling metadata, and an explicit incomplete execution result until the semantic adapter lands.
 - [x] (2026-07-25 09:04Z) Added source-backed procedure, program-point, and control-edge result/reference contracts, typed semantic evidence, boundary metadata, rendering, public re-exports, and detailed-evidence wire-identity invariants without exposing dense IR IDs.
+- [x] (2026-07-25 09:23Z) Added the nested semantic limit and work contracts plus stable workspace, capability, partial-analysis, budget, provider, and no-procedure diagnostic codes across ordinary results, profiles, and policy completion projection.
 - [ ] Implement the request-scoped CFG query adapter, semantic budgets, capability diagnostics, cancellation, and provenance.
 - [ ] Integrate planning/explain/profile reporting and all Rust result rendering/evidence paths.
 - [ ] Update the Python client, LSP/VS Code client, TextMate grammar, public docs, and executable examples.
@@ -132,6 +133,10 @@ Validation at this checkpoint passed `cargo test --lib analyzer::structural::que
 Milestone 2 established the Rust wire contract before binding it to one semantic provider implementation. Procedure rows own artifact identity; points and edges link to their procedure; edge endpoints are compact source-backed point references. Detailed evidence requires semantic rows to use the same wire ID as their stable owner, and policy conversion rejects these diagnostic-neutral domains instead of manufacturing findings.
 
 Validation at this checkpoint passed `cargo check --lib`, `cargo test --lib analyzer::structural::search` (70 tests), and `cargo test --test code_query_public_api` (6 tests).
+
+The first Milestone 3 checkpoint established independent semantic resource controls before provider execution. `CodeQueryExecutionLimits` now carries positive file, source-byte, and per-row-dimension semantic caps; ordinary and profiled work expose a typed zero-cost-until-used semantic ledger; and every planned semantic failure mode has a stable typed diagnostic and policy completion mapping.
+
+Validation at this checkpoint passed the complete integration-test compile gate, the structural execution-profile tests (3 tests), the structural search tests (71 tests), the public API tests (6 tests), and the policy budget tests (4 tests).
 
 ## Context and Orientation
 

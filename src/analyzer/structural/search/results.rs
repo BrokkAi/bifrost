@@ -727,6 +727,12 @@ pub enum CodeQueryDiagnosticCode {
     MissingStructuralAdapter,
     UnsupportedImportAnalysis,
     SemanticResultsOmitted,
+    SemanticWorkspaceRequired,
+    NoEnclosingProcedure,
+    SemanticCapabilityUnsupported,
+    SemanticAnalysisPartial,
+    SemanticBudgetExhausted,
+    SemanticProviderFailed,
     ReceiverAnalysisPartial,
     ReceiverAnalysisFailed,
     CallRelationBudgetExhausted,
@@ -761,6 +767,12 @@ impl CodeQueryDiagnosticCode {
             Self::MissingStructuralAdapter => "missing_structural_adapter",
             Self::UnsupportedImportAnalysis => "unsupported_import_analysis",
             Self::SemanticResultsOmitted => "semantic_results_omitted",
+            Self::SemanticWorkspaceRequired => "semantic_workspace_required",
+            Self::NoEnclosingProcedure => "no_enclosing_procedure",
+            Self::SemanticCapabilityUnsupported => "semantic_capability_unsupported",
+            Self::SemanticAnalysisPartial => "semantic_analysis_partial",
+            Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
+            Self::SemanticProviderFailed => "semantic_provider_failed",
             Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
             Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
             Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
@@ -835,6 +847,22 @@ pub struct CodeQueryExecutionLimits {
     pub max_scanned_source_bytes: usize,
     pub max_fact_nodes: usize,
     pub max_pipeline_rows: usize,
+    pub semantic: CodeQuerySemanticLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CodeQuerySemanticLimits {
+    pub max_materialized_files: usize,
+    pub max_source_bytes: usize,
+    pub max_rows_per_dimension: usize,
+}
+
+impl CodeQuerySemanticLimits {
+    pub const fn all_positive(self) -> bool {
+        self.max_materialized_files > 0
+            && self.max_source_bytes > 0
+            && self.max_rows_per_dimension > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -844,6 +872,19 @@ pub struct CodeQueryExecutionWork {
     pub fact_nodes: u64,
     pub pipeline_rows: u64,
     pub examined_references: u64,
+    pub semantic: CodeQuerySemanticWork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQuerySemanticWork {
+    pub materialization_attempts: u64,
+    pub unique_materialized_files: u64,
+    pub request_cache_hits: u64,
+    pub source_bytes: u64,
+    pub procedures: u64,
+    pub program_points: u64,
+    pub control_edges: u64,
+    pub budget_exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -987,6 +1028,17 @@ impl Default for CodeQueryExecutionLimits {
             max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
             max_fact_nodes: MAX_FACT_NODES,
             max_pipeline_rows: MAX_PIPELINE_ROWS,
+            semantic: CodeQuerySemanticLimits::default(),
+        }
+    }
+}
+
+impl Default for CodeQuerySemanticLimits {
+    fn default() -> Self {
+        Self {
+            max_materialized_files: MAX_SEMANTIC_MATERIALIZED_FILES,
+            max_source_bytes: MAX_SEMANTIC_SOURCE_BYTES,
+            max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION,
         }
     }
 }

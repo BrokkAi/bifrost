@@ -132,7 +132,9 @@ pub use results::CodeQueryResultRef;
 pub use results::CodeQueryResultValue;
 pub use results::CodeQuerySemanticCompleteness;
 pub use results::CodeQuerySemanticEvidence;
+pub use results::CodeQuerySemanticLimits;
 pub use results::CodeQuerySemanticProof;
+pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySourceSite;
 pub(crate) use results::CodeQueryStableOwnerCandidate;
 pub(crate) use results::CodeQueryStableOwnerDerivation;
@@ -154,6 +156,9 @@ const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
 const MAX_PIPELINE_ROWS: usize = 50_000;
+const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
+const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
 const MAX_PROVENANCE_TRACES: usize = 16;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 const CODE_QUERY_SCHEDULER_WORKERS: usize = 2;
@@ -1545,6 +1550,7 @@ fn public_execution_work(work: QueryOperatorWorkProfile) -> CodeQueryExecutionWo
         fact_nodes: work.fact_nodes,
         pipeline_rows: work.pipeline_rows,
         examined_references: work.examined_references,
+        semantic: work.semantic,
     }
 }
 
@@ -1559,6 +1565,7 @@ fn execution_work_snapshot(budget: CodeQueryExecutionBudget) -> QueryOperatorWor
         provenance_steps: as_u64(budget.provenance_steps),
         import_files_resolved: as_u64(budget.import_files_resolved),
         import_edges_resolved: as_u64(budget.import_edges_resolved),
+        semantic: CodeQuerySemanticWork::default(),
     }
 }
 
@@ -2920,16 +2927,21 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ReferenceCandidatesOmitted
             | CodeQueryDiagnosticCode::ReferenceCallsiteLimit
             | CodeQueryDiagnosticCode::UsesCandidateLimit
-            | CodeQueryDiagnosticCode::UsesCandidatesOmitted => {
+            | CodeQueryDiagnosticCode::UsesCandidatesOmitted
+            | CodeQueryDiagnosticCode::SemanticBudgetExhausted => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::UnsupportedStructuralFeature
             | CodeQueryDiagnosticCode::MissingStructuralAdapter
             | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
-            | CodeQueryDiagnosticCode::UsesParserUnsupported => {
+            | CodeQueryDiagnosticCode::UsesParserUnsupported
+            | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
+            | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
+            | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            | CodeQueryDiagnosticCode::SemanticProviderFailed
             | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
             | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
             | CodeQueryDiagnosticCode::CallRelationParseFailed
@@ -2939,6 +2951,7 @@ fn append_diagnostic_terminations(
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan
+            | CodeQueryDiagnosticCode::NoEnclosingProcedure
             | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
             | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
             | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
@@ -4534,6 +4547,9 @@ fn fair_branch_limits(
             parent.max_pipeline_rows,
             remaining_branches,
         ),
+        // Semantic materialization is request-scoped and shared rather than
+        // divided among independently scheduled structural seed branches.
+        semantic: parent.semantic,
     }
 }
 

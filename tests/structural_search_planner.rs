@@ -516,6 +516,7 @@ fn execution_budget_bounds_unanchored_no_match_queries() {
             max_scanned_source_bytes: usize::MAX,
             max_fact_nodes: usize::MAX,
             max_pipeline_rows: usize::MAX,
+            ..CodeQueryExecutionLimits::default()
         },
     );
 

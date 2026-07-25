@@ -1206,6 +1206,7 @@ fn execution_work_snapshot_is_the_single_budget_projection() {
             provenance_steps: 6,
             import_files_resolved: 7,
             import_edges_resolved: 8,
+            semantic: CodeQuerySemanticWork::default(),
         }
     );
     assert_eq!(
@@ -1216,8 +1217,32 @@ fn execution_work_snapshot_is_the_single_budget_projection() {
             fact_nodes: 3,
             pipeline_rows: 5,
             examined_references: 4,
+            semantic: CodeQuerySemanticWork::default(),
         }
     );
+}
+
+#[test]
+fn semantic_execution_limits_require_each_dimension_to_be_positive() {
+    let defaults = CodeQuerySemanticLimits::default();
+    assert!(defaults.all_positive());
+
+    for invalid in [
+        CodeQuerySemanticLimits {
+            max_materialized_files: 0,
+            ..defaults
+        },
+        CodeQuerySemanticLimits {
+            max_source_bytes: 0,
+            ..defaults
+        },
+        CodeQuerySemanticLimits {
+            max_rows_per_dimension: 0,
+            ..defaults
+        },
+    ] {
+        assert!(!invalid.all_positive());
+    }
 }
 
 fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
@@ -1736,6 +1761,12 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::MissingStructuralAdapter, Impact::Incomplete),
         (Code::UnsupportedImportAnalysis, Impact::Incomplete),
         (Code::SemanticResultsOmitted, Impact::Incomplete),
+        (Code::SemanticWorkspaceRequired, Impact::Incomplete),
+        (Code::NoEnclosingProcedure, Impact::Advisory),
+        (Code::SemanticCapabilityUnsupported, Impact::Incomplete),
+        (Code::SemanticAnalysisPartial, Impact::Incomplete),
+        (Code::SemanticBudgetExhausted, Impact::Incomplete),
+        (Code::SemanticProviderFailed, Impact::Incomplete),
         (Code::ReceiverAnalysisPartial, Impact::Incomplete),
         (Code::ReceiverAnalysisFailed, Impact::Incomplete),
         (Code::CallRelationBudgetExhausted, Impact::Incomplete),

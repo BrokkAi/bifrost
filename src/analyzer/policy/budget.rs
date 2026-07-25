@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::analyzer::structural::CodeQueryExecutionLimits;
+use crate::analyzer::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
 
 const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
@@ -65,6 +65,7 @@ impl Default for PolicyBudget {
                 max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
                 max_fact_nodes: MAX_FACT_NODES,
                 max_pipeline_rows: MAX_PIPELINE_ROWS,
+                semantic: CodeQuerySemanticLimits::default(),
             },
             max_findings: MAX_FINDINGS,
             max_diagnostics: MAX_DIAGNOSTICS,
@@ -562,6 +563,7 @@ mod tests {
                 max_scanned_source_bytes: 0,
                 max_fact_nodes: 0,
                 max_pipeline_rows: 0,
+                semantic: CodeQuerySemanticLimits::default(),
             })
             .unwrap()
             .with_max_findings(0)

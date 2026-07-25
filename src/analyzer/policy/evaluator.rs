@@ -3418,6 +3418,8 @@ fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncomplet
         CodeQueryDiagnosticCode::UnsupportedStructuralFeature
         | CodeQueryDiagnosticCode::MissingStructuralAdapter
         | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
+        | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
+        | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
         | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
         | CodeQueryDiagnosticCode::UsesParserUnsupported => {
             PolicyIncompleteReason::CapabilityIncomplete
@@ -3444,6 +3446,10 @@ fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncomplet
         }
         CodeQueryDiagnosticCode::ResultLimitReached => PolicyIncompleteReason::QueryResultLimit,
         CodeQueryDiagnosticCode::SemanticResultsOmitted
+        | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+        | CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        | CodeQueryDiagnosticCode::SemanticProviderFailed
+        | CodeQueryDiagnosticCode::NoEnclosingProcedure
         | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
         | CodeQueryDiagnosticCode::CallRelationParseFailed
         | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
