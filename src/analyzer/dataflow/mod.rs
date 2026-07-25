@@ -38,7 +38,7 @@ pub use summary_result::{
 };
 pub use tabulation::solve;
 pub use witness::{
-    SummaryWitness, SummaryWitnessError, SummaryWitnessStep, SummaryWitnessStepKind,
-    WitnessLimitError, WitnessReconstructionLimits, WitnessReconstructionWork,
-    WitnessRetentionLimits,
+    MAX_WITNESS_ALTERNATIVES_PER_QUALITY, SummaryWitness, SummaryWitnessError, SummaryWitnessStep,
+    SummaryWitnessStepKind, WitnessLimitError, WitnessReconstructionLimits,
+    WitnessReconstructionWork, WitnessRetentionLimits,
 };

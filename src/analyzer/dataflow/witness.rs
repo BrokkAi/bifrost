@@ -5,7 +5,7 @@ use std::{mem::size_of, sync::Arc};
 
 use crate::analyzer::semantic::{
     CallSiteHandle, EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile, ProcedureIcfgEdge,
-    ProgramPointHandle, ProofStatus,
+    ProgramPointHandle, ProofStatus, ReturnTransferKind,
 };
 
 use super::{FactId, PathQuality, PathQualityFrontier, SummaryEdge};
@@ -13,10 +13,14 @@ use super::{FactId, PathQuality, PathQualityFrontier, SummaryEdge};
 const DEFAULT_RECONSTRUCTION_STEPS: usize = 4_096;
 const DEFAULT_RECONSTRUCTION_EXPANSIONS: usize = 16_384;
 
+/// Maximum client-selectable alternatives retained for one exact path quality.
+pub const MAX_WITNESS_ALTERNATIVES_PER_QUALITY: usize = 64;
+
 /// Why witness-limit construction failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WitnessLimitError {
     field: &'static str,
+    maximum: Option<usize>,
 }
 
 impl WitnessLimitError {
@@ -27,7 +31,10 @@ impl WitnessLimitError {
 
 impl fmt::Display for WitnessLimitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} must be greater than zero", self.field)
+        match self.maximum {
+            Some(maximum) => write!(formatter, "{} must be at most {maximum}", self.field),
+            None => write!(formatter, "{} must be greater than zero", self.field),
+        }
     }
 }
 
@@ -55,7 +62,14 @@ impl WitnessRetentionLimits {
         let max_alternatives_per_quality =
             NonZeroUsize::new(max_alternatives_per_quality).ok_or(WitnessLimitError {
                 field: "max_alternatives_per_quality",
+                maximum: None,
             })?;
+        if max_alternatives_per_quality.get() > MAX_WITNESS_ALTERNATIVES_PER_QUALITY {
+            return Err(WitnessLimitError {
+                field: "max_alternatives_per_quality",
+                maximum: Some(MAX_WITNESS_ALTERNATIVES_PER_QUALITY),
+            });
+        }
         Ok(Self {
             max_alternatives_per_quality: Some(max_alternatives_per_quality),
         })
@@ -82,10 +96,13 @@ pub struct WitnessReconstructionLimits {
 
 impl WitnessReconstructionLimits {
     pub fn new(max_steps: usize, max_expansions: usize) -> Result<Self, WitnessLimitError> {
-        let max_steps =
-            NonZeroUsize::new(max_steps).ok_or(WitnessLimitError { field: "max_steps" })?;
+        let max_steps = NonZeroUsize::new(max_steps).ok_or(WitnessLimitError {
+            field: "max_steps",
+            maximum: None,
+        })?;
         let max_expansions = NonZeroUsize::new(max_expansions).ok_or(WitnessLimitError {
             field: "max_expansions",
+            maximum: None,
         })?;
         Ok(Self {
             max_steps,
@@ -119,6 +136,8 @@ pub enum SummaryWitnessStepKind {
     Seed,
     /// One real semantic ICFG edge.
     Edge(IcfgEdgeKind),
+    /// A source-backed return-affecting gap on a profiled callee exit.
+    EndSummaryGap(ReturnTransferKind),
 }
 
 /// One source-backed step in a reconstructed summary-dataflow witness.
@@ -188,6 +207,18 @@ impl SummaryWitnessStep {
 
     pub const fn output_fact(&self) -> FactId {
         self.output_fact
+    }
+
+    fn retained_owned_bytes(&self) -> usize {
+        let proof_bytes = match &self.proof {
+            ProofStatus::Proven => 0,
+            ProofStatus::Unproven(reason) => reason.len(),
+        };
+        let completeness_bytes = match &self.completeness {
+            EvidenceCompleteness::Complete => 0,
+            EvidenceCompleteness::Partial(reason) => reason.len(),
+        };
+        proof_bytes.saturating_add(completeness_bytes)
     }
 }
 
@@ -269,6 +300,11 @@ impl SummaryWitness {
         self.alternatives_truncated
     }
 
+    /// Bytes exclusively retained by this value.
+    ///
+    /// This includes the witness object, its boxed step slice, and owned
+    /// proof/completeness reason strings. Shared backing allocations referenced
+    /// by semantic handles are intentionally excluded.
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
@@ -326,13 +362,20 @@ impl WitnessEvidenceId {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct WitnessAlternatives {
+    inner: Option<Box<WitnessAlternativeSets>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct WitnessAlternativeSets {
     by_quality: [Vec<WitnessEvidenceId>; 4],
     truncated: [bool; 4],
 }
 
 impl WitnessAlternatives {
     pub(crate) fn ids(&self, quality: PathQuality) -> &[WitnessEvidenceId] {
-        &self.by_quality[quality.ordinal()]
+        self.inner
+            .as_ref()
+            .map_or(&[], |inner| &inner.by_quality[quality.ordinal()])
     }
 
     pub(crate) fn first(&self, quality: PathQuality) -> Option<WitnessEvidenceId> {
@@ -344,34 +387,40 @@ impl WitnessAlternatives {
     }
 
     pub(crate) fn is_truncated(&self, quality: PathQuality) -> bool {
-        self.truncated[quality.ordinal()]
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.truncated[quality.ordinal()])
     }
 
     pub(crate) fn push(&mut self, quality: PathQuality, evidence: WitnessEvidenceId) {
-        self.by_quality[quality.ordinal()].push(evidence);
+        self.inner.get_or_insert_with(Default::default).by_quality[quality.ordinal()]
+            .push(evidence);
     }
 
     pub(crate) fn mark_truncated(&mut self, quality: PathQuality) {
-        self.truncated[quality.ordinal()] = true;
+        self.inner.get_or_insert_with(Default::default).truncated[quality.ordinal()] = true;
     }
 
     pub(crate) fn retain_frontier(&mut self, frontier: PathQualityFrontier) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
         for quality in PathQuality::ALL {
             if !frontier.contains(quality) {
-                self.by_quality[quality.ordinal()].clear();
-                self.truncated[quality.ordinal()] = false;
+                inner.by_quality[quality.ordinal()].clear();
+                inner.truncated[quality.ordinal()] = false;
             }
+        }
+        if inner.by_quality.iter().all(Vec::is_empty) && !inner.truncated.iter().any(|flag| *flag) {
+            self.inner = None;
         }
     }
 
-    pub(crate) fn all_ids(&self) -> impl Iterator<Item = WitnessEvidenceId> + '_ {
-        self.by_quality
-            .iter()
-            .flat_map(|alternatives| alternatives.iter().copied())
-    }
-
     pub(crate) fn remap(&mut self, remap: &[Option<WitnessEvidenceId>]) {
-        for alternatives in &mut self.by_quality {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        for alternatives in &mut inner.by_quality {
             for evidence in alternatives {
                 *evidence = remap
                     .get(evidence.index())
@@ -380,6 +429,13 @@ impl WitnessAlternatives {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WitnessAdmission {
+    Retained(WitnessEvidenceId),
+    Duplicate,
+    Truncated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +574,10 @@ impl WitnessEvidenceNode {
         self.quality
     }
 
+    fn same_derivation(&self, other: &Self) -> bool {
+        self.quality == other.quality && self.kind == other.kind
+    }
+
     fn mark_alternatives_truncated(&mut self) {
         self.alternatives_truncated = true;
     }
@@ -550,6 +610,34 @@ impl WitnessEvidenceNode {
                 incoming, summary, ..
             } => [Some(*incoming), Some(*summary)],
         }
+    }
+
+    fn end_summary_gap_step(&self) -> Option<SummaryWitnessStep> {
+        let WitnessEvidenceKind::EndSummary {
+            exit, exit_fact, ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        let reason = exit.return_affecting_gap_reason()?;
+        Some(SummaryWitnessStep::new(
+            SummaryWitnessStepKind::EndSummaryGap(exit.kind()),
+            exit.callee_exit().clone(),
+            None,
+            None,
+            ProofStatus::Unproven(
+                format!(
+                    "callee {:?} exit has a return-affecting semantic gap: {reason}",
+                    exit.kind()
+                )
+                .into(),
+            ),
+            EvidenceCompleteness::Partial(
+                format!("callee exit has return-affecting semantic gaps: {reason}").into(),
+            ),
+            *exit_fact,
+            *exit_fact,
+        ))
     }
 
     fn remap_predecessors(&mut self, remap: &[Option<WitnessEvidenceId>]) {
@@ -598,29 +686,46 @@ impl WitnessArena {
         self.limits.max_alternatives_per_quality()
     }
 
-    pub(crate) fn node(&self, id: WitnessEvidenceId) -> Option<&WitnessEvidenceNode> {
-        self.nodes.get(id.index())
+    fn staged_node<'staged>(
+        &'staged self,
+        id: WitnessEvidenceId,
+        staged: &'staged [(WitnessEvidenceId, WitnessEvidenceNode)],
+    ) -> Option<&'staged WitnessEvidenceNode> {
+        if let Some(node) = self.nodes.get(id.index()) {
+            return Some(node);
+        }
+        staged
+            .get(id.index().checked_sub(self.nodes.len())?)
+            .and_then(|(staged_id, node)| (*staged_id == id).then_some(node))
     }
 
-    pub(crate) fn should_retain(
+    pub(crate) fn stage_candidate(
         &self,
-        alternatives: &WitnessAlternatives,
+        alternatives: &mut WitnessAlternatives,
         quality: PathQuality,
-        candidate: &WitnessEvidenceNode,
-    ) -> bool {
-        if !self.is_enabled()
-            || alternatives.ids(quality).len() >= self.max_alternatives_per_quality()
-        {
-            return false;
-        }
-        alternatives
+        candidate: WitnessEvidenceNode,
+        staged: &mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
+    ) -> Result<WitnessAdmission, usize> {
+        debug_assert!(self.is_enabled());
+        if alternatives
             .ids(quality)
             .iter()
-            .filter_map(|id| self.node(*id))
-            .all(|existing| existing != candidate)
+            .filter_map(|id| self.staged_node(*id, staged))
+            .any(|existing| existing.same_derivation(&candidate))
+        {
+            return Ok(WitnessAdmission::Duplicate);
+        }
+        if alternatives.ids(quality).len() >= self.max_alternatives_per_quality() {
+            alternatives.mark_truncated(quality);
+            return Ok(WitnessAdmission::Truncated);
+        }
+        let id = self.staged_id(staged.len())?;
+        alternatives.push(quality, id);
+        staged.push((id, candidate));
+        Ok(WitnessAdmission::Retained(id))
     }
 
-    pub(crate) fn staged_id(&self, additional_index: usize) -> Result<WitnessEvidenceId, usize> {
+    fn staged_id(&self, additional_index: usize) -> Result<WitnessEvidenceId, usize> {
         let index = self.nodes.len().saturating_add(additional_index);
         WitnessEvidenceId::try_from_index(index).ok_or(index)
     }
@@ -685,17 +790,53 @@ impl WitnessArena {
         (
             WitnessStore {
                 retention_enabled: self.limits.is_enabled(),
-                nodes: nodes.into_boxed_slice(),
+                nodes,
             },
             remap.into_boxed_slice(),
         )
+    }
+
+    pub(crate) fn into_store(self) -> WitnessStore {
+        WitnessStore {
+            retention_enabled: self.limits.is_enabled(),
+            nodes: self.nodes,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WitnessStore {
     retention_enabled: bool,
-    nodes: Box<[WitnessEvidenceNode]>,
+    nodes: Vec<WitnessEvidenceNode>,
+}
+
+pub(crate) enum WitnessTarget<'target> {
+    Reached {
+        entry_point: &'target ProgramPointHandle,
+        entry_fact: FactId,
+        point: &'target ProgramPointHandle,
+        fact: FactId,
+    },
+    EndSummary {
+        entry_point: &'target ProgramPointHandle,
+        entry_fact: FactId,
+        exit: &'target IcfgExitProfile,
+        exit_fact: FactId,
+    },
+}
+
+impl WitnessTarget<'_> {
+    fn entry_point(&self) -> &ProgramPointHandle {
+        match self {
+            Self::Reached { entry_point, .. } | Self::EndSummary { entry_point, .. } => entry_point,
+        }
+    }
+
+    fn entry_fact(&self) -> FactId {
+        match self {
+            Self::Reached { entry_fact, .. } | Self::EndSummary { entry_fact, .. } => *entry_fact,
+        }
+    }
 }
 
 impl WitnessStore {
@@ -705,6 +846,7 @@ impl WitnessStore {
         quality: PathQuality,
         mut alternatives_truncated: bool,
         limits: WitnessReconstructionLimits,
+        target: WitnessTarget<'_>,
     ) -> Result<SummaryWitness, SummaryWitnessError> {
         if !self.retention_enabled {
             return Err(SummaryWitnessError::RetentionDisabled);
@@ -719,6 +861,7 @@ impl WitnessStore {
                 "root quality does not match its result slot",
             ));
         }
+        self.validate_root(root, &target)?;
 
         #[derive(Debug)]
         enum Task {
@@ -757,6 +900,9 @@ impl WitnessStore {
                             }
                         }
                         WitnessEvidenceKind::EndSummary { predecessor, .. } => {
+                            if let Some(gap_step) = node.end_summary_gap_step() {
+                                stack.push(Task::Emit(gap_step));
+                            }
                             stack.push(Task::Expand(*predecessor));
                         }
                         WitnessEvidenceKind::SummaryApplication {
@@ -779,13 +925,29 @@ impl WitnessStore {
                             .count();
                         break;
                     }
+                    if steps.is_empty()
+                        && (!matches!(step.kind(), SummaryWitnessStepKind::Seed)
+                            || step.source() != target.entry_point()
+                            || step.input_fact() != target.entry_fact()
+                            || step.output_fact() != target.entry_fact())
+                    {
+                        return Err(SummaryWitnessError::InvalidEvidence(
+                            "witness does not begin at the requested entry and fact",
+                        ));
+                    }
                     steps.push(step);
                 }
             }
         }
 
         let retained_bytes = size_of::<SummaryWitness>()
-            .saturating_add(steps.len().saturating_mul(size_of::<SummaryWitnessStep>()));
+            .saturating_add(steps.len().saturating_mul(size_of::<SummaryWitnessStep>()))
+            .saturating_add(
+                steps
+                    .iter()
+                    .map(SummaryWitnessStep::retained_owned_bytes)
+                    .fold(0usize, usize::saturating_add),
+            );
         let emitted_steps = steps.len();
         Ok(SummaryWitness::from_parts(
             steps,
@@ -800,6 +962,51 @@ impl WitnessStore {
 
     fn node(&self, id: WitnessEvidenceId) -> Option<&WitnessEvidenceNode> {
         self.nodes.get(id.index())
+    }
+
+    fn validate_root(
+        &self,
+        root: &WitnessEvidenceNode,
+        target: &WitnessTarget<'_>,
+    ) -> Result<(), SummaryWitnessError> {
+        match target {
+            WitnessTarget::Reached { point, fact, .. } => {
+                if root.output_point() != *point || root.output_fact() != *fact {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "root evidence does not terminate at the requested reached fact",
+                    ));
+                }
+            }
+            WitnessTarget::EndSummary {
+                entry_point,
+                entry_fact,
+                exit,
+                exit_fact,
+            } => {
+                let WitnessEvidenceKind::EndSummary {
+                    entry_point: root_entry_point,
+                    entry_fact: root_entry_fact,
+                    exit: root_exit,
+                    exit_fact: root_exit_fact,
+                    ..
+                } = &root.kind
+                else {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "end-summary target does not reference end-summary evidence",
+                    ));
+                };
+                if root_entry_point != *entry_point
+                    || *root_entry_fact != *entry_fact
+                    || root_exit.as_ref() != *exit
+                    || *root_exit_fact != *exit_fact
+                {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "root evidence does not match the requested end summary",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_node(&self, node: &WitnessEvidenceNode) -> Result<(), SummaryWitnessError> {
@@ -898,6 +1105,7 @@ impl WitnessStore {
                 let WitnessEvidenceKind::EndSummary {
                     entry_point,
                     entry_fact,
+                    exit,
                     ..
                 } = &summary.kind
                 else {
@@ -905,13 +1113,33 @@ impl WitnessStore {
                         "summary application does not reference an end summary",
                     ));
                 };
+                let WitnessEvidenceKind::Step {
+                    step: incoming_step,
+                    ..
+                } = &incoming.kind
+                else {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "summary incoming evidence is not a call edge",
+                    ));
+                };
+                let expected_return_kind = match exit.kind() {
+                    ReturnTransferKind::Normal => IcfgEdgeKind::NormalReturn,
+                    ReturnTransferKind::Exceptional => IcfgEdgeKind::ExceptionalReturn,
+                };
                 if incoming.output_point() != entry_point
                     || incoming.output_fact() != *entry_fact
                     || summary.output_point() != return_step.source()
                     || summary.output_fact() != return_step.input_fact()
+                    || incoming_step.kind() != SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call)
+                    || incoming_step.origin().is_none()
+                    || incoming_step.origin() != return_step.origin()
+                    || return_step.kind() != SummaryWitnessStepKind::Edge(expected_return_kind)
+                    || return_step.target().is_none_or(|target| {
+                        target.procedure() != incoming_step.source().procedure()
+                    })
                 {
                     return Err(SummaryWitnessError::InvalidEvidence(
-                        "summary application topology or facts do not match",
+                        "summary application call/return topology or facts do not match",
                     ));
                 }
                 let expected = incoming
@@ -944,6 +1172,18 @@ mod tests {
         let enabled = WitnessRetentionLimits::new(3).unwrap();
         assert!(enabled.is_enabled());
         assert_eq!(enabled.max_alternatives_per_quality(), 3);
+        assert_eq!(
+            WitnessRetentionLimits::new(MAX_WITNESS_ALTERNATIVES_PER_QUALITY + 1)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "max_alternatives_per_quality must be at most {MAX_WITNESS_ALTERNATIVES_PER_QUALITY}"
+            ),
+        );
+        assert!(
+            std::mem::size_of::<WitnessAlternatives>() <= std::mem::size_of::<usize>(),
+            "disabled witness rows retain only one optional pointer",
+        );
     }
 
     #[test]

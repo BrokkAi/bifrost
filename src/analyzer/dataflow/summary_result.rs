@@ -19,7 +19,7 @@ use crate::analyzer::semantic::{
 use super::{FactId, PathQualityFrontier, SemanticInputStatus, SolverTermination, SolverWork};
 use super::{
     PathQuality, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
-    witness::{WitnessAlternatives, WitnessStore},
+    witness::{WitnessAlternatives, WitnessStore, WitnessTarget},
 };
 
 /// One procedure entry and fact whose relative path edges share an end-summary
@@ -70,6 +70,7 @@ pub struct SummaryReachedFact {
     fact: FactId,
     path_qualities: PathQualityFrontier,
     witnesses: WitnessAlternatives,
+    witness_owner: Option<Arc<()>>,
 }
 
 impl PartialEq for SummaryReachedFact {
@@ -99,6 +100,7 @@ impl SummaryReachedFact {
         fact: FactId,
         path_qualities: PathQualityFrontier,
         witnesses: WitnessAlternatives,
+        witness_owner: Option<Arc<()>>,
     ) -> Self {
         debug_assert_eq!(
             entry.procedure(),
@@ -111,6 +113,7 @@ impl SummaryReachedFact {
             fact,
             path_qualities,
             witnesses,
+            witness_owner,
         }
     }
 
@@ -142,6 +145,7 @@ pub struct TabulationEndSummary {
     exit_fact: FactId,
     path_qualities: PathQualityFrontier,
     witnesses: WitnessAlternatives,
+    witness_owner: Option<Arc<()>>,
 }
 
 impl PartialEq for TabulationEndSummary {
@@ -162,6 +166,7 @@ impl TabulationEndSummary {
         exit_fact: FactId,
         path_qualities: PathQualityFrontier,
         witnesses: WitnessAlternatives,
+        witness_owner: Option<Arc<()>>,
     ) -> Self {
         debug_assert_eq!(
             entry.procedure(),
@@ -179,6 +184,7 @@ impl TabulationEndSummary {
             exit_fact,
             path_qualities,
             witnesses,
+            witness_owner,
         }
     }
 
@@ -575,7 +581,13 @@ impl<Fact> SummaryDataflowResult<Fact> {
         let reached = self
             .reached
             .iter()
-            .find(|candidate| *candidate == reached)
+            .find(|candidate| {
+                *candidate == reached
+                    && witness_owners_match(
+                        candidate.witness_owner.as_ref(),
+                        reached.witness_owner.as_ref(),
+                    )
+            })
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
         if !reached.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
@@ -589,6 +601,12 @@ impl<Fact> SummaryDataflowResult<Fact> {
             quality,
             reached.witnesses.is_truncated(quality),
             limits,
+            WitnessTarget::Reached {
+                entry_point: reached.entry.entry_point(),
+                entry_fact: reached.entry.entry_fact(),
+                point: reached.point(),
+                fact: reached.fact(),
+            },
         )
     }
 
@@ -601,7 +619,13 @@ impl<Fact> SummaryDataflowResult<Fact> {
         let summary = self
             .end_summaries
             .iter()
-            .find(|candidate| *candidate == summary)
+            .find(|candidate| {
+                *candidate == summary
+                    && witness_owners_match(
+                        candidate.witness_owner.as_ref(),
+                        summary.witness_owner.as_ref(),
+                    )
+            })
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
         if !summary.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
@@ -615,7 +639,21 @@ impl<Fact> SummaryDataflowResult<Fact> {
             quality,
             summary.witnesses.is_truncated(quality),
             limits,
+            WitnessTarget::EndSummary {
+                entry_point: summary.entry.entry_point(),
+                entry_fact: summary.entry.entry_fact(),
+                exit: summary.exit(),
+                exit_fact: summary.exit_fact(),
+            },
         )
+    }
+}
+
+fn witness_owners_match(left: Option<&Arc<()>>, right: Option<&Arc<()>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
     }
 }
 

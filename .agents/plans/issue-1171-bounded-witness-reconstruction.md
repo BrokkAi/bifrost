@@ -20,8 +20,8 @@ The behavior is observable in `tests/dataflow_summaries.rs`. Focused tests reque
 - [x] (2026-07-25 12:56Z) Milestone 1: defined the generic witness contracts, opt-in retention configuration, reconstruction limits, and `WitnessRelations` solver work dimension.
 - [x] (2026-07-25 12:56Z) Milestone 2: retained seed and ordinary-edge evidence atomically, added bounded iterative reconstruction for reached facts and end summaries, and compacted result-owned evidence to active roots.
 - [x] (2026-07-25 12:56Z) Milestone 3: retained exact incoming-call and end-summary alternatives, expanded matched normal and exceptional returns through summary-application nodes, and verified shared-callee contexts do not cross-return.
-- [ ] (2026-07-25 12:56Z) Milestone 4: bounds, quality validation, deterministic alternatives, cancellation/budget integrity, and behavior-focused coverage are implemented and the featureless focused suites pass; all-feature Clippy and test gates remain.
-- [ ] Milestone 5: run full validation and guided specialist review, address every accepted finding, and complete this document.
+- [x] (2026-07-25 13:37Z) Milestone 4: completed bounded quality-valid reconstruction, explicit end-summary gap evidence, deterministic capped alternatives, prompt cancellation/budget finalization, differential topology checks, and behavior-focused coverage.
+- [x] (2026-07-25 13:54Z) Milestone 5: completed all five guided specialist reviews, addressed every accepted finding, and passed the focused suites, strict all-feature Clippy, and the complete post-review all-feature test matrix.
 
 ## Surprises & Discoveries
 
@@ -43,6 +43,15 @@ The behavior is observable in `tests/dataflow_summaries.rs`. Focused tests reque
 - Observation: Cargo's shared target contained host artifacts built by two rustc identities when a direct Clippy command was attempted.
   Evidence: featureless focused tests pass, while direct Clippy reported `cc` metadata compiled by an incompatible rustc with the same displayed version. The required final Clippy gate will use `scripts/with-isolated-cargo-target.sh` as repository guidance specifies.
 
+- Observation: an exit profile's return-affecting gap is part of an end summary's concrete quality even before a caller-specific matched return is applied.
+  Evidence: guided architecture review found that eliding the `EndSummary` evidence node produced an `UNPROVEN_PARTIAL` witness whose emitted steps all appeared proven and complete. Reconstruction now emits a source-backed `EndSummaryGap` step, and tests fold every complete witness back to its requested quality.
+
+- Observation: opt-in behavior requires compact disabled-state metadata as well as no arena nodes.
+  Evidence: the first implementation embedded four `Vec`s in every internal and public row even with retention disabled. `WitnessAlternatives` now stores one optional boxed table, so its disabled representation is one pointer-sized word.
+
+- Observation: result finalization is still part of cancellation responsiveness.
+  Evidence: security and operational reviews identified that unconditional arena compaction could traverse and copy up to the four-million-relation default after cancellation. Non-fixed-point results now consume the already-budgeted arena without compaction or ID remapping.
+
 ## Decision Log
 
 - Decision: witness retention is opt-in through `SummarySolveInput`, and the default remains disabled.
@@ -61,6 +70,14 @@ The behavior is observable in `tests/dataflow_summaries.rs`. Focused tests reque
   Rationale: the per-key cap prevents local path explosion, while the global budget bounds total query memory and makes failure visible as an ordinary partial solver result.
   Date/Author: 2026-07-25 / Codex
 
+- Decision: cap the public per-quality alternative setting at 64 and centralize candidate staging in the arena.
+  Rationale: an unbounded client-selected `usize` made duplicate admission quadratic and could delay cooperative cancellation. One admission operation now checks committed and transaction-staged duplicates, applies the strict cap, allocates the dense ID, and marks truncation consistently at every publication seam.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: bind public result rows to an enabled solve with a private shared owner token and validate the requested root descriptor during reconstruction.
+  Rationale: `FactId` and evidence IDs are result-local. Logical row equality remains deterministic, while a clone from the same result is accepted and a semantically equal row from another solve is rejected before expansion.
+  Date/Author: 2026-07-25 / Codex
+
 - Decision: reconstruction has query-time step and evidence-expansion limits rather than reusing `DataflowRequest`.
   Rationale: reconstruction happens after the solve has finished and may be requested more than once. Its outcome must report its own work, truncation, and omitted-step lower bound without mutating the completed solver budget.
   Date/Author: 2026-07-25 / Codex
@@ -71,9 +88,11 @@ The behavior is observable in `tests/dataflow_summaries.rs`. Focused tests reque
 
 ## Outcomes & Retrospective
 
-The implementation now has one generic query-local evidence arena, compacted into the result after solving. Public reconstruction is opt-in, quality-specific, iterative, independently step/expansion bounded, and reports both prefix truncation and omitted alternatives. Incoming call prefixes remain separate from callee-relative paths until one exact matched return combines them.
+The implementation now has one generic query-local evidence arena, compacted to active roots at a fixed point and moved directly into partial results so cancellation and budget stops do not trigger a large uninterruptible copy. Public reconstruction is opt-in, result-owned, quality-specific, iterative, independently step/expansion bounded, and reports prefix truncation, omitted alternatives, work, and exclusive retained bytes. Incoming call prefixes remain separate from callee-relative paths until one exact matched return combines them. End-summary gaps are explicit public steps, so proof/completeness folding matches the requested quality.
 
-Focused validation currently passes `dataflow_clients`, `dataflow_tabulation`, and all 26 `dataflow_summaries` tests. New assertions cover source-backed local and end-summary witnesses, summary replay, shared callee reuse, normal and exceptional returns, explicit call-to-return flow, direct and mutual recursion, incomparable qualities, seed/callback/provider permutations, strict alternative caps, and cancellation/witness-budget publication integrity. Full all-feature validation and specialist review remain.
+All five guided reviews ran: security, duplication, issue intent/correctness, operational, and architecture. Accepted findings led to compact disabled-row storage, centralized bounded alternative staging, active-frontier-only admission and compaction roots, exact requested-root and matched call/return validation, result ownership tokens, source-backed end-summary gap steps, accurate owned-string byte accounting, and prompt non-fixed-point finalization.
+
+Post-review focused validation passes `dataflow_clients` (12), `dataflow_tabulation` (11), all 26 `dataflow_summaries` tests, and the witness contract unit tests. Strict `cargo clippy --all-targets --all-features -- -D warnings` passes through the isolated-target helper. The complete `cargo test --features nlp,python` matrix also passes: all 1,904 library tests and every integration suite completed without failures. After the final duplicate-derivation equality tightening, the exact focused suites and strict Clippy gate passed again.
 
 ## Context and Orientation
 
@@ -97,9 +116,9 @@ Milestone 1 introduces contracts without changing propagation. Create `src/analy
 
 At the end of Milestone 1, contract unit tests prove that zero limits are rejected, disabled retention is explicit, and the new budget dimension fails atomically. Run formatting, dataflow library tests, and `dataflow_clients`; then update this plan and commit only the milestone files.
 
-Milestone 2 adds the evidence arena and local propagation. Extend `SummarySolveInput` with witness retention and a builder that opts in without changing existing constructors. Pass the limits into `SummaryState::new`. Add an append-only arena plus path-quality slots. Seed nodes identify the entry program point and fact. Edge nodes reference an already-retained predecessor and own the exact `ProcedureIcfgEdge` plus input/output facts. Update `initialize`, `propagate_owned_edge`, and `publish_path_outputs` so evidence staging and state publication share one staged budget charge and cancellation boundary. Candidates that do not add a frontier quality may still fill an unused alternative slot, but never exceed the per-quality cap.
+Milestone 2 adds the evidence arena and local propagation. Extend `SummarySolveInput` with witness retention and a builder that opts in without changing existing constructors. Pass the limits into `SummaryState::new`. Add an append-only arena plus path-quality slots. Seed nodes identify the entry program point and fact. Edge nodes reference an already-retained predecessor and own the exact `ProcedureIcfgEdge` plus input/output facts. Update `initialize`, `propagate_owned_edge`, and `publish_path_outputs` so evidence staging and state publication share one staged budget charge and cancellation boundary. Candidates may fill an unused alternative slot only when their exact quality remains active in the post-insert frontier, and never exceed the per-quality cap.
 
-Move the arena and active path evidence into `SummaryDataflowResult::from_parts`. Add a reconstruction entry point for `SummaryReachedFact` and one concrete retained quality. The first reconstruction implementation handles seed and ordinary/call-to-return edge nodes with an explicit stack. It validates evidence ownership and endpoints while expanding. At `finish`, iteratively compact the arena to nodes reachable from active frontier qualities so dominated or replaced candidates do not inflate the public result.
+Move the arena and active path evidence into `SummaryDataflowResult::from_parts`. Add a reconstruction entry point for `SummaryReachedFact` and one concrete retained quality. The first reconstruction implementation handles seed and ordinary/call-to-return edge nodes with an explicit stack. It validates evidence ownership and endpoints while expanding. At a fixed point, `finish` iteratively compacts the arena to nodes reachable from active frontier qualities so dominated or replaced candidates do not inflate the public result; cancellation and budget stops preserve dense IDs and move the already-bounded arena without a second traversal.
 
 At the end of Milestone 2, tests prove an exact intraprocedural witness, an explicit call-to-return witness, an unavailable result when retention is disabled, bounded deep iterative reconstruction, and atomic cancellation/budget behavior. Run focused suites, update this plan, and commit.
 
@@ -209,3 +228,7 @@ The implementation may use `Vec`, `HashMap`, `Box<[T]>`, and existing dense-ID/w
 Revision note, 2026-07-25: Initial plan written after live issue verification and code-level diagnosis. It resolves the opt-in, quality identity, atomic publication, context matching, and bounded reconstruction decisions before implementation.
 
 Revision note, 2026-07-25 12:56Z: Milestones 1-3 implemented. Recorded result compaction, propagated alternative truncation, focused validation evidence, and the isolated-target requirement for the remaining Clippy gate.
+
+Revision note, 2026-07-25 13:37Z: Milestone 4 completed and all five guided reviews addressed. Recorded end-summary gap evidence, compact disabled metadata, centralized capped admission, result ownership/root validation, matched-return validation, cancellation-safe finalization, retained-byte accounting, and post-review focused/Clippy evidence.
+
+Revision note, 2026-07-25 13:54Z: Milestone 5 completed. Recorded the clean full all-feature matrix and the exact-state focused and strict-Clippy reruns after the final derivation-equality tightening.

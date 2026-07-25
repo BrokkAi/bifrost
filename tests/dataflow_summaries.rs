@@ -1050,6 +1050,9 @@ fn assert_all_retained_witnesses_reconstruct<F>(result: &SummaryDataflowResult<F
                 .witness_for_reached(reached, quality, WitnessReconstructionLimits::default())
                 .expect("every active reached quality has valid evidence");
             assert_eq!(witness.quality(), quality);
+            if !witness.truncated() {
+                assert_eq!(fold_witness_quality(&witness), quality);
+            }
         }
     }
     for summary in result.end_summaries() {
@@ -1058,7 +1061,27 @@ fn assert_all_retained_witnesses_reconstruct<F>(result: &SummaryDataflowResult<F
                 .witness_for_end_summary(summary, quality, WitnessReconstructionLimits::default())
                 .expect("every active end-summary quality has valid evidence");
             assert_eq!(witness.quality(), quality);
+            if !witness.truncated() {
+                assert_eq!(fold_witness_quality(&witness), quality);
+            }
         }
+    }
+}
+
+fn fold_witness_quality(witness: &SummaryWitness) -> PathQuality {
+    let proven = witness
+        .steps()
+        .iter()
+        .all(|step| matches!(step.proof(), ProofStatus::Proven));
+    let complete = witness
+        .steps()
+        .iter()
+        .all(|step| matches!(step.completeness(), EvidenceCompleteness::Complete));
+    match (proven, complete) {
+        (true, true) => PathQuality::PROVEN_COMPLETE,
+        (true, false) => PathQuality::PROVEN_PARTIAL,
+        (false, true) => PathQuality::UNPROVEN_COMPLETE,
+        (false, false) => PathQuality::UNPROVEN_PARTIAL,
     }
 }
 
@@ -1107,6 +1130,22 @@ fn assert_witness_matches_snapshot(witness: &SummaryWitness, snapshot: &IcfgSnap
                                 .is_some_and(|node| node.point() == target)
                     }),
                     "witness edge must match an independently materialized semantic ICFG edge: {step:?}",
+                );
+            }
+            SummaryWitnessStepKind::EndSummaryGap(_) => {
+                assert!(step.target().is_none());
+                assert!(step.origin().is_none());
+                assert!(matches!(step.proof(), ProofStatus::Unproven(_)));
+                assert!(matches!(
+                    step.completeness(),
+                    EvidenceCompleteness::Partial(_)
+                ));
+                assert!(
+                    snapshot
+                        .nodes()
+                        .iter()
+                        .any(|node| node.point() == step.source()),
+                    "end-summary gap must be attached to a real exit point",
                 );
             }
         }
@@ -1238,9 +1277,50 @@ fn intraprocedural_witness_is_opt_in_source_backed_and_bounded() {
             WitnessReconstructionLimits::default(),
         )
         .expect("end-summary witness");
+    let last_end_step = end_witness.steps().last().expect("non-empty end witness");
+    match last_end_step.kind() {
+        SummaryWitnessStepKind::EndSummaryGap(ReturnTransferKind::Normal) => {
+            assert_eq!(last_end_step.source(), &exit);
+            assert_eq!(last_end_step.target(), None);
+        }
+        SummaryWitnessStepKind::Edge(_) => assert_eq!(last_end_step.target(), Some(&exit)),
+        other => panic!("unexpected terminal end-summary witness step: {other:?}"),
+    }
+    assert_eq!(fold_witness_quality(&end_witness), end_witness.quality());
+    let shallow_end_witness_bytes = std::mem::size_of_val(&end_witness)
+        + end_witness
+            .steps()
+            .iter()
+            .map(std::mem::size_of_val)
+            .sum::<usize>();
+    if matches!(
+        last_end_step.kind(),
+        SummaryWitnessStepKind::EndSummaryGap(_)
+    ) {
+        assert!(
+            end_witness.retained_bytes() > shallow_end_witness_bytes,
+            "owned gap reasons must be included in retained-byte accounting",
+        );
+    }
+
+    let cloned_reached = reached.clone();
+    result
+        .witness_for_reached(
+            &cloned_reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("a cloned row retains this result's witness ownership");
+    let other_result = solve_with_witnesses(&root, &[MarkerFact::Seed], &provider, &MarkerProblem);
     assert_eq!(
-        end_witness.steps().last().and_then(|step| step.target()),
-        Some(&exit),
+        other_result
+            .witness_for_reached(
+                reached,
+                PathQuality::PROVEN_COMPLETE,
+                WitnessReconstructionLimits::default(),
+            )
+            .unwrap_err(),
+        SummaryWitnessError::TargetNotInResult,
     );
 
     let truncated = result
