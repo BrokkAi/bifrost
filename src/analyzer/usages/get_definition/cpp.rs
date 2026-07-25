@@ -2792,13 +2792,23 @@ fn cpp_qualifier_lookup_tiers(
             tiers.push(path);
         }
     }
-    let mut namespace = lexical_namespace;
+    let mut namespace = lexical_namespace.map(str::to_string);
     while let Some(current) = namespace {
         let path = format!("{current}::{}", qualifier.reference);
         if !tiers.contains(&path) {
             tiers.push(path);
         }
-        namespace = current.rsplit_once("::").map(|(parent, _)| parent);
+        // A C++ namespace chain is `::`-joined with no embedded delimiters in any
+        // single component, so re-tokenizing it with the shared structured
+        // splitter and dropping the innermost component reproduces
+        // `rsplit_once("::")`'s outward walk exactly.
+        let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &current);
+        namespace = if parts.len() > 1 {
+            parts.pop();
+            Some(parts.join("::"))
+        } else {
+            None
+        };
     }
     if !tiers.contains(&qualifier.reference) {
         tiers.push(qualifier.reference.clone());
@@ -3615,12 +3625,14 @@ fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn cpp_parent_is_class(support: &dyn BoundedDefinitionLookup, unit: &CodeUnit) -> bool {
-    let fqn = unit.fq_name();
-    let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
+    // The unit's owner is a pure segment pop on its own structured `fq()`
+    // (`default_parent_fq_name`, shared with `IAnalyzer::parent_of`), not a
+    // re-guess of where the legacy fqn string's last `.` falls.
+    let Some(parent_fqn) = crate::analyzer::default_parent_fq_name(unit) else {
         return false;
     };
     support
-        .fqn(parent_fqn)
+        .fqn(&parent_fqn)
         .into_iter()
         .any(|parent| parent.is_class())
 }
@@ -3633,11 +3645,11 @@ fn cpp_is_unqualified_field(
     if !unit.short_name().contains('.') {
         return true;
     }
-    let fqn = unit.fq_name();
-    let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
+    // Same structured owner pop as `cpp_parent_is_class` above.
+    let Some(parent_fqn) = crate::analyzer::default_parent_fq_name(unit) else {
         return false;
     };
-    support.fqn(parent_fqn).into_iter().any(|parent| {
+    support.fqn(&parent_fqn).into_iter().any(|parent| {
         parent
             .signature()
             .is_some_and(|signature| signature.trim_start().starts_with("enum "))
@@ -4460,10 +4472,11 @@ fn cpp_enclosing_class_with_ranges(
         end_line: line,
     };
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
-    let enclosing_fqn = enclosing.fq_name();
-    let owner_fqn = enclosing_fqn.rsplit_once('.')?.0;
+    // Structured owner pop on `enclosing`'s own `fq()` (shared with
+    // `IAnalyzer::parent_of`), not a re-split of its rendered fqn string.
+    let owner_fqn = crate::analyzer::default_parent_fq_name(&enclosing)?;
     support
-        .fqn(owner_fqn)
+        .fqn(&owner_fqn)
         .into_iter()
         .find(|unit| unit.is_class())
 }
@@ -4482,9 +4495,21 @@ fn cpp_out_of_line_function_owner(
         if node.kind() == "function_definition" {
             let declarator = node.child_by_field_name("declarator")?;
             let qualified = cpp_declarator_qualified_name(declarator, source)?;
-            let (owner, _) = qualified.rsplit_once("::")?;
+            // `qualified` is source declarator text (`Namespace::Class::method`);
+            // re-tokenizing all `::` boundaries with the shared structured
+            // splitter and rejoining every part but the last with the same `::`
+            // reproduces `rsplit_once("::")`'s prefix exactly (split-then-join on
+            // an unchanged delimiter round-trips), while going through the one
+            // shared splitter instead of a local ad hoc split.
+            let parts =
+                crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &qualified);
+            let (_, owner_parts) = parts.split_last()?;
+            if owner_parts.is_empty() {
+                return None;
+            }
+            let owner = owner_parts.join("::");
             return cpp_resolve_owner_type_in_lexical_namespace(
-                analyzer, support, visibility, file, source, node, owner, byte,
+                analyzer, support, visibility, file, source, node, &owner, byte,
             );
         }
         node = node.parent()?;
@@ -5351,10 +5376,7 @@ fn cpp_type_unit_matches_name(unit: &CodeUnit, name: &str) -> bool {
 }
 
 fn cpp_namespace_relative_names(namespace: &str, name: &str) -> Vec<String> {
-    let parts = namespace
-        .split("::")
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, namespace);
     (1..=parts.len())
         .rev()
         .map(|len| format!("{}::{name}", parts[..len].join("::")))

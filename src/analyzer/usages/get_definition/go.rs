@@ -2321,6 +2321,18 @@ fn go_resolve_go_field_type_fqn(
     if qualifier.is_some() {
         return go_resolve_qualified_type_from_file(analyzer, support, field_file, type_text);
     }
+    // fqname-M4: this is a plain-string owner/name split (the `FqName` "pop the
+    // last segment" equivalent), but Go's package prefix is `/`-joined and can
+    // itself contain literal `.` (e.g. `github.com`), which is exactly why the
+    // shared M2 shrinking-scope resolver deliberately never reaches Go (see the
+    // ExecPlan's M2 Surprises entry). The generic `parse_symbol_path` splitter
+    // would over-split such a prefix, so it cannot replace this rightmost-`.`
+    // cut. A true structured fix needs the caller to carry the already-resolved
+    // owner `CodeUnit` (its `fq()`/`package_name()` directly) instead of a
+    // pre-flattened `owner_fqn` string threaded through several call sites —
+    // that is a signature change across `go_indexed_field_type_fqn` and
+    // `go_embedded_type_fqns`, not a mechanical one-line rewrite. Revisit
+    // alongside that call chain.
     let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
     go_resolve_type_name_in_package(support, package, name)
 }

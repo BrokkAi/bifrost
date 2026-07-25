@@ -696,7 +696,7 @@ pub trait IAnalyzer: Send + Sync + Any {
 /// segments (M3/M4). The M2-era legacy separator-scan fallback (which split the
 /// joined name on the rightmost of `.`/`$`/`::`/`->`) is deleted; an empty `fq`
 /// now genuinely means "no owner" rather than "not yet migrated".
-fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
+pub(crate) fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
     let parent = code_unit
         .fq()
         .parent()
