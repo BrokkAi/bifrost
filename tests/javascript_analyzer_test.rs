@@ -244,6 +244,69 @@ fn javascript_local_non_shape_preserving_define_function_blocks_surface_members(
 }
 
 #[test]
+fn javascript_local_schema_builder_call_materializes_object_shape() {
+    // Parity with typescript_local_schema_builder_call_materializes_object_shape
+    // (issue #1167, gap 3): a schema-builder call (`z.object({...})`, matched by
+    // the shared `object`-member-name convention) should get shape-preserving
+    // field indexing even for a non-exported local binding, same as TS.
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "schema.js",
+        r#"
+            const LocalSchema = z.object({
+                isEnabled: true
+            });
+        "#,
+    )]);
+    let file = project.file("schema.js");
+    let declarations = analyzer.declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(
+        file,
+        CodeUnitType::Field,
+        "",
+        "schema.js.LocalSchema.isEnabled",
+    )));
+}
+
+#[test]
+fn javascript_regex_initializer_included_in_variable_skeleton() {
+    // Parity with typescript_regex_initializer_included_in_variable_skeleton
+    // (issue #1167, gap 1): a regex-initialized binding renders its initializer
+    // inline in the skeleton, same as any other simple initializer.
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(root, "pattern.js", "const p = /x/;\n");
+    let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
+    let skeletons = analyzer.get_skeletons(&file);
+    assert_eq!(
+        "const p = /x/",
+        skeletons
+            .get(&definition(&analyzer, "pattern.js.p"))
+            .unwrap()
+            .trim()
+    );
+}
+
+#[test]
+fn javascript_function_expression_variable_classified_as_function() {
+    // Parity with typescript_function_expression_variable_classified_as_function
+    // (issue #1167, gap 2): a module-scope `const x = function(){}` is a
+    // function, not a field, in both dialects.
+    let (project, analyzer) = js_inline_analyzer(&[(
+        "handlers.js",
+        r#"
+            const handle = function() {
+                return 1;
+            };
+        "#,
+    )]);
+    let file = project.file("handlers.js");
+    let declarations = analyzer.declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(file, CodeUnitType::Function, "", "handle",)));
+}
+
+#[test]
 fn javascript_type_hierarchy_resolves_same_file_extends() {
     let (_project, analyzer) =
         js_inline_analyzer(&[("models.js", "class Base {}\nclass Child extends Base {}\n")]);

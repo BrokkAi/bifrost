@@ -36,9 +36,10 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{
     add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
-    collect_function_nodes, file_scoped_field_fq, file_scoped_field_name, js_ts_segment,
-    module_code_unit, module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
-    this_member_property, trim_statement, variable_header,
+    call_is_schema_object_builder, collect_function_nodes, file_scoped_field_fq,
+    file_scoped_field_name, js_ts_segment, module_code_unit, module_scoped_field_uses_file_name,
+    node_text, property_name_text, root_node, this_member_property, trim_statement,
+    variable_header,
 };
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::js_ts::{
@@ -1446,7 +1447,7 @@ fn visit_ts_value(
         let name = trim_statement(node_text(name_node, source));
         let value = child.child_by_field_name("value");
         let is_function = value
-            .map(|value| value.kind() == "arrow_function")
+            .map(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
             .unwrap_or(false);
         let module_surface = parent.is_none()
             && (exported || exported_roots.contains(&name))
@@ -1662,29 +1663,11 @@ fn ts_call_preserves_object_argument_shape(
     source: &str,
     argument_index: usize,
 ) -> bool {
-    if argument_index == 0 && ts_call_is_schema_object_builder(call, source) {
+    if argument_index == 0 && call_is_schema_object_builder(call, source) {
         return true;
     }
     ts_call_object_argument_shape_preservation(anchor, call, source, argument_index)
         == TsShapePreservation::Preserves
-}
-
-/// Recognizes a schema-builder call whose first object-literal argument defines the value's
-/// navigable shape, e.g. zod's `z.object({ ... })`. Schema libraries (zod, yup, valibot,
-/// superstruct, ...) universally expose this via an `object(...)` builder, so we match the
-/// `object` member-name convention rather than a specific import alias — `z` is only a
-/// conventional name and breaks under `import * as zod` or aliased imports.
-fn ts_call_is_schema_object_builder(call: Node<'_>, source: &str) -> bool {
-    let Some(function) = call.child_by_field_name("function") else {
-        return false;
-    };
-    if function.kind() != "member_expression" {
-        return false;
-    }
-    let Some(property) = function.child_by_field_name("property") else {
-        return false;
-    };
-    node_text(property, source).trim() == "object"
 }
 
 fn ts_source_function_preserves_parameter_shape(
@@ -1731,7 +1714,7 @@ fn ts_surface_call_preserves_object_argument_shape(
     source: &str,
     argument_index: usize,
 ) -> bool {
-    if argument_index == 0 && ts_call_is_schema_object_builder(call, source) {
+    if argument_index == 0 && call_is_schema_object_builder(call, source) {
         return true;
     }
     match ts_call_object_argument_shape_preservation(anchor, call, source, argument_index) {
@@ -2469,6 +2452,7 @@ fn is_simple_ts_initializer(node: Node<'_>) -> bool {
             | "false"
             | "null"
             | "undefined"
+            | "regex"
             | "template_string"
             | "unary_expression"
             | "binary_expression"
