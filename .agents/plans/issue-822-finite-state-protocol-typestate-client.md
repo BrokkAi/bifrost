@@ -209,10 +209,14 @@ required for that checkpoint.
   explicit uncertainty semantics.
 - [x] Consume #1171's generic witness API after it lands on `origin/master`.
 - [x] Add controlled-graph and equivalent TypeScript/Java conformance fixtures.
-- [ ] Complete repository validation and final guided review (completed:
-  guided architecture/intent/robustness pass, automatic fixes, and post-fix
-  intent recheck; remaining: final all-target/all-feature Clippy and full
-  `nlp,python` test gate).
+- [x] (2026-07-26 00:47+02:00) Completed final repository validation and
+  guided review. The focused protocol/binding/client/summary gate passes 76/76
+  tests; isolated strict all-target/all-feature Clippy passes without warnings;
+  and the elevated isolated `cargo test --all-features` gate passes every
+  library, binary, integration, and doc-test target. Its library binary reports
+  1,933 passed and 6 intentionally ignored, including successful execution of
+  the three MCP stderr-boundary tests denied by the sandbox. Both isolated
+  targets were removed automatically.
 
 ## Surprises & Discoveries
 
@@ -619,10 +623,13 @@ client/finding, and witness checkpoints completed guided specialist review;
 every relevant blocker and reasonably scoped finding was fixed and committed.
 
 Focused typestate, protocol, binding, generic dataflow, ICFG, deferred-call,
-branch, recursion, and real exceptional-return conformance suites pass, as does
-strict focused Clippy. The only remaining work is the final isolated
-all-target/all-feature Clippy and full `nlp,python` repository test gate,
-followed by recording exact evidence and a final remote-state check.
+branch, recursion, and real exceptional-return conformance suites pass. The
+focused final matrix contains 13 protocol, 8 binding, 28 client, and 27 summary
+tests. Isolated strict all-target/all-feature Clippy passes, and the complete
+elevated isolated `nlp,python` repository suite passes every test target; the
+1,933-test library binary has 6 intentional ignores. The final fetched
+`origin/master` is an ancestor of the branch, and no generated `.brokk/` cache
+or retained isolated target remains.
 
 ## Context and Orientation
 
@@ -856,10 +863,11 @@ For cross-language and final acceptance:
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
     BIFROST_SEMANTIC_INDEX=off scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
 
-The exact test counts are recorded after the test binaries exist. Every focused
-command must end with `test result: ok`; strict Clippy must emit no warnings.
-The full feature suite must not download models or start semantic indexer
-threads.
+The focused final binaries contain 13 protocol, 8 binding, 28 client, and 27
+summary tests, all passing. Every focused command ends with `test result: ok`;
+strict Clippy emits no warnings. The full feature suite runs with semantic
+indexing disabled, does not download models, and passes every library, binary,
+integration, and doc-test target.
 
 At every checkpoint:
 
@@ -950,4 +958,6 @@ Revision note (2026-07-26): updated the plan after #1171 landed and the
 client/witness milestones completed. Recorded the bounded witness architecture,
 specialist-review fixes, cross-language coverage boundary, branch/recursion/
 exceptional acceptance fixtures, and the remaining final repository gates so
-the living plan matches the implemented branch.
+the living plan matches the implemented branch. After validation completed,
+recorded the 76-test focused gate, strict all-feature Clippy, full elevated
+all-feature repository suite, cleanup, and final remote-state evidence.
