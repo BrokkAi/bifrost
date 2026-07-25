@@ -194,6 +194,7 @@ pub fn collect_summary_findings_with_limits(
     }
     let analysis_complete = typestate_result.is_complete();
     let mut violations = HashMap::<ViolationKey, ViolationAggregate>::default();
+    let mut non_violations = HashSet::<EventOutcomeKey>::default();
     let mut event_terminals = vec![None; bindings.terminal_bindings().len()];
     let mut needed_states = HashSet::<StateKey>::default();
     for binding in bindings.terminal_bindings() {
@@ -258,6 +259,19 @@ pub fn collect_summary_findings_with_limits(
                 omitted_candidates = omitted_candidates.saturating_add(1);
             }
         }
+        if let Some(binding) = fact.non_violation_binding() {
+            let subject = fact
+                .subject()
+                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+            if bindings.event_binding(binding).is_none() {
+                return Err(TypestateFlowProblemError::InvalidFactIdentity);
+            }
+            non_violations.insert(EventOutcomeKey {
+                point: reached.point().clone(),
+                subject,
+                binding,
+            });
+        }
         if let Some((terminal_binding, state)) = fact.terminal_observation() {
             let aggregate = event_terminals
                 .get_mut(terminal_binding.index())
@@ -311,15 +325,17 @@ pub fn collect_summary_findings_with_limits(
         let binding = bindings
             .event_binding(key.binding)
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        let definite_path = aggregate.paths.has_proven_path()
-            && aggregate.uncertainty.is_empty()
-            && !aggregate.abstained;
-        let certainty = match protocol.semantics().analysis_mode {
-            ProtocolAnalysisMode::May if definite_path => TypestateFindingCertainty::May,
-            ProtocolAnalysisMode::May | ProtocolAnalysisMode::Must => {
-                TypestateFindingCertainty::Inconclusive
-            }
-        };
+        let has_non_violation = non_violations.contains(&EventOutcomeKey {
+            point: key.point.clone(),
+            subject: key.subject,
+            binding: key.binding,
+        });
+        let certainty = error_transition_certainty(
+            protocol.semantics().analysis_mode,
+            analysis_complete,
+            &aggregate,
+            has_non_violation,
+        );
         findings.push(TypestateFinding {
             subject: key.subject,
             site: binding.site().identity().clone(),
@@ -378,14 +394,12 @@ pub fn collect_summary_findings_with_limits(
                 .any(|observation| !observation.uncertainty.is_empty() || observation.abstained);
         let failing_proven = observations.states.iter().any(|(state, observation)| {
             terminal.expected_states().binary_search(state).is_err()
-                && observation.paths.has_proven_path()
-                && observation.uncertainty.is_empty()
-                && !observation.abstained
+                && observation.has_definite_proven_path
                 && binding_definitive
         });
         let all_paths_definitive = binding_definitive
             && observations.states.values().all(|observation| {
-                observation.paths.has_proven_complete_path()
+                observation.has_definite_proven_complete_path
                     && observation.uncertainty.is_empty()
                     && !observation.abstained
             });
@@ -469,11 +483,20 @@ struct ViolationKey {
     to: ProtocolStateId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EventOutcomeKey {
+    point: ProgramPointHandle,
+    subject: TypestateSubjectId,
+    binding: TypestateEventBindingId,
+}
+
 #[derive(Debug, Clone)]
 struct ViolationAggregate {
     paths: PathQualityFrontier,
     uncertainty: TypestateUncertaintySet,
     abstained: bool,
+    has_definite_proven_path: bool,
+    has_definite_proven_complete_path: bool,
 }
 
 impl ViolationAggregate {
@@ -482,10 +505,13 @@ impl ViolationAggregate {
         uncertainty: TypestateUncertaintySet,
         abstained: bool,
     ) -> Self {
+        let definitive = uncertainty.is_empty() && !abstained;
         Self {
             paths,
             uncertainty,
             abstained,
+            has_definite_proven_path: definitive && paths.has_proven_path(),
+            has_definite_proven_complete_path: definitive && paths.has_proven_complete_path(),
         }
     }
 
@@ -495,9 +521,35 @@ impl ViolationAggregate {
         uncertainty: TypestateUncertaintySet,
         abstained: bool,
     ) {
+        let definitive = uncertainty.is_empty() && !abstained;
+        self.has_definite_proven_path |= definitive && paths.has_proven_path();
+        self.has_definite_proven_complete_path |= definitive && paths.has_proven_complete_path();
         merge_paths(&mut self.paths, paths);
         self.uncertainty = self.uncertainty.union(uncertainty);
         self.abstained |= abstained;
+    }
+}
+
+fn error_transition_certainty(
+    mode: ProtocolAnalysisMode,
+    analysis_complete: bool,
+    aggregate: &ViolationAggregate,
+    has_non_violation: bool,
+) -> TypestateFindingCertainty {
+    match mode {
+        ProtocolAnalysisMode::May if aggregate.has_definite_proven_path => {
+            TypestateFindingCertainty::May
+        }
+        ProtocolAnalysisMode::Must
+            if analysis_complete
+                && aggregate.has_definite_proven_complete_path
+                && !has_non_violation =>
+        {
+            TypestateFindingCertainty::Must
+        }
+        ProtocolAnalysisMode::May | ProtocolAnalysisMode::Must => {
+            TypestateFindingCertainty::Inconclusive
+        }
     }
 }
 
@@ -517,6 +569,10 @@ impl ObservationAggregate {
         self.states
             .entry(state)
             .and_modify(|observation| {
+                let definitive = uncertainty.is_empty() && !abstained;
+                observation.has_definite_proven_path |= definitive && paths.has_proven_path();
+                observation.has_definite_proven_complete_path |=
+                    definitive && paths.has_proven_complete_path();
                 merge_paths(&mut observation.paths, paths);
                 observation.uncertainty = observation.uncertainty.union(uncertainty);
                 observation.abstained |= abstained;
@@ -525,6 +581,12 @@ impl ObservationAggregate {
                 paths,
                 uncertainty,
                 abstained,
+                has_definite_proven_path: uncertainty.is_empty()
+                    && !abstained
+                    && paths.has_proven_path(),
+                has_definite_proven_complete_path: uncertainty.is_empty()
+                    && !abstained
+                    && paths.has_proven_complete_path(),
             });
     }
 }
@@ -534,6 +596,8 @@ struct ObservationEvidence {
     paths: PathQualityFrontier,
     uncertainty: TypestateUncertaintySet,
     abstained: bool,
+    has_definite_proven_path: bool,
+    has_definite_proven_complete_path: bool,
 }
 
 fn merge_paths(target: &mut PathQualityFrontier, incoming: PathQualityFrontier) {
@@ -592,4 +656,48 @@ fn merge_findings(findings: Vec<TypestateFinding>) -> Vec<TypestateFinding> {
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::dataflow::{PathQuality, PathQualityFrontier};
+    use crate::analyzer::typestate::TypestateUncertainty;
+
+    #[test]
+    fn clean_may_evidence_survives_an_uncertain_parallel_path() {
+        let paths = PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE);
+        let mut aggregate =
+            ViolationAggregate::new(paths, TypestateUncertaintySet::default(), false);
+        aggregate.merge(
+            paths,
+            TypestateUncertaintySet::default().with(TypestateUncertainty::IncompleteAnalysis),
+            false,
+        );
+
+        assert_eq!(
+            error_transition_certainty(ProtocolAnalysisMode::May, false, &aggregate, false),
+            TypestateFindingCertainty::May
+        );
+        assert!(!aggregate.uncertainty.is_empty());
+    }
+
+    #[test]
+    fn must_evidence_requires_complete_paths_and_no_safe_outcome() {
+        let paths = PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE);
+        let aggregate = ViolationAggregate::new(paths, TypestateUncertaintySet::default(), false);
+
+        assert_eq!(
+            error_transition_certainty(ProtocolAnalysisMode::Must, true, &aggregate, false),
+            TypestateFindingCertainty::Must
+        );
+        assert_eq!(
+            error_transition_certainty(ProtocolAnalysisMode::Must, true, &aggregate, true),
+            TypestateFindingCertainty::Inconclusive
+        );
+        assert_eq!(
+            error_transition_certainty(ProtocolAnalysisMode::Must, false, &aggregate, false),
+            TypestateFindingCertainty::Inconclusive
+        );
+    }
 }

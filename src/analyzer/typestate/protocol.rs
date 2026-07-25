@@ -676,17 +676,17 @@ impl CompiledProtocol {
         if eligible_events.len() > MAX_PROTOCOL_EVENTS {
             return None;
         }
-        let mut eligible = vec![false; self.events.len()];
-        for event in eligible_events {
-            self.events.get(event.index())?;
-            eligible[event.index()] = true;
-        }
         match self.semantics.uncertainty.behavior(cause) {
             ProtocolUncertaintyBehavior::PreserveUncertainty => {
                 Some(ProtocolUncertaintyResolution::PreserveUncertainty { state })
             }
             ProtocolUncertaintyBehavior::Abstain => Some(ProtocolUncertaintyResolution::Abstain),
             ProtocolUncertaintyBehavior::ConservativeTransition => {
+                let mut eligible = vec![false; self.events.len()];
+                for event in eligible_events {
+                    self.events.get(event.index())?;
+                    eligible[event.index()] = true;
+                }
                 let transitive = cause != ProtocolUncertaintyCause::AmbiguousDispatch;
                 Some(ProtocolUncertaintyResolution::StateSet(
                     self.conservative_uncertainty_targets(
@@ -708,7 +708,7 @@ impl CompiledProtocol {
         transitive: bool,
     ) -> ProtocolUncertaintyStateSet {
         let mut reached = vec![false; self.state_keys.len()];
-        let mut predecessor = vec![None; self.state_keys.len()];
+        let mut error_witnesses = Vec::new();
         reached[state.index()] = true;
         let mut stack = vec![state];
         while let Some(source) = stack.pop() {
@@ -719,9 +719,15 @@ impl CompiledProtocol {
                     continue;
                 }
                 let target = transition.to;
+                if self.is_error(target) {
+                    error_witnesses.push(ProtocolUncertaintyViolation {
+                        event: transition.on,
+                        from: source,
+                        to: target,
+                    });
+                }
                 if !reached[target.index()] {
                     reached[target.index()] = true;
-                    predecessor[target.index()] = Some((source, transition.on, transition.to));
                     if transitive {
                         stack.push(target);
                     }
@@ -741,17 +747,6 @@ impl CompiledProtocol {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let mut error_witnesses =
-            states
-                .iter()
-                .filter_map(|target| {
-                    if !self.is_error(*target) {
-                        return None;
-                    }
-                    predecessor[target.index()]
-                        .map(|(from, event, to)| ProtocolUncertaintyViolation { event, from, to })
-                })
-                .collect::<Vec<_>>();
         error_witnesses.sort_unstable();
         error_witnesses.dedup();
         ProtocolUncertaintyStateSet {

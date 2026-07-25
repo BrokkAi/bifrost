@@ -11,8 +11,9 @@ use brokk_bifrost::analyzer::semantic::{
 use brokk_bifrost::analyzer::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, ProtocolAnalysisMode, ProtocolEventKey,
     ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey, ProtocolGuardSpec,
-    ProtocolObservationPhase, ProtocolObservationSpec, ProtocolSemantics, ProtocolSpec,
-    ProtocolStateKey, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
+    ProtocolObservationPhase, ProtocolObservationSpec, ProtocolProcedureExitKind,
+    ProtocolSemantics, ProtocolSpec, ProtocolStateKey, ProtocolTerminalExpectationSpec,
+    ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
     ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
     TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
     TypestateEventBindingSpec, TypestateFact, TypestateFindingCertainty, TypestateFindingKind,
@@ -397,9 +398,11 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .protocol
         .state_id(&ProtocolStateKey::new("open").unwrap())
         .unwrap();
-    assert_eq!(
-        opened,
-        vec![problem.state_fact(fixture.subject, open).unwrap()]
+    assert!(opened.contains(&problem.state_fact(fixture.subject, open).unwrap()));
+    assert!(
+        opened
+            .iter()
+            .any(|fact| fact.non_violation_binding().is_some())
     );
 
     let used = transfer(
@@ -415,7 +418,11 @@ fn bound_events_execute_in_their_dataflow_phase() {
         opened[0],
         TestTransfer::Call,
     );
-    assert_eq!(used, opened);
+    assert!(used.contains(&problem.state_fact(fixture.subject, open).unwrap()));
+    assert!(
+        used.iter()
+            .any(|fact| fact.non_violation_binding().is_some())
+    );
 
     let closed = transfer(
         &problem,
@@ -434,9 +441,11 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .protocol
         .state_id(&ProtocolStateKey::new("closed").unwrap())
         .unwrap();
-    assert_eq!(
-        closed,
-        vec![problem.state_fact(fixture.subject, closed_state).unwrap()]
+    assert!(closed.contains(&problem.state_fact(fixture.subject, closed_state).unwrap()));
+    assert!(
+        closed
+            .iter()
+            .any(|fact| fact.non_violation_binding().is_some())
     );
 
     let violated = transfer(
@@ -526,7 +535,98 @@ fn procedure_exit_events_execute_when_control_enters_the_exit() {
         .state_id(&ProtocolStateKey::new("closed").unwrap())
         .unwrap();
 
-    assert_eq!(result, vec![problem.state_fact(subject, closed).unwrap()]);
+    assert!(result.contains(&problem.state_fact(subject, closed).unwrap()));
+    assert!(
+        result
+            .iter()
+            .any(|fact| fact.non_violation_binding().is_some())
+    );
+}
+
+#[test]
+fn exit_terminal_observes_the_post_return_state() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
+    spec.terminal_expectations = vec![ProtocolTerminalExpectationSpec {
+        id: "exit-observation".into(),
+        on: ProtocolTerminalObservationSpec::Event {
+            observation: ProtocolObservationSpec {
+                occurrence: ProtocolEventOccurrence::ProcedureExit {
+                    kind: ProtocolProcedureExitKind::Normal,
+                },
+            },
+        },
+        expected_states: vec!["closed".into()],
+    }];
+    let protocol = spec.compile().unwrap();
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        Vec::new(),
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("close").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::call_site(
+                fixture.close_call.clone(),
+                TypestateBindingContext::root(),
+            ),
+            0,
+            TypestateObjectRole::Argument,
+            exact.clone(),
+        )],
+        vec![TypestateTerminalBindingSpec::new(
+            ProtocolExpectationKey::new("exit-observation").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::program_point(
+                fixture.exit.clone(),
+                TypestateBindingContext::root(),
+            ),
+            TypestateObjectRole::CurrentObject,
+            exact,
+        )],
+    )
+    .unwrap();
+    let subject = bindings.subjects()[0].id();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let open = protocol
+        .state_id(&ProtocolStateKey::new("open").unwrap())
+        .unwrap();
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::NormalReturn,
+            Some(&fixture.close_call),
+            &fixture.close_point,
+            &fixture.exit,
+            &proven,
+            &complete,
+        ),
+        problem.state_fact(subject, open).unwrap(),
+        TestTransfer::Return,
+    );
+
+    assert!(
+        result.iter().any(|fact| {
+            fact.terminal_observation()
+                .is_some_and(|(_, state)| state == closed)
+        }),
+        "{result:#?}"
+    );
+    assert!(!result.iter().any(|fact| {
+        fact.terminal_observation()
+            .is_some_and(|(_, state)| state == open)
+    }));
 }
 
 #[test]

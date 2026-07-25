@@ -44,7 +44,7 @@ impl TypestateUncertaintySet {
         self.0 & (1 << uncertainty as u8) != 0
     }
 
-    const fn with(self, uncertainty: TypestateUncertainty) -> Self {
+    pub(super) const fn with(self, uncertainty: TypestateUncertainty) -> Self {
         Self(self.0 | (1 << uncertainty as u8))
     }
 
@@ -67,6 +67,13 @@ pub enum TypestateFact {
         plan: TypestateBindingPlanHash,
         subject: TypestateSubjectId,
         violation: TypestateViolation,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    },
+    NonViolation {
+        plan: TypestateBindingPlanHash,
+        subject: TypestateSubjectId,
+        event_binding: TypestateEventBindingId,
         uncertainty: TypestateUncertaintySet,
         abstained: bool,
     },
@@ -121,6 +128,7 @@ impl TypestateFact {
             Self::Zero => None,
             Self::State { subject, .. }
             | Self::Violation { subject, .. }
+            | Self::NonViolation { subject, .. }
             | Self::Terminal { subject, .. } => Some(subject),
         }
     }
@@ -130,6 +138,7 @@ impl TypestateFact {
             Self::Zero => None,
             Self::State { plan, .. }
             | Self::Violation { plan, .. }
+            | Self::NonViolation { plan, .. }
             | Self::Terminal { plan, .. } => Some(plan),
         }
     }
@@ -139,6 +148,7 @@ impl TypestateFact {
             Self::Zero => None,
             Self::State { state, .. } => Some(state),
             Self::Violation { violation, .. } => Some(violation.to),
+            Self::NonViolation { .. } => None,
             Self::Terminal { state, .. } => Some(state),
         }
     }
@@ -148,6 +158,7 @@ impl TypestateFact {
             Self::Zero => TypestateUncertaintySet(0),
             Self::State { uncertainty, .. }
             | Self::Violation { uncertainty, .. }
+            | Self::NonViolation { uncertainty, .. }
             | Self::Terminal { uncertainty, .. } => uncertainty,
         }
     }
@@ -161,6 +172,9 @@ impl TypestateFact {
             } | Self::Violation {
                 abstained: true,
                 ..
+            } | Self::NonViolation {
+                abstained: true,
+                ..
             } | Self::Terminal {
                 abstained: true,
                 ..
@@ -171,7 +185,18 @@ impl TypestateFact {
     pub const fn violation(self) -> Option<TypestateViolation> {
         match self {
             Self::Violation { violation, .. } => Some(violation),
-            Self::Zero | Self::State { .. } | Self::Terminal { .. } => None,
+            Self::Zero | Self::State { .. } | Self::NonViolation { .. } | Self::Terminal { .. } => {
+                None
+            }
+        }
+    }
+
+    pub const fn non_violation_binding(self) -> Option<TypestateEventBindingId> {
+        match self {
+            Self::NonViolation { event_binding, .. } => Some(event_binding),
+            Self::Zero | Self::State { .. } | Self::Violation { .. } | Self::Terminal { .. } => {
+                None
+            }
         }
     }
 
@@ -184,7 +209,10 @@ impl TypestateFact {
                 state,
                 ..
             } => Some((terminal_binding, state)),
-            Self::Zero | Self::State { .. } | Self::Violation { .. } => None,
+            Self::Zero
+            | Self::State { .. }
+            | Self::Violation { .. }
+            | Self::NonViolation { .. } => None,
         }
     }
 }
@@ -457,7 +485,9 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 }
                 let _ = self.transfer_facts(edge, family, vec![fact], out);
             }
-            TypestateFact::Violation { .. } | TypestateFact::Terminal { .. } => {}
+            TypestateFact::Violation { .. }
+            | TypestateFact::NonViolation { .. }
+            | TypestateFact::Terminal { .. } => {}
         }
     }
 
@@ -489,30 +519,6 @@ impl<'plan> TypestateFlowProblem<'plan> {
             .terminal_bindings_at_program_point_all_contexts(edge.source())
         {
             if terminal_point_occurrence(self.protocol, binding)
-                && !self.append_terminal_observations(&mut facts, binding)
-            {
-                return facts.emit(out);
-            }
-        }
-
-        for binding in self
-            .bindings
-            .event_bindings_at_program_point_all_contexts(edge.target())
-        {
-            if exit_point_occurrence(self.protocol, binding.event(), edge.target()) {
-                if subject == Some(binding.subject()) {
-                    eligible_events.push(EligibleEvent::from_binding(binding));
-                }
-                if !self.apply_binding(&mut facts, binding) {
-                    return facts.emit(out);
-                }
-            }
-        }
-        for binding in self
-            .bindings
-            .terminal_bindings_at_program_point_all_contexts(edge.target())
-        {
-            if terminal_exit_point_occurrence(self.protocol, binding, edge.target())
                 && !self.append_terminal_observations(&mut facts, binding)
             {
                 return facts.emit(out);
@@ -598,6 +604,33 @@ impl<'plan> TypestateFlowProblem<'plan> {
             })
         {
             return facts.emit(out);
+        }
+
+        // A return or call-to-return edge can both apply a call-stage event and
+        // enter the procedure exit. Exit observations must see the post-return
+        // state, including any uncertainty introduced by the edge boundary.
+        for binding in self
+            .bindings
+            .event_bindings_at_program_point_all_contexts(edge.target())
+        {
+            if exit_point_occurrence(self.protocol, binding.event(), edge.target()) {
+                if subject == Some(binding.subject()) {
+                    eligible_events.push(EligibleEvent::from_binding(binding));
+                }
+                if !self.apply_binding(&mut facts, binding) {
+                    return facts.emit(out);
+                }
+            }
+        }
+        for binding in self
+            .bindings
+            .terminal_bindings_at_program_point_all_contexts(edge.target())
+        {
+            if terminal_exit_point_occurrence(self.protocol, binding, edge.target())
+                && !self.append_terminal_observations(&mut facts, binding)
+            {
+                return facts.emit(out);
+            }
         }
 
         facts.emit(out)
@@ -730,6 +763,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 TypestateFact::Zero
                 | TypestateFact::State { .. }
                 | TypestateFact::Violation { .. }
+                | TypestateFact::NonViolation { .. }
                 | TypestateFact::Terminal { .. } => None,
             })
             .flat_map(|(plan, subject, state, uncertainty, abstained)| {
@@ -767,6 +801,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 }),
                 TypestateFact::Zero
                 | TypestateFact::Violation { .. }
+                | TypestateFact::NonViolation { .. }
                 | TypestateFact::Terminal { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -820,18 +855,40 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     },
                 ];
             }
-            return vec![target];
-        }
-        match self.protocol.semantics().unmatched_event {
-            ProtocolUnmatchedEventBehavior::PreserveState => vec![fact],
-            ProtocolUnmatchedEventBehavior::MarkInconclusive => {
-                vec![TypestateFact::State {
+            return vec![
+                target,
+                TypestateFact::NonViolation {
                     plan,
                     subject,
-                    state,
-                    uncertainty: uncertainty.with(TypestateUncertainty::UnmatchedEvent),
+                    event_binding: binding.id(),
+                    uncertainty,
                     abstained,
-                }]
+                },
+            ];
+        }
+        let non_violation = |uncertainty| TypestateFact::NonViolation {
+            plan,
+            subject,
+            event_binding: binding.id(),
+            uncertainty,
+            abstained,
+        };
+        match self.protocol.semantics().unmatched_event {
+            ProtocolUnmatchedEventBehavior::PreserveState => {
+                vec![fact, non_violation(uncertainty)]
+            }
+            ProtocolUnmatchedEventBehavior::MarkInconclusive => {
+                let uncertainty = uncertainty.with(TypestateUncertainty::UnmatchedEvent);
+                vec![
+                    TypestateFact::State {
+                        plan,
+                        subject,
+                        state,
+                        uncertainty,
+                        abstained,
+                    },
+                    non_violation(uncertainty),
+                ]
             }
         }
     }
@@ -855,6 +912,21 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     plan,
                     subject,
                     violation,
+                    uncertainty: uncertainty.with(uncertainty_kind),
+                    abstained,
+                }];
+            }
+            TypestateFact::NonViolation {
+                plan,
+                subject,
+                event_binding,
+                uncertainty,
+                abstained,
+            } => {
+                return vec![TypestateFact::NonViolation {
+                    plan,
+                    subject,
+                    event_binding,
                     uncertainty: uncertainty.with(uncertainty_kind),
                     abstained,
                 }];
@@ -922,23 +994,22 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     })
                     .collect::<Vec<_>>();
                 for witness in states.error_witnesses() {
-                    let Some(binding) = eligible_events
+                    for binding in eligible_events
                         .iter()
-                        .find(|eligible| eligible.event == witness.event())
-                    else {
-                        continue;
-                    };
-                    facts.push(TypestateFact::Violation {
-                        plan,
-                        subject,
-                        violation: TypestateViolation {
-                            event_binding: binding.binding,
-                            from: witness.from(),
-                            to: witness.to(),
-                        },
-                        uncertainty,
-                        abstained,
-                    });
+                        .filter(|eligible| eligible.event == witness.event())
+                    {
+                        facts.push(TypestateFact::Violation {
+                            plan,
+                            subject,
+                            violation: TypestateViolation {
+                                event_binding: binding.binding,
+                                from: witness.from(),
+                                to: witness.to(),
+                            },
+                            uncertainty,
+                            abstained,
+                        });
+                    }
                 }
                 facts
             }

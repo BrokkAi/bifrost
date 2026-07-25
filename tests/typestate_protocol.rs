@@ -347,6 +347,30 @@ fn uncertainty_behaviors_compile_to_bounded_state_relations() {
         ),
         vec!["closed", "open", "violated"]
     );
+    let ProtocolUncertaintyResolution::StateSet(states) = protocol
+        .resolve_uncertainty(
+            ProtocolUncertaintyCause::UnknownCall,
+            open,
+            ProtocolObjectCardinality::Singleton,
+            &call_events,
+        )
+        .unwrap()
+    else {
+        panic!("conservative transition should retain state and transition witnesses");
+    };
+    let mut error_events = states
+        .error_witnesses()
+        .iter()
+        .map(|witness| {
+            protocol
+                .event(witness.event())
+                .expect("witness event")
+                .key()
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    error_events.sort_unstable();
+    assert_eq!(error_events, vec!["close", "use"]);
     assert_eq!(
         protocol
             .resolve_uncertainty(
