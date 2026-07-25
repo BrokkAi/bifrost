@@ -51,7 +51,6 @@ function lifecycle() {
 struct ClientFixture {
     protocol: CompiledProtocol,
     bindings: TypestateBindingPlan,
-    subject: brokk_bifrost::analyzer::typestate::TypestateSubjectId,
     subject_key: TypestateSubjectKey,
     subject_class: TypestateSubjectClassKey,
     subject_object: AbstractObject,
@@ -226,12 +225,9 @@ fn fixture_from(
         )],
     )
     .expect("client binding plan");
-    let subject = bindings.subjects()[0].id();
-
     ClientFixture {
         protocol,
         bindings,
-        subject,
         subject_key,
         subject_class: class,
         subject_object: object,
@@ -349,6 +345,22 @@ impl DataflowOutput<TypestateFact> for FactOutput {
     }
 }
 
+#[derive(Default)]
+struct StoppedOutput {
+    emitted: usize,
+}
+
+impl DataflowOutput<TypestateFact> for StoppedOutput {
+    fn should_continue(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, _fact: TypestateFact) -> bool {
+        self.emitted += 1;
+        false
+    }
+}
+
 fn transfer(
     problem: &TypestateFlowProblem<'_>,
     edge: DataflowEdge<'_>,
@@ -391,14 +403,19 @@ fn bound_events_execute_in_their_dataflow_phase() {
             &proven,
             &complete,
         ),
-        TypestateFact::Zero,
+        TypestateFact::zero(),
         TestTransfer::Normal,
     );
-    let open = fixture
-        .protocol
-        .state_id(&ProtocolStateKey::new("open").unwrap())
-        .unwrap();
-    assert!(opened.contains(&problem.state_fact(fixture.subject, open).unwrap()));
+    assert!(
+        opened.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("open").unwrap(),
+                )
+                .unwrap()
+        )
+    );
     assert!(
         opened
             .iter()
@@ -418,7 +435,16 @@ fn bound_events_execute_in_their_dataflow_phase() {
         opened[0],
         TestTransfer::Call,
     );
-    assert!(used.contains(&problem.state_fact(fixture.subject, open).unwrap()));
+    assert!(
+        used.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("open").unwrap(),
+                )
+                .unwrap()
+        )
+    );
     assert!(
         used.iter()
             .any(|fact| fact.non_violation_binding().is_some())
@@ -441,7 +467,16 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .protocol
         .state_id(&ProtocolStateKey::new("closed").unwrap())
         .unwrap();
-    assert!(closed.contains(&problem.state_fact(fixture.subject, closed_state).unwrap()));
+    assert!(
+        closed.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("closed").unwrap(),
+                )
+                .unwrap()
+        )
+    );
     assert!(
         closed
             .iter()
@@ -466,7 +501,16 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .state_id(&ProtocolStateKey::new("violated").unwrap())
         .unwrap();
     assert_eq!(violated.len(), 2);
-    assert!(violated.contains(&problem.state_fact(fixture.subject, violated_state).unwrap()));
+    assert!(
+        violated.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("violated").unwrap(),
+                )
+                .unwrap()
+        )
+    );
     let violation = violated
         .iter()
         .find_map(|fact| fact.violation())
@@ -511,7 +555,6 @@ fn procedure_exit_events_execute_when_control_enters_the_exit() {
         Vec::new(),
     )
     .unwrap();
-    let subject = bindings.subjects()[0].id();
     let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
     let proven = ProofStatus::Proven;
     let complete = EvidenceCompleteness::Complete;
@@ -528,14 +571,19 @@ fn procedure_exit_events_execute_when_control_enters_the_exit() {
             &proven,
             &complete,
         ),
-        TypestateFact::Zero,
+        TypestateFact::zero(),
         TestTransfer::Normal,
     );
-    let closed = protocol
-        .state_id(&ProtocolStateKey::new("closed").unwrap())
-        .unwrap();
-
-    assert!(result.contains(&problem.state_fact(subject, closed).unwrap()));
+    assert!(
+        result.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("closed").unwrap(),
+                )
+                .unwrap()
+        )
+    );
     assert!(
         result
             .iter()
@@ -591,7 +639,6 @@ fn exit_terminal_observes_the_post_return_state() {
         )],
     )
     .unwrap();
-    let subject = bindings.subjects()[0].id();
     let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
     let open = protocol
         .state_id(&ProtocolStateKey::new("open").unwrap())
@@ -612,7 +659,12 @@ fn exit_terminal_observes_the_post_return_state() {
             &proven,
             &complete,
         ),
-        problem.state_fact(subject, open).unwrap(),
+        problem
+            .state_fact(
+                &fixture.subject_key,
+                &ProtocolStateKey::new("open").unwrap(),
+            )
+            .unwrap(),
         TestTransfer::Return,
     );
 
@@ -656,7 +708,12 @@ fn ambiguous_call_binding_preserves_explicit_uncertainty() {
             &proven,
             &complete,
         ),
-        problem.state_fact(fixture.subject, open).unwrap(),
+        problem
+            .state_fact(
+                &fixture.subject_key,
+                &ProtocolStateKey::new("open").unwrap(),
+            )
+            .unwrap(),
         TestTransfer::Return,
     );
 
@@ -712,11 +769,7 @@ fn conservative_uncertainty_retains_error_transition_provenance() {
         Vec::new(),
     )
     .unwrap();
-    let subject = bindings.subjects()[0].id();
     let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
-    let closed = protocol
-        .state_id(&ProtocolStateKey::new("closed").unwrap())
-        .unwrap();
     let violated = protocol
         .state_id(&ProtocolStateKey::new("violated").unwrap())
         .unwrap();
@@ -733,7 +786,12 @@ fn conservative_uncertainty_retains_error_transition_provenance() {
             &proven,
             &complete,
         ),
-        problem.state_fact(subject, closed).unwrap(),
+        problem
+            .state_fact(
+                &fixture.subject_key,
+                &ProtocolStateKey::new("closed").unwrap(),
+            )
+            .unwrap(),
         TestTransfer::Return,
     );
 
@@ -781,7 +839,6 @@ fn callback_expansion_limit_collapses_to_an_explicit_inconclusive_state() {
         Vec::new(),
     )
     .unwrap();
-    let subject = bindings.subjects()[0].id();
     let initial = protocol
         .state_id(&ProtocolStateKey::new("s0").unwrap())
         .unwrap();
@@ -801,7 +858,9 @@ fn callback_expansion_limit_collapses_to_an_explicit_inconclusive_state() {
             &unproven,
             &partial,
         ),
-        problem.state_fact(subject, initial).unwrap(),
+        problem
+            .state_fact(&fixture.subject_key, &ProtocolStateKey::new("s0").unwrap())
+            .unwrap(),
         TestTransfer::Normal,
     );
 
@@ -830,6 +889,62 @@ fn flow_problem_rejects_a_plan_for_another_protocol() {
         TypestateFlowProblem::try_new(&changed, &fixture.bindings),
         Err(TypestateFlowProblemError::ProtocolMismatch)
     ));
+}
+
+#[test]
+fn public_state_facts_resolve_durable_plan_keys() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let problem = TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings).unwrap();
+    let unknown_subject = TypestateSubjectKey::for_object(
+        TypestateSubjectClassKey::new("other-resource").unwrap(),
+        &fixture.subject_object,
+    );
+
+    assert!(
+        problem
+            .state_fact(
+                &fixture.subject_key,
+                &ProtocolStateKey::new("open").unwrap()
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        problem.state_fact(&unknown_subject, &ProtocolStateKey::new("open").unwrap()),
+        Err(TypestateFlowProblemError::InvalidFactIdentity)
+    ));
+    assert!(matches!(
+        problem.state_fact(
+            &fixture.subject_key,
+            &ProtocolStateKey::new("not-a-state").unwrap()
+        ),
+        Err(TypestateFlowProblemError::InvalidFactIdentity)
+    ));
+}
+
+#[test]
+fn typestate_callbacks_stop_before_expansion_when_output_is_cancelled() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let problem = TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings).unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+    let mut output = StoppedOutput::default();
+
+    problem.normal_flow(
+        DataflowEdge::new(
+            IcfgEdgeKind::Intraprocedural(
+                brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+            ),
+            None,
+            &fixture.entry,
+            &fixture.use_point,
+            &proven,
+            &complete,
+        ),
+        TypestateFact::zero(),
+        &mut output,
+    );
+
+    assert_eq!(output.emitted, 0);
 }
 
 #[test]
@@ -876,7 +991,12 @@ fn structured_external_boundary_uses_external_call_semantics() {
             &complete,
         )
         .with_boundary(&boundary),
-        problem.state_fact(fixture.subject, open).unwrap(),
+        problem
+            .state_fact(
+                &fixture.subject_key,
+                &ProtocolStateKey::new("open").unwrap(),
+            )
+            .unwrap(),
         TestTransfer::CallToReturn,
     );
 
@@ -905,16 +1025,15 @@ fn real_summary_solver_executes_the_same_client_contract() {
     );
     let result = solve_summary(&fixture, &analyzer);
     let raw = result.result();
-    let closed = fixture
-        .protocol
-        .state_id(&ProtocolStateKey::new("closed").unwrap())
-        .unwrap();
     assert!(raw.reached_at(&fixture.exit).any(|reached| {
         raw.fact(reached.fact())
             == Some(
                 &TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings)
                     .unwrap()
-                    .state_fact(fixture.subject, closed)
+                    .state_fact(
+                        &fixture.subject_key,
+                        &ProtocolStateKey::new("closed").unwrap(),
+                    )
                     .unwrap(),
             )
     }));
@@ -1149,6 +1268,17 @@ fn finding_collection_observes_its_budget_and_cancellation() {
             &fixture.bindings,
             &result,
             TypestateFindingLimits::new(1, 1).unwrap(),
+            &cancellation,
+        ),
+        Err(TypestateFlowProblemError::FindingBudgetExceeded)
+    ));
+
+    assert!(matches!(
+        collect_summary_findings_with_limits(
+            &fixture.protocol,
+            &fixture.bindings,
+            &result,
+            TypestateFindingLimits::new(1_000_000, 1).unwrap(),
             &cancellation,
         ),
         Err(TypestateFlowProblemError::FindingBudgetExceeded)

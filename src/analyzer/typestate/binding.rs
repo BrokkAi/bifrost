@@ -908,6 +908,13 @@ impl TypestateBindingPlan {
         self.subjects.get(id.index())
     }
 
+    pub fn subject_id(&self, key: &TypestateSubjectKey) -> Option<TypestateSubjectId> {
+        self.subjects
+            .binary_search_by(|subject| subject.key().cmp(key))
+            .ok()
+            .map(|index| self.subjects[index].id())
+    }
+
     pub fn subject_for_object(
         &self,
         class: &TypestateSubjectClassKey,

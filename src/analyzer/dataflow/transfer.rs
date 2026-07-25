@@ -57,8 +57,12 @@ impl<Fact> DataflowOutput<Fact> for BoundedFactOutputs<'_, Fact>
 where
     Fact: Copy + Eq + std::hash::Hash,
 {
+    fn should_continue(&self) -> bool {
+        !self.cancellation.is_cancelled() && self.exceeded.is_none()
+    }
+
     fn emit(&mut self, value: Fact) -> bool {
-        if self.cancellation.is_cancelled() || self.exceeded.is_some() {
+        if !self.should_continue() {
             return false;
         }
         if self.values.contains(&value) {

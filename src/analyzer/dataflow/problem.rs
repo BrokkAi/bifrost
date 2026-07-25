@@ -44,6 +44,14 @@ impl<F> DataflowSeed<F> {
 /// rows even if a callback ignores the signal, but clients must return
 /// cooperatively to keep their own CPU work bounded.
 pub trait DataflowOutput<T> {
+    /// Return whether the callback may continue before it computes its next
+    /// output. The default keeps simple collectors source-compatible; bounded
+    /// kernel outputs override this to expose cancellation and exhausted work
+    /// budgets even while a client is expanding intermediate rows.
+    fn should_continue(&self) -> bool {
+        true
+    }
+
     /// Emit one row, returning whether the callback may continue.
     #[must_use]
     fn emit(&mut self, value: T) -> bool;

@@ -5,8 +5,8 @@ use crate::hash::{HashMap, HashSet};
 use super::{
     CompiledProtocol, ProtocolAnalysisMode, ProtocolEventId, ProtocolExpectationId,
     ProtocolStateId, ProtocolTerminalObservationSpec, TypestateBindingPlan,
-    TypestateEventBindingId, TypestateFact, TypestateFlowProblemError, TypestateSubjectId,
-    TypestateSummaryResult, TypestateUncertaintySet,
+    TypestateEventBindingId, TypestateFlowProblemError, TypestateSubjectId, TypestateSummaryResult,
+    TypestateUncertaintySet,
 };
 
 pub const MAX_TYPESTATE_FINDINGS: usize = 4_096;
@@ -195,8 +195,10 @@ pub fn collect_summary_findings_with_limits(
     let analysis_complete = typestate_result.is_complete();
     let mut violations = HashMap::<ViolationKey, ViolationAggregate>::default();
     let mut non_violations = HashSet::<EventOutcomeKey>::default();
-    let mut event_terminals = vec![None; bindings.terminal_bindings().len()];
+    let mut event_terminals: Vec<Option<ObservationAggregate>> =
+        vec![None; bindings.terminal_bindings().len()];
     let mut needed_states = HashSet::<StateKey>::default();
+    let mut retained_candidates = 0usize;
     for binding in bindings.terminal_bindings() {
         let terminal = protocol
             .terminal_expectation(binding.expectation())
@@ -216,7 +218,6 @@ pub fn collect_summary_findings_with_limits(
         }
     }
 
-    let mut omitted_candidates = 0usize;
     for (index, reached) in result.reached().iter().enumerate() {
         check_cancellation(cancellation, index)?;
         let fact = *result
@@ -242,7 +243,8 @@ pub fn collect_summary_findings_with_limits(
                     fact.uncertainty(),
                     fact.abstained(),
                 );
-            } else if violations.len() < limits.max_candidates {
+            } else {
+                charge_candidate(&mut retained_candidates, limits.max_candidates)?;
                 violations.insert(
                     key,
                     ViolationAggregate::new(
@@ -255,8 +257,6 @@ pub fn collect_summary_findings_with_limits(
                     point: reached.point().clone(),
                     subject,
                 });
-            } else {
-                omitted_candidates = omitted_candidates.saturating_add(1);
             }
         }
         if let Some(binding) = fact.non_violation_binding() {
@@ -266,17 +266,27 @@ pub fn collect_summary_findings_with_limits(
             if bindings.event_binding(binding).is_none() {
                 return Err(TypestateFlowProblemError::InvalidFactIdentity);
             }
-            non_violations.insert(EventOutcomeKey {
+            let key = EventOutcomeKey {
                 point: reached.point().clone(),
                 subject,
                 binding,
-            });
+            };
+            if !non_violations.contains(&key) {
+                charge_candidate(&mut retained_candidates, limits.max_candidates)?;
+                non_violations.insert(key);
+            }
         }
         if let Some((terminal_binding, state)) = fact.terminal_observation() {
             let aggregate = event_terminals
                 .get_mut(terminal_binding.index())
-                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?
-                .get_or_insert_with(ObservationAggregate::default);
+                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+            let is_new = aggregate
+                .as_ref()
+                .is_none_or(|aggregate| !aggregate.contains(state));
+            if is_new {
+                charge_candidate(&mut retained_candidates, limits.max_candidates)?;
+            }
+            let aggregate = aggregate.get_or_insert_with(ObservationAggregate::default);
             aggregate.insert(
                 state,
                 reached.path_qualities(),
@@ -292,14 +302,7 @@ pub fn collect_summary_findings_with_limits(
         let fact = *result
             .fact(reached.fact())
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        let TypestateFact::State {
-            subject,
-            state,
-            uncertainty,
-            abstained,
-            ..
-        } = fact
-        else {
+        let Some((subject, state, uncertainty, abstained)) = fact.state_observation() else {
             continue;
         };
         let key = StateKey {
@@ -307,6 +310,12 @@ pub fn collect_summary_findings_with_limits(
             subject,
         };
         if needed_states.contains(&key) {
+            let is_new = reached_states
+                .get(&key)
+                .is_none_or(|aggregate| !aggregate.contains(state));
+            if is_new {
+                charge_candidate(&mut retained_candidates, limits.max_candidates)?;
+            }
             reached_states.entry(key).or_default().insert(
                 state,
                 reached.path_qualities(),
@@ -321,7 +330,8 @@ pub fn collect_summary_findings_with_limits(
             .len()
             .saturating_add(bindings.terminal_bindings().len()),
     );
-    for (key, aggregate) in violations {
+    for (index, (key, aggregate)) in violations.into_iter().enumerate() {
+        check_cancellation(cancellation, index)?;
         let binding = bindings
             .event_binding(key.binding)
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
@@ -354,7 +364,8 @@ pub fn collect_summary_findings_with_limits(
         });
     }
 
-    for binding in bindings.terminal_bindings() {
+    for (index, binding) in bindings.terminal_bindings().iter().enumerate() {
+        check_cancellation(cancellation, index)?;
         let terminal = protocol
             .terminal_expectation(binding.expectation())
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
@@ -456,10 +467,11 @@ pub fn collect_summary_findings_with_limits(
         });
     }
 
+    check_cancelled(cancellation)?;
     findings.sort_by(compare_findings);
-    findings = merge_findings(findings);
-    let omitted =
-        omitted_candidates.saturating_add(findings.len().saturating_sub(MAX_TYPESTATE_FINDINGS));
+    check_cancelled(cancellation)?;
+    findings = merge_findings(findings, cancellation)?;
+    let omitted = findings.len().saturating_sub(MAX_TYPESTATE_FINDINGS);
     findings.truncate(MAX_TYPESTATE_FINDINGS);
     Ok(TypestateFindingReport {
         findings: findings.into_boxed_slice(),
@@ -559,6 +571,10 @@ struct ObservationAggregate {
 }
 
 impl ObservationAggregate {
+    fn contains(&self, state: ProtocolStateId) -> bool {
+        self.states.contains_key(&state)
+    }
+
     fn insert(
         &mut self,
         state: ProtocolStateId,
@@ -617,6 +633,22 @@ fn check_cancellation(
     }
 }
 
+fn check_cancelled(cancellation: &CancellationToken) -> Result<(), TypestateFlowProblemError> {
+    if cancellation.is_cancelled() {
+        Err(TypestateFlowProblemError::FindingCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn charge_candidate(retained: &mut usize, maximum: usize) -> Result<(), TypestateFlowProblemError> {
+    if *retained >= maximum {
+        return Err(TypestateFlowProblemError::FindingBudgetExceeded);
+    }
+    *retained += 1;
+    Ok(())
+}
+
 fn finding_evidence(
     paths: PathQualityFrontier,
     analysis_complete: bool,
@@ -639,9 +671,13 @@ fn compare_findings(left: &TypestateFinding, right: &TypestateFinding) -> std::c
         .then_with(|| left.kind.cmp(&right.kind))
 }
 
-fn merge_findings(findings: Vec<TypestateFinding>) -> Vec<TypestateFinding> {
+fn merge_findings(
+    findings: Vec<TypestateFinding>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<TypestateFinding>, TypestateFlowProblemError> {
     let mut merged: Vec<TypestateFinding> = Vec::with_capacity(findings.len());
-    for finding in findings {
+    for (index, finding) in findings.into_iter().enumerate() {
+        check_cancellation(cancellation, index)?;
         if let Some(previous) = merged.last_mut()
             && previous.site == finding.site
             && previous.subject == finding.subject
@@ -655,7 +691,7 @@ fn merge_findings(findings: Vec<TypestateFinding>) -> Vec<TypestateFinding> {
             merged.push(finding);
         }
     }
-    merged
+    Ok(merged)
 }
 
 #[cfg(test)]
