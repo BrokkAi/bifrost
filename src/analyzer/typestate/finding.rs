@@ -713,7 +713,7 @@ pub fn collect_summary_findings_with_limits(
                         continue;
                     }
                     let Some(target) =
-                        targets_for_state(state).and_then(|targets| targets.definitive)
+                        targets_for_state(state).and_then(FindingWitnessTargets::may_witness)
                     else {
                         continue;
                     };
@@ -897,6 +897,10 @@ impl FindingWitnessTarget {
             && !self.abstained
     }
 
+    const fn supports_may(self) -> bool {
+        self.quality.is_proven() && self.uncertainty.is_empty() && !self.abstained
+    }
+
     const fn preference(self) -> (bool, bool, std::cmp::Reverse<usize>) {
         (
             self.quality.is_proven(),
@@ -929,6 +933,14 @@ impl FindingWitnessTargets {
             Some(target) => Some(target),
             None => self.uncertain,
         }
+    }
+
+    fn may_witness(self) -> Option<FindingWitnessTarget> {
+        [self.definitive, self.uncertain]
+            .into_iter()
+            .flatten()
+            .filter(|target| target.supports_may())
+            .max_by_key(|target| target.preference())
     }
 
     const fn uncertainty_witness(self) -> Option<FindingWitnessTarget> {
@@ -1125,9 +1137,7 @@ fn merge_pending_findings(
             && previous.kind == finding.kind
         {
             previous.evidence.merge(finding.evidence);
-            if previous.certainty != finding.certainty {
-                previous.certainty = TypestateFindingCertainty::Inconclusive;
-            }
+            previous.certainty = merge_finding_certainty(previous.certainty, finding.certainty);
             previous.omitted_witnesses = previous
                 .omitted_witnesses
                 .saturating_add(finding.omitted_witnesses);
@@ -1165,12 +1175,32 @@ fn should_replace_merged_witness(
     candidate: FindingWitnessTarget,
     certainty: TypestateFindingCertainty,
 ) -> bool {
-    if certainty == TypestateFindingCertainty::Inconclusive
-        && retained.is_definitive() != candidate.is_definitive()
-    {
-        return !candidate.is_definitive();
+    let (retained_supports_certainty, candidate_supports_certainty) = match certainty {
+        TypestateFindingCertainty::May => (retained.supports_may(), candidate.supports_may()),
+        TypestateFindingCertainty::Must => (retained.is_definitive(), candidate.is_definitive()),
+        TypestateFindingCertainty::Inconclusive => {
+            (!retained.is_definitive(), !candidate.is_definitive())
+        }
+    };
+    if retained_supports_certainty != candidate_supports_certainty {
+        return candidate_supports_certainty;
     }
     candidate.preference() > retained.preference()
+}
+
+const fn merge_finding_certainty(
+    retained: TypestateFindingCertainty,
+    candidate: TypestateFindingCertainty,
+) -> TypestateFindingCertainty {
+    match (retained, candidate) {
+        (TypestateFindingCertainty::May, _) | (_, TypestateFindingCertainty::May) => {
+            TypestateFindingCertainty::May
+        }
+        (TypestateFindingCertainty::Must, TypestateFindingCertainty::Must) => {
+            TypestateFindingCertainty::Must
+        }
+        _ => TypestateFindingCertainty::Inconclusive,
+    }
 }
 
 fn materialize_findings(
@@ -1310,6 +1340,75 @@ mod tests {
             }
             .is_definitive()
         );
+    }
+
+    #[test]
+    fn proven_partial_terminal_evidence_retains_a_may_witness() {
+        let target = FindingWitnessTarget {
+            reached_index: 0,
+            quality: PathQuality::PROVEN_PARTIAL,
+            uncertainty: TypestateUncertaintySet::default(),
+            abstained: false,
+        };
+        let mut targets = FindingWitnessTargets::default();
+        targets.insert(target);
+
+        assert!(!target.is_definitive());
+        assert!(target.supports_may());
+        assert_eq!(targets.may_witness(), Some(target));
+    }
+
+    #[test]
+    fn duplicate_may_and_inconclusive_findings_merge_as_may() {
+        assert_eq!(
+            merge_finding_certainty(
+                TypestateFindingCertainty::May,
+                TypestateFindingCertainty::Inconclusive
+            ),
+            TypestateFindingCertainty::May
+        );
+        assert_eq!(
+            merge_finding_certainty(
+                TypestateFindingCertainty::Inconclusive,
+                TypestateFindingCertainty::May
+            ),
+            TypestateFindingCertainty::May
+        );
+        assert_eq!(
+            merge_finding_certainty(
+                TypestateFindingCertainty::Must,
+                TypestateFindingCertainty::Inconclusive
+            ),
+            TypestateFindingCertainty::Inconclusive
+        );
+    }
+
+    #[test]
+    fn may_merge_prefers_clean_proven_evidence_even_when_partial() {
+        let uncertain = FindingWitnessTarget {
+            reached_index: 0,
+            quality: PathQuality::PROVEN_COMPLETE,
+            uncertainty: TypestateUncertaintySet::default()
+                .with(TypestateUncertainty::IncompleteAnalysis),
+            abstained: false,
+        };
+        let clean_partial = FindingWitnessTarget {
+            reached_index: 1,
+            quality: PathQuality::PROVEN_PARTIAL,
+            uncertainty: TypestateUncertaintySet::default(),
+            abstained: false,
+        };
+
+        assert!(should_replace_merged_witness(
+            uncertain,
+            clean_partial,
+            TypestateFindingCertainty::May
+        ));
+        assert!(!should_replace_merged_witness(
+            clean_partial,
+            uncertain,
+            TypestateFindingCertainty::May
+        ));
     }
 
     #[test]
