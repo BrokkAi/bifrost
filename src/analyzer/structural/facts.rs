@@ -9,6 +9,7 @@
 
 use super::kinds::{NormalizedKind, Role};
 use crate::analyzer::Range;
+use crate::analyzer::semantic::ContentIdentity;
 use crate::compact_graph::CompactRows;
 use crate::text_utils::compute_line_starts;
 use bincode::Options;
@@ -267,6 +268,7 @@ impl NormalizedNode {
 #[derive(Debug)]
 pub struct FileFacts {
     source: String,
+    source_identity: ContentIdentity,
     line_starts: Vec<usize>,
     nodes: Vec<NormalizedNode>,
     /// Role edges grouped by source fact and retained in source order.
@@ -281,8 +283,10 @@ impl FileFacts {
         roles: CompactRows<RoleTarget>,
     ) -> Self {
         assert_eq!(roles.rows(), nodes.len());
+        let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
             source,
+            source_identity,
             line_starts,
             nodes,
             roles,
@@ -291,6 +295,10 @@ impl FileFacts {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub(crate) const fn source_identity(&self) -> ContentIdentity {
+        self.source_identity
     }
 
     pub(crate) fn encode_snapshot(&self) -> Result<Vec<u8>, StructuralSnapshotError> {

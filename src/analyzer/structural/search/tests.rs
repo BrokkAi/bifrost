@@ -64,18 +64,35 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
             .into_iter()
             .next()
             .expect("target structural match");
-    let seed = SeedMatch {
+    let seed = Arc::new(SeedMatch {
         language: Language::TypeScript,
         file: file.clone(),
         facts,
         fact_match,
-    };
+    });
+    let (declaration, projection_omitted) =
+        enclosing_declaration_value(workspace.analyzer(), &seed, &mut HashMap::default());
+    assert!(!projection_omitted);
+    let declaration = declaration.expect("original seed has an enclosing declaration");
 
     assert!(overlay.set(file.abs_path(), changed.to_string()));
     let mut semantic = SemanticQueryContext::new(
         &workspace,
         None,
         CodeQueryExecutionLimits::default().semantic,
+    );
+    let composed_row = PipelineRow {
+        value: PipelineValue::Declaration(declaration),
+        traces: vec![PipelineTrace {
+            branch: Vec::new(),
+            seed: Arc::clone(&seed),
+            steps: vec![],
+        }],
+        provenance_truncated: false,
+    };
+    assert!(
+        !semantic_row_seed_generations_current(&mut semantic, &composed_row),
+        "enclosing_decl composition must retain and reject the stale structural seed"
     );
     let procedures = semantic.procedure_of_match(&seed);
     let diagnostics = semantic.take_diagnostics();

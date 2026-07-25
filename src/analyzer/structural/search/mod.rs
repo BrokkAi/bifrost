@@ -5082,6 +5082,16 @@ fn apply_pipeline_step(
         if let Some(instrumentation) = instrumentation.as_deref_mut() {
             instrumentation.rows_visited = instrumentation.rows_visited.saturating_add(1);
         }
+        if query_step_requires_semantic(step)
+            && !semantic_row_seed_generations_current(
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for semantic steps"),
+                &row,
+            )
+        {
+            continue;
+        }
         let mut row_exhausted = false;
         if let (
             PipelineValue::StructuralMatch(_),
@@ -6958,6 +6968,15 @@ fn hierarchy_trace_values(
     }
     values.reverse();
     values
+}
+
+fn semantic_row_seed_generations_current(
+    semantic: &mut SemanticQueryContext<'_>,
+    row: &PipelineRow,
+) -> bool {
+    row.traces
+        .iter()
+        .all(|trace| semantic.seed_generation_is_current(&trace.seed))
 }
 
 fn is_type_declaration(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {

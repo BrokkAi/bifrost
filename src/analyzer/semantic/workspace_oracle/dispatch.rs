@@ -6,6 +6,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use super::WorkspaceSemanticOracle;
 use crate::analyzer::semantic::{
     CallSiteHandle, CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator,
@@ -16,7 +18,7 @@ use crate::analyzer::semantic::{
     ProcedureSemantics, ProofStatus, SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite,
     SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
     SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
-    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
+    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, StableDigest, WorkspaceMountId,
     WorkspaceRelativePath,
 };
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
@@ -1602,23 +1604,32 @@ pub(crate) fn procedures_for_definition_with_limits(
     max_examined: usize,
     cancellation: &CancellationToken,
 ) -> ProcedureRangeLookup {
+    let mut progress = ProcedureLookupProgress::new(max_examined, cancellation);
+    if let Err(status) = progress.examine() {
+        return progress.failed(status);
+    }
     let Some(indexed_source) = analyzer.indexed_source(definition.source()) else {
         return ProcedureRangeLookup {
             handles: Vec::new(),
-            examined: 0,
+            examined: progress.examined,
             status: ProcedureRangeLookupStatus::SourceChanged,
         };
     };
-    if ContentIdentity::hash_bytes(indexed_source.as_bytes()) != artifact.key().revision().content()
-    {
+    let indexed_identity = match content_identity_with_progress(&indexed_source, &mut progress) {
+        Ok(identity) => identity,
+        Err(status) => return progress.failed(status),
+    };
+    if indexed_identity != artifact.key().revision().content() {
         return ProcedureRangeLookup {
             handles: Vec::new(),
-            examined: 0,
+            examined: progress.examined,
             status: ProcedureRangeLookupStatus::SourceChanged,
         };
     }
+    if let Err(status) = progress.examine() {
+        return progress.failed(status);
+    }
     let ranges = analyzer.ranges_of(definition);
-    let mut progress = ProcedureLookupProgress::new(max_examined, cancellation);
     let mut exact = Vec::new();
     let mut enclosing = Vec::new();
     for procedure in artifact.procedures() {
@@ -1653,16 +1664,24 @@ pub(crate) fn procedures_for_definition_with_limits(
         } else {
             continue;
         };
-        if let Err(status) = insert_procedure_by_locator(target, procedure, &mut progress) {
-            return progress.failed(status);
-        }
+        target.push(procedure);
     }
     let matches = if exact.is_empty() { enclosing } else { exact };
+    let matches = match sort_procedures_by_locator(matches, &mut progress) {
+        Ok(matches) => matches,
+        Err(status) => return progress.failed(status),
+    };
+    let mut handles = Vec::with_capacity(matches.len());
+    for procedure in matches {
+        if let Err(status) = progress.examine() {
+            return progress.failed(status);
+        }
+        if let Some(handle) = artifact.procedure_handle(procedure.id()) {
+            handles.push(handle);
+        }
+    }
     ProcedureRangeLookup {
-        handles: matches
-            .into_iter()
-            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
-            .collect(),
+        handles,
         examined: progress.examined,
         status: ProcedureRangeLookupStatus::Complete,
     }
@@ -1717,24 +1736,67 @@ impl<'a> ProcedureLookupProgress<'a> {
     }
 }
 
-fn insert_procedure_by_locator<'a>(
-    procedures: &mut Vec<&'a ProcedureSemantics>,
-    procedure: &'a ProcedureSemantics,
+fn content_identity_with_progress(
+    source: &str,
     progress: &mut ProcedureLookupProgress<'_>,
-) -> Result<(), ProcedureRangeLookupStatus> {
-    let mut start = 0;
-    let mut end = procedures.len();
-    while start < end {
+) -> Result<ContentIdentity, ProcedureRangeLookupStatus> {
+    const HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+    let mut digest = Sha256::new();
+    if source.is_empty() {
         progress.examine()?;
-        let middle = start + (end - start) / 2;
-        if procedures[middle].locator() < procedure.locator() {
-            start = middle + 1;
-        } else {
-            end = middle;
+    } else {
+        for chunk in source.as_bytes().chunks(HASH_CHUNK_BYTES) {
+            progress.examine()?;
+            digest.update(chunk);
         }
     }
-    procedures.insert(start, procedure);
-    Ok(())
+    let bytes: [u8; 32] = digest.finalize().into();
+    Ok(ContentIdentity::from_digest(StableDigest::from_array(
+        bytes,
+    )))
+}
+
+fn sort_procedures_by_locator<'a>(
+    mut source: Vec<&'a ProcedureSemantics>,
+    progress: &mut ProcedureLookupProgress<'_>,
+) -> Result<Vec<&'a ProcedureSemantics>, ProcedureRangeLookupStatus> {
+    let len = source.len();
+    let mut width = 1usize;
+    let mut target = Vec::with_capacity(len);
+    while width < len {
+        target.clear();
+        let run_width = width.saturating_mul(2);
+        for start in (0..len).step_by(run_width) {
+            let middle = start.saturating_add(width).min(len);
+            let end = start.saturating_add(run_width).min(len);
+            let mut left = start;
+            let mut right = middle;
+            while left < middle && right < end {
+                progress.examine()?;
+                if source[left].locator() <= source[right].locator() {
+                    target.push(source[left]);
+                    left += 1;
+                } else {
+                    target.push(source[right]);
+                    right += 1;
+                }
+            }
+            while left < middle {
+                progress.examine()?;
+                target.push(source[left]);
+                left += 1;
+            }
+            while right < end {
+                progress.examine()?;
+                target.push(source[right]);
+                right += 1;
+            }
+        }
+        std::mem::swap(&mut source, &mut target);
+        width = run_width;
+    }
+    Ok(source)
 }
 
 pub(crate) fn procedures_for_source_ranges(

@@ -136,6 +136,7 @@ pub(super) struct SemanticQueryContext<'a> {
     cache_hits: usize,
     retained_bytes: usize,
     traversal_steps: usize,
+    indexed_source_identities: HashMap<ProjectFile, Option<ContentIdentity>>,
     budget_exhausted: bool,
 }
 
@@ -161,6 +162,7 @@ impl<'a> SemanticQueryContext<'a> {
             cache_hits: 0,
             retained_bytes: 0,
             traversal_steps: 0,
+            indexed_source_identities: HashMap::default(),
             budget_exhausted: false,
         }
     }
@@ -181,9 +183,7 @@ impl<'a> SemanticQueryContext<'a> {
         let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
             return Vec::new();
         };
-        if ContentIdentity::hash_bytes(seed.facts.source().as_bytes())
-            != artifact.key().revision().content()
-        {
+        if seed.facts.source_identity() != artifact.key().revision().content() {
             self.push_source_generation_changed(&seed.file);
             return Vec::new();
         }
@@ -223,6 +223,23 @@ impl<'a> SemanticQueryContext<'a> {
                 Vec::new()
             }
         }
+    }
+
+    pub(super) fn seed_generation_is_current(&mut self, seed: &SeedMatch) -> bool {
+        let current = *self
+            .indexed_source_identities
+            .entry(seed.file.clone())
+            .or_insert_with(|| {
+                self.workspace
+                    .analyzer()
+                    .indexed_source(&seed.file)
+                    .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
+            });
+        if current == Some(seed.facts.source_identity()) {
+            return true;
+        }
+        self.push_source_generation_changed(&seed.file);
+        false
     }
 
     fn procedure_of_declaration(
@@ -1248,6 +1265,10 @@ fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
         .expect("validated program point has a source mapping");
     let mut digest = semantic_wire_digest(procedure.artifact().as_ref(), b"program_point");
     push_locator(&mut digest, procedure.semantics().locator());
+    // Two ordinary points may legitimately share all public source and
+    // evidence metadata. Keep the dense ID private, but use it as the
+    // artifact-scoped discriminator that makes the public digest injective.
+    digest.push(&handle.id().get().to_le_bytes());
     push_locator(&mut digest, &mapping.locator);
     digest.push(
         point_boundary(handle)
@@ -1451,9 +1472,17 @@ mod tests {
         let entry = ProgramPointId::new(0);
         let normal_exit = ProgramPointId::new(1);
         let exceptional_exit = ProgramPointId::new(2);
+        let ordinary_first = ProgramPointId::new(3);
+        let ordinary_second = ProgramPointId::new(4);
         procedure.blocks.push(BasicBlock {
             id: BlockId::new(0),
-            points: Box::new([entry, normal_exit, exceptional_exit]),
+            points: Box::new([
+                entry,
+                ordinary_first,
+                ordinary_second,
+                normal_exit,
+                exceptional_exit,
+            ]),
             source,
             evidence,
         });
@@ -1491,18 +1520,32 @@ mod tests {
                 source,
                 evidence,
             },
+            ProgramPoint {
+                id: ordinary_first,
+                block: BlockId::new(0),
+                events: Box::new([]),
+                source,
+                evidence,
+            },
+            ProgramPoint {
+                id: ordinary_second,
+                block: BlockId::new(0),
+                events: Box::new([]),
+                source,
+                evidence,
+            },
         ]);
         procedure.control_edges.extend([
             ControlEdge {
                 source_point: entry,
-                target_point: normal_exit,
+                target_point: ordinary_first,
                 kind: ControlEdgeKind::Normal,
                 source,
                 evidence,
             },
             ControlEdge {
                 source_point: entry,
-                target_point: normal_exit,
+                target_point: ordinary_first,
                 kind: ControlEdgeKind::Normal,
                 source: SourceMappingId::new(1),
                 evidence: EvidenceId::new(1),
@@ -1511,6 +1554,20 @@ mod tests {
                 source_point: entry,
                 target_point: exceptional_exit,
                 kind: ControlEdgeKind::Exceptional,
+                source,
+                evidence,
+            },
+            ControlEdge {
+                source_point: ordinary_first,
+                target_point: ordinary_second,
+                kind: ControlEdgeKind::Normal,
+                source,
+                evidence,
+            },
+            ControlEdge {
+                source_point: ordinary_second,
+                target_point: normal_exit,
+                kind: ControlEdgeKind::Normal,
                 source,
                 evidence,
             },
@@ -1558,7 +1615,7 @@ mod tests {
         let reversed_procedure = reversed
             .procedure_handle(ProcedureId::new(0))
             .expect("reordered test procedure exists");
-        let mut original_ids = (0..3)
+        let mut original_ids = (0..5)
             .map(|id| {
                 control_edge_wire_id(
                     &procedure
@@ -1567,7 +1624,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let mut reordered_ids = (0..3)
+        let mut reordered_ids = (0..5)
             .map(|id| {
                 control_edge_wire_id(
                     &reversed_procedure
@@ -1581,6 +1638,26 @@ mod tests {
         assert_eq!(
             original_ids, reordered_ids,
             "edge storage order must not affect public identities"
+        );
+    }
+
+    #[test]
+    fn ordinary_points_with_identical_public_metadata_have_distinct_wire_ids() {
+        let artifact = parallel_edge_artifact(false);
+        let procedure = artifact
+            .procedure_handle(ProcedureId::new(0))
+            .expect("test procedure exists");
+        let first = procedure
+            .point_handle(ProgramPointId::new(3))
+            .expect("first ordinary point exists");
+        let second = procedure
+            .point_handle(ProgramPointId::new(4))
+            .expect("second ordinary point exists");
+
+        assert_ne!(
+            program_point_wire_id(&first),
+            program_point_wire_id(&second),
+            "valid ordinary points that share source and evidence rows must not collide"
         );
     }
 }
