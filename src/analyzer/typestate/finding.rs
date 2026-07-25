@@ -514,8 +514,8 @@ struct EventOutcomeKey {
     binding: TypestateEventBindingId,
 }
 
-#[derive(Debug, Clone)]
-struct ViolationAggregate {
+#[derive(Debug, Clone, Copy)]
+struct PathEvidenceAggregate {
     paths: PathQualityFrontier,
     uncertainty: TypestateUncertaintySet,
     abstained: bool,
@@ -523,7 +523,7 @@ struct ViolationAggregate {
     has_definite_proven_complete_path: bool,
 }
 
-impl ViolationAggregate {
+impl PathEvidenceAggregate {
     fn new(
         paths: PathQualityFrontier,
         uncertainty: TypestateUncertaintySet,
@@ -553,6 +553,8 @@ impl ViolationAggregate {
         self.abstained |= abstained;
     }
 }
+
+type ViolationAggregate = PathEvidenceAggregate;
 
 fn error_transition_certainty(
     mode: ProtocolAnalysisMode,
@@ -596,37 +598,12 @@ impl ObservationAggregate {
     ) {
         self.states
             .entry(state)
-            .and_modify(|observation| {
-                let definitive = uncertainty.is_empty() && !abstained;
-                observation.has_definite_proven_path |= definitive && paths.has_proven_path();
-                observation.has_definite_proven_complete_path |=
-                    definitive && paths.has_proven_complete_path();
-                merge_paths(&mut observation.paths, paths);
-                observation.uncertainty = observation.uncertainty.union(uncertainty);
-                observation.abstained |= abstained;
-            })
-            .or_insert(ObservationEvidence {
-                paths,
-                uncertainty,
-                abstained,
-                has_definite_proven_path: uncertainty.is_empty()
-                    && !abstained
-                    && paths.has_proven_path(),
-                has_definite_proven_complete_path: uncertainty.is_empty()
-                    && !abstained
-                    && paths.has_proven_complete_path(),
-            });
+            .and_modify(|observation| observation.merge(paths, uncertainty, abstained))
+            .or_insert_with(|| ObservationEvidence::new(paths, uncertainty, abstained));
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ObservationEvidence {
-    paths: PathQualityFrontier,
-    uncertainty: TypestateUncertaintySet,
-    abstained: bool,
-    has_definite_proven_path: bool,
-    has_definite_proven_complete_path: bool,
-}
+type ObservationEvidence = PathEvidenceAggregate;
 
 fn merge_paths(target: &mut PathQualityFrontier, incoming: PathQualityFrontier) {
     for quality in incoming.iter() {

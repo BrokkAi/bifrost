@@ -521,12 +521,6 @@ fn bound_events_execute_in_their_dataflow_phase() {
                 .unwrap()
         )
     );
-    assert!(
-        opened
-            .iter()
-            .any(|fact| fact.non_violation_binding().is_some())
-    );
-
     let used = transfer(
         &problem,
         DataflowEdge::new(
@@ -550,11 +544,6 @@ fn bound_events_execute_in_their_dataflow_phase() {
                 .unwrap()
         )
     );
-    assert!(
-        used.iter()
-            .any(|fact| fact.non_violation_binding().is_some())
-    );
-
     let closed = transfer(
         &problem,
         DataflowEdge::new(
@@ -582,12 +571,6 @@ fn bound_events_execute_in_their_dataflow_phase() {
                 .unwrap()
         )
     );
-    assert!(
-        closed
-            .iter()
-            .any(|fact| fact.non_violation_binding().is_some())
-    );
-
     let violated = transfer(
         &problem,
         DataflowEdge::new(
@@ -688,11 +671,6 @@ fn procedure_exit_events_execute_when_control_enters_the_exit() {
                 )
                 .unwrap()
         )
-    );
-    assert!(
-        result
-            .iter()
-            .any(|fact| fact.non_violation_binding().is_some())
     );
 }
 

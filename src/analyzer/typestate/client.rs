@@ -222,7 +222,7 @@ impl TypestateFact {
         }
     }
 
-    pub const fn non_violation_binding(self) -> Option<TypestateEventBindingId> {
+    pub(super) const fn non_violation_binding(self) -> Option<TypestateEventBindingId> {
         match self.0 {
             TypestateFactKind::NonViolation { event_binding, .. } => Some(event_binding),
             TypestateFactKind::Zero
