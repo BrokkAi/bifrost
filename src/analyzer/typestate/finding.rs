@@ -4,7 +4,7 @@ use crate::analyzer::semantic::SemanticLocator;
 use super::{
     CompiledProtocol, ProtocolAnalysisMode, ProtocolEventId, ProtocolExpectationId,
     ProtocolStateId, ProtocolTerminalObservationSpec, TypestateBindingPlan, TypestateFact,
-    TypestateFlowProblemError, TypestateSubjectId, TypestateUncertaintySet,
+    TypestateFlowProblemError, TypestateSubjectId, TypestateSummaryResult, TypestateUncertaintySet,
 };
 
 pub const MAX_TYPESTATE_FINDINGS: usize = 4_096;
@@ -123,13 +123,19 @@ impl TypestateFindingReport {
 pub fn collect_summary_findings(
     protocol: &CompiledProtocol,
     bindings: &TypestateBindingPlan,
-    result: &SummaryDataflowResult<TypestateFact>,
+    typestate_result: &TypestateSummaryResult,
 ) -> Result<TypestateFindingReport, TypestateFlowProblemError> {
     if bindings.protocol_hash() != protocol.hash() {
         return Err(TypestateFlowProblemError::ProtocolMismatch);
     }
+    if typestate_result.protocol_hash() != protocol.hash()
+        || typestate_result.binding_plan_hash() != bindings.hash()
+    {
+        return Err(TypestateFlowProblemError::BindingPlanMismatch);
+    }
 
-    let analysis_complete = result.is_complete();
+    let result = typestate_result.result();
+    let analysis_complete = typestate_result.is_complete();
     let mut findings = Vec::new();
     for reached in result.reached() {
         let fact = *result
@@ -308,6 +314,7 @@ fn state_observation(
             state,
             uncertainty,
             abstained,
+            ..
         } if fact_subject == subject => Some(StateObservation {
             state,
             uncertainty,

@@ -1287,13 +1287,11 @@ fn validate_seed_site(site: &TypestateObservationSite) -> Result<(), TypestateBi
 }
 
 fn validate_terminal_exit(
-    _kind: ProtocolProcedureExitKind,
+    kind: ProtocolProcedureExitKind,
     site: &TypestateObservationSite,
     role: TypestateObjectRole,
 ) -> Result<(), TypestateBindingPlanError> {
-    if matches!(site, TypestateObservationSite::ProgramPoint { .. })
-        && role == TypestateObjectRole::CurrentObject
-    {
+    if role == TypestateObjectRole::CurrentObject && site_has_exit_kind(site, kind) {
         Ok(())
     } else {
         Err(TypestateBindingPlanError::InvalidObservationShape)
@@ -1366,15 +1364,25 @@ fn validate_observation_shape(
             matches!(site, TypestateObservationSite::ProgramPoint { .. })
                 && role == TypestateObjectRole::EscapedObject
         }
-        ProtocolEventOccurrence::ProcedureExit { .. } => {
-            matches!(site, TypestateObservationSite::ProgramPoint { .. })
-                && role == TypestateObjectRole::CurrentObject
+        ProtocolEventOccurrence::ProcedureExit { kind } => {
+            role == TypestateObjectRole::CurrentObject && site_has_exit_kind(site, *kind)
         }
     };
     if valid {
         Ok(())
     } else {
         Err(TypestateBindingPlanError::InvalidObservationShape)
+    }
+}
+
+fn site_has_exit_kind(site: &TypestateObservationSite, kind: ProtocolProcedureExitKind) -> bool {
+    let TypestateObservationSite::ProgramPoint { point, .. } = site else {
+        return false;
+    };
+    let semantics = point.procedure().semantics();
+    match kind {
+        ProtocolProcedureExitKind::Normal => point.id() == semantics.normal_exit_point(),
+        ProtocolProcedureExitKind::Exceptional => point.id() == semantics.exceptional_exit_point(),
     }
 }
 

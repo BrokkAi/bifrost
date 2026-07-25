@@ -788,6 +788,7 @@ where
                     origin: Some(origin.clone()),
                     proof: transfer.proof.clone(),
                     completeness: transfer.completeness.clone(),
+                    boundary: None,
                 };
                 if newly_materialized && let Some(termination) = self.observe_edge(&edge, request) {
                     return Ok(Some(termination));
@@ -865,6 +866,7 @@ where
                 origin: None,
                 proof: ProofStatus::Proven,
                 completeness: EvidenceCompleteness::Complete,
+                boundary: None,
             };
             if let Some(termination) = self.propagate_owned_edge(
                 problem,
@@ -1542,14 +1544,18 @@ fn canonicalize_call_transfer_set(mut set: CallTransferSet) -> CallTransferSet {
 }
 
 fn descriptor(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_> {
-    DataflowEdge::new(
+    let descriptor = DataflowEdge::new(
         edge.kind,
         edge.origin.as_ref(),
         &edge.source,
         &edge.target,
         &edge.proof,
         &edge.completeness,
-    )
+    );
+    match edge.boundary.as_ref() {
+        Some(boundary) => descriptor.with_boundary(boundary),
+        None => descriptor,
+    }
 }
 
 fn summary_descriptor(edge: &SummaryEdge) -> DataflowEdge<'_> {
@@ -1568,6 +1574,7 @@ fn compare_procedure_edges(left: &ProcedureIcfgEdge, right: &ProcedureIcfgEdge) 
         .then_with(|| compare_program_points(&left.target, &right.target))
         .then_with(|| left.kind.label().cmp(right.kind.label()))
         .then_with(|| compare_optional_call_sites(left.origin.as_ref(), right.origin.as_ref()))
+        .then_with(|| left.boundary.cmp(&right.boundary))
         .then_with(|| compare_proof(&left.proof, &right.proof))
         .then_with(|| compare_completeness(&left.completeness, &right.completeness))
 }

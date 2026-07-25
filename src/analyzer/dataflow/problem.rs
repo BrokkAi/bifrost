@@ -4,8 +4,8 @@ use std::hash::Hash;
 
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::semantic::{
-    CallSiteHandle, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
-    ProgramPointHandle, ProofStatus,
+    CallSiteHandle, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind,
+    IcfgNodeId, IcfgSnapshot, ProgramPointHandle, ProofStatus,
 };
 
 define_dense_id! {
@@ -63,6 +63,7 @@ pub struct DataflowEdge<'graph> {
     target: &'graph ProgramPointHandle,
     proof: &'graph ProofStatus,
     completeness: &'graph EvidenceCompleteness,
+    boundary: Option<&'graph DispatchBoundaryKind>,
 }
 
 impl<'graph> DataflowEdge<'graph> {
@@ -81,7 +82,13 @@ impl<'graph> DataflowEdge<'graph> {
             target,
             proof,
             completeness,
+            boundary: None,
         }
+    }
+
+    pub const fn with_boundary(mut self, boundary: &'graph DispatchBoundaryKind) -> Self {
+        self.boundary = Some(boundary);
+        self
     }
 
     /// Resolve one semantic edge and both procedure-local endpoint handles
@@ -125,6 +132,11 @@ impl<'graph> DataflowEdge<'graph> {
 
     pub const fn completeness(self) -> &'graph EvidenceCompleteness {
         self.completeness
+    }
+
+    /// Structured dispatch boundary that produced this edge, when any.
+    pub const fn boundary(self) -> Option<&'graph DispatchBoundaryKind> {
+        self.boundary
     }
 }
 

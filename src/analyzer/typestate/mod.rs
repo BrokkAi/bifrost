@@ -23,8 +23,9 @@ pub use binding::{
     TypestateTerminalBindingId, TypestateTerminalBindingSpec,
 };
 pub use client::{
-    TypestateFact, TypestateFlowProblem, TypestateFlowProblemError, TypestateUncertainty,
-    TypestateUncertaintySet, TypestateViolation,
+    TypestateFact, TypestateFlowProblem, TypestateFlowProblemError, TypestateSolveError,
+    TypestateSummaryResult, TypestateUncertainty, TypestateUncertaintySet, TypestateViolation,
+    solve_typestate_with_summaries,
 };
 pub use finding::{
     MAX_TYPESTATE_FINDINGS, TypestateFinding, TypestateFindingCertainty, TypestateFindingEvidence,

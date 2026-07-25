@@ -89,6 +89,7 @@ pub struct ProcedureIcfgEdge {
     pub origin: Option<CallSiteHandle>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
+    pub boundary: Option<DispatchBoundaryKind>,
 }
 
 /// One procedure-local incomplete ICFG boundary before snapshot node
@@ -1885,6 +1886,7 @@ pub(crate) fn project_call_boundary(
                     origin: Some(boundary.origin.clone()),
                     proof: boundary.dispatch.proof.clone(),
                     completeness: boundary.dispatch.completeness.clone(),
+                    boundary: Some(boundary.dispatch.kind.clone()),
                 });
             }
             ControlContinuation::Absent => {}
@@ -1997,6 +1999,7 @@ pub(crate) fn project_matched_return(
                 origin: Some(incoming.origin.clone()),
                 proof,
                 completeness,
+                boundary: None,
             }))
         }
         ControlContinuation::Absent => Ok(MatchedReturnProjection::Absent),

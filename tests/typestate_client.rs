@@ -2,11 +2,11 @@ mod common;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, SolverBudget,
-    SummaryDataflowResult, SummarySolveInput, solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
-    ObjectCardinality, ProcedureKind, ProofStatus, SemanticBudget, SemanticCallSite,
+    ObjectCardinality, OracleCallContext, OracleLimits, ProcedureKind, ProofStatus, SemanticBudget,
+    SemanticCallSite,
 };
 use brokk_bifrost::analyzer::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, ProtocolEventKey, ProtocolExpectationKey,
@@ -15,7 +15,8 @@ use brokk_bifrost::analyzer::typestate::{
     TypestateFindingCertainty, TypestateFindingKind, TypestateFlowProblem,
     TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
     TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
-    TypestateTerminalBindingSpec, TypestateUncertainty, collect_summary_findings,
+    TypestateSummaryResult, TypestateTerminalBindingSpec, TypestateUncertainty,
+    collect_summary_findings, solve_typestate_with_summaries,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 
@@ -46,6 +47,9 @@ struct ClientFixture {
     protocol: CompiledProtocol,
     bindings: TypestateBindingPlan,
     subject: brokk_bifrost::analyzer::typestate::TypestateSubjectId,
+    subject_key: TypestateSubjectKey,
+    subject_class: TypestateSubjectClassKey,
+    subject_object: AbstractObject,
     root: brokk_bifrost::analyzer::semantic::ProcedureHandle,
     entry: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
     use_point: brokk_bifrost::analyzer::semantic::ProgramPointHandle,
@@ -78,7 +82,7 @@ fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
         .file("src/main.ts", SOURCE)
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    fixture_from(&project, &analyzer, close_quality, false)
+    fixture_from(&project, &analyzer, close_quality, false, false)
 }
 
 fn fixture_from(
@@ -86,6 +90,7 @@ fn fixture_from(
     analyzer: &WorkspaceAnalyzer,
     close_quality: TypestateBindingQuality,
     swap_use_and_close: bool,
+    contextual: bool,
 ) -> ClientFixture {
     let graph = SemanticGraph::materialize(project, analyzer, "src/main.ts");
     let procedure = graph
@@ -139,16 +144,19 @@ fn fixture_from(
     let close_call_handle = procedure_handle
         .call_site_handle(close_call.id)
         .expect("close call handle");
-    let entry_site =
-        TypestateObservationSite::program_point(entry.clone(), TypestateBindingContext::root());
-    let use_site = TypestateObservationSite::call_site(
-        use_call_handle.clone(),
-        TypestateBindingContext::root(),
-    );
-    let close_site = TypestateObservationSite::call_site(
-        close_call_handle.clone(),
-        TypestateBindingContext::root(),
-    );
+    let context = if contextual {
+        TypestateBindingContext::try_new(OracleCallContext::bounded(
+            vec![use_call_handle.clone()],
+            OracleLimits::default(),
+        ))
+        .unwrap()
+    } else {
+        TypestateBindingContext::root()
+    };
+    let entry_site = TypestateObservationSite::program_point(entry.clone(), context.clone());
+    let use_site = TypestateObservationSite::call_site(use_call_handle.clone(), context.clone());
+    let close_site =
+        TypestateObservationSite::call_site(close_call_handle.clone(), context.clone());
     let exact = TypestateBindingQuality::proven_unique();
     let (use_site, close_site) = if swap_use_and_close {
         (close_site, use_site)
@@ -158,7 +166,11 @@ fn fixture_from(
     let protocol = protocol();
     let bindings = TypestateBindingPlan::try_new(
         &protocol,
-        vec![BoundTypestateSubjectSpec::new(class, object, exact.clone())],
+        vec![BoundTypestateSubjectSpec::new(
+            class.clone(),
+            object.clone(),
+            exact.clone(),
+        )],
         vec![TypestateInitialSeedSpec::new(
             subject_key.clone(),
             ProtocolStateKey::new("unallocated").unwrap(),
@@ -194,8 +206,8 @@ fn fixture_from(
         ],
         vec![TypestateTerminalBindingSpec::new(
             ProtocolExpectationKey::new("normal-exit-closed").unwrap(),
-            subject_key,
-            TypestateObservationSite::program_point(exit.clone(), TypestateBindingContext::root()),
+            subject_key.clone(),
+            TypestateObservationSite::program_point(exit.clone(), context),
             TypestateObjectRole::CurrentObject,
             TypestateBindingQuality::proven_unique(),
         )],
@@ -207,6 +219,9 @@ fn fixture_from(
         protocol,
         bindings,
         subject,
+        subject_key,
+        subject_class: class,
+        subject_object: object,
         root: procedure_handle,
         entry,
         use_point,
@@ -217,18 +232,50 @@ fn fixture_from(
     }
 }
 
-fn solve_summary(
-    fixture: &ClientFixture,
-    analyzer: &WorkspaceAnalyzer,
-) -> SummaryDataflowResult<TypestateFact> {
-    let problem = TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings).unwrap();
+fn exit_protocol() -> CompiledProtocol {
+    ProtocolSpec::from_json(
+        br#"{
+          "schema_version": 1,
+          "states": ["open", "closed"],
+          "initial_state": "open",
+          "accepting_states": ["closed"],
+          "error_states": [],
+          "events": [{
+            "id": "finish",
+            "observation": {
+              "occurrence": {"type": "procedure_exit", "kind": "normal"}
+            }
+          }],
+          "transitions": [{"from": "open", "on": "finish", "to": "closed"}],
+          "terminal_expectations": [],
+          "semantics": {
+            "analysis_mode": "may",
+            "unmatched_event": "preserve_state",
+            "uncertainty": {
+              "ambiguous_dispatch": "preserve_uncertainty",
+              "unknown_call": "preserve_uncertainty",
+              "external_call": "preserve_uncertainty",
+              "escape": "abstain",
+              "incomplete_analysis": "abstain"
+            }
+          }
+        }"#,
+    )
+    .unwrap()
+    .compile()
+    .unwrap()
+}
+
+fn solve_summary(fixture: &ClientFixture, analyzer: &WorkspaceAnalyzer) -> TypestateSummaryResult {
     let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
     let mut solver_budget = SolverBudget::default();
     let mut semantic_budget = SemanticBudget::default();
-    solve_with_summaries(
-        SummarySolveInput::new(&fixture.root, &[]),
+    solve_typestate_with_summaries(
+        &fixture.root,
+        &[],
         &analyzer.icfg_provider(),
-        &problem,
+        &fixture.protocol,
+        &fixture.bindings,
         &mut semantic_budget,
         &mut DataflowRequest::new(&mut solver_budget, &cancellation),
     )
@@ -256,6 +303,7 @@ fn transfer(
         TestTransfer::Normal => problem.normal_flow(edge, fact, &mut output),
         TestTransfer::Call => problem.call_flow(edge, fact, &mut output),
         TestTransfer::Return => problem.return_flow(edge, fact, &mut output),
+        TestTransfer::CallToReturn => problem.call_to_return_flow(edge, fact, &mut output),
     }
     output.0
 }
@@ -264,6 +312,7 @@ enum TestTransfer {
     Normal,
     Call,
     Return,
+    CallToReturn,
 }
 
 #[test]
@@ -292,7 +341,10 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .protocol
         .state_id(&ProtocolStateKey::new("open").unwrap())
         .unwrap();
-    assert_eq!(opened, vec![TypestateFact::state(fixture.subject, open)]);
+    assert_eq!(
+        opened,
+        vec![problem.state_fact(fixture.subject, open).unwrap()]
+    );
 
     let used = transfer(
         &problem,
@@ -328,7 +380,7 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .unwrap();
     assert_eq!(
         closed,
-        vec![TypestateFact::state(fixture.subject, closed_state)]
+        vec![problem.state_fact(fixture.subject, closed_state).unwrap()]
     );
 
     let violated = transfer(
@@ -349,13 +401,76 @@ fn bound_events_execute_in_their_dataflow_phase() {
         .state_id(&ProtocolStateKey::new("violated").unwrap())
         .unwrap();
     assert_eq!(violated.len(), 2);
-    assert!(violated.contains(&TypestateFact::state(fixture.subject, violated_state)));
+    assert!(violated.contains(&problem.state_fact(fixture.subject, violated_state).unwrap()));
     let violation = violated
         .iter()
         .find_map(|fact| fact.violation())
         .expect("error transition emits a violation marker");
     assert_eq!(violation.from(), closed_state);
     assert_eq!(violation.to(), violated_state);
+}
+
+#[test]
+fn procedure_exit_events_execute_when_control_enters_the_exit() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let protocol = exit_protocol();
+    let exact = TypestateBindingQuality::proven_unique();
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        vec![TypestateInitialSeedSpec::new(
+            fixture.subject_key.clone(),
+            ProtocolStateKey::new("open").unwrap(),
+            TypestateObservationSite::program_point(
+                fixture.entry.clone(),
+                TypestateBindingContext::root(),
+            ),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("finish").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::program_point(
+                fixture.exit.clone(),
+                TypestateBindingContext::root(),
+            ),
+            0,
+            TypestateObjectRole::CurrentObject,
+            exact,
+        )],
+        Vec::new(),
+    )
+    .unwrap();
+    let subject = bindings.subjects()[0].id();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::Intraprocedural(
+                brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+            ),
+            None,
+            &fixture.entry,
+            &fixture.exit,
+            &proven,
+            &complete,
+        ),
+        TypestateFact::Zero,
+        TestTransfer::Normal,
+    );
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+
+    assert_eq!(result, vec![problem.state_fact(subject, closed).unwrap()]);
 }
 
 #[test]
@@ -385,7 +500,7 @@ fn ambiguous_call_binding_preserves_explicit_uncertainty() {
             &proven,
             &complete,
         ),
-        TypestateFact::state(fixture.subject, open),
+        problem.state_fact(fixture.subject, open).unwrap(),
         TestTransfer::Return,
     );
 
@@ -417,6 +532,62 @@ fn flow_problem_rejects_a_plan_for_another_protocol() {
 }
 
 #[test]
+fn flow_problem_rejects_context_specific_plans_instead_of_flattening_them() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        false,
+        true,
+    );
+
+    assert!(matches!(
+        TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings),
+        Err(TypestateFlowProblemError::ContextSensitiveBindingsUnsupported)
+    ));
+}
+
+#[test]
+fn structured_external_boundary_uses_external_call_semantics() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let problem = TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings).unwrap();
+    let open = fixture
+        .protocol
+        .state_id(&ProtocolStateKey::new("open").unwrap())
+        .unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+    let boundary = brokk_bifrost::analyzer::semantic::DispatchBoundaryKind::External(None);
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::CallToNormalContinuation,
+            Some(&fixture.close_call),
+            &fixture.close_point,
+            &fixture.exit,
+            &proven,
+            &complete,
+        )
+        .with_boundary(&boundary),
+        problem.state_fact(fixture.subject, open).unwrap(),
+        TestTransfer::CallToReturn,
+    );
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].protocol_state(), Some(open));
+    assert!(
+        result[0]
+            .uncertainty()
+            .contains(TypestateUncertainty::ExternalCall)
+    );
+}
+
+#[test]
 fn real_summary_solver_executes_the_same_client_contract() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("src/main.ts", SOURCE)
@@ -427,14 +598,22 @@ fn real_summary_solver_executes_the_same_client_contract() {
         &analyzer,
         TypestateBindingQuality::proven_unique(),
         false,
+        false,
     );
     let result = solve_summary(&fixture, &analyzer);
+    let raw = result.result();
     let closed = fixture
         .protocol
         .state_id(&ProtocolStateKey::new("closed").unwrap())
         .unwrap();
-    assert!(result.reached_at(&fixture.exit).any(|reached| {
-        result.fact(reached.fact()) == Some(&TypestateFact::state(fixture.subject, closed))
+    assert!(raw.reached_at(&fixture.exit).any(|reached| {
+        raw.fact(reached.fact())
+            == Some(
+                &TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings)
+                    .unwrap()
+                    .state_fact(fixture.subject, closed)
+                    .unwrap(),
+            )
     }));
     let report = collect_summary_findings(&fixture.protocol, &fixture.bindings, &result).unwrap();
     assert!(!report.analysis_complete());
@@ -460,6 +639,7 @@ fn summary_findings_retain_error_and_terminal_semantics() {
         &analyzer,
         TypestateBindingQuality::proven_unique(),
         true,
+        false,
     );
     let result = solve_summary(&fixture, &analyzer);
     let report = collect_summary_findings(&fixture.protocol, &fixture.bindings, &result).unwrap();
@@ -475,4 +655,32 @@ fn summary_findings_retain_error_and_terminal_semantics() {
                 TypestateFindingKind::TerminalExpectation { .. }
             )
     }));
+}
+
+#[test]
+fn finding_collection_rejects_a_result_from_another_binding_plan() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let first = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        false,
+        false,
+    );
+    let second = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        true,
+        false,
+    );
+    let result = solve_summary(&first, &analyzer);
+
+    assert!(matches!(
+        collect_summary_findings(&second.protocol, &second.bindings, &result),
+        Err(TypestateFlowProblemError::BindingPlanMismatch)
+    ));
 }
