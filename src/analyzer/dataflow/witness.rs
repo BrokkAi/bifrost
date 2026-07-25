@@ -75,6 +75,12 @@ impl WitnessRetentionLimits {
     ) -> Result<Self, WitnessLimitError> {
         let max_alternatives_per_quality =
             Self::validate_alternatives(max_alternatives_per_quality)?;
+        if max_alternatives_per_quality.get() != 1 {
+            return Err(WitnessLimitError {
+                field: "max_alternatives_per_quality",
+                maximum: Some(1),
+            });
+        }
         let max_retained_relations =
             NonZeroUsize::new(max_retained_relations).ok_or(WitnessLimitError {
                 field: "max_retained_relations",
@@ -1257,6 +1263,12 @@ mod tests {
                 .unwrap_err()
                 .field(),
             "max_retained_relations"
+        );
+        assert_eq!(
+            WitnessRetentionLimits::best_effort(2, 64)
+                .unwrap_err()
+                .to_string(),
+            "max_alternatives_per_quality must be at most 1"
         );
         assert_eq!(
             WitnessRetentionLimits::new(MAX_WITNESS_ALTERNATIVES_PER_QUALITY + 1)

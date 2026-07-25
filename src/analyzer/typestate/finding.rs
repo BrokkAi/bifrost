@@ -65,6 +65,8 @@ impl TypestateFindingLimits {
             || max_reached_rows > MAX_TYPESTATE_FINDING_REACHED_ROWS
             || max_candidates == 0
             || max_candidates > MAX_TYPESTATE_FINDING_CANDIDATES
+            || witness_reconstruction.max_steps() > MAX_TYPESTATE_WITNESS_STEPS
+            || witness_reconstruction.max_expansions() > MAX_TYPESTATE_WITNESS_EXPANSIONS
             || max_witness_expansions == 0
             || max_witness_expansions > MAX_TYPESTATE_FINDING_WITNESS_EXPANSIONS
             || max_witness_bytes == 0
@@ -699,64 +701,95 @@ pub fn collect_summary_findings_with_limits(
                 })
                 .copied(),
         };
-        let mut witness_targets = match certainty {
-            TypestateFindingCertainty::May => actual_states
-                .iter()
-                .filter(|state| terminal.expected_states().binary_search(state).is_err())
-                .filter_map(|state| {
-                    targets_for_state(*state)
-                        .and_then(|targets| targets.definitive)
-                        .map(|target| PendingFindingWitness {
-                            observed_state: Some(*state),
-                            target,
+        let mut omitted_witnesses = 0usize;
+        let mut witness_targets =
+            Vec::with_capacity(actual_states.len().min(MAX_TYPESTATE_WITNESSES_PER_FINDING));
+        match certainty {
+            TypestateFindingCertainty::May => {
+                let mut preferred = None;
+                for (state_index, state) in actual_states.iter().copied().enumerate() {
+                    check_cancellation(cancellation, state_index)?;
+                    if terminal.expected_states().binary_search(&state).is_ok() {
+                        continue;
+                    }
+                    let Some(target) =
+                        targets_for_state(state).and_then(|targets| targets.definitive)
+                    else {
+                        continue;
+                    };
+                    let candidate = PendingFindingWitness {
+                        observed_state: Some(state),
+                        target,
+                    };
+                    if preferred
+                        .as_ref()
+                        .is_none_or(|retained: &PendingFindingWitness| {
+                            candidate.target.preference() > retained.target.preference()
                         })
-                })
-                .max_by_key(|witness| witness.target.preference())
-                .into_iter()
-                .collect::<Vec<_>>(),
-            TypestateFindingCertainty::Must => actual_states
-                .iter()
-                .filter_map(|state| {
-                    targets_for_state(*state)
-                        .and_then(|targets| targets.definitive)
-                        .map(|target| PendingFindingWitness {
-                            observed_state: Some(*state),
+                    {
+                        preferred = Some(candidate);
+                    }
+                }
+                witness_targets.extend(preferred);
+            }
+            TypestateFindingCertainty::Must => {
+                for (state_index, state) in actual_states.iter().copied().enumerate() {
+                    check_cancellation(cancellation, state_index)?;
+                    let Some(target) =
+                        targets_for_state(state).and_then(|targets| targets.definitive)
+                    else {
+                        continue;
+                    };
+                    if witness_targets.len() < MAX_TYPESTATE_WITNESSES_PER_FINDING {
+                        witness_targets.push(PendingFindingWitness {
+                            observed_state: Some(state),
                             target,
-                        })
-                })
-                .collect::<Vec<_>>(),
-            TypestateFindingCertainty::Inconclusive => actual_states
-                .iter()
-                .filter(|state| {
-                    failing == 0 || terminal.expected_states().binary_search(state).is_err()
-                })
-                .filter_map(|state| {
-                    let targets = targets_for_state(*state)?;
-                    let observation = observations.states.get(state)?;
+                        });
+                    } else {
+                        omitted_witnesses = omitted_witnesses.saturating_add(1);
+                    }
+                }
+            }
+            TypestateFindingCertainty::Inconclusive => {
+                for (state_index, state) in actual_states.iter().copied().enumerate() {
+                    check_cancellation(cancellation, state_index)?;
+                    if failing != 0 && terminal.expected_states().binary_search(&state).is_ok() {
+                        continue;
+                    }
+                    let Some(targets) = targets_for_state(state) else {
+                        continue;
+                    };
+                    let Some(observation) = observations.states.get(&state) else {
+                        continue;
+                    };
                     let target = if failing == 0 {
-                        targets.uncertainty_witness()
+                        targets
+                            .uncertainty_witness()
+                            .or_else(|| targets.preferred())
                     } else if !observation.uncertainty.is_empty() || observation.abstained {
                         targets
                             .uncertainty_witness()
                             .or_else(|| targets.preferred())
                     } else {
                         targets.preferred()
-                    }?;
-                    Some(PendingFindingWitness {
-                        observed_state: Some(*state),
-                        target,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        };
+                    };
+                    let Some(target) = target else {
+                        continue;
+                    };
+                    if witness_targets.len() < MAX_TYPESTATE_WITNESSES_PER_FINDING {
+                        witness_targets.push(PendingFindingWitness {
+                            observed_state: Some(state),
+                            target,
+                        });
+                    } else {
+                        omitted_witnesses = omitted_witnesses.saturating_add(1);
+                    }
+                }
+            }
+        }
         if witness_targets.is_empty() && certainty != TypestateFindingCertainty::Inconclusive {
             return Err(TypestateFlowProblemError::InvalidFactIdentity);
         }
-        witness_targets.sort_by_key(|witness| witness.observed_state);
-        let omitted_witnesses = witness_targets
-            .len()
-            .saturating_sub(MAX_TYPESTATE_WITNESSES_PER_FINDING);
-        witness_targets.truncate(MAX_TYPESTATE_WITNESSES_PER_FINDING);
         findings.push(PendingTypestateFinding {
             subject: binding.subject(),
             site: binding.site().identity().clone(),
@@ -858,7 +891,10 @@ impl FindingWitnessTarget {
     }
 
     const fn is_definitive(self) -> bool {
-        self.uncertainty.is_empty() && !self.abstained
+        self.quality.is_proven()
+            && self.quality.is_complete()
+            && self.uncertainty.is_empty()
+            && !self.abstained
     }
 
     const fn preference(self) -> (bool, bool, std::cmp::Reverse<usize>) {
@@ -1101,7 +1137,11 @@ fn merge_pending_findings(
                     .iter_mut()
                     .find(|retained| retained.observed_state == candidate.observed_state)
                 {
-                    if candidate.target.preference() > retained.target.preference() {
+                    if should_replace_merged_witness(
+                        retained.target,
+                        candidate.target,
+                        previous.certainty,
+                    ) {
                         *retained = candidate;
                     }
                 } else if previous.witness_targets.len() < MAX_TYPESTATE_WITNESSES_PER_FINDING {
@@ -1118,6 +1158,19 @@ fn merge_pending_findings(
         }
     }
     Ok(merged)
+}
+
+fn should_replace_merged_witness(
+    retained: FindingWitnessTarget,
+    candidate: FindingWitnessTarget,
+    certainty: TypestateFindingCertainty,
+) -> bool {
+    if certainty == TypestateFindingCertainty::Inconclusive
+        && retained.is_definitive() != candidate.is_definitive()
+    {
+        return !candidate.is_definitive();
+    }
+    candidate.preference() > retained.preference()
 }
 
 fn materialize_findings(
@@ -1229,5 +1282,60 @@ mod tests {
             error_transition_certainty(ProtocolAnalysisMode::Must, false, &aggregate, false),
             TypestateFindingCertainty::Inconclusive
         );
+    }
+
+    #[test]
+    fn witness_target_is_definitive_only_for_a_proven_complete_path() {
+        for quality in [
+            PathQuality::PROVEN_PARTIAL,
+            PathQuality::UNPROVEN_COMPLETE,
+            PathQuality::UNPROVEN_PARTIAL,
+        ] {
+            assert!(
+                !FindingWitnessTarget {
+                    reached_index: 0,
+                    quality,
+                    uncertainty: TypestateUncertaintySet::default(),
+                    abstained: false,
+                }
+                .is_definitive()
+            );
+        }
+        assert!(
+            FindingWitnessTarget {
+                reached_index: 0,
+                quality: PathQuality::PROVEN_COMPLETE,
+                uncertainty: TypestateUncertaintySet::default(),
+                abstained: false,
+            }
+            .is_definitive()
+        );
+    }
+
+    #[test]
+    fn inconclusive_merge_prefers_the_witness_that_explains_uncertainty() {
+        let clean = FindingWitnessTarget {
+            reached_index: 0,
+            quality: PathQuality::PROVEN_COMPLETE,
+            uncertainty: TypestateUncertaintySet::default(),
+            abstained: false,
+        };
+        let uncertain = FindingWitnessTarget {
+            reached_index: 1,
+            quality: PathQuality::UNPROVEN_PARTIAL,
+            uncertainty: TypestateUncertaintySet::default(),
+            abstained: false,
+        };
+
+        assert!(should_replace_merged_witness(
+            clean,
+            uncertain,
+            TypestateFindingCertainty::Inconclusive
+        ));
+        assert!(!should_replace_merged_witness(
+            uncertain,
+            clean,
+            TypestateFindingCertainty::Inconclusive
+        ));
     }
 }

@@ -3,8 +3,8 @@ mod common;
 use std::cell::Cell;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, SolverBudget,
-    WitnessReconstructionLimits,
+    DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, PathQuality,
+    SolverBudget, WitnessReconstructionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
@@ -1257,6 +1257,12 @@ fn real_summary_solver_executes_the_same_client_contract() {
         report.findings()[0].kind(),
         TypestateFindingKind::TerminalExpectation { .. }
     ));
+    assert!(!report.findings()[0].evidence().analysis_complete());
+    assert_eq!(report.findings()[0].witnesses().len(), 1);
+    assert_eq!(
+        report.findings()[0].witnesses()[0].witness().quality(),
+        PathQuality::PROVEN_COMPLETE
+    );
 }
 
 #[test]
@@ -1775,6 +1781,27 @@ fn finding_collection_observes_its_budget_and_cancellation() {
             &cancellation,
         ),
         Err(TypestateFlowProblemError::FindingBudgetExceeded)
+    ));
+
+    assert!(matches!(
+        TypestateFindingLimits::with_witness_limits(
+            1_000_000,
+            8_192,
+            WitnessReconstructionLimits::new(65, 4_096).unwrap(),
+            1_000_000,
+            64 * 1024 * 1024,
+        ),
+        Err(TypestateFlowProblemError::InvalidFindingLimits)
+    ));
+    assert!(matches!(
+        TypestateFindingLimits::with_witness_limits(
+            1_000_000,
+            8_192,
+            WitnessReconstructionLimits::new(64, 4_097).unwrap(),
+            1_000_000,
+            64 * 1024 * 1024,
+        ),
+        Err(TypestateFlowProblemError::InvalidFindingLimits)
     ));
 
     cancellation.cancel();
