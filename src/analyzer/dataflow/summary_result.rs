@@ -1,6 +1,12 @@
 //! Deterministic public results for in-memory summary tabulation.
 
-use std::{cmp::Ordering, error::Error, fmt, sync::Arc};
+use std::{
+    cmp::Ordering,
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, ControlContinuation, ControlEdgeKind, DispatchBoundary,
@@ -11,6 +17,10 @@ use crate::analyzer::semantic::{
 };
 
 use super::{FactId, PathQualityFrontier, SemanticInputStatus, SolverTermination, SolverWork};
+use super::{
+    PathQuality, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
+    witness::{WitnessAlternatives, WitnessStore},
+};
 
 /// One procedure entry and fact whose relative path edges share an end-summary
 /// relation.
@@ -53,12 +63,33 @@ impl SummaryEntry {
 }
 
 /// One deterministically ordered relative `(entry, point, fact)` path edge.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct SummaryReachedFact {
     entry: SummaryEntry,
     point: ProgramPointHandle,
     fact: FactId,
     path_qualities: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
+}
+
+impl PartialEq for SummaryReachedFact {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.point == other.point
+            && self.fact == other.fact
+            && self.path_qualities == other.path_qualities
+    }
+}
+
+impl Eq for SummaryReachedFact {}
+
+impl Hash for SummaryReachedFact {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.entry.hash(state);
+        self.point.hash(state);
+        self.fact.hash(state);
+        self.path_qualities.hash(state);
+    }
 }
 
 impl SummaryReachedFact {
@@ -67,6 +98,7 @@ impl SummaryReachedFact {
         point: ProgramPointHandle,
         fact: FactId,
         path_qualities: PathQualityFrontier,
+        witnesses: WitnessAlternatives,
     ) -> Self {
         debug_assert_eq!(
             entry.procedure(),
@@ -78,6 +110,7 @@ impl SummaryReachedFact {
             point,
             fact,
             path_qualities,
+            witnesses,
         }
     }
 
@@ -102,13 +135,25 @@ impl SummaryReachedFact {
 ///
 /// This is correctness-critical tabulation state, not a persisted semantic,
 /// taint, typestate, or protocol summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TabulationEndSummary {
     entry: SummaryEntry,
     exit: Arc<IcfgExitProfile>,
     exit_fact: FactId,
     path_qualities: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
 }
+
+impl PartialEq for TabulationEndSummary {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.exit == other.exit
+            && self.exit_fact == other.exit_fact
+            && self.path_qualities == other.path_qualities
+    }
+}
+
+impl Eq for TabulationEndSummary {}
 
 impl TabulationEndSummary {
     pub(crate) fn new(
@@ -116,6 +161,7 @@ impl TabulationEndSummary {
         exit: Arc<IcfgExitProfile>,
         exit_fact: FactId,
         path_qualities: PathQualityFrontier,
+        witnesses: WitnessAlternatives,
     ) -> Self {
         debug_assert_eq!(
             entry.procedure(),
@@ -132,6 +178,7 @@ impl TabulationEndSummary {
             exit,
             exit_fact,
             path_qualities,
+            witnesses,
         }
     }
 
@@ -427,6 +474,7 @@ pub struct SummaryDataflowResult<Fact> {
     work: SolverWork,
     semantic_work: SemanticWork,
     metrics: SummaryMetrics,
+    witness_store: WitnessStore,
 }
 
 impl<Fact> SummaryDataflowResult<Fact> {
@@ -440,6 +488,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
         work: SolverWork,
         semantic_work: SemanticWork,
         metrics: SummaryMetrics,
+        witness_store: WitnessStore,
     ) -> Self {
         reached.sort_by(compare_reached_facts);
         reached.dedup();
@@ -455,6 +504,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
             work,
             semantic_work,
             metrics,
+            witness_store,
         }
     }
 
@@ -515,6 +565,58 @@ impl<Fact> SummaryDataflowResult<Fact> {
             .iter()
             .filter(move |summary| summary.entry() == entry)
     }
+
+    pub fn witness_for_reached(
+        &self,
+        reached: &SummaryReachedFact,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let reached = self
+            .reached
+            .iter()
+            .find(|candidate| *candidate == reached)
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        if !reached.path_qualities.contains(quality) {
+            return Err(SummaryWitnessError::QualityNotRetained(quality));
+        }
+        let evidence = reached
+            .witnesses
+            .first(quality)
+            .ok_or(SummaryWitnessError::RetentionDisabled)?;
+        self.witness_store.reconstruct(
+            evidence,
+            quality,
+            reached.witnesses.is_truncated(quality),
+            limits,
+        )
+    }
+
+    pub fn witness_for_end_summary(
+        &self,
+        summary: &TabulationEndSummary,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let summary = self
+            .end_summaries
+            .iter()
+            .find(|candidate| *candidate == summary)
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        if !summary.path_qualities.contains(quality) {
+            return Err(SummaryWitnessError::QualityNotRetained(quality));
+        }
+        let evidence = summary
+            .witnesses
+            .first(quality)
+            .ok_or(SummaryWitnessError::RetentionDisabled)?;
+        self.witness_store.reconstruct(
+            evidence,
+            quality,
+            summary.witnesses.is_truncated(quality),
+            limits,
+        )
+    }
 }
 
 /// Stable malformed-input/provider errors for summary tabulation.
@@ -524,6 +626,8 @@ impl<Fact> SummaryDataflowResult<Fact> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryDataflowError {
     FactIdOverflow { index: usize },
+    WitnessEvidenceIdOverflow { index: usize },
+    WitnessInvariant(&'static str),
     SemanticProvider(SemanticProviderError),
 }
 
@@ -533,6 +637,12 @@ impl fmt::Display for SummaryDataflowError {
             Self::FactIdOverflow { index } => {
                 write!(formatter, "data-flow fact index {index} exceeds u32")
             }
+            Self::WitnessEvidenceIdOverflow { index } => {
+                write!(formatter, "witness evidence index {index} exceeds u32")
+            }
+            Self::WitnessInvariant(reason) => {
+                write!(formatter, "summary witness invariant failed: {reason}")
+            }
             Self::SemanticProvider(error) => error.fmt(formatter),
         }
     }
@@ -541,7 +651,9 @@ impl fmt::Display for SummaryDataflowError {
 impl Error for SummaryDataflowError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::FactIdOverflow { .. } => None,
+            Self::FactIdOverflow { .. }
+            | Self::WitnessEvidenceIdOverflow { .. }
+            | Self::WitnessInvariant(_) => None,
             Self::SemanticProvider(error) => Some(error),
         }
     }
