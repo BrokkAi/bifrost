@@ -16,10 +16,11 @@ use brokk_bifrost::analyzer::typestate::{
     ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
     TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
     TypestateEventBindingSpec, TypestateFact, TypestateFindingCertainty, TypestateFindingKind,
-    TypestateFlowProblem, TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
-    TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
-    TypestateSummaryResult, TypestateTerminalBindingSpec, TypestateUncertainty,
-    collect_summary_findings, solve_typestate_with_summaries,
+    TypestateFindingLimits, TypestateFlowProblem, TypestateFlowProblemError,
+    TypestateInitialSeedSpec, TypestateObjectRole, TypestateObservationSite,
+    TypestateSubjectClassKey, TypestateSubjectKey, TypestateSummaryResult,
+    TypestateTerminalBindingSpec, TypestateUncertainty, collect_summary_findings,
+    collect_summary_findings_with_limits, solve_typestate_with_summaries,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 
@@ -85,13 +86,21 @@ fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
         .file("src/main.ts", SOURCE)
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    fixture_from(&project, &analyzer, close_quality, false, false)
+    fixture_from(
+        &project,
+        &analyzer,
+        close_quality,
+        TypestateBindingQuality::proven_unique(),
+        false,
+        false,
+    )
 }
 
 fn fixture_from(
     project: &BuiltInlineTestProject,
     analyzer: &WorkspaceAnalyzer,
     close_quality: TypestateBindingQuality,
+    terminal_quality: TypestateBindingQuality,
     swap_use_and_close: bool,
     contextual: bool,
 ) -> ClientFixture {
@@ -212,7 +221,7 @@ fn fixture_from(
             subject_key.clone(),
             TypestateObservationSite::program_point(exit.clone(), context),
             TypestateObjectRole::CurrentObject,
-            TypestateBindingQuality::proven_unique(),
+            terminal_quality,
         )],
     )
     .expect("client binding plan");
@@ -733,6 +742,7 @@ fn flow_problem_rejects_context_specific_plans_instead_of_flattening_them() {
         &project,
         &analyzer,
         TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
         false,
         true,
     );
@@ -789,6 +799,7 @@ fn real_summary_solver_executes_the_same_client_contract() {
         &project,
         &analyzer,
         TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
         false,
         false,
     );
@@ -821,6 +832,141 @@ fn real_summary_solver_executes_the_same_client_contract() {
 }
 
 #[test]
+fn incomplete_terminal_binding_cannot_support_a_definitive_finding() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let partial_terminal = TypestateBindingQuality::new(
+        ProofStatus::Unproven("terminal resolution".into()),
+        EvidenceCompleteness::Partial("terminal resolution".into()),
+        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1).unwrap(),
+    );
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        partial_terminal,
+        false,
+        false,
+    );
+    let result = solve_summary(&fixture, &analyzer);
+    let report = collect_summary_findings(&fixture.protocol, &fixture.bindings, &result).unwrap();
+
+    assert!(!result.bindings_complete());
+    assert!(!report.analysis_complete());
+    assert!(
+        report
+            .findings()
+            .iter()
+            .all(|finding| { finding.certainty() == TypestateFindingCertainty::Inconclusive })
+    );
+}
+
+#[test]
+fn must_mode_does_not_promote_event_specific_markers_without_universal_proof() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
+        false,
+        false,
+    );
+    let source = String::from_utf8(RESOURCE_LIFECYCLE.to_vec())
+        .unwrap()
+        .replace("\"analysis_mode\": \"may\"", "\"analysis_mode\": \"must\"");
+    let protocol = ProtocolSpec::from_json(source.as_bytes())
+        .unwrap()
+        .compile()
+        .unwrap();
+    let exact = TypestateBindingQuality::proven_unique();
+    let entry_site = TypestateObservationSite::program_point(
+        fixture.entry.clone(),
+        TypestateBindingContext::root(),
+    );
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        vec![TypestateInitialSeedSpec::new(
+            fixture.subject_key.clone(),
+            ProtocolStateKey::new("unallocated").unwrap(),
+            entry_site.clone(),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
+        vec![
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("acquire").unwrap(),
+                fixture.subject_key.clone(),
+                entry_site,
+                0,
+                TypestateObjectRole::AllocationResult,
+                exact.clone(),
+            ),
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("use").unwrap(),
+                fixture.subject_key.clone(),
+                TypestateObservationSite::call_site(
+                    fixture.close_call.clone(),
+                    TypestateBindingContext::root(),
+                ),
+                0,
+                TypestateObjectRole::Argument,
+                exact.clone(),
+            ),
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("close").unwrap(),
+                fixture.subject_key.clone(),
+                TypestateObservationSite::call_site(
+                    fixture.use_call.clone(),
+                    TypestateBindingContext::root(),
+                ),
+                0,
+                TypestateObjectRole::Argument,
+                exact,
+            ),
+        ],
+        Vec::new(),
+    )
+    .unwrap();
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_typestate_with_summaries(
+        &fixture.root,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap();
+    let report = collect_summary_findings(&protocol, &bindings, &result).unwrap();
+    let error_findings = report
+        .findings()
+        .iter()
+        .filter(|finding| matches!(finding.kind(), TypestateFindingKind::ErrorTransition { .. }))
+        .collect::<Vec<_>>();
+
+    assert!(!error_findings.is_empty());
+    assert!(
+        error_findings
+            .iter()
+            .all(|finding| { finding.certainty() == TypestateFindingCertainty::Inconclusive })
+    );
+}
+
+#[test]
 fn summary_findings_retain_error_and_terminal_semantics() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("src/main.ts", SOURCE)
@@ -829,6 +975,7 @@ fn summary_findings_retain_error_and_terminal_semantics() {
     let fixture = fixture_from(
         &project,
         &analyzer,
+        TypestateBindingQuality::proven_unique(),
         TypestateBindingQuality::proven_unique(),
         true,
         false,
@@ -859,12 +1006,14 @@ fn finding_collection_rejects_a_result_from_another_binding_plan() {
         &project,
         &analyzer,
         TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
         false,
         false,
     );
     let second = fixture_from(
         &project,
         &analyzer,
+        TypestateBindingQuality::proven_unique(),
         TypestateBindingQuality::proven_unique(),
         true,
         false,
@@ -874,5 +1023,46 @@ fn finding_collection_rejects_a_result_from_another_binding_plan() {
     assert!(matches!(
         collect_summary_findings(&second.protocol, &second.bindings, &result),
         Err(TypestateFlowProblemError::BindingPlanMismatch)
+    ));
+}
+
+#[test]
+fn finding_collection_observes_its_budget_and_cancellation() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
+        false,
+        false,
+    );
+    let result = solve_summary(&fixture, &analyzer);
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+
+    assert!(matches!(
+        collect_summary_findings_with_limits(
+            &fixture.protocol,
+            &fixture.bindings,
+            &result,
+            TypestateFindingLimits::new(1, 1).unwrap(),
+            &cancellation,
+        ),
+        Err(TypestateFlowProblemError::FindingBudgetExceeded)
+    ));
+
+    cancellation.cancel();
+    assert!(matches!(
+        collect_summary_findings_with_limits(
+            &fixture.protocol,
+            &fixture.bindings,
+            &result,
+            TypestateFindingLimits::default(),
+            &cancellation,
+        ),
+        Err(TypestateFlowProblemError::FindingCancelled)
     ));
 }

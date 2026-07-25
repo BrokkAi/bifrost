@@ -1,13 +1,51 @@
-use crate::analyzer::dataflow::{PathQualityFrontier, SummaryDataflowResult};
-use crate::analyzer::semantic::SemanticLocator;
+use crate::analyzer::dataflow::PathQualityFrontier;
+use crate::analyzer::semantic::{CancellationToken, ProgramPointHandle, SemanticLocator};
+use crate::hash::{HashMap, HashSet};
 
 use super::{
     CompiledProtocol, ProtocolAnalysisMode, ProtocolEventId, ProtocolExpectationId,
-    ProtocolStateId, ProtocolTerminalObservationSpec, TypestateBindingPlan, TypestateFact,
-    TypestateFlowProblemError, TypestateSubjectId, TypestateSummaryResult, TypestateUncertaintySet,
+    ProtocolStateId, ProtocolTerminalObservationSpec, TypestateBindingPlan,
+    TypestateEventBindingId, TypestateFact, TypestateFlowProblemError, TypestateSubjectId,
+    TypestateSummaryResult, TypestateUncertaintySet,
 };
 
 pub const MAX_TYPESTATE_FINDINGS: usize = 4_096;
+pub const MAX_TYPESTATE_FINDING_CANDIDATES: usize = 8_192;
+pub const MAX_TYPESTATE_FINDING_REACHED_ROWS: usize = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypestateFindingLimits {
+    max_reached_rows: usize,
+    max_candidates: usize,
+}
+
+impl TypestateFindingLimits {
+    pub fn new(
+        max_reached_rows: usize,
+        max_candidates: usize,
+    ) -> Result<Self, TypestateFlowProblemError> {
+        if max_reached_rows == 0
+            || max_reached_rows > MAX_TYPESTATE_FINDING_REACHED_ROWS
+            || max_candidates == 0
+            || max_candidates > MAX_TYPESTATE_FINDING_CANDIDATES
+        {
+            return Err(TypestateFlowProblemError::InvalidFindingLimits);
+        }
+        Ok(Self {
+            max_reached_rows,
+            max_candidates,
+        })
+    }
+}
+
+impl Default for TypestateFindingLimits {
+    fn default() -> Self {
+        Self {
+            max_reached_rows: MAX_TYPESTATE_FINDING_REACHED_ROWS,
+            max_candidates: MAX_TYPESTATE_FINDING_CANDIDATES,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TypestateFindingCertainty {
@@ -125,6 +163,22 @@ pub fn collect_summary_findings(
     bindings: &TypestateBindingPlan,
     typestate_result: &TypestateSummaryResult,
 ) -> Result<TypestateFindingReport, TypestateFlowProblemError> {
+    collect_summary_findings_with_limits(
+        protocol,
+        bindings,
+        typestate_result,
+        TypestateFindingLimits::default(),
+        &CancellationToken::default(),
+    )
+}
+
+pub fn collect_summary_findings_with_limits(
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    typestate_result: &TypestateSummaryResult,
+    limits: TypestateFindingLimits,
+    cancellation: &CancellationToken,
+) -> Result<TypestateFindingReport, TypestateFlowProblemError> {
     if bindings.protocol_hash() != protocol.hash() {
         return Err(TypestateFlowProblemError::ProtocolMismatch);
     }
@@ -135,44 +189,151 @@ pub fn collect_summary_findings(
     }
 
     let result = typestate_result.result();
+    if result.reached().len() > limits.max_reached_rows {
+        return Err(TypestateFlowProblemError::FindingBudgetExceeded);
+    }
     let analysis_complete = typestate_result.is_complete();
-    let mut findings = Vec::new();
-    for reached in result.reached() {
+    let mut violations = HashMap::<ViolationKey, ViolationAggregate>::default();
+    let mut event_terminals = vec![None; bindings.terminal_bindings().len()];
+    let mut needed_states = HashSet::<StateKey>::default();
+    for binding in bindings.terminal_bindings() {
+        let terminal = protocol
+            .terminal_expectation(binding.expectation())
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+        if matches!(
+            terminal.on(),
+            ProtocolTerminalObservationSpec::AnalysisRootExit { .. }
+        ) {
+            let point = binding
+                .site()
+                .program_point_handle()
+                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+            needed_states.insert(StateKey {
+                point: point.clone(),
+                subject: binding.subject(),
+            });
+        }
+    }
+
+    let mut omitted_candidates = 0usize;
+    for (index, reached) in result.reached().iter().enumerate() {
+        check_cancellation(cancellation, index)?;
         let fact = *result
             .fact(reached.fact())
-            .expect("reached typestate fact IDs resolve");
-        let Some(violation) = fact.violation() else {
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+        if let Some(violation) = fact.violation() {
+            let subject = fact
+                .subject()
+                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+            if bindings.event_binding(violation.event_binding()).is_none() {
+                return Err(TypestateFlowProblemError::InvalidFactIdentity);
+            }
+            let key = ViolationKey {
+                point: reached.point().clone(),
+                subject,
+                binding: violation.event_binding(),
+                from: violation.from(),
+                to: violation.to(),
+            };
+            if let Some(aggregate) = violations.get_mut(&key) {
+                aggregate.merge(
+                    reached.path_qualities(),
+                    fact.uncertainty(),
+                    fact.abstained(),
+                );
+            } else if violations.len() < limits.max_candidates {
+                violations.insert(
+                    key,
+                    ViolationAggregate::new(
+                        reached.path_qualities(),
+                        fact.uncertainty(),
+                        fact.abstained(),
+                    ),
+                );
+                needed_states.insert(StateKey {
+                    point: reached.point().clone(),
+                    subject,
+                });
+            } else {
+                omitted_candidates = omitted_candidates.saturating_add(1);
+            }
+        }
+        if let Some((terminal_binding, state)) = fact.terminal_observation() {
+            let aggregate = event_terminals
+                .get_mut(terminal_binding.index())
+                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?
+                .get_or_insert_with(ObservationAggregate::default);
+            aggregate.insert(
+                state,
+                reached.path_qualities(),
+                fact.uncertainty(),
+                fact.abstained(),
+            );
+        }
+    }
+
+    let mut reached_states = HashMap::<StateKey, ObservationAggregate>::default();
+    for (index, reached) in result.reached().iter().enumerate() {
+        check_cancellation(cancellation, index)?;
+        let fact = *result
+            .fact(reached.fact())
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+        let TypestateFact::State {
+            subject,
+            state,
+            uncertainty,
+            abstained,
+            ..
+        } = fact
+        else {
             continue;
         };
-        let subject = fact
-            .subject()
-            .expect("violation facts always retain subjects");
+        let key = StateKey {
+            point: reached.point().clone(),
+            subject,
+        };
+        if needed_states.contains(&key) {
+            reached_states.entry(key).or_default().insert(
+                state,
+                reached.path_qualities(),
+                uncertainty,
+                abstained,
+            );
+        }
+    }
+
+    let mut findings = Vec::with_capacity(
+        violations
+            .len()
+            .saturating_add(bindings.terminal_bindings().len()),
+    );
+    for (key, aggregate) in violations {
         let binding = bindings
-            .event_binding(violation.event_binding())
-            .expect("violation facts retain valid binding IDs");
+            .event_binding(key.binding)
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+        let definite_path = aggregate.paths.has_proven_path()
+            && aggregate.uncertainty.is_empty()
+            && !aggregate.abstained;
         let certainty = match protocol.semantics().analysis_mode {
-            ProtocolAnalysisMode::May => TypestateFindingCertainty::May,
-            ProtocolAnalysisMode::Must
-                if must_error_at(protocol, result, reached.point(), subject) =>
-            {
-                TypestateFindingCertainty::Must
+            ProtocolAnalysisMode::May if definite_path => TypestateFindingCertainty::May,
+            ProtocolAnalysisMode::May | ProtocolAnalysisMode::Must => {
+                TypestateFindingCertainty::Inconclusive
             }
-            ProtocolAnalysisMode::Must => TypestateFindingCertainty::Inconclusive,
         };
         findings.push(TypestateFinding {
-            subject,
+            subject: key.subject,
             site: binding.site().identity().clone(),
             kind: TypestateFindingKind::ErrorTransition {
                 event: binding.event(),
-                from: violation.from(),
-                to: violation.to(),
+                from: key.from,
+                to: key.to,
             },
             certainty,
             evidence: finding_evidence(
-                reached.path_qualities(),
+                aggregate.paths,
                 analysis_complete,
-                fact.uncertainty(),
-                fact.abstained(),
+                aggregate.uncertainty,
+                aggregate.abstained,
             ),
         });
     }
@@ -180,64 +341,57 @@ pub fn collect_summary_findings(
     for binding in bindings.terminal_bindings() {
         let terminal = protocol
             .terminal_expectation(binding.expectation())
-            .expect("terminal bindings retain valid expectation IDs");
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
         let observations = match terminal.on() {
             ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => {
-                let Some(point) = binding.site().program_point_handle() else {
-                    continue;
-                };
-                result
-                    .reached_at(point)
-                    .filter_map(|reached| {
-                        state_observation(
-                            result,
-                            reached.fact(),
-                            reached.path_qualities(),
-                            binding.subject(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }
-            ProtocolTerminalObservationSpec::Event { .. } => result
-                .reached()
-                .iter()
-                .filter_map(|reached| {
-                    let fact = *result.fact(reached.fact())?;
-                    let (terminal_binding, state) = fact.terminal_observation()?;
-                    (terminal_binding == binding.id()).then_some(StateObservation {
-                        state,
-                        uncertainty: fact.uncertainty(),
-                        abstained: fact.abstained(),
-                        path_qualities: reached.path_qualities(),
-                    })
+                let point = binding
+                    .site()
+                    .program_point_handle()
+                    .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+                reached_states.get(&StateKey {
+                    point: point.clone(),
+                    subject: binding.subject(),
                 })
-                .collect::<Vec<_>>(),
+            }
+            ProtocolTerminalObservationSpec::Event { .. } => event_terminals
+                .get(binding.id().index())
+                .and_then(Option::as_ref),
         };
-        if observations.is_empty() {
+        let Some(observations) = observations else {
             continue;
-        }
+        };
 
-        let mut actual_states = observations
-            .iter()
-            .map(|observation| observation.state)
-            .collect::<Vec<_>>();
+        let mut actual_states = observations.states.keys().copied().collect::<Vec<_>>();
         actual_states.sort_unstable();
-        actual_states.dedup();
         let failing = actual_states
             .iter()
             .filter(|state| terminal.expected_states().binary_search(state).is_err())
             .count();
-        let uncertain = observations
-            .iter()
-            .any(|observation| !observation.uncertainty.is_empty() || observation.abstained);
-        let all_paths_definitive = observations.iter().all(|observation| {
-            observation.path_qualities.has_proven_complete_path()
+        let binding_definitive = binding.quality().is_definitive()
+            && bindings
+                .subject(binding.subject())
+                .is_some_and(|subject| subject.quality().is_definitive());
+        let uncertain = !binding_definitive
+            || observations
+                .states
+                .values()
+                .any(|observation| !observation.uncertainty.is_empty() || observation.abstained);
+        let failing_proven = observations.states.iter().any(|(state, observation)| {
+            terminal.expected_states().binary_search(state).is_err()
+                && observation.paths.has_proven_path()
                 && observation.uncertainty.is_empty()
                 && !observation.abstained
+                && binding_definitive
         });
+        let all_paths_definitive = binding_definitive
+            && observations.states.values().all(|observation| {
+                observation.paths.has_proven_complete_path()
+                    && observation.uncertainty.is_empty()
+                    && !observation.abstained
+            });
         let certainty = match protocol.semantics().analysis_mode {
-            ProtocolAnalysisMode::May if failing > 0 => Some(TypestateFindingCertainty::May),
-            ProtocolAnalysisMode::May if uncertain || !analysis_complete => {
+            ProtocolAnalysisMode::May if failing_proven => Some(TypestateFindingCertainty::May),
+            ProtocolAnalysisMode::May if failing > 0 || uncertain || !analysis_complete => {
                 Some(TypestateFindingCertainty::Inconclusive)
             }
             ProtocolAnalysisMode::May => None,
@@ -255,12 +409,14 @@ pub fn collect_summary_findings(
             continue;
         };
         let path_proven = observations
-            .iter()
-            .any(|observation| observation.path_qualities.has_proven_path());
+            .states
+            .values()
+            .any(|observation| observation.paths.has_proven_path());
         let path_complete = observations
-            .iter()
-            .any(|observation| observation.path_qualities.has_complete_path());
-        let uncertainty = observations.iter().fold(
+            .states
+            .values()
+            .any(|observation| observation.paths.has_complete_path());
+        let uncertainty = observations.states.values().fold(
             TypestateUncertaintySet::default(),
             |uncertainty, observation| uncertainty.union(observation.uncertainty),
         );
@@ -277,14 +433,19 @@ pub fn collect_summary_findings(
                 path_complete,
                 analysis_complete,
                 uncertainty,
-                abstained: observations.iter().any(|observation| observation.abstained),
+                abstained: !binding_definitive
+                    || observations
+                        .states
+                        .values()
+                        .any(|observation| observation.abstained),
             },
         });
     }
 
     findings.sort_by(compare_findings);
     findings = merge_findings(findings);
-    let omitted = findings.len().saturating_sub(MAX_TYPESTATE_FINDINGS);
+    let omitted =
+        omitted_candidates.saturating_add(findings.len().saturating_sub(MAX_TYPESTATE_FINDINGS));
     findings.truncate(MAX_TYPESTATE_FINDINGS);
     Ok(TypestateFindingReport {
         findings: findings.into_boxed_slice(),
@@ -293,63 +454,103 @@ pub fn collect_summary_findings(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StateObservation {
-    state: ProtocolStateId,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StateKey {
+    point: ProgramPointHandle,
+    subject: TypestateSubjectId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ViolationKey {
+    point: ProgramPointHandle,
+    subject: TypestateSubjectId,
+    binding: TypestateEventBindingId,
+    from: ProtocolStateId,
+    to: ProtocolStateId,
+}
+
+#[derive(Debug, Clone)]
+struct ViolationAggregate {
+    paths: PathQualityFrontier,
     uncertainty: TypestateUncertaintySet,
     abstained: bool,
-    path_qualities: PathQualityFrontier,
 }
 
-fn state_observation(
-    result: &SummaryDataflowResult<TypestateFact>,
-    fact_id: crate::analyzer::dataflow::FactId,
-    path_qualities: PathQualityFrontier,
-    subject: TypestateSubjectId,
-) -> Option<StateObservation> {
-    let fact = *result.fact(fact_id)?;
-    match fact {
-        TypestateFact::State {
-            subject: fact_subject,
-            state,
+impl ViolationAggregate {
+    fn new(
+        paths: PathQualityFrontier,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) -> Self {
+        Self {
+            paths,
             uncertainty,
             abstained,
-            ..
-        } if fact_subject == subject => Some(StateObservation {
-            state,
-            uncertainty,
-            abstained,
-            path_qualities,
-        }),
-        TypestateFact::Zero
-        | TypestateFact::State { .. }
-        | TypestateFact::Violation { .. }
-        | TypestateFact::Terminal { .. } => None,
+        }
+    }
+
+    fn merge(
+        &mut self,
+        paths: PathQualityFrontier,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) {
+        merge_paths(&mut self.paths, paths);
+        self.uncertainty = self.uncertainty.union(uncertainty);
+        self.abstained |= abstained;
     }
 }
 
-fn must_error_at(
-    protocol: &CompiledProtocol,
-    result: &SummaryDataflowResult<TypestateFact>,
-    point: &crate::analyzer::semantic::ProgramPointHandle,
-    subject: TypestateSubjectId,
-) -> bool {
-    if !result.is_complete() {
-        return false;
+#[derive(Debug, Default, Clone)]
+struct ObservationAggregate {
+    states: HashMap<ProtocolStateId, ObservationEvidence>,
+}
+
+impl ObservationAggregate {
+    fn insert(
+        &mut self,
+        state: ProtocolStateId,
+        paths: PathQualityFrontier,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) {
+        self.states
+            .entry(state)
+            .and_modify(|observation| {
+                merge_paths(&mut observation.paths, paths);
+                observation.uncertainty = observation.uncertainty.union(uncertainty);
+                observation.abstained |= abstained;
+            })
+            .or_insert(ObservationEvidence {
+                paths,
+                uncertainty,
+                abstained,
+            });
     }
-    let observations = result
-        .reached_at(point)
-        .filter_map(|reached| {
-            state_observation(result, reached.fact(), reached.path_qualities(), subject)
-        })
-        .collect::<Vec<_>>();
-    !observations.is_empty()
-        && observations.iter().all(|observation| {
-            protocol.is_error(observation.state)
-                && observation.uncertainty.is_empty()
-                && !observation.abstained
-                && observation.path_qualities.has_proven_complete_path()
-        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ObservationEvidence {
+    paths: PathQualityFrontier,
+    uncertainty: TypestateUncertaintySet,
+    abstained: bool,
+}
+
+fn merge_paths(target: &mut PathQualityFrontier, incoming: PathQualityFrontier) {
+    for quality in incoming.iter() {
+        target.insert(quality);
+    }
+}
+
+fn check_cancellation(
+    cancellation: &CancellationToken,
+    index: usize,
+) -> Result<(), TypestateFlowProblemError> {
+    if index.is_multiple_of(256) && cancellation.is_cancelled() {
+        Err(TypestateFlowProblemError::FindingCancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn finding_evidence(

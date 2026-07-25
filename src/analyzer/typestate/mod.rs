@@ -28,8 +28,10 @@ pub use client::{
     solve_typestate_with_summaries,
 };
 pub use finding::{
-    MAX_TYPESTATE_FINDINGS, TypestateFinding, TypestateFindingCertainty, TypestateFindingEvidence,
-    TypestateFindingKind, TypestateFindingReport, collect_summary_findings,
+    MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS, MAX_TYPESTATE_FINDINGS,
+    TypestateFinding, TypestateFindingCertainty, TypestateFindingEvidence, TypestateFindingKind,
+    TypestateFindingLimits, TypestateFindingReport, collect_summary_findings,
+    collect_summary_findings_with_limits,
 };
 pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
 pub use protocol::{

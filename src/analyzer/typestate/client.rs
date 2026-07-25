@@ -197,6 +197,9 @@ pub enum TypestateFlowProblemError {
     BindingPlanMismatch,
     InvalidEntryFact,
     InvalidFactIdentity,
+    InvalidFindingLimits,
+    FindingBudgetExceeded,
+    FindingCancelled,
 }
 
 impl fmt::Display for TypestateFlowProblemError {
@@ -218,6 +221,15 @@ impl fmt::Display for TypestateFlowProblemError {
                 .write_str("typestate entry facts must be plan-branded state facts with valid IDs"),
             Self::InvalidFactIdentity => {
                 formatter.write_str("typestate fact carries an ID from a different binding plan")
+            }
+            Self::InvalidFindingLimits => {
+                formatter.write_str("typestate finding limits are zero or exceed hard limits")
+            }
+            Self::FindingBudgetExceeded => {
+                formatter.write_str("typestate finding post-processing budget was exceeded")
+            }
+            Self::FindingCancelled => {
+                formatter.write_str("typestate finding post-processing was cancelled")
             }
         }
     }
