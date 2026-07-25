@@ -309,6 +309,43 @@ pub enum ProtocolUncertaintyBehavior {
     Abstain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProtocolUncertaintyCause {
+    AmbiguousDispatch,
+    UnknownCall,
+    ExternalCall,
+    Escape,
+    IncompleteAnalysis,
+}
+
+impl ProtocolUncertaintySemantics {
+    pub const fn behavior(self, cause: ProtocolUncertaintyCause) -> ProtocolUncertaintyBehavior {
+        match cause {
+            ProtocolUncertaintyCause::AmbiguousDispatch => self.ambiguous_dispatch,
+            ProtocolUncertaintyCause::UnknownCall => self.unknown_call,
+            ProtocolUncertaintyCause::ExternalCall => self.external_call,
+            ProtocolUncertaintyCause::Escape => self.escape,
+            ProtocolUncertaintyCause::IncompleteAnalysis => self.incomplete_analysis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolUncertaintyResolution {
+    StateSet(Box<[ProtocolStateId]>),
+    PreserveUncertainty { state: ProtocolStateId },
+    Abstain,
+}
+
+impl ProtocolUncertaintyResolution {
+    pub fn states(&self) -> Option<&[ProtocolStateId]> {
+        match self {
+            Self::StateSet(states) => Some(states),
+            Self::PreserveUncertainty { .. } | Self::Abstain => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolProcedureExitKind {
@@ -510,6 +547,18 @@ impl CompiledProtocol {
             .take_while(move |transition| (transition.from, transition.on) == (state, event))
     }
 
+    fn outgoing_transitions(
+        &self,
+        state: ProtocolStateId,
+    ) -> impl Iterator<Item = &CompiledProtocolTransition> {
+        let start = self
+            .transitions
+            .partition_point(|transition| transition.from < state);
+        self.transitions[start..]
+            .iter()
+            .take_while(move |transition| transition.from == state)
+    }
+
     pub fn transition_for(
         &self,
         state: ProtocolStateId,
@@ -540,6 +589,74 @@ impl CompiledProtocol {
 
     pub const fn semantics(&self) -> ProtocolSemantics {
         self.semantics
+    }
+
+    /// Resolve one configured uncertainty cause into an executable state
+    /// transfer.
+    ///
+    /// Ambiguous dispatch represents one uncertain observation and therefore
+    /// includes the current state plus every matching one-event target.
+    /// Unknown or external calls, escape, and incomplete analysis may conceal
+    /// an arbitrary event sequence, so their conservative relation is the
+    /// reflexive transitive closure of matching transitions. All traversals are
+    /// iterative and bounded by the compiled protocol.
+    pub fn resolve_uncertainty(
+        &self,
+        cause: ProtocolUncertaintyCause,
+        state: ProtocolStateId,
+        cardinality: ProtocolObjectCardinality,
+    ) -> Option<ProtocolUncertaintyResolution> {
+        self.state_keys.get(state.index())?;
+        match self.semantics.uncertainty.behavior(cause) {
+            ProtocolUncertaintyBehavior::PreserveUncertainty => {
+                Some(ProtocolUncertaintyResolution::PreserveUncertainty { state })
+            }
+            ProtocolUncertaintyBehavior::Abstain => Some(ProtocolUncertaintyResolution::Abstain),
+            ProtocolUncertaintyBehavior::ConservativeTransition => {
+                let transitive = cause != ProtocolUncertaintyCause::AmbiguousDispatch;
+                Some(ProtocolUncertaintyResolution::StateSet(
+                    self.conservative_uncertainty_targets(state, cardinality, transitive),
+                ))
+            }
+        }
+    }
+
+    fn conservative_uncertainty_targets(
+        &self,
+        state: ProtocolStateId,
+        cardinality: ProtocolObjectCardinality,
+        transitive: bool,
+    ) -> Box<[ProtocolStateId]> {
+        let mut reached = vec![false; self.state_keys.len()];
+        reached[state.index()] = true;
+        let mut stack = vec![state];
+        while let Some(source) = stack.pop() {
+            for transition in self.outgoing_transitions(source) {
+                if !transition.guard.applies_to(cardinality) {
+                    continue;
+                }
+                let target = transition.to;
+                if !reached[target.index()] {
+                    reached[target.index()] = true;
+                    if transitive {
+                        stack.push(target);
+                    }
+                }
+            }
+            if !transitive {
+                break;
+            }
+        }
+        reached
+            .into_iter()
+            .enumerate()
+            .filter(|(_, present)| *present)
+            .map(|(index, _)| {
+                ProtocolStateId::try_from_index(index)
+                    .expect("compiled protocol state count fits in u32")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {

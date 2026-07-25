@@ -19,5 +19,6 @@ pub use protocol::{
     ProtocolProcedureExitKind, ProtocolSemantics, ProtocolSpec, ProtocolSpecParseError,
     ProtocolStateId, ProtocolStateKey, ProtocolTerminalExpectationSpec,
     ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
-    ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior,
+    ProtocolUncertaintyCause, ProtocolUncertaintyResolution, ProtocolUncertaintySemantics,
+    ProtocolUnmatchedEventBehavior,
 };

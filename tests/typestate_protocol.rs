@@ -3,7 +3,8 @@ use brokk_bifrost::analyzer::typestate::{
     ProtocolEventKey, ProtocolEventOccurrence, ProtocolEventSpec, ProtocolGuardSpec,
     ProtocolObjectCardinality, ProtocolObservationPhase, ProtocolObservationSpec,
     ProtocolProcedureExitKind, ProtocolSpec, ProtocolStateKey, ProtocolTerminalExpectationSpec,
-    ProtocolTerminalObservationSpec, ProtocolTransitionSpec,
+    ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
+    ProtocolUncertaintyCause, ProtocolUncertaintyResolution,
 };
 
 const RESOURCE_LIFECYCLE: &[u8] =
@@ -310,6 +311,71 @@ fn terminal_event_observations_reuse_event_shape_validation() {
             .expect_err("invalid terminal observation should fail"),
     );
     assert!(codes.contains(&ProtocolDiagnosticCode::InvalidTerminalObservation));
+}
+
+#[test]
+fn uncertainty_behaviors_compile_to_bounded_state_relations() {
+    let mut spec = fixture();
+    spec.semantics.uncertainty.ambiguous_dispatch =
+        ProtocolUncertaintyBehavior::ConservativeTransition;
+    spec.semantics.uncertainty.unknown_call = ProtocolUncertaintyBehavior::ConservativeTransition;
+    let protocol = spec.compile().expect("fixture should compile");
+    let open = protocol
+        .state_id(&ProtocolStateKey::new("open").unwrap())
+        .unwrap();
+
+    let state_names = |resolution: ProtocolUncertaintyResolution| {
+        resolution
+            .states()
+            .expect("conservative transition should produce states")
+            .iter()
+            .map(|state| protocol.state_key(*state).unwrap().as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        state_names(
+            protocol
+                .resolve_uncertainty(
+                    ProtocolUncertaintyCause::AmbiguousDispatch,
+                    open,
+                    ProtocolObjectCardinality::Singleton,
+                )
+                .unwrap()
+        ),
+        vec!["closed", "open"]
+    );
+    assert_eq!(
+        state_names(
+            protocol
+                .resolve_uncertainty(
+                    ProtocolUncertaintyCause::UnknownCall,
+                    open,
+                    ProtocolObjectCardinality::Singleton,
+                )
+                .unwrap()
+        ),
+        vec!["closed", "open", "violated"]
+    );
+    assert_eq!(
+        protocol
+            .resolve_uncertainty(
+                ProtocolUncertaintyCause::Escape,
+                open,
+                ProtocolObjectCardinality::Singleton,
+            )
+            .unwrap(),
+        ProtocolUncertaintyResolution::Abstain
+    );
+    assert_eq!(
+        protocol
+            .resolve_uncertainty(
+                ProtocolUncertaintyCause::ExternalCall,
+                open,
+                ProtocolObjectCardinality::Singleton,
+            )
+            .unwrap(),
+        ProtocolUncertaintyResolution::PreserveUncertainty { state: open }
+    );
 }
 
 #[test]

@@ -69,6 +69,11 @@ required for that checkpoint.
   terminal checks at bound events as well as analysis-root exits, widening
   resolved positional bindings to `u32`, and deriving violation identity from
   transition tuples/expectation IDs instead of free-form strings.
+- [x] (2026-07-25 12:58+02:00) Made uncertainty semantics executable:
+  ambiguous dispatch resolves to a reflexive one-event state relation;
+  unknown/external calls, escape, and incomplete analysis resolve to a
+  reflexive transitive relation; preserve and abstain are explicit outcomes.
+  The compiled iterative traversal is bounded by protocol states/transitions.
 - [ ] Run the guided specialist review over the first protocol checkpoint and
   resolve every actionable finding.
 - [ ] Define the pre-resolved subject/event binding plan and choose the
