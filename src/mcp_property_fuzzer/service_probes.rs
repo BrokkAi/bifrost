@@ -1566,7 +1566,18 @@ pub fn check_i1c(
 /// own keyword. `expected` stays a line vector so a trailing blank line at
 /// the range end is not lost to a join/re-split round trip.
 fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
-    let text_lines: Vec<&str> = text.lines().collect();
+    // CRLF files: `str::lines` strips `\r` only from `\r\n` pairs, so a
+    // block whose range ends between them keeps a lone trailing `\r`
+    // (brpc's rapidjson third-party headers). Normalize per line.
+    let text_lines: Vec<&str> = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let expected: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let expected = expected.as_slice();
     if text_lines.is_empty() || text_lines.len() != expected.len() {
         return false;
     }
