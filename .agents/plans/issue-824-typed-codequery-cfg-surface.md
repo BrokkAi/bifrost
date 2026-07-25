@@ -48,7 +48,7 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 - [x] (2026-07-25 12:28Z) Ran the requested branch-versus-`origin/master` guided review after the core Rust checkpoint and triaged eleven confirmed findings across correctness, resource bounds, public identity, profiling/explain output, schema metadata, and architecture.
 - [x] (2026-07-25 16:38 SAST) Corrected the reviewed semantic execution defects: one-way enclosing-procedure selection, character-based public ranges, bounded and cancellable materialization/traversal, branch-aware diagnostics, accurate per-operator work, stable content-scoped public IDs, and semantic policy hard caps.
 - [x] (2026-07-25 16:55 SAST) Published each physical step's planned semantic facets in explain output and associated every RQL pipeline wrapper with its canonical JSON operation metadata.
-- [ ] Complete Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
+- [x] (2026-07-25 16:58 SAST) Completed Milestone 4 by publishing planned semantic facets, attributing semantic work and termination to physical operators, and extracting shared semantic query context/value/identity helpers so later data-flow and typestate adapters do not depend on a CFG-named service.
 - [ ] Complete Milestone 5 by updating MCP, Python, LSP/VS Code, TextMate grammar, public docs, executable examples, and their behavior-focused tests for schema version 3.
 - [ ] Complete Milestone 6 by reconciling the umbrella roadmap, running the remaining client/documentation tests and the full `nlp,python` release gate, then performing the final guided review.
 
@@ -101,6 +101,9 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
 
 - Observation: Semantic diagnostics were drained only after the complete root expression and the service-level dedupe key omitted set-branch provenance.
   Evidence: A budget diagnostic emitted inside the second set branch surfaced without `[1]`, and successful branch work was charged only to the synthetic root profile node. Draining diagnostics and snapshotting semantic work after every physical step preserves the operator and branch that caused them.
+
+- Observation: The private pipeline repeated the same three semantic variants across terminal values, trace values, keys, detailed evidence, source retention, and rendering.
+  Evidence: Grouping procedure, program-point, and control-edge values under `SemanticPipelineValue` reduced each generic pipeline path to one semantic branch and made terminal and provenance evidence consume the same stable projection.
 
 ## Decision Log
 
@@ -168,6 +171,10 @@ This slice is valuable on its own for CFG inspection, editor navigation, debuggi
   Rationale: Planning, workspace-service activation, JSON help, and RQL help now consume one operation identity instead of maintaining private CFG keyword lists or descriptions that can drift when a domain is added.
   Date/Author: 2026-07-25 / Codex
 
+- Decision: Keep materialization cache, cancellation, budgets, diagnostics, and work accounting in `SemanticQueryContext`, with CFG traversal exposed through `CfgQueryAdapter`.
+  Rationale: Future data-flow and typestate adapters need the same coherent request state but should not inherit a CFG-named service or expand the generic executor with another parallel set of top-level semantic variants.
+  Date/Author: 2026-07-25 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 established schema version 3 while preserving exact version-2 pins. JSON and RQL now lower to the same seven-operation CFG algebra, validate procedure/point/edge domains before execution, and map version errors back to the authored operation. The compatible head also flows through LSP schema completion and policy documentation. Execution deliberately remains incomplete, not panicking, until the typed result contracts and semantic adapter land.
@@ -189,6 +196,10 @@ Validation at this checkpoint passed `cargo fmt`, `cargo clippy --all-targets --
 The reviewed correctness-and-bounds checkpoint separates cache validity from public identity, converts UTF-8 offsets to public character columns, restricts `procedure_of` to true enclosing procedures, and adds cancellable traversal plus retained-memory budgets. Semantic diagnostics and work are now drained at physical-step boundaries, preserving set-branch provenance and operator attribution; policy caps cover every semantic budget dimension. Shared semantic labels and digest framing replace the duplicate CFG-local identity helpers.
 
 Validation for this correction passed `cargo fmt`, `cargo check --lib`, the policy-budget and semantic-limit unit tests, all 119 `code_query_pipelines` integration tests, and focused regressions for nested procedures, Unicode columns, checkout-independent IDs, traversal exhaustion, branch diagnostics, and semantic profile accounting.
+
+Milestone 4 now makes semantic demand visible before execution and keeps execution ownership reusable. Physical explain nodes carry explicit procedure, program-point, and control-edge requirements derived from the query-step registry; RQL wrappers reuse their paired JSON operation metadata. Runtime semantic state lives in one request-local `SemanticQueryContext`, CFG traversal is a narrow adapter, and the generic pipeline handles a single grouped semantic value whose detailed terminal and provenance identities share one projection.
+
+Validation for Milestone 4 passed `cargo check --lib`, the schema-registry and public-explain unit tests, all 20 `structural_search_planner` tests, all 119 `code_query_pipelines` tests, and all 13 `policy_match_evaluation` tests.
 
 ## Context and Orientation
 
@@ -539,3 +550,5 @@ Revision note (2026-07-25 / Codex): Added the post-core guided-review findings a
 Revision note (2026-07-25 16:38 SAST / Codex): Completed the reviewed correctness-and-bounds checkpoint, recorded the separate validity/public identity scopes and per-step diagnostic/profile attribution, and added the focused and full pipeline validation evidence.
 
 Revision note (2026-07-25 16:55 SAST / Codex): Added declarative semantic-facet planning metadata, exposed it in the public physical plan, and linked RQL pipeline wrappers to their canonical JSON operation descriptions and schema versions.
+
+Revision note (2026-07-25 16:58 SAST / Codex): Completed Milestone 4 by extracting the reusable semantic query context and CFG adapter, grouping private semantic pipeline values, and sharing the detailed semantic identity projection across terminal and provenance evidence.

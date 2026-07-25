@@ -48,12 +48,12 @@ impl SemanticSourceSnapshot {
 }
 
 #[derive(Debug, Clone, Default)]
-struct CfgSemanticQuality {
+struct SemanticQueryQuality {
     proof_reason: Option<Arc<str>>,
     completeness_reason: Option<Arc<str>>,
 }
 
-impl CfgSemanticQuality {
+impl SemanticQueryQuality {
     fn unproven_partial(reason: impl Into<Arc<str>>) -> Self {
         let reason = reason.into();
         Self {
@@ -88,27 +88,27 @@ impl CfgSemanticQuality {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct CfgProcedureValue {
+pub(super) struct SemanticProcedureValue {
     pub(super) handle: ProcedureHandle,
     file: ProjectFile,
     source: SemanticSourceSnapshot,
-    quality: CfgSemanticQuality,
+    quality: SemanticQueryQuality,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct CfgProgramPointValue {
+pub(super) struct SemanticProgramPointValue {
     pub(super) handle: ProgramPointHandle,
     file: ProjectFile,
     source: SemanticSourceSnapshot,
-    quality: CfgSemanticQuality,
+    quality: SemanticQueryQuality,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct CfgControlEdgeValue {
+pub(super) struct SemanticControlEdgeValue {
     pub(super) handle: ControlEdgeHandle,
     file: ProjectFile,
     source: SemanticSourceSnapshot,
-    quality: CfgSemanticQuality,
+    quality: SemanticQueryQuality,
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +122,7 @@ enum CachedSemanticMaterialization {
     RetainedBudgetExhausted,
 }
 
-pub(super) struct CfgQueryService<'a> {
+pub(super) struct SemanticQueryContext<'a> {
     workspace: &'a WorkspaceAnalyzer,
     cancellation: Option<&'a CancellationToken>,
     uncancelled: CancellationToken,
@@ -139,7 +139,7 @@ pub(super) struct CfgQueryService<'a> {
     budget_exhausted: bool,
 }
 
-impl<'a> CfgQueryService<'a> {
+impl<'a> SemanticQueryContext<'a> {
     pub(super) fn new(
         workspace: &'a WorkspaceAnalyzer,
         cancellation: Option<&'a CancellationToken>,
@@ -165,7 +165,11 @@ impl<'a> CfgQueryService<'a> {
         }
     }
 
-    pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<CfgProcedureValue> {
+    pub(super) fn cfg(&mut self) -> CfgQueryAdapter<'_, 'a> {
+        CfgQueryAdapter { context: self }
+    }
+
+    fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
         let fact = seed.facts.node(seed.fact_match.node);
         let span = fact.span();
         let ranges = [Range {
@@ -211,10 +215,10 @@ impl<'a> CfgQueryService<'a> {
         }
     }
 
-    pub(super) fn procedure_of_declaration(
+    fn procedure_of_declaration(
         &mut self,
         declaration: &DeclarationValue,
-    ) -> Vec<CfgProcedureValue> {
+    ) -> Vec<SemanticProcedureValue> {
         let file = declaration.unit.source();
         let Some((artifact, source, quality)) = self.materialize(file) else {
             return Vec::new();
@@ -236,10 +240,10 @@ impl<'a> CfgQueryService<'a> {
         self.finish_procedure_lookup(file, source, candidates, quality)
     }
 
-    pub(super) fn cfg_entry(
+    fn cfg_entry(
         &mut self,
-        procedure: &CfgProcedureValue,
-    ) -> Option<CfgProgramPointValue> {
+        procedure: &SemanticProcedureValue,
+    ) -> Option<SemanticProgramPointValue> {
         let quality = procedure.quality.combine(&self.capability_quality(
             &procedure.file,
             procedure.handle.artifact().as_ref(),
@@ -251,7 +255,7 @@ impl<'a> CfgQueryService<'a> {
         procedure
             .handle
             .point_handle(procedure.handle.semantics().entry_point())
-            .map(|handle| CfgProgramPointValue {
+            .map(|handle| SemanticProgramPointValue {
                 handle,
                 file: procedure.file.clone(),
                 source: procedure.source.clone(),
@@ -259,7 +263,7 @@ impl<'a> CfgQueryService<'a> {
             })
     }
 
-    pub(super) fn cfg_exits(&mut self, procedure: &CfgProcedureValue) -> Vec<CfgProgramPointValue> {
+    fn cfg_exits(&mut self, procedure: &SemanticProcedureValue) -> Vec<SemanticProgramPointValue> {
         let quality = procedure.quality.combine(&self.capability_quality(
             &procedure.file,
             procedure.handle.artifact().as_ref(),
@@ -278,7 +282,7 @@ impl<'a> CfgQueryService<'a> {
         ids.into_iter()
             .filter(|id| seen.insert(*id))
             .filter_map(|id| procedure.handle.point_handle(id))
-            .map(|handle| CfgProgramPointValue {
+            .map(|handle| SemanticProgramPointValue {
                 handle,
                 file: procedure.file.clone(),
                 source: procedure.source.clone(),
@@ -287,33 +291,33 @@ impl<'a> CfgQueryService<'a> {
             .collect()
     }
 
-    pub(super) fn cfg_successor_edges(
+    fn cfg_successor_edges(
         &mut self,
-        point: &CfgProgramPointValue,
+        point: &SemanticProgramPointValue,
         max_outputs: usize,
-    ) -> Vec<CfgControlEdgeValue> {
+    ) -> Vec<SemanticControlEdgeValue> {
         self.cfg_edges(point, true, max_outputs)
     }
 
-    pub(super) fn cfg_predecessor_edges(
+    fn cfg_predecessor_edges(
         &mut self,
-        point: &CfgProgramPointValue,
+        point: &SemanticProgramPointValue,
         max_outputs: usize,
-    ) -> Vec<CfgControlEdgeValue> {
+    ) -> Vec<SemanticControlEdgeValue> {
         self.cfg_edges(point, false, max_outputs)
     }
 
-    pub(super) fn cfg_edge_source(
+    fn cfg_edge_source(
         &mut self,
-        edge: &CfgControlEdgeValue,
-    ) -> Option<CfgProgramPointValue> {
+        edge: &SemanticControlEdgeValue,
+    ) -> Option<SemanticProgramPointValue> {
         self.cfg_edge_endpoint(edge, true)
     }
 
-    pub(super) fn cfg_edge_target(
+    fn cfg_edge_target(
         &mut self,
-        edge: &CfgControlEdgeValue,
-    ) -> Option<CfgProgramPointValue> {
+        edge: &SemanticControlEdgeValue,
+    ) -> Option<SemanticProgramPointValue> {
         self.cfg_edge_endpoint(edge, false)
     }
 
@@ -343,8 +347,8 @@ impl<'a> CfgQueryService<'a> {
         file: &ProjectFile,
         source: SemanticSourceSnapshot,
         mut candidates: Vec<ProcedureHandle>,
-        mut quality: CfgSemanticQuality,
-    ) -> Vec<CfgProcedureValue> {
+        mut quality: SemanticQueryQuality,
+    ) -> Vec<SemanticProcedureValue> {
         let smallest_span = candidates
             .iter()
             .map(|candidate| {
@@ -360,7 +364,7 @@ impl<'a> CfgQueryService<'a> {
         }
         if candidates.len() > 1 {
             let reason: Arc<str> = "multiple equally specific enclosing procedures".into();
-            quality = quality.combine(&CfgSemanticQuality::unproven_partial(Arc::clone(&reason)));
+            quality = quality.combine(&SemanticQueryQuality::unproven_partial(Arc::clone(&reason)));
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                 CodeQueryDiagnosticImpact::Incomplete,
@@ -377,7 +381,7 @@ impl<'a> CfgQueryService<'a> {
         }
         candidates
             .into_iter()
-            .map(|handle| CfgProcedureValue {
+            .map(|handle| SemanticProcedureValue {
                 handle,
                 file: file.clone(),
                 source: source.clone(),
@@ -388,10 +392,10 @@ impl<'a> CfgQueryService<'a> {
 
     fn cfg_edges(
         &mut self,
-        point: &CfgProgramPointValue,
+        point: &SemanticProgramPointValue,
         successors: bool,
         max_outputs: usize,
-    ) -> Vec<CfgControlEdgeValue> {
+    ) -> Vec<SemanticControlEdgeValue> {
         let quality = point.quality.combine(&self.capability_quality(
             &point.file,
             point.handle.procedure().artifact().as_ref(),
@@ -423,13 +427,13 @@ impl<'a> CfgQueryService<'a> {
 
     fn collect_cfg_edges<'edge>(
         &mut self,
-        point: &CfgProgramPointValue,
-        quality: CfgSemanticQuality,
+        point: &SemanticProgramPointValue,
+        quality: SemanticQueryQuality,
         edges: impl ExactSizeIterator<
             Item = (crate::analyzer::semantic::ControlEdgeId, &'edge ControlEdge),
         >,
         max_outputs: usize,
-    ) -> Vec<CfgControlEdgeValue> {
+    ) -> Vec<SemanticControlEdgeValue> {
         let edge_count = edges.len();
         let remaining_traversal = self
             .limits
@@ -455,7 +459,7 @@ impl<'a> CfgQueryService<'a> {
             let Some(handle) = procedure.control_edge_handle(id) else {
                 continue;
             };
-            output.push(CfgControlEdgeValue {
+            output.push(SemanticControlEdgeValue {
                 handle,
                 file: point.file.clone(),
                 source: point.source.clone(),
@@ -470,9 +474,9 @@ impl<'a> CfgQueryService<'a> {
 
     fn cfg_edge_endpoint(
         &mut self,
-        edge: &CfgControlEdgeValue,
+        edge: &SemanticControlEdgeValue,
         source: bool,
-    ) -> Option<CfgProgramPointValue> {
+    ) -> Option<SemanticProgramPointValue> {
         let procedure = edge.handle.procedure();
         let quality = edge.quality.combine(&self.capability_quality(
             &edge.file,
@@ -490,7 +494,7 @@ impl<'a> CfgQueryService<'a> {
         };
         procedure
             .point_handle(id)
-            .map(|handle| CfgProgramPointValue {
+            .map(|handle| SemanticProgramPointValue {
                 handle,
                 file: edge.file.clone(),
                 source: edge.source.clone(),
@@ -504,7 +508,7 @@ impl<'a> CfgQueryService<'a> {
     ) -> Option<(
         Arc<SemanticArtifact>,
         SemanticSourceSnapshot,
-        CfgSemanticQuality,
+        SemanticQueryQuality,
     )> {
         if let Some(cached) = self.cache.get(file).cloned() {
             self.cache_hits = self.cache_hits.saturating_add(1);
@@ -593,13 +597,13 @@ impl<'a> CfgQueryService<'a> {
     ) -> Option<(
         Arc<SemanticArtifact>,
         SemanticSourceSnapshot,
-        CfgSemanticQuality,
+        SemanticQueryQuality,
     )> {
         match cached {
             CachedSemanticMaterialization::Outcome { outcome, source } => {
                 let value = outcome.available_value().cloned();
                 let quality = match &outcome {
-                    SemanticOutcome::Complete { .. } => CfgSemanticQuality::default(),
+                    SemanticOutcome::Complete { .. } => SemanticQueryQuality::default(),
                     SemanticOutcome::Ambiguous { .. } => {
                         let reason = "semantic provider returned an ambiguous artifact";
                         self.push_diagnostic(
@@ -608,7 +612,7 @@ impl<'a> CfgQueryService<'a> {
                             file,
                             reason,
                         );
-                        CfgSemanticQuality::unproven_partial(reason)
+                        SemanticQueryQuality::unproven_partial(reason)
                     }
                     SemanticOutcome::Unknown { .. } => {
                         let reason = "semantic provider returned an unknown partial artifact";
@@ -618,7 +622,7 @@ impl<'a> CfgQueryService<'a> {
                             file,
                             reason,
                         );
-                        CfgSemanticQuality::unproven_partial(reason)
+                        SemanticQueryQuality::unproven_partial(reason)
                     }
                     SemanticOutcome::Unsupported { capability, .. } => {
                         let reason = format!(
@@ -631,7 +635,7 @@ impl<'a> CfgQueryService<'a> {
                             file,
                             &reason,
                         );
-                        CfgSemanticQuality::unproven_partial(reason)
+                        SemanticQueryQuality::unproven_partial(reason)
                     }
                     SemanticOutcome::Unproven { .. } => {
                         let reason = "semantic provider returned an unproven partial artifact";
@@ -641,7 +645,7 @@ impl<'a> CfgQueryService<'a> {
                             file,
                             reason,
                         );
-                        CfgSemanticQuality::unproven_partial(reason)
+                        SemanticQueryQuality::unproven_partial(reason)
                     }
                     SemanticOutcome::ExceededBudget { exceeded, .. } => {
                         self.budget_exhausted = true;
@@ -652,7 +656,7 @@ impl<'a> CfgQueryService<'a> {
                             file,
                             &reason,
                         );
-                        CfgSemanticQuality::unproven_partial(reason)
+                        SemanticQueryQuality::unproven_partial(reason)
                     }
                     SemanticOutcome::Cancelled { .. } => {
                         self.push_diagnostic(
@@ -766,8 +770,8 @@ impl<'a> CfgQueryService<'a> {
         file: &ProjectFile,
         artifact: &SemanticArtifact,
         required: &[SemanticCapability],
-    ) -> CfgSemanticQuality {
-        let mut quality = CfgSemanticQuality::default();
+    ) -> SemanticQueryQuality {
+        let mut quality = SemanticQueryQuality::default();
         for &capability in required {
             match artifact.capabilities().support(capability) {
                 CapabilitySupport::Complete => {}
@@ -779,7 +783,7 @@ impl<'a> CfgQueryService<'a> {
                         file,
                         &reason,
                     );
-                    quality = quality.combine(&CfgSemanticQuality::partial(reason));
+                    quality = quality.combine(&SemanticQueryQuality::partial(reason));
                 }
                 CapabilitySupport::Unsupported => {
                     let reason = format!(
@@ -792,7 +796,7 @@ impl<'a> CfgQueryService<'a> {
                         file,
                         &reason,
                     );
-                    quality = quality.combine(&CfgSemanticQuality::partial(reason));
+                    quality = quality.combine(&SemanticQueryQuality::partial(reason));
                 }
             }
         }
@@ -820,7 +824,73 @@ impl<'a> CfgQueryService<'a> {
     }
 }
 
-impl CfgProcedureValue {
+/// CFG-specific projection over the reusable request-local semantic context.
+///
+/// Later flow or typestate adapters can share the same coherent
+/// materialization cache, diagnostics, cancellation, and work ledger without
+/// depending on the CFG operation surface.
+pub(super) struct CfgQueryAdapter<'context, 'workspace> {
+    context: &'context mut SemanticQueryContext<'workspace>,
+}
+
+impl CfgQueryAdapter<'_, '_> {
+    pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
+        self.context.procedure_of_match(seed)
+    }
+
+    pub(super) fn procedure_of_declaration(
+        &mut self,
+        declaration: &DeclarationValue,
+    ) -> Vec<SemanticProcedureValue> {
+        self.context.procedure_of_declaration(declaration)
+    }
+
+    pub(super) fn entry(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Option<SemanticProgramPointValue> {
+        self.context.cfg_entry(procedure)
+    }
+
+    pub(super) fn exits(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Vec<SemanticProgramPointValue> {
+        self.context.cfg_exits(procedure)
+    }
+
+    pub(super) fn successor_edges(
+        &mut self,
+        point: &SemanticProgramPointValue,
+        max_outputs: usize,
+    ) -> Vec<SemanticControlEdgeValue> {
+        self.context.cfg_successor_edges(point, max_outputs)
+    }
+
+    pub(super) fn predecessor_edges(
+        &mut self,
+        point: &SemanticProgramPointValue,
+        max_outputs: usize,
+    ) -> Vec<SemanticControlEdgeValue> {
+        self.context.cfg_predecessor_edges(point, max_outputs)
+    }
+
+    pub(super) fn edge_source(
+        &mut self,
+        edge: &SemanticControlEdgeValue,
+    ) -> Option<SemanticProgramPointValue> {
+        self.context.cfg_edge_source(edge)
+    }
+
+    pub(super) fn edge_target(
+        &mut self,
+        edge: &SemanticControlEdgeValue,
+    ) -> Option<SemanticProgramPointValue> {
+        self.context.cfg_edge_target(edge)
+    }
+}
+
+impl SemanticProcedureValue {
     pub(super) fn public(&self) -> CodeQueryProcedure {
         let procedure = self.handle.semantics();
         let mapping = procedure_source_mapping(&self.handle);
@@ -859,7 +929,7 @@ impl CfgProcedureValue {
     }
 }
 
-impl CfgProgramPointValue {
+impl SemanticProgramPointValue {
     pub(super) fn public(&self) -> CodeQueryProgramPoint {
         let procedure = self.handle.procedure();
         let point = procedure
@@ -931,7 +1001,7 @@ impl CfgProgramPointValue {
     }
 }
 
-impl CfgControlEdgeValue {
+impl SemanticControlEdgeValue {
     pub(super) fn public(&self) -> CodeQueryControlEdge {
         let procedure = self.handle.procedure();
         let edge = procedure
@@ -942,7 +1012,7 @@ impl CfgControlEdgeValue {
             .semantics()
             .source_mapping(edge.source)
             .expect("validated control edge has a source mapping");
-        let source = CfgProgramPointValue {
+        let source = SemanticProgramPointValue {
             handle: procedure
                 .point_handle(edge.source_point)
                 .expect("validated control edge source resolves"),
@@ -950,7 +1020,7 @@ impl CfgControlEdgeValue {
             source: self.source.clone(),
             quality: self.quality.clone(),
         };
-        let target = CfgProgramPointValue {
+        let target = SemanticProgramPointValue {
             handle: procedure
                 .point_handle(edge.target_point)
                 .expect("validated control edge target resolves"),
@@ -1045,7 +1115,10 @@ fn semantic_budget_limits(limits: CodeQuerySemanticLimits) -> SemanticWork {
     }
 }
 
-fn public_evidence(evidence: &Evidence, quality: &CfgSemanticQuality) -> CodeQuerySemanticEvidence {
+fn public_evidence(
+    evidence: &Evidence,
+    quality: &SemanticQueryQuality,
+) -> CodeQuerySemanticEvidence {
     let (proof, proof_reason) = match (&quality.proof_reason, &evidence.proof) {
         (Some(reason), _) => (
             CodeQuerySemanticProof::Unproven,

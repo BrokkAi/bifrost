@@ -89,7 +89,10 @@ mod tests;
 use expansions::{
     call_declaration_expansions, inbound_reference_expansions, scan_outbound_reference_hits,
 };
-use semantic::{CfgControlEdgeValue, CfgProcedureValue, CfgProgramPointValue, CfgQueryService};
+use semantic::{
+    SemanticControlEdgeValue, SemanticProcedureValue, SemanticProgramPointValue,
+    SemanticQueryContext,
+};
 
 // Internal wiring: hoist the handful of `expansions`-child items the moved
 // test module (tests.rs) still reaches via a bare `super::name` path, exactly
@@ -367,9 +370,7 @@ struct PipelineExpansion {
 enum PipelineValue {
     StructuralMatch(Arc<SeedMatch>),
     Declaration(DeclarationValue),
-    Procedure(CfgProcedureValue),
-    ProgramPoint(CfgProgramPointValue),
-    ControlEdge(CfgControlEdgeValue),
+    Semantic(SemanticPipelineValue),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
@@ -377,18 +378,40 @@ enum PipelineValue {
     ReceiverAnalysis(ReceiverAnalysisValue),
 }
 
+#[derive(Debug, Clone)]
+enum SemanticPipelineValue {
+    Procedure(SemanticProcedureValue),
+    ProgramPoint(SemanticProgramPointValue),
+    ControlEdge(SemanticControlEdgeValue),
+}
+
+struct DetailedSemanticProjection<'a> {
+    domain: DetailedCodeQueryDomain,
+    key: DetailedCodeQueryKey,
+    file: &'a ProjectFile,
+    byte_span: std::ops::Range<usize>,
+    display_range: CodeQueryRange,
+    language: &'static str,
+    stable_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PipelineKey {
     StructuralMatch(ProjectFile, u32),
     Declaration(DeclarationValue),
-    Procedure(crate::analyzer::semantic::ProcedureHandle),
-    ProgramPoint(crate::analyzer::semantic::ProgramPointHandle),
-    ControlEdge(crate::analyzer::semantic::ControlEdgeHandle),
+    Semantic(SemanticPipelineKey),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SemanticPipelineKey {
+    Procedure(crate::analyzer::semantic::ProcedureHandle),
+    ProgramPoint(crate::analyzer::semantic::ProgramPointHandle),
+    ControlEdge(crate::analyzer::semantic::ControlEdgeHandle),
 }
 
 impl PipelineValue {
@@ -398,9 +421,7 @@ impl PipelineValue {
                 PipelineKey::StructuralMatch(seed.file.clone(), seed.fact_match.node)
             }
             Self::Declaration(declaration) => PipelineKey::Declaration(declaration.clone()),
-            Self::Procedure(procedure) => PipelineKey::Procedure(procedure.handle.clone()),
-            Self::ProgramPoint(point) => PipelineKey::ProgramPoint(point.handle.clone()),
-            Self::ControlEdge(edge) => PipelineKey::ControlEdge(edge.handle.clone()),
+            Self::Semantic(value) => PipelineKey::Semantic(value.key()),
             Self::File(file) => PipelineKey::File(file.clone()),
             Self::ReferenceSite(site) => PipelineKey::ReferenceSite(site.clone()),
             Self::CallSite(site) => PipelineKey::CallSite(site.clone()),
@@ -410,6 +431,95 @@ impl PipelineValue {
                 value.report.site.file.clone(),
                 value.report.site.range,
             ),
+        }
+    }
+}
+
+impl SemanticPipelineValue {
+    fn key(&self) -> SemanticPipelineKey {
+        match self {
+            Self::Procedure(procedure) => SemanticPipelineKey::Procedure(procedure.handle.clone()),
+            Self::ProgramPoint(point) => SemanticPipelineKey::ProgramPoint(point.handle.clone()),
+            Self::ControlEdge(edge) => SemanticPipelineKey::ControlEdge(edge.handle.clone()),
+        }
+    }
+
+    fn file(&self) -> &ProjectFile {
+        match self {
+            Self::Procedure(value) => value.file(),
+            Self::ProgramPoint(value) => value.file(),
+            Self::ControlEdge(value) => value.file(),
+        }
+    }
+
+    fn public_result(self) -> CodeQueryResultValue {
+        match self {
+            Self::Procedure(value) => CodeQueryResultValue::Procedure {
+                value: value.public(),
+            },
+            Self::ProgramPoint(value) => CodeQueryResultValue::ProgramPoint {
+                value: value.public(),
+            },
+            Self::ControlEdge(value) => CodeQueryResultValue::ControlEdge {
+                value: Box::new(value.public()),
+            },
+        }
+    }
+
+    fn public_ref(&self) -> CodeQueryResultRef {
+        match self {
+            Self::Procedure(value) => value.public_ref(),
+            Self::ProgramPoint(value) => value.public_ref(),
+            Self::ControlEdge(value) => value.public_ref(),
+        }
+    }
+
+    fn detailed_projection(&self) -> DetailedSemanticProjection<'_> {
+        match self {
+            Self::Procedure(value) => {
+                let public = value.public();
+                DetailedSemanticProjection {
+                    domain: DetailedCodeQueryDomain::Procedure,
+                    key: DetailedCodeQueryKey::Procedure {
+                        id: public.id.clone(),
+                    },
+                    file: value.file(),
+                    byte_span: value.byte_span(),
+                    display_range: public.range,
+                    language: public.language,
+                    stable_id: public.id,
+                }
+            }
+            Self::ProgramPoint(value) => {
+                let public = value.public();
+                DetailedSemanticProjection {
+                    domain: DetailedCodeQueryDomain::ProgramPoint,
+                    key: DetailedCodeQueryKey::ProgramPoint {
+                        id: public.id.clone(),
+                        procedure_id: public.procedure_id,
+                    },
+                    file: value.file(),
+                    byte_span: value.byte_span(),
+                    display_range: public.range,
+                    language: public.language,
+                    stable_id: public.id,
+                }
+            }
+            Self::ControlEdge(value) => {
+                let public = value.public();
+                DetailedSemanticProjection {
+                    domain: DetailedCodeQueryDomain::ControlEdge,
+                    key: DetailedCodeQueryKey::ControlEdge {
+                        id: public.id.clone(),
+                        procedure_id: public.procedure_id,
+                    },
+                    file: value.file(),
+                    byte_span: value.byte_span(),
+                    display_range: public.range,
+                    language: public.language,
+                    stable_id: public.id,
+                }
+            }
         }
     }
 }
@@ -431,9 +541,7 @@ struct PipelineTraceStep {
 #[derive(Debug, Clone)]
 enum PipelineTraceValue {
     Declaration(DeclarationValue),
-    Procedure(CfgProcedureValue),
-    ProgramPoint(CfgProgramPointValue),
-    ControlEdge(CfgControlEdgeValue),
+    Semantic(SemanticPipelineValue),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
@@ -950,7 +1058,7 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
-    semantic: Option<CfgQueryService<'a>>,
+    semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
     import_graph_generations: Option<Box<[u64]>>,
     direct_import_layer: Option<Arc<DerivedLayer>>,
@@ -1332,7 +1440,7 @@ fn execute_internal_with_strategy(
         receiver_facts: HashMap::default(),
         semantic: workspace
             .filter(|_| requires_semantic)
-            .map(|workspace| CfgQueryService::new(workspace, cancellation, limits.semantic)),
+            .map(|workspace| SemanticQueryContext::new(workspace, cancellation, limits.semantic)),
         import_graph: None,
         import_graph_generations: None,
         direct_import_layer: None,
@@ -1384,7 +1492,7 @@ fn execute_internal_with_strategy(
     let semantic_work = state
         .semantic
         .as_ref()
-        .map_or_else(CodeQuerySemanticWork::default, CfgQueryService::work);
+        .map_or_else(CodeQuerySemanticWork::default, SemanticQueryContext::work);
     let execution_work_profile =
         capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
     let rendering_started = capture_profile.then(Instant::now);
@@ -1609,7 +1717,7 @@ fn state_execution_work_snapshot(state: &QueryExecutionState<'_>) -> QueryOperat
         state
             .semantic
             .as_ref()
-            .map_or_else(CodeQuerySemanticWork::default, CfgQueryService::work),
+            .map_or_else(CodeQuerySemanticWork::default, SemanticQueryContext::work),
     )
 }
 
@@ -1676,50 +1784,16 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
-        PipelineValue::Procedure(procedure) => {
-            let public = procedure.public();
+        PipelineValue::Semantic(value) => {
+            let projection = value.detailed_projection();
             detailed_semantic_evidence(
                 result_index,
-                DetailedCodeQueryDomain::Procedure,
-                DetailedCodeQueryKey::Procedure {
-                    id: public.id.clone(),
-                },
-                procedure.file(),
-                procedure.byte_span(),
-                public.language,
-                public.id,
-                retained_source,
-            )
-        }
-        PipelineValue::ProgramPoint(point) => {
-            let public = point.public();
-            detailed_semantic_evidence(
-                result_index,
-                DetailedCodeQueryDomain::ProgramPoint,
-                DetailedCodeQueryKey::ProgramPoint {
-                    id: public.id.clone(),
-                    procedure_id: public.procedure_id,
-                },
-                point.file(),
-                point.byte_span(),
-                public.language,
-                public.id,
-                retained_source,
-            )
-        }
-        PipelineValue::ControlEdge(edge) => {
-            let public = edge.public();
-            detailed_semantic_evidence(
-                result_index,
-                DetailedCodeQueryDomain::ControlEdge,
-                DetailedCodeQueryKey::ControlEdge {
-                    id: public.id.clone(),
-                    procedure_id: public.procedure_id,
-                },
-                edge.file(),
-                edge.byte_span(),
-                public.language,
-                public.id,
+                projection.domain,
+                projection.key,
+                projection.file,
+                projection.byte_span,
+                projection.language,
+                projection.stable_id,
                 retained_source,
             )
         }
@@ -1884,9 +1958,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
     match value {
         PipelineValue::StructuralMatch(seed) => Some(&seed.file),
         PipelineValue::Declaration(declaration) => Some(declaration.unit.source()),
-        PipelineValue::Procedure(procedure) => Some(procedure.file()),
-        PipelineValue::ProgramPoint(point) => Some(point.file()),
-        PipelineValue::ControlEdge(edge) => Some(edge.file()),
+        PipelineValue::Semantic(value) => Some(value.file()),
         PipelineValue::ReferenceSite(site) => Some(&site.file),
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
@@ -1976,14 +2048,8 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::Declaration(declaration) => {
             files.insert(declaration.unit.source().clone());
         }
-        PipelineValue::Procedure(procedure) => {
-            files.insert(procedure.file().clone());
-        }
-        PipelineValue::ProgramPoint(point) => {
-            files.insert(point.file().clone());
-        }
-        PipelineValue::ControlEdge(edge) => {
-            files.insert(edge.file().clone());
+        PipelineValue::Semantic(value) => {
+            files.insert(value.file().clone());
         }
         PipelineValue::File(_) => {}
         PipelineValue::ReferenceSite(site) => collect_reference_source_files(site, files),
@@ -1998,14 +2064,8 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         PipelineTraceValue::Declaration(declaration) => {
             files.insert(declaration.unit.source().clone());
         }
-        PipelineTraceValue::Procedure(procedure) => {
-            files.insert(procedure.file().clone());
-        }
-        PipelineTraceValue::ProgramPoint(point) => {
-            files.insert(point.file().clone());
-        }
-        PipelineTraceValue::ControlEdge(edge) => {
-            files.insert(edge.file().clone());
+        PipelineTraceValue::Semantic(value) => {
+            files.insert(value.file().clone());
         }
         PipelineTraceValue::File(_) => {}
         PipelineTraceValue::ReferenceSite(site) => collect_reference_source_files(site, files),
@@ -2166,50 +2226,16 @@ fn detailed_trace_provenance_ref(
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     match value {
         PipelineTraceValue::Declaration(value) => detailed_declaration_provenance_ref(value, cache),
-        PipelineTraceValue::Procedure(value) => {
-            let public = value.public();
+        PipelineTraceValue::Semantic(value) => {
+            let projection = value.detailed_projection();
             detailed_semantic_provenance_ref(
-                DetailedCodeQueryDomain::Procedure,
-                DetailedCodeQueryKey::Procedure {
-                    id: public.id.clone(),
-                },
-                value.file(),
-                value.byte_span(),
-                public.range,
-                public.language,
-                public.id,
-                cache,
-            )
-        }
-        PipelineTraceValue::ProgramPoint(value) => {
-            let public = value.public();
-            detailed_semantic_provenance_ref(
-                DetailedCodeQueryDomain::ProgramPoint,
-                DetailedCodeQueryKey::ProgramPoint {
-                    id: public.id.clone(),
-                    procedure_id: public.procedure_id,
-                },
-                value.file(),
-                value.byte_span(),
-                public.range,
-                public.language,
-                public.id,
-                cache,
-            )
-        }
-        PipelineTraceValue::ControlEdge(value) => {
-            let public = value.public();
-            detailed_semantic_provenance_ref(
-                DetailedCodeQueryDomain::ControlEdge,
-                DetailedCodeQueryKey::ControlEdge {
-                    id: public.id.clone(),
-                    procedure_id: public.procedure_id,
-                },
-                value.file(),
-                value.byte_span(),
-                public.range,
-                public.language,
-                public.id,
+                projection.domain,
+                projection.key,
+                projection.file,
+                projection.byte_span,
+                projection.display_range,
+                projection.language,
+                projection.stable_id,
                 cache,
             )
         }
@@ -4475,9 +4501,7 @@ fn apply_plan_step(
                     PipelineValue::File(file) => topology.import_count(file),
                     PipelineValue::StructuralMatch(_)
                     | PipelineValue::Declaration(_)
-                    | PipelineValue::Procedure(_)
-                    | PipelineValue::ProgramPoint(_)
-                    | PipelineValue::ControlEdge(_)
+                    | PipelineValue::Semantic(_)
                     | PipelineValue::ReferenceSite(_)
                     | PipelineValue::CallSite(_)
                     | PipelineValue::ExpressionSite(_)
@@ -4521,9 +4545,7 @@ fn apply_plan_step(
                                 PipelineValue::File(file) => Some(graph.importer_count(file)),
                                 PipelineValue::StructuralMatch(_)
                                 | PipelineValue::Declaration(_)
-                                | PipelineValue::Procedure(_)
-                                | PipelineValue::ProgramPoint(_)
-                                | PipelineValue::ControlEdge(_)
+                                | PipelineValue::Semantic(_)
                                 | PipelineValue::ReferenceSite(_)
                                 | PipelineValue::CallSite(_)
                                 | PipelineValue::ExpressionSite(_)
@@ -4574,9 +4596,7 @@ fn apply_plan_step(
                         PipelineValue::File(file) => Some(file.clone()),
                         PipelineValue::StructuralMatch(_)
                         | PipelineValue::Declaration(_)
-                        | PipelineValue::Procedure(_)
-                        | PipelineValue::ProgramPoint(_)
-                        | PipelineValue::ControlEdge(_)
+                        | PipelineValue::Semantic(_)
                         | PipelineValue::ReferenceSite(_)
                         | PipelineValue::CallSite(_)
                         | PipelineValue::ExpressionSite(_)
@@ -5001,7 +5021,7 @@ fn apply_pipeline_step(
     reference_cache: &mut ReferenceTraversalCache,
     call_cache: &mut CallTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
-    semantic: &mut Option<CfgQueryService<'_>>,
+    semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: usize,
@@ -5127,64 +5147,98 @@ fn apply_pipeline_step(
             (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
+                .cfg()
                 .procedure_of_match(seed)
                 .into_iter()
-                .map(PipelineValue::Procedure)
+                .map(SemanticPipelineValue::Procedure)
+                .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
             (PipelineValue::Declaration(declaration), QueryStep::ProcedureOf) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
+                .cfg()
                 .procedure_of_declaration(declaration)
                 .into_iter()
-                .map(PipelineValue::Procedure)
+                .map(SemanticPipelineValue::Procedure)
+                .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
-            (PipelineValue::Procedure(procedure), QueryStep::CfgEntry) => semantic
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::CfgEntry,
+            ) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_entry(procedure)
-                .map(PipelineValue::ProgramPoint)
+                .cfg()
+                .entry(procedure)
+                .map(SemanticPipelineValue::ProgramPoint)
+                .map(PipelineValue::Semantic)
                 .into_iter()
                 .map(pipeline_expansion)
                 .collect(),
-            (PipelineValue::Procedure(procedure), QueryStep::CfgExits) => semantic
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::CfgExits,
+            ) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_exits(procedure)
+                .cfg()
+                .exits(procedure)
                 .into_iter()
-                .map(PipelineValue::ProgramPoint)
+                .map(SemanticPipelineValue::ProgramPoint)
+                .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
-            (PipelineValue::ProgramPoint(point), QueryStep::CfgSuccessorEdges) => semantic
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(point)),
+                QueryStep::CfgSuccessorEdges,
+            ) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_successor_edges(point, max_step_outputs.saturating_sub(output.len()))
+                .cfg()
+                .successor_edges(point, max_step_outputs.saturating_sub(output.len()))
                 .into_iter()
-                .map(PipelineValue::ControlEdge)
+                .map(SemanticPipelineValue::ControlEdge)
+                .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
-            (PipelineValue::ProgramPoint(point), QueryStep::CfgPredecessorEdges) => semantic
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(point)),
+                QueryStep::CfgPredecessorEdges,
+            ) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_predecessor_edges(point, max_step_outputs.saturating_sub(output.len()))
+                .cfg()
+                .predecessor_edges(point, max_step_outputs.saturating_sub(output.len()))
                 .into_iter()
-                .map(PipelineValue::ControlEdge)
+                .map(SemanticPipelineValue::ControlEdge)
+                .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
-            (PipelineValue::ControlEdge(edge), QueryStep::CfgEdgeSource) => semantic
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ControlEdge(edge)),
+                QueryStep::CfgEdgeSource,
+            ) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_edge_source(edge)
-                .map(PipelineValue::ProgramPoint)
+                .cfg()
+                .edge_source(edge)
+                .map(SemanticPipelineValue::ProgramPoint)
+                .map(PipelineValue::Semantic)
                 .into_iter()
                 .map(pipeline_expansion)
                 .collect(),
-            (PipelineValue::ControlEdge(edge), QueryStep::CfgEdgeTarget) => semantic
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ControlEdge(edge)),
+                QueryStep::CfgEdgeTarget,
+            ) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
-                .cfg_edge_target(edge)
-                .map(PipelineValue::ProgramPoint)
+                .cfg()
+                .edge_target(edge)
+                .map(SemanticPipelineValue::ProgramPoint)
+                .map(PipelineValue::Semantic)
                 .into_iter()
                 .map(pipeline_expansion)
                 .collect(),
@@ -5213,17 +5267,26 @@ fn apply_pipeline_step(
                     declaration.unit.source().clone(),
                 ))]
             }
-            (PipelineValue::Procedure(procedure), QueryStep::FileOf) => {
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::FileOf,
+            ) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     procedure.file().clone(),
                 ))]
             }
-            (PipelineValue::ProgramPoint(point), QueryStep::FileOf) => {
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(point)),
+                QueryStep::FileOf,
+            ) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     point.file().clone(),
                 ))]
             }
-            (PipelineValue::ControlEdge(edge), QueryStep::FileOf) => {
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ControlEdge(edge)),
+                QueryStep::FileOf,
+            ) => {
                 vec![pipeline_expansion(PipelineValue::File(edge.file().clone()))]
             }
             (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
@@ -7015,11 +7078,7 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::Declaration(declaration) => {
             Some(PipelineTraceValue::Declaration(declaration.clone()))
         }
-        PipelineValue::Procedure(procedure) => {
-            Some(PipelineTraceValue::Procedure(procedure.clone()))
-        }
-        PipelineValue::ProgramPoint(point) => Some(PipelineTraceValue::ProgramPoint(point.clone())),
-        PipelineValue::ControlEdge(edge) => Some(PipelineTraceValue::ControlEdge(edge.clone())),
+        PipelineValue::Semantic(value) => Some(PipelineTraceValue::Semantic(value.clone())),
         PipelineValue::File(file) => Some(PipelineTraceValue::File(file.clone())),
         PipelineValue::ReferenceSite(site) => Some(PipelineTraceValue::ReferenceSite(site.clone())),
         PipelineValue::CallSite(site) => Some(PipelineTraceValue::CallSite(site.clone())),
@@ -7087,15 +7146,7 @@ fn render_pipeline_item(
         PipelineValue::Declaration(declaration) => CodeQueryResultValue::Declaration {
             value: render_declaration(analyzer, &declaration, detail, cache),
         },
-        PipelineValue::Procedure(procedure) => CodeQueryResultValue::Procedure {
-            value: procedure.public(),
-        },
-        PipelineValue::ProgramPoint(point) => CodeQueryResultValue::ProgramPoint {
-            value: point.public(),
-        },
-        PipelineValue::ControlEdge(edge) => CodeQueryResultValue::ControlEdge {
-            value: Box::new(edge.public()),
-        },
+        PipelineValue::Semantic(value) => value.public_result(),
         PipelineValue::File(file) => CodeQueryResultValue::File {
             value: render_file(&file),
         },
@@ -7137,9 +7188,7 @@ fn render_provenance(
                     PipelineTraceValue::Declaration(declaration) => {
                         render_declaration_ref(analyzer, declaration, detail, cache)
                     }
-                    PipelineTraceValue::Procedure(procedure) => procedure.public_ref(),
-                    PipelineTraceValue::ProgramPoint(point) => point.public_ref(),
-                    PipelineTraceValue::ControlEdge(edge) => edge.public_ref(),
+                    PipelineTraceValue::Semantic(value) => value.public_ref(),
                     PipelineTraceValue::File(file) => render_file_ref(file),
                     PipelineTraceValue::ReferenceSite(site) => {
                         render_reference_site_ref(analyzer, site, detail, cache)
