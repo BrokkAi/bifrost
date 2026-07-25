@@ -1,17 +1,27 @@
-use crate::analyzer::dataflow::PathQualityFrontier;
-use crate::analyzer::semantic::{CancellationToken, ProgramPointHandle, SemanticLocator};
+use std::hash::Hash;
+
+use crate::analyzer::dataflow::{
+    PathQuality, PathQualityFrontier, SummaryWitness, SummaryWitnessStepKind,
+    WitnessReconstructionLimits, WitnessReconstructionWork,
+};
+use crate::analyzer::semantic::{
+    CallSiteHandle, CancellationToken, EvidenceCompleteness, ProgramPointHandle, ProofStatus,
+    SemanticLocator,
+};
 use crate::hash::{HashMap, HashSet};
 
 use super::{
     CompiledProtocol, ProtocolAnalysisMode, ProtocolEventId, ProtocolExpectationId,
     ProtocolStateId, ProtocolTerminalObservationSpec, TypestateBindingPlan,
-    TypestateEventBindingId, TypestateFlowProblemError, TypestateSubjectId, TypestateSummaryResult,
-    TypestateUncertaintySet,
+    TypestateEventBindingId, TypestateFact, TypestateFlowProblemError, TypestateSubjectId,
+    TypestateSummaryResult, TypestateTerminalBindingId, TypestateUncertaintySet,
 };
 
 pub const MAX_TYPESTATE_FINDINGS: usize = 4_096;
 pub const MAX_TYPESTATE_FINDING_CANDIDATES: usize = 8_192;
 pub const MAX_TYPESTATE_FINDING_REACHED_ROWS: usize = 1_000_000;
+pub const MAX_TYPESTATE_WITNESS_STEPS: usize = 64;
+pub const MAX_TYPESTATE_WITNESS_EXPANSIONS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypestateFindingLimits {
@@ -113,6 +123,7 @@ pub struct TypestateFinding {
     kind: TypestateFindingKind,
     certainty: TypestateFindingCertainty,
     evidence: TypestateFindingEvidence,
+    witness: TypestateWitness,
 }
 
 impl TypestateFinding {
@@ -134,6 +145,118 @@ impl TypestateFinding {
 
     pub const fn evidence(&self) -> TypestateFindingEvidence {
         self.evidence
+    }
+
+    pub const fn witness(&self) -> &TypestateWitness {
+        &self.witness
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypestateWitnessStep {
+    kind: SummaryWitnessStepKind,
+    source: ProgramPointHandle,
+    target: Option<ProgramPointHandle>,
+    origin: Option<CallSiteHandle>,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+impl TypestateWitnessStep {
+    pub const fn kind(&self) -> SummaryWitnessStepKind {
+        self.kind
+    }
+
+    pub const fn source(&self) -> &ProgramPointHandle {
+        &self.source
+    }
+
+    pub const fn target(&self) -> Option<&ProgramPointHandle> {
+        self.target.as_ref()
+    }
+
+    pub const fn origin(&self) -> Option<&CallSiteHandle> {
+        self.origin.as_ref()
+    }
+
+    pub const fn proof(&self) -> &ProofStatus {
+        &self.proof
+    }
+
+    pub const fn completeness(&self) -> &EvidenceCompleteness {
+        &self.completeness
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypestateWitness {
+    steps: Box<[TypestateWitnessStep]>,
+    quality: PathQuality,
+    truncated: bool,
+    omitted_steps_lower_bound: usize,
+    alternatives_truncated: bool,
+    work: WitnessReconstructionWork,
+    source_order: usize,
+}
+
+impl TypestateWitness {
+    fn from_summary(witness: SummaryWitness, source_order: usize) -> Self {
+        let steps = witness
+            .steps()
+            .iter()
+            .map(|step| TypestateWitnessStep {
+                kind: step.kind(),
+                source: step.source().clone(),
+                target: step.target().cloned(),
+                origin: step.origin().cloned(),
+                proof: step.proof().clone(),
+                completeness: step.completeness().clone(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            steps,
+            quality: witness.quality(),
+            truncated: witness.truncated(),
+            omitted_steps_lower_bound: witness.omitted_steps_lower_bound(),
+            alternatives_truncated: witness.alternatives_truncated(),
+            work: witness.work(),
+            source_order,
+        }
+    }
+
+    pub fn steps(&self) -> &[TypestateWitnessStep] {
+        &self.steps
+    }
+
+    pub const fn quality(&self) -> PathQuality {
+        self.quality
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub const fn omitted_steps_lower_bound(&self) -> usize {
+        self.omitted_steps_lower_bound
+    }
+
+    pub const fn alternatives_truncated(&self) -> bool {
+        self.alternatives_truncated
+    }
+
+    pub const fn work(&self) -> WitnessReconstructionWork {
+        self.work
+    }
+
+    const fn preference(&self) -> (bool, bool, bool, bool, std::cmp::Reverse<usize>) {
+        (
+            self.quality.is_proven(),
+            self.quality.is_complete(),
+            !self.truncated,
+            !self.alternatives_truncated,
+            std::cmp::Reverse(self.source_order),
+        )
     }
 }
 
@@ -196,6 +319,9 @@ pub fn collect_summary_findings_with_limits(
     let mut violations = HashMap::<ViolationKey, ViolationAggregate>::default();
     let mut non_violations = HashSet::<EventOutcomeKey>::default();
     let mut violation_outcome_counts = HashMap::<EventOutcomeKey, usize>::default();
+    let mut violation_witnesses = HashMap::<ViolationKey, FindingWitnessTarget>::default();
+    let mut terminal_witnesses = HashMap::<TerminalWitnessKey, FindingWitnessTarget>::default();
+    let mut state_witnesses = HashMap::<StateWitnessKey, FindingWitnessTarget>::default();
     let mut event_terminals: Vec<Option<ObservationAggregate>> =
         vec![None; bindings.terminal_bindings().len()];
     let mut needed_states = HashSet::<StateKey>::default();
@@ -238,6 +364,15 @@ pub fn collect_summary_findings_with_limits(
                 from: violation.from(),
                 to: violation.to(),
             };
+            retain_preferred_witness_target(
+                &mut violation_witnesses,
+                key.clone(),
+                FindingWitnessTarget::new(
+                    index,
+                    reached.path_qualities(),
+                    fact.uncertainty().is_empty() && !fact.abstained(),
+                )?,
+            );
             if let Some(aggregate) = violations.get_mut(&key) {
                 aggregate.merge(
                     reached.path_qualities(),
@@ -287,6 +422,18 @@ pub fn collect_summary_findings_with_limits(
             }
         }
         if let Some((terminal_binding, state)) = fact.terminal_observation() {
+            retain_preferred_witness_target(
+                &mut terminal_witnesses,
+                TerminalWitnessKey {
+                    binding: terminal_binding,
+                    state,
+                },
+                FindingWitnessTarget::new(
+                    index,
+                    reached.path_qualities(),
+                    fact.uncertainty().is_empty() && !fact.abstained(),
+                )?,
+            );
             let aggregate = event_terminals
                 .get_mut(terminal_binding.index())
                 .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
@@ -320,6 +467,19 @@ pub fn collect_summary_findings_with_limits(
             subject,
         };
         if needed_states.contains(&key) {
+            retain_preferred_witness_target(
+                &mut state_witnesses,
+                StateWitnessKey {
+                    point: reached.point().clone(),
+                    subject,
+                    state,
+                },
+                FindingWitnessTarget::new(
+                    index,
+                    reached.path_qualities(),
+                    uncertainty.is_empty() && !abstained,
+                )?,
+            );
             let is_new = reached_states
                 .get(&key)
                 .is_none_or(|aggregate| !aggregate.contains(state));
@@ -358,6 +518,14 @@ pub fn collect_summary_findings_with_limits(
             &aggregate,
             has_competing_outcome,
         );
+        let witness = reconstruct_finding_witness(
+            result,
+            violation_witnesses
+                .get(&key)
+                .copied()
+                .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?,
+            cancellation,
+        )?;
         findings.push(TypestateFinding {
             subject: key.subject,
             site: binding.site().identity().clone(),
@@ -373,6 +541,7 @@ pub fn collect_summary_findings_with_limits(
                 aggregate.uncertainty,
                 aggregate.abstained,
             ),
+            witness,
         });
     }
 
@@ -381,20 +550,26 @@ pub fn collect_summary_findings_with_limits(
         let terminal = protocol
             .terminal_expectation(binding.expectation())
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        let observations = match terminal.on() {
+        let (observations, root_point) = match terminal.on() {
             ProtocolTerminalObservationSpec::AnalysisRootExit { .. } => {
                 let point = binding
                     .site()
                     .program_point_handle()
                     .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-                reached_states.get(&StateKey {
-                    point: point.clone(),
-                    subject: binding.subject(),
-                })
+                (
+                    reached_states.get(&StateKey {
+                        point: point.clone(),
+                        subject: binding.subject(),
+                    }),
+                    Some(point.clone()),
+                )
             }
-            ProtocolTerminalObservationSpec::Event { .. } => event_terminals
-                .get(binding.id().index())
-                .and_then(Option::as_ref),
+            ProtocolTerminalObservationSpec::Event { .. } => (
+                event_terminals
+                    .get(binding.id().index())
+                    .and_then(Option::as_ref),
+                None,
+            ),
         };
         let Some(observations) = observations else {
             continue;
@@ -457,6 +632,29 @@ pub fn collect_summary_findings_with_limits(
             TypestateUncertaintySet::default(),
             |uncertainty, observation| uncertainty.union(observation.uncertainty),
         );
+        let witness_target = actual_states
+            .iter()
+            .filter(|state| {
+                failing == 0 || terminal.expected_states().binary_search(state).is_err()
+            })
+            .filter_map(|state| match root_point.as_ref() {
+                Some(point) => state_witnesses
+                    .get(&StateWitnessKey {
+                        point: (*point).clone(),
+                        subject: binding.subject(),
+                        state: *state,
+                    })
+                    .copied(),
+                None => terminal_witnesses
+                    .get(&TerminalWitnessKey {
+                        binding: binding.id(),
+                        state: *state,
+                    })
+                    .copied(),
+            })
+            .max_by_key(|target| target.preference())
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+        let witness = reconstruct_finding_witness(result, witness_target, cancellation)?;
         findings.push(TypestateFinding {
             subject: binding.subject(),
             site: binding.site().identity().clone(),
@@ -476,6 +674,7 @@ pub fn collect_summary_findings_with_limits(
                         .values()
                         .any(|observation| observation.abstained),
             },
+            witness,
         });
     }
 
@@ -512,6 +711,98 @@ struct EventOutcomeKey {
     point: ProgramPointHandle,
     subject: TypestateSubjectId,
     binding: TypestateEventBindingId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TerminalWitnessKey {
+    binding: TypestateTerminalBindingId,
+    state: ProtocolStateId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StateWitnessKey {
+    point: ProgramPointHandle,
+    subject: TypestateSubjectId,
+    state: ProtocolStateId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FindingWitnessTarget {
+    reached_index: usize,
+    quality: PathQuality,
+    definitive: bool,
+}
+
+impl FindingWitnessTarget {
+    fn new(
+        reached_index: usize,
+        paths: PathQualityFrontier,
+        definitive: bool,
+    ) -> Result<Self, TypestateFlowProblemError> {
+        let quality = paths
+            .iter()
+            .max_by_key(|quality| (quality.is_proven(), quality.is_complete()))
+            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+        Ok(Self {
+            reached_index,
+            quality,
+            definitive,
+        })
+    }
+
+    const fn preference(self) -> (bool, bool, bool, std::cmp::Reverse<usize>) {
+        (
+            self.definitive,
+            self.quality.is_proven(),
+            self.quality.is_complete(),
+            std::cmp::Reverse(self.reached_index),
+        )
+    }
+}
+
+fn retain_preferred_witness_target<Key>(
+    targets: &mut HashMap<Key, FindingWitnessTarget>,
+    key: Key,
+    candidate: FindingWitnessTarget,
+) where
+    Key: Eq + Hash,
+{
+    targets
+        .entry(key)
+        .and_modify(|retained| {
+            if candidate.preference() > retained.preference() {
+                *retained = candidate;
+            }
+        })
+        .or_insert(candidate);
+}
+
+fn reconstruct_finding_witness(
+    result: &crate::analyzer::dataflow::SummaryDataflowResult<TypestateFact>,
+    target: FindingWitnessTarget,
+    cancellation: &CancellationToken,
+) -> Result<TypestateWitness, TypestateFlowProblemError> {
+    check_cancelled(cancellation)?;
+    let reached = result
+        .reached()
+        .get(target.reached_index)
+        .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
+    let witness = result
+        .witness_for_reached(
+            reached,
+            target.quality,
+            WitnessReconstructionLimits::new(
+                MAX_TYPESTATE_WITNESS_STEPS,
+                MAX_TYPESTATE_WITNESS_EXPANSIONS,
+            )
+            .expect("typestate witness limits are positive"),
+        )
+        .map_err(TypestateFlowProblemError::WitnessReconstruction)?;
+    check_cancelled(cancellation)?;
+    Ok(TypestateWitness::from_summary(
+        witness,
+        target.reached_index,
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -675,6 +966,9 @@ fn merge_findings(
             previous.evidence.merge(finding.evidence);
             if previous.certainty != finding.certainty {
                 previous.certainty = TypestateFindingCertainty::Inconclusive;
+            }
+            if finding.witness.preference() > previous.witness.preference() {
+                previous.witness = finding.witness;
             }
         } else {
             merged.push(finding);

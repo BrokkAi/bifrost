@@ -3,7 +3,8 @@ use std::fmt;
 
 use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
-    SummaryDataflowError, SummaryDataflowResult, SummarySolveInput, solve_with_summaries,
+    SummaryDataflowError, SummaryDataflowResult, SummarySolveInput, SummaryWitnessError,
+    WitnessRetentionLimits, solve_with_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -260,6 +261,7 @@ pub enum TypestateFlowProblemError {
     InvalidFindingLimits,
     FindingBudgetExceeded,
     FindingCancelled,
+    WitnessReconstruction(SummaryWitnessError),
 }
 
 impl fmt::Display for TypestateFlowProblemError {
@@ -291,11 +293,32 @@ impl fmt::Display for TypestateFlowProblemError {
             Self::FindingCancelled => {
                 formatter.write_str("typestate finding post-processing was cancelled")
             }
+            Self::WitnessReconstruction(error) => {
+                write!(
+                    formatter,
+                    "typestate witness reconstruction failed: {error}"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for TypestateFlowProblemError {}
+impl std::error::Error for TypestateFlowProblemError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WitnessReconstruction(error) => Some(error),
+            Self::ProtocolMismatch
+            | Self::ContextSensitiveBindingsUnsupported
+            | Self::AnalysisRootMismatch
+            | Self::BindingPlanMismatch
+            | Self::InvalidEntryFact
+            | Self::InvalidFactIdentity
+            | Self::InvalidFindingLimits
+            | Self::FindingBudgetExceeded
+            | Self::FindingCancelled => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum TypestateSolveError {
@@ -1154,8 +1177,10 @@ where
     let problem = TypestateFlowProblem::try_new(protocol, bindings)?;
     problem.validate_analysis_root(root)?;
     problem.validate_entry_facts(entry_facts)?;
+    let witness_retention =
+        WitnessRetentionLimits::new(1).expect("one typestate witness alternative is valid");
     let result = solve_with_summaries(
-        SummarySolveInput::new(root, entry_facts),
+        SummarySolveInput::new(root, entry_facts).with_witness_retention(witness_retention),
         provider,
         &problem,
         semantic_budget,

@@ -1603,6 +1603,13 @@ fn summary_findings_retain_error_and_terminal_semantics() {
                 TypestateFindingKind::TerminalExpectation { .. }
             )
     }));
+    assert!(report.findings().iter().all(|finding| {
+        let witness = finding.witness();
+        !witness.steps().is_empty()
+            && witness.quality().is_proven()
+            && !witness.truncated()
+            && witness.omitted_steps_lower_bound() == 0
+    }));
 }
 
 #[test]
