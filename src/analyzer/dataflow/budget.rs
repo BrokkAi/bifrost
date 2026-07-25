@@ -157,6 +157,10 @@ impl<'request> DataflowRequest<'request> {
         }
     }
 
+    pub(crate) const fn remaining_witness_relations(&self) -> usize {
+        self.budget.remaining().witness_relations
+    }
+
     /// Reserve solver work with cancellation checkpoints around staging.
     ///
     /// The second check catches cancellation observed during staging. The

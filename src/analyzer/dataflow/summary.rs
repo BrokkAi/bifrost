@@ -15,7 +15,8 @@ use crate::hash::{HashMap, HashSet};
 
 use super::transfer::{TransferEvaluation, TransferScratch, evaluate_transfer};
 use super::witness::{
-    WitnessAdmission, WitnessAlternatives, WitnessArena, WitnessEvidenceId, WitnessEvidenceNode,
+    WitnessAdmission, WitnessAlternatives, WitnessArena, WitnessCandidateBudget, WitnessEvidenceId,
+    WitnessEvidenceNode,
 };
 use super::{
     DataflowEdge, DataflowRequest, DistributiveDataflowProblem, FactId, PathQuality,
@@ -350,6 +351,11 @@ where
         request.reserve(required)
     }
 
+    fn request_witness_staging_capacity(&self, request: &DataflowRequest<'_>) -> Option<usize> {
+        self.best_effort_witness_retention
+            .then(|| request.remaining_witness_relations())
+    }
+
     fn initialize(
         &mut self,
         input: SummarySolveInput<'_, Fact>,
@@ -442,7 +448,10 @@ where
                     .stage_candidate(
                         &mut alternatives,
                         PathQuality::PROVEN_COMPLETE,
-                        WitnessEvidenceNode::seed_retained_bytes(),
+                        WitnessCandidateBudget::new(
+                            WitnessEvidenceNode::seed_retained_bytes(),
+                            self.request_witness_staging_capacity(request),
+                        ),
                         || WitnessEvidenceNode::seed(entry_point.clone(), key.fact),
                         &mut staged_witness_nodes,
                         &mut staged_witness_bytes,
@@ -625,7 +634,10 @@ where
                     .stage_candidate(
                         &mut witnesses,
                         quality,
-                        source.retained_bytes(),
+                        WitnessCandidateBudget::new(
+                            source.retained_bytes(),
+                            self.request_witness_staging_capacity(request),
+                        ),
                         || source.evidence_for(fact),
                         &mut staged_witness_nodes,
                         &mut staged_witness_bytes,
@@ -1455,7 +1467,10 @@ where
                     .stage_candidate(
                         &mut path_witnesses,
                         PathQuality::PROVEN_COMPLETE,
-                        WitnessEvidenceNode::seed_retained_bytes(),
+                        WitnessCandidateBudget::new(
+                            WitnessEvidenceNode::seed_retained_bytes(),
+                            self.request_witness_staging_capacity(request),
+                        ),
                         || WitnessEvidenceNode::seed(transfer.callee_entry.clone(), fact),
                         &mut staged_witness_nodes,
                         &mut staged_witness_bytes,
@@ -1527,7 +1542,10 @@ where
                     .stage_candidate(
                         &mut incoming_witnesses,
                         quality,
-                        WitnessEvidenceNode::edge_retained_bytes(call_edge),
+                        WitnessCandidateBudget::new(
+                            WitnessEvidenceNode::edge_retained_bytes(call_edge),
+                            self.request_witness_staging_capacity(request),
+                        ),
                         || {
                             WitnessEvidenceNode::edge(
                                 caller_evidence.expect("enabled call evidence was validated"),
@@ -1746,7 +1764,10 @@ where
                 .stage_candidate(
                     &mut witnesses,
                     quality,
-                    WitnessEvidenceNode::end_summary_retained_bytes(),
+                    WitnessCandidateBudget::new(
+                        WitnessEvidenceNode::end_summary_retained_bytes(),
+                        self.request_witness_staging_capacity(request),
+                    ),
                     || {
                         WitnessEvidenceNode::end_summary(
                             predecessor,

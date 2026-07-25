@@ -794,6 +794,24 @@ pub(crate) struct WitnessArena {
     retained_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WitnessCandidateBudget {
+    retained_bytes: usize,
+    request_remaining_relations: Option<usize>,
+}
+
+impl WitnessCandidateBudget {
+    pub(crate) const fn new(
+        retained_bytes: usize,
+        request_remaining_relations: Option<usize>,
+    ) -> Self {
+        Self {
+            retained_bytes,
+            request_remaining_relations,
+        }
+    }
+}
+
 impl WitnessArena {
     pub(crate) fn new(limits: WitnessRetentionLimits) -> Self {
         Self {
@@ -828,7 +846,7 @@ impl WitnessArena {
         &self,
         alternatives: &mut WitnessAlternatives,
         quality: PathQuality,
-        candidate_retained_bytes: usize,
+        candidate_budget: WitnessCandidateBudget,
         candidate: Candidate,
         staged: &mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
         staged_retained_bytes: &mut usize,
@@ -838,24 +856,33 @@ impl WitnessArena {
     {
         debug_assert!(self.is_enabled());
         if self.limits.is_best_effort()
-            && (self
-                .limits
-                .best_effort_max_relations()
-                .is_some_and(|limit| self.nodes.len().saturating_add(staged.len()) >= limit)
+            && alternatives.ids(quality).len() >= self.max_alternatives_per_quality()
+        {
+            alternatives.mark_truncated(quality);
+            return Ok(WitnessAdmission::Truncated);
+        }
+        if self.limits.is_best_effort()
+            && (candidate_budget
+                .request_remaining_relations
+                .is_some_and(|remaining| staged.len() >= remaining)
+                || self
+                    .limits
+                    .best_effort_max_relations()
+                    .is_some_and(|limit| self.nodes.len().saturating_add(staged.len()) >= limit)
                 || self
                     .limits
                     .best_effort_max_retained_bytes()
                     .is_some_and(|limit| {
                         self.retained_bytes
                             .saturating_add(*staged_retained_bytes)
-                            .saturating_add(candidate_retained_bytes)
+                            .saturating_add(candidate_budget.retained_bytes)
                             > limit
                     }))
         {
             return Ok(WitnessAdmission::Exhausted);
         }
         let candidate = candidate();
-        debug_assert_eq!(candidate.retained_bytes(), candidate_retained_bytes);
+        debug_assert_eq!(candidate.retained_bytes(), candidate_budget.retained_bytes);
         if alternatives
             .ids(quality)
             .iter()
@@ -871,7 +898,8 @@ impl WitnessArena {
         let id = self.staged_id(staged.len())?;
         alternatives.push(quality, id);
         staged.push((id, candidate));
-        *staged_retained_bytes = (*staged_retained_bytes).saturating_add(candidate_retained_bytes);
+        *staged_retained_bytes =
+            (*staged_retained_bytes).saturating_add(candidate_budget.retained_bytes);
         Ok(WitnessAdmission::Retained(id))
     }
 
@@ -1386,7 +1414,7 @@ mod tests {
             .stage_candidate(
                 &mut alternatives,
                 PathQuality::PROVEN_COMPLETE,
-                WitnessEvidenceNode::seed_retained_bytes(),
+                WitnessCandidateBudget::new(WitnessEvidenceNode::seed_retained_bytes(), None),
                 || panic!("byte-exhausted candidates must remain lazy"),
                 &mut staged,
                 &mut staged_bytes,
@@ -1394,6 +1422,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(admission, WitnessAdmission::Exhausted);
+        assert!(staged.is_empty());
+        assert_eq!(staged_bytes, 0);
+    }
+
+    #[test]
+    fn best_effort_request_admission_is_checked_before_candidate_allocation() {
+        let arena = WitnessArena::new(WitnessRetentionLimits::best_effort(1, 64, 1024).unwrap());
+        let mut alternatives = WitnessAlternatives::default();
+        let mut staged = Vec::new();
+        let mut staged_bytes = 0usize;
+
+        let admission = arena
+            .stage_candidate(
+                &mut alternatives,
+                PathQuality::PROVEN_COMPLETE,
+                WitnessCandidateBudget::new(WitnessEvidenceNode::seed_retained_bytes(), Some(0)),
+                || panic!("request-exhausted candidates must remain lazy"),
+                &mut staged,
+                &mut staged_bytes,
+            )
+            .unwrap();
+
+        assert_eq!(admission, WitnessAdmission::Exhausted);
+        assert!(staged.is_empty());
+        assert_eq!(staged_bytes, 0);
+    }
+
+    #[test]
+    fn full_best_effort_alternative_slot_is_checked_before_candidate_allocation() {
+        let arena = WitnessArena::new(WitnessRetentionLimits::best_effort(1, 64, 1024).unwrap());
+        let mut alternatives = WitnessAlternatives::default();
+        alternatives.push(
+            PathQuality::PROVEN_COMPLETE,
+            WitnessEvidenceId::try_from_index(0).unwrap(),
+        );
+        let mut staged = Vec::new();
+        let mut staged_bytes = 0usize;
+
+        let admission = arena
+            .stage_candidate(
+                &mut alternatives,
+                PathQuality::PROVEN_COMPLETE,
+                WitnessCandidateBudget::new(WitnessEvidenceNode::seed_retained_bytes(), None),
+                || panic!("full best-effort slots must not allocate candidates"),
+                &mut staged,
+                &mut staged_bytes,
+            )
+            .unwrap();
+
+        assert_eq!(admission, WitnessAdmission::Truncated);
+        assert!(alternatives.is_truncated(PathQuality::PROVEN_COMPLETE));
         assert!(staged.is_empty());
         assert_eq!(staged_bytes, 0);
     }
