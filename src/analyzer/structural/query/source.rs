@@ -3,9 +3,9 @@
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
-    QueryField, QueryStepField, RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
-    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
-    usage_proof_from_label, usage_surface_from_label,
+    QueryField, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
+    StringPredicateField, oldest_rql_schema_version, reference_kind_from_label,
+    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
@@ -777,7 +777,13 @@ fn validate_wrapper(
             }
         }
         RqlForm::Typestate => {
-            if args.len() != 3 || args[0].as_symbol() != Some(":protocol-ref") {
+            let option = args
+                .first()
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::Typestate.option_for_rql_label(label));
+            if args.len() != 3
+                || option.is_none_or(|option| option.field() != QueryStepField::ProtocolRef)
+            {
                 analysis.error(
                     head_range.clone(),
                     "wrong-value-shape",
@@ -787,7 +793,10 @@ fn validate_wrapper(
                 analysis.add_help(
                     args[0].range.clone(),
                     ":protocol-ref namespace:name",
-                    QueryStepField::ProtocolRef.description(),
+                    option
+                        .expect("validated typestate option")
+                        .field()
+                        .description(),
                 );
                 let steps = query_to_json(query)
                     .ok()
@@ -834,15 +843,10 @@ fn validate_wrapper(
             let step_path = format!("{}[{steps}]", rql_query_child_path(path, "steps"));
             let mut seen = std::collections::HashSet::new();
             for pair in options.chunks_exact(2) {
-                let Some((field, description)) = (match pair[0].as_symbol() {
-                    Some(":max-steps") => {
-                        Some(("max_steps", QueryStepField::MaxSteps.description()))
-                    }
-                    Some(":max-bytes") => {
-                        Some(("max_bytes", QueryStepField::MaxBytes.description()))
-                    }
-                    _ => None,
-                }) else {
+                let Some(option) = pair[0]
+                    .as_symbol()
+                    .and_then(|label| QueryStepOp::Witness.option_for_rql_label(label))
+                else {
                     analysis.error(
                         pair[0].range.clone(),
                         "unknown-property",
@@ -850,10 +854,11 @@ fn validate_wrapper(
                     );
                     continue;
                 };
+                let field = option.field().label();
                 analysis.add_help(
                     pair[0].range.clone(),
                     format!(":{} non-negative-integer", field.replace('_', "-")),
-                    description,
+                    option.field().description(),
                 );
                 if !seen.insert(field) {
                     analysis.error(

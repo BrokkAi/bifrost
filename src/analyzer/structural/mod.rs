@@ -38,12 +38,14 @@ pub mod spec;
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
-    MAX_PROTOCOL_REFS, MAX_PROTOCOL_REGISTRATIONS, MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES,
-    MAX_RETAINED_BINDING_PLAN_BYTES, MAX_RETAINED_PROTOCOL_BYTES, ProtocolHandle,
-    ProtocolNameError, ProtocolNamespaceError, ProtocolRef, ProtocolRefError, ProtocolRegistration,
+    MAX_PROTOCOL_REFS, MAX_PROTOCOL_REGISTRATIONS, MAX_QUERY_REGISTRATION_VALIDATION_ARTIFACTS,
+    MAX_QUERY_REGISTRATION_VALIDATION_SOURCE_BYTES, MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES,
+    MAX_RETAINED_BINDING_PLAN_BYTES, MAX_RETAINED_PROTOCOL_BYTES,
+    MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES, ProtocolHandle, ProtocolNameError,
+    ProtocolNamespaceError, ProtocolRef, ProtocolRefError, ProtocolRegistration,
     ProtocolRegistrationError, ProtocolRegistrationLimits, ProtocolRegistrationOutcome,
     ProtocolRegistrationSet, ProtocolRegistrationSetError, QueryAnalysisContext,
-    QueryAnalysisContextError,
+    QueryAnalysisContextError, QueryAnalysisValidationLimits,
 };
 pub use execution::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,

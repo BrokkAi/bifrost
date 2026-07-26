@@ -195,6 +195,7 @@ This schema-v3 surface is a procedure-local CFG inspection API. It does not cros
 
 Schema version 4 adds `typestate`, which consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.
 
+<!-- code-query-test:rql:typestate-witness -->
 ```lisp
 (witness :max-steps 32 :max-bytes 16384
   (typestate :protocol-ref "embedding:resource-lifecycle"

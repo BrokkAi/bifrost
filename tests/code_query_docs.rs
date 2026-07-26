@@ -62,6 +62,7 @@ const REQUIRED_JSON_EXAMPLES: &[&str] = &[
     "kind-union",
     "scope",
     "cfg-entry-successor",
+    "typestate-witness",
 ];
 
 #[derive(Debug)]
@@ -123,6 +124,10 @@ fn documented_code_queries_parse() {
     assert!(
         seen.contains(&("rql".to_string(), "cfg-entry-successor".to_string())),
         "missing procedure-local CFG RQL example"
+    );
+    assert!(
+        seen.contains(&("rql".to_string(), "typestate-witness".to_string())),
+        "missing registered typestate RQL example"
     );
 }
 

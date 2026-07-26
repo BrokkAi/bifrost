@@ -47,6 +47,7 @@ use crate::analyzer::reference_candidates::{
 };
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, ProtocolRegistrationSet, QueryAnalysisContext, QueryAnalysisContextError,
+    QueryAnalysisValidationLimits,
 };
 use crate::analyzer::structural::capabilities::QueryFeature;
 #[cfg(test)]
@@ -1347,8 +1348,17 @@ fn execute_request_internal(
         (workspace, registrations)
     {
         let requested = requested_protocol_refs(&query.plan);
-        match QueryAnalysisContext::new(workspace, workspace_generation, registrations, &requested)
-        {
+        match QueryAnalysisContext::new_with_validation(
+            workspace,
+            workspace_generation,
+            registrations,
+            &requested,
+            QueryAnalysisValidationLimits::new(
+                limits.semantic.max_materialized_files,
+                limits.semantic.max_source_bytes,
+            ),
+            cancellation,
+        ) {
             Ok(context) => Some(context),
             Err(error) => {
                 return CodeQueryResponse::Results(query_analysis_context_error_result(error));
@@ -5295,6 +5305,10 @@ fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> Code
             CodeQueryDiagnosticCode::TypestateRootMismatch
         }
         QueryAnalysisContextError::StaleHandle => CodeQueryDiagnosticCode::TypestateHandleStale,
+        QueryAnalysisContextError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+        QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        }
         QueryAnalysisContextError::GenerationExhausted
         | QueryAnalysisContextError::TooManyResolvedProtocols
         | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }

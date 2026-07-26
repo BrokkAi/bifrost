@@ -12,19 +12,23 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::identifier::define_identifier;
-use crate::analyzer::semantic::{ProcedureHandle, SemanticArtifactKey};
+use crate::analyzer::semantic::{ProcedureHandle, SemanticArtifact, SemanticArtifactKey};
 use crate::analyzer::typestate::{
     CompiledProtocol, TypestateBindingPlan, TypestateBindingPlanHash, TypestateProtocolHash,
 };
+use crate::cancellation::CancellationToken;
 
 pub const MAX_PROTOCOL_REFS: usize = 256;
 pub const MAX_PROTOCOL_REGISTRATIONS: usize = 128;
 pub const MAX_RETAINED_PROTOCOL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RETAINED_BINDING_PLAN_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PROTOCOL_REF_BYTES: usize = 192;
 pub const MAX_PROTOCOL_NAMESPACE_BYTES: usize = 63;
 pub const MAX_PROTOCOL_NAME_BYTES: usize = 128;
 pub const MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_QUERY_REGISTRATION_VALIDATION_ARTIFACTS: usize = 256;
+pub const MAX_QUERY_REGISTRATION_VALIDATION_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
 pub type ProtocolNamespaceError = crate::analyzer::identifier::IdentifierError;
 pub type ProtocolNameError = crate::analyzer::identifier::IdentifierError;
@@ -179,6 +183,7 @@ pub struct ProtocolRegistration {
     protocol: Arc<CompiledProtocol>,
     bindings: Arc<TypestateBindingPlan>,
     artifact_keys: Box<[SemanticArtifactKey]>,
+    retained_artifact_bytes: usize,
 }
 
 impl ProtocolRegistration {
@@ -195,7 +200,22 @@ impl ProtocolRegistration {
             });
         }
         let mut artifact_keys = HashSet::new();
-        artifact_keys.insert(expected_root.artifact().key().clone());
+        let mut artifact_allocations = HashSet::<*const SemanticArtifact>::new();
+        let mut retained_artifact_bytes = 0u64;
+        {
+            let mut retain_artifact = |artifact: &Arc<SemanticArtifact>| {
+                artifact_keys.insert(artifact.key().clone());
+                if artifact_allocations.insert(Arc::as_ptr(artifact)) {
+                    retained_artifact_bytes = retained_artifact_bytes.saturating_add(
+                        crate::analyzer::semantic::service::semantic_artifact_retained_bytes(
+                            artifact,
+                        ),
+                    );
+                }
+            };
+            retain_artifact(expected_root.artifact());
+            bindings.for_each_retained_artifact(&mut retain_artifact);
+        }
         bindings.for_each_retained_artifact_key(|key| {
             artifact_keys.insert(key.clone());
         });
@@ -207,6 +227,7 @@ impl ProtocolRegistration {
             protocol,
             bindings,
             artifact_keys: artifact_keys.into_boxed_slice(),
+            retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
         })
     }
 
@@ -228,6 +249,10 @@ impl ProtocolRegistration {
 
     pub fn artifact_keys(&self) -> &[SemanticArtifactKey] {
         &self.artifact_keys
+    }
+
+    pub const fn retained_artifact_bytes(&self) -> usize {
+        self.retained_artifact_bytes
     }
 
     fn identity(&self) -> ProtocolRegistrationIdentity {
@@ -283,6 +308,7 @@ pub struct ProtocolRegistrationLimits {
     registrations: usize,
     protocol_bytes: usize,
     binding_plan_bytes: usize,
+    artifact_bytes: usize,
 }
 
 impl ProtocolRegistrationLimits {
@@ -291,6 +317,22 @@ impl ProtocolRegistrationLimits {
         registrations: usize,
         protocol_bytes: usize,
         binding_plan_bytes: usize,
+    ) -> Self {
+        Self::bounded_with_artifact_bytes(
+            references,
+            registrations,
+            protocol_bytes,
+            binding_plan_bytes,
+            MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES,
+        )
+    }
+
+    pub const fn bounded_with_artifact_bytes(
+        references: usize,
+        registrations: usize,
+        protocol_bytes: usize,
+        binding_plan_bytes: usize,
+        artifact_bytes: usize,
     ) -> Self {
         Self {
             references: if references < MAX_PROTOCOL_REFS {
@@ -312,6 +354,11 @@ impl ProtocolRegistrationLimits {
                 binding_plan_bytes
             } else {
                 MAX_RETAINED_BINDING_PLAN_BYTES
+            },
+            artifact_bytes: if artifact_bytes < MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES {
+                artifact_bytes
+            } else {
+                MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES
             },
         }
     }
@@ -335,6 +382,7 @@ pub struct ProtocolRegistrationSet {
     by_identity: HashMap<ProtocolRegistrationIdentity, Arc<ProtocolRegistration>>,
     retained_protocol_bytes: usize,
     retained_binding_plan_bytes: usize,
+    retained_artifact_bytes: usize,
     limits: ProtocolRegistrationLimits,
 }
 
@@ -351,6 +399,7 @@ impl ProtocolRegistrationSet {
             by_identity: HashMap::new(),
             retained_protocol_bytes: 0,
             retained_binding_plan_bytes: 0,
+            retained_artifact_bytes: 0,
             limits,
         }
     }
@@ -406,12 +455,24 @@ impl ProtocolRegistrationSet {
                 maximum: self.limits.binding_plan_bytes,
             });
         }
+        let retained_artifact_bytes = self
+            .retained_artifact_bytes
+            .checked_add(registration.retained_artifact_bytes())
+            .ok_or(ProtocolRegistrationSetError::RetainedArtifactBytes {
+                maximum: self.limits.artifact_bytes,
+            })?;
+        if retained_artifact_bytes > self.limits.artifact_bytes {
+            return Err(ProtocolRegistrationSetError::RetainedArtifactBytes {
+                maximum: self.limits.artifact_bytes,
+            });
+        }
 
         let registration = Arc::new(registration);
         self.by_ref.insert(protocol_ref, Arc::clone(&registration));
         self.by_identity.insert(identity, registration);
         self.retained_protocol_bytes = retained_protocol_bytes;
         self.retained_binding_plan_bytes = retained_binding_plan_bytes;
+        self.retained_artifact_bytes = retained_artifact_bytes;
         Ok(ProtocolRegistrationOutcome::Inserted)
     }
 
@@ -446,7 +507,19 @@ impl ProtocolRegistrationSet {
             .retained_binding_plan_bytes
             .checked_sub(removed.bindings.canonical_bytes().len())
             .expect("retained binding bytes must cover every unique registration");
+        self.retained_artifact_bytes = self
+            .retained_artifact_bytes
+            .checked_sub(removed.retained_artifact_bytes())
+            .expect("retained artifact bytes must cover every unique registration");
         true
+    }
+
+    pub fn clear(&mut self) {
+        self.by_ref.clear();
+        self.by_identity.clear();
+        self.retained_protocol_bytes = 0;
+        self.retained_binding_plan_bytes = 0;
+        self.retained_artifact_bytes = 0;
     }
 
     pub fn reference_count(&self) -> usize {
@@ -464,6 +537,10 @@ impl ProtocolRegistrationSet {
     pub const fn retained_binding_plan_bytes(&self) -> usize {
         self.retained_binding_plan_bytes
     }
+
+    pub const fn retained_artifact_bytes(&self) -> usize {
+        self.retained_artifact_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +550,7 @@ pub enum ProtocolRegistrationSetError {
     TooManyRegistrations { maximum: usize },
     RetainedProtocolBytes { maximum: usize },
     RetainedBindingPlanBytes { maximum: usize },
+    RetainedArtifactBytes { maximum: usize },
 }
 
 impl fmt::Display for ProtocolRegistrationSetError {
@@ -502,6 +580,10 @@ impl fmt::Display for ProtocolRegistrationSetError {
                 formatter,
                 "protocol registration set exceeds {maximum} retained binding-plan bytes"
             ),
+            Self::RetainedArtifactBytes { maximum } => write!(
+                formatter,
+                "protocol registration set exceeds {maximum} retained semantic-artifact bytes"
+            ),
         }
     }
 }
@@ -527,6 +609,84 @@ pub struct QueryAnalysisContext {
 
 static NEXT_QUERY_ANALYSIS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryAnalysisValidationLimits {
+    max_artifacts: usize,
+    max_source_bytes: usize,
+}
+
+impl QueryAnalysisValidationLimits {
+    pub const fn new(max_artifacts: usize, max_source_bytes: usize) -> Self {
+        Self {
+            max_artifacts,
+            max_source_bytes,
+        }
+    }
+}
+
+impl Default for QueryAnalysisValidationLimits {
+    fn default() -> Self {
+        Self::new(
+            MAX_QUERY_REGISTRATION_VALIDATION_ARTIFACTS,
+            MAX_QUERY_REGISTRATION_VALIDATION_SOURCE_BYTES,
+        )
+    }
+}
+
+struct QueryAnalysisValidationBudget {
+    limits: QueryAnalysisValidationLimits,
+    artifacts: usize,
+    source_bytes: usize,
+}
+
+impl QueryAnalysisValidationBudget {
+    const fn new(limits: QueryAnalysisValidationLimits) -> Self {
+        Self {
+            limits,
+            artifacts: 0,
+            source_bytes: 0,
+        }
+    }
+
+    fn reserve_artifact(&mut self) -> Result<usize, QueryAnalysisContextError> {
+        if self.artifacts >= self.limits.max_artifacts {
+            return Err(QueryAnalysisContextError::ValidationBudgetExceeded {
+                resource: "semantic artifacts",
+                maximum: self.limits.max_artifacts,
+            });
+        }
+        self.artifacts += 1;
+        let remaining = self
+            .limits
+            .max_source_bytes
+            .saturating_sub(self.source_bytes);
+        if remaining == 0 {
+            return Err(QueryAnalysisContextError::ValidationBudgetExceeded {
+                resource: "semantic artifact source bytes",
+                maximum: self.limits.max_source_bytes,
+            });
+        }
+        Ok(remaining.min(MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES))
+    }
+
+    fn charge_source_bytes(&mut self, bytes: usize) -> Result<(), QueryAnalysisContextError> {
+        let source_bytes = self.source_bytes.checked_add(bytes).ok_or(
+            QueryAnalysisContextError::ValidationBudgetExceeded {
+                resource: "semantic artifact source bytes",
+                maximum: self.limits.max_source_bytes,
+            },
+        )?;
+        if source_bytes > self.limits.max_source_bytes {
+            return Err(QueryAnalysisContextError::ValidationBudgetExceeded {
+                resource: "semantic artifact source bytes",
+                maximum: self.limits.max_source_bytes,
+            });
+        }
+        self.source_bytes = source_bytes;
+        Ok(())
+    }
+}
+
 impl QueryAnalysisContext {
     pub fn new(
         workspace: &WorkspaceAnalyzer,
@@ -534,6 +694,27 @@ impl QueryAnalysisContext {
         registrations: &ProtocolRegistrationSet,
         requested: &[ProtocolRef],
     ) -> Result<Self, QueryAnalysisContextError> {
+        Self::new_with_validation(
+            workspace,
+            workspace_generation,
+            registrations,
+            requested,
+            QueryAnalysisValidationLimits::default(),
+            None,
+        )
+    }
+
+    pub fn new_with_validation(
+        workspace: &WorkspaceAnalyzer,
+        workspace_generation: u64,
+        registrations: &ProtocolRegistrationSet,
+        requested: &[ProtocolRef],
+        validation_limits: QueryAnalysisValidationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Self, QueryAnalysisContextError> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(QueryAnalysisContextError::Cancelled);
+        }
         let generation = NEXT_QUERY_ANALYSIS_GENERATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -545,7 +726,11 @@ impl QueryAnalysisContext {
         let mut by_ref = HashMap::with_capacity(requested.len());
         let mut dense_by_registration = HashMap::<*const ProtocolRegistration, u32>::new();
         let mut imported = Vec::new();
+        let mut validation_budget = QueryAnalysisValidationBudget::new(validation_limits);
         for protocol_ref in requested {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(QueryAnalysisContextError::Cancelled);
+            }
             if by_ref.contains_key(protocol_ref) {
                 continue;
             }
@@ -554,11 +739,17 @@ impl QueryAnalysisContext {
                     protocol_ref: protocol_ref.clone(),
                 }
             })?;
-            validate_registration(workspace, workspace_generation, registration)?;
             let pointer = Arc::as_ptr(registration);
             let slot = match dense_by_registration.get(&pointer).copied() {
                 Some(slot) => slot,
                 None => {
+                    validate_registration(
+                        workspace,
+                        workspace_generation,
+                        registration,
+                        &mut validation_budget,
+                        cancellation,
+                    )?;
                     let slot = u32::try_from(imported.len())
                         .map_err(|_| QueryAnalysisContextError::TooManyResolvedProtocols)?;
                     imported.push(Arc::clone(registration));
@@ -590,7 +781,7 @@ impl QueryAnalysisContext {
 
     pub fn resolve<'a>(
         &'a self,
-        workspace: &WorkspaceAnalyzer,
+        _workspace: &WorkspaceAnalyzer,
         workspace_generation: u64,
         expected_root: &ProcedureHandle,
         handle: ProtocolHandle,
@@ -613,18 +804,24 @@ impl QueryAnalysisContext {
         {
             return Err(QueryAnalysisContextError::StaleHandle);
         }
-        if registration.expected_root() != expected_root {
+        if !same_procedure_identity(registration.expected_root(), expected_root) {
             return Err(QueryAnalysisContextError::AnalysisRootMismatch);
         }
-        validate_registration(workspace, workspace_generation, registration)?;
         Ok(registration)
     }
+}
+
+fn same_procedure_identity(left: &ProcedureHandle, right: &ProcedureHandle) -> bool {
+    left.artifact().key() == right.artifact().key()
+        && left.semantics().locator() == right.semantics().locator()
 }
 
 fn validate_registration(
     workspace: &WorkspaceAnalyzer,
     workspace_generation: u64,
     registration: &ProtocolRegistration,
+    validation_budget: &mut QueryAnalysisValidationBudget,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<(), QueryAnalysisContextError> {
     if registration.workspace_generation != workspace_generation {
         return Err(QueryAnalysisContextError::WorkspaceGenerationMismatch {
@@ -633,19 +830,30 @@ fn validate_registration(
         });
     }
     for key in registration.artifact_keys() {
-        match workspace
-            .semantic_artifact_key_is_current(key, MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES)
-        {
-            Ok(Some(true)) => {}
-            Ok(Some(false)) => {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(QueryAnalysisContextError::Cancelled);
+        }
+        let max_source_bytes = validation_budget.reserve_artifact()?;
+        match workspace.semantic_artifact_key_is_current_with_source_bytes(key, max_source_bytes) {
+            Ok(Some((true, source_bytes))) => {
+                validation_budget.charge_source_bytes(source_bytes)?;
+            }
+            Ok(Some((false, source_bytes))) => {
+                validation_budget.charge_source_bytes(source_bytes)?;
                 return Err(QueryAnalysisContextError::StaleArtifact {
                     path: key.path().as_str().into(),
                 });
             }
             Ok(None) => {
+                if max_source_bytes < MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES {
+                    return Err(QueryAnalysisContextError::ValidationBudgetExceeded {
+                        resource: "semantic artifact source bytes",
+                        maximum: validation_budget.limits.max_source_bytes,
+                    });
+                }
                 return Err(QueryAnalysisContextError::ArtifactIdentityUnavailable {
                     path: key.path().as_str().into(),
-                    maximum_source_bytes: MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES,
+                    maximum_source_bytes: max_source_bytes,
                 });
             }
             Err(error) => {
@@ -662,7 +870,12 @@ fn validate_registration(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryAnalysisContextError {
     GenerationExhausted,
+    Cancelled,
     TooManyResolvedProtocols,
+    ValidationBudgetExceeded {
+        resource: &'static str,
+        maximum: usize,
+    },
     UnresolvedReference {
         protocol_ref: ProtocolRef,
     },
@@ -691,8 +904,17 @@ impl fmt::Display for QueryAnalysisContextError {
             Self::GenerationExhausted => {
                 formatter.write_str("query analysis context generation is exhausted")
             }
+            Self::Cancelled => {
+                formatter.write_str("query analysis context construction was cancelled")
+            }
             Self::TooManyResolvedProtocols => {
                 formatter.write_str("query resolved too many protocols for dense handles")
+            }
+            Self::ValidationBudgetExceeded { resource, maximum } => {
+                write!(
+                    formatter,
+                    "query analysis context validation exceeds {maximum} {resource}"
+                )
             }
             Self::UnresolvedReference { protocol_ref } => {
                 write!(

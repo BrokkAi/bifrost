@@ -1,6 +1,7 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{
-    CodeQueryExecutionMode, RqlForm, RqlFormClass, RqlProperty, resolve_rql_schema_version,
+    CodeQueryExecutionMode, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
+    resolve_rql_schema_version,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
@@ -350,20 +351,39 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Typestate => {
-            if items.len() != 4 || items[1].as_symbol() != Some(":protocol-ref") {
+            let option = items
+                .get(1)
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::Typestate.option_for_rql_label(label));
+            if items.len() != 4
+                || option.is_none_or(|option| option.field() != QueryStepField::ProtocolRef)
+            {
                 return Err(lower_error(
                     expr,
                     "(typestate ...) expects :protocol-ref namespace:name followed by a query",
                 ));
             }
             let protocol_ref = symbol_or_string(&items[2])?;
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::Typestate.label().to_string()),
+            );
+            step.insert(
+                option
+                    .expect("validated typestate option")
+                    .field()
+                    .label()
+                    .to_string(),
+                Value::String(protocol_ref),
+            );
             let mut query = query_object(&items[3])?;
             query
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
-                .push(json!({ "op": "typestate", "protocol_ref": protocol_ref }));
+                .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Witness => {
@@ -379,16 +399,16 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(&pair[0], "(witness ...) option names must be symbols")
                 })?;
-                let field = match key {
-                    ":max-steps" => "max_steps",
-                    ":max-bytes" => "max_bytes",
-                    _ => {
-                        return Err(lower_error(
+                let field = QueryStepOp::Witness
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| {
+                        lower_error(
                             &pair[0],
                             "(witness ...) accepts only :max-steps and :max-bytes",
-                        ));
-                    }
-                };
+                        )
+                    })?
+                    .field()
+                    .label();
                 if step
                     .insert(field.to_string(), number_value(&pair[1], "witness")?)
                     .is_some()

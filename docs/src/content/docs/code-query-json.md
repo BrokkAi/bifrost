@@ -235,6 +235,7 @@ Each edge operation is exactly one hop. Compose more steps for a finite traversa
 
 An embedding first registers an in-memory compiled protocol and its pre-resolved binding plan under a namespaced reference. The JSON request supplies only that reference; it never supplies a protocol path, binding JSON, policy severity, or query-time mode override.
 
+<!-- code-query-test:json:typestate-witness -->
 ```json
 {
   "schema_version": 4,

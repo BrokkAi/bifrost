@@ -360,22 +360,34 @@ impl WorkspaceAnalyzer {
 
     /// Check a retained semantic handle against the complete identity of the
     /// file's current analyzer generation without rematerializing its IR.
+    #[cfg(test)]
     pub(crate) fn semantic_artifact_key_is_current(
         &self,
         key: &crate::analyzer::semantic::SemanticArtifactKey,
         max_source_bytes: usize,
     ) -> Result<Option<bool>, crate::analyzer::semantic::SemanticProviderError> {
+        self.semantic_artifact_key_is_current_with_source_bytes(key, max_source_bytes)
+            .map(|current| current.map(|(is_current, _)| is_current))
+    }
+
+    /// Check one retained semantic identity and report the exact source bytes
+    /// read so callers can enforce an aggregate validation budget.
+    pub(crate) fn semantic_artifact_key_is_current_with_source_bytes(
+        &self,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+        max_source_bytes: usize,
+    ) -> Result<Option<(bool, usize)>, crate::analyzer::semantic::SemanticProviderError> {
         let root = self.analyzer().project().root();
         if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
-            return Ok(Some(false));
+            return Ok(Some((false, 0)));
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
         let Some(provider) = self.program_semantics_provider_for_file(&file) else {
-            return Ok(Some(false));
+            return Ok(Some((false, 0)));
         };
         Ok(provider
-            .current_artifact_key(&file, max_source_bytes)?
-            .map(|current| current == *key))
+            .current_artifact_source(&file, max_source_bytes)?
+            .map(|current| (current.key() == key, current.source().len())))
     }
 
     /// File-aware semantic materialization routed through the concrete

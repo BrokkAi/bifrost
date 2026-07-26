@@ -638,9 +638,15 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        let note = "note: policy test.render inferred policy schema 1 and RQL schema 3\n";
-        assert!(output.starts_with(note));
-        assert_eq!(output.matches(note).count(), 1);
+        let compatible_rql_version =
+            crate::analyzer::structural::query::schema::resolve_rql_schema_version(None)
+                .expect("compiled-in RQL schema lineage is valid")
+                .version;
+        let note = format!(
+            "note: policy test.render inferred policy schema 1 and RQL schema {compatible_rql_version}\n"
+        );
+        assert!(output.starts_with(note.as_str()));
+        assert_eq!(output.matches(note.as_str()).count(), 1);
         assert!(!output.contains("policy rule: test.render (Render)\n"));
         assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
 
@@ -653,8 +659,8 @@ mod tests {
         )
         .unwrap();
         let verbose = String::from_utf8(verbose).unwrap();
-        assert!(verbose.starts_with(note));
-        assert_eq!(verbose.matches(note).count(), 1);
+        assert!(verbose.starts_with(note.as_str()));
+        assert_eq!(verbose.matches(note.as_str()).count(), 1);
         assert!(verbose.contains("policy rule: test.render (Render)\n"));
     }
 

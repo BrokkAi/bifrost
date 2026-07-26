@@ -8,7 +8,8 @@ use brokk_bifrost::analyzer::semantic::{
 };
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResponse,
-    CodeQueryResultValue, ProtocolRegistration, ProtocolRegistrationSet, execute_workspace_request,
+    CodeQueryResultValue, CodeQuerySemanticCompleteness, ProtocolRegistration,
+    ProtocolRegistrationSet, execute_workspace_request,
     execute_workspace_request_with_registration_limits,
     execute_workspace_request_with_registrations,
 };
@@ -281,6 +282,73 @@ fn registered_json_and_rql_return_equal_findings_and_retained_witnesses() {
 }
 
 #[test]
+fn typestate_public_identities_are_stable_across_absolute_checkout_roots() {
+    fn identities(fixture: &Fixture) -> Vec<(String, String, String)> {
+        let response = fixture.execute(&witness_query());
+        let mut identities = response
+            .result()
+            .unwrap()
+            .results
+            .iter()
+            .filter_map(|item| match &item.value {
+                CodeQueryResultValue::TypestateWitness { value } => Some((
+                    value.id.clone(),
+                    value.finding_id.clone(),
+                    value.subject.identity.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        identities.sort_unstable();
+        identities
+    }
+
+    let first = Fixture::new();
+    let second = Fixture::new();
+    assert_ne!(first._project.root(), second._project.root());
+    assert_eq!(identities(&first), identities(&second));
+}
+
+#[test]
+fn registered_root_survives_equivalent_semantic_rematerialization() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let registration_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let (root, protocol, bindings) = registered_plan(&project, &registration_workspace);
+    let mut registrations = ProtocolRegistrationSet::default();
+    registrations
+        .register(
+            PROTOCOL_REF.parse().unwrap(),
+            ProtocolRegistration::new(
+                WORKSPACE_GENERATION,
+                root,
+                Arc::new(protocol),
+                Arc::new(bindings),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let rematerialized_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let response = execute_workspace_request_with_registrations(
+        &rematerialized_workspace,
+        WORKSPACE_GENERATION,
+        &registrations,
+        &finding_query(),
+    );
+    assert!(
+        response
+            .result()
+            .unwrap()
+            .results
+            .iter()
+            .any(|item| matches!(&item.value, CodeQueryResultValue::TypestateFinding { .. }))
+    );
+    assert!(!diagnostic_codes(&response).contains(&CodeQueryDiagnosticCode::TypestateRootMismatch));
+}
+
+#[test]
 fn witness_projection_trims_retained_evidence_without_a_second_solve() {
     let fixture = Fixture::new();
     let query = CodeQuery::from_json(&json!({
@@ -307,7 +375,11 @@ fn witness_projection_trims_retained_evidence_without_a_second_solve() {
     let result = response.result().unwrap();
     assert!(result.results.iter().all(|item| match &item.value {
         CodeQueryResultValue::TypestateWitness { value } => {
-            value.steps.is_empty() && value.truncated && value.omitted_steps_lower_bound > 0
+            value.steps.is_empty()
+                && value.truncated
+                && value.omitted_steps_lower_bound > 0
+                && value.quality.completeness == CodeQuerySemanticCompleteness::Partial
+                && value.quality.completeness_reason.is_some()
         }
         _ => false,
     }));

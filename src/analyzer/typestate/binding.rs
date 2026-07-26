@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -9,7 +10,8 @@ use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationSegmentKind,
     EvidenceCompleteness, ObjectCardinality, OracleCallContext, ProcedureHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticLocator, SourceAnchor,
+    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticLocator,
+    SourceAnchor,
 };
 
 use super::{
@@ -154,6 +156,35 @@ impl TypestateSubjectKey {
     pub fn canonical_rendering(&self) -> String {
         serde_json::to_string(&canonical_subject_key(self))
             .expect("canonical typestate subject identities are serializable")
+    }
+
+    /// Render the source-facing identity without the absolute workspace mount.
+    ///
+    /// Registration and cache identities continue to use
+    /// [`Self::canonical_rendering`]. Public query rows use this form so the
+    /// same indexed content has the same identity in different checkouts.
+    pub fn public_canonical_rendering(&self) -> String {
+        let mut value = serde_json::to_value(canonical_subject_key(self))
+            .expect("canonical typestate subject identities are serializable");
+        remove_canonical_mounts(&mut value);
+        serde_json::to_string(&value).expect("public typestate subject identities are serializable")
+    }
+}
+
+fn remove_canonical_mounts(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.remove("mount");
+            for value in fields.values_mut() {
+                remove_canonical_mounts(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_canonical_mounts(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -933,6 +964,28 @@ impl TypestateBindingPlan {
         }
     }
 
+    /// Visit every concrete semantic artifact allocation retained by handles
+    /// in this plan. Key-only scoped locators are intentionally excluded: they
+    /// retain identities but do not own semantic IR allocations.
+    pub(crate) fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
+        for subject in &self.subjects {
+            visit_access_path_root_artifact_values(subject.object().identity(), &mut visit);
+        }
+        for site in self
+            .initial_seeds
+            .iter()
+            .map(BoundTypestateInitialSeed::site)
+            .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
+            .chain(
+                self.terminal_bindings
+                    .iter()
+                    .map(BoundTypestateTerminal::site),
+            )
+        {
+            visit_observation_site_artifact_values(site, &mut visit);
+        }
+    }
+
     pub const fn protocol_hash(&self) -> TypestateProtocolHash {
         self.protocol_hash
     }
@@ -1132,6 +1185,58 @@ fn visit_observation_site_artifacts(
             visit(call.procedure().artifact().key());
             for context_call in context.runtime().calls() {
                 visit(context_call.procedure().artifact().key());
+            }
+        }
+    }
+}
+
+fn visit_access_path_root_artifact_values(
+    root: &AccessPathRoot,
+    visit: &mut impl FnMut(&Arc<SemanticArtifact>),
+) {
+    let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact());
+    match root {
+        AccessPathRoot::Value(value) => visit_procedure(value.procedure()),
+        AccessPathRoot::CallResult(result) => {
+            visit_procedure(result.call().procedure());
+            visit_procedure(result.result().procedure());
+            visit_procedure(result.callee());
+            for call in result
+                .caller_context()
+                .calls()
+                .iter()
+                .chain(result.callee_context().calls())
+            {
+                visit_procedure(call.procedure());
+            }
+        }
+        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
+            visit_procedure(port.procedure());
+        }
+        AccessPathRoot::Allocation(allocation) => visit_procedure(allocation.procedure()),
+        AccessPathRoot::LexicalCell(location) => visit_procedure(location.procedure()),
+        AccessPathRoot::Static(_)
+        | AccessPathRoot::TypeSummary(_)
+        | AccessPathRoot::ModuleObject(_)
+        | AccessPathRoot::External(_) => {}
+    }
+}
+
+fn visit_observation_site_artifact_values(
+    site: &TypestateObservationSite,
+    visit: &mut impl FnMut(&Arc<SemanticArtifact>),
+) {
+    match site {
+        TypestateObservationSite::ProgramPoint { point, context, .. } => {
+            visit(point.procedure().artifact());
+            for call in context.runtime().calls() {
+                visit(call.procedure().artifact());
+            }
+        }
+        TypestateObservationSite::CallSite { call, context, .. } => {
+            visit(call.procedure().artifact());
+            for context_call in context.runtime().calls() {
+                visit(context_call.procedure().artifact());
             }
         }
     }

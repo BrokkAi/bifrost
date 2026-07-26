@@ -42,7 +42,7 @@
     },
     {
       "name": "meta.typestate-witness-limit.bifrost-rql",
-      "match": "(:max[-_](?:steps|bytes))(\\s+)([0-9]+)(?=\\s)",
+      "match": "(:max-(?:steps|bytes))(\\s+)([0-9]+)(?=\\s)",
       "captures": {
         "1": {
           "name": "variable.parameter.role.bifrost-rql"
@@ -54,7 +54,7 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|max[-_](?:bytes|steps)|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|parameter-(?:index|name)|proof|protocol[-_]ref|receiver|reference-kinds|right|surface|text/regex|transitive)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|callee|capture|decorators|depth|field|has|kwargs|left|max-(?:bytes|steps)|module|name(?:/regex)?|not[-_]has|not[-_]kind|object|parameter-(?:index|name)|proof|protocol-ref|receiver|reference-kinds|right|surface|text/regex|transitive)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "support.function.wrapper.bifrost-rql",

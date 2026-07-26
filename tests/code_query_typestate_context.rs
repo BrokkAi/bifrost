@@ -7,10 +7,10 @@ use brokk_bifrost::analyzer::semantic::ProcedureHandle;
 use brokk_bifrost::analyzer::structural::{
     ProtocolRef, ProtocolRegistration, ProtocolRegistrationLimits, ProtocolRegistrationOutcome,
     ProtocolRegistrationSet, ProtocolRegistrationSetError, QueryAnalysisContext,
-    QueryAnalysisContextError,
+    QueryAnalysisContextError, QueryAnalysisValidationLimits,
 };
 use brokk_bifrost::analyzer::typestate::{CompiledProtocol, ProtocolSpec, TypestateBindingPlan};
-use brokk_bifrost::{AnalyzerConfig, Language};
+use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
 
 use common::semantic_graph::{PointSelector, resolve_procedure_handle};
 use common::{BuiltInlineTestProject, InlineTestProject};
@@ -243,6 +243,27 @@ fn registration_limits_are_independent_and_fail_before_mutation() {
     );
     assert_eq!(bindings.reference_count(), 0);
     assert_eq!(bindings.registration_count(), 0);
+
+    let registration = fixture.registration(1);
+    let artifact_bytes = registration.retained_artifact_bytes();
+    let mut artifacts = ProtocolRegistrationSet::with_limits(
+        ProtocolRegistrationLimits::bounded_with_artifact_bytes(
+            1,
+            1,
+            protocol_bytes,
+            binding_bytes,
+            artifact_bytes - 1,
+        ),
+    );
+    assert_eq!(
+        artifacts.register("test:artifacts".parse().unwrap(), registration),
+        Err(ProtocolRegistrationSetError::RetainedArtifactBytes {
+            maximum: artifact_bytes - 1
+        })
+    );
+    assert_eq!(artifacts.reference_count(), 0);
+    assert_eq!(artifacts.registration_count(), 0);
+    assert_eq!(artifacts.retained_artifact_bytes(), 0);
 }
 
 #[test]
@@ -309,6 +330,87 @@ fn execution_handles_are_context_local_root_scoped_and_generation_checked() {
             .resolve(&fixture.analyzer, 11, &other_root, first_handle)
             .unwrap_err(),
         QueryAnalysisContextError::AnalysisRootMismatch
+    );
+
+    let rematerialized_analyzer = fixture
+        .project
+        .workspace_analyzer(AnalyzerConfig::default());
+    let rematerialized_root = resolve_procedure_handle(
+        &fixture.project,
+        &rematerialized_analyzer,
+        "src/main.ts",
+        PointSelector::new("function lifecycle")
+            .procedure("lifecycle")
+            .effect("entry"),
+    );
+    assert!(!Arc::ptr_eq(
+        fixture.root.artifact(),
+        rematerialized_root.artifact()
+    ));
+    assert!(
+        first
+            .resolve(
+                &rematerialized_analyzer,
+                11,
+                &rematerialized_root,
+                first_handle,
+            )
+            .is_ok(),
+        "durably identical rematerialized roots must survive cache eviction"
+    );
+}
+
+#[test]
+fn context_validation_is_bounded_cancellable_and_deduplicates_aliases() {
+    let fixture = Fixture::new();
+    let primary: ProtocolRef = "test:primary".parse().unwrap();
+    let alias: ProtocolRef = "test:alias".parse().unwrap();
+    let mut registrations = ProtocolRegistrationSet::default();
+    registrations
+        .register(primary.clone(), fixture.registration(5))
+        .unwrap();
+    registrations
+        .register(alias.clone(), fixture.registration(5))
+        .unwrap();
+
+    QueryAnalysisContext::new_with_validation(
+        &fixture.analyzer,
+        5,
+        &registrations,
+        &[primary.clone(), alias.clone()],
+        QueryAnalysisValidationLimits::new(1, SOURCE.len()),
+        None,
+    )
+    .expect("aliases of one registration validate its artifact once");
+
+    assert!(matches!(
+        QueryAnalysisContext::new_with_validation(
+            &fixture.analyzer,
+            5,
+            &registrations,
+            std::slice::from_ref(&primary),
+            QueryAnalysisValidationLimits::new(1, SOURCE.len() - 1),
+            None,
+        ),
+        Err(QueryAnalysisContextError::ValidationBudgetExceeded {
+            resource: "semantic artifact source bytes",
+            maximum
+        }) if maximum == SOURCE.len() - 1
+    ));
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        QueryAnalysisContext::new_with_validation(
+            &fixture.analyzer,
+            5,
+            &registrations,
+            &[primary, alias],
+            QueryAnalysisValidationLimits::default(),
+            Some(&cancellation),
+        )
+        .unwrap_err(),
+        QueryAnalysisContextError::Cancelled
     );
 }
 

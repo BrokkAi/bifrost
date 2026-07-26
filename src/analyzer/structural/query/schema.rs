@@ -1019,6 +1019,77 @@ json_fields! {
     MaxBytes { label: "max_bytes", shape: NonNegativeInteger, signature: "\"max_bytes\": non-negative integer", description: "Further cap retained witness bytes without rerunning analysis." }
 }
 
+/// One RQL option owned by a typed query-step descriptor.
+///
+/// JSON field names, accepted RQL spellings, requiredness, value shape, and
+/// help text all meet here so lowerers and editor validation cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryStepOption {
+    field: QueryStepField,
+    rql_labels: &'static [&'static str],
+    required: bool,
+}
+
+impl QueryStepOption {
+    const fn required(field: QueryStepField, rql_labels: &'static [&'static str]) -> Self {
+        Self {
+            field,
+            rql_labels,
+            required: true,
+        }
+    }
+
+    const fn optional(field: QueryStepField, rql_labels: &'static [&'static str]) -> Self {
+        Self {
+            field,
+            rql_labels,
+            required: false,
+        }
+    }
+
+    pub const fn field(self) -> QueryStepField {
+        self.field
+    }
+
+    pub const fn rql_labels(self) -> &'static [&'static str] {
+        self.rql_labels
+    }
+
+    pub const fn is_required(self) -> bool {
+        self.required
+    }
+
+    pub fn accepts_rql_label(self, label: &str) -> bool {
+        self.rql_labels.contains(&label)
+    }
+}
+
+const TYPESTATE_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::ProtocolRef,
+    &[":protocol-ref"],
+)];
+const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::MaxSteps, &[":max-steps"]),
+    QueryStepOption::optional(QueryStepField::MaxBytes, &[":max-bytes"]),
+];
+
+impl QueryStepOp {
+    pub const fn options(self) -> &'static [QueryStepOption] {
+        match self {
+            Self::Typestate => TYPESTATE_STEP_OPTIONS,
+            Self::Witness => WITNESS_STEP_OPTIONS,
+            _ => &[],
+        }
+    }
+
+    pub fn option_for_rql_label(self, label: &str) -> Option<QueryStepOption> {
+        self.options()
+            .iter()
+            .copied()
+            .find(|option| option.accepts_rql_label(label))
+    }
+}
+
 pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[
     ReferenceKind::MethodCall,
     ReferenceKind::ConstructorCall,

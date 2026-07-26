@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   RQL_LANGUAGE_ID,
   RUN_RQL_QUERY_METHOD,
+  codePointColumnToUtf16,
   formatRqlQueryOutput,
   groupRqlQueryResults,
   queryResultDescription,
@@ -32,6 +33,14 @@ function runner(overrides: Partial<RqlQueryRunner> = {}): RqlQueryRunner {
     ...overrides
   };
 }
+
+void test("converts CodeQuery code-point columns to VS Code UTF-16 offsets", () => {
+  const line = "a😀finding";
+  assert.equal(codePointColumnToUtf16(line, 1), 0);
+  assert.equal(codePointColumnToUtf16(line, 2), 1);
+  assert.equal(codePointColumnToUtf16(line, 3), 3);
+  assert.equal(codePointColumnToUtf16(line, 999), line.length);
+});
 
 void test("runs unsaved RQL editor text and returns typed results", async () => {
   const requests: Array<[string, { query: string }]> = [];
@@ -450,7 +459,7 @@ void test("renders typestate findings and exposes navigable witness steps", () =
 
   assert.equal(queryResultLabel(finding), "use: closed → error");
   assert.equal(queryResultDescription(finding), "must · embedding:resource-lifecycle · 8:3");
-  assert.equal(queryResultIcon(finding), "warning");
+  assert.equal(queryResultIcon(finding), "symbol-event");
   assert.match(queryResultTooltip(finding), /aaaaaaaaaaaa/);
   assert.deepEqual(queryResultRange(finding), range);
 

@@ -1763,7 +1763,7 @@ fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_sourc
     );
     let completion = &response["result"]["items"][0];
     assert_eq!(
-        completion["textEdit"]["newText"], ":schema-version 3",
+        completion["textEdit"]["newText"], ":schema-version 4",
         "{response}"
     );
     assert_eq!(

@@ -418,7 +418,7 @@ impl<'a> SemanticQueryContext<'a> {
             control_edges: saturating_u64(used.control_edges),
             retained_bytes: saturating_u64(self.retained_bytes),
             traversal_steps: saturating_u64(self.traversal_steps),
-            budget_exhausted: self.budget_exhausted,
+            budget_exhausted: self.budget_exhausted || self.typestate.semantic_budget_exhausted(),
             typestate: self.typestate.work(),
         }
     }

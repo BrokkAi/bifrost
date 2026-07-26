@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-
 use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryRange,
     CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence, CodeQuerySemanticProof,
@@ -11,12 +9,12 @@ use super::{
     CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork, SemanticProcedureValue,
 };
 use crate::analyzer::dataflow::{
-    DataflowRequest, SolverBudget, SolverTermination, SummaryWitnessStepKind,
+    DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, SummaryWitnessStepKind,
     WitnessReconstructionLimits,
 };
 use crate::analyzer::semantic::{
-    CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProgramPointHandle, ProofStatus,
-    SemanticBudget, SemanticLocator,
+    CallSiteHandle, EvidenceCompleteness, LengthDelimitedDigest, ProcedureHandle,
+    ProgramPointHandle, ProofStatus, SemanticBudget, SemanticLocator,
 };
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, QueryAnalysisContextError,
@@ -58,6 +56,7 @@ pub(super) struct TypestateQueryState {
     cache: HashMap<TypestateCacheKey, CachedTypestateAnalysis>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     work: CodeQueryTypestateWork,
+    semantic_budget_exhausted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -117,8 +116,13 @@ impl TypestateQueryState {
                 return Vec::new();
             }
         };
+        // Registrations retain the immutable semantic allocation used to
+        // construct their binding handles. The selected procedure may be an
+        // equivalent rematerialization after cache eviction, so execute
+        // against the registered root after the durable identity check above.
+        let analysis_root = registration.expected_root().clone();
         let cache_key = TypestateCacheKey {
-            root: procedure.handle.clone(),
+            root: analysis_root.clone(),
             protocol_hash: registration.protocol().hash(),
             binding_plan_hash: registration.bindings().hash(),
         };
@@ -138,7 +142,7 @@ impl TypestateQueryState {
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
                 let solved = solve_typestate_with_summaries(
-                    &procedure.handle,
+                    &analysis_root,
                     &[],
                     &workspace.icfg_provider(),
                     &protocol,
@@ -184,6 +188,7 @@ impl TypestateQueryState {
                         );
                     }
                 }
+                self.record_semantic_status(solved.result().coverage().semantic_status());
                 let finding_limits = TypestateFindingLimits::with_witness_limits(
                     limits.max_reached_rows,
                     limits.max_candidates,
@@ -310,7 +315,7 @@ impl TypestateQueryState {
                     .expect("validated typestate finding subject resolves in its binding plan");
                 let public_subject = CodeQueryTypestateSubject {
                     class: subject.key().class().as_str().to_string(),
-                    identity: subject.key().canonical_rendering(),
+                    identity: subject.key().public_canonical_rendering(),
                 };
                 let finding_kind = public_finding_kind(&analysis.protocol, finding.kind());
                 let id = finding_id(
@@ -357,6 +362,12 @@ impl TypestateQueryState {
     }
 
     fn push_context_error(&mut self, error: QueryAnalysisContextError) {
+        if matches!(
+            &error,
+            QueryAnalysisContextError::ValidationBudgetExceeded { .. }
+        ) {
+            self.semantic_budget_exhausted = true;
+        }
         let code = match error {
             QueryAnalysisContextError::UnresolvedReference { .. } => {
                 CodeQueryDiagnosticCode::UnresolvedProtocolReference
@@ -365,6 +376,10 @@ impl TypestateQueryState {
                 CodeQueryDiagnosticCode::TypestateRootMismatch
             }
             QueryAnalysisContextError::StaleHandle => CodeQueryDiagnosticCode::TypestateHandleStale,
+            QueryAnalysisContextError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+            QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            }
             QueryAnalysisContextError::GenerationExhausted
             | QueryAnalysisContextError::TooManyResolvedProtocols
             | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }
@@ -394,12 +409,43 @@ impl TypestateQueryState {
         });
     }
 
+    fn record_semantic_status(&mut self, status: SemanticInputStatus) {
+        match status {
+            SemanticInputStatus::Unsupported { capability } => self.push_diagnostic(
+                CodeQueryDiagnosticCode::TypestateCapabilityUnsupported,
+                format!(
+                    "typestate analysis requires unsupported semantic capability `{}`",
+                    capability.label()
+                ),
+            ),
+            SemanticInputStatus::ExceededBudget { exceeded } => {
+                self.semantic_budget_exhausted = true;
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    format!("typestate semantic input exceeded its budget: {exceeded}"),
+                );
+            }
+            SemanticInputStatus::Cancelled => self.push_diagnostic(
+                CodeQueryDiagnosticCode::Cancelled,
+                "typestate semantic input materialization was cancelled".to_string(),
+            ),
+            SemanticInputStatus::Complete
+            | SemanticInputStatus::Ambiguous
+            | SemanticInputStatus::Unknown
+            | SemanticInputStatus::Unproven => {}
+        }
+    }
+
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {
         std::mem::take(&mut self.diagnostics)
     }
 
     pub(super) const fn work(&self) -> CodeQueryTypestateWork {
         self.work
+    }
+
+    pub(super) const fn semantic_budget_exhausted(&self) -> bool {
+        self.semantic_budget_exhausted
     }
 
     pub(super) fn witness_truncated(&mut self, count: usize) {
@@ -450,25 +496,18 @@ impl SemanticTypestateFindingValue {
             .enumerate()
             .map(|(witness_index, finding_witness)| {
                 let witness = finding_witness.witness();
-                let mut steps = Vec::new();
-                let mut retained_bytes = 0usize;
-                let mut removed_steps = 0usize;
-                for step in witness.steps() {
-                    if steps.len() >= max_steps {
-                        removed_steps = removed_steps.saturating_add(1);
-                        continue;
-                    }
-                    let public = public_witness_step(workspace, step);
-                    let step_bytes = serde_json::to_vec(&public)
-                        .expect("public typestate witness steps are serializable")
-                        .len();
-                    if step_bytes > max_bytes.saturating_sub(retained_bytes) {
-                        removed_steps = removed_steps.saturating_add(1);
-                        continue;
-                    }
-                    retained_bytes = retained_bytes.saturating_add(step_bytes);
-                    steps.push(public);
-                }
+                let (steps, retained_bytes, removed_steps) = retain_prefix_by_bytes(
+                    witness
+                        .steps()
+                        .map(|step| public_witness_step(workspace, step)),
+                    max_steps,
+                    max_bytes,
+                    |step| {
+                        serde_json::to_vec(step)
+                            .expect("public typestate witness steps are serializable")
+                            .len()
+                    },
+                );
                 let truncated = witness.truncated() || removed_steps > 0;
                 if truncated {
                     truncated_count += 1;
@@ -498,12 +537,16 @@ impl SemanticTypestateFindingValue {
                                 CodeQuerySemanticProof::Unproven
                             },
                             proof_reason: None,
-                            completeness: if witness.quality().is_complete() {
+                            completeness: if witness.quality().is_complete() && removed_steps == 0 {
                                 CodeQuerySemanticCompleteness::Complete
                             } else {
                                 CodeQuerySemanticCompleteness::Partial
                             },
-                            completeness_reason: None,
+                            completeness_reason: (removed_steps > 0).then(|| {
+                                format!(
+                                    "query witness limits omitted at least {removed_steps} step(s)"
+                                )
+                            }),
                         },
                         uncertainty: public_uncertainty(witness.uncertainty()),
                         abstained: witness.abstained(),
@@ -523,6 +566,27 @@ impl SemanticTypestateFindingValue {
             .collect();
         (values, truncated_count)
     }
+}
+
+fn retain_prefix_by_bytes<T>(
+    items: impl IntoIterator<Item = T>,
+    max_items: usize,
+    max_bytes: usize,
+    measure: impl Fn(&T) -> usize,
+) -> (Vec<T>, usize, usize) {
+    let mut items = items.into_iter();
+    let mut retained = Vec::new();
+    let mut retained_bytes = 0usize;
+    while let Some(item) = items.next() {
+        let item_bytes = measure(&item);
+        if retained.len() >= max_items || item_bytes > max_bytes.saturating_sub(retained_bytes) {
+            let omitted = 1usize.saturating_add(items.count());
+            return (retained, retained_bytes, omitted);
+        }
+        retained_bytes = retained_bytes.saturating_add(item_bytes);
+        retained.push(item);
+    }
+    (retained, retained_bytes, 0)
 }
 
 impl SemanticTypestateWitnessValue {
@@ -773,71 +837,83 @@ fn finding_id(
     kind: &CodeQueryTypestateFindingKind,
     certainty: TypestateFindingCertainty,
 ) -> String {
-    let mut digest = Sha256::new();
-    hash_part(&mut digest, b"bifrost.code_query.typestate_finding.v1");
-    hash_part(&mut digest, protocol.hash().to_string().as_bytes());
-    hash_part(&mut digest, bindings.hash().to_string().as_bytes());
-    hash_part(&mut digest, subject.identity.as_bytes());
-    hash_locator(&mut digest, site);
-    hash_part(
-        &mut digest,
-        &serde_json::to_vec(kind).expect("public typestate finding kind is serializable"),
-    );
-    hash_part(
-        &mut digest,
-        match certainty {
-            TypestateFindingCertainty::May => b"may",
-            TypestateFindingCertainty::Must => b"must",
-            TypestateFindingCertainty::Inconclusive => b"inconclusive",
-        },
-    );
-    hex_digest(digest.finalize())
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.typestate_finding.v2");
+    digest.push(protocol.hash().to_string().as_bytes());
+    digest.push(subject.class.as_bytes());
+    digest.push(subject.identity.as_bytes());
+    hash_public_binding_inputs(&mut digest, bindings);
+    hash_public_locator(&mut digest, site);
+    digest.push(&serde_json::to_vec(kind).expect("public typestate finding kind is serializable"));
+    digest.push(match certainty {
+        TypestateFindingCertainty::May => b"may",
+        TypestateFindingCertainty::Must => b"must",
+        TypestateFindingCertainty::Inconclusive => b"inconclusive",
+    });
+    digest.finish().to_string()
+}
+
+fn hash_public_binding_inputs(digest: &mut LengthDelimitedDigest, bindings: &TypestateBindingPlan) {
+    let mut fingerprints = Vec::new();
+    bindings.for_each_retained_artifact_key(|key| {
+        fingerprints.push(key.public_fingerprint());
+    });
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    for fingerprint in fingerprints {
+        digest.push(fingerprint.as_bytes());
+    }
 }
 
 fn witness_id(finding_id: &str, witness_index: usize, observed_state: Option<&str>) -> String {
-    let mut digest = Sha256::new();
-    hash_part(&mut digest, b"bifrost.code_query.typestate_witness.v1");
-    hash_part(&mut digest, finding_id.as_bytes());
-    hash_part(&mut digest, &witness_index.to_le_bytes());
-    hash_part(&mut digest, observed_state.unwrap_or("").as_bytes());
-    hex_digest(digest.finalize())
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.typestate_witness.v2");
+    digest.push(finding_id.as_bytes());
+    digest.push(
+        &u64::try_from(witness_index)
+            .expect("bounded witness index fits in u64")
+            .to_le_bytes(),
+    );
+    digest.push(observed_state.unwrap_or("").as_bytes());
+    digest.finish().to_string()
 }
 
-fn hash_locator(digest: &mut Sha256, locator: &SemanticLocator) {
-    hash_part(digest, locator.mount().to_string().as_bytes());
-    hash_part(digest, locator.path().as_str().as_bytes());
-    hash_part(digest, locator.language().config_label().as_bytes());
+fn hash_public_locator(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
+    digest.push(locator.path().as_str().as_bytes());
+    digest.push(locator.language().config_label().as_bytes());
     for segment in locator.declaration().segments() {
-        hash_part(digest, segment.kind().stable_label().as_bytes());
-        hash_part(digest, segment.name().unwrap_or("").as_bytes());
-        hash_anchor(digest, segment.anchor());
-        hash_part(digest, &segment.sibling_ordinal().to_le_bytes());
+        digest.push(segment.kind().stable_label().as_bytes());
+        digest.push(segment.name().unwrap_or("").as_bytes());
+        digest.push_anchor(segment.anchor());
+        digest.push(&segment.sibling_ordinal().to_le_bytes());
     }
-    hash_part(digest, locator.role().stable_label().as_bytes());
-    hash_anchor(digest, locator.anchor());
-}
-
-fn hash_anchor(digest: &mut Sha256, anchor: crate::analyzer::semantic::SourceAnchor) {
-    let span = anchor.span();
-    hash_part(digest, &span.start_byte().to_le_bytes());
-    hash_part(digest, &span.end_byte().to_le_bytes());
-    hash_part(digest, &anchor.occurrence().to_le_bytes());
-}
-
-fn hash_part(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_le_bytes());
-    digest.update(bytes);
-}
-
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    let mut output = String::with_capacity(bytes.as_ref().len() * 2);
-    use std::fmt::Write as _;
-    for byte in bytes.as_ref() {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
+    digest.push(locator.role().stable_label().as_bytes());
+    digest.push_anchor(locator.anchor());
 }
 
 fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_prefix_by_bytes;
+
+    #[test]
+    fn byte_trimming_keeps_a_contiguous_prefix() {
+        let (retained, retained_bytes, omitted) =
+            retain_prefix_by_bytes(["aaaa", "bbbbbb", "c"], 3, 5, |value| value.len());
+
+        assert_eq!(retained, ["aaaa"]);
+        assert_eq!(retained_bytes, 4);
+        assert_eq!(omitted, 2);
+    }
+
+    #[test]
+    fn zero_step_projection_omits_the_whole_witness() {
+        let (retained, retained_bytes, omitted) =
+            retain_prefix_by_bytes(["first", "second"], 0, usize::MAX, |value| value.len());
+
+        assert!(retained.is_empty());
+        assert_eq!(retained_bytes, 0);
+        assert_eq!(omitted, 2);
+    }
 }

@@ -27,6 +27,12 @@ export interface RqlResultRange {
   end_column: number;
 }
 
+/** Convert Bifrost's one-based Unicode code-point column to VS Code UTF-16. */
+export function codePointColumnToUtf16(line: string, column: number): number {
+  const codePointOffset = Math.max(0, column - 1);
+  return Array.from(line).slice(0, codePointOffset).join("").length;
+}
+
 export interface RqlStructuralMatchResult extends RqlQueryResultBase {
   result_type: "structural_match";
   kind: string;
@@ -530,7 +536,7 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
     case "control_edge":
       return "arrow-right";
     case "typestate_finding":
-      return "warning";
+      return "symbol-event";
     case "typestate_witness":
       return "debug-alt";
     case "file":

@@ -522,7 +522,6 @@ impl SearchToolsService {
         let session = self.read_session()?;
         session.as_ref().ok_or_else(Self::closed_error)?;
         let workspace_generation = self.workspace_generation();
-        drop(session);
 
         let registration = crate::analyzer::structural::ProtocolRegistration::new(
             workspace_generation,
@@ -531,11 +530,14 @@ impl SearchToolsService {
             bindings,
         )
         .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
-        self.query_protocols
+        let outcome = self
+            .query_protocols
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .register(protocol_ref, registration)
-            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        drop(session);
+        Ok(outcome)
     }
 
     /// Remove one host-defined protocol alias. Prepared requests keep their
@@ -1060,6 +1062,10 @@ impl SearchToolsService {
     }
 
     fn advance_workspace_generation(&self) {
+        self.query_protocols
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.workspace_generation.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -3115,6 +3121,34 @@ mod query_protocol_tests {
         assert!(
             prepared_value.get("diagnostics").is_none(),
             "prepared request should retain the registered alias: {prepared_value}"
+        );
+
+        let current = service.query_code_result(query(&protocol_ref)).unwrap();
+        assert_eq!(
+            current.result().unwrap().diagnostics[0].code,
+            CodeQueryDiagnosticCode::UnresolvedProtocolReference
+        );
+    }
+
+    #[test]
+    fn workspace_generation_advance_clears_live_registrations_but_not_prepared_snapshots() {
+        let (_temp, service, protocol_ref) = protocol_service();
+        let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+
+        service.advance_workspace_generation();
+
+        let live = service.query_protocol_snapshot().unwrap();
+        assert_eq!(live.reference_count(), 0);
+        assert_eq!(live.registration_count(), 0);
+        assert_eq!(live.retained_artifact_bytes(), 0);
+
+        let prepared_value = service
+            .execute_prepared_query_code(prepared, None)
+            .unwrap()
+            .into_value();
+        assert!(
+            prepared_value.get("diagnostics").is_none(),
+            "prepared requests own their generation-consistent registration snapshot"
         );
 
         let current = service.query_code_result(query(&protocol_ref)).unwrap();

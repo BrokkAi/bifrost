@@ -530,6 +530,41 @@ class CodeQueryModelTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             CodeQueryResult.from_dict({"results": [invalid], "truncated": False})
 
+        for field, malformed_value in (
+            ("path_proven", "false"),
+            ("retained_witnesses", "1"),
+            ("uncertainty", "unknown_call"),
+        ):
+            malformed = deepcopy(finding)
+            malformed[field] = malformed_value
+            with self.subTest(field=field), self.assertRaises(TypeError):
+                CodeQueryResult.from_dict(
+                    {"results": [malformed], "truncated": False}
+                )
+
+        for field, malformed_value in (
+            ("witness_index", "0"),
+            ("steps", "not-a-list"),
+            ("truncated", "false"),
+        ):
+            malformed = deepcopy(witness)
+            malformed[field] = malformed_value
+            with self.subTest(field=field), self.assertRaises(TypeError):
+                CodeQueryResult.from_dict(
+                    {"results": [malformed], "truncated": False}
+                )
+
+        malformed_terminal = deepcopy(finding)
+        malformed_terminal["finding_kind"] = {
+            "type": "terminal_expectation",
+            "expectation": "closed-on-exit",
+            "actual_states": "open",
+        }
+        with self.assertRaises(TypeError):
+            CodeQueryResult.from_dict(
+                {"results": [malformed_terminal], "truncated": False}
+            )
+
     def test_execution_mode_alias_is_reexported_from_public_import_paths(self) -> None:
         self.assertIs(CodeQueryExecutionMode, ModelCodeQueryExecutionMode)
         self.assertIs(ClientCodeQueryExecutionMode, ModelCodeQueryExecutionMode)

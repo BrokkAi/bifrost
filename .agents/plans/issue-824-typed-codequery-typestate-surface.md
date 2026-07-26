@@ -23,7 +23,8 @@ CodeQuery never loads a protocol, endpoint, or policy path. A host registers alr
 - [x] (2026-07-26 20:30 SAST) Fetched after #821 merged and rebased both checkpoint commits onto `origin/master` at `3a634356` (`Add direct, indirect, and taint data-flow clients (#1180)`). The branch is clean and now includes the value-flow/taint client surface that later #824 slices can consume.
 - [x] (2026-07-26 21:08 SAST) Milestone 3: adapted registered protocols and binding plans to the existing bounded typestate client; retained diagnostic-neutral findings and witnesses in the typed pipeline; reused exact root/protocol/binding analyses across duplicate rows; added deterministic work, completion, and typed failure metadata; and proved JSON/RQL parity, pure witness projection, cache reuse, `file_of`, and stale/unresolved/budget outcomes with an inline TypeScript project. The focused typestate, structural-search, policy, context, and public-API tests pass, as do `cargo fmt --all -- --check`, `git diff --check`, and strict library Clippy with the matching rustup 1.96 driver.
 - [x] (2026-07-26 21:43 SAST) Milestone 4: made `SearchToolsService` own the bounded host registration set and capture immutable registration/workspace snapshots in prepared requests; derived schema-v4 MCP metadata from the declarative registry; carried strict finding/witness models through Python, navigable primary and witness-step locations through LSP/VS Code, and conservative vocabulary through TextMate; documented the registration-only boundary across the public guides; and added lifecycle, malformed-model, transport, grammar, rendering, and docs checks. Focused Rust tests pass, Python reports 15 passing model tests, VS Code reports 71 passing tests, the docs check/build verifies 57 pages and 5,395 links, and rendered local previews of the schema-v4 and RQL/VS Code pages are visually clean with no browser warnings or errors.
-- [ ] Milestone 5: run focused tests, full feature-enabled tests, strict Clippy, guided specialist review, and record exact evidence and any remediation here.
+- [x] (2026-07-26 23:23 SAST) Milestone 5: completed the required security, duplication, intent, operations, and architecture reviews and remediated every confirmed high-risk finding. Registration validation is now globally budgeted, cancellation-aware, artifact-deduplicated, retained-artifact-accounted, and generation-invalidated; execution survives semantic-cache rematerialization; public identities are checkout-root-independent; witness trimming retains only a contiguous prefix and preserves incomplete semantic outcomes; RQL options come from the schema registry; Python rejects coercible malformed values; and VS Code converts CodeQuery code-point columns to UTF-16 without inventing severity. Focused Rust typestate tests pass 21 cases, Python passes 59 tests, VS Code passes 72 tests, documentation checks/builds 57 pages and 5,395 links, strict all-target/all-feature Clippy passes, every ordinary `nlp,python` Rust target passes, and the matching rustup doctest gate passes after the PATH `rustdoc` was found to have an incompatible LLVM patch version.
+- [x] (2026-07-26 23:28 SAST) Refetched after `origin/master` advanced during finalization and rebased all five clean issue checkpoints onto current `origin/master` at `baa33f66`; focused post-rebase validation and diff/format checks remain green.
 
 ## Surprises & Discoveries
 
@@ -65,6 +66,21 @@ CodeQuery never loads a protocol, endpoint, or policy path. A host registers alr
 
 - Observation: the private LSP request has no wire-level protocol-registration operation by design.
   Evidence: an unconfigured LSP session can prove the exact schema-v4 unresolved-reference diagnostic and preserve navigable URI enrichment for any returned witness steps, while configured execution remains a host-side `SearchToolsService` responsibility rather than a protocol-file or binding-plan wire format.
+
+- Observation: equality of an `Arc<SemanticArtifact>` is not a durable registration-root identity.
+  Evidence: semantic cache eviction can rematerialize the same artifact key into a new allocation. Registration validation and execution now compare the current artifact key and procedure locator, then execute the immutable registered root after that durable match.
+
+- Observation: public finding and witness identities cannot hash mount-qualified semantic locators.
+  Evidence: two equivalent inline projects under different temporary roots initially produced different IDs. Public identity now hashes workspace-relative locators, public object/binding fingerprints, protocol identity, and length-delimited components while private scoped handles remain mount-qualified.
+
+- Observation: CodeQuery columns and VS Code columns use different coordinate units.
+  Evidence: CodeQuery source ranges count Unicode code points while the VS Code API counts UTF-16 code units. The extension now converts against the opened document line, with a non-BMP regression test proving navigation after an emoji.
+
+- Observation: witness byte limiting must retain a contiguous derivation prefix.
+  Evidence: skipping one oversized middle step and retaining later steps creates a misleading non-contiguous proof. Projection now stops at the first step that exceeds either cap, reports a lower bound for omitted steps, and marks projected evidence partial with an explicit truncation reason.
+
+- Observation: the full Rust suite found two unrelated compatible-head expectations that legitimately advanced with schema v4.
+  Evidence: the policy renderer, policy CLI, LSP completion test, public policy documentation, and implicit-head normalized policy fixtures still expected schema 3. Explicit version pins remain unchanged; only compatible-head expectations were refreshed to 4.
 
 ## Decision Log
 
@@ -116,9 +132,29 @@ CodeQuery never loads a protocol, endpoint, or policy path. A host registers alr
   Rationale: #709 owns loaded public policy and `PolicyFinding` models. This slice proves the diagnostic-neutral execution contract that the later compiler/evaluator will consume; it must not create a second policy envelope or context-free finding-to-diagnostic conversion.
   Date/Author: 2026-07-26 / Codex
 
+- Decision: charge unique retained semantic artifacts separately from protocol and binding metadata, and clear live registrations whenever the workspace generation advances.
+  Rationale: semantic handles keep immutable artifacts alive even when aliases share a registration. A finite host store therefore needs aggregate artifact accounting, transactional deduplication, and immediate generation invalidation rather than relying only on per-query stale checks.
+  Date/Author: 2026-07-26 / Codex
+
+- Decision: drive RQL typestate properties and option spellings from the declarative schema registry.
+  Rationale: parser, range validation, hover, and editor vocabulary must not grow private keyword tables. The shared `QueryStepOption` descriptors now own accepted spellings, shapes, signatures, descriptions, and schema availability.
+  Date/Author: 2026-07-26 / Codex
+
+- Decision: prefer behavior-focused executable documentation checks and stable component identities over a fixed hash of an entire example response.
+  Rationale: the public contract is exact JSON/RQL execution parity, stable cross-root finding/witness IDs, 64-character protocol/binding identities, and marked documentation examples that tests must discover. Hashing a complete rendered fixture would duplicate serialization shape and would incorrectly freeze mount-scoped private binding-plan identity.
+  Date/Author: 2026-07-26 / Codex
+
+- Decision: leave the low-risk repeated evidence-projection and saturating-accounting helpers local for now.
+  Rationale: the duplication review found no inconsistent behavior, and extracting them during the hardening pass would expand ownership across otherwise independent query and registration modules. A shared helper is warranted only when another consumer appears.
+  Date/Author: 2026-07-26 / Codex
+
+- Decision: keep the public-adapter regression matrix layered instead of repeating every solver-owned typestate case through MCP and LSP.
+  Rationale: the existing #822 client suites own may/must/inconclusive, terminal, ambiguity, cancellation, and safe-path semantics. This slice adds real registered JSON/RQL parity, retained witness, cache-rematerialization, truncation, identity, stale/root/budget, prepared-snapshot, strict Python, and positive LSP URI projection coverage. The LSP test constructs the typed public value because protocol registration is deliberately not an LSP wire operation; the documentation harness discovers and parses the marked registered examples while the integration fixture executes their algebra.
+  Date/Author: 2026-07-26 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 through 4 are complete. The host-side ownership and safety boundary now exists independently of the query grammar, schema v4 exposes that boundary as a typed procedure-to-finding-to-witness algebra with exact JSON/RQL editor behavior, and results/profile execution delegates to the existing #822 client exactly once per root/protocol/binding tuple. The witness operator projects only retained bounded evidence and adds no solver work. Explain mode continues to plan the algebra without touching registrations. Prepared service requests retain exact immutable registration snapshots, and the same diagnostic-neutral shapes now reach MCP metadata, Python, LSP navigation, VS Code presentation, TextMate, and public documentation without accepting protocol or binding paths over the wire. The final milestone reconciles the longer roadmap, runs the guided specialist reviews and full feature-enabled gates, remediates confirmed findings, and records the remaining #824 work for richer binding inputs, policy compilation, value flow, taint, and summary persistence.
+All five milestones are complete. The host-side ownership and safety boundary now exists independently of the query grammar, schema v4 exposes that boundary as a typed procedure-to-finding-to-witness algebra with exact JSON/RQL behavior, and results/profile execution delegates to the existing #822 client exactly once per durable root/protocol/binding tuple. Registration validation and retained memory are finite across aliases, cancellation, and workspace generations. The witness operator projects only a contiguous bounded prefix of retained evidence and adds no solver work. Explain mode continues to plan the algebra without touching registrations. Prepared service requests retain exact immutable registration snapshots, and the same diagnostic-neutral shapes now reach MCP metadata, strict Python models, LSP navigation, UTF-16-correct VS Code presentation, TextMate, and executable public documentation without accepting protocol or binding paths over the wire. Five specialist reviews closed with their confirmed high-risk findings remediated, and the release-quality gates are green. #824 itself remains open for richer binding inputs, policy compilation, flow/taint query domains, and any persisted-summary integration.
 
 ## Context and Orientation
 
@@ -279,8 +315,7 @@ From the repository root, run:
     cargo test --test bifrost_lsp_server
     cargo test --test code_query_docs
     cargo test --test code_query_tutorials
-    python -m unittest discover -s bifrost_searchtools/tests
-    python -m unittest python_tests.test_searchtools_client
+    bash scripts/test_python.sh
     npm --prefix editors/vscode test
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
     scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
@@ -352,6 +387,16 @@ The implementation is accepted when all of the following behavior is observable.
 11. No production path searches source text, method names, or rendered semantic identities to construct bindings. The query consumes the registered structured plan and the existing semantic/ICFG services.
 12. Focused tests, Python tests, VS Code tests, documentation tests, strict all-feature Clippy, and the full `nlp,python` test gate all pass without leaving unmanaged Cargo targets or `.brokk` caches.
 
+Recorded final evidence (2026-07-26):
+
+- `cargo test --test code_query_typestate --test code_query_typestate_context --quiet`: 11 and 10 tests passed.
+- Focused LSP witness URI, schema completion, policy CLI, policy source, and documentation gates passed; `code_query_docs` reports 3 passing tests.
+- `bash scripts/test_python.sh`: 59 tests passed.
+- `npm --prefix editors/vscode test`: 72 tests passed.
+- Documentation `npm run check` reports zero errors, warnings, or hints; `npm run build` renders 57 pages and checks 5,395 links. The schema-v4 JSON and RQL pages were also inspected in the browser without rendering or console errors.
+- `scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings` passed with the rustup 1.96 Clippy driver.
+- `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' scripts/with-isolated-cargo-target.sh cargo test --features nlp,python --quiet` passed every ordinary library, binary, and integration target, including 1,943 library tests with 6 ignored. The process then encountered E0514 because `/opt/homebrew/bin/rustdoc` used LLVM 22.1.6 against dependencies produced by rustup LLVM 22.1.2. Re-running the doctest gate with `RUSTDOC=/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/rustdoc` passed; this crate currently has zero doctests.
+
 ## Idempotence and Recovery
 
 All source edits and test commands are repeatable. Host registration is explicitly idempotent for the same reference and exact registration. A failed registration does not partially mutate aliases, retained-byte accounting, or the hash-pair index. A failed or cancelled query may return cancellation-safe partial results and diagnostics, but it never publishes them as complete and never mutates the registration snapshot.
@@ -394,6 +439,8 @@ The remaining #824 work after this plan is deliberately separate:
         -> #823 reusable cross-query/persisted summaries
 
 Revision note (2026-07-26 19:29 SAST / Codex): Created the plan after live issue, repository, schema, typestate-client, and policy-seam diagnosis. Chose schema v4 and a deliberately narrow procedure-rooted query contract so the first implementation is executable without smuggling in the later binding or policy compiler.
+
+Revision note (2026-07-26 23:23 SAST / Codex): Completed the implementation and five-lane guided review after rebasing onto the #821 merge. Recorded the finite registration, durable identity, contiguous-witness, strict-client, and editor-coordinate remediations plus the exact release validation. The ordinary all-feature Rust targets passed; the first combined command exited only when Homebrew `rustdoc` (LLVM 22.1.6) tried to read rustup-built metadata (LLVM 22.1.2), and the authoritative doctest gate passed with the matching rustup 1.96 `rustdoc`.
 
 ## Interfaces and Dependencies
 

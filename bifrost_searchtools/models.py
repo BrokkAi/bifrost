@@ -7,6 +7,35 @@ from typing import Any, ClassVar, Literal, cast, get_args
 
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
+_MISSING = object()
+
+
+def _strict_bool(data: dict, key: str, default: object = _MISSING) -> bool:
+    value = data[key] if default is _MISSING else data.get(key, default)
+    if type(value) is not bool:
+        raise TypeError(f"{key} must be a boolean")
+    return value
+
+
+def _strict_nonnegative_int(data: dict, key: str) -> int:
+    value = data[key]
+    if type(value) is not int or value < 0:
+        raise TypeError(f"{key} must be a non-negative integer")
+    return value
+
+
+def _strict_list(data: dict, key: str, default: object = _MISSING) -> list[Any]:
+    value = data[key] if default is _MISSING else data.get(key, default)
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a list")
+    return value
+
+
+def _strict_string_list(data: dict, key: str) -> list[str]:
+    values = _strict_list(data, key)
+    if any(not isinstance(value, str) for value in values):
+        raise TypeError(f"{key} must contain only strings")
+    return values
 
 
 def _code_query_execution_mode(value: Any) -> CodeQueryExecutionMode | None:
@@ -625,7 +654,7 @@ class CodeQueryTypestateFindingKind:
         return cls(
             type=kind,
             expectation=data["expectation"],
-            actual_states=tuple(data["actual_states"]),
+            actual_states=tuple(_strict_string_list(data, "actual_states")),
         )
 
     def render_text(self) -> str:
@@ -684,16 +713,16 @@ class CodeQueryTypestateFinding:
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
-            path_proven=bool(data["path_proven"]),
-            path_complete=bool(data["path_complete"]),
-            analysis_complete=bool(data["analysis_complete"]),
-            retained_witnesses=int(data["retained_witnesses"]),
-            omitted_witnesses=int(data["omitted_witnesses"]),
+            path_proven=_strict_bool(data, "path_proven"),
+            path_complete=_strict_bool(data, "path_complete"),
+            analysis_complete=_strict_bool(data, "analysis_complete"),
+            retained_witnesses=_strict_nonnegative_int(data, "retained_witnesses"),
+            omitted_witnesses=_strict_nonnegative_int(data, "omitted_witnesses"),
             uncertainty=tuple(
                 CodeQueryTypestateUncertainty(value)
-                for value in data.get("uncertainty", [])
+                for value in _strict_list(data, "uncertainty", [])
             ),
-            abstained=bool(data.get("abstained", False)),
+            abstained=_strict_bool(data, "abstained", False),
             provenance=_query_provenance(data),
             provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
@@ -789,7 +818,7 @@ class CodeQueryTypestateWitness:
             protocol_hash=data["protocol_hash"],
             binding_plan_hash=data["binding_plan_hash"],
             subject=CodeQueryTypestateSubject.from_dict(data["subject"]),
-            witness_index=int(data["witness_index"]),
+            witness_index=_strict_nonnegative_int(data, "witness_index"),
             observed_state=data.get("observed_state"),
             path=data["path"],
             language=data["language"],
@@ -797,18 +826,22 @@ class CodeQueryTypestateWitness:
             quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
             uncertainty=tuple(
                 CodeQueryTypestateUncertainty(value)
-                for value in data.get("uncertainty", [])
+                for value in _strict_list(data, "uncertainty", [])
             ),
-            abstained=bool(data.get("abstained", False)),
+            abstained=_strict_bool(data, "abstained", False),
             steps=tuple(
                 CodeQueryTypestateWitnessStep.from_dict(step)
-                for step in data["steps"]
+                for step in _strict_list(data, "steps")
             ),
-            retained_bytes=int(data["retained_bytes"]),
-            truncated=bool(data.get("truncated", False)),
-            omitted_steps_lower_bound=int(data["omitted_steps_lower_bound"]),
-            alternatives_truncated=bool(data.get("alternatives_truncated", False)),
-            retention_truncated=bool(data.get("retention_truncated", False)),
+            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
+            truncated=_strict_bool(data, "truncated", False),
+            omitted_steps_lower_bound=_strict_nonnegative_int(
+                data, "omitted_steps_lower_bound"
+            ),
+            alternatives_truncated=_strict_bool(
+                data, "alternatives_truncated", False
+            ),
+            retention_truncated=_strict_bool(data, "retention_truncated", False),
             provenance=_query_provenance(data),
             provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
