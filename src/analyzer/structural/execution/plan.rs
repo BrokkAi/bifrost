@@ -682,6 +682,7 @@ pub struct CodeQuerySemanticRequest {
     pub procedures: bool,
     pub program_points: bool,
     pub control_edges: bool,
+    pub typestate: bool,
 }
 
 impl CodeQuerySemanticRequest {
@@ -695,6 +696,7 @@ impl CodeQuerySemanticRequest {
                 QuerySemanticFacet::Procedures => request.procedures = true,
                 QuerySemanticFacet::ProgramPoints => request.program_points = true,
                 QuerySemanticFacet::ControlEdges => request.control_edges = true,
+                QuerySemanticFacet::Typestate => request.typestate = true,
             }
         }
         Some(request)
@@ -1078,16 +1080,60 @@ mod tests {
                     procedures: true,
                     program_points: false,
                     control_edges: false,
+                    typestate: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
                     program_points: true,
                     control_edges: false,
+                    typestate: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
                     program_points: true,
                     control_edges: true,
+                    typestate: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn public_explain_reports_typestate_without_resolving_a_registration() {
+        let query = query(branch(
+            seed("lifecycle"),
+            vec![
+                QueryStep::ProcedureOf,
+                QueryStep::Typestate(crate::analyzer::structural::query::TypestateTraversal {
+                    protocol_ref: "test:lifecycle".parse().unwrap(),
+                }),
+                QueryStep::Witness(crate::analyzer::structural::query::WitnessTraversal::default()),
+            ],
+        ));
+        let physical =
+            PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
+        let public = physical.public_explain(&query, 1);
+        let requests = public
+            .physical_plan
+            .nodes
+            .iter()
+            .filter_map(|node| node.semantic_request)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            requests,
+            vec![
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: false,
+                    control_edges: false,
+                    typestate: false,
+                },
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: false,
+                    control_edges: false,
+                    typestate: true,
                 },
             ]
         );

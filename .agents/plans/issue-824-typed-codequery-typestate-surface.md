@@ -19,7 +19,7 @@ CodeQuery never loads a protocol, endpoint, or policy path. A host registers alr
 - [x] (2026-07-26 19:29 SAST) Fixed the first-slice decisions: schema version 4, procedure input, in-memory pre-resolved registrations, one solver run, and a witness projection that never reruns analysis.
 - [x] (2026-07-26 20:04 SAST) Attached the clean worktree to the user-selected fresh branch `dave/824-typed-codequery-typestate-surface` at verified `origin/master` commit `4dceaf47`; the older issue worktree remains untouched.
 - [x] (2026-07-26 20:37 SAST) Milestone 1: added bounded protocol registration snapshots, downward-configurable hard limits, execution-scoped dense handles, exact workspace/root/hash checks, whole-plan artifact identity validation, and focused tests for conflicts, alias deduplication, every independent bound, unresolved references, stale files, generation mismatch, root mismatch, and cross-context handles. `cargo test --test code_query_typestate_context` passes 9 tests.
-- [ ] Milestone 2: add the schema-v4 `typestate_finding` and `typestate_witness` domains plus `typestate` and `witness` operations across JSON/RQL parsing, canonical rendering, static validation, ranges, explain planning, and schema metadata.
+- [x] (2026-07-26 21:18 SAST) Milestone 2: added explicit schema lineage 2 -> 3 -> 4; typed `typestate_finding` and `typestate_witness` domains; registered `typestate(protocol_ref)` and pure `witness(max_steps?, max_bytes?)` operations; `file_of` support; JSON/RQL lowering and canonical rendering; version/domain/option validation; exact source ranges and shared help; and explain planning that advertises typestate only for the solver step. `cargo test --lib analyzer::structural::query` passes 96 tests and `cargo test --lib analyzer::structural::execution::plan::tests` passes 11 tests.
 - [ ] Milestone 3: adapt registered protocols and binding plans to the existing typestate client, retain findings in the typed pipeline, project witnesses without a second solve, and expose deterministic work and completion metadata.
 - [ ] Milestone 4: update `SearchToolsService`, MCP/LSP transport behavior, Python models, VS Code rendering/navigation, TextMate grammar, public documentation, and executable examples.
 - [ ] Milestone 5: run focused tests, full feature-enabled tests, strict Clippy, guided specialist review, and record exact evidence and any remediation here.
@@ -52,6 +52,9 @@ CodeQuery never loads a protocol, endpoint, or policy path. A host registers alr
 
 - Observation: validating only observation sites would miss semantic artifacts retained through subject objects and bounded call contexts.
   Evidence: `AbstractObject` can retain value, call-result, procedure-port, allocation, lexical-cell, or scoped-locator roots, while observation and call-result contexts retain additional call handles. `TypestateBindingPlan::for_each_retained_artifact_key` now walks all of these structured handles.
+
+- Observation: a pure witness projection must not inherit the semantic request of its typestate-producing input.
+  Evidence: explain metadata is attached per physical operator. Marking both `typestate` and `witness` with the typestate semantic facet would imply a second analysis boundary, so only `typestate` declares that facet; `witness` has no semantic request.
 
 ## Decision Log
 
@@ -95,13 +98,17 @@ CodeQuery never loads a protocol, endpoint, or policy path. A host registers alr
   Rationale: `collect_summary_findings_with_limits` already bounds reconstruction. `max_steps` and `max_bytes` on the `witness` step can truncate that retained value further, but cannot request a larger hidden reconstruction or alter finding certainty.
   Date/Author: 2026-07-26 / Codex
 
+- Decision: `max_steps` and `max_bytes` accept zero as an explicit metadata-only witness projection.
+  Rationale: the options are further truncation caps, not solver budgets. Zero is a useful bounded request that retains finding/evidence metadata while projecting no witness payload, and it cannot increase work.
+  Date/Author: 2026-07-26 / Codex
+
 - Decision: keep `TypestatePolicyCompiler`, `.rqlp` loading, presentation, classification, human rendering, and SARIF projection out of this ExecPlan.
   Rationale: #709 owns loaded public policy and `PolicyFinding` models. This slice proves the diagnostic-neutral execution contract that the later compiler/evaluator will consume; it must not create a second policy envelope or context-free finding-to-diagnostic conversion.
   Date/Author: 2026-07-26 / Codex
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. The host-side ownership and safety boundary now exists independently of the query grammar: protocol aliases are bounded wire values, registrations retain exact immutable roots/protocols/plans, identical aliases share one allocation, and execution-local handles cannot be reused across contexts or workspace generations. The next milestone introduces schema-v4 typed operations without yet running the solver. At completion, summarize the exact JSON/RQL behavior delivered, the protocol registration and stale-generation guarantees, focused and full validation results, any review remediation, and the remaining #824 work for richer binding inputs, policy compilation, value flow, taint, and summary persistence.
+Milestones 1 and 2 are complete. The host-side ownership and safety boundary now exists independently of the query grammar, and schema v4 exposes that boundary as a typed procedure-to-finding-to-witness algebra with exact JSON/RQL editor behavior. Explain mode plans this algebra without touching registrations; only results/profile execution will resolve the authored alias. The next milestone connects those typed rows to the existing #822 solver and retained finding evidence. At completion, summarize the exact JSON/RQL behavior delivered, the protocol registration and stale-generation guarantees, focused and full validation results, any review remediation, and the remaining #824 work for richer binding inputs, policy compilation, value flow, taint, and summary persistence.
 
 ## Context and Orientation
 

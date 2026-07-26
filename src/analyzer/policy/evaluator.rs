@@ -2170,7 +2170,9 @@ fn evaluate_match_query_candidates(
             QueryValueKind::ReceiverAnalysis
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
-            | QueryValueKind::ControlEdge,
+            | QueryValueKind::ControlEdge
+            | QueryValueKind::TypestateFinding
+            | QueryValueKind::TypestateWitness,
         ) => {
             return failed_before_execution(
                 PolicyFailureReason::InvalidExecutionPlan,

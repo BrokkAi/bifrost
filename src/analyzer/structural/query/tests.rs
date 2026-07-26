@@ -414,7 +414,8 @@ fn schema_version_three_adds_the_typed_cfg_algebra() {
         "(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function)))))",
     )
     .expect("version-three CFG RQL should lower");
-    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+    assert_eq!(rql.schema_version, 4);
+    assert_eq!(rql.plan.steps, query.plan.steps);
 
     let error = error_of(json!({
         "schema_version": 2,
@@ -423,6 +424,84 @@ fn schema_version_three_adds_the_typed_cfg_algebra() {
     }));
     assert_eq!(error.path, "steps[0].op");
     assert!(error.message.contains("requires schema version 3"));
+}
+
+#[test]
+fn schema_version_four_adds_registered_typestate_findings_and_witnesses() {
+    let query = parse_ok(json!({
+        "schema_version": 4,
+        "match": { "kind": "function", "name": "lifecycle" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "typestate", "protocol_ref": "embedding:bifrost.test.resource-lifecycle" },
+            { "op": "witness", "max_steps": 12, "max_bytes": 4096 },
+            { "op": "file_of" }
+        ]
+    }));
+    assert!(matches!(
+        &query.plan.steps[1],
+        QueryStep::Typestate(TypestateTraversal { protocol_ref })
+            if protocol_ref.to_string() == "embedding:bifrost.test.resource-lifecycle"
+    ));
+    assert_eq!(
+        query.plan.steps[2],
+        QueryStep::Witness(WitnessTraversal {
+            max_steps: Some(12),
+            max_bytes: Some(4096),
+        })
+    );
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::File);
+
+    let rql = CodeQuery::from_sexp(
+        "(file-of (witness :max-steps 12 :max-bytes 4096 (typestate :protocol-ref embedding:bifrost.test.resource-lifecycle (procedure-of (function :name \"lifecycle\")))))",
+    )
+    .expect("schema-four typestate RQL should lower");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+
+    let error = error_of(json!({
+        "schema_version": 3,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "typestate", "protocol_ref": "test:lifecycle" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].op");
+    assert!(error.message.contains("requires schema version 4"));
+}
+
+#[test]
+fn typestate_step_options_are_required_bounded_and_operation_specific() {
+    let missing = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "typestate" }]
+    }));
+    assert_eq!(missing.path, "steps[1].protocol_ref");
+
+    let invalid_ref = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "typestate", "protocol_ref": "missing-separator" }
+        ]
+    }));
+    assert_eq!(invalid_ref.path, "steps[1].protocol_ref");
+
+    let negative = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "typestate", "protocol_ref": "test:lifecycle" },
+            { "op": "witness", "max_steps": -1 }
+        ]
+    }));
+    assert_eq!(negative.path, "steps[2].max_steps");
+
+    let wrong_operation = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of", "protocol_ref": "test:lifecycle" }]
+    }));
+    assert_eq!(wrong_operation.path, "steps[0].protocol_ref");
 }
 
 #[test]

@@ -16,13 +16,15 @@ use std::sync::OnceLock;
 use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
 
 const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
+const RQL_CFG_SCHEMA_VERSION: u32 = 3;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
-        SCHEMA_VERSION as u32,
+        RQL_CFG_SCHEMA_VERSION,
         Some(RQL_INITIAL_SCHEMA_VERSION),
         true,
     ),
+    SchemaVersionDescriptor::new(SCHEMA_VERSION as u32, Some(RQL_CFG_SCHEMA_VERSION), true),
 ];
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
@@ -77,6 +79,7 @@ pub enum ValueShape {
     ReferenceKindList,
     UsageProof,
     UsageSurface,
+    ProtocolRef,
 }
 
 impl ValueShape {
@@ -106,6 +109,7 @@ impl ValueShape {
             Self::ReferenceKindList => "one or more structured reference kinds",
             Self::UsageProof => "proven or unproven",
             Self::UsageSurface => "external_usages or lsp_references",
+            Self::ProtocolRef => "a bounded protocol reference in namespace:name form",
         }
     }
 
@@ -259,6 +263,14 @@ macro_rules! query_step_ops {
                     Self::ReceiverTargets | Self::PointsTo | Self::MemberTargets
                 )
             }
+
+            pub fn allows_typestate_options(self) -> bool {
+                matches!(self, Self::Typestate)
+            }
+
+            pub fn allows_witness_options(self) -> bool {
+                matches!(self, Self::Witness)
+            }
         }
     };
 }
@@ -268,6 +280,7 @@ pub enum QuerySemanticFacet {
     Procedures,
     ProgramPoints,
     ControlEdges,
+    Typestate,
 }
 
 query_step_ops! {
@@ -279,7 +292,9 @@ query_step_ops! {
     CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
     CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
     CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    Typestate { label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate], since: 4, }
+    Witness { label: "witness", signature: "typestate_finding -> typestate_witness", description: "Project bounded retained evidence from each typestate finding without rerunning analysis.", since: 4, }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -428,6 +443,8 @@ macro_rules! rql_forms {
                     | Self::CfgPredecessorEdges
                     | Self::CfgEdgeSource
                     | Self::CfgEdgeTarget
+                    | Self::Typestate
+                    | Self::Witness
                     | Self::FileOf
                     | Self::ImportsOf
                     | Self::ImportersOf
@@ -600,6 +617,22 @@ rql_forms! {
         signature: "(cfg-edge-target query)",
         description: (QueryStepOp::CfgEdgeTarget),
         step: CfgEdgeTarget,
+    }
+    Typestate {
+        labels: ["typestate"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(typestate :protocol-ref namespace:name query)",
+        description: (QueryStepOp::Typestate),
+        step: Typestate,
+    }
+    Witness {
+        labels: ["witness"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(witness [:max-steps count] [:max-bytes count] query)",
+        description: (QueryStepOp::Witness),
+        step: Witness,
     }
     FileOf {
         labels: ["file-of"],
@@ -980,6 +1013,9 @@ json_fields! {
     ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
     ParameterName { label: "parameter_name", shape: ParameterName, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
+    ProtocolRef { label: "protocol_ref", shape: ProtocolRef, signature: "\"protocol_ref\": \"namespace:name\"", description: "Select one host-registered compiled protocol and binding plan." }
+    MaxSteps { label: "max_steps", shape: NonNegativeInteger, signature: "\"max_steps\": non-negative integer", description: "Further cap retained witness steps without rerunning analysis." }
+    MaxBytes { label: "max_bytes", shape: NonNegativeInteger, signature: "\"max_bytes\": non-negative integer", description: "Further cap retained witness bytes without rerunning analysis." }
 }
 
 pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[
@@ -1068,11 +1104,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_three_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_version_four_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 3,
+                version: 4,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1090,10 +1126,17 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             }
         );
+        assert_eq!(
+            resolve_rql_schema_version(Some(4)).unwrap(),
+            SchemaVersionResolution {
+                version: 4,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3]);
+        assert_eq!(error.supported, vec![2, 3, 4]);
     }
 
     #[test]

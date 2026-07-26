@@ -349,6 +349,65 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             steps.push(json!({ "op": op }));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Typestate => {
+            if items.len() != 4 || items[1].as_symbol() != Some(":protocol-ref") {
+                return Err(lower_error(
+                    expr,
+                    "(typestate ...) expects :protocol-ref namespace:name followed by a query",
+                ));
+            }
+            let protocol_ref = symbol_or_string(&items[2])?;
+            let mut query = query_object(&items[3])?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(json!({ "op": "typestate", "protocol_ref": protocol_ref }));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Witness => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "(witness ...) expects option/value pairs followed by a query",
+                ));
+            }
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String("witness".to_string()));
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(&pair[0], "(witness ...) option names must be symbols")
+                })?;
+                let field = match key {
+                    ":max-steps" => "max_steps",
+                    ":max-bytes" => "max_bytes",
+                    _ => {
+                        return Err(lower_error(
+                            &pair[0],
+                            "(witness ...) accepts only :max-steps and :max-bytes",
+                        ));
+                    }
+                };
+                if step
+                    .insert(field.to_string(), number_value(&pair[1], "witness")?)
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("(witness ...) repeats option {key}"),
+                    ));
+                }
+            }
+            let mut query = query_object(items.last().expect("witness wrapper has a query"))?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::ReferencesOf | RqlForm::UsedBy | RqlForm::Uses => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
                 return Err(lower_error(
@@ -729,6 +788,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CfgPredecessorEdges
         | RqlForm::CfgEdgeSource
         | RqlForm::CfgEdgeTarget
+        | RqlForm::Typestate
+        | RqlForm::Witness
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
