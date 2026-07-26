@@ -61,6 +61,7 @@ const REQUIRED_JSON_EXAMPLES: &[&str] = &[
     "negative-descendant",
     "kind-union",
     "scope",
+    "cfg-entry-successor",
 ];
 
 #[derive(Debug)]
@@ -119,6 +120,10 @@ fn documented_code_queries_parse() {
         seen.contains(&("rql".to_string(), "complete".to_string())),
         "missing complete RQL code-query example"
     );
+    assert!(
+        seen.contains(&("rql".to_string(), "cfg-entry-successor".to_string())),
+        "missing procedure-local CFG RQL example"
+    );
 }
 
 #[test]
@@ -166,6 +171,32 @@ fn query_documentation_tracks_public_contracts() {
         assert!(
             !contents.contains("`scan_usages`"),
             "{relative} must name one of the public mode-specific usage tools"
+        );
+    }
+
+    let python_client = fs::read_to_string(root.join("docs/src/content/docs/python-client.md"))
+        .expect("read Python client documentation");
+    for required in [
+        "compatible-head version-3",
+        "schema_version=2",
+        "ten possible classes",
+        "CodeQueryProcedure",
+        "CodeQueryProgramPoint",
+        "CodeQueryControlEdge",
+        "CodeQueryReceiverAnalysis",
+    ] {
+        assert!(
+            python_client.contains(required),
+            "Python client documentation must track the schema-v3 result contract: missing {required:?}"
+        );
+    }
+
+    let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
+        .expect("read Python client source");
+    for required in ["schema version 3", "cfg_successor_edges", "cfg_edge_target"] {
+        assert!(
+            python_client_source.contains(required),
+            "Python query_code docstring must track the schema-v3 operation contract: missing {required:?}"
         );
     }
 }

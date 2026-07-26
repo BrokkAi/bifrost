@@ -179,16 +179,29 @@ pub(super) fn resolve_in_enclosing_scopes(
 /// single-segment walk above cannot try it (tier-4 gmock shape, #1129's
 /// sibling).
 ///
-/// The reference is normalized to the canonical `.`-joined segment form the
-/// indexed fq strings use *before* composing candidates: a `::`-qualified
-/// reference (`inner::Config`, `a::b::C`), a `\`-qualified php name, or a
-/// `/`-qualified path reduces to `inner.Config` / `a.b.C`. Without this the
-/// composed candidate keeps the source separator (`{scope}.inner::Config`) and
-/// can never match a `.`-joined fq string, which silently made this fallback
-/// inert for every `::`-qualified reference in a dot-store language (#1162 — the
-/// #1126 safety net structurally did not exist for those shapes). The scope side
-/// is deliberately left verbatim; see the inline note below for why C++'s
-/// `::`-headed namespace fq names must not be normalized.
+/// Both sides are now interned segments (M2). The reference is parsed once into
+/// an [`crate::analyzer::fq_name::FqName`] via
+/// [`crate::analyzer::symbol_lookup::parse_symbol_path_fq`] (which honors the
+/// language's full separator set — `::`, `.`, `\`, `/`, `+` — and per-language
+/// normalization), and the enclosing scope's own structured `fq` supplies the
+/// prefix chain. Composing a candidate is a segment push, not a
+/// `format!("{scope}.{reference}")`, so the M1-era reference-normalization shim
+/// (`normalize_reference_to_fq_segments`) is gone: a `::`-qualified reference
+/// resolving to a `.`-joined candidate falls straight out of the segment
+/// rendering (#1162), with no per-call string massaging.
+///
+/// The scope prefix walk descends only across boundaries the native spelling
+/// renders as a literal `.`, so a C++ `::`-headed namespace scope
+/// (`cutlass::gemm::warp.OperandSharedStorage`) is never descended into its
+/// sibling namespaces — exactly the legacy dot-only `namespace_prefixes` walk,
+/// which is why issue #1163 stays pinned until M4 flips it deliberately.
+///
+/// Cache-loaded scope units carry an empty `fq` until persistence ships
+/// segments (M3); they take the string fallback arm below, which renders the
+/// reference to the same `.`-joined normalization the deleted shim produced and
+/// walks the verbatim scope string. Both arms are proven identical by the
+/// `issue_1162_separator_aware_enclosing_scope` suite and the dual-arm unit
+/// tests. The fallback arm is deleted in M4.
 pub(super) fn resolve_qualified_in_enclosing_scopes(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -200,8 +213,10 @@ pub(super) fn resolve_qualified_in_enclosing_scopes(
         return None;
     }
     let language = language_for_file(file);
-    let normalized = normalize_reference_to_fq_segments(language, reference);
-    if normalized.is_empty() {
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let reference_fq =
+        crate::analyzer::symbol_lookup::parse_symbol_path_fq(language, reference, interner);
+    if reference_fq.is_empty() {
         return None;
     }
     let range = Range {
@@ -210,41 +225,78 @@ pub(super) fn resolve_qualified_in_enclosing_scopes(
         start_line: 0,
         end_line: 0,
     };
-    // The scope's fq name is used verbatim, NOT normalized. In languages whose
-    // stored fq names keep a source separator in the namespace head (C++ indexes
-    // `cutlass::gemm::warp.OperandSharedStorage.OperandLayout` — `::` between
-    // namespaces, `.` down the owner/member chain), the scope prefix must keep
-    // that same `::` head to match the indexed string; `namespace_prefixes`
-    // still walks the dot-joined owner/member tail, which is where the
-    // enclosing-scope members live. Normalizing the scope to all-`.` would break
-    // that match (it regresses cutlass's template-parameter resolution). Only the
-    // *reference* is normalized (below/above): that is what lets a `::`-qualified
-    // reference match a `.`-joined candidate in a dot-store language (rust);
-    // C++'s `::`-headed namespace fqns are a separate indexing concern (#1162).
-    let scope = analyzer.enclosing_code_unit(file, &range)?.fq_name();
-    resolve_qualified_name_in_shrinking_scopes(
-        &scope,
-        &normalized,
+    let scope_unit = analyzer.enclosing_code_unit(file, &range)?;
+
+    // The enclosing scope unit always comes from FileState declarations, which
+    // carry a populated structured `fq` (extracted at M1, rehydrated from
+    // persisted segments at M3), so the composition is a pure segment push. The
+    // M2-era empty-fq string fallback (which walked the verbatim scope string and
+    // rendered the reference via `display`) is deleted; both sides are segments.
+    if scope_unit.fq().is_empty() {
+        return None;
+    }
+    resolve_qualified_name_in_shrinking_scopes_fq(
+        language,
+        scope_unit.fq(),
+        &reference_fq,
+        interner,
         || true,
         |fqn| analyzer.definitions(fqn).collect(),
         accept,
     )
 }
 
-/// Normalize a qualified-name *reference* into the canonical `.`-joined segment
-/// form used when composing enclosing-scope candidates, honoring the language's
-/// full separator set (`::`, `.`, `\`, `/`, `+`) via the shared structured
-/// [`parse_symbol_path`] splitter rather than an ad-hoc `replace`/`split`.
-/// This is what lets a `::`-qualified reference match a `.`-joined candidate in
-/// a language whose indexed fq strings are `.`-joined (rust). It is a no-op for
-/// a bare single-segment reference — which is what every current C++ caller
-/// passes (C++'s `::`-headed namespace fq names are a separate indexing concern;
-/// see the scope note in `resolve_qualified_in_enclosing_scopes`). #1162.
-fn normalize_reference_to_fq_segments(language: Language, reference: &str) -> String {
-    crate::analyzer::symbol_lookup::parse_symbol_path(language, reference).join(".")
+/// Segment-composed sibling of [`resolve_qualified_name_in_shrinking_scopes`]:
+/// tries `{scope} + reference` at the full enclosing scope, then at each
+/// progressively shorter prefix of `scope`, composing each candidate by pushing
+/// the reference's segments onto the scope prefix (no separator inference) and
+/// rendering natively for the string-keyed `definitions` lookup.
+///
+/// A prefix boundary is a valid cut point only where the native rendering
+/// places a literal `.`, which reproduces the legacy dot-only
+/// `namespace_prefixes` walk exactly: a `::`-joined C++ namespace head, a `/`
+/// path join, or a `$` nesting boundary is not a `.`, so the walk never
+/// descends across it. `charge_hop` is polled once per attempted prefix (same
+/// count as the string core), so budget-charging callers truncate identically.
+pub(super) fn resolve_qualified_name_in_shrinking_scopes_fq(
+    language: Language,
+    scope: &crate::analyzer::fq_name::FqName,
+    reference: &crate::analyzer::fq_name::FqName,
+    interner: &crate::analyzer::fq_name::SegmentInterner,
+    mut charge_hop: impl FnMut() -> bool,
+    mut definitions_for: impl FnMut(&str) -> Vec<CodeUnit>,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    let segments = scope.segments();
+    for len in (1..=segments.len()).rev() {
+        let is_cut = len == segments.len()
+            || interner.separator_between(segments[len - 1], segments[len], language) == ".";
+        if !is_cut {
+            continue;
+        }
+        if !charge_hop() {
+            break;
+        }
+        let mut candidate = crate::analyzer::fq_name::FqName::new();
+        for &id in &segments[..len] {
+            candidate.push(id);
+        }
+        for &id in reference.segments() {
+            candidate.push(id);
+        }
+        let candidate_str = candidate.display_native(language, interner);
+        if let Some(unit) = definitions_for(&candidate_str)
+            .into_iter()
+            .find(|unit| accept(unit))
+        {
+            return Some(unit);
+        }
+    }
+    None
 }
 
-/// Budget-parametric core shared by [`resolve_qualified_in_enclosing_scopes`]
+/// Budget-parametric core shared by the empty-fq fallback arm of
+/// [`resolve_qualified_in_enclosing_scopes`]
 /// and C#'s bounded fork (`resolve_csharp_in_enclosing_scopes`): try
 /// `{prefix}.{reference}` at `scope`, then at each progressively shorter
 /// dotted prefix of `scope` in turn (never the bare top level — see the doc

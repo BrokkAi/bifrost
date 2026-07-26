@@ -6,12 +6,17 @@
 
 use std::fmt;
 
-use crate::analyzer::structural::CodeQueryExecutionLimits;
+use crate::analyzer::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
 
 const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
 const MAX_PIPELINE_ROWS: usize = 50_000;
+const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
+const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
+const MAX_SEMANTIC_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SEMANTIC_TRAVERSAL_STEPS: usize = 1_000_000;
 
 const MAX_FINDINGS: usize = 1_000;
 const MAX_DIAGNOSTICS: usize = 256;
@@ -65,6 +70,7 @@ impl Default for PolicyBudget {
                 max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
                 max_fact_nodes: MAX_FACT_NODES,
                 max_pipeline_rows: MAX_PIPELINE_ROWS,
+                semantic: CodeQuerySemanticLimits::default(),
             },
             max_findings: MAX_FINDINGS,
             max_diagnostics: MAX_DIAGNOSTICS,
@@ -216,6 +222,11 @@ pub enum PolicyBudgetField {
     ScannedSourceBytes,
     FactNodes,
     PipelineRows,
+    SemanticMaterializedFiles,
+    SemanticSourceBytes,
+    SemanticRowsPerDimension,
+    SemanticRetainedBytes,
+    SemanticTraversalSteps,
     Findings,
     Diagnostics,
     RelatedLocationsPerFinding,
@@ -245,6 +256,11 @@ impl PolicyBudgetField {
             Self::ScannedSourceBytes => "scanned_source_bytes",
             Self::FactNodes => "fact_nodes",
             Self::PipelineRows => "pipeline_rows",
+            Self::SemanticMaterializedFiles => "semantic_materialized_files",
+            Self::SemanticSourceBytes => "semantic_source_bytes",
+            Self::SemanticRowsPerDimension => "semantic_rows_per_dimension",
+            Self::SemanticRetainedBytes => "semantic_retained_bytes",
+            Self::SemanticTraversalSteps => "semantic_traversal_steps",
             Self::Findings => "findings",
             Self::Diagnostics => "diagnostics",
             Self::RelatedLocationsPerFinding => "related_locations_per_finding",
@@ -358,6 +374,31 @@ impl PolicyBudgetBuilder {
             PolicyBudgetField::PipelineRows,
             limits.max_pipeline_rows,
             MAX_PIPELINE_ROWS,
+        )?;
+        ensure_at_most(
+            PolicyBudgetField::SemanticMaterializedFiles,
+            limits.semantic.max_materialized_files,
+            MAX_SEMANTIC_MATERIALIZED_FILES,
+        )?;
+        ensure_at_most(
+            PolicyBudgetField::SemanticSourceBytes,
+            limits.semantic.max_source_bytes,
+            MAX_SEMANTIC_SOURCE_BYTES,
+        )?;
+        ensure_at_most(
+            PolicyBudgetField::SemanticRowsPerDimension,
+            limits.semantic.max_rows_per_dimension,
+            MAX_SEMANTIC_ROWS_PER_DIMENSION,
+        )?;
+        ensure_at_most(
+            PolicyBudgetField::SemanticRetainedBytes,
+            limits.semantic.max_retained_bytes,
+            MAX_SEMANTIC_RETAINED_BYTES,
+        )?;
+        ensure_at_most(
+            PolicyBudgetField::SemanticTraversalSteps,
+            limits.semantic.max_traversal_steps,
+            MAX_SEMANTIC_TRAVERSAL_STEPS,
         )?;
         self.budget.query = limits;
         Ok(self)
@@ -530,6 +571,18 @@ mod tests {
         assert_eq!(query.max_scanned_source_bytes, 128 * 1024 * 1024);
         assert_eq!(query.max_fact_nodes, 2_000_000);
         assert_eq!(query.max_pipeline_rows, 50_000);
+        assert_eq!(
+            query.semantic.max_materialized_files,
+            MAX_SEMANTIC_MATERIALIZED_FILES
+        );
+        assert_eq!(
+            query.semantic.max_retained_bytes,
+            MAX_SEMANTIC_RETAINED_BYTES
+        );
+        assert_eq!(
+            query.semantic.max_traversal_steps,
+            MAX_SEMANTIC_TRAVERSAL_STEPS
+        );
         assert_eq!(budget.max_findings(), 1_000);
         assert_eq!(budget.max_diagnostics(), 256);
         assert_eq!(budget.max_related_locations_per_finding(), 64);
@@ -562,6 +615,7 @@ mod tests {
                 max_scanned_source_bytes: 0,
                 max_fact_nodes: 0,
                 max_pipeline_rows: 0,
+                semantic: CodeQuerySemanticLimits::default(),
             })
             .unwrap()
             .with_max_findings(0)
@@ -618,6 +672,80 @@ mod tests {
                 hard_cap: MAX_SCANNED_FILES,
             }
         );
+
+        for (limits, field, value, hard_cap) in [
+            (
+                CodeQueryExecutionLimits {
+                    semantic: CodeQuerySemanticLimits {
+                        max_materialized_files: MAX_SEMANTIC_MATERIALIZED_FILES + 1,
+                        ..CodeQuerySemanticLimits::default()
+                    },
+                    ..CodeQueryExecutionLimits::default()
+                },
+                PolicyBudgetField::SemanticMaterializedFiles,
+                MAX_SEMANTIC_MATERIALIZED_FILES + 1,
+                MAX_SEMANTIC_MATERIALIZED_FILES,
+            ),
+            (
+                CodeQueryExecutionLimits {
+                    semantic: CodeQuerySemanticLimits {
+                        max_source_bytes: MAX_SEMANTIC_SOURCE_BYTES + 1,
+                        ..CodeQuerySemanticLimits::default()
+                    },
+                    ..CodeQueryExecutionLimits::default()
+                },
+                PolicyBudgetField::SemanticSourceBytes,
+                MAX_SEMANTIC_SOURCE_BYTES + 1,
+                MAX_SEMANTIC_SOURCE_BYTES,
+            ),
+            (
+                CodeQueryExecutionLimits {
+                    semantic: CodeQuerySemanticLimits {
+                        max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION + 1,
+                        ..CodeQuerySemanticLimits::default()
+                    },
+                    ..CodeQueryExecutionLimits::default()
+                },
+                PolicyBudgetField::SemanticRowsPerDimension,
+                MAX_SEMANTIC_ROWS_PER_DIMENSION + 1,
+                MAX_SEMANTIC_ROWS_PER_DIMENSION,
+            ),
+            (
+                CodeQueryExecutionLimits {
+                    semantic: CodeQuerySemanticLimits {
+                        max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES + 1,
+                        ..CodeQuerySemanticLimits::default()
+                    },
+                    ..CodeQueryExecutionLimits::default()
+                },
+                PolicyBudgetField::SemanticRetainedBytes,
+                MAX_SEMANTIC_RETAINED_BYTES + 1,
+                MAX_SEMANTIC_RETAINED_BYTES,
+            ),
+            (
+                CodeQueryExecutionLimits {
+                    semantic: CodeQuerySemanticLimits {
+                        max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS + 1,
+                        ..CodeQuerySemanticLimits::default()
+                    },
+                    ..CodeQueryExecutionLimits::default()
+                },
+                PolicyBudgetField::SemanticTraversalSteps,
+                MAX_SEMANTIC_TRAVERSAL_STEPS + 1,
+                MAX_SEMANTIC_TRAVERSAL_STEPS,
+            ),
+        ] {
+            assert_eq!(
+                PolicyBudget::builder()
+                    .with_query_limits(limits)
+                    .unwrap_err(),
+                PolicyBudgetError::ExceedsHardCap {
+                    field,
+                    value,
+                    hard_cap,
+                }
+            );
+        }
 
         assert!(
             PolicyBudget::builder()

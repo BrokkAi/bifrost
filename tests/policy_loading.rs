@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use brokk_bifrost::analyzer::structural::CodeQuery;
+use brokk_bifrost::analyzer::structural::{CodeQuery, SCHEMA_VERSION as RQL_SCHEMA_VERSION};
 use brokk_bifrost::policy::{
     CatalogRegistryLimits, PolicyCategoryId, PolicyId, PolicyPort, PolicyRegistry,
     PolicyRegistryError, PolicyRegistryLimits, PolicySelector, PolicySourceIdentity,
@@ -233,14 +233,16 @@ fn explicit_and_compatible_omitted_versions_share_semantics_not_source_identity(
       :message "M"
       :severity warning
       :analysis (analysis :type match :selector (rql (name "target"))))"#;
-    let explicit = r#"(policy
+    let explicit = format!(
+        r#"(policy
       :schema-version 1
       :id "test.versioned"
       :name "Versioned"
       :message "M"
       :severity warning
       :analysis (analysis :type match
-        :selector (rql :schema-version 2 (name "target"))))"#;
+        :selector (rql :schema-version {RQL_SCHEMA_VERSION} (name "target"))))"#
+    );
     let mut omitted_registry = registry_without_workspace();
     let omitted = omitted_registry
         .register_policy_bytes(PolicySourceIdentity::new("omitted"), omitted.as_bytes())
@@ -335,7 +337,7 @@ fn auxiliary_models_consume_endpoint_slots_transactionally() {
 fn catalog_expansion_consumes_retained_bytes_transactionally() {
     let selector = |name: &str| PolicySelector::Inline {
         schema: SchemaVersionResolution {
-            version: 2,
+            version: RQL_SCHEMA_VERSION as u32,
             origin: SchemaVersionOrigin::Explicit,
         },
         query: CodeQuery::from_sexp(&format!("(name \"{name}\")")).unwrap(),
@@ -780,7 +782,7 @@ fn policy_iterators_are_stably_sorted() {
 fn registered_catalog_sources_and_sinks_become_closed_policy_dependencies() {
     let selector = |name: &str| PolicySelector::Inline {
         schema: SchemaVersionResolution {
-            version: 2,
+            version: RQL_SCHEMA_VERSION as u32,
             origin: SchemaVersionOrigin::Explicit,
         },
         query: CodeQuery::from_sexp(&format!("(name \"{name}\")")).unwrap(),
@@ -851,7 +853,7 @@ fn registered_catalog_sources_and_sinks_become_closed_policy_dependencies() {
 fn same_named_catalog_auxiliaries_retain_qualified_identity_and_selector_paths() {
     let selector = |name: &str| PolicySelector::Inline {
         schema: SchemaVersionResolution {
-            version: 2,
+            version: RQL_SCHEMA_VERSION as u32,
             origin: SchemaVersionOrigin::Explicit,
         },
         query: CodeQuery::from_sexp(&format!("(name \"{name}\")")).unwrap(),

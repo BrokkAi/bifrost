@@ -7,6 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::CodeQuery;
 use crate::schema_version::SchemaVersionResolution;
@@ -1561,113 +1562,16 @@ fn lower_hex_nibble(byte: u8, index: usize) -> Result<u8, Sha256ValueError> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyIdentifierError {
-    Empty,
-    TooLong { max_bytes: usize },
-    NonAscii,
-    InvalidStart,
-    InvalidEnd,
-    InvalidCharacter { index: usize },
-}
-
-impl fmt::Display for PolicyIdentifierError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("identifier must not be empty"),
-            Self::TooLong { max_bytes } => {
-                write!(formatter, "identifier must be at most {max_bytes} bytes")
-            }
-            Self::NonAscii => formatter.write_str("identifier must contain only ASCII characters"),
-            Self::InvalidStart => {
-                formatter.write_str("identifier must begin with a lowercase ASCII alphanumeric")
-            }
-            Self::InvalidEnd => {
-                formatter.write_str("identifier must end with a lowercase ASCII alphanumeric")
-            }
-            Self::InvalidCharacter { index } => {
-                write!(
-                    formatter,
-                    "identifier has an invalid character at byte {index}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for PolicyIdentifierError {}
-
-fn validate_identifier(
-    value: &str,
-    max_bytes: usize,
-    allow_dot: bool,
-) -> Result<(), PolicyIdentifierError> {
-    if value.is_empty() {
-        return Err(PolicyIdentifierError::Empty);
-    }
-    if value.len() > max_bytes {
-        return Err(PolicyIdentifierError::TooLong { max_bytes });
-    }
-    if !value.is_ascii() {
-        return Err(PolicyIdentifierError::NonAscii);
-    }
-    let bytes = value.as_bytes();
-    if !is_lower_alphanumeric(bytes[0]) {
-        return Err(PolicyIdentifierError::InvalidStart);
-    }
-    if !is_lower_alphanumeric(bytes[bytes.len() - 1]) {
-        return Err(PolicyIdentifierError::InvalidEnd);
-    }
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if !(is_lower_alphanumeric(byte)
-            || byte == b'-'
-            || byte == b'_'
-            || allow_dot && byte == b'.')
-        {
-            return Err(PolicyIdentifierError::InvalidCharacter { index });
-        }
-    }
-    Ok(())
-}
-
-const fn is_lower_alphanumeric(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit()
-}
+pub type PolicyIdentifierError = crate::analyzer::identifier::IdentifierError;
 
 macro_rules! define_policy_identifier {
     ($name:ident, $max_bytes:expr, $allow_dot:expr) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(Box<str>);
-
-        impl $name {
-            pub fn new(value: impl AsRef<str>) -> Result<Self, PolicyIdentifierError> {
-                let value = value.as_ref();
-                validate_identifier(value, $max_bytes, $allow_dot)?;
-                Ok(Self(value.into()))
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                self.as_str()
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(self.as_str())
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = PolicyIdentifierError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Self::new(value)
+        define_identifier! {
+            #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+            pub struct $name {
+                max_bytes: $max_bytes,
+                allow_dot: $allow_dot,
+                error: PolicyIdentifierError,
             }
         }
     };

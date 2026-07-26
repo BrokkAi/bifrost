@@ -9,8 +9,7 @@ use crate::analyzer::bounded_output::{BalancedWriter, TruncationStyle, quoted};
 
 use super::capabilities::{CapabilitySupport, SemanticCapabilities};
 use super::ids::{
-    ControlEdgeId, DeclarationSegmentKind, ProcedureId, SemanticArtifactKey, SemanticLocator,
-    SourceRevision,
+    ControlEdgeId, ProcedureId, SemanticArtifactKey, SemanticLocator, SourceRevision,
 };
 use super::ir::{
     AllocationKind, AllocationSite, ArgumentDomain, BasicBlock, CallableTarget,
@@ -1190,7 +1189,7 @@ fn write_locator(writer: &mut dyn fmt::Write, locator: &SemanticLocator) -> fmt:
         write!(
             writer,
             "(segment :kind {} :name ",
-            quoted(declaration_segment_kind_label(segment.kind())),
+            quoted(segment.kind().stable_label()),
         )?;
         if let Some(name) = segment.name() {
             write!(writer, "{}", quoted(name))?;
@@ -1208,22 +1207,6 @@ fn write_locator(writer: &mut dyn fmt::Write, locator: &SemanticLocator) -> fmt:
     }
     writer.write_char(')')
 }
-const fn declaration_segment_kind_label(kind: DeclarationSegmentKind) -> &'static str {
-    match kind {
-        DeclarationSegmentKind::File => "file",
-        DeclarationSegmentKind::Namespace => "namespace",
-        DeclarationSegmentKind::Type => "type",
-        DeclarationSegmentKind::Function => "function",
-        DeclarationSegmentKind::Method => "method",
-        DeclarationSegmentKind::Constructor => "constructor",
-        DeclarationSegmentKind::Initializer => "initializer",
-        DeclarationSegmentKind::LocalFunction => "local_function",
-        DeclarationSegmentKind::Lambda => "lambda",
-        DeclarationSegmentKind::Closure => "closure",
-        DeclarationSegmentKind::AnonymousCallable => "anonymous_callable",
-    }
-}
-
 struct OptionalId<T>(Option<T>);
 
 impl<T: fmt::Display> fmt::Display for OptionalId<T> {

@@ -17,7 +17,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 11;
+const CURRENT_MIGRATION_VERSION: i64 = 12;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -37,6 +37,7 @@ const IDENTIFIER_LOOKUP_MEMBERSHIP_SQL: &str =
     include_str!("../migrations/cache/0010-identifier-lookup-membership.sql");
 const CODE_UNIT_TEST_REGION_SQL: &str =
     include_str!("../migrations/cache/0011-code-unit-test-region.sql");
+const FQ_SEGMENTS_SQL: &str = include_str!("../migrations/cache/0012-fq-segments.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -49,6 +50,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     SCALA_EXPORTS_SQL,
     IDENTIFIER_LOOKUP_MEMBERSHIP_SQL,
     CODE_UNIT_TEST_REGION_SQL,
+    FQ_SEGMENTS_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -84,6 +86,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply identifier lookup membership migration");
     conn.execute_batch(CODE_UNIT_TEST_REGION_SQL)
         .expect("apply code unit test region migration");
+    conn.execute_batch(FQ_SEGMENTS_SQL)
+        .expect("apply fq segments migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -563,6 +567,18 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
         [table],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+#[cfg(test)]
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+         )",
+        [table, column],
         |row| row.get(0),
     )
     .map_err(|err| format!("cache DB SQLite error: {err}"))
@@ -1386,6 +1402,59 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn fq_segments_migration_upgrades_pre_column_database() {
+        // Build a database at the schema version that predates the fq_segments
+        // column (everything through 0011), insert a code_units row the old way
+        // (no fq_segments), then run the full migration and prove the ALTER
+        // lands cleanly and the pre-existing row survives with a NULL segments
+        // blob (which the load path decodes to an empty FqName; the epoch salt
+        // bump forces such rows to re-extract and repopulate real segments).
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let pre_column = &CACHE_MIGRATION_SQL[..(CURRENT_MIGRATION_VERSION as usize - 1)];
+        migrate_with_sql(&mut conn, pre_column).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION - 1
+        );
+        assert!(!column_exists(&conn, "code_units", "fq_segments").unwrap());
+
+        let oid = "2222222222222222222222222222222222222222";
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+               signature, synthetic, is_type_alias, top_level_ordinal,
+               in_declarations, in_definition_lookup
+             ) VALUES(?1, 'rust', 1, 2, 'Widget', 'Widget', '', NULL, 0, 0, 0, 1, 0)",
+            [oid],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(column_exists(&conn, "code_units", "fq_segments").unwrap());
+        assert!(current_schema_is_valid(&conn).unwrap());
+        let (short_name, fq_segments): (String, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT short_name, fq_segments FROM code_units WHERE blob_oid = ?1",
+                [oid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(short_name, "Widget");
+        assert_eq!(fq_segments, None);
     }
 
     #[test]

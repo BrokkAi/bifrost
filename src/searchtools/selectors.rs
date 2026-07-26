@@ -767,6 +767,20 @@ pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
 /// "looks like" a `.r` file) and `type` (#1128). So a slash-free anchor must
 /// additionally name a real file before this fallback treats it as one;
 /// otherwise it falls through to a plain name lookup.
+///
+/// M2 note (fqname-interned-segments): the plan envisions this split as
+/// "optional Path-prefix + symbol segments", retiring the `.r`-lookalike
+/// heuristic once the Path/symbol boundary is a recorded segment-kind
+/// transition. That retirement is deliberately deferred: this splitter runs
+/// *before* the input is bound to a language, so it cannot parse `r#type` into
+/// a single (raw-identifier) `Member` segment to prove the `#` is intra-token —
+/// only a language-aware `parse_symbol_path_fq` could, and threading language
+/// into the pre-resolution splitter is a larger change than M2's zero-behavior
+/// bar allows. The `anchor_is_file` resolver check — which the plan keeps as
+/// the semantic validation — already resolves the `DbColumn.r#type` case
+/// correctly (`DbColumn.r` is not a file), so the heuristic is not yet
+/// redundant. The #1128/#1131 anchor canaries pin this behavior unchanged. See
+/// the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
 pub(super) fn split_definition_selector_with_resolver<'a>(
     input: &'a str,
     anchor_is_file: impl Fn(&str) -> bool,

@@ -22,19 +22,21 @@
 //!   * the negative controls still hold — a genuinely-external `::`-qualified
 //!     reference still draws the boundary (the fix does not over-suppress).
 //!
-//! Findings recorded during the fix (see the strengthened NOTEs at the pinned
-//! sites): after the fix, rust's enclosing-scope member fallback is functional
-//! for `::` paths (rust fq strings are all-`.`), but Rust's own scoped-
-//! associated-item / workspace-module resolution already catches every
-//! enclosing-qualified workspace shape upstream, so no reference reaches the
-//! rust.rs:1022 net today. For C++ the fallback stays inert: C++ keys nested-
-//! namespace declarations with `::` in their fq-name head, and the resolver's
-//! dot-based prefix walk (starting from the enclosing scope's own `::`-headed fq
-//! name) can descend the `.`-joined owner/member tail but never re-compose a
-//! sibling namespace — so cpp.rs:2107/:2402 stay pinned until C++ fq indexing is
-//! normalized (out of the get_definition lane).
-//! `cpp_qualified_nested_namespace_type_current_behavior` pins that as the
-//! current (documented) behavior.
+//! Findings recorded during the fix (see the NOTEs at the former pinned sites):
+//! after the fix, rust's enclosing-scope member fallback is functional for `::`
+//! paths (rust fq strings are all-`.`), but Rust's own scoped-associated-item /
+//! workspace-module resolution already catches every enclosing-qualified
+//! workspace shape upstream, so no reference reaches the rust.rs:1022 net today.
+//!
+//! For C++ the sibling-nested-namespace shape was pinned as a documented false
+//! boundary through M3 (C++ keys nested-namespace declarations with `::` in their
+//! fq-name head, which the shared dot-only enclosing-scope walk cannot re-compose
+//! from a sibling `::`-joined scope). M4 CLOSES issue #1163: with interned
+//! segments authoritative end-to-end, cpp.rs's namespace-outward net
+//! (`cpp_resolve_qualified_via_enclosing_namespaces`) re-interns the reference
+//! with namespace-aware kinds and descends the scope's `::`-joined namespace head,
+//! composing the exact stored key. `cpp_qualified_nested_namespace_type_resolves`
+//! now asserts real resolution of that shape.
 
 mod common;
 
@@ -218,15 +220,15 @@ fn cpp_unknown_type_with_unresolved_include_stays_boundary() {
 }
 
 #[test]
-fn cpp_qualified_nested_namespace_type_current_behavior() {
-    // FINDING PIN (#1162, cpp.rs:2402): a `::`-qualified reference to a type in a
-    // *sibling* nested namespace (`inner::Gizmo` -> `outer::inner::Gizmo`) reaches
-    // the include-boundary branch and — because C++ keys nested-namespace
-    // declarations with `::` in their stored fq name, which the shared `.`-based
-    // enclosing-scope resolver cannot match — currently draws a boundary even
-    // though the type IS workspace-owned. This documents that residual gap (the
-    // effective fix is normalizing C++'s fq indexing, out of the get_definition
-    // lane). When that lands, this assertion should flip to `assert_not_boundary`.
+fn cpp_qualified_nested_namespace_type_resolves() {
+    // ISSUE #1163 (was the pinned false boundary at cpp.rs:2402): a `::`-qualified
+    // reference to a type in a *sibling* nested namespace
+    // (`inner::Gizmo` -> `outer::inner::Gizmo`) is workspace-owned and now RESOLVES.
+    // With interned segments authoritative end-to-end (M4), C++'s mixed-separator
+    // store no longer blocks it: the namespace-outward net re-interns the reference
+    // with namespace-aware kinds and descends the scope's `::`-joined namespace
+    // head, composing the exact stored key `outer::inner.Gizmo`. This was the
+    // plan's acceptance payoff — the false-boundary pin flips to real resolution.
     let src = "#include \"missing.h\"\n\nnamespace outer {\nnamespace inner {\nstruct Gizmo {};\n}\nnamespace deep {\nstruct User { inner::Gizmo make(); };\n}\n}\n";
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("main.cpp", src)
@@ -239,10 +241,15 @@ fn cpp_qualified_nested_namespace_type_current_behavior() {
         0,
         "Gizmo",
     );
-    // Documented current behavior — NOT the desired end state; see the NOTE.
+    assert_not_boundary(&v, "cpp sibling-namespace `inner::Gizmo` (#1163)");
     assert_eq!(
         status(&v),
-        "unresolvable_import_boundary",
-        "documenting the C++ nested-namespace store-gap; flip when C++ fq indexing normalizes: {v}"
+        "resolved",
+        "cpp `inner::Gizmo` must resolve to the workspace-owned `outer::inner::Gizmo`: {v}"
+    );
+    assert_eq!(
+        v["results"][0]["definitions"][0]["fqn"].as_str(),
+        Some("outer::inner.Gizmo"),
+        "resolves to the sibling-namespace type: {v}"
     );
 }

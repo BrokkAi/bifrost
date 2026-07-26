@@ -484,7 +484,7 @@ fn scala_companion_syntax_candidate_identifier(target: &CodeUnit) -> Option<&str
     {
         return None;
     }
-    let (owner, _) = target.short_name().rsplit_once('.')?;
+    let (owner, _) = target.short_name().rsplit_once('.')?; // fqname-M4: package-less short_name owner; fq.parent() would add the package prefix, changing the downstream match
     let terminal = owner.rsplit('.').next()?;
     terminal.strip_suffix('$').filter(|name| !name.is_empty())
 }

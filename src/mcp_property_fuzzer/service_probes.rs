@@ -298,6 +298,10 @@ pub struct ProbeSummary {
     /// include/import directive, whose "symbol" is a file path rather than
     /// a resolvable code symbol.
     pub skipped_include_summary_element: usize,
+    /// I3(a) follow-ups skipped because the summary element's name is not
+    /// identifier-shaped (`operator<<`, `~Foo`, `<init>`), so no selector
+    /// spelling can address it.
+    pub skipped_non_ident_name: usize,
     /// Summary probes skipped for empty files (e.g. 0-byte `__init__.py`):
     /// an all-empty response is a valid result there, not a refusal.
     pub skipped_empty_file_summaries: usize,
@@ -1162,8 +1166,14 @@ fn derive_follow_ups(
                             // the module's "path" is a convention, not a
                             // per-file contract, so I3a's path check cannot
                             // apply (java packages, like go blanks and the
-                            // I1(b) module naming convention).
-                            if element.get("kind").and_then(Value::as_str) == Some("module") {
+                            // I1(b) module naming convention). The
+                            // file-level "excerpt" element is the same
+                            // convention for js/ts files: its "symbol" is
+                            // the file path (phpstan's website js docs).
+                            if matches!(
+                                element.get("kind").and_then(Value::as_str),
+                                Some("module") | Some("excerpt")
+                            ) {
                                 summary.skipped_module_summary_element += 1;
                                 continue;
                             }
@@ -1184,6 +1194,15 @@ fn derive_follow_ups(
                             // mismatches between files.
                             if terminal_of(symbol) == "_" {
                                 summary.symbols_excluded_blank_identifier += 1;
+                                continue;
+                            }
+                            // Non-identifier element names (`operator<<`,
+                            // `~Foo`, `<init>`) are not addressable by any
+                            // selector spelling per the fuzzer's own ident
+                            // convention — probing them not_founds by
+                            // construction (googletest's `operator<<`).
+                            if !is_ident_like(terminal_of(symbol)) {
+                                summary.skipped_non_ident_name += 1;
                                 continue;
                             }
                             follow.push(ProbeRecord {
@@ -1560,7 +1579,18 @@ pub fn check_i1c(
 /// own keyword. `expected` stays a line vector so a trailing blank line at
 /// the range end is not lost to a join/re-split round trip.
 fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
-    let text_lines: Vec<&str> = text.lines().collect();
+    // CRLF files: `str::lines` strips `\r` only from `\r\n` pairs, so a
+    // block whose range ends between them keeps a lone trailing `\r`
+    // (brpc's rapidjson third-party headers). Normalize per line.
+    let text_lines: Vec<&str> = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let expected: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let expected = expected.as_slice();
     if text_lines.is_empty() || text_lines.len() != expected.len() {
         return false;
     }
@@ -1601,16 +1631,56 @@ fn strip_type_keyword(line: &str) -> Option<String> {
 }
 
 /// 1-based inclusive line slice, mirroring the SourceBlock range convention.
+/// Uses the resolver's canonical mixed-ending convention (`\r`, `\n`, and
+/// `\r\n` all terminate lines, text_utils::compute_line_starts); a
+/// `str::lines`-based slice under-counts files with lone carriage returns
+/// and misreads ranges as outside the sampled source (8cc's lex.c).
 fn line_slice(text: &str, start_line: usize, end_line: usize) -> Option<Vec<&str>> {
     if start_line == 0 || end_line < start_line {
         return None;
     }
+    let starts = crate::text_utils::compute_line_starts(text);
+    let start_byte = *starts.get(start_line - 1)?;
+    let end_byte = starts.get(end_line).copied().unwrap_or(text.len());
+    if start_byte >= end_byte {
+        return None;
+    }
+    let slice = &text[start_byte..end_byte];
     let wanted = end_line - start_line + 1;
-    let lines: Vec<&str> = text.lines().skip(start_line - 1).take(wanted).collect();
+    let mut lines: Vec<&str> = Vec::with_capacity(wanted);
+    let mut rest = slice;
+    while let Some((line, remaining)) = split_mixed_line(rest) {
+        lines.push(line);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
     if lines.len() != wanted {
         return None;
     }
     Some(lines)
+}
+
+/// Split one line off the front of `text` at the first line terminator
+/// (`\r`, `\n`, or `\r\n`), returning the line without the terminator and
+/// the remainder.
+fn split_mixed_line(text: &str) -> Option<(&str, &str)> {
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '\r' => {
+                let line = &text[..index];
+                let mut rest = &text[index + 1..];
+                if rest.starts_with('\n') {
+                    rest = &rest[1..];
+                }
+                return Some((line, rest));
+            }
+            '\n' => return Some((&text[..index], &text[index + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// How one spelling fared, for I2 comparisons.

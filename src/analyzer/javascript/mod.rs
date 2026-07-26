@@ -3,24 +3,26 @@ use crate::analyzer::clone_detection::{
     detect_structural_clone_smells,
 };
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
-    weight_project_file_set, weight_string_set,
-};
+use crate::analyzer::fq_name::{FqName, SegmentKind};
+use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
 use crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics;
-use crate::analyzer::js_ts::hierarchy::{
-    build_direct_descendant_index_by_unit, extract_js_supertypes, resolve_direct_ancestors,
-};
+use crate::analyzer::js_ts::hierarchy::extract_js_supertypes;
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::extract_js_ts_call_receiver;
 use crate::analyzer::js_ts::imports::{
-    import_info_tokens, parse_commonjs_require_import_infos_from_node,
-    parse_es_import_infos_from_node, resolve_js_ts_import_paths,
+    parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
 };
-use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
+use crate::analyzer::js_ts::model::{
+    add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
+    call_is_schema_object_builder, collect_function_nodes, file_scoped_field_fq,
+    file_scoped_field_name, js_ts_segment, module_code_unit, module_scoped_field_uses_file_name,
+    node_text, property_name_text, root_node, this_member_property, trim_statement,
+    variable_header,
+};
+use crate::analyzer::js_ts::providers::{self, JsTsAnalyzerHost};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::js_ts::{
     contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
@@ -29,22 +31,18 @@ use crate::analyzer::js_ts::{
 };
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::usages::js_ts_graph::{
-    JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
-};
+use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit,
-    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
-    LanguageAdapter, ParameterMetadata, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, ParameterMetadata, Project,
+    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
-use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 mod semantic;
@@ -202,35 +200,29 @@ impl LanguageAdapter for JavascriptAdapter {
 pub struct JavascriptAnalyzer {
     inner: TreeSitterAnalyzer<JavascriptAdapter>,
     memo_budget: u64,
-    memo_caches: Arc<JsMemoCaches>,
+    memo_caches: Arc<JsTsMemoCaches>,
     /// Shared jsconfig/tsconfig path-alias resolver (parsed configs cached) so the
     /// import/reference graph resolves `@/`-style aliases like the scan_usages graph.
     alias_resolver: Arc<AliasResolver>,
 }
 
-struct JsMemoCaches {
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: OnceLock<DirectDescendantIndex>,
-    reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
-    /// Analyzer-cached JS/TS usage-resolution maps, built once and reused across queries.
-    /// Reset (with the rest of this bucket) on `update`/`update_all`.
-    jsts_usage_index: PoolSafeMemo<JsTsUsageIndex>,
-}
+impl JsTsAnalyzerHost for JavascriptAnalyzer {
+    type Adapter = JavascriptAdapter;
 
-impl JsMemoCaches {
-    fn new(budget_bytes: u64) -> Self {
-        Self {
-            imported_code_units: build_weighted_cache(budget_bytes / 3, weight_code_unit_set),
-            referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
-            relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
-            direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: OnceLock::new(),
-            reverse_import_index: PoolSafeMemo::new(),
-            jsts_usage_index: PoolSafeMemo::new(),
-        }
+    fn ts_inner(&self) -> &TreeSitterAnalyzer<JavascriptAdapter> {
+        &self.inner
+    }
+
+    fn memo_caches(&self) -> &JsTsMemoCaches {
+        &self.memo_caches
+    }
+
+    fn alias_resolver(&self) -> &AliasResolver {
+        &self.alias_resolver
+    }
+
+    fn js_ts_language(&self) -> Language {
+        Language::JavaScript
     }
 }
 
@@ -250,46 +242,18 @@ impl JavascriptAnalyzer {
     /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
     /// language. Built once and reused until `update`/`update_all` rebuilds the cache bucket.
     pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        self.memo_caches.jsts_usage_index.get_or_build(
-            || build_jsts_usage_index(self, Language::JavaScript, true),
-            || build_jsts_usage_index(self, Language::JavaScript, false),
-        )
+        providers::jsts_usage_index(self)
     }
 
     pub(crate) fn jsts_usage_index_with_cancellation(
         &self,
         cancellation: &CancellationToken,
     ) -> Option<Arc<JsTsUsageIndex>> {
-        self.memo_caches
-            .jsts_usage_index
-            .get_or_try_build(
-                || {
-                    build_jsts_usage_index_with_cancellation(
-                        self,
-                        Language::JavaScript,
-                        true,
-                        Some(cancellation),
-                    )
-                    .ok_or(())
-                },
-                || {
-                    build_jsts_usage_index_with_cancellation(
-                        self,
-                        Language::JavaScript,
-                        false,
-                        Some(cancellation),
-                    )
-                    .ok_or(())
-                },
-            )
-            .ok()
+        providers::jsts_usage_index_with_cancellation(self, cancellation)
     }
 
     pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        self.memo_caches.jsts_usage_index.get_or_build_parallel(
-            || build_jsts_usage_index(self, Language::JavaScript, true),
-            || build_jsts_usage_index(self, Language::JavaScript, false),
-        )
+        providers::prewarm_jsts_usage_index(self)
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -298,7 +262,7 @@ impl JavascriptAnalyzer {
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, JavascriptAdapter, config),
             memo_budget,
-            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+            memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
         }
     }
@@ -321,7 +285,7 @@ impl JavascriptAnalyzer {
         Ok(Self {
             inner,
             memo_budget,
-            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+            memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
         })
     }
@@ -360,85 +324,11 @@ impl JavascriptAnalyzer {
 }
 impl ImportAnalysisProvider for JavascriptAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
-        if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
-            return (*cached).clone();
-        }
-
-        let mut resolved = HashSet::default();
-        for import in self.inner.import_info_of(file) {
-            for target in resolve_js_ts_import_paths(
-                file,
-                &import.raw_snippet,
-                Language::JavaScript,
-                Some(&self.alias_resolver),
-            ) {
-                let top_level = self.inner.top_level_declarations(&target);
-                if import.is_wildcard {
-                    resolved.extend(
-                        top_level
-                            .iter()
-                            .filter(|code_unit| !code_unit.is_module())
-                            .cloned(),
-                    );
-                } else if let Some(identifier) =
-                    import.identifier.as_ref().or(import.alias.as_ref())
-                {
-                    let mut matched = false;
-                    for code_unit in top_level
-                        .iter()
-                        .filter(|code_unit| code_unit.identifier() == identifier)
-                    {
-                        matched = true;
-                        resolved.insert(code_unit.clone());
-                    }
-                    if !matched {
-                        let module_units = top_level
-                            .iter()
-                            .filter(|code_unit| code_unit.is_module())
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        if !module_units.is_empty() {
-                            resolved.extend(module_units);
-                        } else if top_level.len() == 1 && !top_level[0].is_module() {
-                            resolved.insert(top_level[0].clone());
-                        }
-                    }
-                } else {
-                    resolved.extend(
-                        top_level
-                            .iter()
-                            .filter(|code_unit| !code_unit.is_module())
-                            .cloned(),
-                    );
-                }
-            }
-        }
-
-        self.memo_caches
-            .imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
-        resolved
+        providers::imported_code_units_of(self, file)
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        if let Some(cached) = self.memo_caches.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-
-        let reverse_index = crate::analyzer::memoized_reverse_import_index(
-            &self.memo_caches.reverse_import_index,
-            || self.inner.all_files(),
-            |candidate| self.imported_code_units_of(candidate),
-        );
-        let referencing = reverse_index
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
-
-        self.memo_caches
-            .referencing_files
-            .insert(file.clone(), Arc::new(referencing.clone()));
-        referencing
+        providers::referencing_files_of(self, file)
     }
 
     fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -449,7 +339,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         &self,
         files: &[ProjectFile],
     ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
-        Some(self.inner.bulk_import_infos(files.iter().cloned()))
+        providers::import_infos_for_files(self, files)
     }
 
     fn imported_files_from_infos(
@@ -457,39 +347,11 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
-        Some(
-            imports
-                .iter()
-                .flat_map(|import| {
-                    resolve_js_ts_import_paths(
-                        file,
-                        &import.raw_snippet,
-                        Language::JavaScript,
-                        Some(&self.alias_resolver),
-                    )
-                })
-                .collect(),
-        )
+        providers::imported_files_from_infos(self, file, imports)
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
-        if let Some(cached) = self.memo_caches.relevant_imports.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        let mut relevant = HashSet::default();
-        for import in self.inner.import_info_of(code_unit.source()) {
-            let tokens = import_info_tokens(&import);
-            if tokens.is_empty() || tokens.iter().any(|token| source.contains(token)) {
-                relevant.insert(import.raw_snippet.clone());
-            }
-        }
-
-        self.memo_caches
-            .relevant_imports
-            .insert(code_unit.clone(), Arc::new(relevant.clone()));
-        relevant
+        providers::relevant_imports_for(self, code_unit)
     }
 
     fn could_import_file(
@@ -498,44 +360,17 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        imports.iter().any(|import| {
-            resolve_js_ts_import_paths(
-                source_file,
-                &import.raw_snippet,
-                Language::JavaScript,
-                Some(&self.alias_resolver),
-            )
-            .into_iter()
-            .any(|candidate| candidate == *target)
-        })
+        providers::could_import_file(self, source_file, imports, target)
     }
 }
 
 impl TypeHierarchyProvider for JavascriptAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let ancestors = resolve_direct_ancestors(
-            self,
-            self.jsts_usage_index().as_ref(),
-            Language::JavaScript,
-            &self.alias_resolver,
-            code_unit,
-            &self.inner.raw_supertypes_of(code_unit),
-        );
-        self.memo_caches
-            .direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
-        ancestors
+        providers::get_direct_ancestors(self, code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.memo_caches
-            .direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index_by_unit(self, self))
-            .descendants(code_unit)
+        providers::get_direct_descendants(self, code_unit)
     }
 }
 
@@ -638,6 +473,16 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.ranges(code_unit)
     }
 
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
+        self.inner
+            .ranges_with_limit(code_unit, max_ranges, cancellation)
+    }
+
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         self.inner.compute_cognitive_complexities(file)
     }
@@ -665,7 +510,7 @@ impl IAnalyzer for JavascriptAnalyzer {
         Self {
             inner,
             memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsMemoCaches::new(self.memo_budget)),
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
             alias_resolver,
         }
     }
@@ -676,7 +521,7 @@ impl IAnalyzer for JavascriptAnalyzer {
         Self {
             inner,
             memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsMemoCaches::new(self.memo_budget)),
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
             alias_resolver,
         }
     }
@@ -687,7 +532,7 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit).or_else(|| {
-            js_module_scoped_field_uses_file_name(code_unit)
+            module_scoped_field_uses_file_name(code_unit)
                 .then(|| self.inner.top_level_file_scope_parent_of(code_unit))
                 .flatten()
         })
@@ -973,7 +818,7 @@ fn visit_js_default_export_value(
             visit_js_default_export_class(file, source, export, value, parsed);
         }
         "object" => {
-            let code_unit = add_js_default_export_unit(
+            let code_unit = add_default_export_unit(
                 file,
                 source,
                 export,
@@ -996,7 +841,7 @@ fn visit_js_default_export_function(
     function: Node<'_>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> CodeUnit {
-    let code_unit = add_js_default_export_unit(
+    let code_unit = add_default_export_unit(
         file,
         source,
         export,
@@ -1021,7 +866,7 @@ fn visit_js_default_export_class(
     class: Node<'_>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> CodeUnit {
-    let code_unit = add_js_default_export_unit(
+    let code_unit = add_default_export_unit(
         file,
         source,
         export,
@@ -1037,24 +882,6 @@ fn visit_js_default_export_class(
         parsed.set_raw_supertypes(code_unit.clone(), supertypes);
     }
     visit_js_class_body(file, source, class, &code_unit, &code_unit, parsed);
-    code_unit
-}
-
-fn add_js_default_export_unit(
-    file: &ProjectFile,
-    source: &str,
-    export: Node<'_>,
-    kind: crate::analyzer::CodeUnitType,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> CodeUnit {
-    let code_unit = CodeUnit::new(file.clone(), kind, "", "default");
-    parsed.add_code_unit(
-        code_unit.clone(),
-        export,
-        source,
-        None,
-        Some(code_unit.clone()),
-    );
     code_unit
 }
 
@@ -1080,11 +907,19 @@ fn visit_js_class(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq = match parent {
+        Some(parent) => parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(name, SegmentKind::Type)),
+        None => FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Type)),
+    };
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Class,
         "",
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     let range_node = if exported { node } else { definition };
@@ -1156,11 +991,19 @@ fn visit_js_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq = match parent {
+        Some(parent) => parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+        None => FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+    };
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         "",
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     let range_node = if exported { node } else { definition };
@@ -1198,11 +1041,16 @@ fn visit_js_method(
         return;
     }
 
-    let code_unit = CodeUnit::new(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(js_ts_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         "",
         format!("{}.{}", parent.short_name(), name),
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -1246,16 +1094,21 @@ fn visit_js_constructor_assigned_fields(
         }
         if node.kind() == "assignment_expression"
             && let Some(left) = node.child_by_field_name("left")
-            && let Some(property) = js_this_member_property(left, source)
+            && let Some(property) = this_member_property(left, source)
         {
-            let Some(name) = js_property_name_text(property, source) else {
+            let Some(name) = property_name_text(property, source) else {
                 continue;
             };
-            let code_unit = CodeUnit::new(
+            let fq = parent
+                .fq()
+                .clone()
+                .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
                 file.clone(),
                 crate::analyzer::CodeUnitType::Field,
                 "",
                 format!("{}.{}", parent.short_name(), name),
+                fq,
             );
             parsed.add_code_unit(
                 code_unit.clone(),
@@ -1275,40 +1128,6 @@ fn visit_js_constructor_assigned_fields(
     }
 }
 
-fn js_this_member_property<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    if node.kind() != "member_expression" {
-        return None;
-    }
-    let object = node.child_by_field_name("object")?;
-    if object.kind() != "this" {
-        return None;
-    }
-    let property = node.child_by_field_name("property")?;
-    js_property_name_text(property, source)
-        .is_some()
-        .then_some(property)
-}
-
-fn js_property_name_text(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier"
-        | "property_identifier"
-        | "shorthand_property_identifier"
-        | "shorthand_property_identifier_pattern" => {
-            let text = node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        "string" => {
-            let text = node_text(node, source)
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        _ => None,
-    }
-}
-
 fn visit_js_field(
     file: &ProjectFile,
     source: &str,
@@ -1324,11 +1143,16 @@ fn visit_js_field(
     if name.is_empty() {
         return;
     }
-    let code_unit = CodeUnit::new(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(js_ts_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         "",
         format!("{}.{}", parent.short_name(), name),
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -1385,14 +1209,35 @@ fn visit_js_variable_statement(
             if let Some(parent) = parent {
                 format!("{}.{}", parent.short_name(), name)
             } else {
-                js_file_scoped_field_name(file, name)
+                file_scoped_field_name(file, name)
             }
         } else {
             parent
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
                 .unwrap_or_else(|| name.to_string())
         };
-        let code_unit = CodeUnit::new(file.clone(), kind, "", short_name);
+        // Mirrors `short_name` above segment-for-segment: a Field with no
+        // enclosing scope is qualified by the file-name `Path` prefix (the
+        // structured counterpart of `file_scoped_field_name`); every other
+        // case is a plain `Member` off the parent's `fq` or a fresh chain.
+        let fq = if kind == crate::analyzer::CodeUnitType::Field {
+            match parent {
+                Some(parent) => parent
+                    .fq()
+                    .clone()
+                    .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                None => file_scoped_field_fq(file, name),
+            }
+        } else {
+            match parent {
+                Some(parent) => parent
+                    .fq()
+                    .clone()
+                    .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                None => FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+            }
+        };
+        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
         let range_node = if exported { node } else { definition };
         parsed.add_code_unit(
@@ -1435,8 +1280,14 @@ fn visit_js_variable_statement(
             );
         }
         if module_surface && kind == crate::analyzer::CodeUnitType::Field && parent.is_none() {
-            let surface_code_unit =
-                CodeUnit::new(file.clone(), crate::analyzer::CodeUnitType::Field, "", name);
+            let surface_fq = FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member));
+            let surface_code_unit = CodeUnit::new_fq(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Field,
+                "",
+                name,
+                surface_fq,
+            );
             parsed.add_code_unit(
                 surface_code_unit.clone(),
                 range_node,
@@ -1458,32 +1309,6 @@ fn visit_js_variable_statement(
             }
         }
     }
-}
-
-fn js_file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
-    format!(
-        "{}.{}",
-        file.rel_path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("module"),
-        name
-    )
-}
-
-fn js_module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
-    if !code_unit.is_field() {
-        return false;
-    }
-    let Some(file_name) = code_unit
-        .source()
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        return false;
-    };
-    code_unit.short_name().starts_with(&format!("{file_name}."))
 }
 
 fn visit_js_object_literal_properties(
@@ -1522,11 +1347,16 @@ fn visit_js_object_literal_properties_for_surface(
             continue;
         };
         let kind = js_object_literal_property_kind(child);
-        let code_unit = CodeUnit::new(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             file.clone(),
             kind,
             "",
             format!("{}.{}", parent.short_name(), name),
+            fq,
         );
         match surface {
             JsAssignmentSymbolSurface::Declaration => {
@@ -1563,7 +1393,8 @@ fn visit_js_module_exports_object_literal_properties(
             continue;
         };
         let kind = js_object_literal_property_kind(child);
-        let code_unit = CodeUnit::new(file.clone(), kind, "", name);
+        let fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", name, fq);
         parsed.add_code_unit(
             code_unit.clone(),
             child,
@@ -1683,11 +1514,8 @@ fn js_indexable_object_literal_value<'tree>(
     source: &str,
     include_factory_call: bool,
 ) -> Option<Node<'tree>> {
-    js_object_literal_value(value).or_else(|| {
-        include_factory_call
-            .then(|| js_surface_call_object_argument(value, source))
-            .flatten()
-    })
+    js_object_literal_value(value)
+        .or_else(|| js_surface_call_object_argument(value, source, include_factory_call))
 }
 
 fn js_initializer_has_surface_shape(value: Node<'_>, source: &str) -> bool {
@@ -1712,7 +1540,11 @@ fn js_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn js_surface_call_object_argument<'tree>(call: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+fn js_surface_call_object_argument<'tree>(
+    call: Node<'tree>,
+    source: &str,
+    include_factory_call: bool,
+) -> Option<Node<'tree>> {
     if call.kind() != "call_expression" {
         return None;
     }
@@ -1723,7 +1555,15 @@ fn js_surface_call_object_argument<'tree>(call: Node<'tree>, source: &str) -> Op
         .enumerate()
         .find_map(|(index, argument)| {
             let object = js_object_literal_value(argument)?;
-            js_call_preserves_object_argument_shape(call, source, index).then_some(object)
+            // The schema-builder shortcut (e.g. zod's `z.object({...})`) applies
+            // regardless of export/surface status, matching TS's
+            // `ts_call_preserves_object_argument_shape` (issue #1167, gap 3). The
+            // broader factory-name heuristic below stays surface-gated, unchanged
+            // from before.
+            let preserves = (index == 0 && call_is_schema_object_builder(call, source))
+                || (include_factory_call
+                    && js_call_preserves_object_argument_shape(call, source, index));
+            preserves.then_some(object)
         })
 }
 
@@ -1735,7 +1575,7 @@ fn js_call_preserves_object_argument_shape(
     match js_call_object_argument_shape_preservation(call, source, argument_index) {
         JsShapePreservation::Preserves => true,
         JsShapePreservation::DoesNotPreserve => false,
-        JsShapePreservation::Unknown => js_call_has_likely_surface_factory_name(call, source),
+        JsShapePreservation::Unknown => call_has_likely_surface_factory_name(call, source),
     }
 }
 
@@ -1751,32 +1591,10 @@ fn js_call_object_argument_shape_preservation(
     source: &str,
     argument_index: usize,
 ) -> JsShapePreservation {
-    let Some(callee_name) = js_call_identifier_name(call, source) else {
+    let Some(callee_name) = call_identifier_name(call, source) else {
         return JsShapePreservation::Unknown;
     };
     js_source_function_preserves_parameter_shape(call, source, &callee_name, argument_index)
-}
-
-fn js_call_has_likely_surface_factory_name(call: Node<'_>, source: &str) -> bool {
-    let Some(function) = call.child_by_field_name("function") else {
-        return false;
-    };
-    let name = match function.kind() {
-        "identifier" | "property_identifier" => node_text(function, source).trim(),
-        "member_expression" => function
-            .child_by_field_name("property")
-            .map(|property| node_text(property, source).trim())
-            .unwrap_or(""),
-        _ => "",
-    };
-    name == "define" || name.starts_with("define") || name == "object"
-}
-
-fn js_call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
-    let function = call.child_by_field_name("function")?;
-    matches!(function.kind(), "identifier" | "property_identifier")
-        .then(|| node_text(function, source).trim().to_string())
-        .filter(|name| !name.is_empty())
 }
 
 fn js_source_function_preserves_parameter_shape(
@@ -1785,9 +1603,9 @@ fn js_source_function_preserves_parameter_shape(
     function_name: &str,
     parameter_index: usize,
 ) -> JsShapePreservation {
-    let root = js_root_node(anchor);
+    let root = root_node(anchor);
     let mut functions = Vec::new();
-    js_collect_function_nodes(root, source, function_name, &mut functions);
+    collect_function_nodes(root, source, function_name, &mut functions);
     if functions.is_empty() {
         return JsShapePreservation::Unknown;
     }
@@ -1798,42 +1616,6 @@ fn js_source_function_preserves_parameter_shape(
     } else {
         JsShapePreservation::DoesNotPreserve
     }
-}
-
-fn js_root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
-}
-
-fn js_collect_function_nodes<'tree>(
-    node: Node<'tree>,
-    source: &str,
-    function_name: &str,
-    out: &mut Vec<Node<'tree>>,
-) {
-    walk_named_tree_preorder(node, true, |node| {
-        if node.kind() == "function_declaration"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).trim() == function_name)
-        {
-            out.push(node);
-            return WalkControl::SkipChildren;
-        }
-        if node.kind() == "variable_declarator"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).trim() == function_name)
-            && let Some(value) = node.child_by_field_name("value")
-            && matches!(value.kind(), "arrow_function" | "function_expression")
-        {
-            out.push(value);
-            return WalkControl::SkipChildren;
-        }
-        WalkControl::Continue
-    });
 }
 
 fn js_function_node_preserves_parameter_shape(
@@ -2080,6 +1862,11 @@ enum JsAssignmentSymbolSurface {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JsMemberAssignmentTarget {
     name: String,
+    /// Structured counterpart to `name`, built segment-for-segment alongside
+    /// it (see `js_member_assignment_target`): every link in the
+    /// `object.property` chain is a `Member` segment, mirroring the `.`-joined
+    /// `name` string exactly.
+    fq: FqName,
     surface: JsAssignmentSymbolSurface,
 }
 
@@ -2363,9 +2150,13 @@ fn visit_js_assignment_expression(
     let value_is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
     let Some(target) = js_commonjs_export_assignment_name(left, value, source)
-        .map(|name| JsMemberAssignmentTarget {
-            name,
-            surface: JsAssignmentSymbolSurface::Declaration,
+        .map(|name| {
+            let fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
+            JsMemberAssignmentTarget {
+                name,
+                fq,
+                surface: JsAssignmentSymbolSurface::Declaration,
+            }
         })
         .or_else(|| js_member_assignment_target(left, source, state))
     else {
@@ -2376,7 +2167,7 @@ fn visit_js_assignment_expression(
     } else {
         crate::analyzer::CodeUnitType::Field
     };
-    let code_unit = CodeUnit::new(file.clone(), kind, "", target.name);
+    let code_unit = CodeUnit::new_fq(file.clone(), kind, "", target.name, target.fq);
     add_js_assignment_code_unit(parsed, target.surface, code_unit.clone(), node, source);
     let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
     if let Some(value) = value.filter(|_| value_is_function) {
@@ -2478,9 +2269,17 @@ fn js_member_assignment_target(
     if property.kind() == "computed_property_name" {
         return None;
     }
-    let object_name = match object.kind() {
-        "identifier" | "property_identifier" => node_text(object, source).trim().to_string(),
-        "member_expression" => js_member_assignment_target(object, source, state)?.name,
+    let (object_name, object_fq) = match object.kind() {
+        "identifier" | "property_identifier" => {
+            let object_name = node_text(object, source).trim().to_string();
+            let object_fq =
+                FqName::new().with_pushed(js_ts_segment(&object_name, SegmentKind::Member));
+            (object_name, object_fq)
+        }
+        "member_expression" => {
+            let nested = js_member_assignment_target(object, source, state)?;
+            (nested.name, nested.fq)
+        }
         _ => return None,
     };
     let property_name = node_text(property, source)
@@ -2491,6 +2290,7 @@ fn js_member_assignment_target(
         return None;
     }
     let name = format!("{object_name}.{property_name}");
+    let fq = object_fq.with_pushed(js_ts_segment(property_name, SegmentKind::Member));
     let surface = if state.commonjs_exported_members.contains(&name) {
         JsAssignmentSymbolSurface::Declaration
     } else if js_member_assignment_has_plain_local_root(node, source, state) {
@@ -2498,7 +2298,7 @@ fn js_member_assignment_target(
     } else {
         JsAssignmentSymbolSurface::Declaration
     };
-    Some(JsMemberAssignmentTarget { name, surface })
+    Some(JsMemberAssignmentTarget { name, fq, surface })
 }
 
 fn js_member_assignment_has_plain_local_root(
@@ -2778,7 +2578,7 @@ fn js_variable_signature(
     source: &str,
     exported: bool,
 ) -> String {
-    let header = js_variable_header(statement, declarator, source, exported);
+    let header = variable_header(statement, declarator, source, exported);
     match declarator.child_by_field_name("value") {
         Some(value) if is_simple_js_initializer(value) => {
             let value_text = trim_statement(node_text(value, source));
@@ -2786,26 +2586,6 @@ fn js_variable_signature(
         }
         _ => header,
     }
-}
-
-fn js_variable_header(
-    statement: Node<'_>,
-    declarator: Node<'_>,
-    source: &str,
-    exported: bool,
-) -> String {
-    let keyword = statement
-        .child(0)
-        .map(|node| node_text(node, source).trim().to_string())
-        .unwrap_or_else(|| "const".to_string());
-    let declarator_text = trim_statement(node_text(declarator, source));
-    let left = declarator_text
-        .split('=')
-        .next()
-        .map(trim_statement)
-        .unwrap_or(declarator_text);
-    let export_prefix = if exported { "export " } else { "" };
-    format!("{export_prefix}{keyword} {left}")
 }
 
 fn is_simple_js_initializer(node: Node<'_>) -> bool {

@@ -65,7 +65,7 @@ macro_rules! define_dense_id {
                 index: usize,
             ) -> Result<Self, $crate::analyzer::dense_id::DenseIdOverflow> {
                 <u32 as ::std::convert::TryFrom<usize>>::try_from(index)
-                    .map(Self)
+                    .map(Self::new)
                     .map_err(|_| {
                         $crate::analyzer::dense_id::DenseIdOverflow::new(
                             stringify!($name),

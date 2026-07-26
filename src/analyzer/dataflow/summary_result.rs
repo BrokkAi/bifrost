@@ -12,12 +12,15 @@ use crate::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, ControlContinuation, ControlEdgeKind, DispatchBoundary,
     DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind, IcfgEdgeKind, IcfgExitProfile,
     IcfgLimitKind, OracleRelationHandle, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge,
-    ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticBudgetExceeded,
-    SemanticCapability, SemanticOutcome, SemanticProviderError, SemanticWork,
+    ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticProviderError, SemanticWork,
     compare_relation_provenance,
 };
 
-use super::{FactId, PathQualityFrontier, SolverTermination, SolverWork};
+use super::{FactId, PathQualityFrontier, SemanticInputStatus, SolverTermination, SolverWork};
+use super::{
+    PathQuality, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
+    witness::{WitnessAlternatives, WitnessStore, WitnessTarget},
+};
 
 /// One procedure entry and fact whose relative path edges share an end-summary
 /// relation.
@@ -60,12 +63,34 @@ impl SummaryEntry {
 }
 
 /// One deterministically ordered relative `(entry, point, fact)` path edge.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct SummaryReachedFact {
     entry: SummaryEntry,
     point: ProgramPointHandle,
     fact: FactId,
     path_qualities: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
+    witness_owner: Option<Arc<()>>,
+}
+
+impl PartialEq for SummaryReachedFact {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.point == other.point
+            && self.fact == other.fact
+            && self.path_qualities == other.path_qualities
+    }
+}
+
+impl Eq for SummaryReachedFact {}
+
+impl Hash for SummaryReachedFact {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.entry.hash(state);
+        self.point.hash(state);
+        self.fact.hash(state);
+        self.path_qualities.hash(state);
+    }
 }
 
 impl SummaryReachedFact {
@@ -74,6 +99,8 @@ impl SummaryReachedFact {
         point: ProgramPointHandle,
         fact: FactId,
         path_qualities: PathQualityFrontier,
+        witnesses: WitnessAlternatives,
+        witness_owner: Option<Arc<()>>,
     ) -> Self {
         debug_assert_eq!(
             entry.procedure(),
@@ -85,6 +112,8 @@ impl SummaryReachedFact {
             point,
             fact,
             path_qualities,
+            witnesses,
+            witness_owner,
         }
     }
 
@@ -109,13 +138,26 @@ impl SummaryReachedFact {
 ///
 /// This is correctness-critical tabulation state, not a persisted semantic,
 /// taint, typestate, or protocol summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TabulationEndSummary {
     entry: SummaryEntry,
     exit: Arc<IcfgExitProfile>,
     exit_fact: FactId,
     path_qualities: PathQualityFrontier,
+    witnesses: WitnessAlternatives,
+    witness_owner: Option<Arc<()>>,
 }
+
+impl PartialEq for TabulationEndSummary {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.exit == other.exit
+            && self.exit_fact == other.exit_fact
+            && self.path_qualities == other.path_qualities
+    }
+}
+
+impl Eq for TabulationEndSummary {}
 
 impl TabulationEndSummary {
     pub(crate) fn new(
@@ -123,6 +165,8 @@ impl TabulationEndSummary {
         exit: Arc<IcfgExitProfile>,
         exit_fact: FactId,
         path_qualities: PathQualityFrontier,
+        witnesses: WitnessAlternatives,
+        witness_owner: Option<Arc<()>>,
     ) -> Self {
         debug_assert_eq!(
             entry.procedure(),
@@ -139,6 +183,8 @@ impl TabulationEndSummary {
             exit,
             exit_fact,
             path_qualities,
+            witnesses,
+            witness_owner,
         }
     }
 
@@ -230,116 +276,8 @@ impl SummaryEdge {
     }
 }
 
-/// Aggregate semantic-provider quality observed while materializing a summary
-/// solve.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum SummarySemanticStatus {
-    #[default]
-    Complete,
-    Ambiguous,
-    Unknown,
-    Unsupported {
-        capability: SemanticCapability,
-    },
-    Unproven,
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-    },
-    Cancelled,
-}
-
-impl SummarySemanticStatus {
-    pub fn from_outcome<T>(outcome: &SemanticOutcome<T>) -> Self {
-        match outcome {
-            SemanticOutcome::Complete { .. } => Self::Complete,
-            SemanticOutcome::Ambiguous { .. } => Self::Ambiguous,
-            SemanticOutcome::Unknown { .. } => Self::Unknown,
-            SemanticOutcome::Unsupported { capability, .. } => Self::Unsupported {
-                capability: *capability,
-            },
-            SemanticOutcome::Unproven { .. } => Self::Unproven,
-            SemanticOutcome::ExceededBudget { exceeded, .. } => Self::ExceededBudget {
-                exceeded: *exceeded,
-            },
-            SemanticOutcome::Cancelled { .. } => Self::Cancelled,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::Ambiguous => "ambiguous",
-            Self::Unknown => "unknown",
-            Self::Unsupported { .. } => "unsupported",
-            Self::Unproven => "unproven",
-            Self::ExceededBudget { .. } => "exceeded_budget",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    pub const fn is_complete(self) -> bool {
-        matches!(self, Self::Complete)
-    }
-
-    pub const fn unsupported_capability(self) -> Option<SemanticCapability> {
-        match self {
-            Self::Unsupported { capability } => Some(capability),
-            _ => None,
-        }
-    }
-
-    pub const fn budget_exceeded(self) -> Option<SemanticBudgetExceeded> {
-        match self {
-            Self::ExceededBudget { exceeded } => Some(exceeded),
-            _ => None,
-        }
-    }
-
-    /// Merge statuses independently of provider traversal order.
-    pub(crate) fn merge(self, incoming: Self) -> Self {
-        use SummarySemanticStatus::{
-            Ambiguous, Cancelled, Complete, ExceededBudget, Unknown, Unproven, Unsupported,
-        };
-
-        match (self, incoming) {
-            (Cancelled, _) | (_, Cancelled) => Cancelled,
-            (ExceededBudget { exceeded: left }, ExceededBudget { exceeded: right }) => {
-                ExceededBudget {
-                    exceeded: min_budget_exceeded(left, right),
-                }
-            }
-            (ExceededBudget { exceeded }, _) | (_, ExceededBudget { exceeded }) => {
-                ExceededBudget { exceeded }
-            }
-            (Unsupported { capability: left }, Unsupported { capability: right }) => Unsupported {
-                capability: left.min(right),
-            },
-            (Unsupported { capability }, _) | (_, Unsupported { capability }) => {
-                Unsupported { capability }
-            }
-            (Unknown, _) | (_, Unknown) => Unknown,
-            (Unproven, _) | (_, Unproven) => Unproven,
-            (Ambiguous, _) | (_, Ambiguous) => Ambiguous,
-            (Complete, Complete) => Complete,
-        }
-    }
-}
-
-impl Hash for SummarySemanticStatus {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match *self {
-            Self::Unsupported { capability } => capability.hash(state),
-            Self::ExceededBudget { exceeded } => {
-                exceeded.dimension().hash(state);
-                exceeded.limit().hash(state);
-                exceeded.attempted().hash(state);
-            }
-            Self::Complete | Self::Ambiguous | Self::Unknown | Self::Unproven | Self::Cancelled => {
-            }
-        }
-    }
-}
+/// Summary-solve terminology for the shared semantic input status.
+pub type SummarySemanticStatus = SemanticInputStatus;
 
 /// Why a reachable summary point does not have complete ICFG coverage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -542,6 +480,8 @@ pub struct SummaryDataflowResult<Fact> {
     work: SolverWork,
     semantic_work: SemanticWork,
     metrics: SummaryMetrics,
+    witness_store: WitnessStore,
+    witness_retention_truncated: bool,
 }
 
 impl<Fact> SummaryDataflowResult<Fact> {
@@ -555,6 +495,8 @@ impl<Fact> SummaryDataflowResult<Fact> {
         work: SolverWork,
         semantic_work: SemanticWork,
         metrics: SummaryMetrics,
+        witness_store: WitnessStore,
+        witness_retention_truncated: bool,
     ) -> Self {
         reached.sort_by(compare_reached_facts);
         reached.dedup();
@@ -570,6 +512,8 @@ impl<Fact> SummaryDataflowResult<Fact> {
             work,
             semantic_work,
             metrics,
+            witness_store,
+            witness_retention_truncated,
         }
     }
 
@@ -609,6 +553,10 @@ impl<Fact> SummaryDataflowResult<Fact> {
         self.metrics
     }
 
+    pub const fn witness_retention_truncated(&self) -> bool {
+        self.witness_retention_truncated
+    }
+
     pub fn is_complete(&self) -> bool {
         self.termination.is_fixed_point() && self.coverage.is_complete()
     }
@@ -630,6 +578,109 @@ impl<Fact> SummaryDataflowResult<Fact> {
             .iter()
             .filter(move |summary| summary.entry() == entry)
     }
+
+    pub fn witness_for_reached(
+        &self,
+        reached: &SummaryReachedFact,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let reached_index = self
+            .reached
+            .iter()
+            .position(|candidate| {
+                candidate == reached
+                    && witness_owners_match(
+                        candidate.witness_owner.as_ref(),
+                        reached.witness_owner.as_ref(),
+                    )
+            })
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        self.witness_for_reached_index(reached_index, quality, limits)
+    }
+
+    pub(crate) fn witness_for_reached_index(
+        &self,
+        reached_index: usize,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let reached = self
+            .reached
+            .get(reached_index)
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        if !reached.path_qualities.contains(quality) {
+            return Err(SummaryWitnessError::QualityNotRetained(quality));
+        }
+        let Some(evidence) = reached.witnesses.first(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
+        self.witness_store.reconstruct(
+            evidence,
+            quality,
+            reached.witnesses.is_truncated(quality),
+            limits,
+            WitnessTarget::Reached {
+                entry_point: reached.entry.entry_point(),
+                entry_fact: reached.entry.entry_fact(),
+                point: reached.point(),
+                fact: reached.fact(),
+            },
+        )
+    }
+
+    pub fn witness_for_end_summary(
+        &self,
+        summary: &TabulationEndSummary,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let summary = self
+            .end_summaries
+            .iter()
+            .find(|candidate| {
+                *candidate == summary
+                    && witness_owners_match(
+                        candidate.witness_owner.as_ref(),
+                        summary.witness_owner.as_ref(),
+                    )
+            })
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        if !summary.path_qualities.contains(quality) {
+            return Err(SummaryWitnessError::QualityNotRetained(quality));
+        }
+        let Some(evidence) = summary.witnesses.first(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
+        self.witness_store.reconstruct(
+            evidence,
+            quality,
+            summary.witnesses.is_truncated(quality),
+            limits,
+            WitnessTarget::EndSummary {
+                entry_point: summary.entry.entry_point(),
+                entry_fact: summary.entry.entry_fact(),
+                exit: summary.exit(),
+                exit_fact: summary.exit_fact(),
+            },
+        )
+    }
+}
+
+fn witness_owners_match(left: Option<&Arc<()>>, right: Option<&Arc<()>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Stable malformed-input/provider errors for summary tabulation.
@@ -639,6 +690,8 @@ impl<Fact> SummaryDataflowResult<Fact> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryDataflowError {
     FactIdOverflow { index: usize },
+    WitnessEvidenceIdOverflow { index: usize },
+    WitnessInvariant(&'static str),
     SemanticProvider(SemanticProviderError),
 }
 
@@ -648,6 +701,12 @@ impl fmt::Display for SummaryDataflowError {
             Self::FactIdOverflow { index } => {
                 write!(formatter, "data-flow fact index {index} exceeds u32")
             }
+            Self::WitnessEvidenceIdOverflow { index } => {
+                write!(formatter, "witness evidence index {index} exceeds u32")
+            }
+            Self::WitnessInvariant(reason) => {
+                write!(formatter, "summary witness invariant failed: {reason}")
+            }
             Self::SemanticProvider(error) => error.fmt(formatter),
         }
     }
@@ -656,7 +715,9 @@ impl fmt::Display for SummaryDataflowError {
 impl Error for SummaryDataflowError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::FactIdOverflow { .. } => None,
+            Self::FactIdOverflow { .. }
+            | Self::WitnessEvidenceIdOverflow { .. }
+            | Self::WitnessInvariant(_) => None,
             Self::SemanticProvider(error) => Some(error),
         }
     }
@@ -666,15 +727,6 @@ impl From<SemanticProviderError> for SummaryDataflowError {
     fn from(error: SemanticProviderError) -> Self {
         Self::SemanticProvider(error)
     }
-}
-
-fn min_budget_exceeded(
-    left: SemanticBudgetExceeded,
-    right: SemanticBudgetExceeded,
-) -> SemanticBudgetExceeded {
-    let left_key = (left.dimension(), left.limit(), left.attempted());
-    let right_key = (right.dimension(), right.limit(), right.attempted());
-    if left_key <= right_key { left } else { right }
 }
 
 fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Ordering {
@@ -856,35 +908,7 @@ fn compare_boundary_kinds(left: &SummaryBoundaryKind, right: &SummaryBoundaryKin
 }
 
 fn compare_semantic_status(left: SummarySemanticStatus, right: SummarySemanticStatus) -> Ordering {
-    semantic_status_rank(left)
-        .cmp(&semantic_status_rank(right))
-        .then_with(|| match (left, right) {
-            (
-                SummarySemanticStatus::Unsupported { capability: left },
-                SummarySemanticStatus::Unsupported { capability: right },
-            ) => left.cmp(&right),
-            (
-                SummarySemanticStatus::ExceededBudget { exceeded: left },
-                SummarySemanticStatus::ExceededBudget { exceeded: right },
-            ) => (left.dimension(), left.limit(), left.attempted()).cmp(&(
-                right.dimension(),
-                right.limit(),
-                right.attempted(),
-            )),
-            _ => Ordering::Equal,
-        })
-}
-
-fn semantic_status_rank(status: SummarySemanticStatus) -> u8 {
-    match status {
-        SummarySemanticStatus::Complete => 0,
-        SummarySemanticStatus::Ambiguous => 1,
-        SummarySemanticStatus::Unproven => 2,
-        SummarySemanticStatus::Unknown => 3,
-        SummarySemanticStatus::Unsupported { .. } => 4,
-        SummarySemanticStatus::ExceededBudget { .. } => 5,
-        SummarySemanticStatus::Cancelled => 6,
-    }
+    left.cmp(&right)
 }
 
 fn compare_dispatch_boundaries(

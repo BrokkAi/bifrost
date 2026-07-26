@@ -1,0 +1,28 @@
+-- Add the structured, interned qualified-name segments to `code_units`.
+--
+-- Historically a declaration's qualified name lived only as the two plain
+-- strings `package_name`/`short_name` (the latter stored in `short_name`, the
+-- former reconstructed from `content_qualifier`), whose internal structure --
+-- where one segment ends and the next begins, and what KIND each segment is --
+-- was thrown away and re-inferred by every consumer that split on a guessed
+-- delimiter set. The `FqName` representation (see
+-- `.agents/plans/fqname-interned-segments.md`) records that structure once, at
+-- extraction, as an ordered list of `(kind, text)` segments.
+--
+-- This column carries that structured form so a cache-loaded unit can restore
+-- its `FqName` without re-splitting any string. It is a compact, self-describing
+-- binary blob: for each segment, a one-byte kind tag, a little-endian u32 text
+-- length, then the UTF-8 segment text (see `FqName::encode_segments` /
+-- `FqName::decode_segments` in `src/analyzer/fq_name.rs`). Interner IDs are
+-- process-local and are NEVER persisted; only the text and kind are.
+--
+-- The `short_name`/`content_qualifier` columns stay populated (they back the
+-- lookup indexes and remain human-inspectable), but on load the structured
+-- column becomes authoritative for the `FqName`. It is nullable: units without a
+-- populated `fq` at extraction (e.g. synthetic file-scope units) and any row
+-- written before this migration store NULL, which decodes to an empty `FqName`.
+--
+-- Every language's analysis-epoch SALT gains a matching token in
+-- `src/analyzer/store/epoch.rs`, so pre-existing rows are re-extracted and
+-- repopulated with real segments rather than lingering as NULL.
+ALTER TABLE code_units ADD COLUMN fq_segments BLOB;

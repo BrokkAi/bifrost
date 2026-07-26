@@ -269,7 +269,7 @@ fn is_top_level_type(target: &CodeUnit) -> bool {
 }
 
 fn nested_owner_qualifier(target: &CodeUnit) -> Option<&str> {
-    target.short_name().rsplit_once('.').map(|(owner, _)| owner)
+    target.short_name().rsplit_once('.').map(|(owner, _)| owner) // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
 }
 
 fn qualifier_matches_target_owner(qualifier: &str, spec: &TargetSpec) -> bool {

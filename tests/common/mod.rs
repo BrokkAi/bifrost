@@ -1,3 +1,4 @@
+pub mod dataflow_ide_reference;
 pub mod dataflow_reference;
 pub mod dataflow_summary_reference;
 mod inline_project;

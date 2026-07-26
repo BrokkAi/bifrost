@@ -3955,14 +3955,23 @@ where
                 {
                     continue;
                 }
-                resolved.push(CodeUnit::with_signature(
+                let package_name = self
+                    .adapter
+                    .hydrate_content_qualifier(&row.content_qualifier, &file);
+                let fq = crate::analyzer::store::hydrate_unit_fq(
+                    row.fq_segments.as_deref(),
+                    &package_name,
+                    crate::analyzer::common::language_for_file(&file),
+                )
+                .unwrap_or_default();
+                resolved.push(CodeUnit::with_signature_and_fq(
                     file.clone(),
                     row.kind,
-                    self.adapter
-                        .hydrate_content_qualifier(&row.content_qualifier, &file),
+                    package_name,
                     row.short_name.clone(),
                     row.signature.clone(),
                     row.flags.synthetic,
+                    fq,
                 ));
             }
         }
@@ -4552,14 +4561,23 @@ where
             .rows
             .into_iter()
             .map(|row| {
-                CodeUnit::with_signature(
+                let package_name = self
+                    .adapter
+                    .hydrate_content_qualifier(&row.content_qualifier, file);
+                let fq = crate::analyzer::store::hydrate_unit_fq(
+                    row.fq_segments.as_deref(),
+                    &package_name,
+                    crate::analyzer::common::language_for_file(file),
+                )
+                .unwrap_or_default();
+                CodeUnit::with_signature_and_fq(
                     file.clone(),
                     row.kind,
-                    self.adapter
-                        .hydrate_content_qualifier(&row.content_qualifier, file),
+                    package_name,
                     row.short_name,
                     row.signature,
                     row.flags.synthetic,
+                    fq,
                 )
             })
             .collect();
@@ -6834,6 +6852,23 @@ where
             .or_else(|| self.fetch_file_state(code_unit.source()))
             .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()
+    }
+
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, usize, bool) {
+        if max_ranges == 0 || cancellation.is_cancelled() {
+            return (Vec::new(), 0, true);
+        }
+        let limited = self.ranges_limited(code_unit, max_ranges);
+        (
+            limited.rows,
+            limited.inspected,
+            !limited.complete || cancellation.is_cancelled(),
+        )
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {

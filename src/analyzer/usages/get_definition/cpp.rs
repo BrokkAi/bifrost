@@ -2067,6 +2067,85 @@ fn cpp_type_node_is_local_constructor_argument(mut node: Node<'_>) -> bool {
     false
 }
 
+/// Resolve a `::`-qualified C++ type reference against the *enclosing namespaces*
+/// of the reference site, trying each namespace prefix from innermost to the
+/// global scope. This is the sibling-namespace shape (issue #1163): `inner::Gizmo`
+/// referenced from inside `namespace outer { namespace deep { ... } }` resolves to
+/// `outer::inner::Gizmo`.
+///
+/// With interned segments authoritative end-to-end (M4), C++'s mixed-separator
+/// store no longer blocks this. The reference is re-interned with C++
+/// namespace-qualified kinds — interior segments are namespaces
+/// ([`SegmentKind::Package`]), the leaf is the referenced type
+/// ([`SegmentKind::Type`]) — so composing it onto a namespace prefix renders in
+/// the exact `::`-headed / `.`-terminated spelling the store keys nested-namespace
+/// types by (`outer::inner.Gizmo`), and the walk descends the scope's `::`-joined
+/// namespace head, which the shared dot-only enclosing-scope walk deliberately
+/// never does. Each composed candidate is matched against the string-keyed
+/// `definitions` index, so a hit is a real indexed declaration — never a guess;
+/// the interior-namespace interpretation is the common `::`-qualified shape (a
+/// `Class::Nested` nested-type reference is `$`-spelled in the store and is left
+/// to the owner/member paths above).
+fn cpp_resolve_qualified_via_enclosing_namespaces(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+    byte: usize,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, reference);
+    if parts.len() < 2 {
+        // A bare name has no `::` head to re-anchor; the ordinary lexical and
+        // enclosing-scope resolvers already cover it.
+        return None;
+    }
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let mut reference_fq = crate::analyzer::fq_name::FqName::new();
+    for (index, part) in parts.iter().enumerate() {
+        let kind = if index + 1 == parts.len() {
+            crate::analyzer::fq_name::SegmentKind::Type
+        } else {
+            crate::analyzer::fq_name::SegmentKind::Package
+        };
+        reference_fq.push(interner.intern(part, kind));
+    }
+
+    let range = Range {
+        start_byte: byte,
+        end_byte: byte + 1,
+        start_line: 0,
+        end_line: 0,
+    };
+    let scope_unit = analyzer.enclosing_code_unit(file, &range)?;
+    let scope = scope_unit.fq();
+    if scope.is_empty() {
+        return None;
+    }
+    // The scope's namespace prefix is its leading run of `Package` (namespace)
+    // segments; the owner/type/member tail below it is not a namespace we may
+    // re-anchor a sibling namespace onto.
+    let namespace_len = scope
+        .segments()
+        .iter()
+        .take_while(|&&id| interner.resolve(id).1 == crate::analyzer::fq_name::SegmentKind::Package)
+        .count();
+
+    for prefix_len in (0..=namespace_len).rev() {
+        let mut candidate = crate::analyzer::fq_name::FqName::new();
+        for &id in &scope.segments()[..prefix_len] {
+            candidate.push(id);
+        }
+        for &id in reference_fq.segments() {
+            candidate.push(id);
+        }
+        let candidate_str = candidate.display_native(Language::Cpp, interner);
+        if let Some(unit) = analyzer.definitions(&candidate_str).find(&accept) {
+            return Some(unit);
+        }
+    }
+    None
+}
+
 fn resolve_cpp_type(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
@@ -2104,27 +2183,57 @@ fn resolve_cpp_type(
                 })
         {
             let reference = cpp_callable_reference_text(template_node, source);
-            // NOTE (#1162, site cpp.rs:2107 — pinned): the shared enclosing-scope
-            // resolver is now reference-separator-aware, so a `::`-qualified
-            // template-id no longer keeps its `::` in the composed candidate. But
-            // consulting it here is still inert for C++: nested-namespace
-            // declarations are indexed with `::` in the namespace head of their fq
-            // name (`outer::inner.Gizmo`), and the resolver's dot-based prefix
-            // walk starts from the enclosing scope's own `::`-headed fq name — it
-            // can descend the `.`-joined owner/member tail but never re-compose a
-            // *sibling* namespace (`outer::inner`) from `outer::deep`. Verified:
-            // the fallback returns `None` for the sibling-namespace shape. The
-            // effective fix is normalizing C++'s fq indexing (declarations/graph,
-            // out of the get_definition lane); wiring the fallback here would be a
-            // dead net until then. gated upstream: workspace-owned shapes resolve
-            // through the visibility/owner-member paths above; only external
-            // template-ids reach the honest include boundary below.
-            if cpp_unresolved_include_boundary(analyzer, file, &reference) {
-                return boundary_unchecked(format!(
-                    "`{reference}` appears to cross a C++ include boundary not indexed in this workspace"
+            // #1163 (was pinned at cpp.rs:2107): a `::`-qualified template-id whose
+            // qualifier names a *sibling* nested namespace now resolves through the
+            // segment-based namespace-outward net — C++'s mixed-separator store no
+            // longer blocks it (M4). A hit is a real indexed declaration.
+            if let Some(unit) = cpp_resolve_qualified_via_enclosing_namespaces(
+                analyzer,
+                file,
+                &reference,
+                node.start_byte(),
+                |unit| {
+                    unit.is_class()
+                        && visibility.external_type_candidate_visible_at(
+                            file,
+                            unit,
+                            node.start_byte(),
+                        )
+                },
+            ) {
+                return candidates_outcome(cpp_type_definition_candidates(
+                    analyzer,
+                    visibility,
+                    file,
+                    context.bounded_support(),
+                    unit,
                 ));
             }
-            return no_definition(
+            // Only a genuinely-external template-id reaches the include boundary.
+            // `gated_boundary` makes the workspace-internal check structural: if the
+            // namespace-outward net finds a *visible* indexed declaration for the
+            // qualifier, the honest outcome is no_definition, never a boundary.
+            return gated_boundary(
+                || {
+                    cpp_resolve_qualified_via_enclosing_namespaces(
+                        analyzer,
+                        file,
+                        &reference,
+                        node.start_byte(),
+                        |unit| {
+                            visibility.external_type_candidate_visible_at(
+                                file,
+                                unit,
+                                node.start_byte(),
+                            )
+                        },
+                    )
+                    .is_some()
+                        || !cpp_unresolved_include_boundary(analyzer, file, &reference)
+                },
+                format!(
+                    "`{reference}` appears to cross a C++ include boundary not indexed in this workspace"
+                ),
                 "no_indexed_definition",
                 format!("`{reference}` did not resolve to an indexed C++ type"),
             );
@@ -2417,26 +2526,49 @@ fn resolve_cpp_type_without_focused_qualifier(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        // NOTE (#1162, site cpp.rs:2402 — pinned): sibling 2453 (bare
-        // type_identifier) consults the enclosing scope; this branch handles the
-        // `::`-qualified/scoped identifier. The shared resolver is now
-        // reference-separator-aware (#1162), but consulting it is still inert for
-        // C++: nested-namespace declarations are indexed with `::` in the
-        // namespace head of their fq name (`outer::inner.Gizmo`), and the
-        // resolver's dot-based prefix walk starts from the enclosing scope's own
-        // `::`-headed fq name — it descends the `.`-joined owner/member tail but
-        // never re-composes a sibling namespace (`outer::inner`) from
-        // `outer::deep`. Verified: the fallback returns `None` for that shape. The
-        // effective fix is normalizing C++'s fq indexing (declarations/graph, out
-        // of the get_definition lane). gated upstream: workspace-owned shapes
-        // resolve through the visible-name/owner-member paths above; only
-        // genuinely-external shapes reach the boundary.
-        if cpp_unresolved_include_boundary(analyzer, file, text) {
-            return boundary_unchecked(format!(
-                "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+        // #1163 (was pinned at cpp.rs:2402): a `::`-qualified/scoped identifier
+        // whose qualifier names a *sibling* nested namespace now resolves through
+        // the segment-based namespace-outward net. Nested-namespace declarations
+        // are keyed `outer::inner.Gizmo`; the net re-interns the reference with
+        // namespace-aware kinds and descends the scope's `::`-joined namespace
+        // head, composing `outer::inner.Gizmo` exactly — which C++'s
+        // mixed-separator store no longer obstructs now segments are authoritative
+        // (M4). A hit is a real indexed declaration.
+        if let Some(unit) = cpp_resolve_qualified_via_enclosing_namespaces(
+            analyzer,
+            file,
+            text,
+            node.start_byte(),
+            |unit| {
+                unit.is_class()
+                    && visibility.external_type_candidate_visible_at(file, unit, node.start_byte())
+            },
+        ) {
+            return candidates_outcome(cpp_type_definition_candidates(
+                analyzer, visibility, file, support, unit,
             ));
         }
-        return no_definition(
+        // Only a genuinely-external qualified identifier reaches the include
+        // boundary. `gated_boundary` makes the workspace-internal check structural:
+        // if the namespace-outward net finds a *visible* indexed declaration for the
+        // qualifier, the honest outcome is no_definition, never a boundary.
+        return gated_boundary(
+            || {
+                cpp_resolve_qualified_via_enclosing_namespaces(
+                    analyzer,
+                    file,
+                    text,
+                    node.start_byte(),
+                    |unit| {
+                        visibility.external_type_candidate_visible_at(file, unit, node.start_byte())
+                    },
+                )
+                .is_some()
+                    || !cpp_unresolved_include_boundary(analyzer, file, text)
+            },
+            format!(
+                "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+            ),
             "no_indexed_definition",
             format!("`{text}` did not resolve to an indexed C++ type"),
         );
@@ -2660,13 +2792,23 @@ fn cpp_qualifier_lookup_tiers(
             tiers.push(path);
         }
     }
-    let mut namespace = lexical_namespace;
+    let mut namespace = lexical_namespace.map(str::to_string);
     while let Some(current) = namespace {
         let path = format!("{current}::{}", qualifier.reference);
         if !tiers.contains(&path) {
             tiers.push(path);
         }
-        namespace = current.rsplit_once("::").map(|(parent, _)| parent);
+        // A C++ namespace chain is `::`-joined with no embedded delimiters in any
+        // single component, so re-tokenizing it with the shared structured
+        // splitter and dropping the innermost component reproduces
+        // `rsplit_once("::")`'s outward walk exactly.
+        let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &current);
+        namespace = if parts.len() > 1 {
+            parts.pop();
+            Some(parts.join("::"))
+        } else {
+            None
+        };
     }
     if !tiers.contains(&qualifier.reference) {
         tiers.push(qualifier.reference.clone());
@@ -3483,12 +3625,14 @@ fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn cpp_parent_is_class(support: &dyn BoundedDefinitionLookup, unit: &CodeUnit) -> bool {
-    let fqn = unit.fq_name();
-    let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
+    // The unit's owner is a pure segment pop on its own structured `fq()`
+    // (`default_parent_fq_name`, shared with `IAnalyzer::parent_of`), not a
+    // re-guess of where the legacy fqn string's last `.` falls.
+    let Some(parent_fqn) = crate::analyzer::default_parent_fq_name(unit) else {
         return false;
     };
     support
-        .fqn(parent_fqn)
+        .fqn(&parent_fqn)
         .into_iter()
         .any(|parent| parent.is_class())
 }
@@ -3501,11 +3645,11 @@ fn cpp_is_unqualified_field(
     if !unit.short_name().contains('.') {
         return true;
     }
-    let fqn = unit.fq_name();
-    let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
+    // Same structured owner pop as `cpp_parent_is_class` above.
+    let Some(parent_fqn) = crate::analyzer::default_parent_fq_name(unit) else {
         return false;
     };
-    support.fqn(parent_fqn).into_iter().any(|parent| {
+    support.fqn(&parent_fqn).into_iter().any(|parent| {
         parent
             .signature()
             .is_some_and(|signature| signature.trim_start().starts_with("enum "))
@@ -4328,10 +4472,11 @@ fn cpp_enclosing_class_with_ranges(
         end_line: line,
     };
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
-    let enclosing_fqn = enclosing.fq_name();
-    let owner_fqn = enclosing_fqn.rsplit_once('.')?.0;
+    // Structured owner pop on `enclosing`'s own `fq()` (shared with
+    // `IAnalyzer::parent_of`), not a re-split of its rendered fqn string.
+    let owner_fqn = crate::analyzer::default_parent_fq_name(&enclosing)?;
     support
-        .fqn(owner_fqn)
+        .fqn(&owner_fqn)
         .into_iter()
         .find(|unit| unit.is_class())
 }
@@ -4350,9 +4495,21 @@ fn cpp_out_of_line_function_owner(
         if node.kind() == "function_definition" {
             let declarator = node.child_by_field_name("declarator")?;
             let qualified = cpp_declarator_qualified_name(declarator, source)?;
-            let (owner, _) = qualified.rsplit_once("::")?;
+            // `qualified` is source declarator text (`Namespace::Class::method`);
+            // re-tokenizing all `::` boundaries with the shared structured
+            // splitter and rejoining every part but the last with the same `::`
+            // reproduces `rsplit_once("::")`'s prefix exactly (split-then-join on
+            // an unchanged delimiter round-trips), while going through the one
+            // shared splitter instead of a local ad hoc split.
+            let parts =
+                crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &qualified);
+            let (_, owner_parts) = parts.split_last()?;
+            if owner_parts.is_empty() {
+                return None;
+            }
+            let owner = owner_parts.join("::");
             return cpp_resolve_owner_type_in_lexical_namespace(
-                analyzer, support, visibility, file, source, node, owner, byte,
+                analyzer, support, visibility, file, source, node, &owner, byte,
             );
         }
         node = node.parent()?;
@@ -5219,10 +5376,7 @@ fn cpp_type_unit_matches_name(unit: &CodeUnit, name: &str) -> bool {
 }
 
 fn cpp_namespace_relative_names(namespace: &str, name: &str) -> Vec<String> {
-    let parts = namespace
-        .split("::")
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, namespace);
     (1..=parts.len())
         .rev()
         .map(|len| format!("{}::{name}", parts[..len].join("::")))

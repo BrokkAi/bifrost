@@ -105,7 +105,7 @@ pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<Stri
     } else {
         target.short_name()
     };
-    let cut = short.rfind(['.', '$'])?;
+    let cut = short.rfind(['.', '$'])?; // fqname-M4: parent-of on the raw short_name string; runs on targets whose fq is not threaded to this display helper
     let parent_short = &short[..cut];
     if parent_short.is_empty() {
         return None;
@@ -280,12 +280,20 @@ pub(crate) fn node_ident_text<'a>(
 }
 
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
-    language_for_target(target) == Language::Scala
-        && (target.is_class() || target.is_module())
-        && target
-            .short_name()
-            .split('.')
-            .any(|segment| segment.ends_with('$'))
+    language_for_target(target) == Language::Scala && (target.is_class() || target.is_module()) && {
+        // A `.`-joined short_name segment "ending in `$`" is exactly a
+        // Scala companion-object segment: Scala's only `$`-spelling is
+        // the `Companion` kind's trailing suffix on its own segment text
+        // (never a join, and Scala never emits `Nested`), so walking the
+        // unit's structured `fq()` for a `Companion` segment reproduces
+        // the string check exactly without re-splitting the rendered name.
+        let interner = crate::analyzer::fq_name::segment_interner();
+        target
+            .fq()
+            .segments()
+            .iter()
+            .any(|&id| interner.resolve(id).1 == crate::analyzer::fq_name::SegmentKind::Companion)
+    }
 }
 
 #[cfg(test)]

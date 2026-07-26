@@ -789,6 +789,16 @@ fn resolve_rust_unscoped(
                 RustMemberKind::Field
             }
         });
+        // fqname-M4: `reference` here is always `Self` or `Self::<rest>`, and
+        // `<rest>` may itself contain further `::` (e.g. `Self::Outer::Item`);
+        // `split_once` deliberately peels only the first component and keeps the
+        // remainder verbatim (still `::`-joined) for the downstream
+        // `format!("{self_type}.{name}")`/trait-associated-item lookups below.
+        // Re-decomposing `name` with the generic segment splitter would flatten
+        // that remainder onto `.`-joins and could change which candidates match
+        // for nested associated-item paths — a real (if rare) behavior question
+        // that needs its own equivalence check against the trait-item resolver,
+        // not a mechanical rewrite. Revisit alongside that resolver.
         let candidates = match reference.split_once("::") {
             Some(_) if focused_segment == Some(0) => support.fqn(&self_type),
             Some((_, name)) => {
@@ -860,6 +870,16 @@ fn resolve_rust_unscoped(
     {
         return candidates_outcome(candidates);
     }
+    // fqname-M4: `reference` is an arbitrary bare Rust path (`a::b::c::d`);
+    // `rsplit_once` peels only the terminal segment as `name` and keeps
+    // everything before the last `::` joined verbatim as `path`, which is fed
+    // as an opaque string into `resolve_scoped_associated_item_matching` and
+    // the focused-use-path/scoped-prefix resolvers above. Those resolvers
+    // themselves re-derive structure from `path` (module lookups, `use`
+    // resolution) in ways not yet threaded onto `FqName`; migrating this split
+    // alone without also migrating those callees risks a shape mismatch this
+    // batch cannot fully prove via the touched suites. Revisit once the scoped
+    // associated-item resolver chain carries segments end-to-end.
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
         let role = tree
@@ -1684,17 +1704,15 @@ fn resolve_import_package_scoped(
     scope_start: usize,
     module_specifier: &str,
 ) -> Option<String> {
-    let first = module_specifier.split("::").next()?;
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
         return rust.resolve_module_package(file, module_specifier);
     }
     let file_package = crate::analyzer::rust::rust_package_name(file);
     let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
     let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    let segments: Vec<&str> = module_specifier
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
     crate::analyzer::rust::resolve_rust_module_segments_with_crate(
         &lexical_package,
         &crate_package,
@@ -1712,7 +1730,9 @@ fn import_package_resolves_to_file(
     scope_start: usize,
     module_specifier: &str,
 ) -> bool {
-    let Some(first) = module_specifier.split("::").next() else {
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let Some(first) = segments.first().map(String::as_str) else {
         return false;
     };
     if !matches!(first, "self" | "super") {
@@ -1721,10 +1741,6 @@ fn import_package_resolves_to_file(
     let file_package = crate::analyzer::rust::rust_package_name(file);
     let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
     let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    let segments: Vec<&str> = module_specifier
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
     crate::analyzer::rust::resolve_rust_module_segments_with_crate(
         &lexical_package,
         &crate_package,
@@ -1742,24 +1758,34 @@ fn import_path_resolves_within_file(
     scope_start: usize,
     module_specifier: &str,
 ) -> Option<String> {
-    let first = module_specifier.split("::").next()?;
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
         return None;
     }
     let file_package = crate::analyzer::rust::rust_package_name(file);
     let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
     let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    let segments: Vec<&str> = module_specifier
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
     let resolved = crate::analyzer::rust::resolve_rust_module_segments_with_crate(
         &lexical_package,
         &crate_package,
         &segments,
     )?;
-    let (parent, name) = resolved.rsplit_once('.')?;
-    (parent == file_package).then(|| name.to_string())
+    // `resolved` is this same code's own `.`-joined package/name string (built two
+    // lines above by `resolve_rust_module_segments_with_crate`), and Rust
+    // identifiers cannot contain a literal `.`, so re-tokenizing it with the same
+    // structured splitter reproduces `rsplit_once('.')`'s (parent, name) split
+    // exactly — it is not source-text inference, it is re-reading this function's
+    // own already-structured output.
+    let resolved_parts =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, &resolved);
+    if resolved_parts.len() < 2 {
+        return None;
+    }
+    let (name, parent_parts) = resolved_parts.split_last()?;
+    let parent = parent_parts.join(".");
+    (parent == file_package).then(|| name.clone())
 }
 
 fn rust_import_target_candidates(
@@ -5105,10 +5131,16 @@ fn rust_root_node<'tree>(
     Some(node)
 }
 
-fn rust_fqn_package(fqn: &str) -> &str {
-    fqn.rsplit_once('.')
-        .map(|(package, _)| package)
-        .unwrap_or("")
+fn rust_fqn_package(fqn: &str) -> String {
+    // Rust identifiers cannot contain a literal `.`, so re-tokenizing the
+    // `package.short_name`-shaped fqn with the shared structured splitter and
+    // dropping the terminal segment reproduces `rsplit_once('.')`'s package
+    // prefix exactly.
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, fqn);
+    match parts.split_last() {
+        Some((_, prefix)) => prefix.join("."),
+        None => String::new(),
+    }
 }
 
 fn rust_local_package_name(file: &ProjectFile) -> String {
@@ -5324,6 +5356,12 @@ fn rust_binder_has_external_binding(binder: &ImportBinder, reference: &str) -> b
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {
+    // fqname-M4: peeks at the raw first `::`-split token, including the empty
+    // token an absolute-path reference (`::std::foo`) produces; the shared
+    // structured splitter (`parse_symbol_path`) filters empty segments, which
+    // would shift "which token is first" for that one lead-`::` shape and is
+    // not proven equivalent here. Left as a narrow root-token peek rather than
+    // a full path decomposition.
     reference
         .split("::")
         .next()

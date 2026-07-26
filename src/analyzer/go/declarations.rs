@@ -1,3 +1,4 @@
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
@@ -33,6 +34,28 @@ pub(super) fn parse_go_file(
 
 pub(super) fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
+}
+
+/// Intern one qualified-name segment in the process-global interner.
+fn go_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured package prefix for a Go declaration.
+///
+/// A Go `package_name` is the canonical *import path* (e.g.
+/// `github.com/brokk/bifrost/analyzer`), whose `/`-separated components are
+/// file/directory steps. Each becomes a [`SegmentKind::Path`] segment, so a
+/// component that itself contains a literal dot (`github.com`) stays a single
+/// segment rather than being re-split on `.` by a downstream consumer. The
+/// resulting [`FqName`] renders back to the exact legacy `package_name` string
+/// (`/`-joined) via [`FqName::display`].
+fn go_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name.split('/').filter(|c| !c.is_empty()) {
+        fq.push(go_segment(component, SegmentKind::Path));
+    }
+    fq
 }
 
 pub(crate) fn determine_go_package_name(root: Node<'_>, source: &str) -> String {
@@ -183,16 +206,25 @@ fn visit_go_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
+    // The leaf is a function/method: a Member segment appended either to the
+    // receiver type's structured name (method) or to the package prefix
+    // (top-level function).
+    let fq = match parent {
+        Some(parent) => parent.fq().clone(),
+        None => go_package_fq(&package_name),
+    }
+    .with_pushed(go_segment(name, SegmentKind::Member));
     let signature = node
         .child_by_field_name("parameters")
         .map(|parameters| go_node_text(parameters, source).trim().to_string());
-    let code_unit = CodeUnit::with_signature(
+    let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         CodeUnitType::Function,
         package_name,
         short_name,
         signature,
         false,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -253,11 +285,14 @@ fn visit_go_method(
     let Some(receiver_name) = extract_go_receiver_name(receiver, source) else {
         return;
     };
-    let parent = CodeUnit::new(
+    let parent_fq =
+        go_package_fq(package_name).with_pushed(go_segment(&receiver_name, SegmentKind::Type));
+    let parent = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Class,
         package_name.to_string(),
         receiver_name,
+        parent_fq,
     );
     let _ = visit_go_function(
         file,
@@ -317,11 +352,13 @@ fn visit_go_type_spec(
         return None;
     }
 
-    let code_unit = CodeUnit::new(
+    let fq = go_package_fq(package_name).with_pushed(go_segment(name, SegmentKind::Type));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Class,
         package_name.to_string(),
         name.to_string(),
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -387,11 +424,15 @@ fn visit_go_type_alias(
         return None;
     }
 
-    let code_unit = CodeUnit::new(
+    let fq = go_package_fq(package_name)
+        .with_pushed(go_segment(GO_MODULE_SCOPE_SEGMENT, SegmentKind::Package))
+        .with_pushed(go_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Field,
         package_name.to_string(),
         format!("{GO_MODULE_SCOPE_SEGMENT}.{name}"),
+        fq,
     );
     let range_node = sole_spec_declaration_node(node, "type_alias", "type_declaration");
     parsed.add_code_unit(
@@ -438,11 +479,16 @@ fn visit_go_struct_fields(
             };
             if field_names.is_empty() {
                 if let Some((field_name, type_node)) = go_embedded_struct_field(field, source) {
-                    let code_unit = CodeUnit::new(
+                    let fq = parent
+                        .fq()
+                        .clone()
+                        .with_pushed(go_segment(&field_name, SegmentKind::Member));
+                    let code_unit = CodeUnit::new_fq(
                         file.clone(),
                         CodeUnitType::Field,
                         package_name.to_string(),
                         format!("{}.{}", parent.short_name(), field_name),
+                        fq,
                     );
                     if record_ranges {
                         parsed.add_code_unit(
@@ -476,11 +522,16 @@ fn visit_go_struct_fields(
                 if field_name.is_empty() {
                     continue;
                 }
-                let code_unit = CodeUnit::new(
+                let fq = parent
+                    .fq()
+                    .clone()
+                    .with_pushed(go_segment(field_name, SegmentKind::Member));
+                let code_unit = CodeUnit::new_fq(
                     file.clone(),
                     CodeUnitType::Field,
                     package_name.to_string(),
                     format!("{}.{}", parent.short_name(), field_name),
+                    fq,
                 );
                 if record_ranges {
                     parsed.add_code_unit(
@@ -516,11 +567,15 @@ fn visit_go_struct_fields(
                             file,
                             source,
                             nested_type,
-                            &CodeUnit::new(
+                            &CodeUnit::new_fq(
                                 file.clone(),
                                 CodeUnitType::Field,
                                 package_name.to_string(),
                                 format!("{}.{}", parent.short_name(), field_name),
+                                parent
+                                    .fq()
+                                    .clone()
+                                    .with_pushed(go_segment(field_name, SegmentKind::Member)),
                             ),
                             package_name,
                             parsed,
@@ -530,11 +585,15 @@ fn visit_go_struct_fields(
                             file,
                             source,
                             nested_type,
-                            &CodeUnit::new(
+                            &CodeUnit::new_fq(
                                 file.clone(),
                                 CodeUnitType::Field,
                                 package_name.to_string(),
                                 format!("{}.{}", parent.short_name(), field_name),
+                                parent
+                                    .fq()
+                                    .clone()
+                                    .with_pushed(go_segment(field_name, SegmentKind::Member)),
                             ),
                             package_name,
                             parsed,
@@ -591,13 +650,18 @@ fn visit_go_interface_methods(
         let signature = child
             .child_by_field_name("parameters")
             .map(|parameters| go_node_text(parameters, source).trim().to_string());
-        let code_unit = CodeUnit::with_signature(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(go_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
             file.clone(),
             CodeUnitType::Function,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
             signature,
             false,
+            fq,
         );
         if record_ranges {
             parsed.add_code_unit(
@@ -673,11 +737,15 @@ fn visit_go_value_spec(
         if name.is_empty() {
             continue;
         }
-        let code_unit = CodeUnit::new(
+        let fq = go_package_fq(package_name)
+            .with_pushed(go_segment(GO_MODULE_SCOPE_SEGMENT, SegmentKind::Package))
+            .with_pushed(go_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             file.clone(),
             CodeUnitType::Field,
             package_name.to_string(),
             format!("{GO_MODULE_SCOPE_SEGMENT}.{name}"),
+            fq,
         );
         let declaration_kind = format!("{keyword}_declaration");
         let range_node = sole_spec_declaration_node(node, node.kind(), &declaration_kind);

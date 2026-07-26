@@ -99,6 +99,73 @@ fn typescript_materializes_exported_factory_object_surface() {
 }
 
 #[test]
+fn typescript_local_schema_builder_call_materializes_object_shape() {
+    // Parity baseline for javascript_local_schema_builder_call_materializes_object_shape
+    // (issue #1167, gap 3): TS already recognizes a schema-builder call
+    // (`z.object({...})`) as shape-preserving even for a non-exported local
+    // binding, via `ts_call_is_schema_object_builder`. JS is expected to match.
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "schema.ts",
+        r#"
+            const LocalSchema = z.object({
+                isEnabled: true
+            });
+        "#,
+    )]);
+    let file = project.file("schema.ts");
+    let declarations = analyzer.declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::with_signature(
+        file,
+        CodeUnitType::Field,
+        "",
+        "schema.ts.LocalSchema.isEnabled",
+        None,
+        true,
+    )));
+}
+
+#[test]
+fn typescript_regex_initializer_included_in_variable_skeleton() {
+    // Parity with javascript_regex_initializer_included_in_variable_skeleton
+    // (issue #1167, gap 1): TS's simple-initializer list omits "regex", so a
+    // regex-initialized binding drops its initializer from the skeleton
+    // instead of rendering it inline like JS does.
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(root, "pattern.ts", "const p = /x/;\n");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let skeletons = analyzer.get_skeletons(&file);
+    assert_eq!(
+        "const p = /x/",
+        skeletons
+            .get(&definition(&analyzer, "pattern.ts.p"))
+            .unwrap()
+            .trim()
+    );
+}
+
+#[test]
+fn typescript_function_expression_variable_classified_as_function() {
+    // Parity with javascript_function_expression_variable_classified_as_function
+    // (issue #1167, gap 2): TS's module-scope function-expression check only
+    // matches `arrow_function`, so `const x = function(){}` is classified as a
+    // Field instead of a Function like JS.
+    let (project, analyzer) = ts_inline_analyzer(&[(
+        "handlers.ts",
+        r#"
+            const handle = function() {
+                return 1;
+            };
+        "#,
+    )]);
+    let file = project.file("handlers.ts");
+    let declarations = analyzer.declarations(&file);
+
+    assert!(declarations.contains(&CodeUnit::new(file, CodeUnitType::Function, "", "handle",)));
+}
+
+#[test]
 fn typescript_materializes_named_exported_returned_object_surface() {
     let (project, analyzer) = ts_inline_analyzer(&[(
         "factory.ts",

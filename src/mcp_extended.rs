@@ -1,6 +1,6 @@
 use crate::analyzer::structural::query::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryField,
-    QueryStepField, reference_kind_label,
+    QueryStepField, reference_kind_label, supported_query_schema_versions,
 };
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
@@ -256,7 +256,7 @@ fn query_plan_properties(
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
             "items": { "oneOf": query_step_variants },
-            "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files."
+            "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files; schema-v3 CFG steps consume and produce source-backed procedures, program points, and control edges."
         }
     })
     .as_object()
@@ -319,7 +319,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Set example: {{\"union\":[{{\"match\":{{\"kind\":\"class\",\"name\":\"Legacy\"}}}},{{\"match\":{{\"kind\":\"class\",\"name\":\"Replacement\"}}}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 3 supports {step_vocabulary}; explicit version-2 pins retain the pre-CFG vocabulary. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results with proof and completeness; they are not ICFG, data-flow, taint, or typestate analysis. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. CFG example: {{\"schema_version\":3,\"match\":{{\"kind\":\"function\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"cfg_entry\"}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -329,6 +329,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .iter()
         .map(|mode| mode.label())
         .collect::<Vec<_>>();
+    let schema_versions = supported_query_schema_versions();
     query_code_properties.extend(
         json!({
             "limit": {
@@ -353,8 +354,8 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             "schema_version": {
                 "type": "integer",
                 "default": SCHEMA_VERSION,
-                "enum": [SCHEMA_VERSION],
-                "description": "Optional query schema version. Omit for v2; other versions are rejected so callers do not accidentally rely on an incompatible query shape."
+                "enum": schema_versions,
+                "description": "Optional query schema version. Omit for compatible head v3; pin v2 to retain the pre-CFG query vocabulary."
             },
             "query_file": {
                 "type": "string",
@@ -594,6 +595,13 @@ mod tests {
             steps["items"]["oneOf"][0]["properties"]["op"]["enum"],
             json!([
                 "enclosing_decl",
+                "procedure_of",
+                "cfg_entry",
+                "cfg_exits",
+                "cfg_successor_edges",
+                "cfg_predecessor_edges",
+                "cfg_edge_source",
+                "cfg_edge_target",
                 "file_of",
                 "imports_of",
                 "importers_of",
@@ -640,7 +648,7 @@ mod tests {
         assert_eq!(advertised, registered);
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2])
+            json!([2, 3])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

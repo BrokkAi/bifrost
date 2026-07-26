@@ -260,6 +260,26 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn ranges(&self, _code_unit: &CodeUnit) -> Vec<Range> {
         Vec::new()
     }
+    /// Returns at most `max_ranges` declaration ranges, the provider rows
+    /// inspected, and whether more work remained (including cancellation).
+    /// Production analyzers override this so bounded semantic queries never
+    /// clone an unbounded stored range set.
+    #[doc(hidden)]
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, usize, bool) {
+        if max_ranges == 0 || cancellation.is_cancelled() {
+            return (Vec::new(), 0, true);
+        }
+        let mut ranges = self.ranges(code_unit);
+        let inspected = ranges.len().min(max_ranges);
+        let incomplete = ranges.len() > max_ranges || cancellation.is_cancelled();
+        ranges.truncate(max_ranges);
+        (ranges, inspected, incomplete)
+    }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
@@ -679,21 +699,31 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        let fq_name = code_unit.fq_name();
-        let mut last_index = None;
-
-        for separator in [".", "$", "::", "->"] {
-            if let Some(index) = fq_name.rfind(separator)
-                && index + separator.len() < fq_name.len()
-                && last_index.map(|current| index > current).unwrap_or(true)
-            {
-                last_index = Some(index);
-            }
-        }
-
-        let parent_name = fq_name.get(..last_index?)?;
-        self.definitions(parent_name).next()
+        let parent_name = default_parent_fq_name(code_unit)?;
+        self.definitions(&parent_name).next()
     }
+}
+
+/// The fully-qualified name of `code_unit`'s owner (the unit with its final
+/// name segment removed), or `None` if it has no owner (a top-level or
+/// synthetic file-scope unit).
+///
+/// The owner is a pure segment pop on the unit's structured [`FqName`], rendered
+/// in its native spelling — the boundaries were recorded at construction and are
+/// never re-guessed from the joined string. Every unit that reaches here carries
+/// a populated `fq`: freshly-extracted units populate it at emission (M1),
+/// FileState- and candidate-row-loaded cache units rebuild it from the persisted
+/// segments (M3/M4). The M2-era legacy separator-scan fallback (which split the
+/// joined name on the rightmost of `.`/`$`/`::`/`->`) is deleted; an empty `fq`
+/// now genuinely means "no owner" rather than "not yet migrated".
+pub(crate) fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
+    let parent = code_unit
+        .fq()
+        .parent()
+        .filter(|parent| !parent.is_empty())?;
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let language = crate::analyzer::common::language_for_file(code_unit.source());
+    Some(parent.display_native(language, interner))
 }
 
 /// Releases request-scoped analyzer memoization on every return path.
@@ -938,5 +968,178 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
         crate::analyzer::CodeUnitType::FileScope => 5,
+    }
+}
+
+#[cfg(test)]
+mod parent_of_tests {
+    use super::*;
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+
+    /// Build the two representations of one declaration: a unit carrying a
+    /// populated structured `FqName`, and a twin whose `fq` is empty. Since M4
+    /// deleted the legacy separator-scan fallback, `default_parent_fq_name`
+    /// derives the owner purely from segments: the populated unit pops its last
+    /// segment, and the empty-fq twin now has *no* owner (empty `fq` genuinely
+    /// means "no owner", e.g. a synthetic file-scope unit). The tests assert both
+    /// the popped owner name and that the empty twin yields `None`.
+    fn dual_units(
+        rel: &str,
+        kind: CodeUnitType,
+        package_name: &str,
+        short_name: &str,
+        segments: &[(&str, SegmentKind)],
+    ) -> (CodeUnit, CodeUnit) {
+        let root = std::env::current_dir().expect("test working directory should be available");
+        let source = ProjectFile::new(root, rel);
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        for &(text, seg_kind) in segments {
+            let id: SegmentId = interner.intern(text, seg_kind);
+            fq.push(id);
+        }
+        // `new_fq` runs the M1 equivalence assertion, so a mis-tagged segment
+        // fails this test loudly at construction.
+        let with_fq = CodeUnit::new_fq(source.clone(), kind, package_name, short_name, fq);
+        let without_fq = CodeUnit::new(source, kind, package_name, short_name);
+        assert!(!with_fq.fq().is_empty());
+        assert!(without_fq.fq().is_empty());
+        (with_fq, without_fq)
+    }
+
+    fn assert_arms_agree(
+        rel: &str,
+        kind: CodeUnitType,
+        package_name: &str,
+        short_name: &str,
+        segments: &[(&str, SegmentKind)],
+        expected_parent: Option<&str>,
+    ) {
+        let (with_fq, without_fq) = dual_units(rel, kind, package_name, short_name, segments);
+        let popped = default_parent_fq_name(&with_fq);
+        assert_eq!(
+            popped.as_deref(),
+            expected_parent,
+            "segment-pop owner name mismatch for {short_name:?}"
+        );
+        assert_eq!(
+            default_parent_fq_name(&without_fq),
+            None,
+            "an empty-fq unit has no owner now that the legacy scan is deleted ({short_name:?})"
+        );
+    }
+
+    #[test]
+    fn cpp_namespace_head_owner_is_identical_across_arms() {
+        // `::` between namespaces, `.` down the owner/member tail — the mixed
+        // separator the plan calls out. Both arms drop the trailing member.
+        assert_arms_agree(
+            "a.cpp",
+            CodeUnitType::Function,
+            "ns1::ns2",
+            "Outer.method",
+            &[
+                ("ns1", SegmentKind::Package),
+                ("ns2", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+            Some("ns1::ns2.Outer"),
+        );
+    }
+
+    #[test]
+    fn cpp_namespace_component_owner_is_identical_across_arms() {
+        // Popping into the `::`-joined namespace head: both arms agree because
+        // `::` is in the parent-of separator set (unlike the shrinking-scope
+        // walk, which deliberately never descends it).
+        assert_arms_agree(
+            "a.cpp",
+            CodeUnitType::Class,
+            "ns1::ns2",
+            "Outer",
+            &[
+                ("ns1", SegmentKind::Package),
+                ("ns2", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+            ],
+            Some("ns1::ns2"),
+        );
+    }
+
+    #[test]
+    fn dotted_package_owner_is_identical_across_arms() {
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Function,
+            "pkg.mod",
+            "Cls.method",
+            &[
+                ("pkg", SegmentKind::Package),
+                ("mod", SegmentKind::Package),
+                ("Cls", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+            Some("pkg.mod.Cls"),
+        );
+    }
+
+    #[test]
+    fn dollar_nested_owner_is_identical_across_arms() {
+        // A `$`-joined nested type: dropping the member, then dropping the
+        // nested type, agrees between the segment pop and the `$`/`.` scan.
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Field,
+            "",
+            "Owner$Inner.member",
+            &[
+                ("Owner", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
+                ("member", SegmentKind::Member),
+            ],
+            Some("Owner$Inner"),
+        );
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Class,
+            "",
+            "Owner$Inner",
+            &[("Owner", SegmentKind::Type), ("Inner", SegmentKind::Nested)],
+            Some("Owner"),
+        );
+    }
+
+    #[test]
+    fn go_import_path_member_owner_is_identical_across_arms() {
+        // Path components carry literal dots (`github.com`) and `/` joins; both
+        // arms drop only the trailing member, so the embedded dot never splits.
+        assert_arms_agree(
+            "a.go",
+            CodeUnitType::Function,
+            "github.com/foo/bar",
+            "Baz.method",
+            &[
+                ("github.com", SegmentKind::Path),
+                ("foo", SegmentKind::Path),
+                ("bar", SegmentKind::Path),
+                ("Baz", SegmentKind::Type),
+                ("method", SegmentKind::Member),
+            ],
+            Some("github.com/foo/bar.Baz"),
+        );
+    }
+
+    #[test]
+    fn single_segment_has_no_owner_in_either_arm() {
+        assert_arms_agree(
+            "a.py",
+            CodeUnitType::Class,
+            "",
+            "Solo",
+            &[("Solo", SegmentKind::Type)],
+            None,
+        );
     }
 }

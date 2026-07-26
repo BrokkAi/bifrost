@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, resolved call edges and direct call-site inputs, direct project import edges, indexed type hierarchies, declaration ownership, and bounded receiver provenance from adapter-provided structured facts. It does not infer override families, resolve general aliases, or perform control-flow, taint, or general data-flow analysis.
+The compatible head is schema version 3. It retains version 2's normalized structural matching, declaration/reference/call/import/hierarchy steps, and bounded receiver provenance, then adds source-backed procedure-local CFG inspection. Explicit version-2 pins remain valid and reject version-3-only operations. Version 3 exposes control flow, but it is not an interprocedural CFG, data-flow, taint, or typestate analysis.
 
 ## Minimal Query
 
@@ -28,7 +28,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for version 2 or pass `2` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for compatible head version 3; pass `2` to pin the pre-CFG vocabulary or `3` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
@@ -135,7 +135,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -176,6 +176,13 @@ Steps execute in array order and are validated before the workspace is searched:
 | Operation | Input | Output | Meaning |
 | --- | --- | --- | --- |
 | `enclosing_decl` | structural match | declaration | Smallest non-synthetic indexed declaration containing the exact match range, inclusive of a matched declaration itself. |
+| `procedure_of` (v3) | structural match or declaration | procedure | Unique smallest source-backed executable procedure enclosing the exact input range. |
+| `cfg_entry` (v3) | procedure | program point | Validated entry boundary. |
+| `cfg_exits` (v3) | procedure | program point | Validated normal then exceptional exit boundaries. |
+| `cfg_successor_edges` (v3) | program point | control edge | One-hop outgoing control edges. |
+| `cfg_predecessor_edges` (v3) | program point | control edge | One-hop incoming control edges. |
+| `cfg_edge_source` (v3) | control edge | program point | Source endpoint of an edge. |
+| `cfg_edge_target` (v3) | control edge | program point | Target endpoint of an edge. |
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
@@ -187,7 +194,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_targets` | structural match, reference site, call site, or expression site | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
 | `points_to` | structural match, reference site, or expression site | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
 | `member_targets` | structural match or reference site | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `file_of` | structural match, declaration, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
+| `file_of` | structural match, declaration, procedure, program point, control edge, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -196,6 +203,31 @@ Steps execute in array order and are validated before the workspace is searched:
 | `owner` | declaration | declaration | Exact declaring type of a direct member. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
+
+### Procedure-local CFG inspection (schema v3)
+
+This query starts from a structural function match, resolves its executable procedure, enters its CFG, follows one outgoing edge, and projects the target point:
+
+<!-- code-query-test:json:cfg-entry-successor -->
+```json
+{
+  "schema_version": 3,
+  "languages": ["typescript"],
+  "match": {"kind": "function", "name": "run"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "cfg_entry"},
+    {"op": "cfg_successor_edges"},
+    {"op": "cfg_edge_target"}
+  ]
+}
+```
+
+`procedure` rows include stable content-scoped `id` and `artifact_id`, workspace-relative `path`, `procedure_kind`, exact `range`, and semantic `evidence`. `program_point` rows add `procedure_id`, optional `boundary` (`entry`, `normal_exit`, or `exceptional_exit`), and `event_count`. `control_edge` rows add `edge_kind` plus complete source and target point references.
+
+Every semantic row carries `evidence.proof` (`proven` or `unproven`) and `evidence.completeness` (`complete` or `partial`), with a bounded reason when either status is degraded. Public IDs never expose dense semantic arena IDs and remain stable for identical indexed content mounted at different absolute checkout paths. Diagnostics distinguish unsupported/partial capability, provider failure, missing workspace services, no enclosing procedure, cancellation, and budget exhaustion. An incomplete diagnostic prevents a complete-negative conclusion even when the result array is empty.
+
+Each edge operation is exactly one hop. Compose more steps for a finite traversal; schema v3 does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint.
 
 ```json
 {
@@ -407,7 +439,7 @@ That diagnostic means the affected language was not searched for that feature; i
 
 ## Limits And Validation Errors
 
-Version 2 enforces these budgets:
+The compatible schema-v3 head enforces these budgets (version-2 pins share the structural limits):
 
 | Budget | Maximum |
 | --- | --- |
@@ -426,6 +458,13 @@ Version 2 enforces these budgets:
 | Query-plan nodes / composition depth | `64` nodes / `16` levels |
 | Seed and edge rows per execution | `50000` |
 | Provenance paths per terminal result | `16` |
+| Semantic materialized files | `256` |
+| Semantic source bytes | `16 MiB` |
+| Semantic retained rows per dimension | `1,000,000` |
+| Semantic retained artifact/source bytes | `64 MiB` |
+| Semantic traversal steps | `1,000,000` |
+
+The semantic limits are a separate typed sub-budget. They are charged only when a v3 semantic step reaches a source file; structural-only queries and `explain` mode do not materialize semantic artifacts. `profile` reports materialization attempts, successful unique files, request-cache hits, source/row/retained/traversal work, and budget exhaustion on the physical pipeline step that performed the work.
 
 Validation failures carry a JSON path so agents can correct the precise field. For example, this misspelling:
 

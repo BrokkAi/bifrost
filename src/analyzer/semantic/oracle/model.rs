@@ -1115,7 +1115,7 @@ fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool
     }
 }
 /// A dispatch arm that cannot enter a materialized workspace procedure.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DispatchBoundaryKind {
     External(Option<SemanticLocator>),
     Unmaterialized(SemanticLocator),
@@ -1127,7 +1127,7 @@ pub enum DispatchBoundaryKind {
     Truncated,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeferredInvocationKind {
     Async,
     Generator,

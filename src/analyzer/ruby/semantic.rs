@@ -9,8 +9,8 @@ use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
-    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
-    ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::lowering::formal_multiplicity;
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
@@ -653,32 +653,38 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+        let (specs, initial_work, inventory_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    inventory_work,
+                } => (value, initial_work, inventory_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         let mut bindings_by_procedure: Vec<ProcedureBindings> = Vec::with_capacity(specs.len());
         let mut binding_work = SemanticWork::default();
         for spec in &specs {
             let mut staged_budget = budget.clone();
-            if let Err(exceeded) = staged_budget.charge(binding_work) {
+            let observed = sum_lowering_work(inventory_work, binding_work);
+            if let Err(exceeded) = staged_budget.charge(observed) {
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
                     exceeded,
-                    work: binding_work,
+                    work: observed,
                 });
             }
             let inherited = matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure)
@@ -700,11 +706,11 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 Err(RubyLoweringError::Cancelled(work)) => {
                     return Ok(SemanticOutcome::Cancelled {
                         partial: None,
-                        work: sum_lowering_work(binding_work, *work),
+                        work: sum_lowering_work(observed, *work),
                     });
                 }
                 Err(RubyLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_lowering_work(binding_work, *work);
+                    let work = sum_lowering_work(observed, *work);
                     let exceeded = budget.check(work).err().unwrap_or(exceeded);
                     return Ok(SemanticOutcome::ExceededBudget {
                         partial: None,
@@ -716,14 +722,16 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                     return Err(SemanticProviderError::internal(detail));
                 }
             };
-            binding_work = sum_lowering_work(binding_work, collection.work);
-            if let Err(exceeded) = budget.check(binding_work) {
+            let candidate = sum_lowering_work(binding_work, collection.work);
+            let observed_candidate = sum_lowering_work(inventory_work, candidate);
+            if let Err(exceeded) = budget.check(observed_candidate) {
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
                     exceeded,
-                    work: binding_work,
+                    work: observed_candidate,
                 });
             }
+            binding_work = candidate;
             bindings_by_procedure.push(ProcedureBindings {
                 timeline: collection.timeline,
                 has_parameter_defaults: collection.has_parameter_defaults,
@@ -732,7 +740,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
 
         lower_procedure_batch(
             specs.iter().zip(&bindings_by_procedure),
-            binding_work,
+            sum_lowering_work(initial_work, binding_work),
             budget,
             cancellation,
             |(spec, local_bindings), staged_budget, cancellation| {
@@ -801,14 +809,7 @@ struct ProcedureSpec<'tree> {
     properties: ProcedureProperties,
 }
 
-enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
-    ExceededBudget {
-        exceeded: SemanticBudgetExceeded,
-        work: SemanticWork,
-    },
-    Cancelled,
-}
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -831,33 +832,14 @@ fn enumerate_procedures<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
-    let mount = WorkspaceMountId::from_root(file.root());
-    let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let language = prepared.dialect();
     let root = prepared.tree().root_node();
-    let file_anchor = source_anchor(root, 0).map_err(SemanticProviderError::invalid_identity)?;
-    let file_name = file
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("ruby-source");
-    let file_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::File, file_name, file_anchor, 0)
-            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-
-    type SiblingKey = (usize, DeclarationSegmentKind, Option<Box<str>>);
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "ruby-source", budget)?;
     let mut specs = Vec::new();
-    let mut siblings: HashMap<SiblingKey, u32> = HashMap::default();
-    let mut declaration_paths = vec![DeclarationPathEntry {
-        parent: None,
-        segment: file_segment,
-    }];
-    let mut preflight = SemanticWork::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
-        declaration_path: 0,
+        declaration_path: inventory.root_path(),
         member_context: false,
         singleton_context: false,
         synthetic_body_scope: None,
@@ -865,7 +847,10 @@ fn enumerate_procedures<'tree>(
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
         }
 
         let mut child_path = frame.declaration_path;
@@ -873,13 +858,10 @@ fn enumerate_procedures<'tree>(
         let mut child_singleton_context = frame.singleton_context;
         if let Some(segment_kind) = declaration_container_kind(frame.node) {
             let name = declaration_container_name(prepared.source(), frame.node);
-            let ordinal =
-                next_sibling_ordinal(&mut siblings, child_path, segment_kind, name.as_deref());
             let anchor =
                 source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            child_path = push_declaration_path(&mut declaration_paths, child_path, segment);
+            child_path =
+                inventory.push_container(child_path, segment_kind, name.as_deref(), anchor)?;
             child_member_context = true;
             child_singleton_context = frame.node.kind() == "singleton_class";
         }
@@ -889,63 +871,42 @@ fn enumerate_procedures<'tree>(
         let mut self_synthetic_scope = None;
         if let Some(shape) = callable_shape(prepared.source(), frame.node, frame.singleton_context)
         {
-            let id = ProcedureId::try_from_index(specs.len())
-                .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
             let name = callable_name(prepared.source(), frame.node, shape.kind);
-            let ordinal = next_sibling_ordinal(
-                &mut siblings,
+            let anchor = callable_source_anchor(frame.node, shape.body, 0)
+                .map_err(SemanticProviderError::invalid_identity)?;
+            let identity = match inventory.allocate_procedure(
                 child_path,
                 shape.segment_kind,
                 name.as_deref(),
-            );
-            let anchor = callable_source_anchor(frame.node, shape.body, 0)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let segment = declaration_segment(shape.segment_kind, name.as_deref(), anchor, ordinal)
-                .map_err(SemanticProviderError::invalid_identity)?;
-            let mut segments = collect_declaration_path(&declaration_paths, child_path);
-            segments.push(segment.clone());
-            let declaration = DeclarationLocator::new(segments)
-                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-            let locator = SemanticLocator::new(
-                mount,
-                path.clone(),
-                language,
-                declaration,
-                SemanticRole::Procedure,
                 anchor,
-            );
-            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
-                return Ok(ProcedureEnumeration::ExceededBudget {
-                    exceeded,
-                    work: candidate,
-                });
-            }
-            preflight = candidate;
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
             specs.push(ProcedureSpec {
-                id,
+                id: identity.id,
                 body: shape.body,
                 callable: frame.node,
                 empty_body: shape.empty_body,
-                locator,
+                locator: identity.locator,
                 lexical_parent: frame.lexical_parent,
                 kind: shape.kind,
                 properties: shape.properties,
             });
-            let callable_path = push_declaration_path(&mut declaration_paths, child_path, segment);
+            let callable_path = identity.declaration_path;
             if shape.body.id() == frame.node.id() {
                 if shape.attach_lexical_parent {
-                    self_callable_scope = Some((id, callable_path));
+                    self_callable_scope = Some((identity.id, callable_path));
                 } else {
                     self_synthetic_scope = Some(SyntheticBodyScope {
-                        procedure: id,
+                        procedure: identity.id,
                         callable_path,
                     });
                 }
             } else {
                 callable_body_scope = Some((
                     shape.body.id(),
-                    id,
+                    identity.id,
                     callable_path,
                     shape.attach_lexical_parent,
                 ));
@@ -1013,7 +974,7 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    Ok(ProcedureEnumeration::Complete(specs))
+    Ok(inventory.complete(specs))
 }
 
 struct CallableShape<'tree> {
@@ -1183,20 +1144,7 @@ fn is_initializer_member_declaration(node: Node<'_>) -> bool {
 
 type RubyLoweringError = ProcedureLoweringError;
 
-#[derive(Debug, Clone, Copy)]
-struct EdgeTarget {
-    point: ProgramPointId,
-    kind: ControlEdgeKind,
-}
-
-impl EdgeTarget {
-    const fn normal(point: ProgramPointId) -> Self {
-        Self {
-            point,
-            kind: ControlEdgeKind::Normal,
-        }
-    }
-}
+type EdgeTarget = ControlTarget;
 
 #[derive(Debug, Clone, Copy)]
 enum Work<'tree> {
@@ -1491,45 +1439,15 @@ fn lower_procedure<'tree, 'request>(
             scope: body_scope,
         })
     };
-    let mut drive_error = None;
-    if let Some(initial) = initial
-        && let Err(error) =
-            builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
-                context.step(builder, work, stack)
-            })
-    {
-        drive_error = Some(error);
-    }
-    if let Some(error) = drive_error {
-        let work = builder.prospective_work();
-        return match error {
-            DriveError::Cancelled | DriveError::Step(RubyLoweringError::Cancelled(_)) => {
-                Err(RubyLoweringError::Cancelled(Box::new(work)))
-            }
-            DriveError::ExceededBudget(exceeded) => {
-                Err(RubyLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(RubyLoweringError::Budget(exceeded, _)) => {
-                Err(RubyLoweringError::Budget(exceeded, Box::new(work)))
-            }
-            DriveError::Step(RubyLoweringError::Invalid(detail)) => {
-                Err(RubyLoweringError::Invalid(detail))
-            }
-        };
-    }
-
-    if builder
-        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
-        .is_err()
-    {
-        return Err(RubyLoweringError::Cancelled(Box::new(
-            builder.prospective_work(),
-        )));
-    }
-    let work_before_freeze = builder.prospective_work();
-    builder
-        .finish_with_work()
-        .map_err(|error| RubyLoweringError::Budget(error, Box::new(work_before_freeze)))
+    drive_and_finish_procedure(
+        builder,
+        initial,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -1660,10 +1578,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let value = self
-            .session
-            .add_value_with_metadata(builder, metadata, kind)?;
-        self.expression_values.insert(node.id(), value);
+        let value = self.session.insert_cached_value_with_metadata(
+            builder,
+            &mut self.expression_values,
+            node.id(),
+            metadata,
+            kind,
+        )?;
         Ok(value)
     }
 
@@ -4250,51 +4171,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         route: &CompletionRoute,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<EdgeTarget, RubyLoweringError> {
-        if route.cleanups().is_empty() {
-            return Ok(EdgeTarget {
-                point: route.destination().target(),
-                kind: route.destination().edge_kind(),
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
+            builder,
+            &mut self.session,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )? {
+            stack.push(Work::Statement {
+                node: step.region.body,
+                entry: step.entry,
+                next: step.next,
+                scope: step.region.outer_scope,
             });
         }
-
-        let mut next = EdgeTarget {
-            point: route.destination().target(),
-            kind: route.destination().edge_kind(),
-        };
-        let mut first = None;
-        for index in (0..route.cleanups().len()).rev() {
-            let region_id = route.cleanups()[index];
-            let region = *self
-                .cleanups
-                .iter()
-                .find(|region| region.id == region_id)
-                .ok_or_else(|| RubyLoweringError::Invalid("missing cleanup region".into()))?;
-            let metadata = self.mapping(builder, region.body)?;
-            let (cleanup_entry, created) =
-                builder.cleanup_specialization(route, index, metadata.source, metadata.evidence)?;
-            if created {
-                self.session.register_point(
-                    cleanup_entry,
-                    metadata,
-                    "cleanup specialization broke dense point allocation",
-                )?;
-                stack.push(Work::Statement {
-                    node: region.body,
-                    entry: cleanup_entry,
-                    next,
-                    scope: region.outer_scope,
-                });
-            }
-            next = EdgeTarget {
-                point: cleanup_entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            first = Some(cleanup_entry);
-        }
-        Ok(EdgeTarget {
-            point: first.expect("route with cleanup regions has an entry"),
-            kind: ControlEdgeKind::Cleanup,
-        })
+        Ok(plan.target())
     }
 
     fn resolution_gaps(
@@ -4305,28 +4197,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         call_site: CallSiteId,
         resolution: &CallableTargetResolution,
     ) -> Result<(), RubyLoweringError> {
-        let kind = match resolution {
-            CallableTargetResolution::Proven(_) => return Ok(()),
-            CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
-            CallableTargetResolution::Unknown => SemanticGapKind::Unknown,
-            CallableTargetResolution::Unsupported => SemanticGapKind::Unsupported,
-            CallableTargetResolution::Unproven(_) => SemanticGapKind::Unproven,
-            CallableTargetResolution::ExceededBudget(_) => SemanticGapKind::ExceededBudget,
-        };
-        self.add_gap(
+        self.session.add_callable_resolution_gaps(
             builder,
             point,
-            SemanticGapSubject::Value(callee),
-            SemanticCapability::CallableReferences,
-            kind,
+            callee,
+            call_site,
+            resolution,
             "callable target requires whole-program Ruby dispatch refinement",
-        )?;
-        self.add_gap(
-            builder,
-            point,
-            SemanticGapSubject::CallSite(call_site),
-            SemanticCapability::Calls,
-            kind,
             "call target requires whole-program Ruby dispatch refinement",
         )
     }
@@ -4394,10 +4271,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, RubyLoweringError> {
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(RubyLoweringError::Invalid)?;
-        self.add_mapping(builder, anchor)
+        self.session.add_node_mapping(builder, node)
     }
 
     fn value_mapping(

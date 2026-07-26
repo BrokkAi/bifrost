@@ -53,7 +53,7 @@ Begin with [Build a Static-Analysis Rule](/build-static-analysis-rule/), use RQL
 
 ## Check Suitability Before Installation
 
-Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, indexed type relationships, or bounded receiver provenance reported by the selected adapter. It is not a path-sensitive control-flow, whole-program points-to, general alias, taint, or whole-program data-flow engine. Read the [capability matrix](/capabilities/) and inspect runtime diagnostics before relying on a zero-result or completeness claim.
+Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, indexed type relationships, bounded receiver provenance, or source-backed procedure-local CFG edges reported by the selected adapter. Its CFG surface does not cross call boundaries or perform path-sensitive analysis; it is not an ICFG, whole-program points-to, general alias, taint, or whole-program data-flow engine. Read the [capability matrix](/capabilities/) and inspect runtime diagnostics before relying on a zero-result or completeness claim.
 
 Once you have chosen an interface, read [License and Use Cases](/license-use-cases/)
 for the practical differences between running Bifrost as a subprocess, linking

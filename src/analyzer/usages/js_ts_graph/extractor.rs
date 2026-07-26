@@ -712,7 +712,7 @@ fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) ->
         return owner.identifier().trim_end_matches("$static").to_string();
     }
     if is_static_member(target)
-        && let Some((owner, _)) = target.short_name().rsplit_once('.')
+        && let Some((owner, _)) = target.short_name().rsplit_once('.') // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
         && let Some(owner_name) = owner.rsplit('.').next()
     {
         return owner_name.to_string();
@@ -1254,9 +1254,20 @@ fn commonjs_nested_member_matches(
     local_name: &str,
     export_name: &str,
 ) -> bool {
-    let Some((export_object, export_member)) = export_name.rsplit_once('.') else {
+    // `export_name` is a CommonJS export member NAME (`module.exports.a.b`'s
+    // trailing `a.b`), not a file/module path, so it never carries a `/` — the
+    // shared structured splitter's "everything but the last segment" rejoin
+    // reproduces `rsplit_once('.')`'s (export_object, export_member) split
+    // exactly.
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::JavaScript, export_name);
+    let Some((export_member, export_object_parts)) = segments.split_last() else {
         return false;
     };
+    if export_object_parts.is_empty() {
+        return false;
+    }
+    let export_object = export_object_parts.join(".");
     property_text == export_member && object_text == format!("{local_name}.{export_object}")
 }
 

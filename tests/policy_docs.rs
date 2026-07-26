@@ -188,7 +188,7 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
 > finding by itself.";
     assert!(docs.contains(REACHABILITY_WARNING));
     for required_case in [
-        "| Omitted | Native query with no version envelope | Resolve the latest compatible RQL version (currently 2); the version is inferred. |",
+        "| Omitted | Native query with no version envelope | Resolve the latest compatible RQL version (currently 3); the version is inferred. |",
         "| Exact pin `N` | Native query with no version envelope | Use exact `N`; the wrapper supplies the explicit pin. |",
         "| Omitted | `(rql :schema-version N QUERY)` | Use exact `N`; the referenced document supplies the explicit pin. |",
         "| Exact pin `N` | `(rql :schema-version N QUERY)` | Use exact `N`; the agreeing referenced-document pin is retained as the resolution origin. |",

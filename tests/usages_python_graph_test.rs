@@ -329,7 +329,7 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
     for (fqn, snippets) in [
         (
             "shop.models.User",
-            vec!["Account.guest()", "Account.format_name"],
+            vec!["-> \"User\"", "Account.guest()", "Account.format_name"],
         ),
         ("shop.models.User.guest", vec!["Account.guest()"]),
         ("shop.models.User.format_name", vec!["Account.format_name"]),
@@ -345,11 +345,19 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
             .into_either()
             .unwrap_or_else(|_| panic!("graph should resolve usages for {fqn}"));
         assert_eq!(hits.len(), snippets.len(), "{fqn}: {hits:#?}");
-        assert!(
-            hits.iter()
-                .all(|hit| hit.file == project.file("tests/test_models.py")),
-            "{fqn}: {hits:#?}"
-        );
+        if fqn == "shop.models.User" {
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.file == project.file("src/shop/models.py")),
+                "{fqn}: expected source annotation hit, got {hits:#?}"
+            );
+        } else {
+            assert!(
+                hits.iter()
+                    .all(|hit| hit.file == project.file("tests/test_models.py")),
+                "{fqn}: {hits:#?}"
+            );
+        }
         for snippet in snippets {
             assert!(
                 hits.iter().any(|hit| hit.snippet.contains(snippet)),
@@ -357,6 +365,55 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
             );
         }
     }
+}
+
+#[test]
+fn annotation_references_resolve_reexported_classes_without_matching_other_classes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            "class User:\n    pass\n\nclass Other:\n    pass\n",
+        )
+        .file("src/shop/__init__.py", "from .models import User as Account\n")
+        .file(
+            "tests/annotations.py",
+            "from shop import Account\nfrom shop.models import Other\n\ndef render(value: Account) -> Account:\n    local: Account = value\n    return local\n\ndef unrelated(value: Other) -> Other:\n    return value\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let target = definition(&analyzer, "shop.models.User");
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve re-exported annotation references");
+    assert_eq!(
+        hits.len(),
+        3,
+        "expected parameter, return, and assignment annotations: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("tests/annotations.py")),
+        "unexpected source hit: {hits:#?}"
+    );
+
+    let other = definition(&analyzer, "shop.models.Other");
+    let other_hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&other), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve unrelated annotation references independently");
+    assert!(
+        other_hits.iter().any(|hit| hit.snippet.contains("Other")),
+        "expected the unrelated class annotations: {other_hits:#?}"
+    );
+    assert!(
+        other_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("Account")),
+        "User alias must not resolve to Other: {other_hits:#?}"
+    );
 }
 
 #[test]

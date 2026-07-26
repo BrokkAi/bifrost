@@ -1,6 +1,7 @@
 #[cfg(test)]
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
+pub(crate) mod canonical_hash;
 mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
@@ -14,9 +15,11 @@ mod csharp;
 pub mod dataflow;
 pub(crate) mod declaration_range;
 mod dense_id;
+pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
+pub(crate) mod identifier;
 mod java;
 mod javascript;
 mod js_ts;
@@ -38,13 +41,16 @@ mod source_content;
 pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
+pub mod taint;
 pub(crate) mod test_paths;
 pub(crate) mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 pub(crate) mod type_relations;
 mod typescript;
+pub mod typestate;
 mod usage_facts;
 pub mod usages;
+pub mod value_flow;
 mod work_budget;
 mod workspace;
 
@@ -96,8 +102,8 @@ pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
     packages::{GoModuleRoot, go_module_roots},
 };
-pub(crate) use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::{AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer};
+pub(crate) use i_analyzer::{AnalyzerQueryScope, default_parent_fq_name};
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};

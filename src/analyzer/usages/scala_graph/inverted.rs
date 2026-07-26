@@ -35,7 +35,7 @@ use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
     scala_literal_type_name, scala_normalized_fq_name,
 };
-use super::shared::ScalaEdgeGraph;
+use super::shared::{ScalaEdgeGraph, scala_short_name_terminal_segment};
 use super::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
     ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaGenericOwnerSourceFacts,
@@ -619,12 +619,7 @@ impl ProjectTypes {
         let mut bindings = ExportedMemberBindings::default();
         for child in self.index.fqn_direct_children(owner_fqn) {
             if child.is_function() || child.is_field() || self.type_aliases.contains(&child) {
-                let visible_name = child
-                    .short_name()
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(child.short_name())
-                    .to_string();
+                let visible_name = scala_short_name_terminal_segment(child.short_name());
                 bindings
                     .entry(visible_name)
                     .or_default()
@@ -4131,7 +4126,9 @@ impl ProjectTypes {
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
-        if !target.is_function() || target.short_name().rsplit('.').next() != Some("apply") {
+        if !target.is_function()
+            || scala_short_name_terminal_segment(target.short_name()) != "apply"
+        {
             return None;
         }
         let companion = self.exact_structural_parent(scala, target)?;
@@ -5305,12 +5302,7 @@ fn add_wildcard_member_bindings(
 ) {
     for declaration in declarations {
         if declaration.is_function() || declaration.is_field() {
-            let visible_name = declaration
-                .short_name()
-                .rsplit('.')
-                .next()
-                .unwrap_or(declaration.short_name())
-                .to_string();
+            let visible_name = scala_short_name_terminal_segment(declaration.short_name());
             member_names.add_declaration(visible_name, &declaration, 128);
         }
     }
@@ -5554,13 +5546,17 @@ impl NameResolver {
             if import.is_wildcard {
                 continue;
             }
-            let local_name = import
-                .identifier
-                .as_deref()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
-            if !required_names.contains(local_name) {
+            // `ImportInfo::local_name` is the shared `alias ?? identifier ??
+            // tail-of-structured-path` desugar; scala's `identifier` is already
+            // alias-resolved at construction, so this agrees with the old
+            // `identifier ?? terminal-of(path)` fallback exactly.
+            if !import
+                .local_name()
+                .is_some_and(|name| required_names.contains(name))
+            {
                 continue;
             }
+            let local_name = import.local_name().unwrap_or_default();
             let Some(tier) = types.explicit_import_tier(&path, &package_prefixes) else {
                 continue;
             };
@@ -5775,12 +5771,8 @@ impl NameResolver {
                     {
                         for child in types.index.fqn_direct_children(&declaration.fq_name()) {
                             if child.is_function() || child.is_field() {
-                                let visible_name = child
-                                    .short_name()
-                                    .rsplit('.')
-                                    .next()
-                                    .unwrap_or(child.short_name())
-                                    .to_string();
+                                let visible_name =
+                                    scala_short_name_terminal_segment(child.short_name());
                                 member_names.add_declaration(visible_name, &child, 128);
                             }
                         }
@@ -5907,10 +5899,14 @@ impl NameResolver {
             let Some(tier) = types.explicit_import_tier(&path, active_package_prefixes) else {
                 continue;
             };
+            // `ImportInfo::local_name` is the shared `alias ?? identifier ??
+            // tail-of-structured-path` desugar; scala's `identifier` is already
+            // alias-resolved at construction, so this agrees with the old
+            // `identifier ?? terminal-of(path)` fallback exactly.
             let local_name = import
-                .identifier
-                .clone()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
+                .local_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| path.clone());
             if tier.declaration && tier.package {
                 ambiguous_import_priorities.insert(local_name.clone(), 192);
             }
@@ -6153,13 +6149,13 @@ fn visible_imports_at_byte(
         .collect()
 }
 
+/// The package-qualified owner of `unit` — a pure segment pop on its own
+/// structured `fq()` (shared with `IAnalyzer::parent_of`), not a re-guess of
+/// where the legacy short_name string's last `.` falls plus a manual
+/// package re-qualification (this function's old body did exactly that
+/// reconstruction by hand).
 fn owner_fqn(unit: &CodeUnit) -> Option<String> {
-    let (owner_short, _) = unit.short_name().rsplit_once('.')?;
-    Some(if unit.package_name().is_empty() {
-        owner_short.to_string()
-    } else {
-        format!("{}.{}", unit.package_name(), owner_short)
-    })
+    crate::analyzer::default_parent_fq_name(unit)
 }
 
 enum PhysicalCallableTargets {

@@ -128,9 +128,72 @@ extractions inside it are strong accepts.
 - **Leave as copies (divergence is the design): scala, cpp, ruby.** Tier-search is
   not a lookup; using-directives are scope-ordered and guard-gated; ruby has nothing
   to bind. java is a false friend (binding fused with resolution to CodeUnit).
-- **Optional medium-payoff**: extend `ImportBinding` with multi-target values (go)
-  and a namespace-partition tag (php/csharp) to bring those three onto the shared
-  core. Judge after the accepts land.
+- **Optional medium-payoff, judged 2026-07-24: RESOLVED: LEAVE AS COPIES** (go, php,
+  csharp do not join the shared `ImportBinder`/`ImportBinding`/`ImportKind` core).
+  Full arithmetic below; one real bug found and fixed in the same pass (does not
+  require the widening).
+  - **(a) Consumer unification is mostly illusory.** Go's bulk usage-graph path
+    (`go_graph/resolver.rs::import_binder_of`) is **already on the shared core** —
+    it isn't a widening candidate at all, it's an existing user. Its query-time
+    sibling (`go/imports.rs::definition_import_namespaces`, feeding
+    `get_definition/go.rs`) stays bespoke because it answers a different question
+    under a different constraint (single-file, no-workspace-graph, ambiguity-
+    preserving `HashMap<alias, Vec<package>>`) and its primary consumer
+    (`go_import_paths`) already collapses the `Vec` to `.next()` — the only
+    genuine multi-*value* need is dot-imports, which are already a `Vec<String>`
+    today with no model change required. PHP's usage-graph consumers
+    (`php_graph/extractor.rs`) don't consume a binder at all — they resolve
+    FQN-by-FQN via `resolve_php_type/function/constant(text, ctx) == target_fq`
+    forward comparison, a different algorithm shape than the Named/Namespace/Glob
+    dispatch rust/python/js_ts run over `binder.bindings`; a partition-tagged
+    `ImportBinding` would still leave that comparison loop untouched. C#'s
+    `visible_type_candidates_with_lookups` is an ordered tiered-candidate search
+    (alias → `global::` qualifier → current-namespace probe → using-namespace
+    list) — the same species as scala's already-LEFT tier search, not a keyed
+    lookup; `namespace_of_file` (the file's own declared namespace) isn't an
+    import fact at all and wouldn't fit inside `ImportBinding` regardless of
+    widening.
+  - **(b) Widening cost lands on the three languages already accepted.** Adding a
+    multi-target `Vec` and a namespace-partition tag would add a vestigial
+    field/variant to every `ImportKind` match arm across rust (graph_support.rs,
+    hierarchy.rs, declarations.rs, lexical_scope.rs), python (mod.rs,
+    usage_index.rs, python_graph/{resolver,inverted,extractor}.rs), and js_ts
+    (syntax.rs, hierarchy.rs, js_ts_graph/{resolver,inverted,extractor,
+    receiver_analysis}.rs) — dozens of sites that would carry `None`/single-
+    element handling for a case they never produce. That is the god-struct tax
+    the verdict already predicted.
+  - **(c) Invariant drift: none found from bespoke-copy divergence** (consistent
+    with #1089 being a rust binder gap, not cross-language drift, per the
+    original survey). But the arithmetic surfaced a **real, unrelated bug** in
+    Go's existing (already-shared-core) participation: `import_binder_of` keyed
+    every dot-import (`import . "pkg"`) under one fixed `"*"` map entry, so a
+    second dot-import of a different package in the same file silently clobbered
+    the first — usages of its exports went unfound. Confirmed with a probe test
+    (two dot-imports, disjoint exported names: the first package's usage came
+    back `Ok({})`). Root cause is a local keying bug, not a shape the shared model
+    lacks — Rust's own glob handling in the same core (`lexical_scope.rs:29-37`)
+    already keys by `format!("*:{module}")` for exactly this reason. **Fixed**
+    by keying Go's dot-import bindings the same way
+    (`usages/go_graph/resolver.rs`); regression test added
+    (`go_graph_strategy_resolves_usages_from_multiple_dot_imports_in_one_file`,
+    `tests/usages_go_graph_test.rs`). This is a narrow correctness fix inside the
+    existing shared core, not evidence for the widening — it fixes a bug in a
+    language that was already using the model correctly-shaped, just incorrectly
+    keyed.
+  - **(d) Marginal cost for language N+1 does not improve.** Widening buys future
+    languages a multi-target value and a partition tag, but a hypothetical
+    language needing C#'s tiered-search resolution or PHP's three-namespace
+    forward-comparison would still write its own consumer logic against the
+    widened shape — the mass that would actually be reused (tier search order,
+    FQN forward-comparison, budget-limited/`LimitedQueryRows` construction that
+    neither the shared core nor its three current consumers have ever needed)
+    is exactly the part that stays bespoke either way.
+  - **Explicitly added to "leave as copies" list**: go's query-time
+    `definition_import_namespaces`, csharp's three using-maps, and PHP's
+    `PhpUseAliases` all stay bespoke. Only the already-accepted small wins
+    (workspace-boundary predicate, `ImportInfo::local_name()`,
+    `StructuredImportPath::render_segments`) and the dot-import keying fix above
+    apply to these three languages.
 - **ACCEPT (small, high-confidence):**
   1. **Shared workspace-boundary predicate** — the #1126/#1089 honest-claim invariant
      is independently implemented 5×: go_import_path_is_workspace (go.rs:788),
@@ -224,9 +287,29 @@ call_tool/symbol_sources/definition_reference_status (~14 bodies).
   land under him.
 - Shared `ContainerWalk` for declaration visitors (cpp's Container/Node/Siblings
   as seed; 4 typed + 7 tuple-stack languages).
-- Extending ImportBinding to admit go/php/csharp (multi-target + partition tag).
-- javascript/typescript twin adapters (3.4k tokens; twin-ness may be the honest
-  expression — needs the mass-per-hole arithmetic).
+- ~~Extending ImportBinding to admit go/php/csharp (multi-target + partition
+  tag).~~ **RESOLVED 2026-07-24: LEAVE AS COPIES** — see Concern 3's "Optional
+  medium-payoff" writeup for the full mass-per-hole arithmetic. A real (unrelated)
+  Go dot-import keying bug in the existing shared-core usage was found and fixed
+  in the same pass.
+- javascript/typescript twin adapters — RESOLVED: PARTIAL EXTRACT (2026-07-24).
+  ~10 byte-identical free functions moved verbatim to js_ts::model (their
+  established shared home). Leave as copies: everything driven by real grammar
+  asymmetry (TS types/interfaces/enums/namespaces ~325 LOC; JS CommonJS
+  assignment engine ~400 LOC + mutation-comment/JSX heuristics ~90 LOC) — a
+  Dialect-parameterized single adapter fails mass-per-hole. Judge-separately
+  item RESOLVED (2026-07-25): the provider/usage-index family is extracted -
+  js_ts::cache::JsTsMemoCaches is the reconciled bucket (JS's struct wrapper
+  adopted for both; bucket replacement on update = whole-cache invalidation,
+  behavior pinned by the analyzer update tests), and js_ts::providers hosts the
+  shared implementations behind a four-accessor JsTsAnalyzerHost trait - both
+  adapters reduced to one-line delegations (~500 net LOC removed; policy lives
+  in exactly one place). Churn
+  evidence: ~27 of ~46 commits touched both files together, AND live
+  one-directional drift found by reading (filed as an issue): TS missing JS's
+  "regex" simple-initializer case; TS classifies `const x = function(){}` as
+  Field where JS says Function; TS's zod/schema-builder detection never
+  backported to JS.
 
 **Explicitly leave as copies (divergence is the design):** scala/cpp/ruby import
 models; AST-walk owner queries (impl targets, out-of-line owners, bounded

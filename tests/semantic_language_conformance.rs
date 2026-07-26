@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::analyzer::dataflow::DataflowEdge;
 use brokk_bifrost::analyzer::semantic::{
     CallableReferenceKind, CallableTargetResolution, CancellationToken, ControlEdgeKind,
     DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind,
@@ -975,6 +976,31 @@ fn rust_async_function_calls_are_deferred_icfg_boundaries() {
             .originating_call("async_call"),
         ],
     );
+    let (continuation_edge_id, continuation_edge) = graph
+        .snapshot()
+        .successor_edges(graph.node("async_invoke"))
+        .find(|(_, edge)| edge.kind == IcfgEdgeKind::CallToNormalContinuation)
+        .expect("deferred normal continuation edge");
+    assert!(matches!(
+        continuation_edge.boundary,
+        Some(
+            brokk_bifrost::analyzer::semantic::DispatchBoundaryKind::Deferred {
+                kind: DeferredInvocationKind::Async,
+                ..
+            }
+        )
+    ));
+    assert!(matches!(
+        DataflowEdge::from_snapshot(graph.snapshot(), continuation_edge_id)
+            .expect("bounded dataflow descriptor")
+            .boundary(),
+        Some(
+            brokk_bifrost::analyzer::semantic::DispatchBoundaryKind::Deferred {
+                kind: DeferredInvocationKind::Async,
+                ..
+            }
+        )
+    ));
     graph.assert_predecessors(
         "normal_continuation",
         &[
@@ -3913,10 +3939,101 @@ fn cpp_enumeration_budget_counts_non_callable_syntax() {
     let outcome = analyzer
         .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
         .expect("sufficient enumeration budget");
-    assert!(matches!(
-        outcome,
-        SemanticOutcome::Complete { work, .. } if work.nested_entries > 64
-    ));
+    let SemanticOutcome::Complete { value, work } = outcome else {
+        panic!("sufficient enumeration budget must complete");
+    };
+    assert!(work.nested_entries > 64);
+    assert_eq!(
+        work.procedures,
+        value.procedures().len(),
+        "C++ callable identity preflight must not be charged again when lowering starts"
+    );
+}
+
+#[test]
+fn language_inventories_charge_wide_non_callable_syntax() {
+    let fixtures = [
+        (
+            Language::CSharp,
+            "csharp/enumeration_budget.cs",
+            (0..64)
+                .map(|index| format!("class Budget{index} {{ int value; }}\n"))
+                .collect::<String>(),
+        ),
+        (
+            Language::Java,
+            "java/enumeration_budget.java",
+            (0..64)
+                .map(|index| format!("class Budget{index} {{ int value; }}\n"))
+                .collect::<String>(),
+        ),
+        (
+            Language::JavaScript,
+            "javascript/enumeration_budget.js",
+            (0..64)
+                .map(|index| format!("class Budget{index} {{ value = {index}; }}\n"))
+                .collect::<String>(),
+        ),
+        (
+            Language::Php,
+            "php/enumeration_budget.php",
+            format!(
+                "<?php\n{}",
+                (0..64)
+                    .map(|index| format!("class Budget{index} {{ public $value; }}\n"))
+                    .collect::<String>()
+            ),
+        ),
+        (
+            Language::Ruby,
+            "ruby/enumeration_budget.rb",
+            (0..64)
+                .map(|index| format!("class Budget{index}\n  VALUE = {index}\nend\n"))
+                .collect::<String>(),
+        ),
+        (
+            Language::Rust,
+            "rust/enumeration_budget.rs",
+            (0..64)
+                .map(|index| format!("struct Budget{index} {{ value: i32 }}\n"))
+                .collect::<String>(),
+        ),
+        (
+            Language::Scala,
+            "scala/enumeration_budget.scala",
+            (0..64)
+                .map(|index| format!("class Budget{index} {{ val value = {index} }}\n"))
+                .collect::<String>(),
+        ),
+    ];
+
+    for (language, path, source) in fixtures {
+        let project = InlineTestProject::with_language(language)
+            .file(path, &source)
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file(path);
+        let cancellation = CancellationToken::default();
+        let mut limits = SemanticBudget::default().limits();
+        limits.nested_entries = 12;
+        let mut budget = SemanticBudget::new(limits).expect("positive semantic budget");
+
+        let outcome = analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("enumeration exhaustion is a semantic outcome");
+        assert!(
+            matches!(
+                outcome,
+                SemanticOutcome::ExceededBudget { exceeded, work, .. }
+                    if exceeded.dimension() == SemanticBudgetDimension::NestedEntries
+                        && work.nested_entries > 12
+            ),
+            "{language:?} must budget the inventory traversal even without callable declarations"
+        );
+    }
 }
 
 #[test]
@@ -8970,7 +9087,7 @@ def evaluate():
             PointSelector::new("cleanup()")
                 .procedure("guarded")
                 .effect("invoke")
-                .anchor_occurrence(8),
+                .anchor_occurrence(5),
         )
         .bind(
             "common_cleanup_normal",
@@ -8978,7 +9095,7 @@ def evaluate():
                 .procedure("guarded")
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal)
-                .anchor_occurrence(9),
+                .anchor_occurrence(6),
         )
         .bind(
             "after_try_statement",

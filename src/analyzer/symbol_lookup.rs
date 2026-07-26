@@ -1,5 +1,6 @@
 use crate::analyzer::common::language_for_target as code_unit_language;
 use crate::analyzer::csharp::strip_csharp_generic_arity;
+use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -695,7 +696,7 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
         .iter()
         .flat_map(|segment| {
             segment
-                .split('$')
+                .split('$') // fqname-M4: input-edge splitter of a client-supplied symbol path (pre-language, no CodeUnit/fq yet); the sanctioned MCP input boundary
                 .filter(|part| !part.is_empty())
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -710,6 +711,28 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
 /// separator-free and join with `.` to match how indexed fq strings compose,
 /// which is what makes this the structured way to normalize a `::`-qualified
 /// reference before an enclosing-scope walk.
+/// The structured sibling of [`parse_symbol_path`]: split a client-supplied
+/// qualified-name path into an [`FqName`], reusing the exact same splitter and
+/// per-language segment normalization. Every segment is interned with
+/// [`SegmentKind::Unknown`] — a user types a spelling, not a kind, so input
+/// segments carry no kind claim and are matched kind-insensitively against
+/// extracted names. Because `Unknown` renders with an ordinary `.` join, the
+/// returned `FqName` renders (via `display`/`display_native`) to exactly the
+/// canonical `.`-joined spelling that [`parse_symbol_path`]`.join(".")`
+/// produces, which is what the string-keyed `definitions` index is keyed by.
+/// See the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
+pub(crate) fn parse_symbol_path_fq(
+    language: Language,
+    value: &str,
+    interner: &SegmentInterner,
+) -> FqName {
+    let mut fq = FqName::new();
+    for segment in parse_symbol_path(language, value) {
+        fq.push(interner.intern(&segment, SegmentKind::Unknown));
+    }
+    fq
+}
+
 pub(crate) fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
     let trimmed = value.trim().trim_start_matches('\\');
     let mut segments = Vec::new();
@@ -888,6 +911,36 @@ fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_symbol_path_fq_renders_to_dot_joined_parse_symbol_path() {
+        // The structured input parser must reduce to exactly the legacy
+        // `parse_symbol_path(..).join(".")` normalization for every language and
+        // every separator spelling, so migrating the enclosing-scope resolver
+        // onto it is byte-for-byte behavior-preserving.
+        let interner = crate::analyzer::fq_name::segment_interner();
+        for (language, input) in [
+            (Language::Rust, "inner::Config"),
+            (Language::Rust, "DbColumn.r#type"),
+            (Language::Cpp, "testing::internal::EachMatcher"),
+            (Language::Php, "App\\Models\\User"),
+            (Language::Go, "pkg/sub.Thing"),
+            (Language::CSharp, "Ns.Outer.Inner"),
+        ] {
+            let expected = parse_symbol_path(language, input).join(".");
+            let fq = parse_symbol_path_fq(language, input, interner);
+            assert_eq!(
+                fq.display(interner),
+                expected,
+                "input {input:?} ({language:?}) must round-trip to the dot-joined parse"
+            );
+            assert_eq!(
+                fq.display_native(language, interner),
+                expected,
+                "input {input:?} ({language:?}) must render identically natively (Unknown never triggers a native rule)"
+            );
+        }
+    }
 
     #[test]
     fn csharp_generic_member_alias_includes_arity_free_form() {

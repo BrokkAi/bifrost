@@ -191,6 +191,22 @@ impl WorkspaceAnalyzer {
             .expect("failed to initialize in-memory workspace analyzer")
     }
 
+    /// Build an analyzer whose store lives only in memory, no matter what the
+    /// project's [`Project::persistence_root`] says.
+    ///
+    /// Use this for throwaway file sets — temp-directory revision exports, or a
+    /// changed-file-scoped view of a live workspace — where writing an on-disk
+    /// cache would be either pure waste or actively wrong (a partial file set
+    /// must not become the workspace's cached picture of itself). Unlike
+    /// [`Self::build`] this reports store failures instead of panicking.
+    pub fn build_ephemeral(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, StoreError> {
+        let store_context = crate::analyzer::default_store_context(project.as_ref());
+        Self::build_filtered(project, config, None, store_context, None, true)
+    }
+
     pub fn build_persisted(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,

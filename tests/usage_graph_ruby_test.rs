@@ -70,7 +70,7 @@ end
 }
 
 #[test]
-fn resolves_locally_typed_instance_and_bare_self_calls() {
+fn resolves_locally_typed_instance_and_leaves_bare_self_calls_unproven() {
     let value = ruby_usage_graph();
 
     assert!(
@@ -78,9 +78,12 @@ fn resolves_locally_typed_instance_and_bare_self_calls() {
         "expected via_instance -> Service.run: {}",
         value["edges"]
     );
+    // #1138: a bare self-call inside the same class is same-owner and routes
+    // to unproven inbound - it can never prove a method alive, so it no longer
+    // appears as a proven usage-graph edge.
     assert!(
         !has_edge(&value, "Consumer.calls_local", "Consumer.local"),
-        "implicit-self calls_local -> Consumer.local must stay unproven: {}",
+        "same-owner bare calls must not create a proven calls_local -> Consumer.local edge: {}",
         value["edges"]
     );
 }

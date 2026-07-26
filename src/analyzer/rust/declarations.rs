@@ -1,3 +1,4 @@
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::usages::{ImportBinder, ImportKind};
@@ -8,6 +9,46 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::{Node, Tree};
+
+/// The synthetic module-scope segment Rust uses in `short_name` for
+/// package-level `const`/`static`/`type` items (`_module_.NAME`), mirroring
+/// Go's `_module_` scope. Emitted as a [`SegmentKind::Package`] segment so the
+/// structured name round-trips to the legacy string.
+const RUST_MODULE_SCOPE_SEGMENT: &str = "_module_";
+
+/// Intern one qualified-name segment in the process-global interner.
+fn rust_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured package prefix for a Rust declaration.
+///
+/// A Rust `package_name` is the crate-relative *module path* spelled with `.`
+/// separators (`analyzer.rust.declarations`), where each component is a module.
+/// Each becomes a [`SegmentKind::Package`] segment, so the resulting [`FqName`]
+/// renders back to the exact legacy `package_name` string. Splitting the
+/// already-joined string here is the M1 bridge — the legacy string stays
+/// authoritative until M3, and a component containing a literal dot still
+/// round-trips because adjacent `Package` segments render with `.`.
+fn rust_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name
+        .split('.')
+        .filter(|component| !component.is_empty())
+    {
+        fq.push(rust_segment(component, SegmentKind::Package));
+    }
+    fq
+}
+
+/// The [`FqName`] a child declaration extends: its lexical parent's structured
+/// name when nested, otherwise the file's package prefix.
+fn rust_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName {
+    match parent {
+        Some(parent) => parent.fq().clone(),
+        None => rust_package_fq(package_name),
+    }
+}
 
 use super::imports::rust_imports_from_use_declaration;
 
@@ -235,11 +276,14 @@ fn visit_rust_class_like(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq =
+        rust_child_fq_base(parent, package_name).with_pushed(rust_segment(name, SegmentKind::Type));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Class,
         package_name.to_string(),
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -325,11 +369,14 @@ fn visit_rust_module(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq = rust_child_fq_base(parent, package_name)
+        .with_pushed(rust_segment(name, SegmentKind::Package));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Module,
         package_name.to_string(),
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -487,13 +534,16 @@ fn visit_rust_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::with_signature(
+    let fq = rust_child_fq_base(parent, package_name)
+        .with_pushed(rust_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         signature,
         false,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -556,11 +606,14 @@ fn register_rust_macro(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::new(
+    let fq = rust_child_fq_base(parent, package_name)
+        .with_pushed(rust_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Macro,
         package_name.to_string(),
         short_name,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit_with_range(code_unit.clone(), range, parent.cloned(), Some(top_level));
@@ -1368,14 +1421,25 @@ fn visit_rust_field(
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or_else(|| format!("_module_.{name}"));
-    let code_unit = CodeUnit::with_signature(
+        .unwrap_or_else(|| format!("{RUST_MODULE_SCOPE_SEGMENT}.{name}"));
+    // A package-level `const`/`static` sits under the synthetic `_module_`
+    // scope; a member sits directly under its owner.
+    let fq = match parent {
+        Some(parent) => parent.fq().clone(),
+        None => rust_package_fq(package_name).with_pushed(rust_segment(
+            RUST_MODULE_SCOPE_SEGMENT,
+            SegmentKind::Package,
+        )),
+    }
+    .with_pushed(rust_segment(&name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         package_name.to_string(),
         short_name,
         rust_impl_member_identity_signature(node, source),
         false,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -1462,13 +1526,16 @@ fn visit_rust_alias(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let code_unit = CodeUnit::with_signature(
+    let fq = rust_child_fq_base(parent, package_name)
+        .with_pushed(rust_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         package_name.to_string(),
         short_name,
         rust_impl_member_identity_signature(node, source),
         false,
+        fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -1640,11 +1707,20 @@ fn rust_impl_owner(
         let (owner_package, owner_short_name) = local_short_name
             .map(|short_name| (package_name.to_string(), short_name))
             .unwrap_or((identity.package_name, identity.short_name));
-        Some(CodeUnit::new(
+        // This synthesized owner is not itself indexed, but its `fq` seeds the
+        // structured names of the impl members that extend it, so build it from
+        // the same strings: module-path components are `Package` segments and
+        // the owner-type chain (a `.`-joined nominal path) is `Type` segments.
+        let mut fq = rust_package_fq(&owner_package);
+        for component in owner_short_name.split('.').filter(|c| !c.is_empty()) {
+            fq.push(rust_segment(component, SegmentKind::Type));
+        }
+        Some(CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Class,
             owner_package,
             owner_short_name,
+            fq,
         ))
     })
 }

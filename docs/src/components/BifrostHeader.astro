@@ -18,10 +18,18 @@ const navItems = [
 const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 ---
 
-<div class="bifrost-header-shell">
+<div class="bifrost-header-shell bifrost-panel bifrost-panel--octagon">
 	<div class="bifrost-brand sl-flex">
 		<span class="brand-signal" aria-hidden="true"><i></i><i></i><i></i></span>
 		<SiteTitle />
+		<a
+			class="license-invite bifrost-panel bifrost-panel--sm"
+			href={`${root}license-use-cases/`}
+			aria-label="Free to use under LGPL-3.0-or-later. See license and use cases."
+		>
+			<span>Free to use</span>
+			<small>LGPL-3</small>
+		</a>
 	</div>
 	<nav class="bifrost-primary-nav print:hidden" aria-label="Primary">
 		{
@@ -37,15 +45,6 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 	</nav>
 	<div class="bifrost-header-search sl-flex print:hidden"><Search /></div>
 	<div class="bifrost-header-tools sl-hidden md:sl-flex print:hidden">
-		<a
-			class="license-invite"
-			href={`${root}license-use-cases/`}
-			aria-label="Free to use under LGPL-3.0-or-later. See license and use cases."
-		>
-			<span>Free to use</span>
-			<small>LGPL-3</small>
-			<i aria-hidden="true">↗</i>
-		</a>
 		<div class="sl-flex social-icons"><SocialIcons /></div>
 		<ThemeSelect />
 		<LanguageSelect />
@@ -58,25 +57,29 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 			display: grid;
 			grid-template-columns: auto minmax(8rem, 22rem) auto;
 			align-items: center;
-			gap: clamp(0.65rem, 1.5vw, 1.35rem);
+			gap: clamp(0.65rem, 1.5vw, var(--bifrost-space-5));
 			height: 100%;
 			max-width: 92rem;
 			margin-inline: auto;
-			padding: 0.45rem 0.55rem 0.45rem 0.8rem;
-			border: 1px solid rgb(255 255 255 / 0.11);
-			border-radius: 0.65rem;
+			padding: var(--bifrost-space-2) var(--bifrost-space-6);
+		}
+
+		.bifrost-header-shell::after {
+			/* No backdrop-filter here. The header is sticky over the animated beam,
+			   so a live backdrop blur re-sampled and re-blurred the moving artwork
+			   beneath it on every frame. Over a near-black backdrop an opaque fill
+			   is visually equivalent and costs nothing. */
 			background:
 				linear-gradient(180deg, rgb(255 255 255 / 0.055), transparent),
-				rgb(9 9 9 / 0.9);
+				rgb(9 9 9 / 0.97);
 			box-shadow:
 				0 18px 42px rgb(0 0 0 / 0.34),
 				inset 0 1px rgb(255 255 255 / 0.025);
-			backdrop-filter: blur(18px) saturate(125%);
 		}
 
 		.bifrost-brand {
 			align-items: center;
-			gap: 0.65rem;
+			gap: var(--bifrost-space-3);
 			min-width: 0;
 		}
 
@@ -113,31 +116,33 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 
 		.bifrost-brand :global(.site-title) {
 			color: #f4f1ec;
-			font-family: var(--sl-font);
-			font-size: 0.95rem;
-			font-weight: 700;
-			letter-spacing: 0.035em;
+			font-family: var(--bifrost-font-display);
+			font-size: 1.375rem;
+			font-weight: var(--bifrost-weight-regular);
+			letter-spacing: var(--bifrost-tracking-wide);
+			line-height: 1;
 			text-transform: uppercase;
+			transform: translateY(0.0625rem);
 		}
 
 		.bifrost-primary-nav {
 			display: none;
 			align-items: center;
 			justify-content: center;
-			gap: 0.12rem;
+			gap: var(--bifrost-space-2);
 		}
 
 		.bifrost-primary-nav a {
 			position: relative;
-			padding: 0.48rem 0.66rem;
+			padding: var(--bifrost-space-2) var(--bifrost-space-3);
 			color: #948b7e;
-			font-family: var(--sl-font-mono);
-			font-size: 0.67rem;
-			font-weight: 500;
-			letter-spacing: 0.055em;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-xs);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-widest);
 			text-decoration: none;
 			text-transform: uppercase;
-			transition: color 140ms ease, background-color 140ms ease;
+			transition: color 140ms ease;
 		}
 
 		.bifrost-primary-nav a::after {
@@ -156,7 +161,6 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 		.bifrost-primary-nav a:focus-visible,
 		.bifrost-primary-nav a[aria-current='page'] {
 			color: #f4f1ec;
-			background: rgb(255 255 255 / 0.035);
 		}
 
 		.bifrost-primary-nav a[aria-current='page']::after {
@@ -165,83 +169,89 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 
 		.bifrost-header-search {
 			justify-self: end;
+			width: clamp(11rem, 16vw, 20rem);
 			min-width: 0;
 		}
+		.bifrost-header-search :global(button[data-open-modal]) { max-width: none; }
 
 		.bifrost-header-tools {
 			align-items: center;
-			gap: 0.72rem;
+			gap: var(--bifrost-space-3);
 		}
 
+		.bifrost-header-tools :global(starlight-theme-select select) {
+			padding-inline-start: calc(var(--sl-label-icon-size) + var(--sl-inline-padding) + 0.375rem);
+		}
+
+		/* A quiet chip, not a call to action. The red wash, red border, red
+		   diamond and red arrow all competed with the nav for a link that is
+		   really just a footnote about licensing, so the resting state is now
+		   the same neutral surface as the rest of the header chrome and red is
+		   held back for hover. */
+		/* Uses the shared two-layer panel rather than a border plus clip-path.
+		   A clip-path cuts the border it is supposed to be drawing, which is why
+		   the bottom-left and top-right diagonals and the right edge were
+		   missing: the border was painted on the box, then the chamfer sliced it
+		   off. The panel paints the edge as a clipped fill with a second, one
+		   pixel smaller fill on top, so every side and both diagonals are
+		   continuous. On .bifrost-panel the element's own background IS the
+		   border colour and ::after is the face. */
 		.license-invite {
 			display: none;
-			align-items: center;
-			gap: 0.42rem;
-			padding: 0.38rem 0.52rem;
-			border: 1px solid rgb(235 63 51 / 0.36);
-			border-radius: 0.3rem;
-			background: rgb(235 63 51 / 0.065);
-			box-shadow: inset 0 1px rgb(255 255 255 / 0.035);
-			font-family: var(--sl-font-mono);
+			/* Sits beside the wordmark now, so it must not absorb the brand
+			   column's shrinking. */
+			flex: none;
+			align-items: baseline;
+			gap: var(--bifrost-space-2);
+			padding: var(--bifrost-space-2) var(--bifrost-space-3);
+			font-family: var(--bifrost-font-mono);
 			line-height: 1;
 			text-decoration: none;
 			white-space: nowrap;
-			transition:
-				background-color 150ms ease,
-				border-color 150ms ease,
-				box-shadow 150ms ease,
-				transform 150ms ease;
+			transition: background-color 150ms ease;
 		}
 
-		.license-invite::before {
-			width: 0.36rem;
-			height: 0.36rem;
-			background: #eb3f33;
-			box-shadow: 0 0 9px rgb(235 63 51 / 0.72);
-			content: '';
-			transform: rotate(45deg);
+		.license-invite::after {
+			background: var(--bifrost-surface-raised);
+			transition: background-color 150ms ease;
 		}
 
 		.license-invite span {
 			color: #f4f1ec;
-			font-size: 0.65rem;
-			font-weight: 600;
-			letter-spacing: 0.035em;
+			font-size: var(--bifrost-text-xs);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wide);
 		}
 
+		/* No divider rule between the two: the weight, size and colour shift
+		   already separate them, and the bar was a third ornament in a chip
+		   carrying two words. */
 		.license-invite small {
-			padding-inline-start: 0.42rem;
-			border-inline-start: 1px solid rgb(255 255 255 / 0.14);
 			color: #948b7e;
-			font-size: 0.58rem;
-			letter-spacing: 0.045em;
+			font-size: var(--bifrost-text-2xs);
+			letter-spacing: var(--bifrost-tracking-wide);
+			transition: color 150ms ease;
 		}
 
-		.license-invite i {
-			color: #ff6a5f;
-			font-size: 0.7rem;
-			font-style: normal;
-			transition: transform 150ms ease;
-		}
-
+		/* Outer background is the edge, ::after is the face. */
 		.license-invite:hover,
 		.license-invite:focus-visible {
-			border-color: rgb(255 106 95 / 0.72);
-			background: rgb(235 63 51 / 0.15);
-			box-shadow:
-				0 0 0 1px rgb(235 63 51 / 0.08),
-				0 8px 24px rgb(235 63 51 / 0.13);
-			transform: translateY(-1px);
+			background: rgb(255 106 95 / 0.55);
 		}
 
-		.license-invite:hover i,
-		.license-invite:focus-visible i {
-			transform: translate(1px, -1px);
+		.license-invite:hover::after,
+		.license-invite:focus-visible::after {
+			background: color-mix(in srgb, #eb3f33 12%, var(--bifrost-surface-raised));
+		}
+
+		.license-invite:hover small,
+		.license-invite:focus-visible small {
+			color: #ff6a5f;
 		}
 
 		.social-icons {
 			align-items: center;
-			gap: 0.65rem;
+			gap: var(--bifrost-space-3);
 		}
 
 		.social-icons::after {
@@ -251,13 +261,13 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 			content: '';
 		}
 
-		@media (min-width: 50rem) {
+		@media (width >= 50rem) {
 			.bifrost-header-shell {
 				grid-template-columns: minmax(11rem, auto) minmax(11rem, 22rem) auto;
 			}
 		}
 
-		@media (min-width: 72rem) {
+		@media (width >= 72rem) {
 			.bifrost-header-shell {
 				grid-template-columns: minmax(11rem, auto) minmax(0, 1fr) auto auto;
 			}
@@ -266,28 +276,23 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 				display: flex;
 			}
 
-			.license-invite {
-				display: inline-flex;
-			}
 		}
 
-		@media (max-width: 49.99rem) {
+		@media (width >= 84rem) {
+			.license-invite { display: inline-flex; }
+		}
+
+		@media (width < 50rem) {
 			.bifrost-header-shell {
 				grid-template-columns: minmax(0, 1fr) auto;
 			}
+			.bifrost-header-search { width: auto; }
 		}
 
 		@media (prefers-reduced-motion: reduce) {
 			.license-invite,
-			.license-invite i {
+			.license-invite small {
 				transition: none;
-			}
-
-			.license-invite:hover,
-			.license-invite:focus-visible,
-			.license-invite:hover i,
-			.license-invite:focus-visible i {
-				transform: none;
 			}
 		}
 	}

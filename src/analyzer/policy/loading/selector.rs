@@ -505,10 +505,7 @@ mod tests {
         assert_eq!(neither.document_authored_schema_version(), None);
         assert_eq!(
             neither.schema_resolution(),
-            SchemaVersionResolution {
-                version: 2,
-                origin: SchemaVersionOrigin::ImplicitCompatible,
-            }
+            resolve_rql_schema_version(None).unwrap()
         );
 
         let wrapper = resolve("(name \"A\")", Some(2)).unwrap();

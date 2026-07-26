@@ -25,6 +25,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 10:27+02:00) Published the plan from checkpoint commit `41f1e88b` for review.
 - [x] (2026-07-16 10:35+02:00) Made #709 the early public policy/API contract gate for #824 and #825 while keeping #814 through #823 free to build diagnostic-neutral internal analysis services.
 - [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
+- [x] (2026-07-25 17:24+02:00) Landed the first #824 public-query slice: schema-v3 procedure, program-point, and explicit control-edge domains over real procedure-local CFG services, with bounded execution and matching MCP/Python/LSP/VS Code/docs contracts. The remaining #824 flow, taint, typestate, policy-compiler, finding, and witness work stays open.
 - [x] (2026-07-16 12:39+02:00) Moved the publication thread to neutral branch `dave/composable-typestate-roadmap` and draft PR [#828](https://github.com/BrokkAi/bifrost/pull/828).
 - [x] (2026-07-16 14:39+02:00) Diagnosed #814 in detail and added the focused implementation plan `.agents/plans/issue-814-semantic-ir-contract.md`, including corrected artifact/ID scopes and explicit nested-callable, capture, method-reference, and source-position contracts.
 - [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures.
@@ -196,6 +197,10 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Decision: keep AST containment, CFG, call relations, value flow, and typestate as typed facets rather than one eager universal CPG.
   Rationale: these relations have different identities, lifetimes, payloads, invalidation rules, and materialization costs. Query composition can provide a CPG-shaped experience without duplicating all facts into one graph.
   Date: 2026-07-16.
+
+- Decision: expose control edges as first-class typed query values and use explicit one-hop edge traversal plus endpoint projection as the foundational public CFG algebra.
+  Rationale: `cfg_successor_edges`/`cfg_predecessor_edges` preserve edge kind, identity, source mapping, proof, completeness, and provenance instead of hiding the traversed relation inside a point-to-point convenience step. `cfg_edge_source`/`cfg_edge_target` recover points. Future finite-depth `cfg_successors`/`cfg_predecessors` conveniences may lower to repeated edge traversal and endpoint projection without changing the implemented contract.
+  Date: 2026-07-25.
 
 - Decision: treat dominators and post-dominators as lazy derived analyses, not prerequisites.
   Rationale: IFDS/IDE and pushdown reachability do not require dominance. Dominance becomes worthwhile only for a concrete SSA, control-dependence, strong-update, or pruning client.
@@ -694,13 +699,15 @@ Every persisted artifact uses a packed versioned DTO, generation/content validat
 
 #822 owns the versioned internal `ProtocolSpec`, automaton/terminal-expectation compilation, and diagnostic-neutral error-transition/terminal-expectation findings. #824 owns `TypestatePolicyCompiler`, typed query domains, endpoint binding classes, and adapters from analysis services to query rows and complete #709 projection facts. The compiler consumes #709's stored `ResolvedTypestatePolicySpec` without rescanning and lowers it into #822's internal `ProtocolSpec`; neither model embeds the other. #824 may build internal result domains before #709 closes, but it cannot declare the policy-facing wire shape stable until the #709 envelope and finding model are accepted. #825 requires both paths: diagnostic-neutral query exploration and `.rqlp` policy execution.
 
-Extend `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, `flow_endpoint`, `taint_finding`, `typestate_finding`, `taint_witness`, `typestate_witness`, and `flow_witness` domains. The initial operations are fixed by this plan:
+The first #824 slice extends `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, and `control_edge` domains. Later slices add `flow_endpoint`, `taint_finding`, `typestate_finding`, `taint_witness`, `typestate_witness`, and `flow_witness` only when their owning services exist. The operations are:
 
 | Operation | Accepted input | Output | Required bound/behavior |
 | --- | --- | --- | --- |
 | `procedure_of` | structural match or declaration | procedure | Exact enclosing callable or an explicit no-procedure diagnostic. |
 | `cfg_entry` / `cfg_exits` | procedure | program point | Exits include normal/exceptional kind. |
-| `cfg_successors` / `cfg_predecessors` | program point | program point | Positive finite `depth`, default 1; provenance carries each control edge. |
+| `cfg_successor_edges` / `cfg_predecessor_edges` | program point | control edge | Exactly one hop; retains edge kind, source/target mappings, proof, completeness, and provenance. |
+| `cfg_edge_source` / `cfg_edge_target` | control edge | program point | Exact endpoint projection through the owning procedure. |
+| future `cfg_successors` / `cfg_predecessors` convenience | program point | program point | Optional positive finite `depth`, default 1; lowers to repeated edge traversal plus source/target projection rather than defining another graph relation. |
 | `flows_to` / `flows_from` | expression site, program point, or flow endpoint | flow endpoint | Positive finite `depth` or explicit sink/source selector; valid-path semantics and work budget. |
 | `taint` | structural match, expression site, or flow endpoint | taint finding | Execution-scoped compiled taint plan, one finite multi-source/multi-sink run, solver budget. |
 | `typestate` | structural match, call site, expression site, or flow endpoint | typestate finding | Execution-scoped protocol reference, bind selector, may mode, solver budget. |
@@ -1454,3 +1461,5 @@ Plan revision note (2026-07-21): Recorded the reviewed #816 Ultra contract/dispa
 Plan revision note (2026-07-21): Recorded #816 checkpoints `4a777292`, `fe474cf4`, and `04f5996d`. The reference adapters now feed bounded value-flow, candidate-specific binding, points-to, access-path, alias, and update-eligibility relations; schema v6 carries adapter-owned dispatch closure; and product receiver queries project generation-bound heap facts into stable TypeScript/JavaScript and Java compatibility labels. Only measurement, pressure-testing, final review, and the resulting persistence/rollout decision remain under #816.
 
 Plan revision note (2026-07-21): Recorded #816's retained five-sample lifecycle matrix and portability pressure test. Inline/PetClinic working sets reuse complete artifacts, the 5,625-file VS Code sweep exceeds the byte-bounded cache without violating exact generation keys, source changes invalidate correctly, cancelled work never populates complete reuse, and candidate/path growth remains finite under explicit caps. Corpus pressure found and fixed emitted-parent capture completeness and directional parameter-port projection. Raw semantic artifact and request-arena persistence is a no-go under #816; reusable summaries remain separately measured #817/#823 work.
+
+Plan revision note (2026-07-25): Reconciled Milestone 7 with the implemented first #824 slice. Schema v3 now exposes explicit one-hop `control_edge` values and endpoint projection as the foundation; any future finite-depth point-to-point CFG convenience lowers over that algebra. The epic remains open for flow, taint, typestate, policy compilers, findings, and bounded witnesses.

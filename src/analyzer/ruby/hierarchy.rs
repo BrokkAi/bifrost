@@ -20,7 +20,7 @@ impl RubyAnalyzer {
             return Some(found.clone());
         }
 
-        let last_segment = cleaned.rsplit('$').next().unwrap_or(cleaned);
+        let last_segment = cleaned.rsplit('$').next().unwrap_or(cleaned); // fqname-M4: leaf of a `$`-joined ruby type-name string used as a by-identifier index key; no fq threaded here
         self.types_by_identifier()
             .get(last_segment)
             .and_then(|types| types.first())
