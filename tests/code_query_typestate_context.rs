@@ -132,6 +132,27 @@ fn registration_is_transactional_idempotent_and_deduplicates_aliases() {
         registrations.get(&alias).unwrap()
     ));
 
+    let protocol_bytes = registrations.retained_protocol_bytes();
+    let binding_bytes = registrations.retained_binding_plan_bytes();
+    assert!(registrations.unregister(&primary));
+    assert_eq!(registrations.reference_count(), 1);
+    assert_eq!(registrations.registration_count(), 1);
+    assert_eq!(registrations.retained_protocol_bytes(), protocol_bytes);
+    assert_eq!(registrations.retained_binding_plan_bytes(), binding_bytes);
+    assert!(!registrations.unregister(&primary));
+    assert!(registrations.unregister(&alias));
+    assert_eq!(registrations.reference_count(), 0);
+    assert_eq!(registrations.registration_count(), 0);
+    assert_eq!(registrations.retained_protocol_bytes(), 0);
+    assert_eq!(registrations.retained_binding_plan_bytes(), 0);
+
+    registrations
+        .register(primary.clone(), fixture.registration(7))
+        .unwrap();
+    registrations
+        .register(alias.clone(), fixture.registration(7))
+        .unwrap();
+
     let error = registrations
         .register(primary.clone(), fixture.registration(8))
         .expect_err("same reference cannot silently change registrations");

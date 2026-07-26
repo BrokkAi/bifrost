@@ -419,6 +419,36 @@ impl ProtocolRegistrationSet {
         self.by_ref.get(protocol_ref)
     }
 
+    /// Remove one authored alias and release its unique retained registration
+    /// once the final alias is gone.
+    pub fn unregister(&mut self, protocol_ref: &ProtocolRef) -> bool {
+        let Some(registration) = self.by_ref.remove(protocol_ref) else {
+            return false;
+        };
+        if self
+            .by_ref
+            .values()
+            .any(|candidate| Arc::ptr_eq(candidate, &registration))
+        {
+            return true;
+        }
+
+        let identity = registration.identity();
+        let removed = self
+            .by_identity
+            .remove(&identity)
+            .expect("registered alias must retain its identity entry");
+        self.retained_protocol_bytes = self
+            .retained_protocol_bytes
+            .checked_sub(removed.protocol.canonical_bytes().len())
+            .expect("retained protocol bytes must cover every unique registration");
+        self.retained_binding_plan_bytes = self
+            .retained_binding_plan_bytes
+            .checked_sub(removed.bindings.canonical_bytes().len())
+            .expect("retained binding bytes must cover every unique registration");
+        true
+    }
+
     pub fn reference_count(&self) -> usize {
         self.by_ref.len()
     }

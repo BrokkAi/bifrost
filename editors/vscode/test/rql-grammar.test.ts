@@ -227,3 +227,17 @@ void test("highlights schema-v3 CFG forms and aliases", async () => {
     assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
   }
 });
+
+void test("highlights schema-v4 typestate forms and bounded witness options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    '(witness :max-steps 32 :max_bytes 16384 (typestate :protocol-ref "embedding:resource-lifecycle" (procedure-of (function))))'
+  );
+  assertScoped(tokens, "witness", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "typestate", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":protocol-ref", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":max-steps", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":max_bytes", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, "32", "constant.numeric.integer.decimal.bifrost-rql");
+  assertScoped(tokens, "16384", "constant.numeric.integer.decimal.bifrost-rql");
+});

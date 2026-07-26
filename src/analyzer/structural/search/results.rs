@@ -372,12 +372,38 @@ pub enum CodeQueryTypestateFindingKind {
     },
 }
 
+impl CodeQueryTypestateFindingKind {
+    fn presentation_label(&self) -> String {
+        match self {
+            Self::ErrorTransition {
+                event,
+                from_state,
+                to_state,
+            } => format!("{event}: {from_state} -> {to_state}"),
+            Self::TerminalExpectation {
+                expectation,
+                actual_states,
+            } => format!("{expectation}: actual {}", actual_states.join(", ")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryTypestateCertainty {
     May,
     Must,
     Inconclusive,
+}
+
+impl CodeQueryTypestateCertainty {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::May => "may",
+            Self::Must => "must",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -1718,12 +1744,12 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::TypestateFinding { value } => {
                         out.push_str(&format!(
-                            "{}:{}:{} [typestate finding; {:?}; {:?}] {}\n",
+                            "{}:{}:{} [typestate finding; {}; {}] {}\n",
                             value.path,
                             value.range.start_line,
                             value.range.start_column,
-                            value.certainty,
-                            value.finding_kind,
+                            value.certainty.label(),
+                            value.finding_kind.presentation_label(),
                             value.id,
                         ));
                     }

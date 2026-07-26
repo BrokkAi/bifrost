@@ -117,6 +117,7 @@ impl ValueShape {
         match self {
             Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
             Self::CaptureName => Some((1, MAX_CAPTURE_LENGTH)),
+            Self::ProtocolRef => Some((3, crate::analyzer::structural::MAX_PROTOCOL_REF_BYTES)),
             _ => None,
         }
     }

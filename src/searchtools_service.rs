@@ -146,6 +146,7 @@ pub struct SearchToolsService {
     root: RwLock<Option<PathBuf>>,
     session: RwLock<Option<WorkspaceSession>>,
     workspace_generation: AtomicU64,
+    query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
     /// `ensure_ready` joins it and installs the resulting session into `session`
@@ -188,6 +189,7 @@ pub(crate) struct PreparedQueryCode {
     snapshot: WorkspaceQueryScope,
     arguments: Value,
     workspace_generation: u64,
+    query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
 }
 
 impl PreparedQueryCode {
@@ -425,6 +427,7 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -481,6 +484,7 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -502,6 +506,49 @@ impl SearchToolsService {
             .as_ref()
             .map(|session| Arc::clone(&session.snapshot))
             .ok_or_else(|| "no active workspace session".to_string())
+    }
+
+    /// Register one already-compiled protocol and pre-resolved binding plan for
+    /// in-process CodeQuery callers. Semantic handles remain host-owned and are
+    /// never accepted by an MCP/LSP wire request.
+    pub fn register_query_protocol(
+        &self,
+        protocol_ref: crate::analyzer::structural::ProtocolRef,
+        expected_root: crate::analyzer::semantic::ProcedureHandle,
+        protocol: Arc<crate::analyzer::typestate::CompiledProtocol>,
+        bindings: Arc<crate::analyzer::typestate::TypestateBindingPlan>,
+    ) -> Result<crate::analyzer::structural::ProtocolRegistrationOutcome, SearchToolsServiceError>
+    {
+        let session = self.read_session()?;
+        session.as_ref().ok_or_else(Self::closed_error)?;
+        let workspace_generation = self.workspace_generation();
+        drop(session);
+
+        let registration = crate::analyzer::structural::ProtocolRegistration::new(
+            workspace_generation,
+            expected_root,
+            protocol,
+            bindings,
+        )
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        self.query_protocols
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .register(protocol_ref, registration)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))
+    }
+
+    /// Remove one host-defined protocol alias. Prepared requests keep their
+    /// immutable snapshot, while later requests observe the removal.
+    pub fn unregister_query_protocol(
+        &self,
+        protocol_ref: &crate::analyzer::structural::ProtocolRef,
+    ) -> Result<bool, SearchToolsServiceError> {
+        Ok(self
+            .query_protocols
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .unregister(protocol_ref))
     }
 
     /// Construct with no file watcher and no semantic indexer: the caller drives
@@ -592,6 +639,10 @@ impl SearchToolsService {
             return Self::structured_only(
                 analyze_diff_at_root(&root, params).map_err(SearchToolsServiceError::internal)?,
             );
+        }
+        if name == "query_code" {
+            let prepared = self.prepare_query_code(arguments)?;
+            return self.execute_prepared_query_code(prepared, cancellation);
         }
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
@@ -694,20 +745,6 @@ impl SearchToolsService {
                 render_options,
                 |workspace, params| usage_graph(workspace.analyzer(), params),
             ),
-            "query_code" => {
-                let output =
-                    Self::query_code_result_for_snapshot(&snapshot, arguments, cancellation)?;
-                let rendered_text = output.render_text();
-                let structured = serde_json::to_value(&output).map_err(|err| {
-                    SearchToolsServiceError::internal(format!(
-                        "Failed to serialize tool result: {err}"
-                    ))
-                })?;
-                Ok(ToolOutput::Structured {
-                    structured,
-                    rendered_text: Some(rendered_text),
-                })
-            }
             "get_file_contents" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     get_file_contents(workspace.analyzer(), params)
@@ -804,9 +841,19 @@ impl SearchToolsService {
         &self,
         arguments: Value,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
-        let arguments = self.normalize_arguments_for_current_workspace("query_code", arguments)?;
-        let snapshot = self.snapshot_for_query()?;
-        let result = Self::query_code_result_for_snapshot(&snapshot, arguments, None);
+        let PreparedQueryCode {
+            snapshot,
+            arguments,
+            workspace_generation,
+            query_protocols,
+        } = self.prepare_query_code(arguments)?;
+        let result = Self::query_code_result_for_snapshot(
+            &snapshot,
+            arguments,
+            None,
+            workspace_generation,
+            &query_protocols,
+        );
         snapshot.finish("query_code", result)
     }
 
@@ -817,6 +864,7 @@ impl SearchToolsService {
         loop {
             let generation = self.workspace_generation();
             let snapshot = self.snapshot_for_query()?;
+            let query_protocols = self.query_protocol_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
@@ -828,6 +876,7 @@ impl SearchToolsService {
                 snapshot,
                 arguments,
                 workspace_generation: generation,
+                query_protocols,
             });
         }
     }
@@ -840,10 +889,17 @@ impl SearchToolsService {
         let PreparedQueryCode {
             snapshot,
             arguments,
-            ..
+            workspace_generation,
+            query_protocols,
         } = prepared;
         let result = (|| {
-            let output = Self::query_code_result_for_snapshot(&snapshot, arguments, cancellation)?;
+            let output = Self::query_code_result_for_snapshot(
+                &snapshot,
+                arguments,
+                cancellation,
+                workspace_generation,
+                &query_protocols,
+            )?;
             let rendered_text = output.render_text();
             let structured = serde_json::to_value(&output).map_err(|err| {
                 SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -860,13 +916,24 @@ impl SearchToolsService {
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
         cancellation: Option<&CancellationToken>,
+        workspace_generation: u64,
+        query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(cancellation.map_or_else(
-            || crate::analyzer::structural::execute_workspace_request(snapshot, &query),
-            |cancellation| {
-                crate::analyzer::structural::execute_workspace_request_with_cancellation(
+            || {
+                crate::analyzer::structural::execute_workspace_request_with_registrations(
                     snapshot,
+                    workspace_generation,
+                    query_protocols,
+                    &query,
+                )
+            },
+            |cancellation| {
+                crate::analyzer::structural::execute_workspace_request_with_registration_cancellation(
+                    snapshot,
+                    workspace_generation,
+                    query_protocols,
                     &query,
                     crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                     cancellation,
@@ -983,6 +1050,15 @@ impl SearchToolsService {
         self.workspace_generation.load(Ordering::Acquire)
     }
 
+    fn query_protocol_snapshot(
+        &self,
+    ) -> Result<crate::analyzer::structural::ProtocolRegistrationSet, SearchToolsServiceError> {
+        self.query_protocols
+            .read()
+            .map(|registrations| registrations.clone())
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
     fn advance_workspace_generation(&self) {
         self.workspace_generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -1028,6 +1104,7 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1069,6 +1146,7 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1109,6 +1187,7 @@ impl SearchToolsService {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1165,6 +1244,7 @@ impl SearchToolsService {
             root: RwLock::new(None),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1318,6 +1398,7 @@ impl SearchToolsService {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
             update_strategy,
@@ -2692,6 +2773,7 @@ public partial class MudDialogContainer
                 semantic: None,
             })),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
@@ -2927,6 +3009,7 @@ mod client_roots_tests {
             root: RwLock::new(None),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -2945,6 +3028,99 @@ mod client_roots_tests {
                 .join(crate::cache_db::CACHE_DB_FILE_NAME)
                 .exists(),
             "client-root binding must not collapse cache writes to the primary checkout"
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_protocol_tests {
+    use super::*;
+    use crate::analyzer::semantic::{ProcedureKind, SemanticBudget, SemanticRequest};
+    use crate::analyzer::structural::{CodeQueryDiagnosticCode, ProtocolRef};
+    use crate::analyzer::typestate::{ProtocolSpec, TypestateBindingPlan};
+    use crate::cancellation::CancellationToken;
+    use serde_json::json;
+
+    const RESOURCE_LIFECYCLE: &[u8] =
+        include_bytes!("../tests/fixtures/typestate/resource-lifecycle.protocol.json");
+
+    fn protocol_service() -> (tempfile::TempDir, SearchToolsService, ProtocolRef) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("main.ts"),
+            "export function lifecycle(): void {}\n",
+        )
+        .unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let workspace = service.analyzer_snapshot().unwrap();
+        let file = ProjectFile::new(workspace.analyzer().project().root(), "main.ts");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantics");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.kind() == ProcedureKind::Function)
+            .expect("lifecycle procedure");
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("scoped lifecycle handle");
+        let protocol = Arc::new(
+            ProtocolSpec::from_json(RESOURCE_LIFECYCLE)
+                .unwrap()
+                .compile()
+                .unwrap(),
+        );
+        let bindings = Arc::new(
+            TypestateBindingPlan::try_new(&protocol, vec![], vec![], vec![], vec![]).unwrap(),
+        );
+        let protocol_ref: ProtocolRef = "test:lifecycle".parse().unwrap();
+        service
+            .register_query_protocol(protocol_ref.clone(), root, Arc::clone(&protocol), bindings)
+            .unwrap();
+        (temp, service, protocol_ref)
+    }
+
+    fn query(protocol_ref: &ProtocolRef) -> Value {
+        json!({
+            "schema_version": 4,
+            "match": {"kind": "function", "name": "lifecycle"},
+            "steps": [
+                {"op": "procedure_of"},
+                {"op": "typestate", "protocol_ref": protocol_ref.to_string()}
+            ]
+        })
+    }
+
+    #[test]
+    fn prepared_query_keeps_registration_snapshot_after_alias_removal() {
+        let (_temp, service, protocol_ref) = protocol_service();
+        let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        assert!(service.unregister_query_protocol(&protocol_ref).unwrap());
+
+        let prepared_value = service
+            .execute_prepared_query_code(prepared, None)
+            .unwrap()
+            .into_value();
+        assert!(
+            prepared_value.get("diagnostics").is_none(),
+            "prepared request should retain the registered alias: {prepared_value}"
+        );
+
+        let current = service.query_code_result(query(&protocol_ref)).unwrap();
+        assert_eq!(
+            current.result().unwrap().diagnostics[0].code,
+            CodeQueryDiagnosticCode::UnresolvedProtocolReference
         );
     }
 }
@@ -2982,6 +3158,7 @@ mod tests {
                 semantic: Some(indexer.clone()),
             })),
             workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,

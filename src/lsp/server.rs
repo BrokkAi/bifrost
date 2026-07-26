@@ -1298,6 +1298,14 @@ fn run_rql_query_result(
             .results
             .into_iter()
             .map(|result| {
+                let witness_step_uris = match &result.value {
+                    CodeQueryResultValue::TypestateWitness { value } => value
+                        .steps
+                        .iter()
+                        .map(|step| path_to_uri_string(&workspace_root.join(&step.source.path)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let path = match &result.value {
                     CodeQueryResultValue::StructuralMatch { value } => &value.path,
                     CodeQueryResultValue::Declaration { value } => &value.path,
@@ -1314,6 +1322,7 @@ fn run_rql_query_result(
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),
+                    witness_step_uris,
                     result,
                 }
             })
@@ -2128,6 +2137,8 @@ struct RunRqlQueryResult {
 #[derive(serde::Serialize)]
 struct RunRqlQueryResultItem {
     uri: String,
+    #[serde(rename = "witnessStepUris", skip_serializing_if = "Vec::is_empty")]
+    witness_step_uris: Vec<String>,
     #[serde(flatten)]
     result: CodeQueryResultItem,
 }

@@ -11,12 +11,15 @@ import {
   queryResultRange,
   queryResultTooltip,
   runRqlQuery,
+  typestateWitnessStepTargets,
   type RqlControlEdgeResult,
   type RqlProcedureResult,
   type RqlProgramPointResult,
   type RqlQueryRunner,
   type RqlReceiverAnalysisResult,
-  type RqlReferenceSiteResult
+  type RqlReferenceSiteResult,
+  type RqlTypestateFindingResult,
+  type RqlTypestateWitnessResult
 } from "../src/rql_query";
 import { RQL_POLICY_LANGUAGE_ID } from "../src/rql_validation";
 
@@ -384,4 +387,77 @@ void test("renders and navigates a receiver-analysis result", () => {
   assert.match(tooltip, /factory makeService/);
   assert.match(tooltip, /allocation Service/);
   assert.deepEqual(queryResultRange(analysis), analysis.range);
+});
+
+void test("renders typestate findings and exposes navigable witness steps", () => {
+  const range = {
+    start_line: 8,
+    start_column: 3,
+    end_line: 8,
+    end_column: 16
+  };
+  const finding: RqlTypestateFindingResult = {
+    uri: "file:///workspace/src/run.ts",
+    path: "src/run.ts",
+    result_type: "typestate_finding",
+    id: "finding-a",
+    protocol_ref: "embedding:resource-lifecycle",
+    protocol_hash: "a".repeat(64),
+    binding_plan_hash: "b".repeat(64),
+    subject: { class: "resource", identity: '{"kind":"object"}' },
+    finding_kind: {
+      type: "error_transition",
+      event: "use",
+      from_state: "closed",
+      to_state: "error"
+    },
+    certainty: "must",
+    language: "typescript",
+    range,
+    path_proven: true,
+    path_complete: true,
+    analysis_complete: true,
+    retained_witnesses: 1,
+    omitted_witnesses: 0
+  };
+  const witness: RqlTypestateWitnessResult = {
+    uri: finding.uri,
+    path: finding.path,
+    witnessStepUris: ["file:///workspace/src/run.ts"],
+    result_type: "typestate_witness",
+    id: "witness-a",
+    finding_id: finding.id,
+    protocol_ref: finding.protocol_ref,
+    protocol_hash: finding.protocol_hash,
+    binding_plan_hash: finding.binding_plan_hash,
+    subject: finding.subject,
+    witness_index: 0,
+    observed_state: "closed",
+    language: finding.language,
+    range,
+    quality: { proof: "proven", completeness: "complete" },
+    steps: [
+      {
+        kind: { type: "edge", edge_kind: "normal" },
+        source: { path: finding.path, range },
+        target: { path: finding.path, range: { ...range, start_line: 9, end_line: 9 } },
+        evidence: { proof: "proven", completeness: "complete" }
+      }
+    ],
+    retained_bytes: 128,
+    omitted_steps_lower_bound: 0
+  };
+
+  assert.equal(queryResultLabel(finding), "use: closed → error");
+  assert.equal(queryResultDescription(finding), "must · embedding:resource-lifecycle · 8:3");
+  assert.equal(queryResultIcon(finding), "warning");
+  assert.match(queryResultTooltip(finding), /aaaaaaaaaaaa/);
+  assert.deepEqual(queryResultRange(finding), range);
+
+  assert.equal(queryResultIcon(witness), "debug-alt");
+  assert.match(queryResultTooltip(witness), /retained bytes: 128/);
+  const steps = typestateWitnessStepTargets(witness);
+  assert.equal(steps[0].label, "1. normal edge");
+  assert.equal(steps[0].uri, "file:///workspace/src/run.ts");
+  assert.deepEqual(steps[0].range, range);
 });
