@@ -5,34 +5,27 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{FqName, SegmentKind};
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit,
-    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo,
-    Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider,
+    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
-use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
-    weight_project_file_set, weight_string_set,
-};
+use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
 use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
-use crate::analyzer::js_ts::hierarchy::{
-    build_direct_descendant_index_by_unit, extract_ts_supertypes, resolve_direct_ancestors,
-};
+use crate::analyzer::js_ts::hierarchy::extract_ts_supertypes;
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::{
-    extract_js_ts_call_receiver, import_info_tokens, parse_commonjs_require_import_infos_from_node,
-    parse_es_import_infos_from_node, resolve_js_ts_import_paths,
+    extract_js_ts_call_receiver, parse_commonjs_require_import_infos_from_node,
+    parse_es_import_infos_from_node,
 };
 use crate::analyzer::js_ts::model::{
     add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
@@ -41,6 +34,7 @@ use crate::analyzer::js_ts::model::{
     node_text, property_name_text, root_node, this_member_property, trim_statement,
     variable_header,
 };
+use crate::analyzer::js_ts::providers::{self, JsTsAnalyzerHost};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::js_ts::{
     path_contains_tests as js_ts_path_contains_tests,
@@ -48,9 +42,7 @@ use crate::analyzer::js_ts::{
     synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
 };
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
-use crate::analyzer::usages::js_ts_graph::{
-    JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
-};
+use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use crate::cancellation::CancellationToken;
 
 mod semantic;
@@ -239,18 +231,30 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
 pub struct TypescriptAnalyzer {
     inner: TreeSitterAnalyzer<TypescriptAdapter>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
-    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    /// Analyzer-cached JS/TS usage-resolution maps, built once per analyzer and reused
-    /// across `scan_usages`/`usage_graph` queries. Reset on `update`/`update_all`.
-    jsts_usage_index: Arc<PoolSafeMemo<JsTsUsageIndex>>,
+    memo_caches: Arc<JsTsMemoCaches>,
     /// Shared tsconfig path-alias resolver (parsed configs cached) so the import/reference
     /// graph resolves `@/`-style aliases the same way the scan_usages graph does.
     alias_resolver: Arc<AliasResolver>,
+}
+
+impl JsTsAnalyzerHost for TypescriptAnalyzer {
+    type Adapter = TypescriptAdapter;
+
+    fn ts_inner(&self) -> &TreeSitterAnalyzer<TypescriptAdapter> {
+        &self.inner
+    }
+
+    fn memo_caches(&self) -> &JsTsMemoCaches {
+        &self.memo_caches
+    }
+
+    fn alias_resolver(&self) -> &AliasResolver {
+        &self.alias_resolver
+    }
+
+    fn js_ts_language(&self) -> Language {
+        Language::TypeScript
+    }
 }
 
 crate::analyzer::impl_forward_query_provider!(TypescriptAnalyzer);
@@ -272,13 +276,7 @@ impl TypescriptAnalyzer {
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, TypescriptAdapter, config),
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
-            relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
+            memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
         }
     }
@@ -286,45 +284,18 @@ impl TypescriptAnalyzer {
     /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
     /// language. Built once and reused until `update`/`update_all` resets the cell.
     pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        self.jsts_usage_index.get_or_build(
-            || build_jsts_usage_index(self, Language::TypeScript, true),
-            || build_jsts_usage_index(self, Language::TypeScript, false),
-        )
+        providers::jsts_usage_index(self)
     }
 
     pub(crate) fn jsts_usage_index_with_cancellation(
         &self,
         cancellation: &CancellationToken,
     ) -> Option<Arc<JsTsUsageIndex>> {
-        self.jsts_usage_index
-            .get_or_try_build(
-                || {
-                    build_jsts_usage_index_with_cancellation(
-                        self,
-                        Language::TypeScript,
-                        true,
-                        Some(cancellation),
-                    )
-                    .ok_or(())
-                },
-                || {
-                    build_jsts_usage_index_with_cancellation(
-                        self,
-                        Language::TypeScript,
-                        false,
-                        Some(cancellation),
-                    )
-                    .ok_or(())
-                },
-            )
-            .ok()
+        providers::jsts_usage_index_with_cancellation(self, cancellation)
     }
 
     pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        self.jsts_usage_index.get_or_build_parallel(
-            || build_jsts_usage_index(self, Language::TypeScript, true),
-            || build_jsts_usage_index(self, Language::TypeScript, false),
-        )
+        providers::prewarm_jsts_usage_index(self)
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -345,13 +316,7 @@ impl TypescriptAnalyzer {
         Ok(Self {
             inner,
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
-            relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
+            memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
         })
     }
@@ -417,82 +382,11 @@ impl TypescriptAnalyzer {
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
-        if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
-        }
-
-        let mut resolved = HashSet::default();
-        for import in self.inner.import_info_of(file) {
-            for target in resolve_js_ts_import_paths(
-                file,
-                &import.raw_snippet,
-                Language::TypeScript,
-                Some(&self.alias_resolver),
-            ) {
-                let top_level = self.inner.top_level_declarations(&target);
-                if import.is_wildcard {
-                    resolved.extend(
-                        top_level
-                            .iter()
-                            .filter(|code_unit| !code_unit.is_module())
-                            .cloned(),
-                    );
-                } else if let Some(identifier) =
-                    import.identifier.as_ref().or(import.alias.as_ref())
-                {
-                    let mut matched = false;
-                    for code_unit in top_level
-                        .iter()
-                        .filter(|code_unit| code_unit.identifier() == identifier)
-                    {
-                        matched = true;
-                        resolved.insert(code_unit.clone());
-                    }
-                    if !matched {
-                        let module_units = top_level
-                            .iter()
-                            .filter(|code_unit| code_unit.is_module())
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        if !module_units.is_empty() {
-                            resolved.extend(module_units);
-                        } else if top_level.len() == 1 && !top_level[0].is_module() {
-                            resolved.insert(top_level[0].clone());
-                        }
-                    }
-                } else {
-                    resolved.extend(
-                        top_level
-                            .iter()
-                            .filter(|code_unit| !code_unit.is_module())
-                            .cloned(),
-                    );
-                }
-            }
-        }
-
-        self.imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
-        resolved
+        providers::imported_code_units_of(self, file)
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        if let Some(cached) = self.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-
-        let reverse_index = crate::analyzer::memoized_reverse_import_index(
-            &self.reverse_import_index,
-            || self.inner.all_files(),
-            |candidate| self.imported_code_units_of(candidate),
-        );
-        let referencing = reverse_index
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
-        self.referencing_files
-            .insert(file.clone(), Arc::new(referencing.clone()));
-        referencing
+        providers::referencing_files_of(self, file)
     }
 
     fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -503,7 +397,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         &self,
         files: &[ProjectFile],
     ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
-        Some(self.inner.bulk_import_infos(files.iter().cloned()))
+        providers::import_infos_for_files(self, files)
     }
 
     fn imported_files_from_infos(
@@ -511,39 +405,11 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
-        Some(
-            imports
-                .iter()
-                .flat_map(|import| {
-                    resolve_js_ts_import_paths(
-                        file,
-                        &import.raw_snippet,
-                        Language::TypeScript,
-                        Some(&self.alias_resolver),
-                    )
-                })
-                .collect(),
-        )
+        providers::imported_files_from_infos(self, file, imports)
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
-        if let Some(cached) = self.relevant_imports.get(code_unit) {
-            return (*cached).clone();
-        }
-        let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        let relevant: HashSet<_> = self
-            .inner
-            .import_info_of(code_unit.source())
-            .iter()
-            .filter(|import| {
-                let tokens = import_info_tokens(import);
-                tokens.is_empty() || tokens.iter().any(|token| source.contains(token))
-            })
-            .map(|import| import.raw_snippet.clone())
-            .collect();
-        self.relevant_imports
-            .insert(code_unit.clone(), Arc::new(relevant.clone()));
-        relevant
+        providers::relevant_imports_for(self, code_unit)
     }
 
     fn could_import_file(
@@ -552,16 +418,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        imports.iter().any(|import| {
-            resolve_js_ts_import_paths(
-                source_file,
-                &import.raw_snippet,
-                Language::TypeScript,
-                Some(&self.alias_resolver),
-            )
-            .into_iter()
-            .any(|candidate| candidate == *target)
-        })
+        providers::could_import_file(self, source_file, imports, target)
     }
 }
 
@@ -575,27 +432,11 @@ impl TestDetectionProvider for TypescriptAnalyzer {}
 
 impl TypeHierarchyProvider for TypescriptAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let ancestors = resolve_direct_ancestors(
-            self,
-            self.jsts_usage_index().as_ref(),
-            Language::TypeScript,
-            &self.alias_resolver,
-            code_unit,
-            &self.inner.raw_supertypes_of(code_unit),
-        );
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
-        ancestors
+        providers::get_direct_ancestors(self, code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index_by_unit(self, self))
-            .descendants(code_unit)
+        providers::get_direct_descendants(self, code_unit)
     }
 }
 
@@ -717,16 +558,7 @@ impl IAnalyzer for TypescriptAnalyzer {
         Self {
             inner,
             memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
-            referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
-            relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
-            direct_ancestors: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_vec_by_unit,
-            ),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
             alias_resolver,
         }
     }
@@ -736,16 +568,7 @@ impl IAnalyzer for TypescriptAnalyzer {
         Self {
             inner,
             memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
-            referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
-            relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
-            direct_ancestors: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_vec_by_unit,
-            ),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
             alias_resolver,
         }
     }

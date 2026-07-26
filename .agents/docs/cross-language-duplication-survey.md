@@ -297,10 +297,14 @@ call_tool/symbol_sources/definition_reference_status (~14 bodies).
   established shared home). Leave as copies: everything driven by real grammar
   asymmetry (TS types/interfaces/enums/namespaces ~325 LOC; JS CommonJS
   assignment engine ~400 LOC + mutation-comment/JSX heuristics ~90 LOC) — a
-  Dialect-parameterized single adapter fails mass-per-hole. Judge separately
-  later: ImportAnalysisProvider/TypeHierarchyProvider/jsts_usage_index
-  (~800 LOC/side, same-shape, already Language-parameterized at call sites;
-  blocked on reconciling JsMemoCaches vs TS's flat cache fields). Churn
+  Dialect-parameterized single adapter fails mass-per-hole. Judge-separately
+  item RESOLVED (2026-07-25): the provider/usage-index family is extracted -
+  js_ts::cache::JsTsMemoCaches is the reconciled bucket (JS's struct wrapper
+  adopted for both; bucket replacement on update = whole-cache invalidation,
+  behavior pinned by the analyzer update tests), and js_ts::providers hosts the
+  shared implementations behind a four-accessor JsTsAnalyzerHost trait - both
+  adapters reduced to one-line delegations (~500 net LOC removed; policy lives
+  in exactly one place). Churn
   evidence: ~27 of ~46 commits touched both files together, AND live
   one-directional drift found by reading (filed as an issue): TS missing JS's
   "regex" simple-initializer case; TS classifies `const x = function(){}` as
