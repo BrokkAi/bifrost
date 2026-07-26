@@ -1785,8 +1785,11 @@ namespace Demo {
 
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    // #1138 widening: both the unqualified inherited `Pick<T>(1)` and the inferred
+    // `Identity(value)` are implicit-this (same-owner) calls — self-receiver hits,
+    // excluded from the external surface.
     for (target, expected_start) in [(inherited, inherited_start), (inferred, inferred_start)] {
-        let hits = UsageFinder::new()
+        let result = UsageFinder::new()
             .with_authoritative_scope(true)
             .query_with_provider(
                 &analyzer,
@@ -1795,16 +1798,22 @@ namespace Demo {
                 1,
                 1000,
             )
-            .result
-            .into_either()
-            .expect("generic method query should resolve");
+            .result;
+        let self_hits = self_receiver_hits(&result);
         assert!(
-            hits.iter().any(|hit| {
+            self_hits.iter().any(|hit| {
                 hit.file == consumer
                     && hit.start_offset <= expected_start
                     && expected_start + target.identifier().len() <= hit.end_offset
             }),
-            "inverse lookup should find the generic call for {target:?}: {hits:#?}"
+            "same-owner generic call should be a self-receiver hit for {target:?}: {self_hits:#?}"
+        );
+        let external = result
+            .into_either()
+            .expect("generic method query should resolve");
+        assert!(
+            external.is_empty(),
+            "same-owner generic call must not be external for {target:?}: {external:#?}"
         );
     }
 }
@@ -4651,12 +4660,24 @@ namespace Domain {
 
     let run = member_function(&analyzer, "Domain.Target", "Run");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let hits = CSharpUsageGraphStrategy::new()
-        .find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000)
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    );
+    // #1138 widening: unqualified same-class `Run()` is a same-owner implicit-this
+    // call — a self-receiver hit excluded from the external surface (mirrors Java).
+    let self_hits = self_receiver_hits(&result);
+    let external = result
         .into_either()
         .unwrap_or_else(|err| panic!("same-class unqualified call should resolve: {err}"));
-    assert_eq!(1, hits.len());
-    assert!(hits.iter().any(|hit| {
+    assert!(
+        external.is_empty(),
+        "unqualified same-class call is now a same-owner site, not external: {external:#?}"
+    );
+    assert_eq!(1, self_hits.len(), "{self_hits:#?}");
+    assert!(self_hits.iter().any(|hit| {
         hit.file == project.file("Domain/Target.cs") && hit.snippet.contains("Run();")
     }));
 }
@@ -5634,18 +5655,18 @@ namespace Demo {
         ),
         other => panic!("expected inherited member query success, got {other:#?}"),
     }
-    // Under #1014 facet B the explicit `this.Report(1)` and inherited
-    // `this.Report(4)` calls are same-owner sites (editor-only self-receiver
-    // hits, excluded from external usages). The unqualified `Report(2)` call stays
-    // on the external surface (C# reclassifies only explicit `this.` receivers).
-    // The parameter/local shadows and the hidden-member consumer remain excluded
-    // from both surfaces.
+    // #1138 widening: the explicit `this.Report(1)`, the unqualified (implicit-this)
+    // `Report(2)`, and the inherited `this.Report(4)` calls are all same-owner
+    // sites (editor-only self-receiver hits, excluded from external usages). C# now
+    // classifies bare implicit-this calls in addition to explicit `this.`,
+    // mirroring Java. The parameter/local shadows and the hidden-member consumer
+    // remain excluded from both surfaces, so no external usage survives.
     let self_hits = self_receiver_hits(&query.result);
     let external = query
         .result
         .into_either()
         .expect("inherited member query should resolve");
-    assert_eq!(2, self_hits.len(), "{self_hits:#?}");
+    assert_eq!(3, self_hits.len(), "{self_hits:#?}");
     assert!(
         self_hits.iter().any(|hit| {
             hit.file == consumer
@@ -5660,11 +5681,13 @@ namespace Demo {
             .any(|hit| hit.snippet.contains("Report(4)")),
         "self-receiver surface should follow inheritance declared on a sibling partial type: {self_hits:#?}"
     );
-    assert_eq!(1, external.len(), "{external:#?}");
     assert!(
-        external.iter().any(|hit| hit.snippet.contains("Report(2)")),
-        "the unqualified inherited call stays an external usage: {external:#?}"
+        self_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Report(2)")),
+        "the unqualified inherited call is now a same-owner site: {self_hits:#?}"
     );
+    assert_eq!(0, external.len(), "{external:#?}");
 }
 
 #[test]
@@ -5788,27 +5811,31 @@ public sealed class UnrelatedMapping {
         }));
     }
 
-    // Under #1014 facet B the explicit `this.BuildBody(3, 4)` receiver is a
-    // same-owner site (editor-only self-receiver hit); the unqualified
-    // `BuildBody(5, 6)` call stays external (C# reclassifies only explicit `this.`
-    // receivers). (The `base.BuildBody(1, 2)` receiver above stays external too.)
+    // #1138 widening: the explicit `this.BuildBody(3, 4)` receiver AND the
+    // unqualified (implicit-this) `BuildBody(5, 6)` call are both same-owner sites
+    // (editor-only self-receiver hits), so no external usage survives here. (The
+    // `base.BuildBody(1, 2)` receiver above stays external — `base` is not
+    // same-owner.)
     let derived_result = graph_result(&analyzer, &derived_target);
     let derived_external = derived_result
         .clone()
         .into_either()
         .expect("derived query resolves");
-    assert_eq!(derived_external.len(), 1, "{derived_external:#?}");
-    assert!(derived_external.iter().any(|hit| {
-        hit.file == consumer
-            && hit.start_offset <= unqualified_call
-            && unqualified_call + "BuildBody".len() <= hit.end_offset
-    }));
+    assert!(
+        derived_external.is_empty(),
+        "same-owner this./unqualified calls must not be external: {derived_external:#?}"
+    );
     let derived_self = self_receiver_hits(&derived_result);
-    assert_eq!(derived_self.len(), 1, "{derived_self:#?}");
+    assert_eq!(derived_self.len(), 2, "{derived_self:#?}");
     assert!(derived_self.iter().any(|hit| {
         hit.file == consumer
             && hit.start_offset <= this_call
             && this_call + "BuildBody".len() <= hit.end_offset
+    }));
+    assert!(derived_self.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= unqualified_call
+            && unqualified_call + "BuildBody".len() <= hit.end_offset
     }));
 
     // `this.BuildBody(7, 8)` calls UnrelatedMapping's own method through `this` — a
@@ -5855,18 +5882,24 @@ namespace MudBlazor {
     let activate =
         member_function_with_arity(&analyzer, "MudBlazor.MudTabs", "ActivatePanelClickAsync", 2);
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let hits = CSharpUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&activate),
-            &candidates,
-            1000,
-        )
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&activate),
+        &candidates,
+        1000,
+    );
+    // #1138 widening: the unqualified same-class `ActivatePanelClickAsync(...)` call
+    // is a same-owner implicit-this site — self-receiver, excluded from external.
+    let self_hits = self_receiver_hits(&result);
+    let external = result
         .into_either()
         .unwrap_or_else(|err| panic!("same-class async call should resolve: {err}"));
-
-    assert_eq!(1, hits.len());
-    assert!(hits.iter().any(|hit| {
+    assert!(
+        external.is_empty(),
+        "unqualified same-class async call is now same-owner, not external: {external:#?}"
+    );
+    assert_eq!(1, self_hits.len(), "{self_hits:#?}");
+    assert!(self_hits.iter().any(|hit| {
         hit.file == project.file("MudTabs.cs")
             && hit
                 .snippet

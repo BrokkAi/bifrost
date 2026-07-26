@@ -75,15 +75,21 @@ class Service {
 
 #[test]
 fn scala_dead_code_smell_reports_one_call_method() {
+    // A single *external* caller yields one proven inbound edge. (The caller lives
+    // in a separate class; a same-owner sibling call is now excluded from proven
+    // edges under the #1014/#1138 self-receiver policy and would read
+    // inconclusive rather than a proven inbound edge.)
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "example/Service.scala",
         r#"
 package example
 
 class Service {
-  def wrapper(): Int = leaf()
+  def leaf(): Int = 1
+}
 
-  private def leaf(): Int = 1
+class Caller {
+  def wrapper(service: Service): Int = service.leaf()
 }
 "#,
     )]);
@@ -100,10 +106,12 @@ class Service {
 
     assert!(report.contains("example.Service.leaf"), "{report}");
     assert!(
-        report.contains("one workspace inbound edge from example.Service.wrapper"),
+        report.contains("one workspace inbound edge from example.Caller.wrapper"),
         "{report}"
     );
-    assert!(report.contains("| 1 | 0 |"), "{report}");
+    // Total 1 / External 1: the caller is in a separate class, a genuine external
+    // usage (the old same-owner sibling call showed | 1 | 0 |).
+    assert!(report.contains("| 1 | 1 |"), "{report}");
 }
 
 #[test]
@@ -140,17 +148,22 @@ class OtherConsumer {
 
 #[test]
 fn scala_dead_code_smell_does_not_flag_symbol_with_multiple_inbound_edges() {
+    // External callers in a separate class give the symbol multiple proven inbound
+    // edges; same-owner sibling calls are now excluded from proven edges
+    // (#1014/#1138) and would read inconclusive instead.
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "example/Service.scala",
         r#"
 package example
 
 class Service {
-  def firstCaller(): Int = helper()
+  def helper(): Int = 1
+}
 
-  def secondCaller(): Int = helper()
+class Callers {
+  def firstCaller(service: Service): Int = service.helper()
 
-  private def helper(): Int = 1
+  def secondCaller(service: Service): Int = service.helper()
 }
 "#,
     )]);
@@ -269,17 +282,22 @@ fn scala_dead_code_smell_honors_usage_candidate_file_cap() {
 
 #[test]
 fn scala_dead_code_smell_honors_usage_cap() {
+    // The two callers live in a separate class so their calls are proven inbound
+    // call sites that exercise the cap; same-owner sibling calls are now excluded
+    // from proven edges (#1014/#1138) and would not count toward the cap.
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "example/Service.scala",
         r#"
 package example
 
 class Service {
-  def firstCaller(): Int = helper()
+  def helper(): Int = 1
+}
 
-  def secondCaller(): Int = helper()
+class Callers {
+  def firstCaller(service: Service): Int = service.helper()
 
-  private def helper(): Int = 1
+  def secondCaller(service: Service): Int = service.helper()
 }
 "#,
     )]);

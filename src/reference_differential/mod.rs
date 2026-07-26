@@ -1460,11 +1460,14 @@ mod tests {
                 call_line: "fn caller() { target(); }",
             },
             RoundTripFixture {
+                // Top-level defs (no enclosing class) so `target(1)` is a real
+                // external reference, not a same-owner implicit-this call — the
+                // latter would be editor-only under #1014 facet B / #1138.
                 corpus_language: "scala",
                 analyzer_language: Language::Scala,
                 file_name: "RoundTrip.scala",
-                source: "package example\nobject App {\n  def target(value: Int): Int = value\n  val result = target(1)\n}\n",
-                call_line: "val result = target(1)",
+                source: "package example\n\ndef target(value: Int): Int = value\ndef caller(): Int = target(1)\n",
+                call_line: "def caller(): Int = target(1)",
             },
             RoundTripFixture {
                 corpus_language: "ts",

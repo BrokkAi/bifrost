@@ -418,10 +418,14 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if ctx.spec.kind == TargetKind::Method && !ordinary_call_arity_matches {
             return;
         }
-        // A `this.Member` receiver is the current instance — a same-owner site
-        // (#1014 facet B). `base.Member` (an inherited override) and a call
-        // through another variable of the same type stay external.
-        if receiver_node.kind() == "this_expression" || receiver_node.kind() == "this" {
+        // A `this.Member` receiver is the current instance, and an own-type
+        // static `Owner.Member` (from within `Owner`) is the own type — both are
+        // same-owner sites (#1014 facet B). `base.Member` (an inherited override)
+        // and a call through another variable of the same type stay external.
+        // Reaching here means the receiver resolved *as a type* to the owner, so a
+        // local/parameter value never lands on this branch (it takes the
+        // `receiver_targets_owner` path below, where only `this` is same-owner).
+        if csharp_static_receiver_is_same_owner(receiver_node, ctx) {
             push_self_receiver_hit(name.identifier, ctx);
         } else {
             push_hit(name.identifier, ctx);
@@ -511,6 +515,22 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Whether a member-access receiver that already resolved *as a type* to the
+/// target owner is a same-owner receiver: an explicit `this`, or the owner type
+/// named directly from within the owner (`Owner.StaticMember` inside `Owner`).
+/// `base` and a static reference to the same type from a *different* enclosing
+/// type stay external. Mirrors Java's `method_receiver_object_is_same_owner`.
+fn csharp_static_receiver_is_same_owner(receiver_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    match receiver_node.kind() {
+        "this_expression" | "this" => true,
+        "base_expression" | "base" => false,
+        _ => ctx
+            .class_ranges
+            .enclosing(receiver_node.start_byte())
+            .is_some_and(|enclosing| enclosing == ctx.spec.owner.fq_name()),
+    }
+}
+
 fn extension_call_resolution(
     member_access: Node<'_>,
     name: Node<'_>,
@@ -593,7 +613,11 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 csharp_unqualified_invocation_for_name(node).expect("call shape was checked");
             match unqualified_method_call_resolution(node, invocation, explicit_generic_arity, ctx)
             {
-                TargetMemberResolution::MatchesTarget => push_hit(node, ctx),
+                // A bare `Member(..)` is an implicit-this call on the current
+                // instance — a same-owner site (#1014 facet B), now that csharp's
+                // inverted builder routes same-owner calls to unproven inbound
+                // (#1138). Mirrors Java's `bare_method_context_matches_target`.
+                TargetMemberResolution::MatchesTarget => push_self_receiver_hit(node, ctx),
                 TargetMemberResolution::KnownOther => {}
                 TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
             }

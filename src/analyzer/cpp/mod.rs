@@ -477,6 +477,16 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.ranges(code_unit)
     }
 
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
+        self.inner
+            .ranges_with_limit(code_unit, max_ranges, cancellation)
+    }
+
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         self.inner.compute_cognitive_complexities(file)
     }
@@ -580,6 +590,10 @@ impl IAnalyzer for CppAnalyzer {
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_candidates_by_short_name(symbol)
+    }
+
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_declarations_by_identifier(identifier)
     }
 
     fn search_symbol_candidates(

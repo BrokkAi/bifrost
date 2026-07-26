@@ -178,3 +178,68 @@ impl UsageAnalyzer for CppUsageGraphStrategy {
             .into_fuzzy_result()
     }
 }
+
+#[cfg(test)]
+mod bare_implicit_this_inverted_edge_tests {
+    use super::*;
+    use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, TestProject, WorkspaceAnalyzer};
+    use std::sync::Arc;
+
+    /// #1161: a bare `m()` call resolving to a method on the enclosing class
+    /// (implicit-this, no receiver token at all) must be recorded as
+    /// *unproven* inbound by the whole-workspace inverted builder, never
+    /// silently dropped — the second same-owner drop site, alongside the
+    /// explicit `this->m()` fix at #1138.
+    ///
+    /// This can't be asserted at the dead-code smell verdict: a genuine C++
+    /// method is unconditionally `NeedsPrecise`
+    /// (`dead_code_bulk_eligibility`'s catch-all arm), so the smell path
+    /// never reaches the bulk inverted graph for a method target and the
+    /// verdict is inconclusive-by-skip regardless of this bug. Asserting
+    /// directly on `build_cpp_usage_edges`'s `unproven_inbound` map is the
+    /// level that actually discriminates: before the fix the same-owner call
+    /// site vanishes entirely (`unproven_inbound` has no entry for the
+    /// callee); after the fix it is counted, while `edges` (the proven-edge
+    /// set) stays empty for it either way, matching the sibling
+    /// `this->m()` behavior.
+    #[test]
+    fn bare_implicit_this_call_is_recorded_as_unproven_inbound_not_dropped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "foo.cpp");
+        file.write("class Foo {\npublic:\n  void target() {}\n  void caller() { target(); }\n};\n")
+            .expect("write foo.cpp");
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let _scope = AnalyzerQueryScope::new(analyzer);
+
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "target")
+            .expect("Foo::target declaration");
+        let target_fqn = target.fq_name();
+
+        let nodes: HashSet<String> = HashSet::from_iter([target_fqn.clone()]);
+        let edges = build_cpp_usage_edges(analyzer, &nodes, |_| true)
+            .expect("C++ edge resolver must be available for a C++ analyzer");
+
+        assert_eq!(
+            edges.unproven_inbound.get(target_fqn.as_str()).copied(),
+            Some(1),
+            "bare implicit-this call to Foo::target must be recorded as \
+             unproven inbound, not dropped: {:?}",
+            edges.unproven_inbound
+        );
+        assert!(
+            edges
+                .edges
+                .keys()
+                .all(|(_caller, callee)| callee != &target_fqn),
+            "a same-owner call must never become a proven inbound edge: {:?}",
+            edges.edges
+        );
+    }
+}

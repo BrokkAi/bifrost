@@ -72,6 +72,11 @@ impl RubyTargetSpec {
 
 pub(crate) fn ruby_field_target(target: &CodeUnit) -> Option<RubyFieldTarget> {
     let member = target.identifier();
+    // fqname-M4: `owner` below is compared against a package-less class-name
+    // reference-text `owner` parsed at a field-reference site (see
+    // `field_reference_matches_target`); `fq.parent()`/`default_parent_fq_name`
+    // would render the package-qualified owner, a different string that would
+    // never match there.
     let short_name = target.short_name();
     if member.starts_with("@@") {
         let owner = short_name.strip_suffix(&format!(".{member}"))?;
@@ -548,6 +553,8 @@ impl<'a> RubySemanticIndex<'a> {
     ) -> Option<String> {
         let mut candidate_names = vec![raw.to_string()];
         let mut prefix = lexical_owner;
+        // fqname-M4: walks the `$`-joined lexical-owner *string* (not a CodeUnit) to enumerate
+        // enclosing-scope candidate names; fq not threaded to this string-keyed support probe
         while let Some((parent, _)) = prefix.rsplit_once('$') {
             candidate_names.push(format!("{parent}${raw}"));
             prefix = parent;
@@ -564,7 +571,7 @@ impl<'a> RubySemanticIndex<'a> {
             }
         }
 
-        let identifier = raw.rsplit('$').next().unwrap_or(raw);
+        let identifier = raw.rsplit('$').next().unwrap_or(raw); // fqname-M4: leaf of a `$`-joined reference string (no CodeUnit here)
         let mut matches = support.file_identifier_in_files(visible_files, identifier);
         matches.retain(|unit| {
             (unit.is_class() || unit.is_module()) && unit.identifier() == identifier

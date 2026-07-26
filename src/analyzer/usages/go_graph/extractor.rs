@@ -211,7 +211,7 @@ fn scan_children(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInfere
 
 /// Whether `node` (a `parameter_declaration`) is the receiver of a method
 /// declaration (`func (f *T) m()`), so its binding is the same-owner receiver.
-fn is_method_receiver_parameter(node: Node<'_>) -> bool {
+pub(super) fn is_method_receiver_parameter(node: Node<'_>) -> bool {
     node.parent()
         .filter(|parent| parent.kind() == "parameter_list")
         .and_then(|list| {

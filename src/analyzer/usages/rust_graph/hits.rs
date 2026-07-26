@@ -393,15 +393,12 @@ fn has_ancestor_kind(mut node: Node<'_>, kind: &str) -> bool {
 /// `crate::analyzer::rust::declarations::rust_node_text` for the extraction
 /// side of the same normalization.
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    }
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    )
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {

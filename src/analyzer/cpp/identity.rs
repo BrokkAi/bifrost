@@ -1,5 +1,6 @@
 use super::{CppAnalyzer, include_paths, resolve_include_targets_with_index};
 use crate::analyzer::declaration_range::node_for_exact_range;
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{CallableLinkage, CodeUnit, IAnalyzer, ProjectFile, Range, resolve_analyzer};
 use crate::path_utils::rel_path_string;
 use tree_sitter::{Node, Parser, Tree};
@@ -156,7 +157,7 @@ pub(crate) fn cpp_occurrence_role_for_range(
         return CppOccurrenceRole::Unknown;
     };
     if candidate.is_callable() {
-        return if cpp_subtree_contains(node, |descendant| {
+        return if subtree_contains(node, |descendant| {
             descendant.kind() == "function_definition"
                 && descendant.child_by_field_name("body").is_some()
         }) {
@@ -168,7 +169,7 @@ pub(crate) fn cpp_occurrence_role_for_range(
     if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
         return CppOccurrenceRole::Definition;
     }
-    if !cpp_subtree_contains(node, |descendant| {
+    if !subtree_contains(node, |descendant| {
         matches!(
             descendant.kind(),
             "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
@@ -176,7 +177,7 @@ pub(crate) fn cpp_occurrence_role_for_range(
     }) {
         return CppOccurrenceRole::Both;
     }
-    if cpp_subtree_contains(node, |descendant| {
+    if subtree_contains(node, |descendant| {
         matches!(
             descendant.kind(),
             "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
@@ -198,16 +199,4 @@ fn cpp_declaration_node_for_range<'tree>(root: Node<'tree>, range: &Range) -> Op
                 Some(node)
             })
     })
-}
-
-fn cpp_subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if predicate(candidate) {
-            return true;
-        }
-        let mut cursor = candidate.walk();
-        stack.extend(candidate.named_children(&mut cursor));
-    }
-    false
 }

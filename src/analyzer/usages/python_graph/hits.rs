@@ -1,5 +1,7 @@
 use crate::analyzer::Range;
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use crate::analyzer::usages::common::{
+    SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
+};
 use crate::analyzer::usages::python_graph::extractor::ScanCtx;
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use tree_sitter::Node;
@@ -19,11 +21,11 @@ pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// Record `node` as a same-owner self/cls receiver hit (#1014 facet B): a
 /// `self.member` / `cls.member` access whose receiver is the current instance /
 /// own class. Excluded from the external usage surface, counted as a same-owner
-/// site.
+/// site. Records the ordinary hit, then reclassifies it — the shared scan
+/// consumer, so the record ceremony lives in exactly one place.
 pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(hit) = build_hit(node, ctx) {
-        ctx.hits.insert(hit.into_self_receiver());
-    }
+    record_hit(node, ctx);
+    reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
 
 /// Record `node` as an `Import`-binding hit (the token that brings the symbol

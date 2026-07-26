@@ -1410,6 +1410,12 @@ pub(super) fn unresolved_external_frontier_specifiers(
 }
 
 fn external_frontier_specifier(module_specifier: &str) -> Option<String> {
+    // fqname-M4: the root token must keep a literal `r#` raw-identifier escape
+    // verbatim when the specifier's first segment is one (a crate literally
+    // named via `r#` escape, #1128); `parse_symbol_path`'s per-segment
+    // normalization strips that prefix, which would change this frontier
+    // value for that edge case even though the empty-leading-token filtering
+    // otherwise matches exactly.
     let root = module_specifier
         .split("::")
         .find(|segment| !segment.is_empty())?

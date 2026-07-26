@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -336,6 +337,12 @@ impl OracleRelationHandle {
         &self.arena.records[self.id.index()]
     }
 
+    /// Query-local identity used only to total-order retained handles whose
+    /// durable owner/row coordinates are otherwise equal.
+    pub(crate) fn arena_identity(&self) -> *const () {
+        Arc::as_ptr(&self.arena).cast()
+    }
+
     pub(super) fn same_arena(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.arena, &other.arena)
     }
@@ -364,6 +371,26 @@ impl Hash for OracleRelationHandle {
         Arc::as_ptr(&self.arena).hash(state);
         self.id.hash(state);
     }
+}
+
+/// Total query-local order for retained relation provenance.
+///
+/// Dense relation IDs are only unique within one arena, so deterministic
+/// consumers must include arena identity before comparing IDs.
+pub(crate) fn compare_relation_provenance(
+    left: &[OracleRelationHandle],
+    right: &[OracleRelationHandle],
+) -> Ordering {
+    left.iter()
+        .zip(right)
+        .find_map(|(left, right)| {
+            let ordering = left
+                .arena_identity()
+                .cmp(&right.arena_identity())
+                .then_with(|| left.id().cmp(&right.id()));
+            (!ordering.is_eq()).then_some(ordering)
+        })
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
 pub(super) fn validate_retained_relation_arenas<'a>(

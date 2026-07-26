@@ -12,7 +12,8 @@ use crate::analyzer::usages::{
     CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
     GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
     PhpUsageGraphStrategy, RubyUsageGraphStrategy, RustExportUsageGraphStrategy,
-    ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitSurface,
+    ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitKind,
+    UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
@@ -670,7 +671,7 @@ fn analyze_candidate(
         return None;
     }
 
-    let hits = match query.result {
+    let (hits, same_owner_count) = match query.result {
         FuzzyResult::Success {
             hits_by_overload,
             unproven_total_by_overload,
@@ -684,11 +685,25 @@ fn analyze_candidate(
                 ));
                 return None;
             }
-            hits_by_overload
+            let all_hits: Vec<UsageHit> = hits_by_overload
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
+                .collect();
+            // Same-owner (self/this receiver) sites are excluded from the external
+            // surface, but their presence means the symbol IS referenced from its
+            // own type — inconclusive, never confidently dead (#1138). This mirrors
+            // the inverted builders' `record_unproven` routing for the languages
+            // whose dead-code analysis runs through this per-symbol path (Rust
+            // members, C++).
+            let same_owner_count = all_hits
+                .iter()
+                .filter(|hit| hit.kind == UsageHitKind::SelfReceiver)
+                .count();
+            let external = all_hits
+                .into_iter()
                 .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (external, same_owner_count)
         }
         FuzzyResult::Ambiguous { .. } => {
             skipped.push(format!(
@@ -713,6 +728,17 @@ fn analyze_candidate(
             return None;
         }
     };
+
+    // A symbol whose only references are same-owner (self/this receiver) calls is
+    // inconclusive, not dead: the self-call is real evidence its externality could
+    // not be disproven (#1138). Matches the inverted builders' `record_unproven`.
+    if hits.is_empty() && same_owner_count > 0 {
+        skipped.push(format!(
+            "`{}`: {same_owner_count} same-owner (self/this receiver) usage site(s) could not be proven or disproven; evidence is inconclusive",
+            candidate.fq_name()
+        ));
+        return None;
+    }
 
     let non_self_hits: Vec<UsageHit> = hits
         .into_iter()

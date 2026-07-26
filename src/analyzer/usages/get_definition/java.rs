@@ -124,7 +124,7 @@ impl<'a> JavaResolutionSession<'a> {
         file: &ProjectFile,
         byte: usize,
     ) -> Option<CodeUnit> {
-        let mut unit = self.query_optional_row(|| {
+        let start = self.query_optional_row(|| {
             analyzer.enclosing_code_unit(
                 file,
                 &Range {
@@ -135,10 +135,10 @@ impl<'a> JavaResolutionSession<'a> {
                 },
             )
         })?;
-        while !unit.is_class() {
-            unit = self.parent_of(analyzer, &unit)?;
-        }
-        Some(unit)
+        crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            self.parent_of(analyzer, unit)
+        })
+        .find(CodeUnit::is_class)
     }
 
     fn structured_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
@@ -762,12 +762,13 @@ fn resolve_java_type_reference(
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return candidates_outcome(vec![unit]);
     }
-    if java_import_boundary_for_type(java, session, file, normalized) {
-        return boundary(format!(
+    // `java_import_boundary_for_type` fuses the unresolved-import signal with the
+    // workspace-type check; its negation is the workspace-internal gate.
+    gated_boundary(
+        || !java_import_boundary_for_type(java, session, file, normalized),
+        format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     )
@@ -797,7 +798,10 @@ fn java_explicit_scoped_type_reference(
         return Some(candidates_outcome(vec![unit]));
     }
     if session.type_name_resolves_with_external(java, file, normalized) {
-        return Some(boundary(format!(
+        // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
+        // above return early for any workspace-internal type; reaching here means
+        // the name only resolves once external imports are considered.
+        return Some(boundary_unchecked(format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         )));
     }
@@ -809,13 +813,16 @@ fn java_explicit_scoped_type_reference(
     }
     let qualifier_is_in_workspace = java_scoped_type_qualifier_text(session, scoped, source)
         .is_some_and(|qualifier| java_workspace_package_exists(support, qualifier));
-    if java_import_boundary_for_type(java, session, file, normalized) || !qualifier_is_in_workspace
-    {
-        return Some(boundary(format!(
+    // The `!qualifier_is_in_workspace` disjunct is the #1089 workspace-namespace
+    // check, so the negation of the whole condition is the workspace gate.
+    Some(gated_boundary(
+        || {
+            !java_import_boundary_for_type(java, session, file, normalized)
+                && qualifier_is_in_workspace
+        },
+        format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
-        )));
-    }
-    Some(no_definition(
+        ),
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     ))
@@ -1324,12 +1331,10 @@ fn resolve_java_bare_identifier(
     if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
-    if java_import_boundary_for_type(java, session, file, name) {
-        return boundary(format!(
-            "`{name}` appears to cross a Java import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+    // Workspace gate is the negation of the fused import-boundary predicate.
+    gated_boundary(
+        || !java_import_boundary_for_type(java, session, file, name),
+        format!("`{name}` appears to cross a Java import boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{name}` did not resolve to an indexed Java definition"),
     )
@@ -2425,8 +2430,33 @@ fn java_raw_type_name(type_text: &str) -> Option<String> {
         .next()
         .unwrap_or(type_text)
         .trim();
-    let name = raw.rsplit('.').next().unwrap_or(raw).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    java_terminal_segment(raw)
+}
+
+/// The final `.`-joined segment of a Java-spelled qualified name (an import
+/// path or type reference, with any generic argument list already stripped by
+/// the caller). Java identifiers never contain a literal `.`, so re-tokenizing
+/// with the shared structured splitter and taking the last segment reproduces
+/// `rsplit('.').next()`'s terminal split exactly.
+fn java_terminal_segment(path: &str) -> Option<String> {
+    crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path)
+        .pop()
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Splits a Java-spelled dotted qualified name into its owner prefix and
+/// final segment (`com.foo.Bar` -> (`com.foo`, `Bar`)), or `None` for a bare
+/// name with no owner. Java identifiers never contain a literal `.`, so
+/// re-tokenizing with the shared structured splitter and rejoining every part
+/// but the last with `.` reproduces `rsplit_once('.')`'s (owner, member)
+/// split exactly.
+fn java_owner_and_member(path: &str) -> Option<(String, String)> {
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
+    let (member, owner_parts) = segments.split_last()?;
+    if owner_parts.is_empty() {
+        return None;
+    }
+    Some((owner_parts.join("."), member.clone()))
 }
 
 fn java_identifier_binding_before(
@@ -2945,8 +2975,7 @@ fn java_annotation_short_name(annotation: Node<'_>, source: &str) -> Option<Stri
         java_node_text(annotation, source)
     };
     let trimmed = raw.trim().trim_start_matches('@');
-    let short = trimmed.rsplit('.').next().unwrap_or(trimmed).trim();
-    (!short.is_empty()).then(|| short.to_string())
+    java_terminal_segment(trimmed)
 }
 
 fn java_lombok_annotation_generates_accessor(name: &str, kind: JavaAccessorKind) -> bool {
@@ -2984,7 +3013,7 @@ fn java_static_import_candidates(
                 );
             }
             if owner_candidates.is_empty()
-                && let Some((outer, leaf)) = owner.rsplit_once('.')
+                && let Some((outer, leaf)) = java_owner_and_member(owner)
             {
                 // On-demand static imports may land on nested types too.
                 owner_candidates = java_filter_member_candidates(
@@ -2998,7 +3027,7 @@ fn java_static_import_candidates(
             candidates.extend(owner_candidates);
             continue;
         }
-        let Some((owner, imported_member)) = path.rsplit_once('.') else {
+        let Some((owner, imported_member)) = java_owner_and_member(path) else {
             continue;
         };
         if imported_member != member {
@@ -3010,14 +3039,17 @@ fn java_static_import_candidates(
             // (`import static com.x.Tacos.Burritos`).
             imported = java_filter_member_candidates(support.fqn(path), JavaMemberLookupKind::Type);
         }
-        if imported.is_empty()
-            && let Some((outer, leaf)) = path.rsplit_once('.')
-        {
+        if imported.is_empty() {
             // The index keys nested types with `$`, not `.` (tier-4
-            // spoon/mockito static-import claims).
-            imported = java_filter_member_candidates(support.fqn(&format!("{outer}${leaf}")), kind);
+            // spoon/mockito static-import claims). `owner`/`imported_member`
+            // are the same (owner, member) split as above — `path` never
+            // changed, so re-splitting it here would just reproduce them.
+            imported = java_filter_member_candidates(
+                support.fqn(&format!("{owner}${imported_member}")),
+                kind,
+            );
         }
-        if imported.is_empty() && !java_workspace_fqn_exists(support, owner) {
+        if imported.is_empty() && !java_workspace_fqn_exists(support, &owner) {
             saw_external = true;
         }
         candidates.extend(imported);
@@ -3031,12 +3063,14 @@ fn java_static_import_candidates(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if saw_external {
-        return boundary(format!(
+    // `saw_external` is set only when an import target is both unindexed and
+    // `!java_workspace_fqn_exists(owner)`, so `!saw_external` is the workspace
+    // gate (no double work — the flag already carries the check).
+    gated_boundary(
+        || !saw_external,
+        format!(
             "`{member}` appears to cross a Java static import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+        ),
         "no_static_import_match",
         format!("`{member}` did not match an indexed Java static import"),
     )
@@ -3067,12 +3101,14 @@ fn java_import_boundary_for_type(
             }
             continue;
         }
-        if path.rsplit('.').next() == Some(name) {
-            let package = path
-                .rsplit_once('.')
-                .map(|(package, _)| package)
-                .unwrap_or("");
-            return !java_workspace_package_exists(support, package);
+        // Java identifiers never contain a literal `.`, so re-tokenizing with
+        // the shared structured splitter and rejoining every part but the
+        // last with `.` reproduces the string's (package, terminal) split
+        // exactly, including the no-owner case (`package` stays empty).
+        let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
+        if segments.last().map(String::as_str) == Some(name) {
+            let package = segments[..segments.len().saturating_sub(1)].join(".");
+            return !java_workspace_package_exists(support, &package);
         }
     }
     false

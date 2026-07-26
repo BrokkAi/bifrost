@@ -160,10 +160,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
-        let value = self
-            .session
-            .add_value_with_metadata(builder, metadata, kind)?;
-        self.expression_values.insert(node.id(), value);
+        let value = self.session.insert_cached_value_with_metadata(
+            builder,
+            &mut self.expression_values,
+            node.id(),
+            metadata,
+            kind,
+        )?;
         Ok(value)
     }
 
@@ -220,28 +223,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         call_site: CallSiteId,
         resolution: &CallableTargetResolution,
     ) -> Result<(), TsLoweringError> {
-        let kind = match resolution {
-            CallableTargetResolution::Proven(_) => return Ok(()),
-            CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
-            CallableTargetResolution::Unknown => SemanticGapKind::Unknown,
-            CallableTargetResolution::Unsupported => SemanticGapKind::Unsupported,
-            CallableTargetResolution::Unproven(_) => SemanticGapKind::Unproven,
-            CallableTargetResolution::ExceededBudget(_) => SemanticGapKind::ExceededBudget,
-        };
-        self.add_gap(
+        self.session.add_callable_resolution_gaps(
             builder,
             point,
-            SemanticGapSubject::Value(callee),
-            SemanticCapability::CallableReferences,
-            kind,
+            callee,
+            call_site,
+            resolution,
             "callable target requires whole-program dispatch refinement",
-        )?;
-        self.add_gap(
-            builder,
-            point,
-            SemanticGapSubject::CallSite(call_site),
-            SemanticCapability::Calls,
-            kind,
             "call target requires whole-program dispatch refinement",
         )
     }
@@ -261,11 +249,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, TsLoweringError> {
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(TsLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.session.add_node_mapping(builder, node)
     }
 
     fn value_mapping(

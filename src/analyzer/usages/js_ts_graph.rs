@@ -471,7 +471,7 @@ fn target_seed_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String
         return parent.identifier().trim_end_matches("$static").to_string();
     }
     if is_static_member(target)
-        && let Some((owner, _)) = target.short_name().rsplit_once('.')
+        && let Some((owner, _)) = target.short_name().rsplit_once('.') // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner, changing this string comparison
         && let Some(owner_name) = owner.rsplit('.').next()
     {
         return owner_name.to_string();

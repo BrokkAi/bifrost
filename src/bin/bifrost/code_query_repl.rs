@@ -843,6 +843,55 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         paint(Style::new().bold(), &name, use_color)
                     ));
                 }
+                CodeQueryResultValue::Procedure { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "procedure:", use_color),
+                        value.procedure_kind,
+                        paint(Style::new().bold(), &id, use_color),
+                        value.evidence.status_label(),
+                    ));
+                }
+                CodeQueryResultValue::ProgramPoint { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    let boundary = value
+                        .boundary
+                        .map_or("interior", |boundary| boundary.label());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} ({}; {} event{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "program point:", use_color),
+                        boundary,
+                        paint(Style::new().bold(), &id, use_color),
+                        value.evidence.status_label(),
+                        value.event_count,
+                        if value.event_count == 1 { "" } else { "s" },
+                    ));
+                }
+                CodeQueryResultValue::ControlEdge { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let source = sanitize_terminal_text(&value.source.id);
+                    let target = sanitize_terminal_text(&value.target.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} -> {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "control edge:", use_color),
+                        value.edge_kind,
+                        paint(Style::new().bold(), &source, use_color),
+                        paint(Style::new().bold(), &target, use_color),
+                        value.evidence.status_label(),
+                    ));
+                }
                 CodeQueryResultValue::File { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(

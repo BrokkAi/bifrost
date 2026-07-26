@@ -18,7 +18,7 @@ use super::syntax::{
     dynamic_dispatch_target_argument, is_call_method_identifier, is_declaration_constant,
     is_declaration_identifier, method_receiver_mode, node_text,
 };
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,
@@ -282,6 +282,13 @@ impl RubyEdgeWalkState<'_, '_, '_> {
         lookup: MethodLookup,
     ) {
         let receiver_node = node.child_by_field_name("receiver");
+        // A `self.method` or implicit-self (bare) call is on the current instance
+        // / own class — a same-owner site (#1138). An explicit variable/constant
+        // receiver stays external.
+        let same_owner = match receiver_node {
+            None => true,
+            Some(receiver) => receiver.kind() == "self",
+        };
         let receiver = match receiver_node {
             Some(receiver) => self.receiver_type(receiver),
             None => self.enclosing_receiver(node.start_byte()),
@@ -296,10 +303,11 @@ impl RubyEdgeWalkState<'_, '_, '_> {
                 "initialize",
                 hit_node,
                 MethodLookup::Explicit,
+                same_owner,
             );
             return;
         }
-        self.record_unique_method_candidate(receiver, member, hit_node, lookup);
+        self.record_unique_method_candidate(receiver, member, hit_node, lookup, same_owner);
     }
 
     fn record_bare_identifier_method_reference(&mut self, node: Node<'_>) {
@@ -314,7 +322,9 @@ impl RubyEdgeWalkState<'_, '_, '_> {
         let Some(receiver) = self.enclosing_receiver(node.start_byte()) else {
             return;
         };
-        self.record_unique_method_candidate(receiver, name, node, MethodLookup::Bare);
+        // A bare method-name reference resolves against the enclosing (implicit
+        // self) receiver — a same-owner site (#1138).
+        self.record_unique_method_candidate(receiver, name, node, MethodLookup::Bare, true);
     }
 
     fn record_unique_method_candidate(
@@ -323,7 +333,17 @@ impl RubyEdgeWalkState<'_, '_, '_> {
         member: &str,
         node: Node<'_>,
         lookup: MethodLookup,
+        same_owner: bool,
     ) {
+        // A `self.`/implicit-self call is a same-owner reference (#1138): record
+        // it as unproven inbound rather than a proven edge, so a method reachable
+        // only through same-owner calls reads INCONCLUSIVE, never confidently
+        // dead. An explicit variable/constant receiver — even of the same type —
+        // is a different instance and stays external.
+        if same_owner {
+            self.scan.record_unproven_name(member, node);
+            return;
+        }
         let candidates = match lookup {
             MethodLookup::Bare => self.scan.semantic.resolve_bare_method_candidates(
                 self.scan.support,

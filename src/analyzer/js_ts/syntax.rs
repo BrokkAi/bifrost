@@ -331,7 +331,7 @@ fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
 }
 
 pub(crate) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(crate) fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {

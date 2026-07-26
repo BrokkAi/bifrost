@@ -161,11 +161,17 @@ impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
         }
         if units.is_empty()
             && self.session.observe_cancellation()
-            && let Some(terminal) = fqn.rsplit('.').next().filter(|name| !name.is_empty())
+            // Scala identifiers never contain a literal `.`, so the shared
+            // structured splitter's terminal segment reproduces
+            // `rsplit('.').next()` exactly.
+            && let Some(terminal) =
+                crate::analyzer::symbol_lookup::parse_symbol_path(Language::Scala, fqn)
+                    .pop()
+                    .filter(|name| !name.is_empty())
         {
             let normalized = crate::analyzer::scala::scala_normalize_full_name(fqn);
-            let mut identifiers = vec![terminal];
-            let plain = terminal.trim_end_matches('$');
+            let plain = terminal.trim_end_matches('$').to_string();
+            let mut identifiers = vec![terminal.clone()];
             if !plain.is_empty() && plain != terminal {
                 identifiers.push(plain);
             }
@@ -174,7 +180,7 @@ impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
                     self.session
                         .query_limited_rows(|limit| {
                             self.scala.declaration_candidates_by_identifier_limited(
-                                identifier,
+                                &identifier,
                                 limit,
                                 || self.session.observe_cancellation(),
                             )
@@ -382,11 +388,13 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     let Some(path) = scala_import_path(import) else {
                         return false;
                     };
-                    let local_name = import
-                        .identifier
-                        .as_deref()
-                        .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
-                    local_name == name && scala_normalized_fq_name(&path) != format!("scala.{name}")
+                    // `ImportInfo::local_name` is the shared `alias ?? identifier
+                    // ?? tail-of-structured-path` desugar; scala's `identifier` is
+                    // already alias-resolved at construction, so this agrees with
+                    // the old `identifier ?? terminal-of(path)` fallback exactly,
+                    // without rejoining then re-splitting `path`.
+                    import.local_name() == Some(name)
+                        && scala_normalized_fq_name(&path) != format!("scala.{name}")
                 });
                 if has_non_intrinsic_import {
                     return ScalaNameResolution::MissingExplicitImport;
@@ -644,13 +652,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
-            if import.is_wildcard
-                || import
-                    .identifier
-                    .as_deref()
-                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path))
-                    != binding
-            {
+            if import.is_wildcard || import.local_name() != Some(binding) {
                 continue;
             }
             matching_explicit_import = true;
@@ -967,7 +969,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 );
             }
 
-            let flattened = path.segments.join(".");
+            let flattened = path.render_segments(".");
             let import_prefixes = if path.lexical_prefixes.is_empty() {
                 self.package_prefixes.as_slice()
             } else {
@@ -1007,12 +1009,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                             .filter(|unit| unit.identifier() == member),
                     );
                 }
-            } else if import
-                .identifier
-                .as_deref()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path))
-                == member
-            {
+            } else if import.local_name() == Some(member) {
                 for candidate in import_candidate_fq_names(&path, &self.package) {
                     units.extend(self.support.fqn(&candidate));
                 }
@@ -2343,9 +2340,9 @@ fn bounded_scala_resolve_segments(
                 .chain(std::iter::once(""))
             {
                 let base = if prefix.is_empty() {
-                    path.segments.join(".")
+                    path.render_segments(".")
                 } else {
-                    format!("{prefix}.{}", path.segments.join("."))
+                    format!("{prefix}.{}", path.render_segments("."))
                 };
                 candidate_fqns.extend(scala_nested_type_candidates(base, segments, true));
             }
@@ -3720,7 +3717,10 @@ fn resolve_scala_with_context(
                     return scala_fqn_outcome(support, &owner.fqn, text);
                 }
                 ScalaNameResolution::MissingExplicitImport => {
-                    return boundary(format!(
+                    // gated upstream: resolver verdict — the explicit-import
+                    // target is bound but not indexed (the workspace check is the
+                    // resolver's).
+                    return boundary_unchecked(format!(
                         "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
@@ -3735,12 +3735,13 @@ fn resolve_scala_with_context(
             if let Some(imported_member) = scala_wildcard_imported_member_outcome(ctx, text, None) {
                 return imported_member;
             }
-            if scala_import_boundary_for_name(scala, support, file, text) {
-                return boundary(format!(
+            // `scala_import_boundary_for_name` checks the workspace-package /
+            // import-target existence internally, so its negation is the gate.
+            gated_boundary(
+                || !scala_import_boundary_for_name(scala, support, file, text),
+                format!(
                     "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
-                ));
-            }
-            no_definition(
+                ),
                 "no_indexed_definition",
                 format!("`{text}` did not resolve to an indexed Scala definition"),
             )
@@ -3861,7 +3862,10 @@ fn scala_import_reference_outcome(
                         return Some(candidates_outcome(indexed));
                     }
                     if support.package_exists(&candidate) {
-                        return Some(boundary(format!(
+                        // gated upstream: `scala_fqn_probe` just above returns
+                        // early for any workspace-indexed declaration; this arm is
+                        // the package-segment-without-target residual.
+                        return Some(boundary_unchecked(format!(
                             "`{prefix}` is a Scala import package segment without a declaration target"
                         )));
                     }
@@ -3902,8 +3906,11 @@ fn scala_import_reference_outcome(
             }
         }
     }
+    // gated upstream: the `fqn_exists` checks in the loop above return `None`
+    // for any workspace-indexed import target, so this is reached only when a
+    // relevant import's declaration is genuinely absent from the index.
     saw_relevant.then(|| {
-        boundary(format!(
+        boundary_unchecked(format!(
             "`{name}` is part of a Scala import whose declaration is not indexed in this workspace"
         ))
     })
@@ -4152,12 +4159,18 @@ fn resolve_scala_focused_qualified_path(
                 "ambiguous_scala_type",
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ),
-            ScalaNameResolution::MissingExplicitImport => boundary(format!(
+            // gated upstream: `MissingExplicitImport` is the resolver's own
+            // verdict that the name is bound by an explicit import whose target
+            // the workspace does not index — the workspace check lives in the
+            // resolver, so this arm cannot fabricate a claim the resolver did not.
+            ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                 "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
             )),
-            ScalaNameResolution::Unresolved if missing_singleton_import => boundary(format!(
-                "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-            )),
+            ScalaNameResolution::Unresolved if missing_singleton_import => {
+                boundary_unchecked(format!(
+                    "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                ))
+            }
             ScalaNameResolution::Unresolved => no_definition(
                 "no_indexed_definition",
                 format!("`{display}` did not resolve to an indexed Scala owner"),
@@ -4419,7 +4432,9 @@ fn resolve_scala_parser_proven_term_role(
                     ScalaQualifiedStableTypeRole::Type
                     | ScalaQualifiedStableTypeRole::Constructor => unreachable!(),
                 },
-                ScalaNameResolution::MissingExplicitImport => boundary(format!(
+                // gated upstream: resolver-verdict arm (workspace check is the
+                // resolver's — see the sibling arm's note above).
+                ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                     "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 )),
                 ScalaNameResolution::Ambiguous => no_definition(
@@ -4442,7 +4457,9 @@ fn resolve_scala_parser_proven_term_role(
                             &display_name,
                             call_site_shape_for_reference(reference.expression).as_ref(),
                         ),
-                        ScalaNameResolution::MissingExplicitImport => boundary(format!(
+                        // gated upstream: resolver-verdict arm (workspace check is
+                        // the resolver's).
+                        ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                             "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                         )),
                         ScalaNameResolution::Ambiguous => no_definition(
@@ -4494,7 +4511,8 @@ fn resolve_scala_parser_proven_term_role(
             name,
             call_site_shape_for_reference(node).as_ref(),
         ),
-        ScalaNameResolution::MissingExplicitImport => boundary(format!(
+        // gated upstream: resolver-verdict arm (workspace check is the resolver's).
+        ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
             "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
         )),
         ScalaNameResolution::Ambiguous => no_definition(
@@ -4512,7 +4530,8 @@ fn resolve_scala_parser_proven_term_role(
                     name,
                     call_site_shape_for_reference(node).as_ref(),
                 ),
-                ScalaNameResolution::MissingExplicitImport => boundary(format!(
+                // gated upstream: resolver-verdict arm (workspace check is the resolver's).
+                ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                     "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 )),
                 ScalaNameResolution::Ambiguous => no_definition(
@@ -5639,14 +5658,19 @@ fn resolve_scala_type(
             )
         })
     });
+    let mut missing_local_import = false;
     match local_import {
         Some(ScalaNameResolution::Resolved(owner)) => {
             return candidates_outcome(vec![owner._declaration]);
         }
         Some(ScalaNameResolution::MissingExplicitImport) => {
-            return boundary(format!(
-                "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
-            ));
+            // Defer the boundary: a local explicit import binds the name but its
+            // declaration is not indexed — yet the enclosing lexical namespace
+            // (the enclosing class's own type, an exact owner-namespace child)
+            // may still resolve it. Run that probe first, exactly as the
+            // non-local sibling below does, and claim a boundary only if it finds
+            // nothing (#1158, restoring the symmetry with the non-local branch).
+            missing_local_import = true;
         }
         Some(ScalaNameResolution::Ambiguous) => {
             return no_definition(
@@ -5674,6 +5698,14 @@ fn resolve_scala_type(
         }
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
+    if missing_local_import {
+        // gated upstream: the enclosing lexical-namespace probe (Stage B) above
+        // already ran and found nothing, exactly as the non-local sibling does
+        // (#1158); only then does the deferred local-import boundary fire.
+        return boundary_unchecked(format!(
+            "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
+        ));
+    }
     if !type_segments.is_empty() {
         match resolver
             .resolve_explicit_owner_segments(&type_segments, scala_type_node_owner_kind(node))
@@ -5681,8 +5713,9 @@ fn resolve_scala_type(
             ScalaNameResolution::Resolved(owner) => {
                 return candidates_outcome(vec![owner._declaration]);
             }
+            // gated upstream: resolver-verdict arm (workspace check is the resolver's).
             ScalaNameResolution::MissingExplicitImport => {
-                return boundary(format!(
+                return boundary_unchecked(format!(
                     "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 ));
             }
@@ -5721,8 +5754,9 @@ fn resolve_scala_type(
                 ScalaNameResolution::Resolved(owner) => {
                     return scala_fqn_outcome(ctx.support, &owner.fqn, text);
                 }
+                // gated upstream: resolver-verdict arm (workspace check is the resolver's).
                 ScalaNameResolution::MissingExplicitImport => {
-                    return boundary(format!(
+                    return boundary_unchecked(format!(
                         "`{intrinsic}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
@@ -5745,12 +5779,16 @@ fn resolve_scala_type(
     if let Some(fqn) = scala_resolve_visible_type_node_after_lexical_miss(ctx, resolver, node) {
         return scala_fqn_outcome(ctx.support, &fqn, text);
     }
-    if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, scala_simple_name(text)) {
-        return boundary(format!(
-            "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+    gated_boundary(
+        || {
+            !scala_import_boundary_for_name(
+                ctx.scala,
+                ctx.support,
+                ctx.file,
+                scala_simple_name(text),
+            )
+        },
+        format!("`{text}` appears to cross a Scala import boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed Scala type"),
     )
@@ -6069,8 +6107,9 @@ fn resolve_scala_call(
                         call_shape.as_ref(),
                     );
                 }
+                // gated upstream: resolver-verdict arm (workspace check is the resolver's).
                 ScalaNameResolution::MissingExplicitImport => {
-                    return boundary(format!(
+                    return boundary_unchecked(format!(
                         "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
@@ -6129,12 +6168,11 @@ fn resolve_scala_call(
                     call_shape.as_ref(),
                 );
             }
-            if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name) {
-                return boundary(format!(
+            gated_boundary(
+                || !scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name),
+                format!(
                     "`{name}` appears to cross a Scala import boundary not indexed in this workspace"
-                ));
-            }
-            no_definition(
+                ),
                 "no_indexed_definition",
                 format!("`{name}` did not resolve to an indexed Scala callable"),
             )
@@ -6331,7 +6369,7 @@ fn resolve_scala_constructor(
             ctx,
             exact_owner,
             &owner_fqn,
-            member,
+            &member,
             call_shape.as_ref(),
         );
     }
@@ -6475,12 +6513,23 @@ fn resolve_java_constructor_from_scala(
     )
 }
 
-fn scala_constructor_member_name(owner_fqn: &str) -> &str {
-    owner_fqn
-        .trim_end_matches('$')
-        .rsplit('.')
-        .next()
-        .unwrap_or(owner_fqn)
+/// The final `.`-joined segment of a Scala-spelled qualified name or import
+/// path, trimming a trailing companion-object `$` suffix first (Scala's
+/// `Companion` segments carry that suffix as part of their own text, per
+/// `SegmentKind::Companion`'s render rule). Scala identifiers never contain a
+/// literal `.`, so re-tokenizing with the shared structured splitter and
+/// taking the last segment reproduces `rsplit('.').next()`'s terminal-segment
+/// split exactly; falls back to the whole (untrimmed) input for a bare name
+/// with no dotted tail.
+fn scala_terminal_segment(path: &str) -> String {
+    let trimmed = path.trim_end_matches('$');
+    crate::analyzer::symbol_lookup::parse_symbol_path(Language::Scala, trimmed)
+        .pop()
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn scala_constructor_member_name(owner_fqn: &str) -> String {
+    scala_terminal_segment(owner_fqn)
 }
 
 fn resolve_scala_field(
@@ -6695,12 +6744,11 @@ fn resolve_scala_stable_identifier(
         }
         return scala_member_not_found(ctx, &owner, member);
     }
-    if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, root_name) {
-        return boundary(format!(
+    gated_boundary(
+        || !scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, root_name),
+        format!(
             "`{root_name}` appears to cross a Scala import boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed Scala definition"),
     )
@@ -6906,7 +6954,9 @@ fn scala_explicit_local_member_import_outcome(
     if !candidates.is_empty() {
         Some(candidates_outcome(candidates))
     } else if matched_local_import {
-        Some(boundary(format!(
+        // gated upstream: reached only after exact-member resolution against the
+        // matched local import found no indexed candidate.
+        Some(boundary_unchecked(format!(
             "`{visible_name}` is imported from a local Scala value whose exact member is unavailable"
         )))
     } else {
@@ -9285,14 +9335,10 @@ fn scala_type_annotation_has_explicit_import(ctx: ScalaLookupCtx<'_>, type_text:
             if import.is_wildcard {
                 return false;
             }
-            let Some(path) = scala_import_path(&import) else {
+            let Some(_path) = scala_import_path(&import) else {
                 return false;
             };
-            let local_name = import
-                .identifier
-                .as_deref()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-            local_name == simple
+            import.local_name() == Some(simple)
         })
 }
 
@@ -9426,11 +9472,7 @@ fn scala_imported_member_shadows_bare_call(
             continue;
         }
 
-        let local_name = import
-            .identifier
-            .as_deref()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-        if local_name != name {
+        if import.local_name() != Some(name) {
             continue;
         }
         for candidate in import_candidate_fq_names(&path, &file_package) {
@@ -9924,7 +9966,12 @@ fn scala_constructor_type_text(value_text: &str) -> Option<&str> {
         return None;
     }
     let type_text = &value[..end];
-    let simple_name = type_text.rsplit('.').next().unwrap_or(type_text);
+    // `type_text` was scanned above as alphanumeric/`_`/`.` only, so `.` is the
+    // only delimiter the shared splitter can find in it; taking its last
+    // segment reproduces `rsplit('.').next()` exactly.
+    let simple_name = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Scala, type_text)
+        .pop()
+        .unwrap_or_else(|| type_text.to_string());
     simple_name
         .chars()
         .next()
@@ -10002,11 +10049,9 @@ fn scala_import_boundary_for_name(
             }
             continue;
         }
-        let local_name = import
-            .identifier
-            .as_deref()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-        if local_name == simple && supportless_scala_import_target_missing(support, &path) {
+        if import.local_name() == Some(simple)
+            && supportless_scala_import_target_missing(support, &path)
+        {
             return true;
         }
     }

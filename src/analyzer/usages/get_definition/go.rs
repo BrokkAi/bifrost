@@ -319,29 +319,25 @@ pub(super) fn resolve_go(
                 // "workspace package namespace", never a boundary claim whose
                 // tail implies it may be outside the workspace (issue #1089 go
                 // cousin: rclone `fs.Debugf`).
-                if go_import_path_is_workspace(support, package) {
-                    return no_definition(
-                        "workspace_package_namespace",
-                        format!(
-                            "`{reference}` names a Go package in this workspace, not a single indexed declaration"
-                        ),
-                    );
-                }
-                return boundary(format!(
-                    "`{reference}` is a Go import namespace rather than an indexed declaration"
-                ));
+                return gated_boundary(
+                    || go_import_path_is_workspace(support, package),
+                    format!(
+                        "`{reference}` is a Go import namespace rather than an indexed declaration"
+                    ),
+                    "workspace_package_namespace",
+                    format!(
+                        "`{reference}` names a Go package in this workspace, not a single indexed declaration"
+                    ),
+                );
             }
             if let Some(outcome) =
                 go_package_selector_chain_outcome(support, package, source, selector)
             {
                 return outcome;
             }
-            if !go_import_path_is_workspace(support, package) {
-                return boundary(format!(
-                    "`{package}` is outside this partial Go workspace analysis"
-                ));
-            }
-            return no_definition(
+            return gated_boundary(
+                || go_import_path_is_workspace(support, package),
+                format!("`{package}` is outside this partial Go workspace analysis"),
                 "no_indexed_definition",
                 format!("`{reference}` is not indexed in Go package `{package}`"),
             );
@@ -351,7 +347,9 @@ pub(super) fn resolve_go(
             .iter()
             .find(|package| !go_import_path_is_workspace(support, package))
         {
-            return boundary(format!(
+            // gated upstream: the `find` predicate is the workspace gate — only a
+            // package that is NOT a workspace import path reaches here.
+            return boundary_unchecked(format!(
                 "`{package}` is outside this partial Go workspace analysis"
             ));
         }
@@ -371,12 +369,9 @@ pub(super) fn resolve_go(
             {
                 return outcome;
             }
-            if !go_import_path_is_workspace(support, import_path) {
-                return boundary(format!(
-                    "`{import_path}` is outside this partial Go workspace analysis"
-                ));
-            }
-            return no_definition(
+            return gated_boundary(
+                || go_import_path_is_workspace(support, import_path),
+                format!("`{import_path}` is outside this partial Go workspace analysis"),
                 "no_indexed_definition",
                 format!("`{name}` is not indexed in Go package `{import_path}`"),
             );
@@ -433,7 +428,9 @@ pub(super) fn resolve_go(
         .into_iter()
         .find(|import_path| !go_import_path_is_workspace(support, import_path))
     {
-        return boundary(format!(
+        // gated upstream: the `find` predicate is the workspace gate — only a
+        // non-workspace dot-import path reaches here.
+        return boundary_unchecked(format!(
             "`{import_path}` is outside this partial Go workspace analysis"
         ));
     }
@@ -752,7 +749,7 @@ fn go_import_paths(
         .import_infos(go, file)
         .into_iter()
         .filter_map(|import| {
-            let local = import.alias.clone().or_else(|| import.identifier.clone())?;
+            let local = import.local_name()?.to_string();
             if local == "_" {
                 return None;
             }
@@ -772,17 +769,12 @@ fn go_structured_import_path(
     {
         return None;
     }
-    let mut rendered = String::new();
     for segment in &path.segments {
         if !support.scope_step() || segment.is_empty() {
             return None;
         }
-        if !rendered.is_empty() {
-            rendered.push('/');
-        }
-        rendered.push_str(segment);
     }
-    Some(rendered)
+    Some(path.render_segments("/"))
 }
 
 fn go_import_path_is_workspace(support: &dyn GoDefinitionProvider, import_path: &str) -> bool {
@@ -2329,6 +2321,18 @@ fn go_resolve_go_field_type_fqn(
     if qualifier.is_some() {
         return go_resolve_qualified_type_from_file(analyzer, support, field_file, type_text);
     }
+    // fqname-M4: this is a plain-string owner/name split (the `FqName` "pop the
+    // last segment" equivalent), but Go's package prefix is `/`-joined and can
+    // itself contain literal `.` (e.g. `github.com`), which is exactly why the
+    // shared M2 shrinking-scope resolver deliberately never reaches Go (see the
+    // ExecPlan's M2 Surprises entry). The generic `parse_symbol_path` splitter
+    // would over-split such a prefix, so it cannot replace this rightmost-`.`
+    // cut. A true structured fix needs the caller to carry the already-resolved
+    // owner `CodeUnit` (its `fq()`/`package_name()` directly) instead of a
+    // pre-flattened `owner_fqn` string threaded through several call sites —
+    // that is a signature change across `go_indexed_field_type_fqn` and
+    // `go_embedded_type_fqns`, not a mechanical one-line rewrite. Revisit
+    // alongside that call chain.
     let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
     go_resolve_type_name_in_package(support, package, name)
 }

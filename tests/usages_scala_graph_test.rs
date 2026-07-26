@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder,
-    UsageHit, UsageHitKind,
+    UsageHit, UsageHitKind, UsageHitSurface,
 };
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, ScalaAnalyzer,
@@ -1734,9 +1734,17 @@ class Container {
         ),
     ] {
         let target = definition(&analyzer, fqn);
-        let targeted = authoritative_scala_hits(&analyzer, &target);
-        let file_major =
-            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000));
+        // Full reference surface: `positive-nearest-applied-callable` is
+        // `CallableWins` invoking its own `appliedCollision`, a self-receiver hit
+        // excluded from the external surface (#1014/#1138). Field reads are
+        // unaffected (never self-receiver).
+        let targeted = authoritative_scala_reference_hits(&analyzer, &target);
+        let file_major = reference_surface_hits(strategy.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
         for target_hits in [&targeted, &file_major] {
             if let Some(marker) = positive {
                 assert_hit_contains(target_hits, marker);
@@ -3530,8 +3538,13 @@ class SenderOverride extends ActorBase {
     ]);
 
     let sender = definition(&analyzer, "app.ActorBase.sender");
-    let sender_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender)));
+    // Full reference surface: `positive-related-override` is `SenderOverride`
+    // calling its own overriding `sender()` — a self-receiver hit now excluded
+    // from the external surface (#1014/#1138). The inherited call and negatives
+    // are unaffected (owned by a supertype / unresolved).
+    let sender_hits = reference_surface_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender)),
+    );
     assert_hit_contains(&sender_hits, "sender() // positive-inherited-call");
     assert_hit_contains(&sender_hits, "sender() // positive-related-override");
     assert_no_hit_contains(&sender_hits, "negative-trait-conflict");
@@ -3539,7 +3552,7 @@ class SenderOverride extends ActorBase {
     assert_no_hit_contains(&sender_hits, "negative-unrelated");
 
     let sender_override = definition(&analyzer, "app.SenderOverride.sender");
-    let override_hits = hits(
+    let override_hits = reference_surface_hits(
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender_override)),
     );
     assert_hit_contains(&override_hits, "sender() // positive-related-override");
@@ -3592,7 +3605,10 @@ fn scala_usage_scan_is_stack_safe_for_deep_lexical_scopes() {
             let (_project, analyzer) =
                 scala_analyzer_with_files(&[("app/Deep.scala", source.as_str())]);
             let target = definition(&analyzer, "app.Deep.ping");
-            let hits = hits(
+            // `ping()` is `Deep`'s own method called from `Deep.run` — a self-receiver
+            // hit now excluded from the external surface (#1014/#1138); read the full
+            // reference surface (this test checks deep-scope stack safety).
+            let hits = reference_surface_hits(
                 UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
             );
             assert_hit_contains(&hits, "ping() // positive-deep-scope");
@@ -3802,8 +3818,12 @@ class Use extends Base {
         ),
     ] {
         let target = definition(&analyzer, target);
-        let target_hits =
-            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        // Full reference surface: the `one`/`two` callers invoke their class's own
+        // override, so these are self-receiver hits excluded from the external
+        // surface (#1014/#1138); this test checks default/override *resolution*.
+        let target_hits = reference_surface_hits(
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+        );
         for marker in expected {
             assert_hit_contains(&target_hits, marker);
         }
@@ -3836,8 +3856,12 @@ class Use extends Base {
         ),
     ] {
         let target = definition(&analyzer, target);
-        let target_hits =
-            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        // Full reference surface so a same-owner *mis*-resolution of the bare call
+        // would surface here rather than being hidden by the external-surface
+        // exclusion (#1014/#1138).
+        let target_hits = reference_surface_hits(
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+        );
         assert_no_hit_contains(&target_hits, marker);
     }
 }
@@ -5944,8 +5968,13 @@ object Use extends Parent {
         ),
     ] {
         let target = definition(&analyzer, target_fqn);
-        let target_hits =
-            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        // Full reference surface: a same-object unqualified call (e.g. the
+        // `contextual(3)` self-call) is a self-receiver hit now excluded from the
+        // external surface (#1014/#1138); this parity check is about the scanner
+        // emitting the forward event, not about external counting.
+        let target_hits = reference_surface_hits(
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+        );
         if !target_hits.iter().any(|hit| hit.snippet.contains(marker)) {
             missing.push((target_fqn, marker, target_hits));
         }
@@ -6045,8 +6074,13 @@ abstract class Use extends FixtureSuite {
         ("parity.TestInboxImpl.ref", "positive-generic-factory-field"),
     ] {
         let target = definition(&analyzer, target_fqn);
-        let target_hits =
-            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        // Full reference surface: several markers are same-object self-calls (e.g.
+        // `Use`'s own `elementProbeFailure`/`serialize`) now excluded from the
+        // external surface (#1014/#1138); this parity check is about the emitted
+        // event shape, not external counting.
+        let target_hits = reference_surface_hits(
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+        );
         if !target_hits.iter().any(|hit| hit.snippet.contains(marker)) {
             missing.push((target_fqn, marker, target_hits));
         }
@@ -6108,7 +6142,11 @@ object Calls:
         ("app.Calls$.knownString", "positive-known-curried-overload"),
     ] {
         let target = definition(&analyzer, target_fqn);
-        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        // Full reference surface: same-object self-calls (`elementProbeFailure`,
+        // `serialize`, `knownString` invoked from within `Calls`) are self-receiver
+        // hits now excluded from the external surface (#1014/#1138); this test
+        // checks completed-curried resolution, not externality.
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
         assert_hit_contains(&target_hits, marker);
     }
 
@@ -6205,8 +6243,13 @@ abstract class Use extends FixtureSuite {
     let (_project, analyzer) = scala_analyzer_with_files(&[("paritynegative/Use.scala", source)]);
 
     let element = definition(&analyzer, "paritynegative.Use.elementProbeFailure");
-    let element_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&element)));
+    // Full reference surface: `positive-exact-owner` is `Use`'s own method called
+    // from within `Use` — a self-receiver hit now excluded from the external
+    // surface (#1014/#1138). The negatives (wrong shape, sibling owner) resolve to
+    // no / a different declaration and stay absent on either surface.
+    let element_hits = reference_surface_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&element)),
+    );
     assert_hit_contains(&element_hits, "positive-exact-owner");
     assert_no_hit_contains(&element_hits, "negative-wrong-call-shape");
     assert_no_hit_contains(&element_hits, "negative-sibling-owner");
@@ -6327,6 +6370,40 @@ fn hits(result: FuzzyResult) -> Vec<UsageHit> {
         .expect("expected usage graph success")
         .into_iter()
         .collect()
+}
+
+/// Every recorded hit on the editor find-references surface, *including* self/this
+/// receiver (same-owner) hits that the default external-usage surface excludes
+/// (#1014 facet B / #1138). Resolution/parity tests assert that the scanner
+/// *produced* an event for a reference — a concern independent of whether that
+/// reference is externally counted — so they read the full surface. The
+/// same-owner exclusion itself is covered by `scan_usages_same_owner_policy`.
+fn reference_surface_hits(result: FuzzyResult) -> Vec<UsageHit> {
+    result
+        .all_hits_for_surface(UsageHitSurface::LspReferences)
+        .into_iter()
+        .collect()
+}
+
+fn authoritative_scala_reference_hits(
+    analyzer: &ScalaAnalyzer,
+    target: &CodeUnit,
+) -> Vec<UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    reference_surface_hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    )
 }
 
 fn authoritative_scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit) -> Vec<UsageHit> {
@@ -7042,8 +7119,15 @@ class Other {
     assert_no_hit_in_enclosing(&field_hits, "pkg.Other.call");
 
     let run = definition(&analyzer, "pkg.Target.run");
-    let run_hits =
-        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+    // Read the full reference surface: `this.run()` and the enclosing-qualified
+    // `Target.this.run()` are self-receiver hits the external surface now excludes
+    // (#1014/#1138); this test verifies owner-context *resolution*, not externality.
+    let run_hits = reference_surface_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    ));
     assert_hit_line(&run_hits, line_of(target_source, "this.run()"));
     assert_hit_line(&run_hits, line_of(target_source, "Target.this.run()"));
     assert_no_hit_line(&run_hits, line_of(target_source, "Other.this.run()"));

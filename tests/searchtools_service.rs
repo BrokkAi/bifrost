@@ -6230,6 +6230,51 @@ class Service:
 }
 
 #[test]
+fn scan_usages_by_location_keeps_python_class_annotation_references() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/shop/models.py",
+            "from dataclasses import dataclass\n\n@dataclass\nclass User:\n    name: str\n\n    @property\n    def normalized_name(self) -> str:\n        return self.name.lower()\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls(\"guest\")\n\n    @staticmethod\n    def format_name(name: str) -> str:\n        return name.title()\n",
+        )
+        .file("src/shop/__init__.py", "from .models import User as Account\n")
+        .file(
+            "tests/test_models.py",
+            "from shop import Account\nuser = Account.guest()\nAccount.format_name(\"ada\")\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"src/shop/models.py","line":4,"column":7}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("shop.models.User", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(3, result["total_hits"], "payload: {value}");
+    assert!(
+        result["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .any(|file| {
+                file["path"] == "src/shop/models.py"
+                    && file["hits"].as_array().into_iter().flatten().any(|hit| {
+                        hit["snippet"]
+                            .as_str()
+                            .is_some_and(|snippet| snippet.contains(r#"-> "User""#))
+                    })
+            }),
+        "quoted return annotation must remain an external class usage: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_requires_symbols() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
 
@@ -8264,6 +8309,18 @@ impl Service {
     assert_eq!(vec![3, 4, 5], lines, "payload: {value}");
 }
 
+// #1139: `RustAnalyzer` previously never implemented
+// `IAnalyzer::lookup_candidates_by_identifier` (silently falling back to the
+// empty default), so a bare terminal module segment like `desired` never saw
+// the same-named nested module `unrelated::desired` as a same-identifier
+// candidate and resolved uniquely to the top-level module by accident. Now
+// that the identifier index is wired up for Rust (matching every other
+// language), `desired` correctly ambiguates between the two same-terminal-
+// identifier modules per #1057's bare-name semantics, exactly as a bare
+// field or function name would. This test now pins that ambiguity and proves
+// the two modules' usages still are not conflated: re-calling with the
+// qualified `unrelated.desired` candidate resolves to only the nested
+// module's usage.
 #[test]
 fn scan_usages_by_reference_finds_exact_rust_module_path_segment() {
     let project = InlineTestProject::with_language(Language::Rust)
@@ -8297,6 +8354,27 @@ pub fn consume() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
+    let usage = only_result(&value);
+    assert_eq!("ambiguous", usage["status"], "payload: {value}");
+    let candidates: Vec<&str> = usage["candidate_targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap())
+        .collect();
+    assert!(
+        candidates.contains(&"desired") && candidates.contains(&"unrelated.desired"),
+        "payload: {value}"
+    );
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["unrelated.desired"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
     assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
     let usage = only_result(&value);
     assert_eq!(1, usage["total_hits"].as_u64().unwrap(), "payload: {value}");
@@ -8305,7 +8383,7 @@ pub fn consume() {
     assert_eq!("lib.rs", files[0]["path"], "payload: {value}");
     let hits = files[0]["hits"].as_array().unwrap();
     assert_eq!(1, hits.len(), "payload: {value}");
-    assert_eq!(11, hits[0]["line"], "payload: {value}");
+    assert_eq!(12, hits[0]["line"], "payload: {value}");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -144,6 +144,70 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         })
 }
 
+/// Resolve a class reference written in a structured Python annotation.
+///
+/// Only AST nodes that occur inside a function return type, parameter type, or
+/// annotated-assignment type are considered. In particular, string contents are
+/// accepted only in those annotation positions; arbitrary string literals are
+/// never interpreted as type expressions.
+pub(in crate::analyzer::usages) fn annotation_reference_candidates(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    target_self_file: bool,
+) -> Option<Vec<CodeUnit>> {
+    if !is_annotation_reference_node(node) {
+        return None;
+    }
+    eprintln!("ANNOTATION {:?} {:?}", node.kind(), node_text(node, source));
+
+    let mut candidates = match node.kind() {
+        "identifier" | "string_content" => resolve_receiver_type(
+            analyzer,
+            py,
+            file,
+            node_text(node, source),
+            target_self_file,
+        )
+        .into_iter()
+        .collect(),
+        "attribute" => resolve_constructor_types(analyzer, py, file, source, node),
+        _ => Vec::new(),
+    };
+    candidates.sort();
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn is_annotation_reference_node(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "attribute" | "string_content") {
+        return false;
+    }
+
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let annotation = match parent.kind() {
+            "function_definition" => parent.child_by_field_name("return_type"),
+            "typed_parameter" | "typed_default_parameter" | "assignment" => {
+                parent.child_by_field_name("type")
+            }
+            _ => None,
+        };
+        if let Some(annotation) = annotation
+            && annotation.start_byte() <= start
+            && end <= annotation.end_byte()
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 /// Resolve the class constructed by a Python call callee without interpreting
 /// source text. Bare callees use the import binder or same-file declarations;
 /// qualified callees walk tree-sitter's `attribute` fields back to a namespace
@@ -223,7 +287,7 @@ fn namespace_constructor_fqn(
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn resolve_indexed_receiver_type(
@@ -325,9 +389,20 @@ pub(super) fn receiver_annotation_matches_target(
         return target_self_file || edges.iter().any(|edge| edge.local_name == target_short);
     }
 
-    let Some((qualifier, member)) = annotation.rsplit_once('.') else {
+    // `annotation` was already filtered above to exclude generics/unions/calls, so
+    // it is a bare dotted qualifier (Python identifiers never embed a literal
+    // `.`); re-tokenizing with the shared structured splitter and rejoining
+    // every part but the last with `.` reproduces `rsplit_once('.')`'s
+    // (qualifier, member) split exactly.
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, annotation);
+    let Some((member, qualifier_parts)) = segments.split_last() else {
         return false;
     };
+    if qualifier_parts.is_empty() {
+        return false;
+    }
+    let qualifier = qualifier_parts.join(".");
+    let member = member.as_str();
     if member != target_short {
         return false;
     }

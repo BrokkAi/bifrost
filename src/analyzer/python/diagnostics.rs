@@ -2,6 +2,7 @@ use crate::analyzer::semantic_diagnostics::{
     ScopeStack, contains_node, node_range, node_text, same_node,
 };
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{
     GlobalUsageDefinitionIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer,
     Range, SemanticDiagnostic, resolve_analyzer,
@@ -365,20 +366,12 @@ fn has_module_getattr(source: &str, root: Node<'_>) -> bool {
 }
 
 fn has_dynamic_namespace_call(source: &str, root: Node<'_>) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call"
-            && let Some(function) = node.child_by_field_name("function")
-            && is_dynamic_function(function, source)
-        {
-            return true;
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    false
+    subtree_contains(root, |node| {
+        node.kind() == "call"
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|function| is_dynamic_function(function, source))
+    })
 }
 
 fn is_dynamic_function(node: Node<'_>, source: &str) -> bool {

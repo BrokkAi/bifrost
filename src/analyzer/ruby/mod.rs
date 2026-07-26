@@ -188,6 +188,7 @@ impl RubyAnalyzer {
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let Some(identifier) = fqn
+            // fqname-M4: leaf identifier of a `&str` fqn parameter (no CodeUnit/fq at this query boundary)
             .rsplit(['.', '$'])
             .next()
             .filter(|name| !name.is_empty())
@@ -410,6 +411,16 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
+    }
+
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
+        self.inner
+            .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {

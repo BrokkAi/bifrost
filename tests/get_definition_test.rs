@@ -9217,6 +9217,43 @@ export function Item({ provider }: Props) {
 }
 
 #[test]
+fn javascript_local_schema_builder_object_member_resolves_to_definition() {
+    // Parity with the TS schema-builder resolution above (issue #1167, gap 3):
+    // a `z.object({...})`-shaped local binding gets shape-preserving field
+    // indexing in JS too, so a same-file member access resolves to the field.
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "schema.js",
+            r#"
+const LocalSchema = z.object({
+  isEnabled: z.boolean(),
+})
+
+export function check() {
+  return LocalSchema.isEnabled
+}
+"#,
+        )
+        .build();
+
+    let line = "  return LocalSchema.isEnabled";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"schema.js","line":7,"column":{}}}]}}"#,
+            column_of(line, "isEnabled")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "schema.js.LocalSchema.isEnabled",
+        "{value}"
+    );
+}
+
+#[test]
 fn typescript_call_initialized_local_member_resolves_to_returned_object_property() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -17033,6 +17070,101 @@ fn csharp_chained_extension_method_call_resolves_forward() {
         value["results"][0]["definitions"][0]["fqn"], "Demo.HandlerExtensions.Tag",
         "chained extension call should resolve to the extension method by reference: {value}"
     );
+}
+
+// The canonical usagebench `csharp-parity-extension-method-call` shape uses an
+// unindexed BCL receiver: a property and an interface method both produce
+// `string`, then invoke the same `Tag(this string)` extension. Keep the
+// incompatible `Tag(this int)` overload so this proves we retained precise type
+// evidence rather than treating an unindexed receiver as a wildcard.
+#[test]
+fn csharp_bcl_extension_receivers_resolve_forward() {
+    let handlers = r#"namespace Example.Parity {
+    public interface IHandler {
+        string Handle(string name);
+    }
+    public sealed partial class EventRecord {
+        public string Name { get; }
+        public EventRecord(string name) { Name = name; }
+    }
+    public static class StringExtensions {
+        public static string Tag(this string value) { return $"tag:{value}"; }
+    }
+    public static class IntExtensions {
+        public static string Tag(this int value) { return value.ToString(); }
+    }
+}
+"#;
+    let consumers = r#"namespace Example.Parity {
+    public sealed partial class EventRecord {
+        public string Label() {
+            return Name.Tag();
+        }
+    }
+    public static class ParityConsumer {
+        public static string Run(IHandler handler) {
+            return handler.Handle("Ada").Tag();
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Handlers.cs", handlers)
+        .file("src/Consumers.cs", consumers)
+        .build();
+
+    let direct = consumers.find("Name.Tag()").expect("direct extension call") + "Name.".len();
+    let chained = consumers
+        .find("handler.Handle(\"Ada\").Tag()")
+        .expect("chained extension call")
+        + "handler.Handle(\"Ada\").".len();
+    for (label, offset) in [("direct", direct), ("chained", chained)] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/Consumers.cs", consumers, offset),
+        );
+        let definitions = value["results"][0]["definitions"]
+            .as_array()
+            .expect("resolved result should include definitions");
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{label}: {value}"
+        );
+        assert_eq!(definitions.len(), 1, "{label}: {value}");
+        assert_eq!(
+            definitions[0]["fqn"], "Example.Parity.StringExtensions.Tag",
+            "{label}: {value}"
+        );
+    }
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [
+                {
+                    "symbol": "Label",
+                    "context": "return Name.Tag();",
+                    "target": "Tag"
+                },
+                {
+                    "symbol": "Run",
+                    "context": "return handler.Handle(\"Ada\").Tag();",
+                    "target": "Tag"
+                }
+            ]
+        })
+        .to_string(),
+    );
+    for (label, result) in [
+        ("direct reference", &value["results"][0]),
+        ("chained reference", &value["results"][1]),
+    ] {
+        assert_eq!(result["status"], "resolved", "{label}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "Example.Parity.StringExtensions.Tag",
+            "{label}: {value}"
+        );
+    }
 }
 
 // A three-link chain `a.Handle(..).Wrap().Tag()` where every intermediate call is

@@ -15,11 +15,15 @@ use std::sync::OnceLock;
 
 use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
 
-const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[SchemaVersionDescriptor::new(
-    SCHEMA_VERSION as u32,
-    None,
-    true,
-)];
+const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
+const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
+    SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
+    SchemaVersionDescriptor::new(
+        SCHEMA_VERSION as u32,
+        Some(RQL_INITIAL_SCHEMA_VERSION),
+        true,
+    ),
+];
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -28,6 +32,17 @@ pub(crate) fn rql_schema_version_registry() -> &'static SchemaVersionRegistry {
         SchemaVersionRegistry::new(RQL_SCHEMA_VERSIONS)
             .expect("the compiled-in RQL schema lineage must be valid")
     })
+}
+
+pub(super) const fn oldest_rql_schema_version() -> u64 {
+    RQL_SCHEMA_VERSIONS[0].version as u64
+}
+
+pub(crate) fn supported_query_schema_versions() -> Vec<u64> {
+    RQL_SCHEMA_VERSIONS
+        .iter()
+        .map(|descriptor| descriptor.version as u64)
+        .collect()
 }
 
 pub(crate) fn resolve_rql_schema_version(
@@ -157,11 +172,23 @@ impl CodeQueryExecutionMode {
     }
 }
 
+macro_rules! minimum_schema_version {
+    () => {
+        RQL_INITIAL_SCHEMA_VERSION as u64
+    };
+    ($version:literal) => {
+        $version
+    };
+}
+
 macro_rules! query_step_ops {
     ($($variant:ident {
         label: $label:literal,
         signature: $signature:literal,
-        description: $description:literal $(,)?
+        description: $description:literal
+        $(, semantic: [$($semantic:ident),*])?
+        $(, since: $since:literal)?
+        $(,)?
     })+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum QueryStepOp {
@@ -198,6 +225,18 @@ macro_rules! query_step_ops {
                 }
             }
 
+            pub const fn minimum_schema_version(self) -> u64 {
+                match self {
+                    $(Self::$variant => minimum_schema_version!($($since)?),)+
+                }
+            }
+
+            pub const fn semantic_facets(self) -> &'static [QuerySemanticFacet] {
+                match self {
+                    $(Self::$variant => &[$($(QuerySemanticFacet::$semantic),*)?],)+
+                }
+            }
+
             pub fn allows_hierarchy_options(self) -> bool {
                 matches!(self, Self::Supertypes | Self::Subtypes)
             }
@@ -224,9 +263,23 @@ macro_rules! query_step_ops {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuerySemanticFacet {
+    Procedures,
+    ProgramPoints,
+    ControlEdges,
+}
+
 query_step_ops! {
     EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    ProcedureOf { label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures], since: 3, }
+    CfgEntry { label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints], since: 3, }
+    CfgExits { label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints], since: 3, }
+    CfgSuccessorEdges { label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
+    CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
+    CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
+    CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -246,13 +299,43 @@ query_step_ops! {
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
 }
 
+macro_rules! rql_form_description {
+    ($description:literal) => {
+        $description
+    };
+    (($step:path)) => {
+        $step.description()
+    };
+}
+
+macro_rules! rql_form_step {
+    () => {
+        None
+    };
+    ($step:ident) => {
+        Some(QueryStepOp::$step)
+    };
+}
+
+macro_rules! rql_form_minimum_schema_version {
+    ($step:ident $(, $since:literal)?) => {
+        QueryStepOp::$step.minimum_schema_version()
+    };
+    ($(, $since:literal)?) => {
+        minimum_schema_version!($($since)?)
+    };
+}
+
 macro_rules! rql_forms {
     ($($variant:ident {
         labels: [$primary:literal $(, $alias:literal)* $(,)?],
         class: $class:ident,
         shape: $shape:ident,
         signature: $signature:literal,
-        description: $description:literal $(,)?
+        description: $description:tt
+        $(, step: $step:ident)?
+        $(, since: $since:literal)?
+        $(,)?
     })+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum RqlForm {
@@ -303,7 +386,19 @@ macro_rules! rql_forms {
 
             pub fn description(self) -> &'static str {
                 match self {
-                    $(Self::$variant => $description,)+
+                    $(Self::$variant => rql_form_description!($description),)+
+                }
+            }
+
+            pub const fn minimum_schema_version(self) -> u64 {
+                match self {
+                    $(Self::$variant => rql_form_minimum_schema_version!($($step)? $(, $since)?),)+
+                }
+            }
+
+            pub const fn query_step_op(self) -> Option<QueryStepOp> {
+                match self {
+                    $(Self::$variant => rql_form_step!($($step)?),)+
                 }
             }
 
@@ -326,6 +421,13 @@ macro_rules! rql_forms {
                     | Self::Intersect
                     | Self::Except
                     | Self::EnclosingDecl
+                    | Self::ProcedureOf
+                    | Self::CfgEntry
+                    | Self::CfgExits
+                    | Self::CfgSuccessorEdges
+                    | Self::CfgPredecessorEdges
+                    | Self::CfgEdgeSource
+                    | Self::CfgEdgeTarget
                     | Self::FileOf
                     | Self::ImportsOf
                     | Self::ImportersOf
@@ -440,133 +542,208 @@ rql_forms! {
         class: Wrapper,
         shape: Query,
         signature: "(enclosing-decl query)",
-        description: "Return the smallest real declaration enclosing each structural match.",
+        description: (QueryStepOp::EnclosingDecl),
+        step: EnclosingDecl,
+    }
+    ProcedureOf {
+        labels: ["procedure-of", "procedure_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(procedure-of query)",
+        description: (QueryStepOp::ProcedureOf),
+        step: ProcedureOf,
+    }
+    CfgEntry {
+        labels: ["cfg-entry", "cfg_entry"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-entry query)",
+        description: (QueryStepOp::CfgEntry),
+        step: CfgEntry,
+    }
+    CfgExits {
+        labels: ["cfg-exits", "cfg_exits"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-exits query)",
+        description: (QueryStepOp::CfgExits),
+        step: CfgExits,
+    }
+    CfgSuccessorEdges {
+        labels: ["cfg-successor-edges", "cfg_successor_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-successor-edges query)",
+        description: (QueryStepOp::CfgSuccessorEdges),
+        step: CfgSuccessorEdges,
+    }
+    CfgPredecessorEdges {
+        labels: ["cfg-predecessor-edges", "cfg_predecessor_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-predecessor-edges query)",
+        description: (QueryStepOp::CfgPredecessorEdges),
+        step: CfgPredecessorEdges,
+    }
+    CfgEdgeSource {
+        labels: ["cfg-edge-source", "cfg_edge_source"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-edge-source query)",
+        description: (QueryStepOp::CfgEdgeSource),
+        step: CfgEdgeSource,
+    }
+    CfgEdgeTarget {
+        labels: ["cfg-edge-target", "cfg_edge_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-edge-target query)",
+        description: (QueryStepOp::CfgEdgeTarget),
+        step: CfgEdgeTarget,
     }
     FileOf {
         labels: ["file-of"],
         class: Wrapper,
         shape: Query,
         signature: "(file-of query)",
-        description: "Return the workspace file containing each structural match, declaration, reference site, call site, expression site, or receiver analysis.",
+        description: (QueryStepOp::FileOf),
+        step: FileOf,
     }
     ImportsOf {
         labels: ["imports-of"],
         class: Wrapper,
         shape: Query,
         signature: "(imports-of query)",
-        description: "Return files directly imported by each input file.",
+        description: (QueryStepOp::ImportsOf),
+        step: ImportsOf,
     }
     ImportersOf {
         labels: ["importers-of"],
         class: Wrapper,
         shape: Query,
         signature: "(importers-of query)",
-        description: "Return files that directly import each input file.",
+        description: (QueryStepOp::ImportersOf),
+        step: ImportersOf,
     }
     Supertypes {
         labels: ["supertypes"],
         class: Wrapper,
         shape: Query,
         signature: "(supertypes [:depth count | :transitive true] query)",
-        description: "Return indexed direct, depth-bounded, or transitive supertypes.",
+        description: (QueryStepOp::Supertypes),
+        step: Supertypes,
     }
     Subtypes {
         labels: ["subtypes"],
         class: Wrapper,
         shape: Query,
         signature: "(subtypes [:depth count | :transitive true] query)",
-        description: "Return indexed direct, depth-bounded, or transitive subtypes.",
+        description: (QueryStepOp::Subtypes),
+        step: Subtypes,
     }
     Members {
         labels: ["members"],
         class: Wrapper,
         shape: Query,
         signature: "(members query)",
-        description: "Return direct indexed member declarations of each input type.",
+        description: (QueryStepOp::Members),
+        step: Members,
     }
     Owner {
         labels: ["owner"],
         class: Wrapper,
         shape: Query,
         signature: "(owner query)",
-        description: "Return the exact indexed declaring type of each input member.",
+        description: (QueryStepOp::Owner),
+        step: Owner,
     }
     ReferencesOf {
         labels: ["references-of"],
         class: Wrapper,
         shape: Query,
         signature: "(references-of [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
-        description: "Return exact resolved reference sites for each input declaration.",
+        description: (QueryStepOp::ReferencesOf),
+        step: ReferencesOf,
     }
     UsedBy {
         labels: ["used-by"],
         class: Wrapper,
         shape: Query,
         signature: "(used-by [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
-        description: "Return exact declarations containing references to each input declaration.",
+        description: (QueryStepOp::UsedBy),
+        step: UsedBy,
     }
     Uses {
         labels: ["uses"],
         class: Wrapper,
         shape: Query,
         signature: "(uses [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
-        description: "Return exact indexed declarations referenced by each input declaration.",
+        description: (QueryStepOp::Uses),
+        step: Uses,
     }
     Callers {
         labels: ["callers"],
         class: Wrapper,
         shape: Query,
         signature: "(callers [:depth count] [:proof proven|unproven] query)",
-        description: "Traverse incoming calls to caller declarations with a finite depth bound.",
+        description: (QueryStepOp::Callers),
+        step: Callers,
     }
     Callees {
         labels: ["callees"],
         class: Wrapper,
         shape: Query,
         signature: "(callees [:depth count] [:proof proven|unproven] query)",
-        description: "Traverse outgoing calls to callee declarations with a finite depth bound.",
+        description: (QueryStepOp::Callees),
+        step: Callees,
     }
     CallSitesTo {
         labels: ["call-sites-to", "call_sites_to"],
         class: Wrapper,
         shape: Query,
         signature: "(call-sites-to [:proof proven|unproven] query)",
-        description: "Return structured incoming call sites for each declaration.",
+        description: (QueryStepOp::CallSitesTo),
+        step: CallSitesTo,
     }
     CallSitesFrom {
         labels: ["call-sites-from", "call_sites_from"],
         class: Wrapper,
         shape: Query,
         signature: "(call-sites-from [:proof proven|unproven] query)",
-        description: "Return structured outgoing call sites for each declaration.",
+        description: (QueryStepOp::CallSitesFrom),
+        step: CallSitesFrom,
     }
     CallInput {
         labels: ["call-input", "call_input"],
         class: Wrapper,
         shape: Query,
         signature: "(call-input (:receiver true | :parameter-index index | :parameter-name name) query)",
-        description: "Project the receiver or one formal parameter's direct argument expressions.",
+        description: (QueryStepOp::CallInput),
+        step: CallInput,
     }
     ReceiverTargets {
         labels: ["receiver-targets", "receiver_targets"],
         class: Wrapper,
         shape: Query,
         signature: "(receiver-targets [:capture name] query)",
-        description: "Analyze bounded receiver values at structural or semantic source sites.",
+        description: (QueryStepOp::ReceiverTargets),
+        step: ReceiverTargets,
     }
     PointsTo {
         labels: ["points-to", "points_to"],
         class: Wrapper,
         shape: Query,
         signature: "(points-to [:capture name] query)",
-        description: "Analyze bounded value and allocation provenance at source expressions.",
+        description: (QueryStepOp::PointsTo),
+        step: PointsTo,
     }
     MemberTargets {
         labels: ["member-targets", "member_targets"],
         class: Wrapper,
         shape: Query,
         signature: "(member-targets [:capture name] query)",
-        description: "Resolve exact member declarations through an analyzed receiver.",
+        description: (QueryStepOp::MemberTargets),
+        step: MemberTargets,
     }
     Name {
         labels: ["name"],
@@ -891,11 +1068,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_two_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_version_three_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 2,
+                version: 3,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -906,10 +1083,17 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             }
         );
+        assert_eq!(
+            resolve_rql_schema_version(Some(3)).unwrap(),
+            SchemaVersionResolution {
+                version: 3,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2]);
+        assert_eq!(error.supported, vec![2, 3]);
     }
 
     #[test]
@@ -918,6 +1102,7 @@ mod tests {
         for form in ALL_RQL_FORMS {
             assert!(!form.signature().is_empty());
             assert!(!form.description().is_empty());
+            assert!((2..=SCHEMA_VERSION).contains(&form.minimum_schema_version()));
             for label in form.labels() {
                 assert!(forms.insert(*label), "duplicate form label {label}");
                 assert_eq!(RqlForm::from_label(label), Some(*form));
@@ -929,7 +1114,33 @@ mod tests {
             assert!(step_ops.insert(op.label()), "duplicate query step op");
             assert!(!op.signature().is_empty());
             assert!(!op.description().is_empty());
+            assert!((2..=SCHEMA_VERSION).contains(&op.minimum_schema_version()));
             assert_eq!(QueryStepOp::from_label(op.label()), Some(*op));
+        }
+        for form in ALL_RQL_FORMS {
+            let Some(op) = form.query_step_op() else {
+                continue;
+            };
+            assert_eq!(form.description(), op.description());
+            assert_eq!(form.minimum_schema_version(), op.minimum_schema_version());
+            assert_eq!(
+                ALL_RQL_FORMS
+                    .iter()
+                    .filter(|candidate| candidate.query_step_op() == Some(op))
+                    .count(),
+                1,
+                "query step {} must have exactly one RQL wrapper",
+                op.label()
+            );
+        }
+        for op in ALL_QUERY_STEP_OPS {
+            assert!(
+                ALL_RQL_FORMS
+                    .iter()
+                    .any(|form| form.query_step_op() == Some(*op)),
+                "query step {} is missing an RQL wrapper",
+                op.label()
+            );
         }
 
         let mut properties = HashSet::new();

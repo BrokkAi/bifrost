@@ -138,8 +138,5 @@ pub(crate) fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<Str
 }
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim()
+    crate::analyzer::common::node_source_text_trimmed(node, source)
 }

@@ -18,9 +18,10 @@
 //! where the forward scan matches one target it resolves the reference's callee.
 
 use super::extractor::{
-    for_each_var_spec, is_definition_identifier, is_identifier_node, lhs_identifier_slots,
-    parameter_names, receiver_symbol_from_qualifier, rhs_expressions, selector_parts,
-    type_ref_from_node, var_spec_names,
+    SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
+    is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
+    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
+    var_spec_names,
 };
 use super::resolver::{GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text};
 use crate::analyzer::usages::inverted_edges::{
@@ -156,6 +157,13 @@ impl FileScan<'_, '_> {
             .record_unproven_name(name, node.start_byte(), node.end_byte());
     }
 
+    /// Record a resolved callee as unproven inbound (rather than a proven edge):
+    /// used for same-owner receiver calls (#1138).
+    fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
+        self.collector
+            .record_unproven(callee, node.start_byte(), node.end_byte());
+    }
+
     fn has_node(&self, node: &String) -> bool {
         self.collector.contains_node(node)
     }
@@ -191,7 +199,9 @@ fn scan_node(
             locals.exit_scope();
             return;
         }
-        "parameter_declaration" => seed_parameter_declaration(node, ctx, locals),
+        "parameter_declaration" => {
+            seed_parameter_declaration(node, ctx, locals, is_method_receiver_parameter(node));
+        }
         "const_declaration" if is_top_level_declaration(node) => {
             scan_top_level_value_initializers(node, ctx);
         }
@@ -328,16 +338,27 @@ fn scan_selector(
     let receiver = receiver_symbol_from_qualifier(&qualifier);
     let receiver_resolution = locals.resolve_symbol(receiver);
     if let Some(types) = receiver_resolution.as_precise() {
+        // A call through the enclosing method's own receiver variable is a
+        // same-owner site (#1138): route its resolved callees to unproven inbound
+        // rather than proven edges. A call through another owner-typed value stays
+        // external.
+        let same_owner = types.iter().any(|type_fqn| type_fqn == SELF_RECEIVER_TOKEN);
         let callees: Vec<String> = types
             .iter()
             .flat_map(|type_fqn| ctx.member_callees(type_fqn, &field))
             .collect();
-        if callees.is_empty() && types.iter().all(|type_fqn| !ctx.has_node(type_fqn)) {
-            ctx.record_unproven(&field, field_node);
+        if callees.is_empty() {
+            if same_owner || types.iter().all(|type_fqn| !ctx.has_node(type_fqn)) {
+                ctx.record_unproven(&field, field_node);
+            }
             return;
         }
         for callee in callees {
-            ctx.record(callee, field_node);
+            if same_owner {
+                ctx.record_unproven_callee(callee, field_node);
+            } else {
+                ctx.record(callee, field_node);
+            }
         }
         return;
     }
@@ -385,15 +406,33 @@ fn seed_parameters(
     ctx: &FileScan<'_, '_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
+    // Mark the method's own receiver variable as the same-owner receiver (Go has
+    // no `self`/`this`; `func (s *T) f() { s.g() }` calls siblings through `s`).
+    // Ported from the forward scan (extractor.rs) so `s.g()` routes to unproven
+    // inbound (#1138) while `other.g()` — another `*T` value — stays external.
+    if node.kind() == "method_declaration"
+        && let Some(receiver) = node.child_by_field_name("receiver")
+    {
+        seed_parameter_list(receiver, ctx, locals, true);
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "parameter_list" {
-            let mut params = child.walk();
-            for param in child.named_children(&mut params) {
-                if param.kind() == "parameter_declaration" {
-                    seed_parameter_declaration(param, ctx, locals);
-                }
-            }
+            seed_parameter_list(child, ctx, locals, false);
+        }
+    }
+}
+
+fn seed_parameter_list(
+    node: Node<'_>,
+    ctx: &FileScan<'_, '_>,
+    locals: &mut LocalInferenceEngine<String>,
+    is_method_receiver: bool,
+) {
+    let mut params = node.walk();
+    for param in node.named_children(&mut params) {
+        if param.kind() == "parameter_declaration" {
+            seed_parameter_declaration(param, ctx, locals, is_method_receiver);
         }
     }
 }
@@ -402,13 +441,23 @@ fn seed_parameter_declaration(
     node: Node<'_>,
     ctx: &FileScan<'_, '_>,
     locals: &mut LocalInferenceEngine<String>,
+    is_method_receiver: bool,
 ) {
     let names = parameter_names(node, ctx.source);
-    let tokens = node
+    let mut tokens = node
         .child_by_field_name("type")
         .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
         .map(|ty| ctx.type_tokens(&ty))
         .unwrap_or_default();
+    // Tag the receiver variable so `recv.member` is recognized as same-owner in
+    // `scan_selector`. Only when the receiver type resolved to a workspace type
+    // (otherwise the name is a shadow with no callable siblings to route).
+    if is_method_receiver
+        && !tokens.is_empty()
+        && !tokens.iter().any(|token| token == SELF_RECEIVER_TOKEN)
+    {
+        tokens.push(SELF_RECEIVER_TOKEN.to_string());
+    }
     seed_or_shadow(names, tokens, locals);
 }
 

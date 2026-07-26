@@ -9,19 +9,21 @@ use crate::analyzer::lexical_definitions::FormalVariadicKind;
 use crate::hash::HashMap;
 use tree_sitter::Node;
 
-use super::cfg::{ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
+use super::cfg::{
+    CleanupRegionId, CompletionRoute, DriveError, ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
+};
 use super::{
-    AllocationId, AllocationKind, AllocationSite, ArgumentDomain, CallContinuationKind, CallSiteId,
-    CallableTargetResolution, CancellationToken, CaptureBinding, CaptureId, CaptureMode,
-    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, DeclarationSegment,
-    DeclarationSegmentKind, Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity,
-    MemoryAccessKind, MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId,
-    ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
-    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
-    SemanticGap, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
-    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
-    SourceMappingKind, SourcePosition, SourceSpan, ValueId,
+    AllocationId, AllocationKind, AllocationSite, ArgumentDomain, AsyncResumeKind,
+    CallContinuationKind, CallSiteId, CallableTargetResolution, CancellationToken, CaptureBinding,
+    CaptureId, CaptureMode, CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind,
+    Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity, MemoryAccessKind,
+    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts,
+    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument,
+    SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
+    SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
+    SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
+    SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
+    SourceSpan, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -93,6 +95,16 @@ pub(crate) fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option
     source.get(node.byte_range())
 }
 
+/// [`node_text`] filtered to reject the empty string, so a name-bearing node
+/// that spans zero bytes (or an out-of-range slice) is treated as absent.
+/// Shared by every per-language semantic lowering module.
+pub(crate) fn nonempty_node_text<'source>(
+    source: &'source str,
+    node: Node<'_>,
+) -> Option<&'source str> {
+    node_text(source, node).filter(|text| !text.is_empty())
+}
+
 /// Collect children associated with one structured tree-sitter field.
 pub(crate) fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
     let mut cursor = node.walk();
@@ -132,96 +144,6 @@ pub(crate) const fn formal_multiplicity(
         Some(FormalVariadicKind::Both) => {
             FormalMultiplicity::Rest(ArgumentDomain::PositionalOrKeyword)
         }
-    }
-}
-
-/// One node in the persistent declaration path assembled while adapters walk
-/// nested syntax iteratively.
-///
-/// Adapters decide which syntax introduces a declaration segment; this shared
-/// representation owns the language-neutral path mechanics used after that
-/// decision.
-pub(crate) struct DeclarationPathEntry {
-    pub(crate) parent: Option<usize>,
-    pub(crate) segment: DeclarationSegment,
-}
-
-pub(crate) fn push_declaration_path(
-    paths: &mut Vec<DeclarationPathEntry>,
-    parent: usize,
-    segment: DeclarationSegment,
-) -> usize {
-    let id = paths.len();
-    paths.push(DeclarationPathEntry {
-        parent: Some(parent),
-        segment,
-    });
-    id
-}
-
-pub(crate) fn collect_declaration_path(
-    paths: &[DeclarationPathEntry],
-    mut path: usize,
-) -> Vec<DeclarationSegment> {
-    let mut segments = Vec::new();
-    loop {
-        let entry = &paths[path];
-        segments.push(entry.segment.clone());
-        let Some(parent) = entry.parent else {
-            break;
-        };
-        path = parent;
-    }
-    segments.reverse();
-    segments
-}
-
-pub(crate) fn next_sibling_ordinal(
-    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
-    scope: usize,
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-) -> u32 {
-    let key = (scope, kind, name.map(Box::<str>::from));
-    let next = siblings.entry(key).or_default();
-    let ordinal = *next;
-    *next += 1;
-    ordinal
-}
-
-pub(crate) fn declaration_segment(
-    kind: DeclarationSegmentKind,
-    name: Option<&str>,
-    anchor: SourceAnchor,
-    sibling_ordinal: u32,
-) -> Result<DeclarationSegment, String> {
-    match name {
-        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
-            .map_err(|error| error.to_string()),
-        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
-    }
-}
-
-/// Work retained for the shared procedure identity rows created by
-/// [`ProcedureLoweringSession::start`]. Adapters use the same calculation to
-/// reject an enumeration before retaining an unbounded locator path.
-pub(crate) fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
-    let segments = locator.declaration().segments();
-    let locator_text = locator.path().as_str().len().saturating_add(
-        segments
-            .iter()
-            .filter_map(|segment| segment.name())
-            .fold(0usize, |total, name| total.saturating_add(name.len())),
-    );
-    SemanticWork {
-        procedures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        // Two empty adjacency offset arrays, one evidence source, and three
-        // retained locator copies (procedure, locator index, source mapping).
-        nested_entries: 3usize.saturating_add(segments.len().saturating_mul(3)),
-        owned_text_bytes: locator_text.saturating_mul(3),
-        ..SemanticWork::default()
     }
 }
 
@@ -301,10 +223,386 @@ where
     })
 }
 
+/// Drive one adapter's opaque work items, seal detached source regions, and
+/// freeze the completed procedure.
+///
+/// The adapter owns the work-item type and step function. This helper owns the
+/// identical cancellation, budget, and finalization policy used after syntax
+/// has already been classified.
+pub(crate) fn drive_and_finish_procedure<I, F>(
+    mut builder: ProcedureCfgBuilder,
+    initial: I,
+    entry: ProgramPointId,
+    normal_exit: ProgramPointId,
+    exceptional_exit: ProgramPointId,
+    cancellation: &CancellationToken,
+    mut step: F,
+) -> Result<(ProcedureSemanticsParts, SemanticWork), ProcedureLoweringError>
+where
+    I: IntoIterator,
+    F: FnMut(
+        &mut ProcedureCfgBuilder,
+        I::Item,
+        &mut Vec<I::Item>,
+    ) -> Result<(), ProcedureLoweringError>,
+{
+    for initial in initial {
+        if let Err(error) =
+            builder.drive_iteratively(initial, cancellation, |builder, work, stack| {
+                step(builder, work, stack)
+            })
+        {
+            let work = Box::new(builder.prospective_work());
+            return match error {
+                DriveError::Cancelled | DriveError::Step(ProcedureLoweringError::Cancelled(_)) => {
+                    Err(ProcedureLoweringError::Cancelled(work))
+                }
+                DriveError::ExceededBudget(exceeded)
+                | DriveError::Step(ProcedureLoweringError::Budget(exceeded, _)) => {
+                    Err(ProcedureLoweringError::Budget(exceeded, work))
+                }
+                DriveError::Step(ProcedureLoweringError::Invalid(detail)) => {
+                    Err(ProcedureLoweringError::Invalid(detail))
+                }
+            };
+        }
+    }
+
+    if builder
+        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
+        .is_err()
+    {
+        return Err(ProcedureLoweringError::Cancelled(Box::new(
+            builder.prospective_work(),
+        )));
+    }
+    let work_before_freeze = builder.prospective_work();
+    builder
+        .finish_with_work()
+        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PointMetadata {
     pub(crate) source: SourceMappingId,
     pub(crate) evidence: EvidenceId,
+}
+
+/// One already-classified control-flow destination.
+///
+/// Language adapters decide which syntax owns the destination and which edge
+/// kind applies. This shared value only carries that syntax-free decision
+/// through their iterative work queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlTarget {
+    pub(crate) point: ProgramPointId,
+    pub(crate) kind: ControlEdgeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AwaitScaffold {
+    pub(crate) suspend: ProgramPointId,
+    pub(crate) normal_resume: ProgramPointId,
+    pub(crate) exceptional_resume: ProgramPointId,
+    pub(crate) awaited: ValueId,
+    pub(crate) result: ValueId,
+}
+
+pub(crate) type ScheduledControlNode<T> = (T, ProgramPointId);
+
+/// Push the three opaque work items for a conditional choice in execution
+/// order: evaluate the condition first, then only the selected arm.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_conditional_choice<T, W>(
+    stack: &mut Vec<W>,
+    condition: ScheduledControlNode<T>,
+    consequence: ScheduledControlNode<T>,
+    alternative: ScheduledControlNode<T>,
+    when_true: ControlTarget,
+    when_false: ControlTarget,
+    scope: ScopeFrameId,
+    work: impl Fn(T, ProgramPointId, ControlTarget, ControlTarget, ScopeFrameId) -> W,
+) where
+    T: Copy,
+{
+    stack.push(work(
+        alternative.0,
+        alternative.1,
+        when_true,
+        when_false,
+        scope,
+    ));
+    stack.push(work(
+        consequence.0,
+        consequence.1,
+        when_true,
+        when_false,
+        scope,
+    ));
+    stack.push(work(
+        condition.0,
+        condition.1,
+        ControlTarget {
+            point: consequence.1,
+            kind: ControlEdgeKind::ConditionalTrue,
+        },
+        ControlTarget {
+            point: alternative.1,
+            kind: ControlEdgeKind::ConditionalFalse,
+        },
+        scope,
+    ));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortCircuitKind {
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CleanupSpecialization<R> {
+    pub(crate) region: R,
+    pub(crate) entry: ProgramPointId,
+    pub(crate) next: ControlTarget,
+}
+
+pub(crate) struct CleanupRoutePlanner<'route> {
+    route: &'route CompletionRoute,
+    next_index: usize,
+    next: ControlTarget,
+}
+
+impl<'route> CleanupRoutePlanner<'route> {
+    pub(crate) fn new(route: &'route CompletionRoute) -> Self {
+        Self {
+            route,
+            next_index: route.cleanups().len(),
+            next: ControlTarget {
+                point: route.destination().target(),
+                kind: route.destination().edge_kind(),
+            },
+        }
+    }
+
+    /// Advance through reused entries and return the next newly allocated step.
+    ///
+    /// Yielding one step at a time lets the adapter finish its relay, body, or
+    /// gaps before the outer cleanup is allocated, preserving deterministic
+    /// point order and tight-budget outcomes.
+    pub(crate) fn next<'tree, R>(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        session: &mut ProcedureLoweringSession<'_>,
+        regions: &[R],
+        region_id: impl Fn(R) -> CleanupRegionId,
+        source_node: impl Fn(R) -> Node<'tree>,
+    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError>
+    where
+        R: Copy,
+    {
+        while self.next_index > 0 {
+            self.next_index -= 1;
+            let index = self.next_index;
+            let expected = self.route.cleanups()[index];
+            let region = regions
+                .iter()
+                .copied()
+                .find(|region| region_id(*region) == expected)
+                .ok_or_else(|| ProcedureLoweringError::Invalid("missing cleanup region".into()))?;
+            let (entry, step) =
+                if let Some(entry) = builder.cleanup_specialization_entry(self.route, index) {
+                    (entry, None)
+                } else {
+                    let metadata = session.add_node_mapping(builder, source_node(region))?;
+                    let (entry, created) = builder.cleanup_specialization(
+                        self.route,
+                        index,
+                        metadata.source,
+                        metadata.evidence,
+                    )?;
+                    debug_assert!(created, "cleanup lookup and allocation must agree");
+                    session.register_point(
+                        entry,
+                        metadata,
+                        "cleanup specialization broke dense point allocation",
+                    )?;
+                    (
+                        entry,
+                        Some(CleanupSpecialization {
+                            region,
+                            entry,
+                            next: self.next,
+                        }),
+                    )
+                };
+            self.next = ControlTarget {
+                point: entry,
+                kind: ControlEdgeKind::Cleanup,
+            };
+            if step.is_some() {
+                return Ok(step);
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn target(&self) -> ControlTarget {
+        debug_assert_eq!(self.next_index, 0, "cleanup route planning is incomplete");
+        self.next
+    }
+}
+
+/// Schedule a boolean short-circuit pair after the adapter has identified its
+/// operands and allocated the right-hand entry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_short_circuit_condition<T, W>(
+    stack: &mut Vec<W>,
+    kind: ShortCircuitKind,
+    left: ScheduledControlNode<T>,
+    right: ScheduledControlNode<T>,
+    when_true: ControlTarget,
+    when_false: ControlTarget,
+    scope: ScopeFrameId,
+    work: impl Fn(T, ProgramPointId, ControlTarget, ControlTarget, ScopeFrameId) -> W,
+) where
+    T: Copy,
+{
+    stack.push(work(right.0, right.1, when_true, when_false, scope));
+    let (left_true, left_false) = match kind {
+        ShortCircuitKind::And => (
+            ControlTarget {
+                point: right.1,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            when_false,
+        ),
+        ShortCircuitKind::Or => (
+            when_true,
+            ControlTarget {
+                point: right.1,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+        ),
+    };
+    stack.push(work(left.0, left.1, left_true, left_false, scope));
+}
+
+impl ControlTarget {
+    pub(crate) const fn normal(point: ProgramPointId) -> Self {
+        Self {
+            point,
+            kind: ControlEdgeKind::Normal,
+        }
+    }
+}
+
+/// Schedule the stable topology of a C-style loop after an adapter has
+/// identified and allocated every syntax node.
+///
+/// The adapter supplies opaque payloads and constructors for its work-item
+/// enum. This function owns only scope targets, edge kinds, and reverse stack
+/// ordering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_c_style_loop<T, W, Initializer, Expression, Statement, Condition>(
+    builder: &mut ProcedureCfgBuilder,
+    session: &ProcedureLoweringSession<'_>,
+    entry: ProgramPointId,
+    next: ControlTarget,
+    parent_scope: ScopeFrameId,
+    label: Option<Box<str>>,
+    initializers: &[ScheduledControlNode<T>],
+    condition: Option<ScheduledControlNode<T>>,
+    condition_entry: ProgramPointId,
+    body: ScheduledControlNode<T>,
+    updates: &[ScheduledControlNode<T>],
+    stack: &mut Vec<W>,
+    initializer_work: Initializer,
+    expression_work: Expression,
+    statement_work: Statement,
+    condition_work: Condition,
+) -> Result<(), ProcedureLoweringError>
+where
+    T: Copy,
+    Initializer: Fn(T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+    Expression: Fn(T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+    Statement: Fn(T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+    Condition: Fn(T, ProgramPointId, ControlTarget, ControlTarget, ScopeFrameId) -> W,
+{
+    let continue_target = updates.first().map_or(condition_entry, |update| update.1);
+    let loop_scope = builder.push_scope(
+        Some(parent_scope),
+        ScopeBinding::Loop {
+            label,
+            break_target: next.point,
+            break_edge_kind: next.kind,
+            continue_target,
+            continue_edge_kind: if updates.is_empty() {
+                ControlEdgeKind::LoopBack
+            } else {
+                ControlEdgeKind::Normal
+            },
+        },
+    );
+
+    for (index, update) in updates.iter().enumerate().rev() {
+        let next = updates
+            .get(index + 1)
+            .map(|next| ControlTarget::normal(next.1))
+            .unwrap_or(ControlTarget {
+                point: condition_entry,
+                kind: ControlEdgeKind::LoopBack,
+            });
+        stack.push(expression_work(update.0, update.1, next, loop_scope));
+    }
+    stack.push(statement_work(
+        body.0,
+        body.1,
+        ControlTarget {
+            point: continue_target,
+            kind: if updates.is_empty() {
+                ControlEdgeKind::LoopBack
+            } else {
+                ControlEdgeKind::Normal
+            },
+        },
+        loop_scope,
+    ));
+    if let Some(condition) = condition {
+        stack.push(condition_work(
+            condition.0,
+            condition.1,
+            ControlTarget {
+                point: body.1,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            ControlTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+            loop_scope,
+        ));
+    } else {
+        session.add_edge(builder, condition_entry, body.1, ControlEdgeKind::Normal)?;
+    }
+
+    if let Some(first) = initializers.first() {
+        session.add_edge(builder, entry, first.1, ControlEdgeKind::Normal)?;
+        for (index, initializer) in initializers.iter().enumerate().rev() {
+            let next = initializers
+                .get(index + 1)
+                .map_or(condition_entry, |next| next.1);
+            stack.push(initializer_work(
+                initializer.0,
+                initializer.1,
+                ControlTarget::normal(next),
+                loop_scope,
+            ));
+        }
+    } else if entry != condition_entry {
+        session.add_edge(builder, entry, condition_entry, ControlEdgeKind::Normal)?;
+    }
+    Ok(())
 }
 
 /// Target-local slot reserved for the lexical receiver capture, when present.
@@ -520,6 +818,17 @@ impl<'a> ProcedureLoweringSession<'a> {
         Ok(PointMetadata { source, evidence })
     }
 
+    pub(crate) fn add_node_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+    ) -> Result<PointMetadata, ProcedureLoweringError> {
+        let range = node.byte_range();
+        let occurrence = self.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(ProcedureLoweringError::Invalid)?;
+        self.add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     pub(crate) fn add_point(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -588,6 +897,97 @@ impl<'a> ProcedureLoweringSession<'a> {
         })?;
         self.next_value += 1;
         Ok(id)
+    }
+
+    /// Retain a semantic value after the adapter has established that its
+    /// syntax identity is absent from the cache.
+    ///
+    /// Keeping the lookup adapter-side ensures source metadata is allocated
+    /// only for a new value rather than leaked on a cache hit.
+    pub(crate) fn insert_cached_value_with_metadata(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        cache: &mut HashMap<usize, ValueId>,
+        syntax_id: usize,
+        metadata: PointMetadata,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ProcedureLoweringError> {
+        debug_assert!(
+            !cache.contains_key(&syntax_id),
+            "cached value insertion requires an adapter-side miss"
+        );
+        let value = self.add_value_with_metadata(builder, metadata, kind)?;
+        let previous = cache.insert(syntax_id, value);
+        debug_assert!(previous.is_none(), "cached value insertion replaced a row");
+        Ok(value)
+    }
+
+    /// Emit the language-neutral suspend and two-resume core of an await.
+    ///
+    /// Operand selection, exceptional completion routing, and any
+    /// runtime-specific uncertainty remain adapter-owned.
+    pub(crate) fn add_await_scaffold(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        mut add_mapping: impl FnMut(
+            &mut ProcedureLoweringSession<'_>,
+            &mut ProcedureCfgBuilder,
+        ) -> Result<PointMetadata, ProcedureLoweringError>,
+    ) -> Result<AwaitScaffold, ProcedureLoweringError> {
+        let suspend_metadata = add_mapping(self, builder)?;
+        let suspend = self.add_point(builder, suspend_metadata, Vec::new())?;
+        let normal_metadata = add_mapping(self, builder)?;
+        let normal_resume = self.add_point(builder, normal_metadata, Vec::new())?;
+        let exceptional_metadata = add_mapping(self, builder)?;
+        let exceptional_resume = self.add_point(builder, exceptional_metadata, Vec::new())?;
+        let awaited = self.add_value(builder, suspend, SemanticValueKind::Temporary)?;
+        let result = self.add_value(builder, normal_resume, SemanticValueKind::AwaitResult)?;
+        self.append_effect(
+            builder,
+            suspend,
+            SemanticEffect::AsyncSuspend {
+                awaited: Some(awaited),
+                normal_resume: ControlContinuation::Target(normal_resume),
+                exceptional_resume: ControlContinuation::Target(exceptional_resume),
+            },
+        )?;
+        self.append_effect(
+            builder,
+            normal_resume,
+            SemanticEffect::AsyncResume {
+                suspend,
+                kind: AsyncResumeKind::Normal,
+                result: Some(result),
+            },
+        )?;
+        self.append_effect(
+            builder,
+            exceptional_resume,
+            SemanticEffect::AsyncResume {
+                suspend,
+                kind: AsyncResumeKind::Exceptional,
+                result: None,
+            },
+        )?;
+        self.add_edge(
+            builder,
+            suspend,
+            normal_resume,
+            ControlEdgeKind::AsyncNormal,
+        )?;
+        self.add_edge(
+            builder,
+            suspend,
+            exceptional_resume,
+            ControlEdgeKind::AsyncExceptional,
+        )?;
+        Ok(AwaitScaffold {
+            suspend,
+            normal_resume,
+            exceptional_resume,
+            awaited,
+            result,
+        })
     }
 
     pub(crate) fn add_allocation(
@@ -735,6 +1135,46 @@ impl<'a> ProcedureLoweringSession<'a> {
         )
     }
 
+    /// Publish the paired value/call-site gaps for one unresolved callable
+    /// target while preserving adapter-owned diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_callable_resolution_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callee: ValueId,
+        call_site: CallSiteId,
+        resolution: &CallableTargetResolution,
+        callable_detail: impl Into<Box<str>>,
+        call_detail: impl Into<Box<str>>,
+    ) -> Result<(), ProcedureLoweringError> {
+        let kind = match resolution {
+            CallableTargetResolution::Proven(_) => return Ok(()),
+            CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
+            CallableTargetResolution::Unknown => SemanticGapKind::Unknown,
+            CallableTargetResolution::Unsupported => SemanticGapKind::Unsupported,
+            CallableTargetResolution::Unproven(_) => SemanticGapKind::Unproven,
+            CallableTargetResolution::ExceededBudget(_) => SemanticGapKind::ExceededBudget,
+        };
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::Value(callee),
+            SemanticCapability::CallableReferences,
+            kind,
+            callable_detail,
+        )?;
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::Calls,
+            kind,
+            call_detail,
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_gap_with_impacts(
         &mut self,
@@ -839,9 +1279,11 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::analyzer::semantic::cfg::{CompletionKind, CompletionRequest};
     use crate::analyzer::semantic::{
         DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId, ProcedureKind,
-        SemanticLanguage, SourcePosition, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        SemanticBudgetDimension, SemanticLanguage, SourcePosition, SourceSpan, WorkspaceMountId,
+        WorkspaceRelativePath,
     };
 
     fn anchor(start: u32, end: u32, occurrence: u32) -> SourceAnchor {
@@ -975,6 +1417,415 @@ mod tests {
             0
         );
         assert_eq!(start.session.point_metadata.len(), 3);
+    }
+
+    #[test]
+    fn cached_value_insertion_retains_one_row() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let metadata = session
+            .add_mapping(&mut builder, anchor(8, 14, 0), SourceMappingKind::Exact)
+            .expect("value mapping");
+        let mut cache = HashMap::default();
+
+        let first = session
+            .insert_cached_value_with_metadata(
+                &mut builder,
+                &mut cache,
+                42,
+                metadata,
+                SemanticValueKind::Temporary,
+            )
+            .expect("first cached value");
+        let (parts, _) = builder.finish_with_work().expect("finished parts");
+
+        assert_eq!(cache.get(&42), Some(&first));
+        assert_eq!(parts.values.len(), 1);
+    }
+
+    #[test]
+    fn c_style_loop_schedules_execution_and_continue_targets() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            entry,
+            normal_exit,
+            function_scope,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let mut points = Vec::new();
+        for occurrence in 0..6 {
+            let metadata = session
+                .add_mapping(
+                    &mut builder,
+                    anchor(20 + occurrence, 21 + occurrence, occurrence),
+                    SourceMappingKind::Exact,
+                )
+                .expect("loop mapping");
+            points.push(
+                session
+                    .add_point(&mut builder, metadata, Vec::new())
+                    .expect("loop point"),
+            );
+        }
+        let [condition, body, update_one, update_two, init_one, init_two] = points.as_slice()
+        else {
+            panic!("expected six loop points");
+        };
+        type LoopWork = (
+            &'static str,
+            u8,
+            ProgramPointId,
+            ControlTarget,
+            Option<ControlTarget>,
+            ScopeFrameId,
+        );
+        let mut stack: Vec<LoopWork> = Vec::new();
+
+        schedule_c_style_loop(
+            &mut builder,
+            &session,
+            entry,
+            ControlTarget::normal(normal_exit),
+            function_scope,
+            None,
+            &[(1, *init_one), (2, *init_two)],
+            Some((3, *condition)),
+            *condition,
+            (4, *body),
+            &[(5, *update_one), (6, *update_two)],
+            &mut stack,
+            |payload, entry, next, scope| ("init", payload, entry, next, None, scope),
+            |payload, entry, next, scope| ("update", payload, entry, next, None, scope),
+            |payload, entry, next, scope| ("body", payload, entry, next, None, scope),
+            |payload, entry, when_true, when_false, scope| {
+                (
+                    "condition",
+                    payload,
+                    entry,
+                    when_true,
+                    Some(when_false),
+                    scope,
+                )
+            },
+        )
+        .expect("scheduled C-style loop");
+
+        let execution = stack.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(
+            execution
+                .iter()
+                .map(|work| (work.0, work.1))
+                .collect::<Vec<_>>(),
+            vec![
+                ("init", 1),
+                ("init", 2),
+                ("condition", 3),
+                ("body", 4),
+                ("update", 5),
+                ("update", 6),
+            ]
+        );
+        assert_eq!(execution[0].3, ControlTarget::normal(*init_two));
+        assert_eq!(execution[1].3, ControlTarget::normal(*condition));
+        assert_eq!(
+            execution[2].3,
+            ControlTarget {
+                point: *body,
+                kind: ControlEdgeKind::ConditionalTrue,
+            }
+        );
+        assert_eq!(
+            execution[2].4,
+            Some(ControlTarget {
+                point: normal_exit,
+                kind: ControlEdgeKind::ConditionalFalse,
+            })
+        );
+        assert_eq!(execution[3].3, ControlTarget::normal(*update_one));
+        assert_eq!(execution[4].3, ControlTarget::normal(*update_two));
+        assert_eq!(
+            execution[5].3,
+            ControlTarget {
+                point: *condition,
+                kind: ControlEdgeKind::LoopBack,
+            }
+        );
+
+        let loop_scope = execution[0].5;
+        let continue_route = builder
+            .resolve_completion(
+                loop_scope,
+                &CompletionRequest::new(CompletionKind::Continue, None),
+            )
+            .expect("continue route");
+        assert_eq!(continue_route.destination().target(), *update_one);
+        assert_eq!(
+            continue_route.destination().edge_kind(),
+            ControlEdgeKind::Normal
+        );
+    }
+
+    #[test]
+    fn await_scaffold_emits_exact_suspend_resume_core() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let mut occurrence = 0;
+        let scaffold = session
+            .add_await_scaffold(&mut builder, |session, builder| {
+                let current = occurrence;
+                occurrence += 1;
+                session.add_mapping(builder, anchor(8, 14, current), SourceMappingKind::Exact)
+            })
+            .expect("await scaffold");
+        let (parts, _) = builder.finish_with_work().expect("finished parts");
+
+        assert_eq!(scaffold.suspend.index(), 3);
+        assert_eq!(scaffold.normal_resume.index(), 4);
+        assert_eq!(scaffold.exceptional_resume.index(), 5);
+        assert_eq!(scaffold.awaited.index(), 0);
+        assert_eq!(scaffold.result.index(), 1);
+        let resume_edges = parts
+            .control_edges
+            .iter()
+            .filter(|edge| edge.source_point == scaffold.suspend)
+            .map(|edge| (edge.target_point, edge.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resume_edges,
+            vec![
+                (scaffold.normal_resume, ControlEdgeKind::AsyncNormal),
+                (
+                    scaffold.exceptional_resume,
+                    ControlEdgeKind::AsyncExceptional
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn await_scaffold_preserves_mapping_point_budget_order() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.program_points = 4;
+        let budget = SemanticBudget::new(limits).expect("positive budget");
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &budget, &cancellation)
+            .expect("lowering start");
+        let mut occurrence = 0;
+
+        let error = session
+            .add_await_scaffold(&mut builder, |session, builder| {
+                let current = occurrence;
+                occurrence += 1;
+                session.add_mapping(builder, anchor(8, 14, current), SourceMappingKind::Exact)
+            })
+            .expect_err("second await point should exceed the point budget");
+
+        let ProcedureLoweringError::Budget(exceeded, _) = error else {
+            panic!("expected a budget error");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::ProgramPoints);
+        let work = builder.prospective_work();
+        assert_eq!(work.program_points, 4);
+        assert_eq!(work.source_mappings, 3);
+        assert_eq!(work.evidence, 3);
+    }
+
+    #[test]
+    fn cleanup_planner_yields_before_allocating_the_next_step() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.program_points = 5;
+        let budget = SemanticBudget::new(limits).expect("positive budget");
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            exceptional_exit,
+            function_scope,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &budget, &cancellation)
+            .expect("lowering start");
+        let outer_region = CleanupRegionId::new(1);
+        let inner_region = CleanupRegionId::new(2);
+        let outer_scope = builder.push_scope(
+            Some(function_scope),
+            ScopeBinding::Cleanup {
+                region: outer_region,
+            },
+        );
+        let inner_scope = builder.push_scope(
+            Some(outer_scope),
+            ScopeBinding::Cleanup {
+                region: inner_region,
+            },
+        );
+        let route = builder
+            .resolve_completion(
+                inner_scope,
+                &CompletionRequest::new(CompletionKind::Throw, None),
+            )
+            .expect("throw route");
+        assert_eq!(route.destination().target(), exceptional_exit);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        let tree = parser
+            .parse("fn fixture() {}", None)
+            .expect("parsed fixture");
+        let node = tree.root_node();
+        let regions = [(outer_region, node), (inner_region, node)];
+        let mut planner = CleanupRoutePlanner::new(&route);
+
+        let first = planner
+            .next(
+                &mut builder,
+                &mut session,
+                &regions,
+                |region| region.0,
+                |region| region.1,
+            )
+            .expect("first cleanup step")
+            .expect("new outer cleanup specialization");
+        assert_eq!(first.entry.index(), 3);
+
+        let relay_metadata = session
+            .add_node_mapping(&mut builder, node)
+            .expect("relay mapping");
+        let relay = session
+            .add_point(&mut builder, relay_metadata, Vec::new())
+            .expect("relay point");
+        assert_eq!(relay.index(), 4);
+
+        let error = planner
+            .next(
+                &mut builder,
+                &mut session,
+                &regions,
+                |region| region.0,
+                |region| region.1,
+            )
+            .expect_err("inner entry should follow the relay and exceed the point budget");
+        let ProcedureLoweringError::Budget(exceeded, _) = error else {
+            panic!("expected a budget error");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::ProgramPoints);
+        let work = builder.prospective_work();
+        assert_eq!(work.program_points, 5);
+        assert_eq!(work.source_mappings, 4);
+        assert_eq!(work.evidence, 4);
+    }
+
+    #[test]
+    fn cleanup_planner_reuse_does_not_allocate_provenance() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            mut builder,
+            mut session,
+            normal_exit,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        let region_id = CleanupRegionId::new(1);
+        let route = builder.normal_cleanup_completion(region_id, normal_exit);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        let tree = parser
+            .parse("fn fixture() {}", None)
+            .expect("parsed fixture");
+        let node = tree.root_node();
+        let regions = [(region_id, node)];
+
+        let mut first_plan = CleanupRoutePlanner::new(&route);
+        let first = first_plan
+            .next(
+                &mut builder,
+                &mut session,
+                &regions,
+                |region| region.0,
+                |region| region.1,
+            )
+            .expect("first cleanup step")
+            .expect("new cleanup specialization");
+        assert!(
+            first_plan
+                .next(
+                    &mut builder,
+                    &mut session,
+                    &regions,
+                    |region| region.0,
+                    |region| region.1,
+                )
+                .expect("finished first plan")
+                .is_none()
+        );
+        let before_reuse = builder.prospective_work();
+
+        let mut reused_plan = CleanupRoutePlanner::new(&route);
+        assert!(
+            reused_plan
+                .next(
+                    &mut builder,
+                    &mut session,
+                    &regions,
+                    |region| region.0,
+                    |region| region.1,
+                )
+                .expect("reused cleanup plan")
+                .is_none()
+        );
+        assert_eq!(
+            reused_plan.target(),
+            ControlTarget {
+                point: first.entry,
+                kind: ControlEdgeKind::Cleanup,
+            }
+        );
+        assert_eq!(builder.prospective_work(), before_reuse);
+    }
+
+    #[test]
+    fn shared_driver_reports_cancellation_with_retained_work() {
+        let cancellation = CancellationToken::default();
+        let ProcedureLoweringStart {
+            builder,
+            entry,
+            normal_exit,
+            exceptional_exit,
+            ..
+        } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
+            .expect("lowering start");
+        cancellation.cancel();
+        let outcome = drive_and_finish_procedure(
+            builder,
+            [()],
+            entry,
+            normal_exit,
+            exceptional_exit,
+            &cancellation,
+            |_, (), _| Ok(()),
+        );
+        assert!(matches!(outcome, Err(ProcedureLoweringError::Cancelled(_))));
     }
 
     #[test]

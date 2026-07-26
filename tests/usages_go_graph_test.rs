@@ -3028,3 +3028,46 @@ func run() {
         }
     ));
 }
+
+/// Two dot-imports of different packages in one file each contribute their
+/// own exported names to scope. The bulk usage-graph binder used to key every
+/// dot-import under a single fixed `"*"` map entry, so the second dot-import
+/// silently clobbered the first and usages of its exports went unfound.
+#[test]
+fn go_graph_strategy_resolves_usages_from_multiple_dot_imports_in_one_file() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        ("pkga/pkga.go", "package pkga\nfunc Foo() {}\n"),
+        ("pkgb/pkgb.go", "package pkgb\nfunc Bar() {}\n"),
+        (
+            "main.go",
+            r#"
+package main
+
+import . "example.com/app/pkga"
+import . "example.com/app/pkgb"
+
+func run() {
+    Foo()
+    Bar()
+}
+"#,
+        ),
+    ]);
+
+    let foo = definition(&analyzer, "example.com/app/pkga.Foo");
+    let bar = definition(&analyzer, "example.com/app/pkgb.Bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let foo_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&foo), &candidates, 1000)
+        .into_either()
+        .expect("dot-imported Foo usage should resolve");
+    let bar_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&bar), &candidates, 1000)
+        .into_either()
+        .expect("dot-imported Bar usage should resolve");
+
+    assert_eq!(1, foo_hits.len(), "Foo hits: {foo_hits:?}");
+    assert_eq!(1, bar_hits.len(), "Bar hits: {bar_hits:?}");
+}

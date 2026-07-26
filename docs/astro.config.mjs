@@ -24,9 +24,18 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Bifrost Documentation',
+      title: 'Bifrost',
       description: 'Documentation for Brokk Bifrost, the analyzer behind Brokk code intelligence.',
       head: [
+        { tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.googleapis.com' } },
+        { tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: true } },
+        {
+          tag: 'link',
+          attrs: {
+            rel: 'stylesheet',
+            href: 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Rajdhani:wght@400;500;600;700&family=Staatliches&display=swap',
+          },
+        },
         { tag: 'meta', attrs: { property: 'og:image', content: socialCardUrl } },
         { tag: 'meta', attrs: { property: 'og:image:type', content: 'image/png' } },
         { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },

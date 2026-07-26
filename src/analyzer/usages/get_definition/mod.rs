@@ -2,6 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
+use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
     CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner,
     CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppVisibilityIndex,
@@ -176,8 +177,31 @@ pub(super) fn resolve_in_enclosing_scopes(
 /// `internal::EachMatcher` inside `namespace testing` must resolve to
 /// `testing::internal::EachMatcher` — the reference is multi-segment, so the
 /// single-segment walk above cannot try it (tier-4 gmock shape, #1129's
-/// sibling). Scope segments and reference segments share the `.` separator
-/// here, matching how the indexed fq strings compose.
+/// sibling).
+///
+/// Both sides are now interned segments (M2). The reference is parsed once into
+/// an [`crate::analyzer::fq_name::FqName`] via
+/// [`crate::analyzer::symbol_lookup::parse_symbol_path_fq`] (which honors the
+/// language's full separator set — `::`, `.`, `\`, `/`, `+` — and per-language
+/// normalization), and the enclosing scope's own structured `fq` supplies the
+/// prefix chain. Composing a candidate is a segment push, not a
+/// `format!("{scope}.{reference}")`, so the M1-era reference-normalization shim
+/// (`normalize_reference_to_fq_segments`) is gone: a `::`-qualified reference
+/// resolving to a `.`-joined candidate falls straight out of the segment
+/// rendering (#1162), with no per-call string massaging.
+///
+/// The scope prefix walk descends only across boundaries the native spelling
+/// renders as a literal `.`, so a C++ `::`-headed namespace scope
+/// (`cutlass::gemm::warp.OperandSharedStorage`) is never descended into its
+/// sibling namespaces — exactly the legacy dot-only `namespace_prefixes` walk,
+/// which is why issue #1163 stays pinned until M4 flips it deliberately.
+///
+/// Cache-loaded scope units carry an empty `fq` until persistence ships
+/// segments (M3); they take the string fallback arm below, which renders the
+/// reference to the same `.`-joined normalization the deleted shim produced and
+/// walks the verbatim scope string. Both arms are proven identical by the
+/// `issue_1162_separator_aware_enclosing_scope` suite and the dual-arm unit
+/// tests. The fallback arm is deleted in M4.
 pub(super) fn resolve_qualified_in_enclosing_scopes(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -188,29 +212,119 @@ pub(super) fn resolve_qualified_in_enclosing_scopes(
     if reference.is_empty() {
         return None;
     }
+    let language = language_for_file(file);
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let reference_fq =
+        crate::analyzer::symbol_lookup::parse_symbol_path_fq(language, reference, interner);
+    if reference_fq.is_empty() {
+        return None;
+    }
     let range = Range {
         start_byte: byte,
         end_byte: byte + 1,
         start_line: 0,
         end_line: 0,
     };
-    let mut scope = analyzer.enclosing_code_unit(file, &range)?.fq_name();
-    loop {
-        if scope.is_empty() {
-            // Only *enclosing* named scopes are tried here; the bare top level is
-            // left to the caller's normal name resolution, which applies imports
-            // and shadowing (so this cannot override a glob import / local shadow).
-            return None;
+    let scope_unit = analyzer.enclosing_code_unit(file, &range)?;
+
+    // The enclosing scope unit always comes from FileState declarations, which
+    // carry a populated structured `fq` (extracted at M1, rehydrated from
+    // persisted segments at M3), so the composition is a pure segment push. The
+    // M2-era empty-fq string fallback (which walked the verbatim scope string and
+    // rendered the reference via `display`) is deleted; both sides are segments.
+    if scope_unit.fq().is_empty() {
+        return None;
+    }
+    resolve_qualified_name_in_shrinking_scopes_fq(
+        language,
+        scope_unit.fq(),
+        &reference_fq,
+        interner,
+        || true,
+        |fqn| analyzer.definitions(fqn).collect(),
+        accept,
+    )
+}
+
+/// Segment-composed sibling of [`resolve_qualified_name_in_shrinking_scopes`]:
+/// tries `{scope} + reference` at the full enclosing scope, then at each
+/// progressively shorter prefix of `scope`, composing each candidate by pushing
+/// the reference's segments onto the scope prefix (no separator inference) and
+/// rendering natively for the string-keyed `definitions` lookup.
+///
+/// A prefix boundary is a valid cut point only where the native rendering
+/// places a literal `.`, which reproduces the legacy dot-only
+/// `namespace_prefixes` walk exactly: a `::`-joined C++ namespace head, a `/`
+/// path join, or a `$` nesting boundary is not a `.`, so the walk never
+/// descends across it. `charge_hop` is polled once per attempted prefix (same
+/// count as the string core), so budget-charging callers truncate identically.
+pub(super) fn resolve_qualified_name_in_shrinking_scopes_fq(
+    language: Language,
+    scope: &crate::analyzer::fq_name::FqName,
+    reference: &crate::analyzer::fq_name::FqName,
+    interner: &crate::analyzer::fq_name::SegmentInterner,
+    mut charge_hop: impl FnMut() -> bool,
+    mut definitions_for: impl FnMut(&str) -> Vec<CodeUnit>,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    let segments = scope.segments();
+    for len in (1..=segments.len()).rev() {
+        let is_cut = len == segments.len()
+            || interner.separator_between(segments[len - 1], segments[len], language) == ".";
+        if !is_cut {
+            continue;
         }
-        let child_fqn = format!("{scope}.{reference}");
-        if let Some(child) = analyzer.definitions(&child_fqn).find(|unit| accept(unit)) {
-            return Some(child);
+        if !charge_hop() {
+            break;
         }
-        match scope.rfind('.') {
-            Some(idx) => scope.truncate(idx),
-            None => return None,
+        let mut candidate = crate::analyzer::fq_name::FqName::new();
+        for &id in &segments[..len] {
+            candidate.push(id);
+        }
+        for &id in reference.segments() {
+            candidate.push(id);
+        }
+        let candidate_str = candidate.display_native(language, interner);
+        if let Some(unit) = definitions_for(&candidate_str)
+            .into_iter()
+            .find(|unit| accept(unit))
+        {
+            return Some(unit);
         }
     }
+    None
+}
+
+/// Budget-parametric core shared by the empty-fq fallback arm of
+/// [`resolve_qualified_in_enclosing_scopes`]
+/// and C#'s bounded fork (`resolve_csharp_in_enclosing_scopes`): try
+/// `{prefix}.{reference}` at `scope`, then at each progressively shorter
+/// dotted prefix of `scope` in turn (never the bare top level — see the doc
+/// comment above), returning the first hit `definitions_for` reports that
+/// `accept` approves.
+///
+/// `definitions_for` supplies the definitions source (an unbounded
+/// `analyzer.definitions` call, or a session-aware/budget-charging one), and
+/// `charge_hop` gates each prefix attempt (an always-`true` closure for
+/// unbounded callers). Once `charge_hop` declines, the walk stops
+/// immediately without formatting or looking up further prefixes — matching
+/// how csharp's/java's per-hop `scope_step` budgets truncate the walk today.
+pub(super) fn resolve_qualified_name_in_shrinking_scopes(
+    scope: &str,
+    reference: &str,
+    mut charge_hop: impl FnMut() -> bool,
+    mut definitions_for: impl FnMut(&str) -> Vec<CodeUnit>,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    namespace_prefixes(scope)
+        .take_while(|prefix| !prefix.is_empty())
+        .map_while(|prefix| charge_hop().then_some(prefix))
+        .find_map(|prefix| {
+            let candidate = format!("{prefix}.{reference}");
+            definitions_for(&candidate)
+                .into_iter()
+                .find(|unit| accept(unit))
+        })
 }
 
 pub(crate) const SCALA_UNSUPPORTED_CALL_TARGET_SHAPE: &str = "unsupported_scala_call_target_shape";
@@ -511,7 +625,7 @@ struct DefinitionBatchContext<'a> {
     cpp_navigation_indexes: HashMap<ProjectFile, Option<Arc<cpp::CppNavigationIndex>>>,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
-    cpp_enclosing_class_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
+    enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
     navigation_target_limit: usize,
     #[cfg(test)]
@@ -540,7 +654,7 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_navigation_indexes: HashMap::default(),
             cpp_structural_alias_paths: HashMap::default(),
             cpp_class_ranges: HashMap::default(),
-            cpp_enclosing_class_chains: HashMap::default(),
+            enclosing_owner_chains: HashMap::default(),
             python_contexts: HashMap::default(),
             navigation_target_limit: 256,
             #[cfg(test)]
@@ -698,20 +812,31 @@ impl<'a> DefinitionBatchContext<'a> {
         index
     }
 
-    fn cpp_enclosing_class_chain(&mut self, owner: CodeUnit) -> Arc<Vec<CodeUnit>> {
-        self.cpp_enclosing_class_chains
+    /// Generalized, memoized version of the enclosing-owner-chain walk (see
+    /// `common::enclosing_owner_chain`): `owner` plus every contiguous
+    /// ancestor `accept` approves, stopping at the first rejection.
+    ///
+    /// The cache key is `owner` alone, not `(owner, accept)` — every caller
+    /// today shares one predicate (C++'s `CodeUnit::is_class`). A second
+    /// predicate reused through this same cache would silently return the
+    /// first-cached chain for a given owner; give it a predicate-aware key
+    /// before adding one.
+    fn enclosing_owner_chain(
+        &mut self,
+        owner: CodeUnit,
+        accept: impl Fn(&CodeUnit) -> bool,
+    ) -> Arc<Vec<CodeUnit>> {
+        let analyzer = self.analyzer;
+        self.enclosing_owner_chains
             .entry(owner.clone())
             .or_insert_with(|| {
-                let mut classes = Vec::new();
-                let mut current = Some(owner);
-                while let Some(owner) = current {
-                    if !owner.is_class() {
-                        break;
-                    }
-                    current = self.analyzer.parent_of(&owner);
-                    classes.push(owner);
-                }
-                Arc::new(classes)
+                Arc::new(
+                    crate::analyzer::usages::common::enclosing_owner_chain(owner, |unit| {
+                        analyzer.parent_of(unit)
+                    })
+                    .take_while(|unit| accept(unit))
+                    .collect(),
+                )
             })
             .clone()
     }
@@ -1286,12 +1411,56 @@ fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
     (unit.fq_name(), format!("{:?}", unit.kind()))
 }
 
-fn boundary(message: String) -> DefinitionLookupOutcome {
+/// Emit a confident cross-workspace boundary claim *without* the structural
+/// workspace-internal gate. This is the raw emitter; it is `_unchecked` on
+/// purpose so that every remaining call site is greppable and must justify why
+/// it does not go through [`gated_boundary`].
+///
+/// Prefer [`gated_boundary`] for any new site: it forces the second, load-
+/// bearing question ("does the workspace nonetheless declare this?") to be
+/// answered structurally. Only call `boundary_unchecked` when that question is
+/// already answered upstream on this path — an exhausted resolver verdict, a
+/// preceding enclosing-scope/workspace-namespace probe that returned early, or a
+/// predicate that already fused the workspace check. Each such call MUST carry a
+/// `// gated upstream:` comment naming where its guard lives.
+fn boundary_unchecked(message: String) -> DefinitionLookupOutcome {
     diagnostic_outcome(
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "unresolvable_import_boundary",
         import_boundary_workspace_message(message),
     )
+}
+
+/// Emit a confident cross-workspace boundary claim only when the target is *not*
+/// workspace-internal.
+///
+/// Every confident `boundary()` claim answers two questions, and the second one
+/// is the one call sites keep forgetting:
+///
+/// 1. Is there an *external signal* — an unresolved import/include/using, a
+///    looks-external path? The caller checks this at the call site (it is
+///    language- and shape-specific) and only reaches here when it is true.
+/// 2. Does the workspace nonetheless *declare or contain* this target — a
+///    same-named enclosing-scope member (the #1126 shape) or a workspace
+///    namespace/module the qualifier names (the #1089 shape)? If so, the honest
+///    outcome is `no_definition`, never a boundary.
+///
+/// `workspace_internal` answers (2). Routing confident claims through this
+/// constructor makes the second check structural instead of a per-site
+/// convention: a new emission site cannot skip it, because it cannot reach
+/// [`boundary_unchecked`] without supplying the closure. Where both guard
+/// families apply, callers `OR` them inside the closure.
+fn gated_boundary(
+    workspace_internal: impl FnOnce() -> bool,
+    boundary_message: String,
+    no_definition_kind: impl Into<String>,
+    no_definition_message: impl Into<String>,
+) -> DefinitionLookupOutcome {
+    if workspace_internal() {
+        no_definition(no_definition_kind, no_definition_message)
+    } else {
+        boundary_unchecked(boundary_message)
+    }
 }
 
 fn import_boundary_workspace_message(message: String) -> String {
@@ -1762,7 +1931,7 @@ mod tests {
             "focused qualifiers in one file should share one class-range index"
         );
         assert_eq!(
-            context.cpp_enclosing_class_chains.len(),
+            context.enclosing_owner_chains.len(),
             1,
             "focused qualifiers in one class should share its enclosing owner chain"
         );

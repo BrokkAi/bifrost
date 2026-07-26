@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::analyzer::fq_name::FqName;
 use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
@@ -1800,7 +1801,7 @@ impl fmt::Display for ProjectFile {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 struct CodeUnitInner {
     source: ProjectFile,
     kind: CodeUnitType,
@@ -1808,6 +1809,16 @@ struct CodeUnitInner {
     short_name: String,
     signature: Option<String>,
     synthetic: bool,
+    /// Structured, interned form of the qualified name (see
+    /// `.agents/plans/fqname-interned-segments.md`). During the staged
+    /// migration this rides ALONGSIDE the legacy `package_name`/`short_name`
+    /// strings, which remain authoritative. It is empty for languages not yet
+    /// migrated and for units reconstructed from the legacy string path (e.g.
+    /// cache load). It is deliberately excluded from `CodeUnit`'s identity
+    /// (`PartialEq`/`Eq`/`Hash`/`Ord`): it is a redundant derived form of the
+    /// strings, so a populated-`fq` unit and an empty-`fq` unit describing the
+    /// same declaration must still compare equal.
+    fq: FqName,
 }
 
 #[derive(Clone)]
@@ -1831,12 +1842,66 @@ impl CodeUnit {
         signature: Option<String>,
         synthetic: bool,
     ) -> Self {
+        Self::with_signature_and_fq(
+            source,
+            kind,
+            package_name,
+            short_name,
+            signature,
+            synthetic,
+            FqName::new(),
+        )
+    }
+
+    /// Construct a unit while also recording the structured [`FqName`].
+    ///
+    /// This is the M1 dual-representation entry point: per-language extractors
+    /// build the `fq` by interning segments at the exact site where they know
+    /// each segment's kind, and pass it here. When `fq` is non-empty a
+    /// debug/test-only assertion verifies it round-trips to the legacy joined
+    /// string, so a mis-tagged or missing segment fails loudly in tests while
+    /// the strings still drive behavior. Passing an empty `fq` (the default via
+    /// [`Self::with_signature`]/[`Self::new`]) opts a unit out until its
+    /// language is migrated.
+    pub(crate) fn with_signature_and_fq(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        package_name: impl Into<String>,
+        short_name: impl Into<String>,
+        signature: Option<String>,
+        synthetic: bool,
+        fq: FqName,
+    ) -> Self {
         let package_name = package_name.into();
         let short_name = short_name.into();
         assert!(
             !short_name.is_empty(),
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
+
+        #[cfg(any(test, debug_assertions))]
+        if !fq.is_empty() {
+            let interner = crate::analyzer::fq_name::segment_interner();
+            let expected = if package_name.is_empty() {
+                short_name.clone()
+            } else {
+                format!("{package_name}.{short_name}")
+            };
+            // Render natively for the unit's language so the compatibility
+            // target is the exact legacy string. Only C++ differs from the
+            // canonical `.`-join (its package_name keeps a `::`-headed spelling
+            // and nested classes use `$`); `display_native` falls back to the
+            // canonical rendering for every other language, so this stays a
+            // no-op for go/rust/scala while making the cpp check `::`/`$`-aware
+            // (the plan's "cpp-specific expected-join"). See
+            // `.agents/plans/fqname-interned-segments.md`.
+            let language = crate::analyzer::common::language_for_file(&source);
+            debug_assert_eq!(
+                fq.display_native(language, interner),
+                expected,
+                "FqName does not round-trip to the legacy qualified name (kind={kind:?}, language={language:?}, package_name={package_name:?}, short_name={short_name:?})"
+            );
+        }
 
         Self(Arc::new(CodeUnitInner {
             source,
@@ -1845,7 +1910,19 @@ impl CodeUnit {
             short_name,
             signature,
             synthetic,
+            fq,
         }))
+    }
+
+    /// Like [`Self::new`] but records the structured [`FqName`] (M1).
+    pub(crate) fn new_fq(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        package_name: impl Into<String>,
+        short_name: impl Into<String>,
+        fq: FqName,
+    ) -> Self {
+        Self::with_signature_and_fq(source, kind, package_name, short_name, None, false, fq)
     }
 
     pub fn file_scope(source: ProjectFile) -> Self {
@@ -1874,6 +1951,34 @@ impl CodeUnit {
 
     pub fn short_name(&self) -> &str {
         &self.0.short_name
+    }
+
+    /// The structured, interned qualified name (M1 dual representation). Empty
+    /// for languages not yet migrated and for cache-loaded units; the legacy
+    /// `package_name`/`short_name` strings remain authoritative until M3. See
+    /// `.agents/plans/fqname-interned-segments.md`.
+    pub(crate) fn fq(&self) -> &FqName {
+        &self.0.fq
+    }
+
+    /// Debug/test-only view of the structured `fq` as ordered `(kind_name,
+    /// text)` pairs. Public so integration tests in `tests/` (compiled against
+    /// the lib in debug builds, where `debug_assertions` is on) can assert that
+    /// a cache round-trip preserved every segment's KIND and TEXT — not merely
+    /// the joined string — without leaking the crate-private `SegmentKind` or
+    /// interner types. See `tests/analyzer_persistence.rs`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn fq_segments_debug(&self) -> Vec<(&'static str, String)> {
+        let interner = crate::analyzer::fq_name::segment_interner();
+        self.0
+            .fq
+            .segments()
+            .iter()
+            .map(|&id| {
+                let (text, kind) = interner.resolve(id);
+                (kind.name(), text.to_string())
+            })
+            .collect()
     }
 
     pub fn signature(&self) -> Option<&str> {
@@ -1912,29 +2017,31 @@ impl CodeUnit {
         {
             member_name
         } else {
-            member_name.rsplit('$').next().unwrap_or(member_name)
+            member_name.rsplit('$').next().unwrap_or(member_name) // fqname-M4: identifier() strips a nested-type prefix from short_name's leaf; a bare string accessor called on synthetic lookup units that carry no fq
         }
     }
 
     pub fn without_signature(&self) -> Self {
-        Self::with_signature(
+        Self::with_signature_and_fq(
             self.0.source.clone(),
             self.0.kind,
             self.0.package_name.clone(),
             self.0.short_name.clone(),
             None,
             self.0.synthetic,
+            self.0.fq.clone(),
         )
     }
 
     pub fn with_synthetic(&self, synthetic: bool) -> Self {
-        Self::with_signature(
+        Self::with_signature_and_fq(
             self.0.source.clone(),
             self.0.kind,
             self.0.package_name.clone(),
             self.0.short_name.clone(),
             self.0.signature.clone(),
             synthetic,
+            self.0.fq.clone(),
         )
     }
 
@@ -2344,6 +2451,17 @@ pub struct StructuredImportPath {
     pub declaration_start_byte: usize,
 }
 
+impl StructuredImportPath {
+    /// Render all path segments joined by `separator`. Shared by adapters
+    /// that reimplement plain segment-joining over this model, e.g. go's
+    /// `/`-joined package path and scala's `.`-joined qualified names. Only
+    /// a drop-in replacement for call sites that join the *whole* segment
+    /// list; slicing/prefix joins over a subset of segments stay bespoke.
+    pub fn render_segments(&self, separator: &str) -> String {
+        self.segments.join(separator)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StructuredImportPathKind {
     Namespace,
@@ -2367,6 +2485,32 @@ pub struct ImportInfo {
     /// from `raw_snippet`.
     #[serde(default)]
     pub path: Option<StructuredImportPath>,
+}
+
+impl ImportInfo {
+    /// The name this import binds in the importing scope: the explicit
+    /// `alias` if the language recorded one, otherwise the parsed
+    /// `identifier`, otherwise the tail (last segment) of the structured
+    /// import path when the parser recorded one and neither of the above is
+    /// present.
+    ///
+    /// This is the common `alias ?? identifier ?? tail-of-path` desugar shape
+    /// shared by several language adapters. It is intentionally narrow: a
+    /// site should only switch to it when its own fallback order and
+    /// tail-of-path semantics agree with this one exactly (some languages
+    /// normalize separators, split on a different delimiter, or fall back to
+    /// something other than the last path segment — those stay bespoke).
+    pub fn local_name(&self) -> Option<&str> {
+        self.alias
+            .as_deref()
+            .or(self.identifier.as_deref())
+            .or_else(|| {
+                self.path
+                    .as_ref()
+                    .and_then(|path| path.segments.last())
+                    .map(String::as_str)
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

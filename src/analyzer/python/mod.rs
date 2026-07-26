@@ -454,8 +454,8 @@ impl PythonAnalyzer {
                 PythonImportDetails::FromImport {
                     module,
                     name,
-                    alias,
                     wildcard,
+                    ..
                 } => {
                     let resolved_module = if module.starts_with('.') {
                         resolve_python_relative_module(file, &module)
@@ -468,7 +468,14 @@ impl PythonAnalyzer {
                     if wildcard {
                         continue;
                     }
-                    let local_name = alias.unwrap_or_else(|| name.clone());
+                    // Non-wildcard from-imports always populate `identifier`
+                    // as `alias ?? name` (see `python_import_details`), so
+                    // `local_name()` reproduces the same alias-first fallback
+                    // without re-deriving it here.
+                    let local_name = import
+                        .local_name()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| name.clone());
                     let module_candidate = format!("{resolved_module}.{name}");
                     if self.resolve_module_code_unit(&module_candidate).is_some() {
                         binder.bindings.insert(
@@ -777,6 +784,16 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
         self.inner.ranges(code_unit)
+    }
+
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
+        self.inner
+            .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {

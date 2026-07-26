@@ -510,11 +510,11 @@ pub(in crate::analyzer::usages) fn scala_resolve_declared_type(
             continue;
         }
 
-        let local_name = import
-            .identifier
-            .as_deref()
-            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
-        if local_name != simple {
+        // `ImportInfo::local_name` is the shared `alias ?? identifier ??
+        // tail-of-structured-path` desugar; scala's `identifier` is already
+        // alias-resolved at construction, so this agrees with the old
+        // `identifier ?? terminal-of(path)` fallback exactly.
+        if import.local_name() != Some(simple) {
             continue;
         }
         for candidate in import_candidate_fq_names(&path, package_name) {
@@ -626,15 +626,15 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
         return owner.is_class().then_some(owner);
     }
 
-    if let Some((owner_short, _)) = target.short_name().rsplit_once('.') {
-        let owner_fq = if target.package_name().is_empty() {
-            owner_short.to_string()
-        } else {
-            format!("{}.{}", target.package_name(), owner_short)
-        };
-        if let Some(owner) = scala.definitions(&owner_fq).find(|unit| unit.is_class()) {
-            return Some(owner);
-        }
+    // The package-qualified owner is a pure segment pop on `target`'s own
+    // structured `fq()` (shared with `IAnalyzer::parent_of`), not a re-guess of
+    // where the legacy short_name string's last `.` falls plus a manual
+    // package re-qualification (this branch's old body did exactly that
+    // reconstruction by hand).
+    if let Some(owner_fq) = crate::analyzer::default_parent_fq_name(target)
+        && let Some(owner) = scala.definitions(&owner_fq).find(|unit| unit.is_class())
+    {
+        return Some(owner);
     }
 
     scala
@@ -701,10 +701,7 @@ pub(in crate::analyzer::usages) fn scala_normalized_fq_name(fq_name: &str) -> St
 }
 
 pub(in crate::analyzer::usages) fn scala_display_name(unit: &CodeUnit) -> String {
-    unit.short_name()
-        .rsplit('.')
-        .next()
-        .unwrap_or(unit.short_name())
+    super::shared::scala_short_name_terminal_segment(unit.short_name())
         .trim_end_matches('$')
         .to_string()
 }

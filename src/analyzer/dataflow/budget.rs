@@ -5,20 +5,28 @@ use std::{error::Error, fmt};
 use crate::analyzer::semantic::CancellationToken;
 use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
+use super::SolverTermination;
+
 define_work_dimensions! {
     /// One independently limited source of solver growth.
     #[repr(u8)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum SolverBudgetDimension;
-    /// Work performed or limits applied by one bounded data-flow solve.
+    /// Work performed or limits applied by one data-flow solve.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SolverWork;
-    all: pub(crate) [5];
+    all: pub(crate) [11];
     InternedFacts => interned_facts = 100_000,
     ReachedStates => reached_states = 1_000_000,
     FlowEvaluations => flow_evaluations = 4_000_000,
     CallbackRows => callback_rows = 4_000_000,
     PropagatedOutputs => propagated_outputs = 4_000_000,
+    EndSummaries => end_summaries = 1_000_000,
+    IncomingCalls => incoming_calls = 1_000_000,
+    ProviderMaterializations => provider_materializations = 100_000,
+    SummaryApplications => summary_applications = 4_000_000,
+    CoverageRows => coverage_rows = 1_000_000,
+    WitnessRelations => witness_relations = 4_000_000,
 }
 
 /// Exact failed solver-budget charge.
@@ -67,14 +75,17 @@ impl fmt::Display for SolverBudgetExceeded {
 
 impl Error for SolverBudgetExceeded {}
 
-/// Five-dimensional request-local work budget.
+/// Eleven-dimensional request-local work budget.
 ///
 /// `callback_rows` is the single deterministic cap for each unique seed or
 /// transfer relation collected from clients. If a complete relation fits that
 /// cap, the kernel sorts it and atomically checks the exact fact, state,
 /// callback-row, and propagated-output charge. Problem implementations must
 /// still stop emitting when requested and return cooperatively to bound their
-/// own CPU work.
+/// own CPU work. Summary tabulation additionally limits retained end summaries,
+/// waiting incoming calls, semantic-provider cache misses, matched-return
+/// applications, retained incomplete-coverage rows, and retained witness
+/// relations independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverBudget {
     ledger: BudgetLedger<SolverWork>,
@@ -145,6 +156,26 @@ impl<'request> DataflowRequest<'request> {
             cancellation,
         }
     }
+
+    /// Reserve solver work with cancellation checkpoints around staging.
+    ///
+    /// The second check catches cancellation observed during staging. The
+    /// token remains cooperative rather than synchronized with assignment, so
+    /// cancellation may still race immediately after the final checkpoint.
+    pub fn reserve(&mut self, work: SolverWork) -> Option<SolverTermination> {
+        if self.cancellation.is_cancelled() {
+            return Some(SolverTermination::Cancelled);
+        }
+        let staged = match self.budget.staged_charge(work) {
+            Ok(staged) => staged,
+            Err(exceeded) => return Some(SolverTermination::ExceededBudget(exceeded)),
+        };
+        if self.cancellation.is_cancelled() {
+            return Some(SolverTermination::Cancelled);
+        }
+        *self.budget = staged;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +190,12 @@ mod tests {
             flow_evaluations: 10,
             callback_rows: 10,
             propagated_outputs: 10,
+            end_summaries: 10,
+            incoming_calls: 10,
+            provider_materializations: 10,
+            summary_applications: 10,
+            coverage_rows: 10,
+            witness_relations: 10,
         });
         budget
             .charge(SolverWork {
@@ -195,5 +232,35 @@ mod tests {
         assert_eq!(budget.used(), SolverWork::default());
         assert_eq!(staged.used().reached_states, 3);
         assert_eq!(staged.used().saturating_sub(budget.used()), staged.used());
+    }
+
+    #[test]
+    fn request_reservation_does_not_commit_after_cancellation() {
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+        let mut budget = SolverBudget::uniform(4);
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+
+        assert_eq!(
+            request.reserve(SolverWork {
+                reached_states: 3,
+                ..SolverWork::default()
+            }),
+            Some(SolverTermination::Cancelled)
+        );
+        assert_eq!(request.budget.used(), SolverWork::default());
+    }
+
+    #[test]
+    fn request_reservation_commits_once_when_active() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SolverBudget::uniform(4);
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+        let charge = SolverWork {
+            reached_states: 3,
+            ..SolverWork::default()
+        };
+
+        assert_eq!(request.reserve(charge), None);
+        assert_eq!(request.budget.used(), charge);
     }
 }

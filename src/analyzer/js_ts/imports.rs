@@ -321,9 +321,7 @@ fn first_identifier_child(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn unquote(text: &str) -> String {
@@ -472,9 +470,8 @@ fn ts_source_extensions_for_runtime_specifier(
 
 pub(crate) fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
     import
-        .alias
-        .clone()
-        .or_else(|| import.identifier.clone())
+        .local_name()
+        .map(str::to_string)
         .into_iter()
         .collect()
 }

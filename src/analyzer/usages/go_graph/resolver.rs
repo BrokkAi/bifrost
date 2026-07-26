@@ -512,13 +512,22 @@ fn collect_go_declaration_facts(
             if !(unit.is_function() || unit.is_field()) {
                 continue;
             }
-            let Some((owner, member)) = fqn.rsplit_once('.') else {
+            // A true segment pop on `unit`'s own structured `fq()` (shared with
+            // `IAnalyzer::parent_of`) reproduces `fqn.rsplit_once('.')`'s owner
+            // cut exactly — Go's import-path components are already `Path`
+            // segments joined only among themselves by `/`, so the rightmost
+            // `.` in the rendered string is always this owner/member boundary,
+            // regardless of literal dots inside a domain-style package head
+            // (`github.com`). `identifier()` reproduces the member side: Go
+            // short names carry no `$`-nested nesting, so its Function/Field
+            // branch returns the same terminal segment `rsplit('.')` would.
+            let Some(owner) = crate::analyzer::default_parent_fq_name(&unit) else {
                 continue;
             };
             members
-                .entry(owner.to_string())
+                .entry(owner)
                 .or_default()
-                .entry(member.to_string())
+                .entry(unit.identifier().to_string())
                 .or_default()
                 .push(fqn);
         }
@@ -621,17 +630,18 @@ fn collect_go_embedded_field_type_fqns(
             else {
                 continue;
             };
-            let field_fqn = field.fq_name();
-            let Some((owner_fqn, _)) = field_fqn.rsplit_once('.') else {
+            // Structured owner pop on `field`'s own `fq()`, not a re-split of
+            // its rendered fqn string — same reasoning as the owner cut above.
+            let Some(owner_fqn) = crate::analyzer::default_parent_fq_name(&field) else {
                 continue;
             };
             let Some(embedded_fqn) =
-                resolver.resolve_field_type_fqn(field.source(), owner_fqn, &type_text)
+                resolver.resolve_field_type_fqn(field.source(), &owner_fqn, &type_text)
             else {
                 continue;
             };
             embedded_by_owner
-                .entry(owner_fqn.to_string())
+                .entry(owner_fqn)
                 .or_default()
                 .push(embedded_fqn);
         }
@@ -718,6 +728,16 @@ impl GoEdgeTypeResolver<'_> {
                 })
             });
         }
+        // fqname-M4: `owner_fqn` here is a plain string (the field's owner's
+        // rendered fqn, one level further removed than the CodeUnit-owner pop
+        // above); popping its OWN owner (the field owner's package) needs a
+        // live CodeUnit to call `default_parent_fq_name` on, and `owner_fqn`'s
+        // Go import-path head can itself contain literal dots (`github.com`),
+        // so the generic segment splitter would over-split it (same reasoning
+        // as the go.rs `go_resolve_go_field_type_fqn` deferral). Threading the
+        // owner CodeUnit through this call chain instead of a pre-flattened
+        // string is a signature change across `collect_go_embedded_field_type_fqns`
+        // and this resolver, not a mechanical rewrite here.
         let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
         let name = go_simple_type_name(type_text)?;
         let fqn = format!("{package}.{name}");
@@ -971,8 +991,13 @@ fn import_binder_of(
         };
         match import.alias.as_deref() {
             Some(".") => {
+                // Keyed per module (mirroring Rust's `*:{module}` glob-binding
+                // convention in lexical_scope.rs), not a single shared "*" key —
+                // Go permits multiple dot-imports in one file, and each must
+                // survive independently. A fixed "*" key let a second dot-import
+                // silently clobber the first in `binder.bindings`.
                 binder.bindings.insert(
-                    "*".to_string(),
+                    format!("*:{path}"),
                     ImportBinding {
                         module_specifier: path,
                         namespace_imported_module: None,
@@ -1421,7 +1446,7 @@ fn owner_name(target: &CodeUnit) -> Option<String> {
     }
     let short = target.short_name();
     short
-        .rsplit_once('.')
+        .rsplit_once('.') // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
         .map(|(owner, _)| owner.to_string())
         .filter(|owner| !owner.is_empty())
 }
@@ -1430,7 +1455,7 @@ fn is_module_field(target: &CodeUnit) -> bool {
     target.is_field()
         && target
             .short_name()
-            .split('.')
+            .split('.') // fqname-M4: first-segment sentinel check on the package-less short_name; no shared accessor exposes a raw first-segment text without routing through the client-selector normalizer (which strips generic/receiver decoration not applicable to this already-canonical internal string)
             .next()
             .is_some_and(|segment| segment == crate::analyzer::GO_MODULE_SCOPE_SEGMENT)
 }

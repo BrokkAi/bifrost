@@ -1,4 +1,5 @@
 use crate::analyzer::scala::{scala_package_prefixes_at, scala_type_lookup_segments};
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{CallableArity, CodeUnit, ImportInfo, scala_parenthesized_arity};
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
@@ -776,15 +777,7 @@ fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
 }
 
 fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "repeated_parameter_type" {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    false
+    subtree_contains(node, |current| current.kind() == "repeated_parameter_type")
 }
 
 pub(super) fn parenthesized_arity(source: &str) -> Option<usize> {
@@ -2010,7 +2003,7 @@ fn pattern_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool
 }
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {

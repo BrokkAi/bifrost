@@ -116,16 +116,21 @@ namespace App {
 
 #[test]
 fn csharp_dead_code_smell_reports_one_call_method() {
+    // #1138: a same-class bare `Leaf()` call is now a same-owner site, not a
+    // proven inbound edge, so the one-call finding must come from a genuine
+    // external caller (`s.Leaf()` through a Service parameter in another class).
     let (_project, analyzer) = csharp_analyzer_with_files(&[(
         "Service.cs",
         r#"
 namespace App {
     class Service {
-        void Wrapper() {
-            Leaf();
-        }
-
         void Leaf() {}
+    }
+
+    class Client {
+        void Wrapper(Service s) {
+            s.Leaf();
+        }
     }
 }
 "#,
@@ -143,10 +148,10 @@ namespace App {
 
     assert!(report.contains("App.Service.Leaf"), "{report}");
     assert!(
-        report.contains("one workspace inbound edge from App.Service.Wrapper"),
+        report.contains("one workspace inbound edge from App.Client.Wrapper"),
         "{report}"
     );
-    assert!(report.contains("| 1 | 0 |"), "{report}");
+    assert!(report.contains("| 1 | 1 |"), "{report}");
 }
 
 #[test]
@@ -256,15 +261,18 @@ namespace App {
 
 #[test]
 fn csharp_dead_code_smell_honors_usage_cap() {
+    // #1138: same-class bare `Helper()` calls are now same-owner (unproven), so the
+    // two *proven* inbound edges the cap test needs come from external callers
+    // (`s.Helper()` through a Service parameter in two other classes).
     let (_project, analyzer) = csharp_analyzer_with_files(&[(
         "Service.cs",
         r#"
 namespace App {
     class Service {
-        int First() { return Helper(); }
-        int Second() { return Helper(); }
-        int Helper() { return 1; }
+        public int Helper() { return 1; }
     }
+    class First { void Run(Service s) { s.Helper(); } }
+    class Second { void Run(Service s) { s.Helper(); } }
 }
 "#,
     )]);
@@ -385,6 +393,14 @@ namespace App {
 
 #[test]
 fn csharp_overloaded_methods_stay_on_precise_path() {
+    // Regression gate for the #1014 revert: extending bare implicit-this
+    // classification once flagged the uncalled zero-arg overload as confidently
+    // dead. With csharp's inverted builder now routing same-owner calls to
+    // record_unproven (#1138), the bare `Run(1)` cross-overload call is a
+    // same-owner site — so BOTH overloads read INCONCLUSIVE (the (int) overload's
+    // only caller is now same-owner, no longer a proven "only usage"; the zero-arg
+    // overload is still never confidently dead). INCONCLUSIVE-not-dead is the
+    // accepted java-uniform semantics.
     let (_project, analyzer) = csharp_analyzer_with_files(&[(
         "Service.cs",
         r#"
@@ -411,15 +427,24 @@ namespace App {
         },
     );
 
+    // Neither overload is confidently dead nor confidently alive: both inconclusive.
     assert!(
         report.contains("could not be proven or disproven"),
-        "the zero-arg overload's cross-overload call must stay inconclusive: {report}"
+        "the same-owner cross-overload call must be inconclusive: {report}"
     );
     assert!(!report.contains("one workspace inbound edge"), "{report}");
     assert!(!report.contains("no non-self usages found"), "{report}");
+    // The (int) overload's only caller is the bare same-owner `Run(1)`, so it is
+    // reported same-owner-inconclusive rather than a proven "only usage".
     assert!(
-        report.contains("only usage: Service.cs:5"),
-        "the (int) overload's same-class call is proven and counted: {report}"
+        report.contains(
+            "same-owner (self/this receiver) usage site(s) could not be proven or disproven"
+        ),
+        "the (int) overload's same-owner call is inconclusive, not a proven usage: {report}"
+    );
+    assert!(
+        !report.contains("only usage: Service.cs:5"),
+        "the (int) overload's same-owner call must not be counted as a proven usage: {report}"
     );
 }
 

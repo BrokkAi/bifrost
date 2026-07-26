@@ -130,7 +130,7 @@ fn is_typing_module(module: &str) -> bool {
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 /// Return the name-bearing node of a Python expression using tree-sitter fields.

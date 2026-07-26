@@ -40,6 +40,7 @@ use crate::analyzer::usages::inverted_edges::{
     classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
     IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
     resolve_php_function, resolve_php_type,
@@ -187,7 +188,22 @@ fn record_reference(
             }
             if let Some(owner) = scope_class_fqn(scope, scan) {
                 scan.record(owner.clone(), scope);
-                scan.record(format!("{owner}.{method}"), name_node);
+                // `self::m()` / `static::m()` are same-owner own-type static
+                // calls (#1138): the member edge is unproven inbound. `parent::`
+                // and an explicit class name stay external/proven.
+                let is_same_owner = matches!(node_text(scope, scan.source), "self" | "static");
+                route_same_owner(
+                    scan,
+                    is_same_owner,
+                    |scan| {
+                        scan.collector.record_unproven_name(
+                            method,
+                            name_node.start_byte(),
+                            name_node.end_byte(),
+                        );
+                    },
+                    |scan| scan.record(format!("{owner}.{method}"), name_node),
+                );
             }
         }
         // `X::$property` static property access.
@@ -201,7 +217,21 @@ fn record_reference(
             }
             if let Some(owner) = scope_class_fqn(scope, scan) {
                 scan.record(owner.clone(), scope);
-                scan.record(format!("{owner}.{property}"), name_node);
+                // `self::$prop` / `static::$prop` are same-owner own-type static
+                // accesses (#1138): the member edge is unproven inbound.
+                let is_same_owner = matches!(node_text(scope, scan.source), "self" | "static");
+                route_same_owner(
+                    scan,
+                    is_same_owner,
+                    |scan| {
+                        scan.collector.record_unproven_name(
+                            property,
+                            name_node.start_byte(),
+                            name_node.end_byte(),
+                        );
+                    },
+                    |scan| scan.record(format!("{owner}.{property}"), name_node),
+                );
             }
         }
         // `X::CONST`: the scope is also a type reference, independently of the
@@ -226,19 +256,36 @@ fn record_reference(
             if method.is_empty() {
                 return;
             }
-            if let Some(owner) = receiver_type_fqn(object, scan, bindings) {
-                if let Some(callable) =
-                    declared_instance_callable(scan.php, scan.analyzer, &owner, method)
-                {
-                    scan.record(callable.fq_name(), name_node);
-                }
-            } else {
-                scan.collector.record_unproven_name(
-                    method,
-                    name_node.start_byte(),
-                    name_node.end_byte(),
-                );
-            }
+            // `$this->m()` is a same-owner instance call (#1138): record it as
+            // unproven inbound rather than a proven edge. A call through another
+            // object — even one of the same type — stays external.
+            let is_same_owner = node_text(object, scan.source) == "$this";
+            route_same_owner(
+                scan,
+                is_same_owner,
+                |scan| {
+                    scan.collector.record_unproven_name(
+                        method,
+                        name_node.start_byte(),
+                        name_node.end_byte(),
+                    );
+                },
+                |scan| {
+                    if let Some(owner) = receiver_type_fqn(object, scan, bindings) {
+                        if let Some(callable) =
+                            declared_instance_callable(scan.php, scan.analyzer, &owner, method)
+                        {
+                            scan.record(callable.fq_name(), name_node);
+                        }
+                    } else {
+                        scan.collector.record_unproven_name(
+                            method,
+                            name_node.start_byte(),
+                            name_node.end_byte(),
+                        );
+                    }
+                },
+            );
         }
         // `$obj->field` and `$obj?->field`: type the receiver and record the
         // declared member owner just as targeted usage search does.
@@ -253,12 +300,27 @@ fn record_reference(
             if member.is_empty() {
                 return;
             }
-            if let Some(owner) = receiver_type_fqn(object, scan, bindings)
-                && let Some(field) =
-                    declared_instance_field(scan.php, scan.analyzer, &owner, member)
-            {
-                scan.record(field.fq_name(), name_node);
-            }
+            // `$this->field` is a same-owner access (#1138): unproven inbound.
+            let is_same_owner = node_text(object, scan.source) == "$this";
+            route_same_owner(
+                scan,
+                is_same_owner,
+                |scan| {
+                    scan.collector.record_unproven_name(
+                        member,
+                        name_node.start_byte(),
+                        name_node.end_byte(),
+                    );
+                },
+                |scan| {
+                    if let Some(owner) = receiver_type_fqn(object, scan, bindings)
+                        && let Some(field) =
+                            declared_instance_field(scan.php, scan.analyzer, &owner, member)
+                    {
+                        scan.record(field.fq_name(), name_node);
+                    }
+                },
+            );
         }
         // A bare constant name in reference position (`LIMIT`): not a call, not a
         // member, not a declaration. Resolves to the namespace constant fqn.

@@ -38,14 +38,15 @@ fn resolves_instance_static_and_unqualified_calls() {
         "expected ViaStatic -> Service.Helper: {}",
         value["edges"]
     );
-    // Unqualified `Local()` attributes to the enclosing class.
+    // #1138: unqualified `Local()` is a same-owner implicit-this call, now recorded
+    // as unproven inbound rather than a proven edge (uniform with Java/Rust).
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "Example.Consumer.CallsLocal",
             "Example.Consumer.Local"
         ),
-        "expected CallsLocal -> Consumer.Local: {}",
+        "same-owner unqualified call must not be a proven edge: {}",
         value["edges"]
     );
 }
@@ -287,6 +288,10 @@ public sealed class Consumer : Intermediate {
         Report(2);
     }
 
+    public void RunInstance(Consumer other) {
+        other.Report(6);
+    }
+
     public void RunParameter(System.Action<int> Report) {
         Report(4);
     }
@@ -317,20 +322,32 @@ public sealed class GenericConsumer : Box<int> {
     public void Run() {
         this.Read();
     }
+
+    public void RunInstance(GenericConsumer other) {
+        other.Read();
+    }
 }
 "#,
         )
         .build();
 
     let value = usage_graph_at(project.root(), "{}");
+    // #1138: `this.Report()` and bare `Report()` are same-owner receivers, now
+    // recorded as unproven inbound rather than proven edges — the nearest-declaring
+    // resolution is instead exercised by the non-self `other.Report()` call below.
     assert!(
-        has_edge(&value, "Demo.Consumer.RunQualified", "Demo.Base.Report"),
-        "qualified inherited call should edge to the declaring base member: {}",
+        !has_edge(&value, "Demo.Consumer.RunQualified", "Demo.Base.Report"),
+        "qualified same-owner call must not be a proven edge: {}",
         value["edges"]
     );
     assert!(
-        has_edge(&value, "Demo.Consumer.RunUnqualified", "Demo.Base.Report"),
-        "unqualified inherited call should edge to the declaring base member: {}",
+        !has_edge(&value, "Demo.Consumer.RunUnqualified", "Demo.Base.Report"),
+        "unqualified same-owner call must not be a proven edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Consumer.RunInstance", "Demo.Base.Report"),
+        "non-self instance call should edge to the nearest declaring base member: {}",
         value["edges"]
     );
     assert!(
@@ -343,13 +360,15 @@ public sealed class GenericConsumer : Box<int> {
         "local function must shadow the inherited member: {}",
         value["edges"]
     );
+    // #1138: `this.Report(3)` is a same-owner call, now unproven inbound rather
+    // than a proven edge; it must not edge to either declaration.
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "Demo.HiddenConsumer.Run",
             "Demo.HiddenConsumer.Report"
         ),
-        "nearer member should receive the hidden call edge: {}",
+        "same-owner hidden call must not be a proven edge: {}",
         value["edges"]
     );
     assert!(
@@ -357,13 +376,24 @@ public sealed class GenericConsumer : Box<int> {
         "nearer declaration must hide the base member: {}",
         value["edges"]
     );
+    // #1138: `this.Read()` is same-owner (unproven); the exact generic-arity owner
+    // resolution is exercised by the non-self `other.Read()` call instead.
     assert!(
-        has_edge(&value, "Demo.GenericConsumer.Run", "Demo.Box`1.Read"),
-        "generic inherited call should retain the exact metadata-arity owner: {}",
+        !has_edge(&value, "Demo.GenericConsumer.Run", "Demo.Box`1.Read"),
+        "same-owner generic inherited call must not be a proven edge: {}",
         value["edges"]
     );
     assert!(
-        !has_edge(&value, "Demo.GenericConsumer.Run", "Demo.Box.Read"),
+        has_edge(
+            &value,
+            "Demo.GenericConsumer.RunInstance",
+            "Demo.Box`1.Read"
+        ),
+        "non-self generic inherited call should retain the exact metadata-arity owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.GenericConsumer.RunInstance", "Demo.Box.Read"),
         "generic inherited call must not normalize to the nongeneric owner: {}",
         value["edges"]
     );
@@ -532,9 +562,13 @@ namespace Other {
         "generic return-type inference should preserve the selected overload: {}",
         value["edges"]
     );
+    // #1138: bare `Pick<int>(1)` is a same-owner implicit-this call, now unproven
+    // inbound — no proven edge to either the base generic or the derived nongeneric
+    // overload (the non-same-owner arity resolution is covered by the extension and
+    // factory cases above).
     assert!(
-        has_edge(&value, "Demo.Consumer.Run", "Demo.Base.Pick"),
-        "wrong generic arity on the derived member must not hide the base call: {}",
+        !has_edge(&value, "Demo.Consumer.Run", "Demo.Base.Pick"),
+        "same-owner explicit-generic call must not be a proven edge: {}",
         value["edges"]
     );
     assert!(
@@ -678,15 +712,17 @@ fn every_edge_endpoint_is_a_node() {
 fn nested_class_unqualified_calls_attribute_to_the_nested_fqn() {
     let value = usage_graph();
 
-    // An unqualified call inside `Outer.Inner` attributes to the nested class's
-    // own fqn (`$`-separated, as the analyzer emits it), not to `Outer`.
+    // #1138: an unqualified `Helper()` call inside `Outer.Inner` is a same-owner
+    // implicit-this call, now recorded as unproven inbound rather than a proven
+    // edge (uniform with Java/Rust) — so it must not appear as a proven edge, even
+    // to the nested class's own fqn.
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "Example.Outer$Inner.Compute",
             "Example.Outer$Inner.Helper"
         ),
-        "expected Outer$Inner.Compute -> Outer$Inner.Helper: {}",
+        "same-owner unqualified nested call must not be a proven edge: {}",
         value["edges"]
     );
 }

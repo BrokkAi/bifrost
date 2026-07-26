@@ -846,12 +846,14 @@ fn php_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if php_crosses_unindexed_boundary(support, &fqn) {
-        return boundary(format!(
+    // `php_crosses_unindexed_boundary` fuses the external signal with the
+    // workspace-namespace check, so its negation is exactly the workspace-
+    // internal gate `gated_boundary` wants.
+    gated_boundary(
+        || !php_crosses_unindexed_boundary(support, &fqn),
+        format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial PHP workspace analysis"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed PHP definition was found"),
     )
@@ -879,12 +881,13 @@ fn php_member_outcome(
     if !inherited.is_empty() {
         return candidates_outcome(inherited);
     }
-    if php_crosses_unindexed_boundary(support, &owner) {
-        return boundary(format!(
+    // gated on the owner's workspace-namespace check fused into
+    // `php_crosses_unindexed_boundary` (its negation is the workspace gate).
+    gated_boundary(
+        || !php_crosses_unindexed_boundary(support, &owner),
+        format!(
             "`{member}` appears to cross a PHP boundary at `{owner}` not indexed in this workspace"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{fqn}` is not indexed as a PHP definition"),
     )
@@ -950,10 +953,16 @@ fn php_direct_member_owner_fqns(
 }
 
 fn php_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
-    let Some((namespace, _)) = fqn.rsplit_once('.') else {
-        return !php_workspace_exact_namespace_exists(support, "");
-    };
-    !php_workspace_exact_namespace_exists(support, namespace)
+    // `fqn` is already a resolved, `.`-joined PHP fqn (namespace segments are
+    // `.`-joined; a nested type's `$` boundary, if present, is untouched by
+    // this splitter's delimiter set, exactly like the string `rsplit_once`
+    // it replaces). Re-tokenizing with the shared structured splitter and
+    // rejoining every part but the last with `.` reproduces
+    // `rsplit_once('.')`'s (namespace, _) split exactly, including the
+    // no-dot case (an empty namespace, which the exists-check always rejects).
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Php, fqn);
+    let namespace = segments[..segments.len().saturating_sub(1)].join(".");
+    !php_workspace_exact_namespace_exists(support, &namespace)
 }
 
 fn php_workspace_exact_namespace_exists(

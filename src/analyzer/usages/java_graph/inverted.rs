@@ -29,7 +29,7 @@ use super::return_type::{
     method_return_type_for_owner_fqn,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     build_file_declarations, build_file_declarations_from_state, classify_reference_node,
@@ -37,6 +37,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -273,15 +274,19 @@ fn record_reference(
             // method reachable only through same-owner calls is reported as
             // inconclusive (its receivers could not be proven external), never
             // confidently dead.
-            if method_invocation_receiver_is_same_owner(node, ctx, bindings) {
-                ctx.record_unproven(name, name_node);
-                return;
-            }
-            if let Some(owner) = method_owner_fqn(node, ctx, bindings) {
-                ctx.record(format!("{owner}.{name}"), name_node);
-            } else {
-                ctx.record_unproven(name, name_node);
-            }
+            let is_same_owner = method_invocation_receiver_is_same_owner(node, ctx, bindings);
+            route_same_owner(
+                ctx,
+                is_same_owner,
+                |ctx| ctx.record_unproven(name, name_node),
+                |ctx| {
+                    if let Some(owner) = method_owner_fqn(node, ctx, bindings) {
+                        ctx.record(format!("{owner}.{name}"), name_node);
+                    } else {
+                        ctx.record_unproven(name, name_node);
+                    }
+                },
+            );
         }
         "method_reference" => {
             if let Some(receiver) = constructor_method_reference_receiver(node) {

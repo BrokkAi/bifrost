@@ -2003,7 +2003,7 @@ mod tests {
     fn selector(name: &str) -> PolicySelector {
         PolicySelector::Inline {
             schema: SchemaVersionResolution {
-                version: 2,
+                version: RQL_SCHEMA_VERSION as u32,
                 origin: SchemaVersionOrigin::Explicit,
             },
             query: CodeQuery::from_sexp(&format!(r#"(call :callee (name "{name}"))"#)).unwrap(),
@@ -2303,7 +2303,8 @@ mod tests {
             normalize_and_validate_catalog(catalog("bifrost.sources", "request", "request"))
                 .unwrap();
         let compact = serde_json::to_string(&CatalogWire::from(&definition)).unwrap();
-        let duplicate = compact.replacen(r#""query":{"#, r#""query":{"schema_version":2,"#, 1);
+        let duplicate_prefix = format!(r#""query":{{"schema_version":{RQL_SCHEMA_VERSION},"#);
+        let duplicate = compact.replacen(r#""query":{"#, &duplicate_prefix, 1);
         assert_ne!(duplicate, compact, "fixture must contain a query object");
 
         let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());

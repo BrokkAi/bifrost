@@ -17,35 +17,8 @@
 
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
-use common::InlineTestProject;
-use serde_json::Value;
-
-fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
-        .expect("service");
-    let payload = service
-        .call_tool_json(tool, args)
-        .expect("tool call failed");
-    serde_json::from_str(&payload).expect("tool returned invalid JSON")
-}
-
-fn definition_reference_status(
-    project: &common::BuiltInlineTestProject,
-    symbol: &str,
-    context: &str,
-    target: &str,
-) -> String {
-    let args = serde_json::json!({
-        "references": [{ "symbol": symbol, "context": context, "target": target }]
-    })
-    .to_string();
-    let result = call_tool(project, "get_definitions_by_reference", &args);
-    result["results"][0]["status"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a status string, got {result}"))
-        .to_string()
-}
+use brokk_bifrost::Language;
+use common::{InlineTestProject, call_tool, definition_reference_status};
 
 /// The failing shape from the issue: header declares the class inside
 /// `namespace log4cxx {}`, the `.cpp` defines the out-of-line member at file

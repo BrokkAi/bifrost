@@ -2,8 +2,9 @@ use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
-use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
     rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
@@ -3063,12 +3064,12 @@ fn simple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
 /// (#1128): usage-side member/reference text must agree with normalized
 /// declaration names.
 fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
-    let text = source.get(node.start_byte()..node.end_byte())?.trim();
-    let text = if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    };
+    let text = crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    );
     (!text.is_empty()).then(|| text.to_string())
 }
 

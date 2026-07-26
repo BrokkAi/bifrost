@@ -1222,9 +1222,25 @@ pub(super) fn resolve_python(
             }
             if python_unresolved_import_boundary(file, analyzer, object_text, Some(attribute_text))
             {
-                return boundary(format!(
-                    "`{object_text}.{attribute_text}` crosses a Python import boundary not indexed in this workspace"
-                ));
+                return gated_boundary(
+                    || {
+                        python_import_binding_is_workspace_internal(
+                            py,
+                            support,
+                            file,
+                            object_text,
+                            Some(attribute_text),
+                        )
+                    },
+                    format!(
+                        "`{object_text}.{attribute_text}` crosses a Python import boundary not indexed in this workspace"
+                    ),
+                    "no_indexed_definition",
+                    format!(
+                        "`{}` did not resolve to an indexed Python definition",
+                        site.text
+                    ),
+                );
             }
             no_definition(
                 "no_indexed_definition",
@@ -1282,9 +1298,14 @@ pub(super) fn resolve_python(
                 }
             }
             if python_unresolved_import_boundary(file, analyzer, text, None) {
-                return boundary(format!(
-                    "`{text}` crosses a Python import boundary not indexed in this workspace"
-                ));
+                return gated_boundary(
+                    || python_import_binding_is_workspace_internal(py, support, file, text, None),
+                    format!(
+                        "`{text}` crosses a Python import boundary not indexed in this workspace"
+                    ),
+                    "no_indexed_definition",
+                    format!("`{text}` did not resolve to an indexed Python definition"),
+                );
             }
             no_definition(
                 "no_indexed_definition",
@@ -1817,12 +1838,13 @@ fn python_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if python_crosses_unindexed_boundary(support, fqn) {
-        return boundary(format!(
+    // `python_crosses_unindexed_boundary` is `!python_workspace_module_exists`,
+    // so its negation is the workspace-internal gate.
+    gated_boundary(
+        || !python_crosses_unindexed_boundary(support, fqn),
+        format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial Python workspace analysis"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed Python definition was found"),
     )
@@ -1837,12 +1859,12 @@ fn python_module_outcome(
     if let Some(module) = py.resolve_module_code_unit(module_fq) {
         return candidates_outcome(vec![module]);
     }
-    if python_crosses_unindexed_boundary(support, module_fq) {
-        return boundary(format!(
+    // Same workspace-namespace gate as the fqn path above.
+    gated_boundary(
+        || !python_crosses_unindexed_boundary(support, module_fq),
+        format!(
             "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{raw}` resolved to module `{module_fq}`, but no indexed Python module was found"),
     )
@@ -1897,10 +1919,15 @@ fn python_member_outcome(
 }
 
 fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
-    let Some((module, _)) = fqn.rsplit_once('.') else {
-        return !python_workspace_module_exists(support, "");
-    };
-    !python_workspace_module_exists(support, module)
+    // Python module paths are `.`-joined and identifiers never contain a
+    // literal `.`, so re-tokenizing `fqn` with the shared structured splitter
+    // and rejoining every part but the last with `.` reproduces
+    // `rsplit_once('.')`'s (module, _) split exactly, including the no-dot
+    // case (an empty module, which `python_workspace_module_exists` always
+    // rejects).
+    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, fqn);
+    let module = segments[..segments.len().saturating_sub(1)].join(".");
+    !python_workspace_module_exists(support, &module)
 }
 
 fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
@@ -2142,6 +2169,34 @@ fn python_unresolved_import_boundary(
         }
     }
     false
+}
+
+/// True when the name is bound by an import whose *target module* the workspace
+/// actually indexes — e.g. `from .sibling import Thing` where `sibling` is a
+/// workspace module. A missing `Thing` is then a not-yet-indexed member of a
+/// known-internal module, never a confident cross-workspace boundary (#1158).
+/// This is the workspace-module guard the fqn/module paths already apply through
+/// `python_crosses_unindexed_boundary`, which the import-binding paths lacked.
+fn python_import_binding_is_workspace_internal(
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    local: &str,
+    attribute: Option<&str>,
+) -> bool {
+    let binder = py.import_binder_of(file);
+    let Some(binding) = binder
+        .bindings
+        .get(local)
+        .or_else(|| attribute.and_then(|attribute| binder.bindings.get(attribute)))
+    else {
+        return false;
+    };
+    let module = binding
+        .namespace_imported_module
+        .as_deref()
+        .unwrap_or(binding.module_specifier.as_str());
+    python_workspace_module_exists(support, module)
 }
 
 fn python_name_shadowed_at(name: &str, root: Node<'_>, byte: usize, source: &str) -> bool {

@@ -2408,11 +2408,12 @@ pub(super) fn external_usage_definition_ranges(
     target: &CodeUnit,
 ) -> Vec<Range> {
     let ranges = analyzer.ranges_of(target);
-    let lookup_only_local_property = language_for_file(target.source()) == Language::JavaScript
-        && target.is_field()
-        && analyzer.parent_of(target).is_none()
-        && !analyzer.declarations(target.source()).contains(target);
-    if !lookup_only_local_property {
+    let narrow_to_name = target.is_class()
+        || (language_for_file(target.source()) == Language::JavaScript
+            && target.is_field()
+            && analyzer.parent_of(target).is_none()
+            && !analyzer.declarations(target.source()).contains(target));
+    if !narrow_to_name {
         return ranges;
     }
 

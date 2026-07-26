@@ -1,12 +1,30 @@
 use crate::analyzer::store::LimitedQueryRows;
-pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 pub(super) use crate::analyzer::usages::common::same_node;
+
+/// Trimmed C# node text with the verbatim-identifier `@` sigil normalized off
+/// identifier tokens (`@class` -> `class`). Declaration short/fq names already
+/// strip `@` when built, so the reference/get-definition side must strip it too
+/// for a verbatim-identifier usage to resolve to its declaration (previously it
+/// did not — the same normalization-agreement class as Rust's `r#`). Gated to
+/// the `identifier` kind so `@"..."` verbatim strings and attribute markers are
+/// untouched.
+pub(in crate::analyzer::usages) fn node_text<'a>(
+    node: tree_sitter::Node<'_>,
+    source: &'a str,
+) -> &'a str {
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::CSHARP_IDENTIFIER_SIGIL,
+    )
+}
 use crate::analyzer::usages::get_definition::ResolutionSession;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
-    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
+    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, Language, ProjectFile,
     StructuredTypeIdentity, StructuredTypeName, csharp_callable_arity,
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
     csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
@@ -1836,19 +1854,14 @@ fn resolve_in_enclosing_namespace(
     namespace: &str,
     name: &str,
 ) -> Option<CodeUnit> {
-    let mut namespace = namespace.to_string();
-    loop {
-        let candidate_fqn = if namespace.is_empty() {
+    crate::analyzer::usages::common::namespace_prefixes(namespace).find_map(|scope| {
+        let candidate_fqn = if scope.is_empty() {
             name.to_string()
         } else {
-            format!("{namespace}.{name}")
+            format!("{scope}.{name}")
         };
-        if let Some(candidate) = class_unit_for_fq_name(csharp, &candidate_fqn) {
-            return Some(candidate);
-        }
-        let separator = namespace.rfind('.')?;
-        namespace.truncate(separator);
-    }
+        class_unit_for_fq_name(csharp, &candidate_fqn)
+    })
 }
 
 fn type_parameter_shadows_reference(node: Node<'_>, source: &str, reference: &str) -> bool {
@@ -2484,11 +2497,27 @@ fn push_namespace_scopes(
         }
         scopes.push(scope);
         include_usings = false;
-        let Some((parent, _)) = current.rsplit_once('.') else {
+        let Some(parent) = csharp_namespace_parent(&current) else {
             break;
         };
-        current.truncate(parent.len());
+        current = parent;
     }
+}
+
+/// The namespace one level outward from `current` (its dotted prefix with the
+/// innermost component dropped), or `None` if `current` is already a single
+/// component. A C# namespace path is `.`-joined with no embedded delimiters in
+/// any single identifier segment, so re-tokenizing it with the shared
+/// structured splitter and dropping the innermost component reproduces
+/// `rsplit_once('.')`'s outward walk exactly (mirrors the cpp namespace-chain
+/// walk in `cpp_qualifier_lookup_tiers`).
+fn csharp_namespace_parent(current: &str) -> Option<String> {
+    let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::CSharp, current);
+    if parts.len() <= 1 {
+        return None;
+    }
+    parts.pop();
+    Some(parts.join("."))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2568,10 +2597,10 @@ fn namespace_relative_names(namespace: &str, target: &str) -> Vec<String> {
         return vec![target.trim_start_matches("global::").to_string()];
     }
     let mut names = Vec::new();
-    let mut prefix = namespace;
+    let mut prefix = namespace.to_string();
     while !prefix.is_empty() {
         names.push(format!("{prefix}.{target}"));
-        prefix = prefix.rsplit_once('.').map_or("", |(parent, _)| parent);
+        prefix = csharp_namespace_parent(&prefix).unwrap_or_default();
     }
     names.push(target);
     names

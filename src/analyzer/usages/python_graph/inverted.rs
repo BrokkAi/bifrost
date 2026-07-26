@@ -20,7 +20,9 @@ use super::extractor::{
     call_result_types, collect_assigned_identifiers, collect_scope_facts_from_parsed_source,
     enclosing_scope_facts, is_declaration_identifier, slice,
 };
-use super::resolver::{resolve_constructor_types, resolve_receiver_type};
+use super::resolver::{
+    annotation_reference_candidates, resolve_constructor_types, resolve_receiver_type,
+};
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
@@ -28,7 +30,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
@@ -52,8 +54,15 @@ where
     let language = tree_sitter_python::LANGUAGE.into();
     let mut targets_by_terminal: HashMap<String, Vec<String>> = HashMap::default();
     for target in targets {
+        // Python fqns are dotted module paths with no other delimiter (per the
+        // module doc comment above), so re-tokenizing with the shared structured
+        // splitter and taking the terminal segment reproduces
+        // `rsplit('.').next()`'s terminal split exactly.
+        let terminal = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, target)
+            .pop()
+            .unwrap_or_else(|| target.clone());
         targets_by_terminal
-            .entry(target.rsplit('.').next().unwrap_or(target).to_string())
+            .entry(terminal)
             .or_default()
             .push(target.clone());
     }
@@ -277,12 +286,20 @@ fn walk<'a>(
                 // no enclosing-function facts. Methods inside re-resolve their own facts.
                 "class_definition" => push_children(node, None, &mut stack),
                 "identifier" => {
-                    handle_identifier(node, ctx, scopes);
+                    if !handle_annotation_reference(node, ctx) {
+                        handle_identifier(node, ctx, scopes);
+                    }
                     push_children(node, facts, &mut stack);
                 }
                 "attribute" => {
+                    if handle_annotation_reference(node, ctx) {
+                        continue;
+                    }
                     handle_attribute(node, ctx, scopes, facts);
                     push_children(node, facts, &mut stack);
+                }
+                "string_content" => {
+                    handle_annotation_reference(node, ctx);
                 }
                 "keyword_argument" => {
                     handle_keyword_argument(node, ctx, scopes);
@@ -354,6 +371,19 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[Functio
     if let Some(callee) = ctx.bare_callee(text) {
         ctx.record(callee, node);
     }
+}
+
+fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_, '_>) -> bool {
+    let Some(candidates) =
+        annotation_reference_candidates(ctx.analyzer, ctx.py, ctx.file, ctx.source, node, false)
+    else {
+        return false;
+    };
+
+    for candidate in candidates {
+        ctx.record(candidate.fq_name(), node);
+    }
+    true
 }
 
 fn handle_attribute<'a>(
@@ -438,12 +468,16 @@ fn handle_attribute<'a>(
     if let Some(facts) = facts
         && ctx.targets_by_terminal.contains_key(attribute_text)
     {
-        if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
+        if matches!(object_text, "self" | "cls") {
+            // `self.member` / `cls.member` is a same-owner reference (#1138):
+            // record it as unproven inbound rather than a proven edge, so a
+            // member reachable only through same-owner access reads
+            // INCONCLUSIVE, never confidently dead — matching the other
+            // languages.
+            ctx.record_unproven_name(attribute_text, attribute);
+        } else if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
             ctx.record(format!("{type_fqn}.{attribute_text}"), attribute);
-        } else if object.kind() == "identifier"
-            && !matches!(object_text, "self" | "cls")
-            && !ctx.named.contains_key(object_text)
-        {
+        } else if object.kind() == "identifier" && !ctx.named.contains_key(object_text) {
             let resolution = facts.resolution_for(object_text);
             if resolution.is_ambiguous()
                 || (resolution.is_unknown() && is_receiver_parameter(scopes, object_text))

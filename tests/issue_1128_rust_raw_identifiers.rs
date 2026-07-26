@@ -14,26 +14,8 @@
 
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
-use common::InlineTestProject;
-use serde_json::Value;
-
-fn call_tool(project: &common::BuiltInlineTestProject, tool: &str, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
-        .expect("service");
-    let payload = service
-        .call_tool_json(tool, args)
-        .expect("tool call failed");
-    serde_json::from_str(&payload).expect("tool returned invalid JSON")
-}
-
-fn symbol_sources(project: &common::BuiltInlineTestProject, symbol: &str) -> Value {
-    call_tool(
-        project,
-        "get_symbol_sources",
-        &serde_json::json!({ "symbols": [symbol] }).to_string(),
-    )
-}
+use brokk_bifrost::Language;
+use common::{InlineTestProject, call_tool, symbol_sources};
 
 fn assert_resolves(project: &common::BuiltInlineTestProject, symbol: &str, expected_snippet: &str) {
     let result = symbol_sources(project, symbol);

@@ -789,6 +789,16 @@ fn resolve_rust_unscoped(
                 RustMemberKind::Field
             }
         });
+        // fqname-M4: `reference` here is always `Self` or `Self::<rest>`, and
+        // `<rest>` may itself contain further `::` (e.g. `Self::Outer::Item`);
+        // `split_once` deliberately peels only the first component and keeps the
+        // remainder verbatim (still `::`-joined) for the downstream
+        // `format!("{self_type}.{name}")`/trait-associated-item lookups below.
+        // Re-decomposing `name` with the generic segment splitter would flatten
+        // that remainder onto `.`-joins and could change which candidates match
+        // for nested associated-item paths — a real (if rare) behavior question
+        // that needs its own equivalence check against the trait-item resolver,
+        // not a mechanical rewrite. Revisit alongside that resolver.
         let candidates = match reference.split_once("::") {
             Some(_) if focused_segment == Some(0) => support.fqn(&self_type),
             Some((_, name)) => {
@@ -860,6 +870,16 @@ fn resolve_rust_unscoped(
     {
         return candidates_outcome(candidates);
     }
+    // fqname-M4: `reference` is an arbitrary bare Rust path (`a::b::c::d`);
+    // `rsplit_once` peels only the terminal segment as `name` and keeps
+    // everything before the last `::` joined verbatim as `path`, which is fed
+    // as an opaque string into `resolve_scoped_associated_item_matching` and
+    // the focused-use-path/scoped-prefix resolvers above. Those resolvers
+    // themselves re-derive structure from `path` (module lookups, `use`
+    // resolution) in ways not yet threaded onto `FqName`; migrating this split
+    // alone without also migrating those callees risks a shape mismatch this
+    // batch cannot fully prove via the touched suites. Revisit once the scoped
+    // associated-item resolver chain carries segments end-to-end.
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
         let role = tree
@@ -971,7 +991,10 @@ fn resolve_rust_unscoped(
                     ) {
                         return candidates_outcome(vec![unit]);
                     }
-                    return boundary(format!(
+                    // gated upstream: the enclosing-scope member fallback and the
+                    // current-module candidates just above are the workspace
+                    // check; only a genuinely-unindexed import reaches here.
+                    return boundary_unchecked(format!(
                         "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
                     ));
                 }
@@ -1019,7 +1042,23 @@ fn resolve_rust_unscoped(
         return candidates_outcome(candidates);
     }
     if rust_reference_looks_external(reference) {
-        return boundary(format!(
+        // A `::`-qualified reference reaches here only after the scoped-
+        // associated-item and visible-import paths above are exhausted. Before a
+        // confident boundary claim, consult the enclosing lexical scope: now that
+        // the shared resolver is separator-aware (#1162), the member fallback can
+        // match a `::`-qualified path (`inner::Config` -> a workspace-declared
+        // enclosing-scope `inner.Config`) instead of being inert as the ff08191a
+        // NOTE recorded. Rust's own scoped-associated resolution already catches
+        // every enclosing-qualified workspace shape upstream (see
+        // issue_1162's rust pin), so this fires only as the #1126 safety net for
+        // a future upstream regression — a genuinely-external `::` path yields
+        // `None` here and still draws the boundary.
+        if let Some(unit) =
+            rust_enclosing_scope_member_fallback(analyzer, file, reference, site.focus_start_byte)
+        {
+            return candidates_outcome(vec![unit]);
+        }
+        return boundary_unchecked(format!(
             "`{reference}` appears to cross a Rust crate/module boundary not indexed in this workspace"
         ));
     }
@@ -1438,7 +1477,23 @@ fn rust_macro_name_outcome(
             RustVisibleImportResolution::Resolved(candidates)
             | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
             RustVisibleImportResolution::BoundButUnindexed => {
-                return Some(boundary(format!(
+                // An unresolvable macro import must not blind the reference to a
+                // workspace-declared macro of the same name in an enclosing
+                // scope: macros keep their own namespace, so consult it before
+                // claiming an unindexed boundary (#1158, the macro-namespace
+                // analogue of the type-namespace fallback its siblings run).
+                if let Some(unit) = resolve_in_enclosing_scopes(
+                    analyzer,
+                    file,
+                    name,
+                    site.focus_start_byte,
+                    CodeUnit::is_macro,
+                ) {
+                    return Some(candidates_outcome(vec![unit]));
+                }
+                // gated upstream: the macro-namespace enclosing-scope fallback
+                // above is the workspace check.
+                return Some(boundary_unchecked(format!(
                     "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
                 )));
             }
@@ -1649,17 +1704,15 @@ fn resolve_import_package_scoped(
     scope_start: usize,
     module_specifier: &str,
 ) -> Option<String> {
-    let first = module_specifier.split("::").next()?;
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
         return rust.resolve_module_package(file, module_specifier);
     }
     let file_package = crate::analyzer::rust::rust_package_name(file);
     let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
     let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    let segments: Vec<&str> = module_specifier
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
     crate::analyzer::rust::resolve_rust_module_segments_with_crate(
         &lexical_package,
         &crate_package,
@@ -1677,7 +1730,9 @@ fn import_package_resolves_to_file(
     scope_start: usize,
     module_specifier: &str,
 ) -> bool {
-    let Some(first) = module_specifier.split("::").next() else {
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let Some(first) = segments.first().map(String::as_str) else {
         return false;
     };
     if !matches!(first, "self" | "super") {
@@ -1686,10 +1741,6 @@ fn import_package_resolves_to_file(
     let file_package = crate::analyzer::rust::rust_package_name(file);
     let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
     let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    let segments: Vec<&str> = module_specifier
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
     crate::analyzer::rust::resolve_rust_module_segments_with_crate(
         &lexical_package,
         &crate_package,
@@ -1707,24 +1758,34 @@ fn import_path_resolves_within_file(
     scope_start: usize,
     module_specifier: &str,
 ) -> Option<String> {
-    let first = module_specifier.split("::").next()?;
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
         return None;
     }
     let file_package = crate::analyzer::rust::rust_package_name(file);
     let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
     let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    let segments: Vec<&str> = module_specifier
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
     let resolved = crate::analyzer::rust::resolve_rust_module_segments_with_crate(
         &lexical_package,
         &crate_package,
         &segments,
     )?;
-    let (parent, name) = resolved.rsplit_once('.')?;
-    (parent == file_package).then(|| name.to_string())
+    // `resolved` is this same code's own `.`-joined package/name string (built two
+    // lines above by `resolve_rust_module_segments_with_crate`), and Rust
+    // identifiers cannot contain a literal `.`, so re-tokenizing it with the same
+    // structured splitter reproduces `rsplit_once('.')`'s (parent, name) split
+    // exactly — it is not source-text inference, it is re-reading this function's
+    // own already-structured output.
+    let resolved_parts =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, &resolved);
+    if resolved_parts.len() < 2 {
+        return None;
+    }
+    let (name, parent_parts) = resolved_parts.split_last()?;
+    let parent = parent_parts.join(".");
+    (parent == file_package).then(|| name.clone())
 }
 
 fn rust_import_target_candidates(
@@ -2565,17 +2626,18 @@ fn rust_focused_prefix_resolution_outcome(
                 ) {
                     return candidates_outcome(vec![unit]);
                 }
-                if rust_focused_is_workspace_module_namespace(rust, file, focused_text) {
-                    return no_definition(
-                        "workspace_module_namespace",
-                        format!(
-                            "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
-                        ),
-                    );
-                }
-                return boundary(format!(
-                    "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
-                ));
+                // The enclosing-scope fallback above already returned early; the
+                // remaining gate is the #1089 workspace-module-namespace check.
+                return gated_boundary(
+                    || rust_focused_is_workspace_module_namespace(rust, file, focused_text),
+                    format!(
+                        "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
+                    ),
+                    "workspace_module_namespace",
+                    format!(
+                        "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+                    ),
+                );
             }
             RustVisibleImportResolution::Unbound => {}
         }
@@ -2632,7 +2694,10 @@ fn rust_focused_prefix_resolution_outcome(
             if !routed.is_empty() {
                 return candidates_outcome(routed);
             }
-            return boundary(format!(
+            // gated upstream: reached only inside a resolved Cargo library route
+            // whose crate root the workspace does not index — the route
+            // resolution itself is the workspace check.
+            return boundary_unchecked(format!(
                 "focused Rust owner `{focused_text}` resolves through Cargo but its crate root is not indexed"
             ));
         }
@@ -2712,19 +2777,22 @@ fn rust_focused_prefix_resolution_outcome(
         // extern-prelude crate that an inline `mod <name>` shadows (`mod
         // serde_json { serde_json::… }`), which is genuinely unindexed — keep the
         // boundary there.
-        if !enclosing_module_self_root
-            && rust_focused_is_workspace_module_namespace(rust, file, focused_text)
-        {
-            return no_definition(
-                "workspace_module_namespace",
-                format!(
-                    "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
-                ),
-            );
-        }
-        return boundary(format!(
-            "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
-        ));
+        // Enclosing-scope fallback above returned early; the residual gate is the
+        // #1089 workspace-module check (except for an inline `mod <name>` self-
+        // root shadow, which stays a genuine boundary).
+        return gated_boundary(
+            || {
+                !enclosing_module_self_root
+                    && rust_focused_is_workspace_module_namespace(rust, file, focused_text)
+            },
+            format!(
+                "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
+            ),
+            "workspace_module_namespace",
+            format!(
+                "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+            ),
+        );
     }
     no_definition(
         "no_indexed_definition",
@@ -5063,10 +5131,16 @@ fn rust_root_node<'tree>(
     Some(node)
 }
 
-fn rust_fqn_package(fqn: &str) -> &str {
-    fqn.rsplit_once('.')
-        .map(|(package, _)| package)
-        .unwrap_or("")
+fn rust_fqn_package(fqn: &str) -> String {
+    // Rust identifiers cannot contain a literal `.`, so re-tokenizing the
+    // `package.short_name`-shaped fqn with the shared structured splitter and
+    // dropping the terminal segment reproduces `rsplit_once('.')`'s package
+    // prefix exactly.
+    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, fqn);
+    match parts.split_last() {
+        Some((_, prefix)) => prefix.join("."),
+        None => String::new(),
+    }
 }
 
 fn rust_local_package_name(file: &ProjectFile) -> String {
@@ -5224,14 +5298,12 @@ fn rust_simple_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
 /// text read here (e.g. `self.r#type`'s `field` node) must agree with the
 /// normalized declaration names built on the extraction side.
 fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default();
-    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    }
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        false,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    )
 }
 
 fn rust_imported_export_candidates(
@@ -5284,6 +5356,12 @@ fn rust_binder_has_external_binding(binder: &ImportBinder, reference: &str) -> b
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {
+    // fqname-M4: peeks at the raw first `::`-split token, including the empty
+    // token an absolute-path reference (`::std::foo`) produces; the shared
+    // structured splitter (`parse_symbol_path`) filters empty segments, which
+    // would shift "which token is first" for that one lead-`::` shape and is
+    // not proven equivalent here. Left as a narrow root-token peek rather than
+    // a full path decomposition.
     reference
         .split("::")
         .next()

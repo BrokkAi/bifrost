@@ -211,7 +211,7 @@ fn collect_parent_type_roots<'tree>(node: Node<'tree>, parents: &mut Vec<Node<'t
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 #[cfg(test)]

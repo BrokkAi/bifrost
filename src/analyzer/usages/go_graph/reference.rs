@@ -220,7 +220,7 @@ pub(in crate::analyzer::usages) fn resolve_go_reference_with_namespaces(
 }
 
 fn node_text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
-    source.get(node.byte_range()).unwrap_or_default()
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 /// Whether `node` is a top-level declaration (a direct child of the source file),

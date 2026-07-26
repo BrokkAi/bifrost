@@ -17,33 +17,29 @@ hero:
 
 import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-export const version = import.meta.env.PUBLIC_BIFROST_VERSION ?? 'development';
-export const tag = import.meta.env.PUBLIC_BIFROST_TAG ?? '';
-export const releaseUrl = import.meta.env.PUBLIC_BIFROST_RELEASE_URL ?? '';
-
-<CardGrid>
-  <LinkCard
-    title="Multi-language analysis"
-    href="capabilities/"
-    description="Parse mixed-language repositories into structured symbols, definitions, declarations, and cross-file relationships."
-  />
-  <LinkCard
-    title="Structural code queries"
-    href="code-querying/"
-    description="Match syntax and relationships with composable, AST-aware queries instead of fragile text patterns."
-  />
-  <LinkCard
-    title="Deep usage graphs"
-    href="code-querying/#choose-the-right-tool"
-    description="Trace definitions, references, call sites, and usages across files without falling back to raw text search."
-  />
-  <LinkCard
-    title="Built for agent workflows"
-    href="choose-bifrost/#then-choose-the-interface"
-    description="Run Bifrost through MCP, LSP, the CLI, or native libraries. Keep analysis local and give agents repository-scale context."
-  />
-</CardGrid>
-
-<p class="version-strip">
-  {tag ? <>Docs build: <a href={releaseUrl}>{tag}</a></> : <>Docs build: Bifrost {version}</>}
-</p>
+<div class="capability-deck">
+  <div class="capability-deck__inner">
+    <CardGrid>
+      <LinkCard
+        title="Multi-language analysis"
+        href="capabilities/"
+        description="Parse mixed-language repositories into structured symbols, definitions, declarations, and cross-file relationships."
+      />
+      <LinkCard
+        title="Structural code queries"
+        href="code-querying/"
+        description="Match syntax and relationships with composable, AST-aware queries instead of fragile text patterns."
+      />
+      <LinkCard
+        title="Deep usage graphs"
+        href="code-querying/#choose-the-right-tool"
+        description="Trace definitions, references, call sites, and usages across files without falling back to raw text search."
+      />
+      <LinkCard
+        title="Built for agent workflows"
+        href="choose-bifrost/#then-choose-the-interface"
+        description="Run Bifrost through MCP, LSP, the CLI, or native libraries. Keep analysis local and give agents repository-scale context."
+      />
+    </CardGrid>
+  </div>
+</div>

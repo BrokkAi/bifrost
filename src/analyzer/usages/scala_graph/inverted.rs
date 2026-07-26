@@ -35,7 +35,7 @@ use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
     scala_literal_type_name, scala_normalized_fq_name,
 };
-use super::shared::ScalaEdgeGraph;
+use super::shared::{ScalaEdgeGraph, scala_short_name_terminal_segment};
 use super::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
     ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaGenericOwnerSourceFacts,
@@ -75,6 +75,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHitKind;
+use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
     CallableArity, CodeUnit, GlobalUsageDefinitionIndex, Range, UsageFactsIndex,
 };
@@ -103,6 +104,21 @@ pub(super) enum ScalaResolvedReference {
     Logical(String),
 }
 
+/// Same-owner policy (#1014 facet B / #1138): Scala's receiver shape is threaded
+/// through this event pipeline via `hit_kind`.
+///
+/// The `ScalaScan` producer (which holds the call node) classifies a callable
+/// reference whose receiver denotes the enclosing instance / own object —
+/// explicit `this.m()`, an implicit bare `m()` resolved to an own or inherited
+/// template member, or `Obj.m()` from within `Obj` — as
+/// [`UsageHitKind::SelfReceiver`], while `super.m()` and a call through a
+/// different variable (even one of the same type) stay [`UsageHitKind::Reference`].
+/// The shared [`route_same_owner`] contract is honored at the two sinks:
+/// the scan sink records the hit and lets the external surface exclude it (and
+/// count it as a same-owner site), while the inverted [`ScalaEdgeSink`] routes a
+/// same-owner reference to *unproven* inbound rather than a proven edge, so a
+/// method reachable only through same-owner calls reads INCONCLUSIVE — uniform
+/// with the other ten languages.
 pub(super) trait ScalaReferenceSink {
     fn may_match_name(&self, _name: &str) -> bool {
         true
@@ -603,12 +619,7 @@ impl ProjectTypes {
         let mut bindings = ExportedMemberBindings::default();
         for child in self.index.fqn_direct_children(owner_fqn) {
             if child.is_function() || child.is_field() || self.type_aliases.contains(&child) {
-                let visible_name = child
-                    .short_name()
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(child.short_name())
-                    .to_string();
+                let visible_name = scala_short_name_terminal_segment(child.short_name());
                 bindings
                     .entry(visible_name)
                     .or_default()
@@ -4115,7 +4126,9 @@ impl ProjectTypes {
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
-        if !target.is_function() || target.short_name().rsplit('.').next() != Some("apply") {
+        if !target.is_function()
+            || scala_short_name_terminal_segment(target.short_name()) != "apply"
+        {
             return None;
         }
         let companion = self.exact_structural_parent(scala, target)?;
@@ -5289,12 +5302,7 @@ fn add_wildcard_member_bindings(
 ) {
     for declaration in declarations {
         if declaration.is_function() || declaration.is_field() {
-            let visible_name = declaration
-                .short_name()
-                .rsplit('.')
-                .next()
-                .unwrap_or(declaration.short_name())
-                .to_string();
+            let visible_name = scala_short_name_terminal_segment(declaration.short_name());
             member_names.add_declaration(visible_name, &declaration, 128);
         }
     }
@@ -5538,13 +5546,17 @@ impl NameResolver {
             if import.is_wildcard {
                 continue;
             }
-            let local_name = import
-                .identifier
-                .as_deref()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
-            if !required_names.contains(local_name) {
+            // `ImportInfo::local_name` is the shared `alias ?? identifier ??
+            // tail-of-structured-path` desugar; scala's `identifier` is already
+            // alias-resolved at construction, so this agrees with the old
+            // `identifier ?? terminal-of(path)` fallback exactly.
+            if !import
+                .local_name()
+                .is_some_and(|name| required_names.contains(name))
+            {
                 continue;
             }
+            let local_name = import.local_name().unwrap_or_default();
             let Some(tier) = types.explicit_import_tier(&path, &package_prefixes) else {
                 continue;
             };
@@ -5759,12 +5771,8 @@ impl NameResolver {
                     {
                         for child in types.index.fqn_direct_children(&declaration.fq_name()) {
                             if child.is_function() || child.is_field() {
-                                let visible_name = child
-                                    .short_name()
-                                    .rsplit('.')
-                                    .next()
-                                    .unwrap_or(child.short_name())
-                                    .to_string();
+                                let visible_name =
+                                    scala_short_name_terminal_segment(child.short_name());
                                 member_names.add_declaration(visible_name, &child, 128);
                             }
                         }
@@ -5891,10 +5899,14 @@ impl NameResolver {
             let Some(tier) = types.explicit_import_tier(&path, active_package_prefixes) else {
                 continue;
             };
+            // `ImportInfo::local_name` is the shared `alias ?? identifier ??
+            // tail-of-structured-path` desugar; scala's `identifier` is already
+            // alias-resolved at construction, so this agrees with the old
+            // `identifier ?? terminal-of(path)` fallback exactly.
             let local_name = import
-                .identifier
-                .clone()
-                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
+                .local_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| path.clone());
             if tier.declaration && tier.package {
                 ambiguous_import_priorities.insert(local_name.clone(), 192);
             }
@@ -6137,13 +6149,13 @@ fn visible_imports_at_byte(
         .collect()
 }
 
+/// The package-qualified owner of `unit` — a pure segment pop on its own
+/// structured `fq()` (shared with `IAnalyzer::parent_of`), not a re-guess of
+/// where the legacy short_name string's last `.` falls plus a manual
+/// package re-qualification (this function's old body did exactly that
+/// reconstruction by hand).
 fn owner_fqn(unit: &CodeUnit) -> Option<String> {
-    let (owner_short, _) = unit.short_name().rsplit_once('.')?;
-    Some(if unit.package_name().is_empty() {
-        owner_short.to_string()
-    } else {
-        format!("{}.{}", unit.package_name(), owner_short)
-    })
+    crate::analyzer::default_parent_fq_name(unit)
 }
 
 enum PhysicalCallableTargets {
@@ -6249,34 +6261,51 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
         target: ScalaResolvedReference,
         role: ScalaReferenceRole,
         reference_kind: UsageReferenceKind,
-        _hit_kind: UsageHitKind,
+        hit_kind: UsageHitKind,
         start: usize,
         end: usize,
     ) {
-        if matches!(
-            role,
-            ScalaReferenceRole::CompanionApplication
-                | ScalaReferenceRole::CompanionExtractor
-                | ScalaReferenceRole::CompanionValue
-        ) && let ScalaResolvedReference::Exact(callable) = &target
-            && let Some(owner) = self.types.exact_structural_parent(self.scala, callable)
-        {
-            let companions = if owner.short_name().ends_with('$') {
-                vec![owner]
-            } else {
-                self.types.exact_companion_objects(self.scala, &owner)
-            };
-            if let [companion] = companions.as_slice() {
-                self.collector
-                    .record_kind(companion.fq_name(), reference_kind, start, end);
-            }
-        }
-        let target = match target {
+        // A same-owner (self/this receiver, implicit-this, or own-object) call is
+        // recorded as UNPROVEN inbound, never a proven caller->callee edge, so a
+        // method reachable only through same-owner calls reads INCONCLUSIVE for
+        // dead-code — uniform with Rust and the other landed languages (#1138).
+        let unproven_target = match &target {
             ScalaResolvedReference::Exact(unit) => unit.fq_name(),
-            ScalaResolvedReference::Logical(fqn) => fqn,
+            ScalaResolvedReference::Logical(fqn) => fqn.clone(),
         };
-        self.collector
-            .record_kind(target, reference_kind, start, end);
+        route_same_owner(
+            self,
+            hit_kind == UsageHitKind::SelfReceiver,
+            move |sink| {
+                sink.collector.record_unproven(unproven_target, start, end);
+            },
+            move |sink| {
+                if matches!(
+                    role,
+                    ScalaReferenceRole::CompanionApplication
+                        | ScalaReferenceRole::CompanionExtractor
+                        | ScalaReferenceRole::CompanionValue
+                ) && let ScalaResolvedReference::Exact(callable) = &target
+                    && let Some(owner) = sink.types.exact_structural_parent(sink.scala, callable)
+                {
+                    let companions = if owner.short_name().ends_with('$') {
+                        vec![owner]
+                    } else {
+                        sink.types.exact_companion_objects(sink.scala, &owner)
+                    };
+                    if let [companion] = companions.as_slice() {
+                        sink.collector
+                            .record_kind(companion.fq_name(), reference_kind, start, end);
+                    }
+                }
+                let target = match target {
+                    ScalaResolvedReference::Exact(unit) => unit.fq_name(),
+                    ScalaResolvedReference::Logical(fqn) => fqn,
+                };
+                sink.collector
+                    .record_kind(target, reference_kind, start, end);
+            },
+        );
     }
 
     fn record_with_caller(
@@ -6507,6 +6536,114 @@ impl ScalaScan<'_, '_> {
 
     fn enclosing_class_unit(&self, byte: usize) -> Option<&CodeUnit> {
         self.class_ranges.enclosing_unit(byte)
+    }
+
+    /// The `UsageHitKind` a callable reference at `node` targeting `callee`
+    /// carries under the same-owner policy (#1014 facet B / #1138).
+    ///
+    /// A method call whose receiver denotes the current instance / own object —
+    /// explicit `this.m()`, an implicit bare `m()` resolved to an own or
+    /// inherited template member, or `Obj.m()` from within `Obj` — is a
+    /// self/this receiver. `super.m()` and a call through a different variable
+    /// (even one of the same type) stay external references.
+    fn callable_reference_hit_kind(&self, node: Node<'_>, callee: &CodeUnit) -> UsageHitKind {
+        if self.callable_reference_is_same_owner(node, callee) {
+            UsageHitKind::SelfReceiver
+        } else {
+            UsageHitKind::Reference
+        }
+    }
+
+    fn callable_reference_is_same_owner(&self, node: Node<'_>, callee: &CodeUnit) -> bool {
+        // Only an actual invocation is a self/this-receiver *call*. A bare method
+        // *value* (eta-expansion / a method captured as a function value) is a
+        // genuine usage even within the owning type and stays external, matching
+        // C#'s method-group-value rule (#1014).
+        if !scala_reference_is_invoked(node) {
+            return false;
+        }
+        match callable_receiver_value(node) {
+            Some(receiver) => {
+                let text = node_text(receiver, self.source).trim();
+                if receiver.kind() == "this" || text == "this" {
+                    // Explicit `this.m()` — the enclosing instance.
+                    true
+                } else if text == "super" {
+                    // `super.m()` is a deliberate up-call: external, uniform with
+                    // every landed language.
+                    false
+                } else {
+                    // Own-object `Obj.m()` from within `Obj`.
+                    self.receiver_names_enclosing_own_object(node.start_byte(), text, callee)
+                }
+            }
+            // Bare `m()` — implicit-this iff the callee is an (own or inherited)
+            // member of the enclosing template, not an imported free function.
+            None => self.callee_owned_by_enclosing_template(node.start_byte(), callee),
+        }
+    }
+
+    /// The class/object templates enclosing `byte`, innermost first, walking the
+    /// structural owner chain. Mirrors
+    /// [`scala_enclosing_template_owner_fq_names`] but keeps the `CodeUnit`
+    /// identities for exact owner comparison.
+    fn enclosing_template_owners(&self, byte: usize) -> Vec<CodeUnit> {
+        let mut owners = Vec::new();
+        let mut current = self.class_ranges.enclosing_unit(byte).cloned();
+        let mut seen = HashSet::default();
+        while let Some(template) = current {
+            if !seen.insert(template.clone()) {
+                break;
+            }
+            current = self.types.exact_structural_parent(self.scala, &template);
+            if template.is_class() {
+                owners.push(template);
+            }
+        }
+        owners
+    }
+
+    /// Whether `callee` is declared directly by the *innermost* enclosing template
+    /// at `byte` — the implicit-`this` case for a bare call: `m()` resolving to a
+    /// member of the current instance's own declaration.
+    ///
+    /// This deliberately compares the enclosing template against the callee's
+    /// owner by equality (the uniform enclosing-template == owner rule). A bare
+    /// name resolving to an *inherited* member (owned by a supertype), an *outer*
+    /// lexical scope's member (a different, enclosing instance), or an imported
+    /// free function is a call across a declaration/instance boundary and stays an
+    /// external reference — genuine cross-declaration demand for the callee.
+    fn callee_owned_by_enclosing_template(&self, byte: usize, callee: &CodeUnit) -> bool {
+        let Some(owner) = self.types.exact_structural_parent(self.scala, callee) else {
+            return false;
+        };
+        self.class_ranges
+            .enclosing_unit(byte)
+            .is_some_and(|template| template.fq_name() == owner.fq_name())
+    }
+
+    /// Whether `receiver_text` names an enclosing singleton object that declares
+    /// `callee` — the own-object static-style call `Obj.m()` from within `Obj`.
+    /// A same-typed local variable has a different name and is excluded; a sibling
+    /// object is not an enclosing owner and is excluded.
+    fn receiver_names_enclosing_own_object(
+        &self,
+        byte: usize,
+        receiver_text: &str,
+        callee: &CodeUnit,
+    ) -> bool {
+        let Some(owner) = self.types.exact_structural_parent(self.scala, callee) else {
+            return false;
+        };
+        // Only a singleton object can be a named same-owner receiver: an instance
+        // method is never reachable through a bare *type* name.
+        if !owner.short_name().ends_with('$') || scala_simple_type_name(&owner) != receiver_text {
+            return false;
+        }
+        let owner_fqn = owner.fq_name();
+        self.enclosing_template_owners(byte)
+            .iter()
+            .any(|template| template.fq_name() == owner_fqn)
     }
 
     fn exact_lexically_visible_type(&self, node: Node<'_>) -> ScalaTypeNamespaceResolution {
@@ -6771,11 +6908,16 @@ impl ScalaScan<'_, '_> {
     }
 
     fn record_exact(&mut self, callee: CodeUnit, role: ScalaReferenceRole, node: Node<'_>) {
+        let hit_kind = if role == ScalaReferenceRole::Callable {
+            self.callable_reference_hit_kind(node, &callee)
+        } else {
+            UsageHitKind::Reference
+        };
         self.sink.record(
             ScalaResolvedReference::Exact(callee),
             role,
             classify_reference_node(node),
-            UsageHitKind::Reference,
+            hit_kind,
             node.start_byte(),
             node.end_byte(),
         );
@@ -6828,11 +6970,12 @@ impl ScalaScan<'_, '_> {
         node: Node<'_>,
         call_shape: &ScalaCallSiteShape,
     ) {
+        let hit_kind = self.callable_reference_hit_kind(node, &callee);
         self.sink.record_callable(
             ScalaResolvedReference::Exact(callee),
             call_shape,
             classify_reference_node(node),
-            UsageHitKind::Reference,
+            hit_kind,
             node.start_byte(),
             node.end_byte(),
         );
@@ -7015,6 +7158,32 @@ fn record_import_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
             }
         }
     }
+}
+
+/// The receiver value node of a `recv.method` call when `node` is the `field`
+/// child of a `field_expression`; `None` for a bare `method()` call (no explicit
+/// receiver). Used by the same-owner classification to inspect the receiver
+/// shape (`this` / `super` / a named own-object) at the record site.
+fn callable_receiver_value(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    (parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node))
+        .then(|| parent.child_by_field_name("value"))
+        .flatten()
+}
+
+/// Whether the callable reference `node` is an actual invocation — a bare call
+/// `m(..)`, or the `field` of a `recv.m(..)` whose `field_expression` is the
+/// function of a call. A reference in argument/value position (a method value)
+/// is not an invocation, so it is never a self-receiver *call*.
+fn scala_reference_is_invoked(node: Node<'_>) -> bool {
+    if is_call_function_reference(node) {
+        return true;
+    }
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression"
+            && parent.child_by_field_name("field") == Some(node)
+            && is_call_function_reference(parent)
+    })
 }
 
 fn record_reference(

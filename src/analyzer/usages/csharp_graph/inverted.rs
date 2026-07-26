@@ -136,6 +136,7 @@ impl CsScan<'_, '_> {
         node: Node<'_>,
         call_arity: Option<usize>,
         explicit_generic_arity: Option<usize>,
+        same_owner: bool,
     ) {
         let key = (
             owner_fqn.to_string(),
@@ -181,7 +182,15 @@ impl CsScan<'_, '_> {
         let callees = candidates.clone();
         if !callees.is_empty() {
             for callee in callees {
-                self.record(callee, node);
+                // Same-owner (`this.`, bare implicit-this, own-type static) calls
+                // are unproven inbound rather than proven edges (#1138): a member
+                // reachable only through same-owner calls reads INCONCLUSIVE,
+                // never confidently dead.
+                if same_owner {
+                    self.record_unproven_callee(callee, node);
+                } else {
+                    self.record(callee, node);
+                }
             }
             return;
         }
@@ -226,13 +235,17 @@ impl CsScan<'_, '_> {
             .unwrap_or_default();
         if !extension_callees.is_empty() {
             for callee in extension_callees {
-                self.record(callee, node);
+                if same_owner {
+                    self.record_unproven_callee(callee, node);
+                } else {
+                    self.record(callee, node);
+                }
             }
             return;
         }
 
         if candidates.is_empty() {
-            if explicit_generic_arity.is_some() {
+            if explicit_generic_arity.is_some() || same_owner {
                 self.record_unproven(name, node);
             } else {
                 self.record(format!("{owner_fqn}.{name}"), node);
@@ -322,7 +335,7 @@ fn record_reference(
                     && let Some(owner) = ctx
                         .resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
                 {
-                    ctx.record_nearest_member(&owner, name, node, None, None);
+                    ctx.record_nearest_member(&owner, name, node, None, None, false);
                 } else {
                     ctx.record_unproven(name, node);
                 }
@@ -340,12 +353,17 @@ fn record_reference(
                 }
                 if let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string) {
                     let arity = argument_count(invocation, ctx.source);
+                    // A bare `Member(..)` is an implicit-this call on the current
+                    // instance — a same-owner reference (#1138), now routed to
+                    // unproven inbound. This is the inverted routing that unlocks
+                    // the scan-side bare-implicit-this widening (#1014 deferral).
                     ctx.record_nearest_member(
                         &owner,
                         name,
                         node,
                         Some(arity),
                         explicit_generic_arity,
+                        true,
                     );
                 }
                 return;
@@ -434,12 +452,18 @@ fn record_reference(
                         && parent.child_by_field_name("function") == Some(node))
                     .then(|| argument_count(parent, ctx.source))
                 });
+                // `this.Member` / own-type-static `Owner.Member` (from within
+                // `Owner`) is a same-owner reference (#1138) → unproven inbound.
+                // `base.Member` and a call through another same-type variable stay
+                // external.
+                let same_owner = csharp_receiver_is_same_owner(receiver, ctx, bindings);
                 ctx.record_nearest_member(
                     &owner,
                     name,
                     name_shape.identifier,
                     call_arity,
                     name_shape.explicit_generic_arity,
+                    same_owner,
                 );
             } else {
                 ctx.record_unproven(name, name_shape.identifier);
@@ -481,6 +505,39 @@ fn record_structured_type_candidate(
         true
     } else {
         false
+    }
+}
+
+/// Whether a member-access receiver is a same-owner receiver: an explicit `this`
+/// receiver, or the owner type itself for an own-type static call
+/// (`Owner.StaticMember` from within `Owner`). A `base` receiver, or a call
+/// through a differently-named local/parameter — even one of the same type —
+/// stays external (#1138). Mirrors Java's `method_invocation_receiver_is_same_owner`.
+fn csharp_receiver_is_same_owner(
+    receiver: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let Some(enclosing_owner) = ctx.enclosing_class(receiver.start_byte()) else {
+        return false;
+    };
+    match receiver.kind() {
+        "this" => true,
+        "base" => false,
+        "identifier" | "qualified_name" | "generic_name" => {
+            let name = node_text(receiver, ctx.source);
+            if name.is_empty() {
+                return false;
+            }
+            // A typed or shadowed local/parameter is a value of some type, not the
+            // own type used as a static receiver — a different instance.
+            if first_precise(bindings, name).is_some() || bindings.is_shadowed(name) {
+                return false;
+            }
+            ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
+                .is_some_and(|receiver_fqn| receiver_fqn == enclosing_owner)
+        }
+        _ => false,
     }
 }
 

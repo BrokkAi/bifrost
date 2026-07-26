@@ -41,7 +41,7 @@ use super::resolver::{
     type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, first_precise, parse_and_collect,
@@ -474,6 +474,12 @@ fn record_call(
                 return;
             };
             if receiver_is_self_like(receiver) {
+                // `this->m()` / `(*this).m()` is a same-owner call (#1138):
+                // record it as unproven inbound rather than dropping it, so a
+                // member reachable only through same-owner calls reads
+                // INCONCLUSIVE, never confidently dead — uniformly with the
+                // other languages.
+                ctx.record_unproven(name, field);
                 return;
             }
             if let Some(receiver_owner) = receiver_type_unit(receiver, ctx, bindings, 32) {
@@ -540,7 +546,18 @@ fn record_call(
                         }
                         return;
                     }
-                    EnclosingMemberOwnerResolution::Owner(_) => return,
+                    EnclosingMemberOwnerResolution::Owner(_) => {
+                        // Bare `m(..)` resolving to a method whose owner IS the
+                        // enclosing class is a same-owner call (#1161, mirroring
+                        // the `this->m()` fix at #1138): record it as unproven
+                        // inbound rather than dropping it, so a member reachable
+                        // only through bare implicit-this calls reads
+                        // INCONCLUSIVE, never confidently dead — uniformly with
+                        // the other languages and with the explicit-`this->m()`
+                        // site above.
+                        ctx.record_unproven(name, function);
+                        return;
+                    }
                     EnclosingMemberOwnerResolution::Ambiguous => {
                         ctx.record_unproven(name, function);
                         return;

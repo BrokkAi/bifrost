@@ -1,7 +1,30 @@
 use super::*;
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{CallableArity, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
+
+/// Intern one qualified-name segment in the process-global interner.
+fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured package-path prefix for a Java declaration.
+///
+/// `package_name` (from `determine_package_name`) is already the `.`-joined
+/// dotted package (`com.example.pkg`, empty for the unnamed package). Java
+/// identifiers can never contain a literal `.`, so splitting on `.` is
+/// lossless; each component becomes one [`SegmentKind::Package`] segment —
+/// mirroring python's `python_module_fq` (`Package`-`Package` renders `.` by
+/// default, which is exactly this convention; unlike go's `/`-joined import
+/// path, java's package has no `Path` component).
+fn java_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name.split('.').filter(|c| !c.is_empty()) {
+        fq.push(java_segment(component, SegmentKind::Package));
+    }
+    fq
+}
 
 pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
     for index in 0..root.named_child_count() {
@@ -74,6 +97,8 @@ pub(super) fn normalize_java_full_name(fq_name: &str) -> String {
 fn strip_trailing_numeric_suffix(input: &str) -> String {
     let colon_split = input.rsplit_once(':');
     let candidate = colon_split.map(|(head, _)| head).unwrap_or(input);
+    // fqname-M4: parses a JVM bytecode-derived synthetic name (anonymous `$<digits>` suffix),
+    // not a CodeUnit's structured short_name — the `$anon`/binary-name subsystem, not fq inference.
     let Some((prefix, suffix)) = candidate.rsplit_once('$') else {
         return input.to_string();
     };
@@ -171,6 +196,7 @@ fn looks_like_pascal_identifier(name: &str) -> bool {
 pub(super) fn is_java_anonymous_structure(fq_name: &str) -> bool {
     fq_name.contains("$anon$")
         || fq_name
+            // fqname-M4: classifies a JVM bytecode-derived anonymous-structure name, not a CodeUnit fq
             .rsplit_once('$')
             .map(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
             .unwrap_or(false)
@@ -220,12 +246,25 @@ pub(super) fn visit_class_like(
             .as_ref()
             .map(|parent| format!("{}.{}", parent.short_name(), simple_name))
             .unwrap_or(simple_name.clone());
+        // A nested class joins its parent with an ordinary `.` in Java's legacy
+        // convention (unlike python/php/ruby's `$`-joined nesting), so it is a
+        // plain `Type` segment hanging off the parent's own `Type` chain; a
+        // top-level class hangs off the package-path `Package` chain instead.
+        let fq = match &parent {
+            Some(parent) => parent
+                .fq()
+                .clone()
+                .with_pushed(java_segment(&simple_name, SegmentKind::Type)),
+            None => java_package_fq(package_name)
+                .with_pushed(java_segment(&simple_name, SegmentKind::Type)),
+        };
 
-        let code_unit = CodeUnit::new(
+        let code_unit = CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Class,
             package_name.to_string(),
             short_name,
+            fq,
         );
         if first.is_none() {
             first = Some(code_unit.clone());
@@ -343,13 +382,18 @@ fn visit_callable(
         .child_by_field_name("parameters")
         .map(|parameters| parameter_labels(parameters, source))
         .unwrap_or_default();
-    let code_unit = CodeUnit::with_signature(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(java_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         signature.clone(),
         false,
+        fq,
     );
 
     parsed.add_code_unit(
@@ -408,13 +452,18 @@ fn visit_compact_constructor(
     let short_name = format!("{}.{}", parent.short_name(), name);
     let declaration_header = callable_signature(node, source);
     let callable_sig = format!("{declaration_header}{signature}");
-    let code_unit = CodeUnit::with_signature(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(java_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         Some(signature),
         false,
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -469,11 +518,16 @@ fn visit_field_declaration(
             continue;
         }
 
-        let code_unit = CodeUnit::new(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(java_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Field,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
+            fq,
         );
         parsed.add_code_unit(
             code_unit.clone(),
@@ -526,11 +580,16 @@ fn visit_record_components(
             continue;
         }
 
-        let code_unit = CodeUnit::new(
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(java_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Field,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
+            fq,
         );
         parsed.add_code_unit(
             code_unit.clone(),
@@ -561,11 +620,16 @@ fn visit_enum_constant(
         return;
     }
 
-    let code_unit = CodeUnit::new(
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(java_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         package_name.to_string(),
         format!("{}.{}", parent.short_name(), name),
+        fq,
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -629,18 +693,40 @@ fn lambda_code_unit(
             parent.identifier()
         )
     };
-    CodeUnit::with_signature(
+    // The synthetic anonymous-lambda marker is a single `$anon$line:column`
+    // segment whose OWN text embeds a literal `$` between "anon" and the
+    // coordinate (`SegmentKind::Nested` renders one more `$` before it,
+    // regardless of the preceding segment's kind, and segment text is
+    // free-form, so the embedded `$` round-trips untouched). A lambda nested
+    // directly in a method (`parent.is_function()`) hangs the marker off the
+    // method's own `fq`; a lambda in a field/class-level initializer repeats
+    // the owning class's own last segment first (mirroring `parent.identifier()`
+    // in `short_name` above) before the marker.
+    let anon = java_segment(&format!("anon${line}:{column}"), SegmentKind::Nested);
+    let fq = if parent.fq().is_empty() {
+        FqName::new()
+    } else if parent.is_function() {
+        parent.fq().clone().with_pushed(anon)
+    } else {
+        let mut fq = parent.fq().clone();
+        if let Some(last) = parent.fq().last() {
+            fq.push(last);
+        }
+        fq.with_pushed(anon)
+    };
+    CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         None,
         true,
+        fq,
     )
 }
 
 pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 pub(super) fn normalize_whitespace(text: &str) -> String {
@@ -1109,18 +1195,21 @@ fn enum_constant_signature(node: Node<'_>, source: &str) -> String {
 }
 
 pub(super) fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUnit {
+    let fq = java_package_fq(package_name);
     match package_name.rsplit_once('.') {
-        Some((parent, leaf)) => CodeUnit::new(
+        Some((parent, leaf)) => CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Module,
             parent.to_string(),
             leaf.to_string(),
+            fq,
         ),
-        None => CodeUnit::new(
+        None => CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Module,
             String::new(),
             package_name.to_string(),
+            fq,
         ),
     }
 }

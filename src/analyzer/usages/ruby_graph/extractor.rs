@@ -1,7 +1,7 @@
 use crate::analyzer::ruby::{
     RubyFieldScope, extract_name_segments, parse_ruby_tree, ruby_variable_field_name,
 };
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
@@ -1070,6 +1070,7 @@ fn ruby_tail_expression(node: Node<'_>) -> Option<Node<'_>> {
 
 fn ruby_lexical_stack_for_owner(owner_fq_name: &str) -> Vec<String> {
     let segments: Vec<_> = owner_fq_name
+        // fqname-M4: builds the ruby lexical-scope stack from a `&str` owner fq-name (no CodeUnit/fq at this call site)
         .split('$')
         .filter(|segment| !segment.is_empty())
         .collect();

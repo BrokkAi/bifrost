@@ -1,5 +1,5 @@
 use crate::analyzer::java::structural::expression_name_node;
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::get_definition::java_lombok_generated_accessor_field_candidates;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;

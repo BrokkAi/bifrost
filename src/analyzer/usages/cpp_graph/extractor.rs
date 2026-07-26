@@ -2077,6 +2077,11 @@ fn definition_name_candidates(function: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Stri
     if !raw.contains("::") {
         return vec![format!("{namespace}::{raw}")];
     }
+    // fqname-M4: peeks at the raw first `::`-split token, including the empty
+    // token a leading-`::` absolute reference (`::Foo::Bar`) produces (same
+    // shape as rust's `rust_reference_looks_external`); the shared structured
+    // splitter filters empty segments, which would shift "which token is
+    // first" for that one lead-`::` shape and is not proven equivalent here.
     if raw
         .split("::")
         .next()
@@ -3141,6 +3146,17 @@ fn has_recovered_class_shape_ancestor(node: Node<'_>) -> bool {
     false
 }
 
+/// Whether `unit` is a real (non-alias) class owner — the shared filter
+/// `indexed_enclosing_class_components` and `indexed_enclosing_owner_scope`
+/// both apply while walking the indexed enclosing-owner chain: a `using`
+/// alias never counts as the true lexical owner.
+fn is_indexed_class_owner(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.is_class()
+        && !analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(unit))
+}
+
 fn indexed_enclosing_class_components(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -3152,20 +3168,14 @@ fn indexed_enclosing_class_components(
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
-    let mut current = analyzer.enclosing_code_unit(file, &range)?;
-    let mut classes = Vec::new();
-    loop {
-        let is_alias = analyzer
-            .type_alias_provider()
-            .is_some_and(|provider| provider.is_type_alias(&current));
-        if current.is_class() && !is_alias {
-            classes.push(current.identifier().to_string());
-        }
-        let Some(parent) = analyzer.parent_of(&current) else {
-            break;
-        };
-        current = parent;
-    }
+    let start = analyzer.enclosing_code_unit(file, &range)?;
+    let classes: Vec<String> =
+        crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            analyzer.parent_of(unit)
+        })
+        .filter(|unit| is_indexed_class_owner(analyzer, unit))
+        .map(|unit| unit.identifier().to_string())
+        .collect();
     if classes.is_empty() {
         return None;
     }
@@ -3196,21 +3206,19 @@ fn indexed_enclosing_owner_scope(
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
-    let mut current = analyzer.enclosing_code_unit(file, &range)?;
-    loop {
-        let is_alias = analyzer
-            .type_alias_provider()
-            .is_some_and(|provider| provider.is_type_alias(&current));
-        if current.is_class() && !is_alias {
-            return Some(
-                cpp_name_for(&current)
-                    .split("::")
-                    .map(String::from)
-                    .collect(),
-            );
-        }
-        current = analyzer.parent_of(&current)?;
-    }
+    let start = analyzer.enclosing_code_unit(file, &range)?;
+    let owner = crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+        analyzer.parent_of(unit)
+    })
+    .find(|unit| is_indexed_class_owner(analyzer, unit))?;
+    // `cpp_name_for` converts every `.`/`$` in the unit's name to `::` before
+    // this call, so it is already a pure `::`-joined string (same guarantee
+    // `namespace_prefixes` relies on); the shared structured splitter's
+    // segments are the `::`-delimited components exactly.
+    Some(crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(&owner),
+    ))
 }
 
 pub(in crate::analyzer::usages) fn resolve_type_node_lexically(

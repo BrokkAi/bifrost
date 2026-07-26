@@ -27,6 +27,7 @@ use super::extractor::{
 use super::hits::rust_path_segments;
 use crate::analyzer::rust::RustReferenceNamespace;
 use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
+use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
     classify_reference_node, parse_and_collect,
@@ -37,6 +38,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
     resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
     rust_unique_nominal_reference_namespace,
 };
+use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
     RustReferenceContext,
@@ -257,64 +259,55 @@ struct ScopeFacts {
 }
 
 fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &mut Vec<ScopeFacts>) {
-    let mut stack = vec![WalkFrame::Enter(node)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            WalkFrame::Enter(node) => match node.kind() {
-                "use_declaration" => {}
-                // A function or closure opens a parameter scope. `let` bindings
-                // are seeded incrementally when traversal reaches them so later
-                // shadowing cannot type earlier receiver calls.
-                "function_item" | "closure_expression" => {
-                    scopes.push(collect_parameter_scope_facts(node, ctx));
-                    stack.push(WalkFrame::ExitScope);
-                    push_children(node, &mut stack);
-                }
-                "block" => {
-                    scopes.push(ScopeFacts::default());
-                    stack.push(WalkFrame::ExitScope);
-                    push_children(node, &mut stack);
-                }
-                "let_declaration" => {
-                    handle_let_declaration(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                "call_expression" => {
-                    handle_method_call(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                "token_tree" => {
-                    handle_token_tree_paths(node, ctx);
-                    push_children(node, &mut stack);
-                }
-                "identifier" | "type_identifier" => {
-                    handle_identifier(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                "scoped_identifier" | "scoped_type_identifier" => {
-                    handle_scoped(node, ctx, scopes);
-                    push_children(node, &mut stack);
-                }
-                _ => push_children(node, &mut stack),
-            },
-            WalkFrame::ExitScope => {
-                scopes.pop();
+    let mut state = RustWalkState { ctx, scopes };
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, state| match node.kind() {
+            "use_declaration" => TreeWalkAction::Skip,
+            // A function or closure opens a parameter scope. `let` bindings
+            // are seeded incrementally when traversal reaches them so later
+            // shadowing cannot type earlier receiver calls.
+            "function_item" | "closure_expression" => {
+                let facts = collect_parameter_scope_facts(node, state.ctx);
+                state.scopes.push(facts);
+                TreeWalkAction::DescendWithExit
             }
-        }
-    }
+            "block" => {
+                state.scopes.push(ScopeFacts::default());
+                TreeWalkAction::DescendWithExit
+            }
+            "let_declaration" => {
+                handle_let_declaration(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            "call_expression" => {
+                handle_method_call(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            "token_tree" => {
+                handle_token_tree_paths(node, state.ctx);
+                TreeWalkAction::Descend
+            }
+            "identifier" | "type_identifier" => {
+                handle_identifier(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                handle_scoped(node, state.ctx, state.scopes);
+                TreeWalkAction::Descend
+            }
+            _ => TreeWalkAction::Descend,
+        },
+        |state| {
+            state.scopes.pop();
+        },
+    );
 }
 
-enum WalkFrame<'tree> {
-    Enter(Node<'tree>),
-    ExitScope,
-}
-
-fn push_children<'tree>(node: Node<'tree>, stack: &mut Vec<WalkFrame<'tree>>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(WalkFrame::Enter(child));
-        }
-    }
+struct RustWalkState<'a, 'b, 'c> {
+    ctx: &'a mut RustScan<'b, 'c>,
+    scopes: &'a mut Vec<ScopeFacts>,
 }
 
 fn is_shadowed(scopes: &[ScopeFacts], name: &str) -> bool {
@@ -456,11 +449,25 @@ fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scop
     if receiver_name.is_empty() || method_name.is_empty() {
         return;
     }
-    if let Some(owner) = receiver_type(scopes, receiver_name) {
-        ctx.record(format!("{owner}.{method_name}"), field);
-    } else {
-        ctx.record_unproven(method_name, field);
-    }
+    // A `self.method()` call is a same-owner reference (#1138): make the routing
+    // explicit rather than relying on `self` accidentally never seeding a
+    // `receiver_type`. Same-owner is recorded unproven — inconclusive, never a
+    // proven inbound edge — matching every other language. (This is the thin
+    // inverted-context self proof; it deliberately does NOT reuse the rich
+    // scan-side `receiver_owner_proof`.)
+    let is_same_owner = receiver.kind() == "self" || receiver_name == "self";
+    route_same_owner(
+        ctx,
+        is_same_owner,
+        |ctx| ctx.record_unproven(method_name, field),
+        |ctx| {
+            if let Some(owner) = receiver_type(scopes, receiver_name) {
+                ctx.record(format!("{owner}.{method_name}"), field);
+            } else {
+                ctx.record_unproven(method_name, field);
+            }
+        },
+    );
 }
 
 /// The local names a function/closure binds through its parameters. `let`
@@ -774,13 +781,10 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
 /// (#1128): usage-side member/reference text must agree with normalized
 /// declaration names.
 fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if crate::analyzer::common::rust_identifier_like_node_kind(node.kind()) {
-        crate::analyzer::common::strip_raw_identifier_prefix(text)
-    } else {
-        text
-    }
+    crate::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+    )
 }

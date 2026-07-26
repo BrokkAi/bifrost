@@ -3,6 +3,7 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::syntax::{
     JsTsLexicalBindingIndex, is_declaration_identifier, is_explicit_object_literal_key,
 };
+use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::typescript::ts_is_global_internal_module;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
@@ -668,14 +669,18 @@ fn resolve_js_ts_module_binding(
 ) -> DefinitionLookupOutcome {
     let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
     if files.is_empty() {
-        if is_bare_js_ts_specifier(module) {
-            return boundary(format!(
-                "`{module}` is a package import outside this partial workspace analysis"
-            ));
-        }
-        return boundary(format!(
-            "`{module}` could not be resolved to a workspace JS/TS file"
-        ));
+        // Only a bare specifier (`react`, `lodash`) is a confident external
+        // package boundary. A relative/absolute specifier (`./`, `../`, `/`)
+        // that resolves to no file is an in-workspace path that did not land —
+        // a typo or a not-yet-indexed sibling — never a confident cross-workspace
+        // claim (#1158): treat the relative shape as workspace-internal so the
+        // gate yields `no_definition` instead of `boundary`.
+        return gated_boundary(
+            || !is_bare_js_ts_specifier(module),
+            format!("`{module}` is a package import outside this partial workspace analysis"),
+            "no_indexed_definition",
+            format!("`{module}` could not be resolved to a workspace JS/TS file"),
+        );
     }
 
     let candidates = resolve_js_ts_module_binding_candidates(
@@ -692,7 +697,9 @@ fn resolve_js_ts_module_binding(
         if let Some((reexport_file, external_module)) = cached_jsts_index(analyzer, language, None)
             .and_then(|index| index.unresolved_reexport_boundary(&files, exported_name))
         {
-            return boundary(format!(
+            // gated upstream: `unresolved_reexport_boundary` only returns Some for
+            // a re-export chain that terminates outside the indexed workspace.
+            return boundary_unchecked(format!(
                 "`{exported_name}` is re-exported by `{}` from `{external_module}`, which is outside the indexed workspace",
                 rel_path_string(&reexport_file)
             ));
@@ -1119,21 +1126,14 @@ fn jsts_nearest_lexical_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope
 }
 
 fn jsts_pattern_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if matches!(
+    subtree_contains(node, |node| {
+        matches!(
             node.kind(),
             "identifier" | "shorthand_property_identifier_pattern"
         ) && source
             .get(node.start_byte()..node.end_byte())
             .is_some_and(|text| text.trim() == name)
-        {
-            return true;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
+    })
 }
 
 fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
@@ -1288,7 +1288,7 @@ fn jsts_receiver_provider_member_candidates(
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    crate::analyzer::common::node_source_text(node, source)
 }
 
 fn jsts_member_candidates(
@@ -3190,7 +3190,14 @@ fn ts_schema_infer_argument(text: &str) -> Option<&str> {
     let text = text.trim();
     let open = text.find('<')?;
     let head = text[..open].trim();
-    let last = head.rsplit('.').next()?;
+    // `head` is a type-annotation qualifier chain (already sliced before any
+    // generic argument list), so re-tokenizing it with the shared structured
+    // splitter and taking the last segment reproduces `rsplit('.').next()`'s
+    // terminal split exactly (TS/JS have no per-segment normalization
+    // quirks, unlike Go/Rust/Cpp).
+    let last = crate::analyzer::symbol_lookup::parse_symbol_path(Language::TypeScript, head)
+        .pop()
+        .unwrap_or_default();
     if !head.contains('.') || !(last == "infer" || last == "Infer") {
         return None;
     }
