@@ -171,9 +171,17 @@ comes through the local gate, but is not the focus.
   partitions, target-limit disposition, raw missing set, and
   BitcoinAddressFinder's selector-faithful zero-file record. Added the durable
   C manifest and narrative under `.agents/docs/reference-differential/`.
-- [ ] Commit and publish the C evidence summary, reconcile local and remote
-  master, and remove obsolete C diagnostics while retaining final raw evidence
-  through the 110-envelope audit.
+- [x] (2026-07-26) Committed and published the C evidence summary, merged the
+  concurrently advanced `origin/master`, and repeated formatting,
+  all-target/all-feature Clippy, and the complete `nlp,python` matrix on the
+  integrated head. Local HEAD, local `origin/master`, and remote master agree
+  at `5f04aa52`. Removed every obsolete C diagnostic while retaining only the
+  four final raw artifacts through the 110-envelope audit.
+- [x] (2026-07-26) Regenerated the live C++ selector and delegated an
+  independent Oldskool preflight. Both checks reproduce the planned ten
+  repositories and task counts, including stable 32-task and 22-task tie
+  ordering; none is excluded by `large-repos.csv`, and all ten clones are
+  tracked-clean at the expected readable heads with complete corpus metadata.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
@@ -483,9 +491,9 @@ negative controls, implement at the graph/parser/resolver root, review the
 diff, and run focused tests. Do not use regex, substring, delimiter splitting,
 or source-text mini-parsers.
 
-At the language publication boundary, run formatting, isolated all-target and
-all-feature Clippy, and the complete isolated
-`cargo test --features nlp,python` gate. Commit only campaign files with a
+At the language publication boundary, run formatting, all-target and
+all-feature Clippy, and the complete `cargo test --features nlp,python` gate
+normally outside the sandbox at niceness 10. Commit only campaign files with a
 multiline why-oriented message. Fetch and merge current `origin/master`, repeat
 proportionate gates, and push the integrated current branch directly to
 `origin/master` without waiting for CI.
@@ -507,14 +515,15 @@ canonical language key:
 
 Build and fingerprint the runner from a clean checkpoint:
 
-    cargo build --release --bin bifrost_reference_differential
+    nice -n 10 cargo build --release --bin bifrost_reference_differential
     git rev-parse HEAD
     sha256sum target/release/bifrost_reference_differential
 
 The C command shape is:
 
     set -o pipefail
-    /usr/bin/time -v target/release/bifrost_reference_differential run-corpus \
+    /usr/bin/time -v nice -n 10 \
+      target/release/bifrost_reference_differential run-corpus \
       --clones-root /home/jonathan/Projects/brokkbench/clones \
       --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
       --language c \
