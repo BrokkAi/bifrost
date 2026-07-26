@@ -40,7 +40,10 @@ Issue #1165 reports that broad C/C++ type inverse queries can spend many minutes
   `5a54b026`, including all 147 C/C++ usage tests and the symbols MCP/CLI and
   LSP surfaces. Cargo ran outside the sandbox with its normal repository target
   at niceness 10.
-- [ ] Publish and close #1165 after the pushed-head C corpus proof.
+- [x] (2026-07-26) Published head `d9df6f92` to `origin/master`, completed the
+  exact pushed-head Libgit2 replay at niceness 10 with all 796 inverse targets
+  and zero actionable residuals, and closed assigned issue #1165 with the
+  production evidence.
 
 ## Surprises & Discoveries
 
