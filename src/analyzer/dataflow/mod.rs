@@ -9,6 +9,8 @@
 
 mod budget;
 mod direct;
+mod ide;
+mod ide_result;
 mod input;
 mod problem;
 mod quality;
@@ -23,6 +25,14 @@ pub use budget::{
     DataflowRequest, SolverBudget, SolverBudgetDimension, SolverBudgetExceeded, SolverWork,
 };
 pub use direct::{DirectFact, DirectFlowProblem};
+pub use ide::{
+    IdeDataflowProblem, IdeDataflowSeed, IdeSummarySolveInput, IdeTransition,
+    solve_ide_with_summaries,
+};
+pub use ide_result::{
+    IdeDataflowError, IdeEdgeFunctionId, IdeMetrics, IdePointValue, IdeSummaryDataflowResult,
+    IdeValueId,
+};
 pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput, SemanticInputStatus};
 pub use problem::{
     BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowSeed,
