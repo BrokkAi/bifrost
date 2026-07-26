@@ -146,11 +146,19 @@ comes through the local gate, but is not the focus.
   and switched all subsequent Cargo and Bifrost commands to normal
   outside-sandbox execution at niceness 10. One older explicitly retained
   `.bifrost-keep` target was left untouched.
-- [ ] Merge current `origin/master`, which already owns cache schema version
-  12, and rerun the complete normal-permission gate. The current branch's
-  schema-11 binaries correctly rejected the linked primary checkout's newer
-  cache in CLI integration children; no user cache was modified.
-- [ ] Complete the repository-wide Rust gates and publish #1165.
+- [x] (2026-07-26) Merged current `origin/master` at `09771a77`, resolving the
+  only textual conflicts by retaining master's equivalent negative PHP/Ruby
+  same-owner assertions. The merge also aligned this branch with cache schema
+  version 12, so the CLI children no longer need any cache override.
+- [x] (2026-07-26) Passed `cargo fmt --all -- --check`,
+  `git diff --check`, all-target/all-feature Clippy with warnings denied, and
+  the complete normal-permission `cargo test --features nlp,python` matrix on
+  merged head `5a54b026`. Cargo ran outside the sandbox with its normal
+  repository target and every Cargo process ran at niceness 10. The matrix
+  included the symbols MCP and CLI surfaces, all LSP tests, the 16-opener cache
+  regression, all 147 C/C++ usage tests, and doc tests.
+- [ ] Publish the reviewed #1165, #1169, #1170, and #1173 commits to
+  `origin/master` and close their assigned issues with local-gate evidence.
 - [ ] Complete C and publish its evidence and user summary.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.

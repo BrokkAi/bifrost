@@ -41,8 +41,11 @@ auto-vacuum, and enabled foreign keys without a `database is locked` error.
   `git diff --check`, and all-target/all-feature Clippy with warnings denied.
   A final Oldskool read-only review found no actionable correctness,
   lock-order, portability, or coverage issue.
-- [ ] Pass the complete `cargo test --features nlp,python` gate after merging
-  the current `origin/master` schema migration.
+- [x] (2026-07-26) Merged the current `origin/master` schema migration and
+  passed the complete normal-permission `cargo test --features nlp,python`
+  matrix without a cache override. Formatting, `git diff --check`, and
+  all-target/all-feature Clippy also pass on the merged head. Cargo used the
+  normal repository target outside the sandbox at niceness 10.
 - [ ] Commit, synchronize, publish to `origin/master`, and close #1173.
 
 ## Surprises & Discoveries

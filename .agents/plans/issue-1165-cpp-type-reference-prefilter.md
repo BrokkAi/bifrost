@@ -32,10 +32,15 @@ Issue #1165 reports that broad C/C++ type inverse queries can spend many minutes
 - [x] (2026-07-25) Removed an eager global alias-identifier classification pass after the first repository-wide gate exposed provider-backed scaling of 140 first-run and 137 warm-run calls against bounds of 20 and 10. The final filter remains name-bounded and lazy; the focused scale test, all 147 C/C++ usage tests, and isolated all-feature Clippy pass.
 - [x] (2026-07-25) Delegated a final read-only correctness and cache-concurrency review. Oldskool found no actionable issue and confirmed that uncertain parser aliases, templates, unresolved chains, and cycles bypass pruning.
 - [x] (2026-07-26) Passed formatting, `git diff --check`, all-target/all-feature
-  Clippy with warnings denied, and the complete 1,872-test substantive library
+  Clippy with warnings denied, and the complete pre-merge substantive library
   target. The separately isolated MCP integration target passed 28/28.
-- [ ] Merge current `origin/master` (whose cache schema is one version ahead),
-  rerun the complete integration matrix, and publish.
+- [x] (2026-07-26) Merged current `origin/master` at `09771a77`, including its
+  cache-schema and FqName refactors. The complete normal-permission
+  `cargo test --features nlp,python` matrix then passed on merged head
+  `5a54b026`, including all 147 C/C++ usage tests and the symbols MCP/CLI and
+  LSP surfaces. Cargo ran outside the sandbox with its normal repository target
+  at niceness 10.
+- [ ] Publish and close #1165 after the pushed-head C corpus proof.
 
 ## Surprises & Discoveries
 
@@ -105,7 +110,7 @@ Issue #1165 reports that broad C/C++ type inverse queries can spend many minutes
 
 ## Outcomes & Retrospective
 
-Four cache boundaries were rejected rather than published: eager flattened evidence, cached peer/route collections that destroyed legacy short circuits, the semantically safe declaration-guard-only cache, and an exact-span final-decision cache. Those experiments localized the remaining waste above visibility normalization, where target-specific lexical resolution ran for large numbers of unrelated type nodes. The accepted two-stage structured prefilter removes that work before scope reconstruction while conservatively retaining every plausible alias and type shape. A fifth eager global alias-name set was removed during repository-wide validation because it regressed provider-backed declaration scaling; the final implementation stays lazy and terminal-name bounded. All 147 C/C++ usage integration tests and all-feature Clippy pass, and the full unfiltered libgit2 replay completed all 796 inverse targets with zero missing rows and exact envelope accounting. The complete repository-wide test gate and clean pushed-head corpus proof remain before this plan is complete.
+Four cache boundaries were rejected rather than published: eager flattened evidence, cached peer/route collections that destroyed legacy short circuits, the semantically safe declaration-guard-only cache, and an exact-span final-decision cache. Those experiments localized the remaining waste above visibility normalization, where target-specific lexical resolution ran for large numbers of unrelated type nodes. The accepted two-stage structured prefilter removes that work before scope reconstruction while conservatively retaining every plausible alias and type shape. A fifth eager global alias-name set was removed during repository-wide validation because it regressed provider-backed declaration scaling; the final implementation stays lazy and terminal-name bounded. All 147 C/C++ usage integration tests, all-feature Clippy, and the complete merged-head all-feature test matrix pass, and the full unfiltered libgit2 replay completed all 796 inverse targets with zero missing rows and exact envelope accounting. Publication and the clean pushed-head corpus proof remain before this plan is complete.
 
 ## Context and Orientation
 
