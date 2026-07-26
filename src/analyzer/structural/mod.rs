@@ -21,6 +21,7 @@
 //! and `.agents/plans/issue-449-query-code-reference.md` for the public rename.
 
 pub(crate) mod adapter_helpers;
+pub mod analysis_context;
 pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
@@ -35,6 +36,15 @@ pub mod rune_ir;
 pub mod search;
 pub mod spec;
 
+pub use analysis_context::{
+    MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
+    MAX_PROTOCOL_REFS, MAX_PROTOCOL_REGISTRATIONS, MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES,
+    MAX_RETAINED_BINDING_PLAN_BYTES, MAX_RETAINED_PROTOCOL_BYTES, ProtocolHandle,
+    ProtocolNameError, ProtocolNamespaceError, ProtocolRef, ProtocolRefError, ProtocolRegistration,
+    ProtocolRegistrationError, ProtocolRegistrationLimits, ProtocolRegistrationOutcome,
+    ProtocolRegistrationSet, ProtocolRegistrationSetError, QueryAnalysisContext,
+    QueryAnalysisContextError,
+};
 pub use execution::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
     CodeQueryDerivedLayerCacheCounters, CodeQueryExplain, CodeQueryExplainScheduling,

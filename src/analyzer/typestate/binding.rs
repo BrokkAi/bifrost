@@ -9,7 +9,7 @@ use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationSegmentKind,
     EvidenceCompleteness, ObjectCardinality, OracleCallContext, ProcedureHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, SemanticLocator, SourceAnchor,
+    ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticLocator, SourceAnchor,
 };
 
 use super::{
@@ -900,6 +900,30 @@ impl TypestateBindingPlan {
         &self.subjects
     }
 
+    /// Visit every semantic artifact identity retained by this plan.
+    ///
+    /// Registries use this to reject stale bindings before solver execution.
+    /// Duplicate keys are intentional here: callers that need a set can
+    /// deduplicate without this hot-path model retaining another index.
+    pub fn for_each_retained_artifact_key(&self, mut visit: impl FnMut(&SemanticArtifactKey)) {
+        for subject in &self.subjects {
+            visit_access_path_root_artifacts(subject.object().identity(), &mut visit);
+        }
+        for site in self
+            .initial_seeds
+            .iter()
+            .map(BoundTypestateInitialSeed::site)
+            .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
+            .chain(
+                self.terminal_bindings
+                    .iter()
+                    .map(BoundTypestateTerminal::site),
+            )
+        {
+            visit_observation_site_artifacts(site, &mut visit);
+        }
+    }
+
     pub const fn protocol_hash(&self) -> TypestateProtocolHash {
         self.protocol_hash
     }
@@ -1049,6 +1073,58 @@ impl TypestateBindingPlan {
 
     pub const fn hash(&self) -> TypestateBindingPlanHash {
         self.hash
+    }
+}
+
+fn visit_access_path_root_artifacts(
+    root: &AccessPathRoot,
+    visit: &mut impl FnMut(&SemanticArtifactKey),
+) {
+    let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact().key());
+    match root {
+        AccessPathRoot::Value(value) => visit_procedure(value.procedure()),
+        AccessPathRoot::CallResult(result) => {
+            visit_procedure(result.call().procedure());
+            visit_procedure(result.result().procedure());
+            visit_procedure(result.callee());
+            for call in result
+                .caller_context()
+                .calls()
+                .iter()
+                .chain(result.callee_context().calls())
+            {
+                visit_procedure(call.procedure());
+            }
+        }
+        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
+            visit_procedure(port.procedure());
+        }
+        AccessPathRoot::Allocation(allocation) => visit_procedure(allocation.procedure()),
+        AccessPathRoot::LexicalCell(location) => visit_procedure(location.procedure()),
+        AccessPathRoot::Static(locator)
+        | AccessPathRoot::TypeSummary(locator)
+        | AccessPathRoot::ModuleObject(locator)
+        | AccessPathRoot::External(locator) => visit(locator.scope().key()),
+    }
+}
+
+fn visit_observation_site_artifacts(
+    site: &TypestateObservationSite,
+    visit: &mut impl FnMut(&SemanticArtifactKey),
+) {
+    match site {
+        TypestateObservationSite::ProgramPoint { point, context, .. } => {
+            visit(point.procedure().artifact().key());
+            for call in context.runtime().calls() {
+                visit(call.procedure().artifact().key());
+            }
+        }
+        TypestateObservationSite::CallSite { call, context, .. } => {
+            visit(call.procedure().artifact().key());
+            for context_call in context.runtime().calls() {
+                visit(context_call.procedure().artifact().key());
+            }
+        }
     }
 }
 
