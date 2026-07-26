@@ -41,6 +41,7 @@ mod source_content;
 pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
+pub mod taint;
 pub(crate) mod test_paths;
 pub(crate) mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
@@ -49,6 +50,7 @@ mod typescript;
 pub mod typestate;
 mod usage_facts;
 pub mod usages;
+pub mod value_flow;
 mod work_budget;
 mod workspace;
 
