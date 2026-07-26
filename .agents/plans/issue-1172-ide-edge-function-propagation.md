@@ -19,7 +19,7 @@ The new capability is separately named. Existing `DistributiveDataflowProblem`, 
 - [x] (2026-07-26 08:31Z) Milestone 2: recorded canonical IDE transfer relations through the unchanged fact summary solver and implemented the bounded jump-function fixed point.
 - [x] (2026-07-26 08:31Z) Milestone 3: exposed deterministic relative jump summaries and root values, including exact call/summary/return composition and recursion reuse metrics.
 - [x] (2026-07-26 09:17Z) Milestone 4: extended the independent repeated-scan oracle through relative jump functions, end-summary functions, recursive entry-value propagation, and entry-aware final values; all focused algebra, call/return, recursion, reuse, permutation, cancellation, and budget regressions are green.
-- [ ] Milestone 5: completed all five guided specialist review angles and fixed the accepted correctness, boundedness, interning, and telemetry findings; final focused, strict all-feature Clippy, and all-feature validation gates remain.
+- [ ] (2026-07-26 09:43Z) Milestone 5: completed all five guided specialist review angles plus targeted re-reviews and fixed the accepted correctness, boundedness, interning, quality, and telemetry findings. The final no-feature focused set is green; strict all-feature Clippy and final all-feature validation remain on the post-review state.
 
 ## Surprises & Discoveries
 
@@ -49,6 +49,15 @@ The new capability is separately named. Existing `DistributiveDataflowProblem`, 
 
 - Observation: retained-object limits do not bound scheduling work or clone amplification by themselves.
   Evidence: review identified uncharged cache-hit/adjacency work and raw-graph function clones. `IdePropagations` now charges graph expansion, jump scheduling, and recursive entry-value propagation, while capture-time function interning and incremental value interning enforce unique-object limits before graph/value amplification.
+
+- Observation: recursive calls into the root procedure are not necessarily root seeds.
+  Evidence: a call-flow callback can map a seeded root fact to a distinct fact and thereby create a second `SummaryEntry` for the same procedure and entry point. Concrete materialization now seeds only explicitly supplied facts and lets exact incoming-call propagation populate re-entrant entries; the regression also agrees with the independent reference.
+
+- Observation: final point quality must be made concrete across summary-entry boundaries just like the value.
+  Evidence: callee-relative `PathQualityFrontier` rows start at proven/complete regardless of the caller. Entry propagation now independently combines the caller entry frontier, caller-relative path, and exact call evidence, requeues quality-only improvements, and conjoins the concrete entry frontier with each published relative row.
+
+- Observation: stopping one IDE capture dimension must immediately simplify later fact callbacks.
+  Evidence: after relation, function, or capture-operation exhaustion, the adapter now switches uncached callbacks to a fact-only sink. The function limit is enforced while collecting, performed capture meets are included in the attempted charge, and a counter-based regression proves later callbacks do not rerun client meet algebra.
 
 ## Decision Log
 
@@ -84,13 +93,17 @@ The new capability is separately named. Existing `DistributiveDataflowProblem`, 
   Rationale: reusable jump functions remain relative, while concrete values require meeting every caller-derived value at the exact callee `SummaryEntry`. Entry-aware rows preserve the acceptance key and avoid context-crossing point-only aggregation.
   Date/Author: 2026-07-26 / Codex
 
+- Decision: canonicalize duplicate root values with ordered per-fact sets before charging value meets.
+  Rationale: associative/commutative/idempotent meet guarantees a semantic result, but a tight operation budget must also be independent of seed order. Ordered grouping is deliberate here: it bounds insertion incrementally, preserves cancellation checkpoints, deduplicates identical values, and gives every permutation the same exact meet schedule.
+  Date/Author: 2026-07-26 / Codex
+
 ## Outcomes & Retrospective
 
 Milestones 1 through 3 are implemented. Ordinary fact-only code remains unchanged apart from the additive work-dimension definition and its exhaustive test match. IDE clients opt into `IdeDataflowProblem` and receive an owned `IdeSummaryDataflowResult` containing the original fact result, deterministic function/value arenas, relative reached/end-summary jump functions, root point values, and IDE-only metrics.
 
-The optimized layer currently passes 18 source-backed focused test cases (including the shared harness tests). The proving qualifier client demonstrates local identity, two-way branch meet, provider/callback permutation invariance, exact normal and exceptional returns, explicit deferred call-to-return, two-caller summary reuse, entry-aware callee values, cancellation during client composition, atomic exhaustion of all six IDE dimensions, capture-time algebra gating, deterministic duplicate seed meet, and witness independence. Helper, shared-callee, exceptional-return, direct-recursive, and mutually recursive fixtures compare final values, relative reached jump functions, and end-summary functions with the independent provider-backed repeated-scan oracle.
+The optimized layer currently passes 23 focused test invocations (19 IDE cases plus four shared harness cases). The proving qualifier client demonstrates local identity, two-way branch meet, provider/callback permutation invariance, exact normal and exceptional returns, explicit deferred call-to-return, two-caller summary reuse, entry-aware callee values and qualities, recursive root re-entry under a remapped fact, cancellation during client composition, atomic exhaustion of all six IDE dimensions, sticky capture-time algebra gating, propagation-bounded graph expansion, canonical duplicate-seed meet cost, and witness independence. Helper, shared-callee, exceptional-return, direct-recursive, remapped-recursive, and mutually recursive fixtures compare final values, relative reached jump functions, and end-summary functions with the independent provider-backed repeated-scan oracle.
 
-The five specialist angles found and drove fixes for seed canonicalization before cancellation/budget checks, exact transfer retention, incomplete fact projection on IDE exhaustion, missing callee values, unbounded fixed-point scheduling, graph/value clone amplification, differential coverage of public summaries, and partial-result telemetry. A low-risk suggestion to merge the two deliberately independent reference runners' scaffolding remains intentionally deferred so their control structures cannot drift together. Final validation remains before closure.
+The five specialist angles and targeted re-reviews found and drove fixes for bounded seed preflight, canonical seed algebra, exact transfer retention, incomplete fact projection on IDE exhaustion, missing and re-entrant callee values, caller-aware value quality, sticky capture exhaustion, unbounded fixed-point scheduling/storage, graph/value clone amplification, differential coverage of public summaries, and partial-result telemetry. The targeted correctness re-review found no remaining high/medium issue. A low-risk suggestion to merge the two deliberately independent reference runners' scaffolding remains intentionally deferred so their control structures cannot drift together. Final validation remains before closure.
 
 ## Context and Orientation
 
@@ -251,3 +264,5 @@ Use only existing standard-library collections, `crate::hash::{HashMap, HashSet}
 Revision note, 2026-07-26 07:52Z: Initial plan written after live issue verification, remote sync, code/history diagnosis, and explicit comparison of a generic-core refactor with an IDE-only captured-topology phase. The selected design preserves the fact-only kernel and avoids a second provider traversal while still giving jump functions their own monotone fixed point.
 
 Revision note, 2026-07-26 09:17Z: Updated after the five-angle guided review. Added exact transfer callback context, fact-preserving overlay exhaustion, entry-aware recursive concrete values, capture/value interning, an IDE propagation dimension, partial metrics, provider/callback permutation coverage, and differential comparison of public reached and end-summary functions.
+
+Revision note, 2026-07-26 09:43Z: Updated after targeted post-review corrections. Added remapped recursive root-entry propagation, concrete entry-quality frontiers, canonical per-fact seed schedules, sticky fact-only projection after capture exhaustion, collection-time function limits, and pre-allocation/scheduling propagation charges with focused regressions.

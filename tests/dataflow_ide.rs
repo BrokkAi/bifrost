@@ -4,15 +4,16 @@ use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, IdeDataflowProblem, IdeDataflowSeed,
-    IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, SolverBudget,
+    IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, PathQuality, SolverBudget,
     SolverBudgetDimension, SolverTermination, SolverWork, WitnessRetentionLimits,
     solve_ide_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken, ControlEdgeKind,
-    DispatchOracle, DispatchResult, IcfgEdgeKind, IcfgExitProfile, IcfgProvider, IcfgSnapshot,
-    IcfgSnapshotLimits, ProcedureHandle, ProgramPointId, ReturnTransferKind, SemanticBudget,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, WorkspaceIcfgProvider,
+    DispatchOracle, DispatchResult, EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile,
+    IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle, ProgramPointId, ProofStatus,
+    ReturnTransferKind, SemanticBudget, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    WorkspaceIcfgProvider,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -75,6 +76,7 @@ struct QualifierProblem {
     reverse_duplicate_normal_outputs: bool,
     value_meets: Option<Rc<Cell<usize>>>,
     edge_function_meets: Option<Rc<Cell<usize>>>,
+    remap_recursive_call_fact: bool,
 }
 
 impl QualifierProblem {
@@ -175,7 +177,16 @@ impl IdeDataflowProblem for QualifierProblem {
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
-        Self::preserve(fact, QualifierFunction::constant(Qualifier::Dirty), out);
+        let output_fact = if self.remap_recursive_call_fact && fact == QualifierFact::Tracked {
+            QualifierFact::Alternate
+        } else {
+            fact
+        };
+        Self::preserve(
+            output_fact,
+            QualifierFunction::constant(Qualifier::Dirty),
+            out,
+        );
     }
 
     fn return_flow(
@@ -217,6 +228,7 @@ type QualifierResult = IdeSummaryDataflowResult<QualifierFact, Qualifier, Qualif
 struct ReversingProvider<'workspace> {
     inner: WorkspaceIcfgProvider<'workspace>,
     reverse: bool,
+    degrade_calls: bool,
 }
 
 impl DispatchOracle for ReversingProvider<'_> {
@@ -240,6 +252,13 @@ impl IcfgProvider for ReversingProvider<'_> {
             .call_transfers(caller, call, request)
             .map(|outcome| {
                 outcome.map(|mut transfers| {
+                    if self.degrade_calls {
+                        for transfer in &mut transfers.transfers {
+                            transfer.proof = ProofStatus::Unproven("test call evidence".into());
+                            transfer.completeness =
+                                EvidenceCompleteness::Partial("test call coverage".into());
+                        }
+                    }
                     if self.reverse {
                         let mut rows = transfers.transfers.into_vec();
                         rows.reverse();
@@ -620,10 +639,12 @@ fn provider_and_callback_permutations_produce_the_same_ide_result() {
     let forward_provider = ReversingProvider {
         inner: analyzer.icfg_provider(),
         reverse: false,
+        degrade_calls: false,
     };
     let reverse_provider = ReversingProvider {
         inner: analyzer.icfg_provider(),
         reverse: true,
+        degrade_calls: false,
     };
     let semantic_call = root
         .semantics()
@@ -756,6 +777,51 @@ fn each_ide_budget_dimension_returns_a_typed_atomic_partial_result() {
 }
 
 #[test]
+fn ide_propagation_budget_bounds_multi_entry_graph_expansion() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn root() {}\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let seeds = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Alternate, Qualifier::Dirty),
+    ];
+    let mut limits = SolverBudget::default().limits();
+    limits.ide_propagations = 0;
+    let cancellation = CancellationToken::default();
+    let result = solve_problem_with_controls(
+        &root,
+        &analyzer.icfg_provider(),
+        &QualifierProblem::default(),
+        &seeds,
+        &mut SolverBudget::new(limits),
+        &cancellation,
+    );
+
+    assert_eq!(
+        result.fact_result().termination(),
+        SolverTermination::FixedPoint
+    );
+    assert_eq!(
+        result
+            .termination()
+            .budget_exceeded()
+            .expect("entry graph indexing exceeds the zero propagation budget")
+            .dimension(),
+        SolverBudgetDimension::IdePropagations,
+    );
+    assert!(result.point_values().is_empty());
+}
+
+#[test]
 fn capture_meet_budget_stops_before_running_client_algebra() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("lib.rs", "pub fn root(value: i32) -> i32 { value + 1 }\n")
@@ -807,6 +873,64 @@ fn capture_meet_budget_stops_before_running_client_algebra() {
         SolverBudgetDimension::EdgeFunctionOperations,
     );
     assert!(result.point_values().is_empty());
+}
+
+#[test]
+fn capture_exhaustion_switches_later_callbacks_to_fact_only_projection() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub fn root(value: i32) -> i32 { let next = value + 1; next + 1 }\n",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let cancellation = CancellationToken::default();
+    let meets = Rc::new(Cell::new(0));
+    let problem = QualifierProblem {
+        duplicate_normal_outputs: true,
+        edge_function_meets: Some(Rc::clone(&meets)),
+        ..QualifierProblem::default()
+    };
+    let seeds = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Alternate, Qualifier::Clean),
+    ];
+    let mut limits = SolverBudget::default().limits();
+    limits.edge_function_operations = 1;
+    let result = solve_problem_with_controls(
+        &root,
+        &analyzer.icfg_provider(),
+        &problem,
+        &seeds,
+        &mut SolverBudget::new(limits),
+        &cancellation,
+    );
+
+    assert_eq!(
+        meets.get(),
+        1,
+        "later callbacks must not rerun capture meets"
+    );
+    assert_eq!(
+        result.fact_result().termination(),
+        SolverTermination::FixedPoint
+    );
+    assert_eq!(
+        result
+            .termination()
+            .budget_exceeded()
+            .expect("the second capture meet exceeds the global limit")
+            .dimension(),
+        SolverBudgetDimension::EdgeFunctionOperations,
+    );
 }
 
 #[test]
@@ -909,6 +1033,68 @@ fn seed_fact_and_value_limits_stop_before_unbounded_value_algebra() {
     assert_eq!(
         cancelled_result.fact_result().termination(),
         SolverTermination::Cancelled
+    );
+}
+
+#[test]
+fn duplicate_seed_meets_have_a_canonical_budget_cost() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn root() {}\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let provider = analyzer.icfg_provider();
+    let grouped_duplicates = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Dirty),
+    ];
+    let interleaved_duplicates = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Dirty),
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+    ];
+    let run = |seeds: &[IdeDataflowSeed<QualifierFact, Qualifier>]| {
+        let value_meets = Rc::new(Cell::new(0));
+        let problem = QualifierProblem {
+            value_meets: Some(Rc::clone(&value_meets)),
+            ..QualifierProblem::default()
+        };
+        let mut limits = SolverBudget::default().limits();
+        limits.value_operations = 1;
+        let cancellation = CancellationToken::default();
+        let result = solve_problem_with_controls(
+            &root,
+            &provider,
+            &problem,
+            seeds,
+            &mut SolverBudget::new(limits),
+            &cancellation,
+        );
+        (result, value_meets.get())
+    };
+
+    let grouped = run(&grouped_duplicates);
+    let interleaved = run(&interleaved_duplicates);
+    assert_eq!(grouped.1, 1);
+    assert_eq!(interleaved.1, 1);
+    assert_eq!(grouped.0, interleaved.0);
+    assert_eq!(grouped.0.work().value_operations, 1);
+    assert_eq!(
+        grouped
+            .0
+            .termination()
+            .budget_exceeded()
+            .expect("materialization exceeds the exact one-meet seed budget")
+            .dimension(),
+        SolverBudgetDimension::ValueOperations,
     );
 }
 
@@ -1046,6 +1232,52 @@ fn helper_summary_composes_call_body_and_exact_return_in_path_order() {
         result.fact_result().end_summaries().len(),
     );
     assert_matches_reference(&root, &analyzer.icfg_provider(), &result);
+}
+
+#[test]
+fn callee_values_include_the_incoming_call_quality() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+                fn helper(value: i32) -> i32 { value + 1 }
+                pub fn root() -> i32 { helper(1) }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let provider = ReversingProvider {
+        inner: analyzer.icfg_provider(),
+        reverse: false,
+        degrade_calls: true,
+    };
+
+    let result = solve(&root, &provider);
+
+    let callee_entry = result
+        .point_values()
+        .iter()
+        .find(|row| {
+            row.entry().procedure() != &root
+                && row.point() == row.entry().entry_point()
+                && result.fact_result().fact(row.fact()).copied() == Some(QualifierFact::Tracked)
+        })
+        .expect("the helper entry has a concrete value and quality");
+    assert!(
+        callee_entry
+            .path_qualities()
+            .contains(PathQuality::UNPROVEN_PARTIAL)
+    );
+    assert!(!callee_entry.path_qualities().has_proven_path());
+    assert!(!callee_entry.path_qualities().has_complete_path());
 }
 
 #[test]
@@ -1262,6 +1494,77 @@ fn recursive_function_improvements_match_the_repeated_scan_reference() {
     );
     assert!(result.metrics().meet_cache_misses > 0);
     assert!(result.metrics().summary_function_applications > 1);
+}
+
+#[test]
+fn recursive_call_can_create_a_distinct_root_entry_fact() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/recursive.ts",
+            r#"
+                export function root(n: number): number {
+                    if (n <= 0) return 0;
+                    return root(n - 1);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/recursive.ts",
+        PointSelector::new("function root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let problem = QualifierProblem {
+        remap_recursive_call_fact: true,
+        ..QualifierProblem::default()
+    };
+    let seeds = [IdeDataflowSeed::new(
+        QualifierFact::Tracked,
+        Qualifier::Clean,
+    )];
+    let cancellation = CancellationToken::default();
+    let mut budget = SolverBudget::default();
+    let result = solve_problem_with_controls(
+        &root,
+        &analyzer.icfg_provider(),
+        &problem,
+        &seeds,
+        &mut budget,
+        &cancellation,
+    );
+
+    assert_eq!(result.termination(), SolverTermination::FixedPoint);
+    let recursive_entry_value = result
+        .point_values()
+        .iter()
+        .find(|row| {
+            let entry_fact = result.fact_result().fact(row.entry().entry_fact()).copied();
+            let fact = result.fact_result().fact(row.fact()).copied();
+            row.entry().procedure() == &root
+                && row.point() == row.entry().entry_point()
+                && entry_fact == Some(QualifierFact::Alternate)
+                && fact == Some(QualifierFact::Alternate)
+        })
+        .and_then(|row| result.value(row.value()))
+        .copied()
+        .expect("the recursive call populates the remapped root entry");
+    assert_eq!(recursive_entry_value, Qualifier::Dirty);
+
+    let mut reference_budget =
+        SemanticBudget::uniform(100_000_000).expect("positive reference budget");
+    let reference = reference_ide_projection(
+        &root,
+        &seeds,
+        &analyzer.icfg_provider(),
+        &problem,
+        &mut reference_budget,
+    )
+    .expect("remapped recursive reference reaches a fixed point");
+    assert_eq!(point_value_projection(&result), *reference.point_values());
 }
 
 #[test]

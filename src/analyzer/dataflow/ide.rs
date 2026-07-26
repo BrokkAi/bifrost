@@ -1,6 +1,10 @@
 //! Client contracts for bounded IDE edge-function propagation.
 
-use std::{cell::RefCell, collections::VecDeque, hash::Hash};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    hash::Hash,
+};
 
 use crate::analyzer::semantic::{
     CallTransfer, IcfgEdgeKind, MatchedReturnProjection, ProcedureHandle, ProcedureIcfgEdge,
@@ -11,9 +15,9 @@ use crate::hash::{HashMap, HashSet};
 use super::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, FactId,
     IdeDataflowError, IdeEdgeFunctionId, IdeMetrics, IdePointValue, IdeSummaryDataflowResult,
-    IdeValueId, PathQualityFrontier, SolverTermination, SolverWork, SummaryDataflowError,
-    SummaryDataflowResult, SummaryEntry, SummarySolveInput, WitnessRetentionLimits,
-    solve_with_summaries,
+    IdeValueId, PathQuality, PathQualityFrontier, SolverTermination, SolverWork,
+    SummaryDataflowError, SummaryDataflowResult, SummaryEntry, SummarySolveInput,
+    WitnessRetentionLimits, solve_with_summaries,
 };
 
 /// One fact transition coupled to its client-supplied edge function.
@@ -304,10 +308,15 @@ where
         });
     }
 
-    fn mark_functions_exhausted(&mut self, attempted_functions: usize) {
+    fn mark_functions_exhausted(
+        &mut self,
+        staged_relations: usize,
+        staged_meets: usize,
+        attempted_functions: usize,
+    ) {
         self.attempted_work = Some(SolverWork {
-            ide_relations: self.retained_relations,
-            edge_function_operations: self.capture_meets,
+            ide_relations: self.retained_relations.saturating_add(staged_relations),
+            edge_function_operations: self.capture_meets.saturating_add(staged_meets),
             edge_functions: attempted_functions,
             ..SolverWork::default()
         });
@@ -321,17 +330,10 @@ where
     ) {
         debug_assert!(!self.ids.contains_key(&key));
         debug_assert!(self.retained_relations.saturating_add(outputs.len()) <= self.relation_limit);
-        let new_functions = outputs
-            .iter()
-            .filter(|output| !self.function_ids.contains_key(&output.function))
-            .map(|output| &output.function)
-            .collect::<HashSet<_>>()
-            .len();
-        let attempted_functions = self.functions.len().saturating_add(new_functions);
-        if attempted_functions > self.function_limit {
-            self.mark_functions_exhausted(attempted_functions);
-            return;
-        }
+        debug_assert!(outputs.iter().all(|output| {
+            self.function_ids.contains_key(&output.function)
+                || self.functions.len() < self.function_limit
+        }));
         let outputs: Vec<InternedTraceOutput<Fact>> = outputs
             .into_iter()
             .map(|output| {
@@ -360,42 +362,64 @@ where
     }
 }
 
-struct IdeTransitionCollector<'output, Problem>
+struct IdeTransitionCollector<'output, 'trace, Problem>
 where
     Problem: IdeDataflowProblem,
 {
     problem: &'output Problem,
     fact_output: &'output mut dyn DataflowOutput<Problem::Fact>,
     transitions: HashMap<Problem::Fact, Problem::EdgeFunction>,
+    known_functions: &'trace HashMap<Problem::EdgeFunction, usize>,
+    staged_functions: HashSet<Problem::EdgeFunction>,
+    max_new_functions: usize,
     max_outputs: usize,
     max_meets: usize,
     capture_meets: usize,
     stopped: bool,
     relation_overflowed: bool,
     operation_overflowed: bool,
+    function_overflowed: bool,
 }
 
-impl<'output, Problem> IdeTransitionCollector<'output, Problem>
+impl<'output, 'trace, Problem> IdeTransitionCollector<'output, 'trace, Problem>
 where
     Problem: IdeDataflowProblem,
 {
     fn new(
         problem: &'output Problem,
         fact_output: &'output mut dyn DataflowOutput<Problem::Fact>,
+        known_functions: &'trace HashMap<Problem::EdgeFunction, usize>,
         max_outputs: usize,
         max_meets: usize,
+        max_new_functions: usize,
     ) -> Self {
         Self {
             problem,
             fact_output,
             transitions: HashMap::default(),
+            known_functions,
+            staged_functions: HashSet::default(),
+            max_new_functions,
             max_outputs,
             max_meets,
             capture_meets: 0,
             stopped: false,
             relation_overflowed: false,
             operation_overflowed: false,
+            function_overflowed: false,
         }
+    }
+
+    fn retain_function(&mut self, function: &Problem::EdgeFunction) -> bool {
+        if self.known_functions.contains_key(function) || self.staged_functions.contains(function) {
+            return true;
+        }
+        if self.staged_functions.len() >= self.max_new_functions {
+            self.function_overflowed = true;
+            return false;
+        }
+        self.staged_functions.insert(function.clone());
+        true
     }
 
     fn into_outputs(mut self) -> CollectedTransitions<Problem::Fact, Problem::EdgeFunction> {
@@ -417,7 +441,7 @@ where
 }
 
 impl<Problem> DataflowOutput<IdeTransition<Problem::Fact, Problem::EdgeFunction>>
-    for IdeTransitionCollector<'_, Problem>
+    for IdeTransitionCollector<'_, '_, Problem>
 where
     Problem: IdeDataflowProblem,
 {
@@ -431,7 +455,10 @@ where
             return false;
         }
         let (fact, function) = transition.into_parts();
-        if self.relation_overflowed || self.operation_overflowed {
+        if self.relation_overflowed || self.operation_overflowed || self.function_overflowed {
+            return self.fact_output.emit(fact);
+        }
+        if !self.retain_function(&function) {
             return self.fact_output.emit(fact);
         }
         if let Some(existing) = self.transitions.get(&fact) {
@@ -448,6 +475,9 @@ where
                 self.problem.meet_edge_functions(&function, existing)
             };
             self.capture_meets = self.capture_meets.saturating_add(1);
+            if !self.retain_function(&merged) {
+                return self.fact_output.should_continue();
+            }
             self.transitions.insert(fact, merged);
             return true;
         }
@@ -461,6 +491,23 @@ where
         }
         self.transitions.insert(fact, function);
         true
+    }
+}
+
+struct IdeFactOnlyCollector<'output, Fact> {
+    fact_output: &'output mut dyn DataflowOutput<Fact>,
+}
+
+impl<Fact, EdgeFunction> DataflowOutput<IdeTransition<Fact, EdgeFunction>>
+    for IdeFactOnlyCollector<'_, Fact>
+{
+    fn should_continue(&self) -> bool {
+        self.fact_output.should_continue()
+    }
+
+    fn emit(&mut self, transition: IdeTransition<Fact, EdgeFunction>) -> bool {
+        let (fact, _) = transition.into_parts();
+        self.fact_output.emit(fact)
     }
 }
 
@@ -518,12 +565,27 @@ where
             }
             return;
         }
-        drop(trace);
+        if trace.attempted_work.is_some() {
+            drop(trace);
+            let mut collector = IdeFactOnlyCollector { fact_output: out };
+            callback(self.problem, edge, fact, &mut collector);
+            if fact == self.problem.zero_fact() && collector.fact_output.should_continue() {
+                let _ = collector.fact_output.emit(fact);
+            }
+            return;
+        }
 
-        let remaining = self.trace.borrow().remaining_relations();
-        let remaining_operations = self.trace.borrow().remaining_capture_operations();
-        let mut collector =
-            IdeTransitionCollector::new(self.problem, out, remaining, remaining_operations);
+        let remaining = trace.remaining_relations();
+        let remaining_operations = trace.remaining_capture_operations();
+        let max_new_functions = trace.function_limit.saturating_sub(trace.functions.len());
+        let mut collector = IdeTransitionCollector::new(
+            self.problem,
+            out,
+            &trace.function_ids,
+            remaining,
+            remaining_operations,
+            max_new_functions,
+        );
         callback(self.problem, edge, fact, &mut collector);
         if fact == self.problem.zero_fact() && collector.should_continue() {
             let _ = collector.emit(IdeTransition::new(
@@ -533,16 +595,38 @@ where
         }
         if collector.relation_overflowed {
             let staged = collector.transitions.len();
+            let staged_meets = collector.capture_meets;
+            drop(collector);
+            drop(trace);
             self.trace
                 .borrow_mut()
-                .mark_relation_exhausted(staged, collector.capture_meets);
+                .mark_relation_exhausted(staged, staged_meets);
             return;
         }
         if collector.operation_overflowed {
             let staged = collector.transitions.len();
-            self.trace.borrow_mut().mark_capture_operations_exhausted(
+            let attempted_meets = collector.capture_meets.saturating_add(1);
+            drop(collector);
+            drop(trace);
+            self.trace
+                .borrow_mut()
+                .mark_capture_operations_exhausted(staged, attempted_meets);
+            return;
+        }
+        if collector.function_overflowed {
+            let staged = collector.transitions.len();
+            let attempted_functions = trace
+                .functions
+                .len()
+                .saturating_add(collector.staged_functions.len())
+                .saturating_add(1);
+            let staged_meets = collector.capture_meets;
+            drop(collector);
+            drop(trace);
+            self.trace.borrow_mut().mark_functions_exhausted(
                 staged,
-                collector.capture_meets.saturating_add(1),
+                staged_meets,
+                attempted_functions,
             );
             return;
         }
@@ -550,6 +634,7 @@ where
             return;
         }
         let collected = collector.into_outputs();
+        drop(trace);
         self.trace
             .borrow_mut()
             .insert(key, collected.outputs, collected.capture_meets);
@@ -638,6 +723,7 @@ struct RawEntryValueRelation {
     caller: usize,
     target_entry: usize,
     function: IdeEdgeFunctionId,
+    edge_quality: PathQuality,
 }
 
 struct RawIdeGraph {
@@ -671,6 +757,7 @@ struct EntryValueRelation {
     caller: usize,
     target_entry: usize,
     function: IdeEdgeFunctionId,
+    edge_quality: PathQuality,
 }
 
 struct IdeGraph {
@@ -1184,35 +1271,46 @@ fn canonical_seed_values<Problem>(
 where
     Problem: IdeDataflowProblem,
 {
-    let mut values = HashMap::default();
-    values.insert(problem.zero_fact(), problem.zero_value());
+    let mut grouped = BTreeMap::<Problem::Fact, BTreeSet<&Problem::Value>>::new();
     for seed in input.seeds() {
         if request.cancellation.is_cancelled() {
             return Err(SolverTermination::Cancelled);
         }
-        let fact = *seed.fact();
-        let value = seed.value();
-        if let Some(existing) = values.get(&fact) {
-            if existing == value {
-                continue;
-            }
-            if let Some(termination) = request.reserve(SolverWork {
-                value_operations: 1,
-                ..SolverWork::default()
-            }) {
-                return Err(termination);
-            }
-            let merged = if existing <= value {
-                problem.meet_values(existing, value)
-            } else {
-                problem.meet_values(value, existing)
-            };
+        grouped
+            .entry(*seed.fact())
+            .or_default()
+            .insert(seed.value());
+    }
+
+    let mut values = HashMap::default();
+    values.insert(problem.zero_fact(), problem.zero_value());
+    for (fact, candidates) in grouped {
+        for value in candidates {
             if request.cancellation.is_cancelled() {
                 return Err(SolverTermination::Cancelled);
             }
-            values.insert(fact, merged);
-        } else {
-            values.insert(fact, value.clone());
+            if let Some(existing) = values.get(&fact) {
+                if existing == value {
+                    continue;
+                }
+                if let Some(termination) = request.reserve(SolverWork {
+                    value_operations: 1,
+                    ..SolverWork::default()
+                }) {
+                    return Err(termination);
+                }
+                let merged = if existing <= value {
+                    problem.meet_values(existing, value)
+                } else {
+                    problem.meet_values(value, existing)
+                };
+                if request.cancellation.is_cancelled() {
+                    return Err(SolverTermination::Cancelled);
+                }
+                values.insert(fact, merged);
+            } else {
+                values.insert(fact, value.clone());
+            }
         }
     }
     Ok(values)
@@ -1249,17 +1347,30 @@ where
     metrics.summary_relations = raw_graph.summaries.len();
     metrics.entry_value_relations = raw_graph.entry_values.len();
     metrics.reused_summary_functions = raw_graph.reused_summary_functions;
-    let graph = build_graph(raw_graph);
+    let graph = build_graph(raw_graph, request)?;
+    let scheduling_storage = fact_result
+        .reached()
+        .len()
+        .saturating_mul(2)
+        .saturating_add(fact_result.end_summaries().len());
+    reserve_ide_work(
+        SolverWork {
+            ide_propagations: scheduling_storage,
+            ..SolverWork::default()
+        },
+        request,
+    )?;
     let mut jumps = vec![None; fact_result.reached().len()];
     let mut worklist = VecDeque::new();
     let mut queued = vec![false; jumps.len()];
     for entry in graph.entry_rows.iter().copied() {
         jumps[entry] = Some(functions.identity);
-        enqueue(entry, &mut worklist, &mut queued);
+        enqueue(entry, &mut worklist, &mut queued, request)?;
         metrics.jump_updates = metrics.jump_updates.saturating_add(1);
     }
 
     while let Some(source) = worklist.pop_front() {
+        reserve_ide_propagation(request)?;
         queued[source] = false;
         if request.cancellation.is_cancelled() {
             return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
@@ -1366,18 +1477,41 @@ where
     }
     jumps[target] = Some(next);
     metrics.jump_updates = metrics.jump_updates.saturating_add(1);
-    enqueue(target, worklist, queued);
+    enqueue(target, worklist, queued, request)?;
     Ok(())
 }
 
-fn enqueue(row: usize, worklist: &mut VecDeque<usize>, queued: &mut [bool]) {
+fn enqueue(
+    row: usize,
+    worklist: &mut VecDeque<usize>,
+    queued: &mut [bool],
+    request: &mut DataflowRequest<'_>,
+) -> Result<(), IdeRunFailure> {
     if !queued[row] {
+        reserve_ide_propagation(request)?;
         queued[row] = true;
         worklist.push_back(row);
     }
+    Ok(())
 }
 
-fn build_graph(raw: RawIdeGraph) -> IdeGraph {
+fn build_graph(
+    raw: RawIdeGraph,
+    request: &mut DataflowRequest<'_>,
+) -> Result<IdeGraph, IdeRunFailure> {
+    let expansion_work = raw
+        .row_count
+        .saturating_mul(3)
+        .saturating_add(raw.direct.len())
+        .saturating_add(raw.summaries.len().saturating_mul(3))
+        .saturating_add(raw.entry_values.len());
+    reserve_ide_work(
+        SolverWork {
+            ide_propagations: expansion_work,
+            ..SolverWork::default()
+        },
+        request,
+    )?;
     let mut direct_by_source = vec![Vec::new(); raw.row_count];
     for relation in raw.direct {
         direct_by_source[relation.source].push(DirectRelation {
@@ -1410,9 +1544,10 @@ fn build_graph(raw: RawIdeGraph) -> IdeGraph {
             caller: relation.caller,
             target_entry: relation.target_entry,
             function: relation.function,
+            edge_quality: relation.edge_quality,
         });
     }
-    IdeGraph {
+    Ok(IdeGraph {
         direct_by_source,
         summaries,
         summaries_by_dependency,
@@ -1420,7 +1555,7 @@ fn build_graph(raw: RawIdeGraph) -> IdeGraph {
         entry_rows: raw.entry_rows,
         row_entries: raw.row_entries,
         end_summary_exit_rows: raw.end_summary_exit_rows,
-    }
+    })
 }
 
 fn build_raw_graph<Fact, EdgeFunction>(
@@ -1433,6 +1568,18 @@ where
     Fact: Copy + Eq + Hash + Ord,
     EdgeFunction: Clone + Eq + Hash + Ord,
 {
+    let indexing_work = result
+        .facts()
+        .len()
+        .saturating_add(result.reached().len().saturating_mul(3))
+        .saturating_add(result.end_summaries().len().saturating_mul(2));
+    reserve_ide_work(
+        SolverWork {
+            ide_propagations: indexing_work,
+            ..SolverWork::default()
+        },
+        request,
+    )?;
     let mut fact_ids = HashMap::default();
     for (index, fact) in result.facts().iter().copied().enumerate() {
         let id = FactId::try_from_index(index)
@@ -1512,7 +1659,7 @@ where
         reserve_ide_propagation(request)?;
         let sources = by_point_fact
             .get(&(record.key.edge.source.clone(), record.key.input))
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
         match record.key.edge.kind {
             IcfgEdgeKind::Call => {
@@ -1524,7 +1671,7 @@ where
                         .ok_or(IdeDataflowError::Invariant(
                             "captured call edge has no exact transfer",
                         ))?;
-                for source in sources {
+                for source in sources.iter().copied() {
                     reserve_ide_propagation(request)?;
                     let caller_entry = result.reached()[source].entry().clone();
                     for output in &record.outputs {
@@ -1555,6 +1702,10 @@ where
                             caller: source,
                             target_entry,
                             function: call_function,
+                            edge_quality: PathQuality::PROVEN_COMPLETE.through_evidence(
+                                &record.key.edge.proof,
+                                &record.key.edge.completeness,
+                            ),
                         };
                         if !entry_values.contains(&entry_value) {
                             ensure_relation_capacity(
@@ -1634,7 +1785,7 @@ where
             }
             IcfgEdgeKind::NormalReturn | IcfgEdgeKind::ExceptionalReturn => {}
             _ => {
-                for source in sources {
+                for source in sources.iter().copied() {
                     reserve_ide_propagation(request)?;
                     let entry = result.reached()[source].entry().clone();
                     for output in &record.outputs {
@@ -1690,6 +1841,16 @@ where
         (left.caller, left.target_entry)
             .cmp(&(right.caller, right.target_entry))
             .then_with(|| left.function.cmp(&right.function))
+            .then_with(|| {
+                (
+                    left.edge_quality.is_proven(),
+                    left.edge_quality.is_complete(),
+                )
+                    .cmp(&(
+                        right.edge_quality.is_proven(),
+                        right.edge_quality.is_complete(),
+                    ))
+            })
     });
     let reused_summary_functions = summary_uses
         .values()
@@ -1729,6 +1890,19 @@ struct PendingPointValue {
     qualities: PathQualityFrontier,
 }
 
+fn conjoin_quality_frontiers(
+    prefix: PathQualityFrontier,
+    suffix: PathQualityFrontier,
+) -> PathQualityFrontier {
+    let mut combined = PathQualityFrontier::default();
+    for prefix_quality in prefix.iter() {
+        for suffix_quality in suffix.iter() {
+            combined.insert(prefix_quality.conjoin(suffix_quality));
+        }
+    }
+    combined
+}
+
 #[allow(clippy::too_many_arguments)]
 fn materialize_values<Problem>(
     root: &ProcedureHandle,
@@ -1748,11 +1922,20 @@ where
             .ok_or(IdeDataflowError::Invariant(
                 "IDE root procedure has no entry point",
             ))?;
+    reserve_ide_work(
+        SolverWork {
+            ide_propagations: result.reached().len().saturating_mul(4),
+            ..SolverWork::default()
+        },
+        request,
+    )?;
     let mut values = ValueArena::new();
     let mut entry_values = vec![None; result.reached().len()];
+    let mut entry_qualities = vec![PathQualityFrontier::default(); result.reached().len()];
     let mut entry_worklist = VecDeque::new();
     let mut entry_queued = vec![false; result.reached().len()];
     for entry in graph.entry_rows.iter().copied() {
+        reserve_ide_propagation(request)?;
         let reached = &result.reached()[entry];
         if reached.entry().procedure() != root || reached.entry().entry_point() != &root_entry {
             continue;
@@ -1760,16 +1943,16 @@ where
         let entry_fact = result.fact(reached.entry().entry_fact()).copied().ok_or(
             IdeDataflowError::Invariant("root IDE entry fact is absent from its result"),
         )?;
-        let seed = seed_values
-            .get(&entry_fact)
-            .ok_or(IdeDataflowError::MissingRootSeedValue {
-                fact: reached.entry().entry_fact(),
-            })?;
+        let Some(seed) = seed_values.get(&entry_fact) else {
+            continue;
+        };
         entry_values[entry] = Some(values.intern_ref(seed, request)?);
-        enqueue(entry, &mut entry_worklist, &mut entry_queued);
+        entry_qualities[entry] = reached.path_qualities();
+        enqueue(entry, &mut entry_worklist, &mut entry_queued, request)?;
     }
 
     while let Some(entry) = entry_worklist.pop_front() {
+        reserve_ide_propagation(request)?;
         entry_queued[entry] = false;
         if request.cancellation.is_cancelled() {
             return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
@@ -1810,7 +1993,7 @@ where
                 return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
             }
             let candidate = values.intern(candidate, request)?;
-            let next = match entry_values[relation.target_entry] {
+            let next_value = match entry_values[relation.target_entry] {
                 Some(existing) if existing != candidate => {
                     reserve_ide_work(
                         SolverWork {
@@ -1831,22 +2014,40 @@ where
                     }
                     values.intern(met, request)?
                 }
-                Some(_) => continue,
+                Some(existing) => existing,
                 None => candidate,
             };
-            if entry_values[relation.target_entry] == Some(next) {
+
+            let prefix_qualities = conjoin_quality_frontiers(
+                entry_qualities[entry],
+                result.reached()[relation.caller].path_qualities(),
+            );
+            let candidate_qualities = conjoin_quality_frontiers(
+                prefix_qualities,
+                PathQualityFrontier::singleton(relation.edge_quality),
+            );
+            let mut next_qualities = entry_qualities[relation.target_entry];
+            let mut quality_changed = false;
+            for quality in candidate_qualities.iter() {
+                quality_changed |= next_qualities.insert(quality);
+            }
+
+            let value_changed = entry_values[relation.target_entry] != Some(next_value);
+            if !value_changed && !quality_changed {
                 continue;
             }
-            entry_values[relation.target_entry] = Some(next);
+            entry_values[relation.target_entry] = Some(next_value);
+            entry_qualities[relation.target_entry] = next_qualities;
             enqueue(
                 relation.target_entry,
                 &mut entry_worklist,
                 &mut entry_queued,
-            );
+                request,
+            )?;
         }
     }
 
-    let mut pending = Vec::<PendingPointValue>::new();
+    let mut pending = Vec::<PendingPointValue>::with_capacity(result.reached().len());
     for (index, reached) in result.reached().iter().enumerate() {
         let seed = entry_values[graph.row_entries[index]].ok_or(IdeDataflowError::Invariant(
             "reachable IDE entry has no concrete value",
@@ -1870,7 +2071,10 @@ where
             point: reached.point().clone(),
             fact: reached.fact(),
             value,
-            qualities: reached.path_qualities(),
+            qualities: conjoin_quality_frontiers(
+                entry_qualities[graph.row_entries[index]],
+                reached.path_qualities(),
+            ),
         });
     }
 
