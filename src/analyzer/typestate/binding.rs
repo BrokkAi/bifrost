@@ -146,6 +146,15 @@ impl TypestateSubjectKey {
     pub fn object(&self) -> &TypestateObjectKey {
         &self.object
     }
+
+    /// Render the stable semantic subject identity used by public query rows.
+    ///
+    /// This is the same canonical representation that contributes to the
+    /// binding-plan hash; it never contains a run-local dense subject ID.
+    pub fn canonical_rendering(&self) -> String {
+        serde_json::to_string(&canonical_subject_key(self))
+            .expect("canonical typestate subject identities are serializable")
+    }
 }
 
 /// Candidate-set closure retained with every pre-resolved binding.

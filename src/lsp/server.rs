@@ -1304,6 +1304,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::Procedure { value } => &value.path,
                     CodeQueryResultValue::ProgramPoint { value } => &value.path,
                     CodeQueryResultValue::ControlEdge { value } => &value.path,
+                    CodeQueryResultValue::TypestateFinding { value } => &value.path,
+                    CodeQueryResultValue::TypestateWitness { value } => &value.path,
                     CodeQueryResultValue::File { value } => &value.path,
                     CodeQueryResultValue::ReferenceSite { value } => &value.path,
                     CodeQueryResultValue::CallSite { value } => &value.path,

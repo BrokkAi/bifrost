@@ -852,7 +852,7 @@ fn validate_wrapper(
                 };
                 analysis.add_help(
                     pair[0].range.clone(),
-                    &format!(":{} non-negative-integer", field.replace('_', "-")),
+                    format!(":{} non-negative-integer", field.replace('_', "-")),
                     description,
                 );
                 if !seen.insert(field) {

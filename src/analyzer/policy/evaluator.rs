@@ -2642,6 +2642,8 @@ fn terminal_presentation(
         CodeQueryResultValue::Procedure { .. }
         | CodeQueryResultValue::ProgramPoint { .. }
         | CodeQueryResultValue::ControlEdge { .. }
+        | CodeQueryResultValue::TypestateFinding { .. }
+        | CodeQueryResultValue::TypestateWitness { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
@@ -3185,6 +3187,8 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::Procedure { .. } => "procedure",
         CodeQueryResultRef::ProgramPoint { .. } => "program_point",
         CodeQueryResultRef::ControlEdge { .. } => "control_edge",
+        CodeQueryResultRef::TypestateFinding { .. } => "typestate_finding",
+        CodeQueryResultRef::TypestateWitness { .. } => "typestate_witness",
         CodeQueryResultRef::File { .. } => "file",
         CodeQueryResultRef::ReferenceSite { .. } => "reference_site",
         CodeQueryResultRef::CallSite { .. } => "call_site",
@@ -3200,6 +3204,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::Procedure { path, .. }
         | CodeQueryResultRef::ProgramPoint { path, .. }
         | CodeQueryResultRef::ControlEdge { path, .. }
+        | CodeQueryResultRef::TypestateFinding { path, .. }
+        | CodeQueryResultRef::TypestateWitness { path, .. }
         | CodeQueryResultRef::File { path }
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
@@ -3234,6 +3240,8 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
+        | DetailedCodeQueryDomain::TypestateFinding
+        | DetailedCodeQueryDomain::TypestateWitness
         | DetailedCodeQueryDomain::ReceiverAnalysis => None,
     }
 }
@@ -3271,6 +3279,13 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, procedure_id.as_bytes());
+        }
+        DetailedCodeQueryKey::TypestateFinding { id } => {
+            update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::TypestateWitness { id, finding_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, finding_id.as_bytes());
         }
         DetailedCodeQueryKey::File => {}
         DetailedCodeQueryKey::ReferenceSite {
@@ -3348,6 +3363,8 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::Procedure => "procedure",
         DetailedCodeQueryDomain::ProgramPoint => "program_point",
         DetailedCodeQueryDomain::ControlEdge => "control_edge",
+        DetailedCodeQueryDomain::TypestateFinding => "typestate_finding",
+        DetailedCodeQueryDomain::TypestateWitness => "typestate_witness",
         DetailedCodeQueryDomain::ReferenceSite => "reference_site",
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
@@ -3422,6 +3439,7 @@ fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncomplet
         | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
         | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
         | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
+        | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
         | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
         | CodeQueryDiagnosticCode::UsesParserUnsupported => {
             PolicyIncompleteReason::CapabilityIncomplete
@@ -3451,6 +3469,15 @@ fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncomplet
         | CodeQueryDiagnosticCode::SemanticAnalysisPartial
         | CodeQueryDiagnosticCode::SemanticBudgetExhausted
         | CodeQueryDiagnosticCode::SemanticProviderFailed
+        | CodeQueryDiagnosticCode::UnresolvedProtocolReference
+        | CodeQueryDiagnosticCode::TypestateRegistrationStale
+        | CodeQueryDiagnosticCode::TypestateHandleStale
+        | CodeQueryDiagnosticCode::TypestateRootMismatch
+        | CodeQueryDiagnosticCode::TypestateAnalysisPartial
+        | CodeQueryDiagnosticCode::TypestateProviderFailed
+        | CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted
+        | CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
+        | CodeQueryDiagnosticCode::TypestateWitnessTruncated
         | CodeQueryDiagnosticCode::NoEnclosingProcedure
         | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
         | CodeQueryDiagnosticCode::CallRelationParseFailed
