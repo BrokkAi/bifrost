@@ -79,8 +79,8 @@ fn resolves_locally_typed_instance_and_bare_self_calls() {
         value["edges"]
     );
     assert!(
-        has_edge(&value, "Consumer.calls_local", "Consumer.local"),
-        "expected calls_local -> Consumer.local: {}",
+        !has_edge(&value, "Consumer.calls_local", "Consumer.local"),
+        "implicit-self calls_local -> Consumer.local must stay unproven: {}",
         value["edges"]
     );
 }
