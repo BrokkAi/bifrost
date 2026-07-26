@@ -259,9 +259,14 @@ impl CppAnalyzer {
         self.inner.cpp_template_metadata_of(code_unit)
     }
 
-    #[cfg(test)]
-    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+    #[doc(hidden)]
+    pub fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.inner.prepared_syntax_parse_count_for_test(file)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_prepared_syntax_parse_counts_for_test(&self) {
+        self.inner.reset_prepared_syntax_parse_counts_for_test();
     }
 
     #[cfg(test)]

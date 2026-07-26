@@ -1493,8 +1493,13 @@ pub struct TreeSitterAnalyzer<A> {
     query_read_cache: Arc<Mutex<QueryReadCache>>,
     #[cfg(test)]
     live_oid_validation_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
-    #[cfg(test)]
-    prepared_syntax_parse_counts: Arc<Mutex<HashMap<FileStateCacheKey, usize>>>,
+    /// Syntax parses performed per file, for perf pins. Always compiled: a
+    /// parse is a source re-read plus a tree build, so one map update per parse
+    /// is free relative to the work it measures — and the counter has to
+    /// survive in non-test builds for integration tests to pin it (#1175,
+    /// where a detached analyzer clone re-parsed one 4.8 MB header tens of
+    /// thousands of times inside a single scan).
+    syntax_parse_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
@@ -1530,8 +1535,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
-            #[cfg(test)]
-            prepared_syntax_parse_counts: Arc::clone(&self.prepared_syntax_parse_counts),
+            syntax_parse_counts: Arc::clone(&self.syntax_parse_counts),
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
@@ -1711,8 +1715,7 @@ where
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
-            #[cfg(test)]
-            prepared_syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
+            syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
@@ -1897,8 +1900,7 @@ where
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
-            #[cfg(test)]
-            prepared_syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
+            syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
@@ -3275,14 +3277,6 @@ where
             return PreparedSyntaxLimitedOutcome::Cancelled;
         }
 
-        #[cfg(test)]
-        {
-            let mut counts = self
-                .prepared_syntax_parse_counts
-                .lock()
-                .expect("prepared syntax parse count mutex poisoned");
-            *counts.entry(key.clone()).or_default() += 1;
-        }
         let prepared = match self.prepare_exact_syntax_cancellable(
             file,
             origin,
@@ -3344,14 +3338,6 @@ where
             );
         };
         cell.get_or_init(|| {
-            #[cfg(test)]
-            {
-                let mut counts = self
-                    .prepared_syntax_parse_counts
-                    .lock()
-                    .expect("prepared syntax parse count mutex poisoned");
-                *counts.entry(key.clone()).or_default() += 1;
-            }
             self.prepare_syntax_for_key(
                 file,
                 &key,
@@ -3420,6 +3406,12 @@ where
         {
             return PreparedSyntaxPreparation::Complete(None);
         }
+        *self
+            .syntax_parse_counts
+            .lock()
+            .expect("syntax parse count mutex poisoned")
+            .entry(file.clone())
+            .or_default() += 1;
         let exact_source = source.source();
         let tree = if let Some(cancellation) = cancellation {
             let mut read = |offset: usize, _| &exact_source.as_bytes()[offset..];
@@ -3453,18 +3445,25 @@ where
         })))
     }
 
-    #[cfg(test)]
-    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
-        let Some(oid) = self.resolve_live_oid_for_file(file) else {
-            return 0;
-        };
-        let key = Self::transient_cache_key(oid, file);
-        self.prepared_syntax_parse_counts
+    /// How many times `file` has been parsed since the last reset. Pins the
+    /// per-query parse budget: a scan must parse each candidate file once, not
+    /// once per candidate declaration it inspects.
+    #[doc(hidden)]
+    pub fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.syntax_parse_counts
             .lock()
-            .expect("prepared syntax parse count mutex poisoned")
-            .get(&key)
+            .expect("syntax parse count mutex poisoned")
+            .get(file)
             .copied()
             .unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn reset_prepared_syntax_parse_counts_for_test(&self) {
+        self.syntax_parse_counts
+            .lock()
+            .expect("syntax parse count mutex poisoned")
+            .clear();
     }
 
     pub(crate) fn bulk_file_states(
@@ -9067,7 +9066,10 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.source(), "fn second() { first(); }\n");
-        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+        // Two revisions, one parse each: the counter totals every parse of the
+        // file rather than bucketing by source identity, so "no revision was
+        // parsed twice" reads as one parse per revision.
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 2);
         assert_ne!(
             first.tree().root_node().to_sexp(),
             second.tree().root_node().to_sexp()

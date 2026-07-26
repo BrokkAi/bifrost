@@ -61,7 +61,7 @@ pub(crate) struct CppQueryResolver<'a> {
 pub(crate) struct CppAuthoritativeUsageBatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     resolver: CppQueryResolver<'a>,
-    visibility: VisibilityIndex,
+    visibility: VisibilityIndex<'a>,
 }
 
 impl<'a> CppAuthoritativeUsageBatch<'a> {

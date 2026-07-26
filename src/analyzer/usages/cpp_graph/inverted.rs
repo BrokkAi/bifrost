@@ -56,7 +56,7 @@ use tree_sitter::Node;
 pub(super) fn build_cpp_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Output
@@ -92,7 +92,7 @@ where
 
 struct CppScan<'a, 'b> {
     analyzer: &'a dyn IAnalyzer,
-    visibility: &'a VisibilityIndex,
+    visibility: &'a VisibilityIndex<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     ordinary_type_imports: OrdinaryTypeImportCell,
