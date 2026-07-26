@@ -1,6 +1,7 @@
 //! Shared SQLite schema and connection setup for bifrost's rebuildable cache DB.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -100,11 +101,22 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 const INITIALIZATION_RETRY_DEADLINE: Duration = BUSY_TIMEOUT;
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
+// Persistent pragma setup and migration are serialized only among same-process
+// openers for one canonical cache path. SQLite remains the cross-process lock.
+static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     let db_path = prepare_cache_db_path(db_path)?;
     ensure_safe_cache_path(&db_path)?;
+    let process_local_open_lock = process_local_open_lock_cell(&db_path)?;
+    let _process_local_open_guard = process_local_open_lock.lock().map_err(|_| {
+        format!(
+            "cache DB process-local open guard poisoned for {}",
+            db_path.display()
+        )
+    })?;
     let mut conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -195,6 +207,19 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(db_path.to_path_buf())
+}
+
+fn process_local_open_lock_cell(db_path: &Path) -> Result<Arc<Mutex<()>>> {
+    let mut guards = PROCESS_LOCAL_OPEN_GUARDS
+        .lock()
+        .map_err(|_| "cache DB process-local open guard mutex poisoned".to_string())?;
+    guards.retain(|_, cell| cell.strong_count() > 0);
+    if let Some(lock) = guards.get(db_path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    guards.insert(db_path.to_path_buf(), Arc::downgrade(&lock));
+    Ok(lock)
 }
 
 pub fn configure_connection(conn: &mut Connection) -> Result<()> {
@@ -735,7 +760,6 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
 mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::Duration;
 
     use rusqlite_migration::{M, Migrations};
 
@@ -859,6 +883,44 @@ mod tests {
             conn.query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn process_local_open_lock_reuses_same_canonical_path_cell() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = prepare_cache_db_path(&temp.path().join(CACHE_DB_FILE_NAME)).unwrap();
+        let alternate = prepare_cache_db_path(
+            &temp
+                .path()
+                .join(".")
+                .join("nested")
+                .join("..")
+                .join(CACHE_DB_FILE_NAME),
+        )
+        .unwrap();
+
+        let first = process_local_open_lock_cell(&canonical).unwrap();
+        let second = process_local_open_lock_cell(&alternate).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same canonical cache path must reuse one in-process lock cell"
+        );
+    }
+
+    #[test]
+    fn process_local_open_lock_distinguishes_independent_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = prepare_cache_db_path(&temp.path().join("left.db")).unwrap();
+        let right = prepare_cache_db_path(&temp.path().join("right.db")).unwrap();
+
+        let left_lock = process_local_open_lock_cell(&left).unwrap();
+        let right_lock = process_local_open_lock_cell(&right).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&left_lock, &right_lock),
+            "independent cache paths must not share one global lock cell"
         );
     }
 

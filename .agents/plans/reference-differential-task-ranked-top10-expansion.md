@@ -50,7 +50,115 @@ comes through the local gate, but is not the focus.
 - [x] (2026-07-24) Received direct authorization for the top-ten expansion,
   fetched `origin/master`, and fast-forwarded the current `bifrost-fird`
   branch from `8b3423b9` to current shared baseline `40d98491`.
-- [ ] Build and fingerprint a clean release runner from the plan checkpoint.
+- [x] (2026-07-24) Committed and published this plan at `37412679`, then
+  built the clean release runner with SHA-256
+  `2f32980c15c556f7e4b9a9b6453f93ec040aec310920cd3039b744b955a3d735`.
+- [x] (2026-07-24) Started the authoritative C top-ten baseline. Dovecot and
+  go-ethereum completed with zero raw missing rows. Libgit2 exposed a severe
+  guarded-type inverse performance regression: 365 of 796 targets required
+  3,034 seconds, versus a historical 666-target completed envelope in 911.9
+  seconds on the same clone head. The interrupted evidence is preserved as
+  `/mnt/optane/tmp/bifrost-fird/c-task-top10-37412679-aborted-issue1165.*`.
+- [x] (2026-07-24) Searched the complete issue tracker, found no matching
+  owner, then created and assigned `FIRD:` issue #1165 to `jbellis` before
+  implementation. Delegated the bounded structured visibility-memoization
+  implementation to Oldskool while root retains review and publication.
+- [x] (2026-07-24) Added only generated `.bifrost/` and `.brokk/` directories
+  to the four affected C clones' local Git excludes; all ten selected C clones
+  now report clean state without altering corpus source.
+- [x] (2026-07-24) Implemented and independently reviewed the first #1165
+  candidate. Both new tests, the nearby guard regressions, and all 146 C/C++
+  usage integration tests passed before the final mixed-outcome strengthening.
+- [x] (2026-07-25) Rejected that first candidate during isolated libgit2
+  performance validation: eager normalization preserved semantics but made the
+  forward phase exceed 1,618 seconds versus 264.9 seconds on the unmodified
+  head. Preserved the aborted replay and delegated a lazy peer-level revision.
+- [x] (2026-07-25) Rejected the subsequent declaration-guard-only cache after
+  its clean isolated replay retained the pathological inverse tail. It
+  completed forward in 237.5 seconds and initially improved inverse
+  checkpoints, but reached only 360 of 796 targets in 2,822 seconds and then
+  made no progress for more than twelve minutes with eight broad targets in
+  flight. Preserved the failed log and started targeted root-cause analysis.
+- [x] (2026-07-25) Rejected a batch-only cache of the final
+  `(consumer, candidate, reference span)` visibility decision after an
+  eight-target-only replay left every broad target unfinished for roughly
+  twelve inverse minutes. Removed both the candidate and the temporary
+  differential target filter.
+- [x] (2026-07-25) Traced the remaining #1165 work to target-specific lexical
+  resolution of unrelated type-shaped nodes in every candidate file. Updated
+  the issue ExecPlan to optimize at a conservative structured may-resolve
+  boundary ahead of that work.
+- [x] (2026-07-25) Replayed `git_diff` as the sole inverse target. It still
+  failed to finish after twelve inverse minutes, ruling out eight-worker
+  contention as the primary cause and preserving the solo log for #1165.
+- [x] (2026-07-25) Implemented and independently reviewed the conservative
+  two-stage type-reference prefilter for #1165. After confining it away from
+  static qualifier and method-owner classification, focused exactness and
+  work-count tests passed and the complete C/C++ usage integration target
+  passed all 147 tests.
+- [x] (2026-07-25) Completed the corrected full-workload libgit2 replay:
+  forward finished in 202.9 seconds, inverse reached the old 365-target
+  checkpoint in 1,011.5 seconds instead of 3,034.3, and all 796 targets
+  completed in 3,060.9 seconds. The one completed envelope has zero missing,
+  zero truncation, zero file errors, and exact 10,000-site accounting.
+- [x] (2026-07-25) Delegated a second live-selector audit for the ten languages
+  after C. Oldskool confirmed every slug, task count, stable tie ordering, and
+  the `SFT_PREDICATES.not_overlarge` path against current `tasks.py`; the plan
+  has no selector discrepancies.
+- [x] (2026-07-25) The first repository-wide gate exposed an eager provider
+  scaling regression in the candidate's global alias-name classification. I
+  removed that global pass, retained only lazy visible parser aliases plus
+  same-terminal indexed candidates, and restored the focused provider count
+  from 140/137 calls to within its 20/10 bounds. The complete 147-test C/C++
+  usage target and all-feature Clippy are green on the corrected source.
+- [x] (2026-07-25) Delegated a final read-only #1165 review to Oldskool. It
+  found no actionable correctness, cache-concurrency, or coverage issue and
+  confirmed that unresolved/template/cyclic aliases stay conservative.
+- [x] (2026-07-25) The corrected repository-wide gate found one pre-existing
+  stale PHP graph assertion from the shared same-owner policy. After confirming
+  no existing owner, I created and assigned `FIRD:` issue #1169 to `jbellis`,
+  changed the test to reject a proven `$this` self edge, and passed its isolated
+  all-feature regression. Existing targeted symbols coverage continues to prove
+  the site is retained as `SelfReceiver`.
+- [x] (2026-07-25) The next complete gate reached the analogous pre-existing
+  Ruby assertion. I confirmed no existing owner, created and assigned `FIRD:`
+  issue #1170 to `jbellis`, changed the test to reject a proven implicit-self
+  edge, and passed its isolated all-feature regression. A delegated audit of
+  every remaining usage-graph language found no further stale positive
+  same-owner expectations.
+- [x] (2026-07-25) A later complete-gate attempt exposed a timing-sensitive
+  same-process cache initialization race: 15 of 16 openers exhausted SQLite's
+  five-second lock window while one migrated successfully. I found no existing
+  owner, created and assigned `FIRD:` issue #1173 to `jbellis`, wrote its
+  ExecPlan, and delegated `src/cache_db.rs` implementation to Oldskool.
+- [x] (2026-07-25) Reviewed #1173's accepted path-local
+  `Weak<Mutex<()>>` registry. It serializes persistent pragma setup and
+  migration only for one canonical path, prunes unused cells, leaves
+  cross-process locking to SQLite, returns poison errors, and passes focused
+  canonical-path, independent-path, and 16-opener tests.
+- [x] (2026-07-26) Passed formatting, `git diff --check`, focused cache and
+  C/C++ regressions, all 147 C/C++ usage tests, and all-target/all-feature
+  Clippy. The full normal-permission gate passed all 1,872 substantive library
+  tests, all 193 LSP tests, and the separately isolated MCP integration target
+  28/28.
+- [x] (2026-07-26) Stopped creating isolated Cargo targets under `/tmp` after
+  direct user correction, removed both abandoned targets created by this work,
+  and switched all subsequent Cargo and Bifrost commands to normal
+  outside-sandbox execution at niceness 10. One older explicitly retained
+  `.bifrost-keep` target was left untouched.
+- [x] (2026-07-26) Merged current `origin/master` at `09771a77`, resolving the
+  only textual conflicts by retaining master's equivalent negative PHP/Ruby
+  same-owner assertions. The merge also aligned this branch with cache schema
+  version 12, so the CLI children no longer need any cache override.
+- [x] (2026-07-26) Passed `cargo fmt --all -- --check`,
+  `git diff --check`, all-target/all-feature Clippy with warnings denied, and
+  the complete normal-permission `cargo test --features nlp,python` matrix on
+  merged head `5a54b026`. Cargo ran outside the sandbox with its normal
+  repository target and every Cargo process ran at niceness 10. The matrix
+  included the symbols MCP and CLI surfaces, all LSP tests, the 16-opener cache
+  regression, all 147 C/C++ usage tests, and doc tests.
+- [ ] Publish the reviewed #1165, #1169, #1170, and #1173 commits to
+  `origin/master` and close their assigned issues with local-gate evidence.
 - [ ] Complete C and publish its evidence and user summary.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
@@ -98,6 +206,75 @@ comes through the local gate, but is not the focus.
   regression evidence only; all expanded baselines start from the synchronized
   head.
 
+- The synchronized C/C++ inverse path repeats declaration-side conditional
+  visibility normalization for every broad type occurrence. On libgit2 this
+  made the new baseline more than three times slower than the completed
+  historical envelope before reaching half its target groups. The differential
+  wrapper still shares one prepared batch; the hot work is
+  `external_type_candidate_visible_in_context`, which repeatedly enumerates
+  logical peers, declaration guards, include projections, and macro stability.
+
+- Libgit2's forward phase also contains a few extreme file outliers: in the
+  eager #1165 candidate the first 306 of 312 files finished in 61 seconds, but
+  file 311 did not complete until 1,619 seconds. The same unmodified head
+  completed all 312 files in 264.9 seconds. The memo must therefore preserve
+  the legacy peer/declaration short circuit in forward as well as improving
+  repeated inverse work.
+
+- A cache can pass focused semantics and improve early inverse checkpoints
+  without removing the true tail. The declaration-guard-only candidate reached
+  100 targets 15 percent faster than pre-fix, but its eight remaining broad
+  workers (`git_diff`, `git_vector`, `git_str`, `git_index_entry`,
+  `git_iterator_status_t`, `git_diff_options`, `git_config`, and
+  `checkout_data`) still ran for many minutes. Acceptance therefore requires a
+  completed repository envelope and targeted evidence for these broad types.
+
+- The final visibility decision is not the repeated boundary that controls the
+  broad-target tail. Exact reference spans are mostly unique, and the
+  extractor performs structured type parsing, lexical-scope reconstruction,
+  candidate lookup, and alias handling before or around that decision. The
+  accepted fix must reject only structurally impossible target/name pairs
+  before expensive target-specific resolution, while leaving plausible alias
+  and scope cases on the exact legacy path.
+
+- The structured prefilter removed the broad-target tail at its actual source.
+  The accepted dirty-candidate replay completed all 796 inverse targets in
+  3,060.9 seconds; at the comparable 365-target checkpoint it was about three
+  times faster than the pre-fix run. Its one-record envelope covers 326 of 326
+  eligible files and 10,000 sites with 1,249 consistent, 13 unproven, 8,738
+  inconclusive, and zero missing classifications.
+
+- The prefilter is semantically appropriate only for actual type-reference
+  queries. Applying it to static qualifier and method-owner classification
+  changed three exact integration results because a known non-target owner was
+  weakened to an unproven owner. Passing an explicit query-path flag preserves
+  those owner classifiers and keeps the optimization's proof boundary narrow.
+
+- A target-independent alias-name set is only useful when it stays lazy and
+  visibility-bounded. Eagerly classifying every parser alias through
+  provider-backed APIs caused 140 first-run and 137 warm-run provider calls in
+  a scale test whose bounds are 20 and 10. Removing the global classification
+  set and consulting only the per-file visible parser-alias cell plus
+  same-terminal indexed candidates restored the intended locality.
+
+- The shared same-owner policy made an old PHP usage-graph assertion internally
+  inconsistent. `$this->viaInstance()` is intentionally recorded as unproven
+  inbound, and targeted PHP usage tests already classify it as `SelfReceiver`;
+  only the old graph test still expected a proven edge. Issue #1169 tracks the
+  corrected expectation.
+
+- Ruby had the same test drift: the inverted builder deliberately routes a bare
+  `local` call as unproven implicit-self inbound, while the old usage-graph test
+  expected a proven `calls_local -> local` edge. Issue #1170 tracks the
+  correction; all other language graph expectations were audited against the
+  shared policy before the next full gate.
+
+- Same-process cache initialization depended on the schema migration finishing
+  within each peer connection's five-second SQLite busy window. Under load one
+  opener completed while fifteen peers failed or timed out. Issue #1173 fixes
+  this at the admission boundary with one weakly retained mutex per canonical
+  cache path; SQLite transactions still provide cross-process correctness.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -133,6 +310,34 @@ comes through the local gate, but is not the focus.
   safely and accelerates diagnosis. Root retains issue ownership checks, code
   review, gates, publication, and acceptance decisions.
   Date/Author: 2026-07-23 / Codex
+
+- Decision: Interrupt the `37412679` C run after it supplied reproducible
+  #1165 baseline evidence, preserve it under an explicit `aborted` name, and
+  rerun all ten repositories from the fixed pushed head.
+  Rationale: Any #1165 product change makes the old head ineligible for final
+  acceptance. Continuing a multi-hour obsolete envelope would delay the
+  required fixed-head proof without adding final evidence. The two completed
+  repository records and exact libgit2 progress log remain sufficient
+  before/after performance evidence.
+  Date/Author: 2026-07-24 / Codex
+
+- Decision: Reject every #1165 cache candidate and optimize the extractor's
+  structured target plausibility boundary instead.
+  Rationale: Four isolated cache designs either destroyed legacy short
+  circuits or failed to remove the eight-target tail. The remaining repeated
+  cost is target-specific lexical resolution for unrelated type nodes, which
+  can be avoided conservatively using tree-sitter components and indexed
+  alias/visibility facts without changing exact proof semantics.
+  Date/Author: 2026-07-25 / Codex
+
+- Decision: Accept the two-stage structured prefilter for #1165 and proceed to
+  publication gates.
+  Rationale: The complete C/C++ usage suite preserves exact direct, qualified,
+  alias, inherited-alias, template, guard, macro, and owner-classification
+  behavior; work counters prove unrelated bare types bypass lexical scope and
+  target-specific resolution; and the decisive unfiltered libgit2 replay
+  completed every target with exact accounting and zero missing rows.
+  Date/Author: 2026-07-25 / Codex
 
 ## Outcomes & Retrospective
 
@@ -328,10 +533,9 @@ Before pushing Rust changes, run:
 
     cargo fmt --all -- --check
     git diff --check
-    scripts/with-isolated-cargo-target.sh \
-      cargo clippy --all-targets --all-features -- -D warnings
-    UV_CACHE_DIR=/tmp/bifrost-uv-cache BIFROST_SEMANTIC_INDEX=off \
-      scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
+    nice -n 10 cargo clippy --all-targets --all-features -- -D warnings
+    BIFROST_SEMANTIC_INDEX=off nice -n 10 \
+      cargo test --features nlp,python
 
 ## Validation and Acceptance
 
@@ -358,8 +562,8 @@ interruption; repeat the exact command without `--force`. If Bifrost source
 changes, rebuild the runner and use a new head-scoped artifact. Never mutate
 selected clone sources or delete caches to hide migration failures.
 
-Run isolated Cargo work through
-`scripts/with-isolated-cargo-target.sh`. Use
+Run Cargo normally outside the restrictive sandbox at niceness 10. Do not set
+`CARGO_TARGET_DIR` or create Cargo targets under `/tmp`. Use
 `scripts/cleanup-bifrost-tmp.sh` only after reviewing its dry-run candidates.
 At campaign completion, remove disposable exact diagnostics and scratch
 ledgers from `/mnt/optane/tmp/bifrost-fird/`, retaining only the final
@@ -387,3 +591,9 @@ from the completed historical five-repository campaign to the live task-ranked
 ten-repository campaign. Records the independently audited 110-repository
 selection, global-filter runner pitfall, current synchronized baseline, and
 publication contract.
+
+Revision note (2026-07-26): Recorded the completed focused, Clippy, library,
+LSP, and MCP gates, the linked-primary schema drift that requires merging
+current master before the final integration pass, and the user's direct
+instruction to run normal Cargo/Bifrost work at niceness 10 without temporary
+Cargo targets.

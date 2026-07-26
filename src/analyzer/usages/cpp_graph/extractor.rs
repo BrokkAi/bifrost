@@ -15,10 +15,17 @@ use crate::analyzer::{
     CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range, cpp_node_text as node_text,
 };
 use crate::hash::{HashMap, HashSet};
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
+
+#[cfg(test)]
+thread_local! {
+    static LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
@@ -1258,6 +1265,8 @@ fn static_qualifier_type_scopes<'tree>(
             ctx.file,
             ctx.source,
             &ctx.spec.target,
+            false,
+            false,
         ) {
             LexicalTypeResolution::Resolved {
                 unit, candidates, ..
@@ -2965,6 +2974,8 @@ fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwn
         ctx.file,
         ctx.source,
         target_owner,
+        false,
+        false,
     ) {
         LexicalTypeResolution::Resolved { unit: owner, .. }
             if receiver_owner_matches_target(&owner, target_owner, ctx) =>
@@ -3054,6 +3065,8 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
     allow_structured_unresolved_owner: bool,
     ignore_function_owner: bool,
 ) -> LexicalScopeResolution {
+    #[cfg(test)]
+    LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(|count| count.set(count.get() + 1));
     let namespace = enclosing_namespace_components(node, source);
     let mut scope = namespace.clone();
     let mut classes = Vec::new();
@@ -3256,7 +3269,8 @@ fn resolve_type_node_lexically_for_target(
     let Some((components, global)) = type_reference_components(node, source) else {
         return LexicalTypeResolution::Missing;
     };
-    if let Some(arguments) = cpp_template_reference_arguments(node, source) {
+    let template_arguments = cpp_template_reference_arguments(node, source);
+    if let Some(arguments) = template_arguments.as_ref() {
         let alias_resolution = resolve_type_components_lexically_at_preserving_alias(
             node,
             &components,
@@ -3272,7 +3286,7 @@ fn resolve_type_node_lexically_for_target(
                 unit,
                 components,
                 candidates,
-            } => match visibility.resolve_template_arguments(file, unit, &arguments) {
+            } => match visibility.resolve_template_arguments(file, unit, arguments) {
                 Ok(unit) => LexicalTypeResolution::Resolved {
                     unit,
                     components,
@@ -3293,6 +3307,8 @@ fn resolve_type_node_lexically_for_target(
         file,
         source,
         target,
+        template_arguments.is_some(),
+        true,
     )
 }
 
@@ -4044,6 +4060,8 @@ pub(super) fn resolve_type_components_lexically_at(
         source,
         None,
         false,
+        false,
+        false,
     )
 }
 
@@ -4068,6 +4086,8 @@ fn resolve_type_components_lexically_at_preserving_alias(
         file,
         source,
         None,
+        false,
+        false,
         true,
     )
 }
@@ -4083,6 +4103,8 @@ fn resolve_type_components_lexically_at_for_target(
     file: &ProjectFile,
     source: &str,
     target: &CodeUnit,
+    has_template_arguments: bool,
+    apply_structured_prefilter: bool,
 ) -> LexicalTypeResolution {
     resolve_type_components_lexically_at_inner(
         node,
@@ -4094,6 +4116,8 @@ fn resolve_type_components_lexically_at_for_target(
         file,
         source,
         Some(target),
+        has_template_arguments,
+        apply_structured_prefilter,
         false,
     )
 }
@@ -4109,8 +4133,23 @@ fn resolve_type_components_lexically_at_inner(
     file: &ProjectFile,
     source: &str,
     direct_target: Option<&CodeUnit>,
+    has_template_arguments: bool,
+    apply_structured_prefilter: bool,
     preserve_alias: bool,
 ) -> LexicalTypeResolution {
+    if apply_structured_prefilter
+        && direct_target.is_some()
+        && !preserve_alias
+        && !global
+        && components.len() == 1
+        && !visibility.coarse_unqualified_type_reference_may_resolve(
+            file,
+            &components[0],
+            has_template_arguments,
+        )
+    {
+        return LexicalTypeResolution::Missing;
+    }
     let lexical_scope = if global {
         Vec::new()
     } else {
@@ -4129,6 +4168,21 @@ fn resolve_type_components_lexically_at_inner(
             LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
         }
     };
+    if apply_structured_prefilter
+        && let Some(target) = direct_target
+        && !preserve_alias
+        && !visibility.structured_type_reference_may_resolve_to_target(
+            analyzer,
+            file,
+            components,
+            global,
+            &lexical_scope,
+            target,
+            has_template_arguments,
+        )
+    {
+        return LexicalTypeResolution::Missing;
+    }
     let normal = if preserve_alias {
         visibility.resolve_type_components_lexically_for_forward(
             analyzer,
@@ -4253,10 +4307,18 @@ fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 mod effective_using_scale_tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, AnalyzerQueryScope, Language, TestProject, WorkspaceAnalyzer,
+        AnalyzerConfig, AnalyzerQueryScope, CodeUnitType, Language, TestProject, WorkspaceAnalyzer,
         resolve_analyzer,
     };
     use std::sync::Arc;
+
+    fn reset_lexical_scope_reconstructions_for_test() {
+        LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(|count| count.set(0));
+    }
+
+    fn lexical_scope_reconstructions_for_test() -> usize {
+        LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(Cell::get)
+    }
 
     #[test]
     fn effective_using_projection_and_callable_metadata_are_cached_at_scale() {
@@ -4400,6 +4462,106 @@ mod effective_using_scale_tests {
             visibility.using_work_counts_for_test().3,
             1,
             "repeated logical callable lookup must hydrate default metadata once"
+        );
+    }
+
+    #[test]
+    fn structured_prefilter_skips_unrelated_unqualified_type_before_scope_or_alias_work() {
+        const NOISE_COUNT: usize = 96;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let header = ProjectFile::new(root.clone(), "types.h");
+        let alias_header = ProjectFile::new(root.clone(), "aliases.h");
+        alias_header
+            .write("namespace aliasing { using SeenAlias = int; }\n")
+            .expect("write alias header");
+        let mut header_source =
+            String::from("#include \"aliases.h\"\nnamespace target { struct Wanted {}; }\n");
+        for index in 0..NOISE_COUNT {
+            header_source.push_str(&format!(
+                "namespace noise_{index} {{ struct Value {{}}; }}\n"
+            ));
+        }
+        header.write(header_source).expect("write header");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cc");
+        consumer
+            .write("#include \"types.h\"\nvoid consume() { Missing value; }\n")
+            .expect("write consumer");
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
+        let _scope = AnalyzerQueryScope::new(analyzer);
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
+        let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
+        let source = prepared.source();
+        let start = source.find("Missing").expect("unqualified type reference");
+        let end = start + "Missing".len();
+        let mut stack = vec![prepared.tree().root_node()];
+        let mut type_node = None;
+        while let Some(node) = stack.pop() {
+            if node.start_byte() == start
+                && node.end_byte() == end
+                && matches!(node.kind(), "type_identifier" | "identifier")
+            {
+                type_node = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let type_node = type_node.expect("qualified type node");
+        let imports = initialized_ordinary_type_imports(
+            prepared.tree().root_node(),
+            analyzer,
+            &visibility,
+            &consumer,
+            source,
+        );
+        let target = cpp
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == "target.Wanted")
+            .expect("target declaration");
+
+        reset_lexical_scope_reconstructions_for_test();
+        visibility.reset_target_preserving_type_resolution_count();
+        for _ in 0..2 {
+            let resolution = resolve_type_node_lexically_for_target(
+                type_node,
+                analyzer,
+                &visibility,
+                &imports,
+                &consumer,
+                source,
+                &target,
+            );
+            assert!(
+                matches!(resolution, LexicalTypeResolution::Missing),
+                "an unrelated bare type must fail closed before scope reconstruction"
+            );
+        }
+        assert_eq!(
+            lexical_scope_reconstructions_for_test(),
+            0,
+            "the coarse unqualified prefilter must bypass lexical-scope reconstruction"
+        );
+        assert_eq!(
+            visibility.target_preserving_type_resolution_count(),
+            0,
+            "the coarse unqualified prefilter must bypass target-preserving lexical resolution"
+        );
+        assert_eq!(
+            visibility.visible_parser_alias_name_set_build_count(),
+            1,
+            "the visible parser-alias-name set must build lazily once and then be reused"
+        );
+        assert_eq!(
+            visibility.alias_source_parse_count_for_test(&alias_header),
+            1,
+            "the shared visible parser-alias-name set must parse each visible alias source at most once"
         );
     }
 }
