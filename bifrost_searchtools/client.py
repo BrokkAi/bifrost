@@ -13,7 +13,7 @@ from types import ModuleType
 from typing import Any, get_args, overload
 
 from .models import (
-    CommitAnalysisResult,
+    DiffAnalysisResult,
     CodeQualityReport,
     CodeQueryExecutionMode,
     FileSummariesResult,
@@ -636,19 +636,25 @@ class SearchToolsClient:
             arguments["max_entries"] = max_entries
         return ListFilesResult.from_dict(self._call_tool("list_files", arguments))
 
-    def analyze_commit(
+    def analyze_diff(
         self,
-        revision: str,
+        target: str | None = None,
         *,
+        base: str | None = None,
         include_tests: bool = True,
-    ) -> CommitAnalysisResult:
-        """Analyze a single-parent commit against its parent and return semantic effects."""
-        return CommitAnalysisResult.from_dict(
-            self._call_tool(
-                "analyze_commit",
-                {"revision": revision, "include_tests": include_tests},
-            )
-        )
+    ) -> DiffAnalysisResult:
+        """Diff two endpoints and return semantic effects.
+
+        ``target`` omitted means the uncommitted working tree; ``base`` defaults
+        to the first parent of ``target`` (or ``HEAD`` when ``target`` is the
+        working tree). Merge and root commits require an explicit ``base``.
+        """
+        arguments: dict[str, Any] = {"include_tests": include_tests}
+        if target is not None:
+            arguments["target"] = target
+        if base is not None:
+            arguments["base"] = base
+        return DiffAnalysisResult.from_dict(self._call_tool("analyze_diff", arguments))
 
     # ------------------------------------------------------------------
     # Structured data tools

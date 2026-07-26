@@ -71,7 +71,7 @@ Use `manual=True` with `update_paths(...)` when the caller wants to control incr
 | Workspace | `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()` |
 | Symbols and summaries | `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `classify_test_files(...)` |
 | Declarations, definitions, and types | `get_declarations_by_location(...)`, `get_definitions_by_location(...)`, `get_definitions_by_reference(...)`, `get_type_by_location(...)` |
-| Usages and graph | `scan_usages_by_reference(...)`, `scan_usages_by_location(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`, `analyze_commit(...)` |
+| Usages and graph | `scan_usages_by_reference(...)`, `scan_usages_by_location(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`, `analyze_diff(...)` |
 | Code query | `query_code(...)` |
 | Semantic search | `semantic_search(...)`, `semantic_search_status()` |
 | Files | `get_file_contents(...)`, `find_filenames(...)`, `search_file_contents(...)`, `find_files_containing(...)`, `list_files(...)` |

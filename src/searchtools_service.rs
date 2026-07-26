@@ -10,7 +10,7 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
-    commit_analysis::{AnalyzeCommitParams, analyze_commit_at_root},
+    diff_analysis::{AnalyzeDiffParams, analyze_diff_at_root},
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
@@ -558,16 +558,13 @@ impl SearchToolsService {
         if name == "semantic_search_status" {
             return self.handle_semantic_search_status(arguments);
         }
-        if name == "analyze_commit" {
-            let params =
-                serde_json::from_value::<AnalyzeCommitParams>(arguments).map_err(|err| {
-                    SearchToolsServiceError::invalid_params(format!(
-                        "Invalid tool arguments: {err}"
-                    ))
-                })?;
+        if name == "analyze_diff" {
+            let params = serde_json::from_value::<AnalyzeDiffParams>(arguments).map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+            })?;
             let root = self.service_root()?;
             return Self::structured_only(
-                analyze_commit_at_root(&root, params).map_err(SearchToolsServiceError::internal)?,
+                analyze_diff_at_root(&root, params).map_err(SearchToolsServiceError::internal)?,
             );
         }
 

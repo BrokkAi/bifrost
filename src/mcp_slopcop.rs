@@ -16,7 +16,7 @@ pub const SLOPCOP_TOOL_NAMES: &[&str] = &[
     "report_long_method_and_god_object_smells",
     "report_dead_code_and_unused_abstraction_smells",
     "report_secret_like_code",
-    "analyze_commit",
+    "analyze_diff",
 ];
 
 pub fn run_slopcop_stdio_server(
@@ -423,23 +423,27 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
             }),
         ),
         tool_descriptor(
-            "analyze_commit",
-            "Analyze a normal single-parent commit against its parent and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices.",
+            "analyze_diff",
+            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices. Three modes: omit both params to compare HEAD against the uncommitted working tree (`git diff HEAD`, staged plus unstaged plus new files); pass `target` alone to compare a single commit against its first parent; pass `base` and/or `target` to compare any two endpoints (`git diff <base> <target>`, or `<base>` against the working tree when `target` is omitted). Merge and root commits require an explicit `base`. The working-tree endpoint is a live snapshot with no locking: files may change between the diff and the analysis.",
             json!({
                 "type": "object",
                 "properties": {
-                    "revision": {
+                    "base": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Commit hash, branch, or tag resolving to a single-parent commit."
+                        "description": "Revspec of the \"before\" endpoint (commit hash, branch, or tag). Defaults to the first parent of `target`, or to HEAD when `target` is omitted."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Revspec of the \"after\" endpoint (commit hash, branch, or tag). Omit to use the uncommitted working tree."
                     },
                     "include_tests": {
                         "type": "boolean",
                         "default": true,
                         "description": "Include symbols and call edges from detected test files."
                     }
-                },
-                "required": ["revision"]
+                }
             }),
         ),
     ]

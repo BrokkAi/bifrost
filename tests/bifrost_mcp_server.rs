@@ -212,7 +212,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
-            "analyze_commit",
+            "analyze_diff",
             "classify_test_files",
         ];
         #[cfg(feature = "nlp")]
@@ -253,7 +253,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
-            "analyze_commit",
+            "analyze_diff",
             "classify_test_files",
         ];
         expected
@@ -933,8 +933,8 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     assert_unknown_tool(
         &fixture_root,
         "core",
-        "analyze_commit",
-        json!({ "revision": "HEAD" }),
+        "analyze_diff",
+        json!({ "target": "HEAD" }),
     );
     assert_unknown_tool(
         &fixture_root,
@@ -1020,7 +1020,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
-            "analyze_commit",
+            "analyze_diff",
         ],
     );
     #[cfg(feature = "nlp")]

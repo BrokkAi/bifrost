@@ -2921,13 +2921,19 @@ class UsageGraphResult:
 
 
 @dataclass(frozen=True)
-class CommitPair:
-    hash: str
-    parent_hash: str
+class DiffEndpoints:
+    """Resolved diff endpoints.
+
+    Each field is a full commit hash, or the literal ``"worktree"`` when that
+    endpoint is the uncommitted working tree.
+    """
+
+    base: str
+    target: str
 
     @classmethod
-    def from_dict(cls, data: dict) -> CommitPair:
-        return cls(hash=data["hash"], parent_hash=data["parent_hash"])
+    def from_dict(cls, data: dict) -> DiffEndpoints:
+        return cls(base=data["base"], target=data["target"])
 
 
 @dataclass(frozen=True)
@@ -3155,8 +3161,8 @@ class LargeCallsiteSymbol:
 
 
 @dataclass(frozen=True)
-class CommitAnalysisResult:
-    commit: CommitPair
+class DiffAnalysisResult:
+    endpoints: DiffEndpoints
     file_changes: list[FileChange]
     patch_symbols: PatchSymbols
     moved_symbols: list[MovedSymbol]
@@ -3168,9 +3174,9 @@ class CommitAnalysisResult:
     large_callsite_symbols: list[LargeCallsiteSymbol]
 
     @classmethod
-    def from_dict(cls, data: dict) -> CommitAnalysisResult:
+    def from_dict(cls, data: dict) -> DiffAnalysisResult:
         return cls(
-            commit=CommitPair.from_dict(data["commit"]),
+            endpoints=DiffEndpoints.from_dict(data["endpoints"]),
             file_changes=[FileChange.from_dict(item) for item in data.get("file_changes", [])],
             patch_symbols=PatchSymbols.from_dict(data["patch_symbols"]),
             moved_symbols=[MovedSymbol.from_dict(item) for item in data.get("moved_symbols", [])],
