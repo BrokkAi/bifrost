@@ -4,18 +4,25 @@ use std::cell::Cell;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, PathQuality,
-    SolverBudget, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SolverBudget,
+    SolverTermination, SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey,
+    SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence,
+    SummaryOrigin, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryWitnessStepKind, WitnessReconstructionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
-    ObjectCardinality, OracleCallContext, OracleLimits, ProcedureKind, ProofStatus, SemanticBudget,
-    SemanticCallSite,
+    ObjectCardinality, OracleCallContext, OracleLimits, ProcedureKind, ProcedurePortHandle,
+    ProofStatus, SemanticBudget, SemanticCallSite,
 };
 use brokk_bifrost::analyzer::typestate::{
-    BoundTypestateSubjectSpec, CompiledProtocol, ProtocolAnalysisMode, ProtocolEventKey,
-    ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey, ProtocolGuardSpec,
-    ProtocolObservationPhase, ProtocolObservationSpec, ProtocolProcedureExitKind,
-    ProtocolSemantics, ProtocolSpec, ProtocolStateKey, ProtocolTerminalExpectationSpec,
+    BoundTypestateSubjectSpec, CompiledProtocol, CompleteProtocolSummaryRepository,
+    ProtocolAnalysisMode, ProtocolEventKey, ProtocolEventOccurrence, ProtocolEventSpec,
+    ProtocolExpectationKey, ProtocolFactKey, ProtocolGuardSpec, ProtocolObservationPhase,
+    ProtocolObservationSpec, ProtocolProcedureExitKind, ProtocolSemanticSummarySet,
+    ProtocolSemantics, ProtocolSpec, ProtocolStateKey, ProtocolSummaryCacheStatus,
+    ProtocolSummaryError, ProtocolSummaryKey, ProtocolSummaryRepositoryLimits,
+    ProtocolSummarySolveError, ProtocolSummarySolveResult, ProtocolTerminalExpectationSpec,
     ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
     ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
     TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
@@ -24,7 +31,8 @@ use brokk_bifrost::analyzer::typestate::{
     TypestateInitialSeedSpec, TypestateObjectRole, TypestateObservationSite,
     TypestateSubjectClassKey, TypestateSubjectKey, TypestateSummaryResult,
     TypestateTerminalBindingSpec, TypestateUncertainty, collect_summary_findings,
-    collect_summary_findings_with_limits, solve_typestate_with_summaries,
+    collect_summary_findings_with_limits, solve_typestate_with_reusable_summaries,
+    solve_typestate_with_summaries,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 
@@ -152,6 +160,64 @@ final class BranchFixture {
 }
 "#;
 
+const TWO_CALLER_HELPER_SOURCE: &str = r#"
+final class SharedResource {}
+
+final class SharedHelperFixture {
+  static void use(SharedResource resource) {}
+  static void close(SharedResource resource) {}
+
+  static void helper(SharedResource resource) {
+    use(resource);
+    close(resource);
+  }
+
+  static void callerOne() {
+    helper(null);
+  }
+
+  static void callerTwo() {
+    helper(null);
+  }
+}
+"#;
+
+const SUMMARY_RECURSIVE_HELPER_SOURCE: &str = r#"
+package fixture
+
+var recurse bool
+
+func helper() {
+    if recurse {
+        helper()
+    }
+}
+
+func callerOne() { helper() }
+func callerTwo() { helper() }
+"#;
+
+const MUTUAL_RECURSIVE_HELPER_SOURCE: &str = r#"
+package fixture
+
+var recurse bool
+
+func even() {
+    if recurse {
+        odd()
+    }
+}
+
+func odd() {
+    if recurse {
+        even()
+    }
+}
+
+func callerOne() { even() }
+func callerTwo() { even() }
+"#;
+
 struct ClientFixture {
     protocol: CompiledProtocol,
     bindings: TypestateBindingPlan,
@@ -186,6 +252,30 @@ fn call_containing<'procedure>(
         .unwrap_or_else(|| panic!("missing call containing {text:?}"))
 }
 
+fn procedure_handle_named(
+    graph: &SemanticGraph,
+    name: &str,
+) -> brokk_bifrost::analyzer::semantic::ProcedureHandle {
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some(name)
+        })
+        .unwrap_or_else(|| panic!("fixture missing procedure {name}"));
+    graph
+        .artifact()
+        .procedure_handle(procedure.id())
+        .unwrap_or_else(|| panic!("fixture procedure {name} has no live handle"))
+}
+
 fn protocol() -> CompiledProtocol {
     ProtocolSpec::from_json(RESOURCE_LIFECYCLE)
         .expect("protocol fixture should parse")
@@ -200,6 +290,14 @@ fn observable_lifecycle_protocol() -> CompiledProtocol {
 fn observable_lifecycle_protocol_with_incomplete_analysis(
     incomplete_analysis: ProtocolUncertaintyBehavior,
 ) -> CompiledProtocol {
+    observable_lifecycle_spec_with_incomplete_analysis(incomplete_analysis)
+        .compile()
+        .unwrap()
+}
+
+fn observable_lifecycle_spec_with_incomplete_analysis(
+    incomplete_analysis: ProtocolUncertaintyBehavior,
+) -> ProtocolSpec {
     let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();
     spec.states.push("used".to_owned());
     for transition in &mut spec.transitions {
@@ -217,7 +315,7 @@ fn observable_lifecycle_protocol_with_incomplete_analysis(
         }
     }
     spec.semantics.uncertainty.incomplete_analysis = incomplete_analysis;
-    spec.compile().unwrap()
+    spec
 }
 
 fn fixture(close_quality: TypestateBindingQuality) -> ClientFixture {
@@ -380,6 +478,174 @@ fn fixture_from(
     }
 }
 
+fn complete_java_fixture(
+    project: &BuiltInlineTestProject,
+    analyzer: &WorkspaceAnalyzer,
+    swap_use_and_close: bool,
+) -> ClientFixture {
+    complete_java_fixture_with_close_quality(
+        project,
+        analyzer,
+        swap_use_and_close,
+        TypestateBindingQuality::proven_unique(),
+    )
+}
+
+fn complete_java_fixture_with_close_quality(
+    project: &BuiltInlineTestProject,
+    analyzer: &WorkspaceAnalyzer,
+    swap_use_and_close: bool,
+    close_quality: TypestateBindingQuality,
+) -> ClientFixture {
+    let graph = SemanticGraph::materialize(project, analyzer, "src/LifecycleFixture.java");
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Method
+                && procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("lifecycle")
+        })
+        .expect("Java lifecycle procedure");
+    let root = graph
+        .artifact()
+        .procedure_handle(procedure.id())
+        .expect("Java lifecycle handle");
+    let use_call = call_containing(procedure, JAVA_CONFORMANCE_SOURCE, "use(alias)");
+    let close_call = call_containing(procedure, JAVA_CONFORMANCE_SOURCE, "close(alias)");
+    let use_call_handle = root.call_site_handle(use_call.id).expect("Java use call");
+    let close_call_handle = root
+        .call_site_handle(close_call.id)
+        .expect("Java close call");
+    let subject_object = AbstractObject::new(
+        AccessPathRoot::Value(
+            root.value_handle(close_call.arguments[0].value)
+                .expect("Java aliased close argument"),
+        ),
+        ObjectCardinality::Singleton,
+    )
+    .expect("Java lifecycle subject");
+    let subject_class = TypestateSubjectClassKey::new("resource").unwrap();
+    let subject_key = TypestateSubjectKey::for_object(subject_class.clone(), &subject_object);
+    let entry = root
+        .point_handle(procedure.entry_point())
+        .expect("Java lifecycle entry");
+    let exit = root
+        .point_handle(procedure.normal_exit_point())
+        .expect("Java lifecycle exit");
+    let use_point = root.point_handle(use_call.point).expect("Java use point");
+    let close_point = root
+        .point_handle(close_call.point)
+        .expect("Java close point");
+    let context = TypestateBindingContext::root();
+    let exact = TypestateBindingQuality::proven_unique();
+    let protocol = if close_quality.multiplicity().is_ambiguous() {
+        let mut spec = observable_lifecycle_spec_with_incomplete_analysis(
+            ProtocolUncertaintyBehavior::Abstain,
+        );
+        spec.events
+            .iter_mut()
+            .find(|event| event.id == "close")
+            .expect("close event")
+            .observation
+            .occurrence = ProtocolEventOccurrence::Endpoint {
+            phase: ProtocolObservationPhase::BeforeCall,
+        };
+        spec.compile().expect("ambiguous Java protocol")
+    } else {
+        observable_lifecycle_protocol()
+    };
+    let (use_site, close_site) = if swap_use_and_close {
+        (close_point.clone(), use_point.clone())
+    } else {
+        (use_point.clone(), close_point.clone())
+    };
+    let event = |name: &str, point| {
+        TypestateEventBindingSpec::new(
+            ProtocolEventKey::new(name).unwrap(),
+            subject_key.clone(),
+            TypestateObservationSite::program_point(point, context.clone()),
+            0,
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )
+    };
+    let close_binding = if close_quality.multiplicity().is_ambiguous() {
+        TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("close").unwrap(),
+            subject_key.clone(),
+            TypestateObservationSite::call_site(close_call_handle.clone(), context.clone()),
+            0,
+            TypestateObjectRole::Argument,
+            close_quality,
+        )
+    } else {
+        TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("close").unwrap(),
+            subject_key.clone(),
+            TypestateObservationSite::program_point(close_site, context.clone()),
+            0,
+            TypestateObjectRole::MatchedValue,
+            close_quality,
+        )
+    };
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            subject_class.clone(),
+            subject_object.clone(),
+            exact.clone(),
+        )],
+        vec![TypestateInitialSeedSpec::new(
+            subject_key.clone(),
+            ProtocolStateKey::new("unallocated").unwrap(),
+            TypestateObservationSite::program_point(entry.clone(), context.clone()),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
+        vec![
+            TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("acquire").unwrap(),
+                subject_key.clone(),
+                TypestateObservationSite::program_point(entry.clone(), context.clone()),
+                0,
+                TypestateObjectRole::AllocationResult,
+                exact.clone(),
+            ),
+            event("use", use_site),
+            close_binding,
+        ],
+        vec![TypestateTerminalBindingSpec::new(
+            ProtocolExpectationKey::new("normal-exit-closed").unwrap(),
+            subject_key.clone(),
+            TypestateObservationSite::program_point(exit.clone(), context),
+            TypestateObjectRole::CurrentObject,
+            exact,
+        )],
+    )
+    .expect("complete Java lifecycle binding plan");
+    ClientFixture {
+        protocol,
+        bindings,
+        subject_key,
+        subject_class,
+        subject_object,
+        root,
+        entry,
+        use_point,
+        close_point,
+        exit,
+        use_call: use_call_handle,
+        close_call: close_call_handle,
+    }
+}
+
 fn exit_protocol() -> CompiledProtocol {
     ProtocolSpec::from_json(
         br#"{
@@ -514,6 +780,234 @@ fn solve_summary(fixture: &ClientFixture, analyzer: &WorkspaceAnalyzer) -> Types
     .expect("typestate summary solve")
 }
 
+fn reusable_semantic_summary_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+) -> SemanticProcedureSummary {
+    let procedure = ProcedureSummaryKey::try_new(reusable_semantic_identity_for(root), &[], None)
+        .expect("typestate summary fixture key is valid");
+    SemanticProcedureSummary::try_new(
+        procedure,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        SummaryCompleteness::Complete,
+    )
+    .expect("typestate fixture semantic summary is valid")
+}
+
+fn reusable_semantic_identity_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+) -> ProcedureSummaryIdentity {
+    reusable_semantic_identity_with_behavior_for(
+        root,
+        SummaryBehaviorKey::hash_bytes(b"compiled-protocol-semantics"),
+    )
+}
+
+fn reusable_semantic_identity_with_behavior_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+    behavior: SummaryBehaviorKey,
+) -> ProcedureSummaryIdentity {
+    reusable_semantic_identity_with_context_and_behavior_for(
+        root,
+        SummaryContextKey::hash_bytes(b"root-context"),
+        behavior,
+    )
+}
+
+fn reusable_semantic_identity_with_context_and_behavior_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+    context: SummaryContextKey,
+    behavior: SummaryBehaviorKey,
+) -> ProcedureSummaryIdentity {
+    ProcedureSummaryIdentity::new(
+        root.artifact().key().clone(),
+        root.semantics().locator().declaration().clone(),
+        SummarySchemaVersion::CURRENT,
+        SummarySemanticsVersion::hash_bytes(b"typestate-summary-client-v1"),
+        context,
+        behavior,
+        SummaryOrigin::Inferred,
+    )
+}
+
+fn reusable_semantic_summary_with_behavior_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+    behavior: SummaryBehaviorKey,
+) -> SemanticProcedureSummary {
+    let key = ProcedureSummaryKey::try_new(
+        reusable_semantic_identity_with_behavior_for(root, behavior),
+        &[],
+        None,
+    )
+    .unwrap();
+    SemanticProcedureSummary::try_new(
+        key,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        SummaryCompleteness::Complete,
+    )
+    .unwrap()
+}
+
+fn reusable_semantic_summary_with_context_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+    context: SummaryContextKey,
+) -> SemanticProcedureSummary {
+    let key = ProcedureSummaryKey::try_new(
+        reusable_semantic_identity_with_context_and_behavior_for(
+            root,
+            context,
+            SummaryBehaviorKey::hash_bytes(b"compiled-protocol-semantics"),
+        ),
+        &[],
+        None,
+    )
+    .unwrap();
+    SemanticProcedureSummary::try_new(
+        key,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        SummaryCompleteness::Complete,
+    )
+    .unwrap()
+}
+
+fn reusable_semantic_summary_with_dependencies_for(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+    dependencies: &[&SemanticProcedureSummary],
+) -> SemanticProcedureSummary {
+    let dependencies = dependencies
+        .iter()
+        .map(|summary| SummaryDependencyKey::complete(summary.key().clone()))
+        .collect::<Vec<_>>();
+    let key =
+        ProcedureSummaryKey::try_new(reusable_semantic_identity_for(root), &dependencies, None)
+            .unwrap();
+    let effects = dependencies
+        .iter()
+        .enumerate()
+        .map(|(index, dependency)| {
+            SummaryEffect::new(
+                SummaryEffectKey::Call {
+                    event: SummaryEventKey::hash_bytes(index.to_le_bytes()),
+                    callee: Box::new(dependency.clone()),
+                },
+                SummaryEvidence::proven_complete(),
+            )
+        })
+        .collect();
+    SemanticProcedureSummary::try_new(
+        key,
+        Vec::new(),
+        effects,
+        dependencies,
+        SummaryCompleteness::Complete,
+    )
+    .unwrap()
+}
+
+fn reusable_recursive_semantic_summaries_for(
+    procedures: &[brokk_bifrost::analyzer::semantic::ProcedureHandle],
+    edges: &[(usize, usize)],
+) -> Vec<SemanticProcedureSummary> {
+    let identities = procedures
+        .iter()
+        .map(reusable_semantic_identity_for)
+        .collect::<Vec<_>>();
+    let recursive_edges = edges
+        .iter()
+        .map(|(source, target)| {
+            SummaryRecursiveEdge::new(identities[*source].clone(), identities[*target].clone())
+        })
+        .collect::<Vec<_>>();
+    let group = SummaryRecursiveGroupKey::from_closure(&identities, &recursive_edges, &[])
+        .expect("recursive typestate fixture forms an exact SCC");
+    procedures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let dependencies = edges
+                .iter()
+                .filter(|(source, _)| *source == index)
+                .map(|(_, target)| SummaryDependencyKey::recursive(identities[*target].clone()))
+                .collect::<Vec<_>>();
+            let effects = edges
+                .iter()
+                .filter(|(source, _)| *source == index)
+                .zip(dependencies.iter())
+                .map(|((source, target), dependency)| {
+                    SummaryEffect::new(
+                        SummaryEffectKey::Call {
+                            event: SummaryEventKey::hash_bytes(&[
+                                u8::try_from(*source).unwrap(),
+                                u8::try_from(*target).unwrap(),
+                            ]),
+                            callee: Box::new(dependency.clone()),
+                        },
+                        SummaryEvidence::proven_complete(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let key =
+                ProcedureSummaryKey::try_new(identities[index].clone(), &dependencies, Some(group))
+                    .expect("recursive typestate key");
+            SemanticProcedureSummary::try_new(
+                key,
+                Vec::new(),
+                effects,
+                dependencies,
+                SummaryCompleteness::Complete,
+            )
+            .expect("recursive typestate semantic summary")
+        })
+        .collect()
+}
+
+fn reusable_semantic_summary(fixture: &ClientFixture) -> SemanticProcedureSummary {
+    reusable_semantic_summary_for(&fixture.root)
+}
+
+fn reusable_protocol_key(fixture: &ClientFixture) -> ProtocolSummaryKey {
+    let semantic_summary = reusable_semantic_summary(fixture);
+    ProtocolSummaryKey::try_from_semantic_summary(
+        &semantic_summary,
+        fixture.protocol.hash(),
+        fixture.bindings.summary_hash_for(
+            fixture.root.artifact().key(),
+            fixture.root.semantics().locator().declaration(),
+        ),
+        Vec::new(),
+    )
+    .expect("complete semantic summary can brand the protocol relation")
+}
+
+fn reusable_solve(
+    fixture: &ClientFixture,
+    analyzer: &WorkspaceAnalyzer,
+    repository: &mut CompleteProtocolSummaryRepository,
+) -> Result<ProtocolSummarySolveResult, ProtocolSummarySolveError> {
+    let semantic_summary = reusable_semantic_summary(fixture);
+    let semantic_summaries = ProtocolSemanticSummarySet::try_new(vec![&semantic_summary])
+        .expect("fixture semantic set is exact");
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    solve_typestate_with_reusable_summaries(
+        &fixture.root,
+        &[],
+        &analyzer.icfg_provider(),
+        &fixture.protocol,
+        &fixture.bindings,
+        &semantic_summaries,
+        repository,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+}
+
 #[derive(Default)]
 struct FactOutput(Vec<TypestateFact>);
 
@@ -580,6 +1074,769 @@ enum TestTransfer {
     Call,
     Return,
     CallToReturn,
+}
+
+#[test]
+fn complete_protocol_summary_reuses_canonical_outcomes_and_effects() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let mut repository = CompleteProtocolSummaryRepository::default();
+
+    let computed = reusable_solve(&fixture, &analyzer, &mut repository)
+        .expect("complete typestate solve should publish a protocol summary");
+    assert!(!computed.was_reused());
+    assert!(computed.computed_result().is_complete());
+    assert_eq!(repository.len(), 1);
+    let computed_application = computed
+        .application()
+        .expect("complete solve has a projected application");
+    assert!(computed_application.outcomes().iter().all(|outcome| {
+        outcome.evidence().has_proven_complete_path()
+            && ProtocolFactKey::from_live(outcome.fact(), &fixture.protocol, &fixture.bindings)
+                .is_ok_and(|fact| &fact == outcome.stable_fact())
+    }));
+    assert!(
+        computed_application
+            .effects()
+            .iter()
+            .any(|effect| { matches!(effect.stable_fact(), ProtocolFactKey::NonViolation { .. }) })
+    );
+
+    let expected = computed_application.clone();
+    let reused = reusable_solve(&fixture, &analyzer, &mut repository)
+        .expect("the exact complete protocol summary should remain valid");
+    assert!(!reused.was_reused());
+    assert!(reused.computed_result().is_complete());
+    assert_eq!(reused.application(), Some(&expected));
+    assert_eq!(repository.len(), 1);
+}
+
+#[test]
+fn two_callers_reuse_one_helper_protocol_summary_inside_tabulation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/SharedHelperFixture.java", TWO_CALLER_HELPER_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/SharedHelperFixture.java");
+    let procedure = |name: &str| {
+        graph
+            .artifact()
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("two-caller fixture missing {name}"))
+    };
+    let helper = procedure("helper");
+    let caller_one = procedure("callerOne");
+    let caller_two = procedure("callerTwo");
+    let helper_handle = graph
+        .artifact()
+        .procedure_handle(helper.id())
+        .expect("helper handle");
+    let caller_one_handle = graph
+        .artifact()
+        .procedure_handle(caller_one.id())
+        .expect("caller one handle");
+    let caller_two_handle = graph
+        .artifact()
+        .procedure_handle(caller_two.id())
+        .expect("caller two handle");
+    let use_call = call_containing(helper, TWO_CALLER_HELPER_SOURCE, "use(resource)");
+    let close_call = call_containing(helper, TWO_CALLER_HELPER_SOURCE, "close(resource)");
+    let helper_entry = helper_handle
+        .point_handle(helper.entry_point())
+        .expect("helper entry");
+    let helper_exit = helper_handle
+        .point_handle(helper.normal_exit_point())
+        .expect("helper normal exit");
+    let helper_port =
+        ProcedurePortHandle::parameter(helper_handle.clone(), 0).expect("helper parameter port");
+    let subject_object = AbstractObject::new(
+        AccessPathRoot::ProcedurePort(helper_port),
+        ObjectCardinality::Singleton,
+    )
+    .expect("helper formal subject");
+    let subject_class = TypestateSubjectClassKey::new("resource").unwrap();
+    let subject_key = TypestateSubjectKey::for_object(subject_class.clone(), &subject_object);
+    let context = TypestateBindingContext::root();
+    let exact = TypestateBindingQuality::proven_unique();
+    let mut protocol_spec =
+        observable_lifecycle_spec_with_incomplete_analysis(ProtocolUncertaintyBehavior::Abstain);
+    protocol_spec.terminal_expectations = vec![ProtocolTerminalExpectationSpec {
+        id: "helper-exit-unallocated".into(),
+        on: ProtocolTerminalObservationSpec::Event {
+            observation: ProtocolObservationSpec {
+                occurrence: ProtocolEventOccurrence::ProcedureExit {
+                    kind: ProtocolProcedureExitKind::Normal,
+                },
+            },
+        },
+        expected_states: vec!["unallocated".into()],
+    }];
+    let protocol = protocol_spec.compile().expect("helper terminal protocol");
+    let event = |name: &str, point: brokk_bifrost::analyzer::semantic::ProgramPointHandle| {
+        TypestateEventBindingSpec::new(
+            ProtocolEventKey::new(name).unwrap(),
+            subject_key.clone(),
+            TypestateObservationSite::program_point(point, context.clone()),
+            0,
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )
+    };
+    let subjects = vec![BoundTypestateSubjectSpec::new(
+        subject_class,
+        subject_object,
+        exact.clone(),
+    )];
+    let seeds = vec![TypestateInitialSeedSpec::new(
+        subject_key.clone(),
+        ProtocolStateKey::new("open").unwrap(),
+        TypestateObservationSite::program_point(helper_entry.clone(), context.clone()),
+        TypestateObjectRole::FormalArgument { ordinal: 0 },
+        exact.clone(),
+    )];
+    let events = vec![
+        event(
+            "use",
+            helper_handle
+                .point_handle(use_call.point)
+                .expect("helper use point"),
+        ),
+        event(
+            "close",
+            helper_handle
+                .point_handle(close_call.point)
+                .expect("helper close point"),
+        ),
+    ];
+    let terminals = vec![TypestateTerminalBindingSpec::new(
+        ProtocolExpectationKey::new("helper-exit-unallocated").unwrap(),
+        subject_key.clone(),
+        TypestateObservationSite::program_point(helper_exit, context),
+        TypestateObjectRole::CurrentObject,
+        exact.clone(),
+    )];
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        subjects.clone(),
+        seeds.clone(),
+        events.clone(),
+        terminals.clone(),
+    )
+    .expect("two-caller helper bindings");
+    let unrelated_object = AbstractObject::new(
+        AccessPathRoot::ProcedurePort(ProcedurePortHandle::normal_return(
+            caller_two_handle.clone(),
+        )),
+        ObjectCardinality::Singleton,
+    )
+    .unwrap();
+    let mut extended_subjects = subjects;
+    extended_subjects.push(BoundTypestateSubjectSpec::new(
+        TypestateSubjectClassKey::new("unrelated-caller-two").unwrap(),
+        unrelated_object,
+        exact,
+    ));
+    let bindings_with_unrelated_caller_subject =
+        TypestateBindingPlan::try_new(&protocol, extended_subjects, seeds, events, terminals)
+            .expect("caller-only subjects do not alter helper propagation bindings");
+    assert_ne!(
+        bindings.hash(),
+        bindings_with_unrelated_caller_subject.hash(),
+        "the full live binding layout changes"
+    );
+    assert_eq!(
+        bindings.summary_hash_for(
+            helper_handle.artifact().key(),
+            helper_handle.semantics().locator().declaration(),
+        ),
+        bindings_with_unrelated_caller_subject.summary_hash_for(
+            helper_handle.artifact().key(),
+            helper_handle.semantics().locator().declaration(),
+        ),
+        "caller-only subjects must not invalidate the helper contract"
+    );
+    let helper_semantic = reusable_semantic_summary_for(&helper_handle);
+    let caller_one_semantic =
+        reusable_semantic_summary_with_dependencies_for(&caller_one_handle, &[&helper_semantic]);
+    let caller_two_semantic =
+        reusable_semantic_summary_with_dependencies_for(&caller_two_handle, &[&helper_semantic]);
+    let semantic_summaries = ProtocolSemanticSummarySet::try_new(vec![
+        &helper_semantic,
+        &caller_one_semantic,
+        &caller_two_semantic,
+    ])
+    .expect("two-caller semantic summaries are exact");
+    let mut repository = CompleteProtocolSummaryRepository::default();
+
+    let solve = |root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+                 bindings: &TypestateBindingPlan,
+                 semantic_summaries: &ProtocolSemanticSummarySet<'_>,
+                 repository: &mut CompleteProtocolSummaryRepository| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_reusable_summaries(
+            root,
+            &[],
+            &analyzer.icfg_provider(),
+            &protocol,
+            &bindings,
+            &semantic_summaries,
+            repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .expect("two-caller reusable solve")
+    };
+
+    let first = solve(
+        &caller_one_handle,
+        &bindings,
+        &semantic_summaries,
+        &mut repository,
+    );
+    assert!(!first.was_reused());
+    assert!(
+        first.published_summaries() == 1,
+        "status={:?} published={} entries={}",
+        first.cache_status(),
+        first.published_summaries(),
+        repository.len()
+    );
+    assert!(
+        first.application().is_none(),
+        "a caller artifact is not published until nested effects can be flattened exactly"
+    );
+    let mut first_outcomes = first
+        .computed_result()
+        .result()
+        .end_summaries()
+        .iter()
+        .filter(|summary| summary.entry().procedure() == &caller_one_handle)
+        .map(|summary| {
+            let fact = first
+                .computed_result()
+                .result()
+                .fact(summary.exit_fact())
+                .unwrap();
+            ProtocolFactKey::from_live(*fact, &protocol, &bindings).unwrap()
+        })
+        .collect::<Vec<_>>();
+    first_outcomes.sort_unstable();
+    first_outcomes.dedup();
+    let first_findings = collect_summary_findings(&protocol, &bindings, first.computed_result())
+        .expect("first caller findings");
+    assert_eq!(first_findings.findings().len(), 1);
+
+    let helper_alternate_context = reusable_semantic_summary_with_context_for(
+        &helper_handle,
+        SummaryContextKey::hash_bytes(b"alternate-helper-context"),
+    );
+    assert_eq!(
+        ProtocolSemanticSummarySet::try_new(vec![
+            &helper_semantic,
+            &helper_alternate_context,
+            &caller_two_semantic,
+        ])
+        .unwrap_err(),
+        ProtocolSummaryError::AmbiguousSemanticSummary,
+        "context-sensitive summaries fail closed until invocations carry an exact context key"
+    );
+    let second = solve(
+        &caller_two_handle,
+        &bindings_with_unrelated_caller_subject,
+        &semantic_summaries,
+        &mut repository,
+    );
+    assert!(second.was_reused());
+    assert!(
+        second
+            .computed_result()
+            .result()
+            .metrics()
+            .reusable_summary_hits
+            > 0
+    );
+    assert!(
+        second
+            .computed_result()
+            .result()
+            .witness_retention_truncated(),
+        "reused protocol rows never retain fabricated witness paths"
+    );
+    assert!(second.application().is_none());
+    let mut second_outcomes = second
+        .computed_result()
+        .result()
+        .end_summaries()
+        .iter()
+        .filter(|summary| summary.entry().procedure() == &caller_two_handle)
+        .map(|summary| {
+            let fact = second
+                .computed_result()
+                .result()
+                .fact(summary.exit_fact())
+                .unwrap();
+            ProtocolFactKey::from_live(*fact, &protocol, &bindings_with_unrelated_caller_subject)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    second_outcomes.sort_unstable();
+    second_outcomes.dedup();
+    assert_eq!(second_outcomes, first_outcomes);
+    let second_findings = collect_summary_findings(
+        &protocol,
+        &bindings_with_unrelated_caller_subject,
+        second.computed_result(),
+    )
+    .expect("reused helper findings");
+    assert_eq!(second_findings.findings().len(), 1);
+    let first_finding = &first_findings.findings()[0];
+    let second_finding = &second_findings.findings()[0];
+    assert_eq!(second_finding.kind(), first_finding.kind());
+    assert_eq!(second_finding.certainty(), first_finding.certainty());
+    assert_eq!(second_finding.evidence(), first_finding.evidence());
+    assert_eq!(second_finding.site(), first_finding.site());
+    assert!(
+        second_finding
+            .witnesses()
+            .iter()
+            .all(|witness| witness.witness().retention_truncated()),
+        "cached callee effects expose explicit omission markers, not fabricated paths"
+    );
+    let root_end = second
+        .computed_result()
+        .result()
+        .end_summaries()
+        .iter()
+        .find(|summary| summary.entry().procedure() == &caller_two_handle)
+        .expect("second caller has a query-local end summary");
+    let root_quality = root_end
+        .path_qualities()
+        .iter()
+        .next()
+        .expect("root end summary retains a path quality");
+    let root_witness = second
+        .computed_result()
+        .result()
+        .witness_for_end_summary(
+            root_end,
+            root_quality,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("caller-local witness survives helper reuse");
+    assert!(!root_witness.steps().is_empty());
+    assert!(root_witness.truncated());
+    assert!(!root_witness.retention_truncated());
+    assert!(root_witness.omitted_steps_lower_bound() > 0);
+
+    let changed_helper = reusable_semantic_summary_with_behavior_for(
+        &helper_handle,
+        SummaryBehaviorKey::hash_bytes(b"changed-protocol-call-semantics"),
+    );
+    let changed_caller_two =
+        reusable_semantic_summary_with_dependencies_for(&caller_two_handle, &[&changed_helper]);
+    let changed_semantics =
+        ProtocolSemanticSummarySet::try_new(vec![&changed_helper, &changed_caller_two]).unwrap();
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let invalidated = solve_typestate_with_reusable_summaries(
+        &caller_two_handle,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings_with_unrelated_caller_subject,
+        &changed_semantics,
+        &mut repository,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap();
+    assert!(
+        !invalidated.was_reused(),
+        "changed semantic-summary behavior must miss the old helper artifact"
+    );
+}
+
+#[test]
+fn direct_recursive_protocol_summary_projects_and_reuses_after_atomic_publication() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("src/direct_recursive.go", SUMMARY_RECURSIVE_HELPER_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/direct_recursive.go");
+    let helper = procedure_handle_named(&graph, "helper");
+    let caller_one = procedure_handle_named(&graph, "callerOne");
+    let caller_two = procedure_handle_named(&graph, "callerTwo");
+    let recursive =
+        reusable_recursive_semantic_summaries_for(std::slice::from_ref(&helper), &[(0, 0)]);
+    let caller_one_semantic =
+        reusable_semantic_summary_with_dependencies_for(&caller_one, &[&recursive[0]]);
+    let caller_two_semantic =
+        reusable_semantic_summary_with_dependencies_for(&caller_two, &[&recursive[0]]);
+    let semantic_summaries = ProtocolSemanticSummarySet::try_new(vec![
+        &recursive[0],
+        &caller_one_semantic,
+        &caller_two_semantic,
+    ])
+    .unwrap();
+    let protocol = exit_protocol();
+    let bindings =
+        TypestateBindingPlan::try_new(&protocol, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+    let mut repository = CompleteProtocolSummaryRepository::default();
+    let solve = |root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+                 repository: &mut CompleteProtocolSummaryRepository| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_reusable_summaries(
+            root,
+            &[],
+            &analyzer.icfg_provider(),
+            &protocol,
+            &bindings,
+            &semantic_summaries,
+            repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .unwrap()
+    };
+    let first = solve(&caller_one, &mut repository);
+    assert!(!first.was_reused());
+    assert!(
+        first.published_summaries() == 1,
+        "status={:?} published={} entries={} bindings={} complete={} termination={:?} coverage={:?}",
+        first.cache_status(),
+        first.published_summaries(),
+        repository.len(),
+        first.computed_result().bindings_summary_complete(),
+        first.computed_result().result().is_complete(),
+        first.computed_result().result().termination(),
+        first.computed_result().result().coverage()
+    );
+    assert_eq!(
+        first.computed_result().result().termination(),
+        SolverTermination::FixedPoint
+    );
+    let second = solve(&caller_two, &mut repository);
+    assert!(second.was_reused());
+    assert_eq!(
+        second.computed_result().result().termination(),
+        SolverTermination::FixedPoint
+    );
+    assert_eq!(
+        first.computed_result().result().facts(),
+        second.computed_result().result().facts()
+    );
+    assert_eq!(repository.len(), 1);
+}
+
+#[test]
+fn mutual_recursive_protocol_summaries_project_and_reuse_atomically() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("src/mutual_recursive.go", MUTUAL_RECURSIVE_HELPER_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/mutual_recursive.go");
+    let even = procedure_handle_named(&graph, "even");
+    let odd = procedure_handle_named(&graph, "odd");
+    let caller_one = procedure_handle_named(&graph, "callerOne");
+    let caller_two = procedure_handle_named(&graph, "callerTwo");
+    let recursive =
+        reusable_recursive_semantic_summaries_for(&[even.clone(), odd.clone()], &[(0, 1), (1, 0)]);
+    let caller_one_semantic =
+        reusable_semantic_summary_with_dependencies_for(&caller_one, &[&recursive[0]]);
+    let caller_two_semantic =
+        reusable_semantic_summary_with_dependencies_for(&caller_two, &[&recursive[0]]);
+    let semantic_summaries = ProtocolSemanticSummarySet::try_new(vec![
+        &recursive[0],
+        &recursive[1],
+        &caller_one_semantic,
+        &caller_two_semantic,
+    ])
+    .unwrap();
+    let protocol = exit_protocol();
+    let exact = TypestateBindingQuality::proven_unique();
+    let even_object = AbstractObject::new(
+        AccessPathRoot::ProcedurePort(ProcedurePortHandle::normal_return(even.clone())),
+        ObjectCardinality::Singleton,
+    )
+    .unwrap();
+    let odd_object = AbstractObject::new(
+        AccessPathRoot::ProcedurePort(ProcedurePortHandle::normal_return(odd.clone())),
+        ObjectCardinality::Singleton,
+    )
+    .unwrap();
+    let even_class = TypestateSubjectClassKey::new("even-state").unwrap();
+    let odd_class = TypestateSubjectClassKey::new("odd-state").unwrap();
+    let even_subject = TypestateSubjectKey::for_object(even_class.clone(), &even_object);
+    let odd_subject = TypestateSubjectKey::for_object(odd_class.clone(), &odd_object);
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![
+            BoundTypestateSubjectSpec::new(even_class, even_object, exact.clone()),
+            BoundTypestateSubjectSpec::new(odd_class, odd_object, exact.clone()),
+        ],
+        vec![
+            TypestateInitialSeedSpec::new(
+                even_subject,
+                ProtocolStateKey::new("open").unwrap(),
+                TypestateObservationSite::program_point(
+                    even.point_handle(even.semantics().entry_point()).unwrap(),
+                    TypestateBindingContext::root(),
+                ),
+                TypestateObjectRole::CurrentObject,
+                exact.clone(),
+            ),
+            TypestateInitialSeedSpec::new(
+                odd_subject,
+                ProtocolStateKey::new("open").unwrap(),
+                TypestateObservationSite::program_point(
+                    odd.point_handle(odd.semantics().entry_point()).unwrap(),
+                    TypestateBindingContext::root(),
+                ),
+                TypestateObjectRole::CurrentObject,
+                exact,
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_ne!(
+        bindings.summary_hash_for(
+            even.artifact().key(),
+            even.semantics().locator().declaration(),
+        ),
+        bindings.summary_hash_for(
+            odd.artifact().key(),
+            odd.semantics().locator().declaration(),
+        ),
+        "the SCC fixture must exercise distinct member-local binding contracts"
+    );
+    let mut repository = CompleteProtocolSummaryRepository::default();
+    let solve = |root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+                 repository: &mut CompleteProtocolSummaryRepository| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_reusable_summaries(
+            root,
+            &[],
+            &analyzer.icfg_provider(),
+            &protocol,
+            &bindings,
+            &semantic_summaries,
+            repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .unwrap()
+    };
+    let first = solve(&caller_one, &mut repository);
+    assert!(!first.was_reused());
+    assert!(
+        first.published_summaries() == 2,
+        "status={:?} published={} entries={}",
+        first.cache_status(),
+        first.published_summaries(),
+        repository.len()
+    );
+    let entries_after_first = repository.len();
+    assert_eq!(entries_after_first, 2);
+    let second = solve(&caller_two, &mut repository);
+    assert!(second.was_reused());
+    assert_eq!(
+        second.computed_result().result().termination(),
+        SolverTermination::FixedPoint
+    );
+    assert_eq!(repository.len(), entries_after_first);
+}
+
+#[test]
+fn protocol_summary_key_misses_when_binding_semantics_change() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let first = complete_java_fixture(&project, &analyzer, false);
+    let changed = complete_java_fixture(&project, &analyzer, true);
+    assert_ne!(
+        reusable_protocol_key(&first),
+        reusable_protocol_key(&changed)
+    );
+
+    let mut repository = CompleteProtocolSummaryRepository::default();
+    let first_result = reusable_solve(&first, &analyzer, &mut repository).unwrap();
+    let changed_result = reusable_solve(&changed, &analyzer, &mut repository).unwrap();
+    assert!(!first_result.was_reused());
+    assert!(!changed_result.was_reused());
+    assert_eq!(repository.len(), 2);
+}
+
+#[test]
+fn protocol_summary_requires_the_exact_entry_fact_manifest() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let key = reusable_protocol_key(&fixture);
+    let mut repository = CompleteProtocolSummaryRepository::default();
+    reusable_solve(&fixture, &analyzer, &mut repository).unwrap();
+    let summary = repository.get(&key).expect("root summary was published");
+    let semantic = reusable_semantic_summary(&fixture);
+    let semantic_summaries = ProtocolSemanticSummarySet::try_new(vec![&semantic]).unwrap();
+    let problem = TypestateFlowProblem::try_new(&fixture.protocol, &fixture.bindings).unwrap();
+    let explicit_open = problem
+        .state_fact(
+            &fixture.subject_key,
+            &ProtocolStateKey::new("open").unwrap(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        summary.apply(
+            &[explicit_open],
+            &fixture.protocol,
+            &fixture.bindings,
+            &semantic_summaries,
+        ),
+        Err(ProtocolSummaryError::EntryFactCoverageMismatch)
+    ));
+
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let expanded_manifest = solve_typestate_with_reusable_summaries(
+        &fixture.root,
+        &[explicit_open],
+        &analyzer.icfg_provider(),
+        &fixture.protocol,
+        &fixture.bindings,
+        &semantic_summaries,
+        &mut repository,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("an overlapping optional-cache manifest cannot fail the analysis");
+    assert!(expanded_manifest.computed_result().is_complete());
+}
+
+#[test]
+fn protocol_and_repository_limits_fail_closed_for_reuse_but_not_analysis() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let mut repository =
+        CompleteProtocolSummaryRepository::with_limits(ProtocolSummaryRepositoryLimits {
+            max_entries: 0,
+            max_bytes: usize::MAX,
+        });
+    let result = reusable_solve(&fixture, &analyzer, &mut repository).unwrap();
+    assert!(result.computed_result().is_complete());
+    assert_eq!(
+        result.cache_status(),
+        ProtocolSummaryCacheStatus::CapacityExceeded
+    );
+    assert!(repository.is_empty());
+
+    let mut changed_spec =
+        observable_lifecycle_spec_with_incomplete_analysis(ProtocolUncertaintyBehavior::Abstain);
+    changed_spec.semantics.analysis_mode = ProtocolAnalysisMode::Must;
+    let changed_protocol = changed_spec.compile().unwrap();
+    let key = reusable_protocol_key(&fixture);
+    let mut normal_repository = CompleteProtocolSummaryRepository::default();
+    reusable_solve(&fixture, &analyzer, &mut normal_repository).unwrap();
+    let summary = normal_repository.get(&key).unwrap();
+    let semantic = reusable_semantic_summary(&fixture);
+    let semantic_summaries = ProtocolSemanticSummarySet::try_new(vec![&semantic]).unwrap();
+    assert!(matches!(
+        summary.apply(
+            &[],
+            &changed_protocol,
+            &fixture.bindings,
+            &semantic_summaries,
+        ),
+        Err(ProtocolSummaryError::KeyProtocolMismatch)
+    ));
+}
+
+#[test]
+fn modeled_uncertainty_remains_publishable_and_canonical() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let ambiguous = TypestateBindingQuality::new(
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 2).unwrap(),
+    );
+    let fixture = complete_java_fixture_with_close_quality(&project, &analyzer, false, ambiguous);
+    let mut repository = CompleteProtocolSummaryRepository::default();
+    let result = reusable_solve(&fixture, &analyzer, &mut repository).unwrap();
+
+    assert!(!result.computed_result().is_complete());
+    assert!(result.computed_result().is_summary_publication_complete());
+    assert_eq!(result.cache_status(), ProtocolSummaryCacheStatus::Published);
+    assert_eq!(repository.len(), 1);
+    assert!(result.application().is_some_and(|application| {
+        application
+            .effects()
+            .iter()
+            .any(|effect| match effect.stable_fact() {
+                ProtocolFactKey::State { uncertainty, .. } => !uncertainty.values().is_empty(),
+                _ => false,
+            })
+    }));
+}
+
+#[test]
+fn incomplete_bindings_never_publish_a_protocol_summary() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let partial = TypestateBindingQuality::new(
+        ProofStatus::Proven,
+        EvidenceCompleteness::Partial("fixture binding is incomplete".into()),
+        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1).unwrap(),
+    );
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        partial,
+        TypestateBindingQuality::proven_unique(),
+        false,
+        false,
+    );
+    let mut repository = CompleteProtocolSummaryRepository::default();
+
+    let result = reusable_solve(&fixture, &analyzer, &mut repository)
+        .expect("incomplete analysis remains a valid uncached result");
+    assert!(!result.was_reused());
+    assert!(!result.computed_result().is_complete());
+    assert!(result.application().is_none());
+    assert!(repository.is_empty());
 }
 
 #[test]

@@ -41,6 +41,7 @@ pub use problem::{
 };
 pub use quality::{PathQuality, PathQualityFrontier};
 pub use result::{DataflowCoverage, DataflowResult, ReachedFact, SolverTermination};
+pub(crate) use reusable_summary::validate_recursive_summary_batch;
 pub use reusable_summary::{
     CompleteSummaryRepository, DEFAULT_SUMMARY_REPOSITORY_BYTES,
     DEFAULT_SUMMARY_REPOSITORY_ENTRIES, ExternalSummaryContentHash, ExternalSummaryModelId,
@@ -58,7 +59,10 @@ pub use reusable_summary::{
     SummaryRecursiveGroupFingerprint, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
     SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, SummaryValidationError,
 };
-pub use summary::{SummarySolveInput, solve_with_summaries};
+pub use summary::{
+    ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
+    SummarySolveInput, solve_with_reusable_end_summaries, solve_with_summaries,
+};
 pub use summary_result::{
     SummaryBoundary, SummaryBoundaryKind, SummaryCoverage, SummaryDataflowError,
     SummaryDataflowResult, SummaryEdge, SummaryEntry, SummaryMetrics, SummaryReachedFact,

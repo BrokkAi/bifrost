@@ -467,6 +467,12 @@ pub struct SummaryMetrics {
     pub summary_applications: usize,
     /// Incoming relations that reused an existing callee entry context.
     pub reused_entry_contexts: usize,
+    /// Exact callee entry contexts served by a cross-query reusable artifact.
+    pub reusable_summary_hits: usize,
+    /// Callee entry contexts for which the cross-query oracle had no artifact.
+    pub reusable_summary_misses: usize,
+    /// Query-visible internal observations restored from reusable artifacts.
+    pub reusable_observations: usize,
 }
 
 /// Deterministic typed result of one query-local summary solve.

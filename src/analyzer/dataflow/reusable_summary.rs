@@ -410,6 +410,11 @@ impl ProcedureSummaryKey {
         }
         StableDigest::sha256(bytes)
     }
+
+    /// Conservative retained size of this owned key, including heap-backed identity fields.
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(procedure_key_heap_bytes(self))
+    }
 }
 
 /// Compact recursive group identity shared by every member summary.
@@ -1409,79 +1414,10 @@ impl CompleteSummaryRepository {
         &mut self,
         summaries: Vec<SemanticProcedureSummary>,
     ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
-        if summaries.is_empty() {
-            return Err(SummaryPublicationError::EmptyScc);
-        }
-        if summaries.len() > MAX_SUMMARY_RECURSIVE_MEMBERS {
-            return Err(SummaryPublicationError::TooManySccMembers {
-                actual: summaries.len(),
-                limit: MAX_SUMMARY_RECURSIVE_MEMBERS,
-            });
-        }
+        let summary_refs = summaries.iter().collect::<Vec<_>>();
+        let validated = validate_recursive_summary_batch(&summary_refs)?;
         for summary in &summaries {
-            validate_publishable(summary)?;
-        }
-        let batch_dependencies = summaries.iter().fold(0_usize, |total, summary| {
-            total.saturating_add(summary.dependencies.len())
-        });
-        if batch_dependencies > MAX_SUMMARY_DEPENDENCIES {
-            return Err(SummaryPublicationError::TooManySccDependencies {
-                actual: batch_dependencies,
-                limit: MAX_SUMMARY_DEPENDENCIES,
-            });
-        }
-
-        let mut batch_keys: Vec<_> = summaries.iter().map(|row| row.key.clone()).collect();
-        batch_keys.sort_unstable();
-        let original_len = batch_keys.len();
-        batch_keys.dedup();
-        if batch_keys.len() != original_len {
-            return Err(SummaryPublicationError::DuplicateSccMember);
-        }
-        let mut batch_identities: Vec<_> = summaries
-            .iter()
-            .map(|summary| summary.key.identity().clone())
-            .collect();
-        batch_identities.sort_unstable();
-        batch_identities.dedup();
-        if batch_identities.len() != summaries.len() {
-            return Err(SummaryPublicationError::DuplicateSccIdentity);
-        }
-        let mut external_dependencies = Vec::new();
-        let mut recursive_edges = Vec::new();
-        for summary in &summaries {
-            recursive_edges.extend_from_slice(summary.recursive_topology());
-            for dependency in &summary.dependencies {
-                match dependency {
-                    SummaryDependencyKey::Complete(key) => {
-                        if batch_identities.binary_search(key.identity()).is_ok() {
-                            return Err(SummaryPublicationError::InternalDependencyMustBeRecursive);
-                        }
-                        external_dependencies.push((**key).clone());
-                    }
-                    SummaryDependencyKey::Recursive(_) => {}
-                }
-            }
-        }
-        external_dependencies.sort_unstable();
-        external_dependencies.dedup();
-        recursive_edges.sort_unstable();
-        recursive_edges.dedup();
-        let expected = SummaryRecursiveGroupKey::from_closure(
-            &batch_identities,
-            &recursive_edges,
-            &external_dependencies,
-        )
-        .map_err(SummaryPublicationError::InvalidSummary)?;
-        if summaries
-            .iter()
-            .any(|summary| summary.recursive_group() != Some(expected))
-        {
-            return Err(SummaryPublicationError::SccMembershipMismatch);
-        }
-        validate_recursive_topology(&summaries, &batch_identities, &recursive_edges)?;
-        for summary in &summaries {
-            self.validate_dependencies(summary, &batch_identities)?;
+            self.validate_dependencies(summary, &validated.identities)?;
         }
 
         let mut inserted = false;
@@ -2328,8 +2264,93 @@ fn push_digest_part(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
+pub(crate) struct ValidatedRecursiveSummaryBatch {
+    pub(crate) group: SummaryRecursiveGroupKey,
+    identities: Vec<ProcedureSummaryIdentity>,
+}
+
+pub(crate) fn validate_recursive_summary_batch(
+    summaries: &[&SemanticProcedureSummary],
+) -> Result<ValidatedRecursiveSummaryBatch, SummaryPublicationError> {
+    if summaries.is_empty() {
+        return Err(SummaryPublicationError::EmptyScc);
+    }
+    if summaries.len() > MAX_SUMMARY_RECURSIVE_MEMBERS {
+        return Err(SummaryPublicationError::TooManySccMembers {
+            actual: summaries.len(),
+            limit: MAX_SUMMARY_RECURSIVE_MEMBERS,
+        });
+    }
+    for summary in summaries {
+        validate_publishable(summary)?;
+    }
+    let batch_dependencies = summaries.iter().fold(0_usize, |total, summary| {
+        total.saturating_add(summary.dependencies.len())
+    });
+    if batch_dependencies > MAX_SUMMARY_DEPENDENCIES {
+        return Err(SummaryPublicationError::TooManySccDependencies {
+            actual: batch_dependencies,
+            limit: MAX_SUMMARY_DEPENDENCIES,
+        });
+    }
+
+    let mut batch_keys = summaries
+        .iter()
+        .map(|summary| summary.key.clone())
+        .collect::<Vec<_>>();
+    batch_keys.sort_unstable();
+    let original_len = batch_keys.len();
+    batch_keys.dedup();
+    if batch_keys.len() != original_len {
+        return Err(SummaryPublicationError::DuplicateSccMember);
+    }
+    let mut identities = summaries
+        .iter()
+        .map(|summary| summary.key.identity().clone())
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    identities.dedup();
+    if identities.len() != summaries.len() {
+        return Err(SummaryPublicationError::DuplicateSccIdentity);
+    }
+    let mut external_dependencies = Vec::new();
+    let mut recursive_edges = Vec::new();
+    for summary in summaries {
+        recursive_edges.extend_from_slice(summary.recursive_topology());
+        for dependency in &summary.dependencies {
+            match dependency {
+                SummaryDependencyKey::Complete(key) => {
+                    if identities.binary_search(key.identity()).is_ok() {
+                        return Err(SummaryPublicationError::InternalDependencyMustBeRecursive);
+                    }
+                    external_dependencies.push((**key).clone());
+                }
+                SummaryDependencyKey::Recursive(_) => {}
+            }
+        }
+    }
+    external_dependencies.sort_unstable();
+    external_dependencies.dedup();
+    recursive_edges.sort_unstable();
+    recursive_edges.dedup();
+    let group = SummaryRecursiveGroupKey::from_closure(
+        &identities,
+        &recursive_edges,
+        &external_dependencies,
+    )
+    .map_err(SummaryPublicationError::InvalidSummary)?;
+    if summaries
+        .iter()
+        .any(|summary| summary.recursive_group() != Some(group))
+    {
+        return Err(SummaryPublicationError::SccMembershipMismatch);
+    }
+    validate_recursive_topology(summaries, &identities, &recursive_edges)?;
+    Ok(ValidatedRecursiveSummaryBatch { group, identities })
+}
+
 fn validate_recursive_topology(
-    summaries: &[SemanticProcedureSummary],
+    summaries: &[&SemanticProcedureSummary],
     identities: &[ProcedureSummaryIdentity],
     recursive_edges: &[SummaryRecursiveEdge],
 ) -> Result<(), SummaryPublicationError> {

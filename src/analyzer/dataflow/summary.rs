@@ -33,6 +33,60 @@ type CachedExitOutcome = Arc<SemanticOutcome<Arc<IcfgExitProfile>>>;
 type ExitCacheKey = (ProcedureHandle, ProgramPointId, ProgramPointId);
 type ProviderCacheLookup<T> = Result<(T, bool), SolverTermination>;
 
+/// One validated reusable entry-to-exit relation remapped into live facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableEndSummary<Fact> {
+    pub exit_kind: crate::analyzer::semantic::ReturnTransferKind,
+    pub exit_fact: Fact,
+    pub qualities: Box<[PathQuality]>,
+}
+
+/// One query-visible internal observation retained by a reusable summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableReachedFact<Fact> {
+    pub point: ProgramPointHandle,
+    pub fact: Fact,
+    pub qualities: Box<[PathQuality]>,
+}
+
+/// Complete reusable relation for one exact callee entry fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableProcedureSummary<Fact> {
+    pub exits: Box<[ReusableEndSummary<Fact>]>,
+    pub reached: Box<[ReusableReachedFact<Fact>]>,
+}
+
+/// Optional cross-query summary oracle used by the query-local tabulator.
+///
+/// A provider must reserve the callback/output work needed to materialize a
+/// returned summary through `request` before allocating its returned rows.
+/// Cancellation, exhausted work, or invalid cache state must fail closed. The
+/// returned relation must be context-independent for the exact procedure and
+/// entry fact: query-local tabulation intentionally deduplicates entries by
+/// that identity. Context-sensitive clients must decline reuse until their
+/// context is represented in a future solver-level entry key.
+pub trait ReusableSummaryProvider<Fact> {
+    fn summary_for(
+        &mut self,
+        procedure: &ProcedureHandle,
+        entry_fact: Fact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination>;
+}
+
+struct NoReusableSummaries;
+
+impl<Fact> ReusableSummaryProvider<Fact> for NoReusableSummaries {
+    fn summary_for(
+        &mut self,
+        _procedure: &ProcedureHandle,
+        _entry_fact: Fact,
+        _request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination> {
+        Ok(None)
+    }
+}
+
 /// One root procedure and its explicit entry facts for a summary solve.
 ///
 /// The root's declared entry point is implicit. The distinguished zero fact is
@@ -162,6 +216,13 @@ enum PathWitnessSource<'edge> {
         return_edge: &'edge SummaryEdge,
         input_fact: FactId,
     },
+    ReusableSummaryApplication {
+        incoming: WitnessEvidenceId,
+        incoming_quality: PathQuality,
+        summary_quality: PathQuality,
+        return_edge: &'edge SummaryEdge,
+        input_fact: FactId,
+    },
 }
 
 impl PathWitnessSource<'_> {
@@ -177,6 +238,12 @@ impl PathWitnessSource<'_> {
                 summary_quality,
                 return_edge,
                 ..
+            }
+            | Self::ReusableSummaryApplication {
+                incoming_quality,
+                summary_quality,
+                return_edge,
+                ..
             } => incoming_quality
                 .conjoin(*summary_quality)
                 .through_evidence(return_edge.proof(), return_edge.completeness()),
@@ -188,6 +255,9 @@ impl PathWitnessSource<'_> {
             Self::Edge { edge, .. } => WitnessEvidenceNode::edge_retained_bytes(edge),
             Self::SummaryApplication { return_edge, .. } => {
                 WitnessEvidenceNode::summary_application_retained_bytes(return_edge)
+            }
+            Self::ReusableSummaryApplication { return_edge, .. } => {
+                WitnessEvidenceNode::reusable_summary_application_retained_bytes(return_edge)
             }
         }
     }
@@ -222,6 +292,20 @@ impl PathWitnessSource<'_> {
                 *input_fact,
                 output_fact,
             ),
+            Self::ReusableSummaryApplication {
+                incoming,
+                incoming_quality,
+                summary_quality,
+                return_edge,
+                input_fact,
+            } => WitnessEvidenceNode::reusable_summary_application(
+                *incoming,
+                *incoming_quality,
+                *summary_quality,
+                return_edge,
+                *input_fact,
+                output_fact,
+            ),
         }
     }
 
@@ -250,6 +334,20 @@ impl PathWitnessSource<'_> {
                 *incoming,
                 *incoming_quality,
                 *summary,
+                *summary_quality,
+                return_edge,
+                *input_fact,
+                output_fact,
+            ),
+            Self::ReusableSummaryApplication {
+                incoming,
+                incoming_quality,
+                summary_quality,
+                return_edge,
+                input_fact,
+            } => existing.matches_reusable_summary_application_derivation(
+                *incoming,
+                *incoming_quality,
                 *summary_quality,
                 return_edge,
                 *input_fact,
@@ -294,6 +392,7 @@ struct SummaryState<Fact> {
     incoming: Vec<IncomingCall>,
     incoming_ids: HashMap<IncomingKey, usize>,
     incoming_by_entry: HashMap<EntryKey, Vec<usize>>,
+    reusable_entries: HashSet<EntryKey>,
     call_cache: HashMap<CallSiteHandle, CachedCallOutcome>,
     exit_cache: HashMap<ExitCacheKey, CachedExitOutcome>,
     call_to_return_cache: HashMap<CallSiteHandle, Arc<[ProcedureIcfgEdge]>>,
@@ -329,6 +428,7 @@ where
             incoming: Vec::new(),
             incoming_ids: HashMap::default(),
             incoming_by_entry: HashMap::default(),
+            reusable_entries: HashSet::default(),
             call_cache: HashMap::default(),
             exit_cache: HashMap::default(),
             call_to_return_cache: HashMap::default(),
@@ -358,6 +458,11 @@ where
         for summary in &mut self.summaries {
             summary.witnesses = WitnessAlternatives::default();
         }
+    }
+
+    fn mark_reusable_witnesses_omitted(&mut self) {
+        debug_assert!(self.best_effort_witness_retention);
+        self.witness_retention_truncated = true;
     }
 
     fn reserve_publication(
@@ -953,9 +1058,10 @@ where
         Ok(Ok((outcome, true)))
     }
 
-    fn propagate<P, Provider>(
+    fn propagate<P, Provider, Reusable>(
         &mut self,
         provider: &Provider,
+        reusable: &mut Reusable,
         problem: &P,
         semantic_budget: &mut SemanticBudget,
         request: &mut DataflowRequest<'_>,
@@ -963,10 +1069,16 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
         Provider: IcfgProvider + ?Sized,
+        Reusable: ReusableSummaryProvider<Fact> + ?Sized,
     {
         while let Some(queued) = self.worklist.pop_front() {
             if request.cancellation.is_cancelled() {
                 return Ok(SolverTermination::Cancelled);
+            }
+            if queued.key.point == queued.key.entry.entry_point
+                && self.reusable_entries.contains(&queued.key.entry)
+            {
+                continue;
             }
             let frontier = *self
                 .reached
@@ -1012,6 +1124,7 @@ where
             if let Some(call) = crate::analyzer::semantic::icfg::invoked_call_at(&point)? {
                 if let Some(termination) = self.process_call(
                     provider,
+                    reusable,
                     problem,
                     &point,
                     call,
@@ -1082,9 +1195,10 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn process_call<P, Provider>(
+    fn process_call<P, Provider, Reusable>(
         &mut self,
         provider: &Provider,
+        reusable: &mut Reusable,
         problem: &P,
         point: &ProgramPointHandle,
         call: crate::analyzer::semantic::CallSiteId,
@@ -1096,6 +1210,7 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
         Provider: IcfgProvider + ?Sized,
+        Reusable: ReusableSummaryProvider<Fact> + ?Sized,
     {
         let caller = point.procedure();
         let semantic_call = caller.semantics().call_site(call).ok_or_else(|| {
@@ -1243,6 +1358,17 @@ where
                 )? {
                     return Ok(Some(termination));
                 }
+                if let Some(termination) = self.apply_reusable_callee_summaries(
+                    provider,
+                    reusable,
+                    problem,
+                    transfer,
+                    &outputs,
+                    semantic_budget,
+                    request,
+                )? {
+                    return Ok(Some(termination));
+                }
             }
         }
 
@@ -1360,6 +1486,186 @@ where
             witness_source,
             request,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_reusable_callee_summaries<P, Provider, Reusable>(
+        &mut self,
+        provider: &Provider,
+        reusable: &mut Reusable,
+        problem: &P,
+        transfer: &CallTransfer,
+        entry_facts: &[Fact],
+        semantic_budget: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, SummaryDataflowError>
+    where
+        P: DistributiveDataflowProblem<Fact = Fact>,
+        Provider: IcfgProvider + ?Sized,
+        Reusable: ReusableSummaryProvider<Fact> + ?Sized,
+    {
+        for &entry_fact in entry_facts {
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
+            let procedure = self
+                .procedure_ids
+                .get(&transfer.callee)
+                .copied()
+                .ok_or_else(|| {
+                    SemanticProviderError::internal(
+                        "reusable callee was not interned after call publication",
+                    )
+                })?;
+            let entry_fact_id = self.fact_ids.get(&entry_fact).copied().ok_or_else(|| {
+                SemanticProviderError::internal(
+                    "reusable callee entry fact was not interned after call publication",
+                )
+            })?;
+            let entry = EntryKey {
+                procedure,
+                entry_point: transfer.callee_entry.id(),
+                entry_fact: entry_fact_id,
+            };
+            if self.reusable_entries.contains(&entry) {
+                continue;
+            }
+            if self.witness_arena.is_enabled() && !self.best_effort_witness_retention {
+                self.metrics.reusable_summary_misses =
+                    self.metrics.reusable_summary_misses.saturating_add(1);
+                continue;
+            }
+            let summary = match reusable.summary_for(&transfer.callee, entry_fact, request) {
+                Ok(Some(summary)) => summary,
+                Ok(None) => {
+                    self.metrics.reusable_summary_misses =
+                        self.metrics.reusable_summary_misses.saturating_add(1);
+                    continue;
+                }
+                Err(termination) => return Ok(Some(termination)),
+            };
+            if summary.exits.iter().any(|row| row.qualities.is_empty())
+                || summary.reached.iter().any(|row| {
+                    row.qualities.is_empty() || row.point.procedure() != &transfer.callee
+                })
+            {
+                self.metrics.reusable_summary_misses =
+                    self.metrics.reusable_summary_misses.saturating_add(1);
+                continue;
+            }
+            if self.witness_arena.is_enabled() {
+                self.mark_reusable_witnesses_omitted();
+            }
+
+            let mut facts = summary
+                .exits
+                .iter()
+                .map(|row| row.exit_fact)
+                .chain(summary.reached.iter().map(|row| row.fact))
+                .collect::<Vec<_>>();
+            facts.sort_unstable();
+            facts.dedup();
+            let Some(staged) = self.stage_facts(&facts, request)? else {
+                return Ok(Some(SolverTermination::Cancelled));
+            };
+            let staged_ids = facts
+                .iter()
+                .copied()
+                .zip(staged.ids.iter().copied())
+                .collect::<HashMap<_, _>>();
+            let new_reached_states = summary
+                .reached
+                .iter()
+                .filter(|row| {
+                    !self.reached.contains_key(&PathEdgeKey {
+                        entry,
+                        point: row.point.id(),
+                        fact: staged_ids[&row.fact],
+                    })
+                })
+                .count();
+            if let Some(termination) = self.reserve_publication(
+                SolverWork {
+                    interned_facts: staged.new_facts.len(),
+                    reached_states: new_reached_states,
+                    ..SolverWork::default()
+                },
+                0,
+                request,
+            ) {
+                return Ok(Some(termination));
+            }
+            self.commit_facts(staged.new_facts);
+            self.reusable_entries.insert(entry);
+            self.metrics.reusable_summary_hits =
+                self.metrics.reusable_summary_hits.saturating_add(1);
+
+            for row in summary.reached {
+                let fact = self.fact_ids[&row.fact];
+                let path = PathEdgeKey {
+                    entry,
+                    point: row.point.id(),
+                    fact,
+                };
+                let frontier = self.reached.entry(path).or_default();
+                for quality in row.qualities {
+                    frontier.insert(quality);
+                }
+                self.metrics.reusable_observations =
+                    self.metrics.reusable_observations.saturating_add(1);
+            }
+
+            for row in summary.exits {
+                let exit_point = match row.exit_kind {
+                    crate::analyzer::semantic::ReturnTransferKind::Normal => {
+                        transfer.callee.semantics().normal_exit_point()
+                    }
+                    crate::analyzer::semantic::ReturnTransferKind::Exceptional => {
+                        transfer.callee.semantics().exceptional_exit_point()
+                    }
+                };
+                let exit_point = transfer.callee.point_handle(exit_point).ok_or_else(|| {
+                    SemanticProviderError::internal("reusable callee exit point is stale")
+                })?;
+                let (outcome, newly_materialized) = match self.cached_exit_profile(
+                    provider,
+                    &transfer.callee_entry,
+                    &exit_point,
+                    semantic_budget,
+                    request,
+                )? {
+                    Ok(outcome) => outcome,
+                    Err(termination) => return Ok(Some(termination)),
+                };
+                if newly_materialized
+                    && let Some(termination) =
+                        self.observe_semantic_outcome(&exit_point, None, outcome.as_ref(), request)
+                {
+                    return Ok(Some(termination));
+                }
+                let Some(exit) = outcome.available_value().cloned() else {
+                    continue;
+                };
+                let path = PathEdgeKey {
+                    entry,
+                    point: exit_point.id(),
+                    fact: self.fact_ids[&row.exit_fact],
+                };
+                for quality in row.qualities {
+                    if let Some(termination) = self.publish_end_summary(
+                        path,
+                        Arc::clone(&exit),
+                        quality,
+                        None,
+                        problem,
+                        request,
+                    )? {
+                        return Ok(Some(termination));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1792,7 +2098,8 @@ where
         let mut staged_witness_bytes = 0usize;
         let mut activated_evidence = None;
         let mut witness_exhausted = false;
-        if self.witness_arena.is_enabled() && qualities.contains(quality) {
+        let reusable_entry = self.reusable_entries.contains(&path.entry);
+        if self.witness_arena.is_enabled() && qualities.contains(quality) && !reusable_entry {
             let predecessor =
                 predecessor_evidence.ok_or(SummaryDataflowError::WitnessInvariant(
                     "enabled end-summary publication has no predecessor evidence",
@@ -1847,6 +2154,7 @@ where
         }
         if frontier_changed
             && self.witness_arena.is_enabled()
+            && !reusable_entry
             && activated_evidence.is_none()
             && !witness_exhausted
         {
@@ -1919,9 +2227,9 @@ where
             let qualities = self.incoming[incoming_id].qualities;
             for incoming_quality in qualities.iter() {
                 if self.witness_arena.is_enabled() {
-                    let Some(summary_evidence) = activated_evidence else {
+                    if activated_evidence.is_none() && !reusable_entry {
                         continue;
-                    };
+                    }
                     let incoming_evidence = self.incoming[incoming_id]
                         .witnesses
                         .ids(incoming_quality)
@@ -1933,7 +2241,7 @@ where
                             incoming_quality,
                             Some(incoming_evidence),
                             quality,
-                            Some(summary_evidence),
+                            activated_evidence,
                             problem,
                             request,
                         )? {
@@ -2014,6 +2322,21 @@ where
                         .witnesses
                         .ids(summary_quality)
                         .to_vec();
+                    if summary_evidence.is_empty()
+                        && self.reusable_entries.contains(&entry)
+                        && let Some(termination) = self.apply_summary(
+                            incoming,
+                            summary,
+                            incoming_quality,
+                            incoming_evidence,
+                            summary_quality,
+                            None,
+                            problem,
+                            request,
+                        )?
+                    {
+                        return Ok(Some(termination));
+                    }
                     for summary_evidence in summary_evidence {
                         if let Some(termination) = self.apply_summary(
                             incoming,
@@ -2129,16 +2452,20 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
+        let reusable_summary = self
+            .reusable_entries
+            .contains(&self.summaries[summary_id].key.entry);
         if self.witness_arena.is_enabled()
             && (incoming_evidence.is_none_or(|evidence| {
                 !self.incoming[incoming_id]
                     .witnesses
                     .contains(incoming_quality, evidence)
-            }) || summary_evidence.is_none_or(|evidence| {
-                !self.summaries[summary_id]
-                    .witnesses
-                    .contains(summary_quality, evidence)
-            }))
+            }) || (!reusable_summary
+                && summary_evidence.is_none_or(|evidence| {
+                    !self.summaries[summary_id]
+                        .witnesses
+                        .contains(summary_quality, evidence)
+                })))
         {
             return Err(SummaryDataflowError::WitnessInvariant(
                 "summary application evidence is not active",
@@ -2203,14 +2530,26 @@ where
                 self.metrics.summary_applications =
                     self.metrics.summary_applications.saturating_add(1);
                 let witness_source = if self.witness_arena.is_enabled() {
-                    Some(PathWitnessSource::SummaryApplication {
-                        incoming: incoming_evidence
-                            .expect("enabled incoming evidence was validated"),
-                        incoming_quality,
-                        summary: summary_evidence.expect("enabled summary evidence was validated"),
-                        summary_quality,
-                        return_edge: edge,
-                        input_fact: exit_fact,
+                    let incoming =
+                        incoming_evidence.expect("enabled incoming evidence was validated");
+                    Some(if reusable_summary {
+                        PathWitnessSource::ReusableSummaryApplication {
+                            incoming,
+                            incoming_quality,
+                            summary_quality,
+                            return_edge: edge,
+                            input_fact: exit_fact,
+                        }
+                    } else {
+                        PathWitnessSource::SummaryApplication {
+                            incoming,
+                            incoming_quality,
+                            summary: summary_evidence
+                                .expect("enabled summary evidence was validated"),
+                            summary_quality,
+                            return_edge: edge,
+                            input_fact: exit_fact,
+                        }
                     })
                 } else {
                     None
@@ -2352,13 +2691,38 @@ where
     P: DistributiveDataflowProblem,
     Provider: IcfgProvider + ?Sized,
 {
+    let mut reusable = NoReusableSummaries;
+    solve_with_reusable_end_summaries(
+        input,
+        provider,
+        problem,
+        &mut reusable,
+        semantic_budget,
+        request,
+    )
+}
+
+/// Solve with an optional validated cross-query callee-summary oracle.
+pub fn solve_with_reusable_end_summaries<P, Provider, Reusable>(
+    input: SummarySolveInput<'_, P::Fact>,
+    provider: &Provider,
+    problem: &P,
+    reusable: &mut Reusable,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<SummaryDataflowResult<P::Fact>, SummaryDataflowError>
+where
+    P: DistributiveDataflowProblem,
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<P::Fact> + ?Sized,
+{
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
     let mut state = SummaryState::new(problem.zero_fact(), input.witness_retention());
     let termination = if let Some(termination) = state.initialize(input, request)? {
         termination
     } else {
-        state.propagate(provider, problem, semantic_budget, request)?
+        state.propagate(provider, reusable, problem, semantic_budget, request)?
     };
     let work = request.budget.used().saturating_sub(initial_work);
     let semantic_work = semantic_budget.used().saturating_sub(initial_semantic_work);
