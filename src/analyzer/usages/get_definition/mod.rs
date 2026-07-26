@@ -1463,6 +1463,35 @@ fn gated_boundary(
     }
 }
 
+/// Workspace declarations sitting at *exactly* `fqn` but written in a language
+/// other than `own_language`.
+///
+/// Polyglot repositories address one declaration from two languages that share a
+/// fully-qualified namespace: Scala names Java types by their exact JVM fq, and
+/// pythonnet's Python tests name CLR types by their exact CLR fq
+/// (`Python.Test.ClassCtorTest2`).  A language-scoped resolver sees none of
+/// those declarations, so without this it cannot tell "not in the workspace"
+/// apart from "in the workspace, in another language" — and the confident
+/// boundary claim fires for a workspace-indexed target (#1174, same invariant as
+/// #1126/#1089).
+///
+/// Matching is exact-fq only, never normalized and never identifier-level, so a
+/// merely same-named declaration in another language can never be produced.
+fn cross_language_declarations(
+    support: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+    own_language: Language,
+) -> Vec<CodeUnit> {
+    let mut units = support
+        .fqn_in_any_language(fqn)
+        .into_iter()
+        .filter(|unit| unit.fq_name() == fqn && language_for_file(unit.source()) != own_language)
+        .collect::<Vec<_>>();
+    sort_units(&mut units);
+    units.dedup();
+    units
+}
+
 fn import_boundary_workspace_message(message: String) -> String {
     let message = message.replace(
         "outside this partial ",

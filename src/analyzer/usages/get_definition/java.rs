@@ -322,6 +322,14 @@ impl BoundedDefinitionLookup for JavaResolutionSession<'_> {
         self.query_rows(|| self.support.fqn_in_language(fqn, language))
     }
 
+    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.query_rows(|| self.support.fqn_in_any_language(fqn))
+    }
+
+    fn package_exists_in_any_language(&self, package: &str) -> bool {
+        self.bool_query(|| self.support.package_exists_in_any_language(package))
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         self.query_rows(|| self.support.file_identifier(file, ident))
     }

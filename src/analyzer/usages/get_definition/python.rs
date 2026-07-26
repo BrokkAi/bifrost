@@ -1411,9 +1411,16 @@ fn python_visible_module_binding_candidates(
                     } else {
                         format!("{module}.{imported_name}")
                     };
-                    candidates.extend(
-                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate)),
-                    );
+                    let mut resolved_candidates =
+                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate));
+                    if resolved_candidates.is_empty() {
+                        // No Python module backs the specifier because it names a
+                        // CLR/JVM namespace this workspace indexes in another
+                        // language (#1174) -- pythonnet's
+                        // `from Python.Test import ClassCtorTest2`.
+                        resolved_candidates = python_cross_language_declarations(support, &fqn);
+                    }
+                    candidates.extend(resolved_candidates);
                 }
             }
             ModuleBindingEventKind::ImportModule(module) => {
@@ -1838,6 +1845,14 @@ fn python_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
+    // pythonnet-style interop (#1174): `from Python.Test import ClassCtorTest2`
+    // names a CLR type whose C# declaration is indexed at exactly this fq. The
+    // Python index has nothing here, so the exact cross-language declaration is
+    // the honest answer rather than a boundary claim about a workspace type.
+    let cross_language = python_cross_language_declarations(support, fqn);
+    if !cross_language.is_empty() {
+        return candidates_outcome(cross_language);
+    }
     // `python_crosses_unindexed_boundary` is `!python_workspace_module_exists`,
     // so its negation is the workspace-internal gate.
     gated_boundary(
@@ -1850,6 +1865,14 @@ fn python_fqn_outcome(
     )
 }
 
+/// Declarations indexed at exactly `fqn` in a language other than Python.
+fn python_cross_language_declarations(
+    support: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+) -> Vec<CodeUnit> {
+    cross_language_declarations(support, fqn, Language::Python)
+}
+
 fn python_module_outcome(
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -1859,9 +1882,15 @@ fn python_module_outcome(
     if let Some(module) = py.resolve_module_code_unit(module_fq) {
         return candidates_outcome(vec![module]);
     }
-    // Same workspace-namespace gate as the fqn path above.
+    // Same workspace-namespace gate as the fqn path above, plus the module path
+    // itself: `import Python.Test as Test` names a C# namespace that this
+    // workspace indexes, so it is internal even though Python declares no such
+    // module (#1174).
     gated_boundary(
-        || !python_crosses_unindexed_boundary(support, module_fq),
+        || {
+            !python_crosses_unindexed_boundary(support, module_fq)
+                || python_workspace_module_exists(support, module_fq)
+        },
         format!(
             "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
         ),
@@ -1878,6 +1907,13 @@ fn python_class_for_fqn(
     py.resolve_fqn_candidates(fqn, |name| support.fqn(name))
         .into_iter()
         .find(|unit| unit.is_class())
+        .or_else(|| {
+            // An imported CLR/JVM type used as a receiver: the class is indexed
+            // at this exact fq in another language (#1174).
+            python_cross_language_declarations(support, fqn)
+                .into_iter()
+                .find(|unit| unit.is_class())
+        })
 }
 
 fn python_member_outcome(
@@ -1886,12 +1922,22 @@ fn python_member_outcome(
     receiver_type: CodeUnit,
     member: &str,
 ) -> DefinitionLookupOutcome {
+    // A receiver typed cross-language (#1174) owns members in *its* language's
+    // index, not Python's, so the exact-fq member lookup has to follow it there.
+    let receiver_language = language_for_file(receiver_type.source());
+    let cross_language_owner = receiver_language != Language::Python;
     // Members use a `.` separator; a nested class is indexed with `$`
     // (`Outer$Inner`), so try both.
     let member_candidates = |owner: &str| {
         let mut units = support.fqn(&format!("{owner}.{member}"));
         if units.is_empty() {
             units = support.fqn(&format!("{owner}${member}"));
+        }
+        if units.is_empty() && cross_language_owner {
+            units = python_cross_language_declarations(support, &format!("{owner}.{member}"));
+            if units.is_empty() {
+                units = python_cross_language_declarations(support, &format!("{owner}${member}"));
+            }
         }
         units
     };
@@ -1906,13 +1952,16 @@ fn python_member_outcome(
         candidates.dedup();
     }
     if candidates.is_empty() {
-        no_definition(
-            "no_indexed_definition",
+        let owner = receiver_type.fq_name();
+        let message = if cross_language_owner {
             format!(
-                "`{}.{member}` is not indexed as a Python definition",
-                receiver_type.fq_name()
-            ),
-        )
+                "`{owner}.{member}` is not indexed; `{owner}` is a {} declaration, not a Python one",
+                receiver_language.config_label()
+            )
+        } else {
+            format!("`{owner}.{member}` is not indexed as a Python definition")
+        };
+        no_definition("no_indexed_definition", message)
     } else {
         candidates_outcome(candidates)
     }
@@ -1930,11 +1979,19 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
     !python_workspace_module_exists(support, &module)
 }
 
+/// Whether the workspace declares `module` as a package/namespace or as a
+/// declaration.
+///
+/// Deliberately language-blind: this is the honesty gate behind every confident
+/// Python boundary claim, and a namespace that only C#/Java/Scala declares (a
+/// pythonnet CLR namespace, say) is still *inside* the workspace. Answering it
+/// Python-only made the claim wrong about workspace-internal targets (#1174).
 fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
     if module.is_empty() {
         return false;
     }
-    support.package_exists(module) || support.fqn_exists(module)
+    support.package_exists_in_any_language(module)
+        || !support.fqn_in_any_language(module).is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]

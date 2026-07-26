@@ -7,7 +7,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::borrow::Borrow;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 
 #[derive(Debug, Clone, Default)]
 pub struct GlobalUsageDefinitionIndex {
@@ -34,6 +34,26 @@ pub struct GlobalUsageDefinitionIndex {
 pub(crate) trait BoundedDefinitionLookup {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;
+
+    /// Exact-fq lookup across *every* language the workspace indexes.
+    ///
+    /// A language-scoped resolver cannot tell "this fq is not in the workspace"
+    /// apart from "this fq belongs to another language's declarations", so a
+    /// confident cross-workspace boundary claim must consult this before it
+    /// fires (#1174).  The default is the implementation's own scope: bounded
+    /// single-language providers genuinely have no view of other languages, and
+    /// answering same-language keeps them conservative (they can only *fail* to
+    /// suppress a boundary claim, never invent a cross-language hit).
+    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.fqn(fqn)
+    }
+
+    /// Language-blind counterpart of [`Self::package_exists`]; see
+    /// [`Self::fqn_in_any_language`] for why the default is same-language.
+    fn package_exists_in_any_language(&self, package: &str) -> bool {
+        self.package_exists(package)
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_exists(&self, fqn: &str) -> bool;
@@ -111,6 +131,7 @@ pub(crate) use impl_forward_query_provider;
 pub(crate) struct AnalyzerDefinitionLookup<'a> {
     analyzer: &'a dyn IAnalyzer,
     language: Cell<Language>,
+    workspace_languages: OnceCell<Vec<Language>>,
     fqn_cache: RefCell<HashMap<(Language, String), Vec<CodeUnit>>>,
     file_identifier_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
     children_cache: RefCell<HashMap<(Language, String), Vec<CodeUnit>>>,
@@ -123,6 +144,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         Self {
             analyzer,
             language: Cell::new(language),
+            workspace_languages: OnceCell::new(),
             fqn_cache: RefCell::new(HashMap::default()),
             file_identifier_cache: RefCell::new(HashMap::default()),
             children_cache: RefCell::new(HashMap::default()),
@@ -137,6 +159,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
 
     fn language_analyzer(&self, language: Language) -> Option<&dyn ForwardQueryProvider> {
         analyzer_for_language(self.analyzer, language)
+    }
+
+    /// The languages this workspace actually indexes, in a stable order.
+    /// Resolved once per batch: `IAnalyzer::languages` rebuilds a set per call.
+    fn workspace_languages(&self) -> &[Language] {
+        self.workspace_languages
+            .get_or_init(|| self.analyzer.languages().into_iter().collect())
     }
 
     fn fqn_for_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
@@ -218,6 +247,22 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         self.fqn_for_language(fqn, language)
+    }
+
+    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units = Vec::new();
+        for language in self.workspace_languages() {
+            units.extend(self.fqn_for_language(fqn, *language));
+        }
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn package_exists_in_any_language(&self, package: &str) -> bool {
+        self.workspace_languages()
+            .iter()
+            .any(|language| self.package_exists_in_language(package, *language))
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
