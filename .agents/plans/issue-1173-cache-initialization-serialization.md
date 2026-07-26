@@ -46,7 +46,9 @@ auto-vacuum, and enabled foreign keys without a `database is locked` error.
   matrix without a cache override. Formatting, `git diff --check`, and
   all-target/all-feature Clippy also pass on the merged head. Cargo used the
   normal repository target outside the sandbox at niceness 10.
-- [ ] Commit, synchronize, publish to `origin/master`, and close #1173.
+- [x] (2026-07-26) Committed, synchronized, and published the fix at
+  `d9df6f92`, then closed assigned issue #1173 with focused concurrency and
+  complete local-gate evidence.
 
 ## Surprises & Discoveries
 
