@@ -57,8 +57,8 @@ pub struct CppAnalyzer {
     /// member definition `CodeUnit`s whose per-file identity extraction could not
     /// reconcile with it (the file-scope-under-using-directive shape and the
     /// template-specialization twin), keyed on the include-visible class table.
-    /// Built lazily once; see `reconciled_definition_index`.
-    reconciled_definition_index: Arc<OnceLock<ReconciledDefinitionIndex>>,
+    /// Memoized per queried name; see `reconciled_definitions`.
+    reconciled_definitions_by_fq: Cache<String, Arc<ReconciledDefinitionIndex>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
@@ -83,10 +83,16 @@ pub struct CppAnalyzer {
 /// definition alongside its header declaration across every resolution surface
 /// (`definitions`, source blocks, occurrence roles, canonical selectors). The
 /// re-keyed unit is not in the store, so `provisional_of` maps it back to the
-/// stored provisional unit for range lookups (`ranges`).
+/// stored provisional unit for range and signature-metadata lookups.
+///
+/// Computed per queried name (see `CppAnalyzer::reconciled_definitions`), never
+/// as a workspace-wide table: a warm forward lookup must not trigger a full
+/// declaration scan.
 #[derive(Default)]
 struct ReconciledDefinitionIndex {
-    by_canonical_fq: HashMap<String, Vec<CodeUnit>>,
+    /// Re-keyed definitions belonging under the queried canonical `fq_name`.
+    rekeyed: Vec<CodeUnit>,
+    /// Re-keyed unit -> the stored provisional unit its indexed data lives under.
     provisional_of: HashMap<CodeUnit, CodeUnit>,
 }
 
@@ -138,7 +144,7 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
-            reconciled_definition_index: Arc::new(OnceLock::new()),
+            reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -155,25 +161,54 @@ impl CppAnalyzer {
         }
     }
 
-    /// The #1134 resolution-time identity-reconciliation overlay, built once and
-    /// cached. See the field docs on `reconciled_definition_index`.
-    fn reconciled_definition_index(&self) -> &ReconciledDefinitionIndex {
-        self.reconciled_definition_index
-            .get_or_init(|| self.build_reconciled_definition_index())
+    /// The re-keyed reconciled definitions (if any) that belong under the
+    /// canonical `fq_name` a header declaration carries, memoized per queried
+    /// name. See the field docs on `reconciled_definition_index`.
+    ///
+    /// Deliberately **not** a workspace-wide index: building one would need a
+    /// full declaration scan, and a warm forward lookup must not trigger one
+    /// (`tests/analyzer_persistence.rs`'s candidate-bounded contract). Instead
+    /// each queried name reconciles only the candidates the persisted terminal
+    /// identifier index already offers, which is the same bounded lookup the
+    /// ordinary resolution path uses.
+    fn reconciled_definitions(&self, fq_name: &str) -> Arc<ReconciledDefinitionIndex> {
+        self.reconciled_definitions_by_fq
+            .get_with_by_ref(fq_name, || {
+                Arc::new(self.build_reconciled_definitions(fq_name))
+            })
     }
 
-    /// Scan every out-of-line member definition in the workspace and, for those
-    /// whose provisional per-file identity the include-visible class table
-    /// re-keys to a different canonical `fq_name` (the two ambiguous shapes left
-    /// by #1121), record a re-keyed `CodeUnit` under that canonical `fq_name` and
-    /// remember its provisional store identity. A definition whose reconciled
-    /// identity equals its provisional one (the overwhelming majority, including
-    /// genuine `ns1::ns2::Klass::method` namespace chains) contributes nothing.
-    fn build_reconciled_definition_index(&self) -> ReconciledDefinitionIndex {
+    /// Reconcile the bounded candidate set for one queried canonical `fq_name`:
+    /// every out-of-line member definition sharing its terminal identifier whose
+    /// provisional per-file identity the include-visible class table re-keys onto
+    /// exactly this name (the two ambiguous shapes left by #1121). A definition
+    /// whose reconciled identity equals its provisional one (the overwhelming
+    /// majority, including genuine `ns1::ns2::Klass::method` namespace chains)
+    /// contributes nothing.
+    fn build_reconciled_definitions(&self, fq_name: &str) -> ReconciledDefinitionIndex {
         let mut index = ReconciledDefinitionIndex::default();
+        let interner = segment_interner();
+        // The queried name's terminal segment is the member identifier to probe
+        // the identifier index with. Parsed through the sanctioned input-edge
+        // parser rather than split here, and note `$` is not a segment boundary
+        // for it -- a nested owner chain stays one segment, so the terminal
+        // really is the member.
+        let query_fq =
+            crate::analyzer::symbol_lookup::parse_symbol_path_fq(Language::Cpp, fq_name, interner);
+        let Some(member_segment) = query_fq.last() else {
+            return index;
+        };
+        let (member_identifier, _) = interner.resolve(member_segment);
+        if member_identifier.is_empty() {
+            return index;
+        }
+
         let mut using_by_file: HashMap<ProjectFile, Arc<Vec<String>>> = HashMap::default();
-        for unit in self.inner.get_all_declarations() {
-            if !unit.is_callable() {
+        for unit in self
+            .inner
+            .lookup_candidates_by_identifier(member_identifier)
+        {
+            if !unit.is_callable() || unit.fq_name() == fq_name {
                 continue;
             }
             if !matches!(
@@ -187,7 +222,7 @@ impl CppAnalyzer {
                 continue;
             };
             let canonical_fq = reconciled.fq_name();
-            if canonical_fq == unit.fq_name() {
+            if canonical_fq != fq_name {
                 continue;
             }
             // Re-key onto the canonical identity while keeping the definition's
@@ -201,11 +236,7 @@ impl CppAnalyzer {
                 unit.signature().map(str::to_string),
                 unit.is_synthetic(),
             );
-            index
-                .by_canonical_fq
-                .entry(canonical_fq)
-                .or_default()
-                .push(rekeyed.clone());
+            index.rekeyed.push(rekeyed.clone());
             index.provisional_of.insert(rekeyed, unit);
         }
         index
@@ -284,7 +315,7 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
-            reconciled_definition_index: Arc::new(OnceLock::new()),
+            reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -580,15 +611,12 @@ impl IAnalyzer for CppAnalyzer {
         // extraction could not reconcile with this canonical `fq_name`, but the
         // include-visible class table confirms belong here, so a header
         // declaration and its `.cpp` definition unify at resolution time.
-        let Some(reconciled) = self
-            .reconciled_definition_index()
-            .by_canonical_fq
-            .get(fq_name)
-        else {
+        let reconciled = self.reconciled_definitions(fq_name);
+        if reconciled.rekeyed.is_empty() {
             return Box::new(inner.into_iter());
-        };
+        }
         let mut definitions = inner;
-        for unit in reconciled {
+        for unit in &reconciled.rekeyed {
             if !definitions.contains(unit) {
                 definitions.push(unit.clone());
             }
@@ -643,7 +671,7 @@ impl IAnalyzer for CppAnalyzer {
         // `.cpp` source) is not itself in the store; its ranges live under the
         // provisional identity extraction assigned it.
         if let Some(provisional) = self
-            .reconciled_definition_index()
+            .reconciled_definitions(&code_unit.fq_name())
             .provisional_of
             .get(code_unit)
         {
@@ -683,7 +711,7 @@ impl IAnalyzer for CppAnalyzer {
         // Stored units always return non-empty here, so this never re-enters the
         // lazily-built index during its own construction.
         if let Some(provisional) = self
-            .reconciled_definition_index()
+            .reconciled_definitions(&code_unit.fq_name())
             .provisional_of
             .get(code_unit)
         {
@@ -722,12 +750,9 @@ impl IAnalyzer for CppAnalyzer {
         // extraction could not reconcile with this canonical `fq_name`, but the
         // include-visible class table confirms belong here (so a header
         // declaration and its `.cpp` definition unify at query time).
-        if let Some(reconciled) = self
-            .reconciled_definition_index()
-            .by_canonical_fq
-            .get(fq_name)
         {
-            for unit in reconciled {
+            let reconciled = self.reconciled_definitions(fq_name);
+            for unit in &reconciled.rekeyed {
                 if !definitions.contains(unit) {
                     definitions.push(unit.clone());
                 }
