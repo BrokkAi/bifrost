@@ -18,8 +18,10 @@ The first working milestone does not add a database table. It defines the stable
 - [x] (2026-07-26 17:31Z) Read the live issue and dependency state: #817 and #822 are closed, #821 is open with implementation at `origin/agent/issue-821-value-flow-taint`, and #823 is unblocked for its semantic and protocol layers.
 - [x] (2026-07-26 17:31Z) Audited query-local tabulation, IDE, typestate, semantic identity, store, and #817 lifecycle boundaries; confirmed no `SemanticProcedureSummary`, `ProtocolSummary`, `TaintTransferSummary`, or complete-summary repository exists on `origin/master`.
 - [x] (2026-07-26 17:31Z) Wrote this issue-specific ExecPlan and selected stable in-memory contracts as Milestone 1.
-- [ ] Implement and validate Milestone 1: stable semantic summary keys, artifacts, provenance/completeness rules, deterministic composition, and complete-only in-memory SCC publication.
-- [ ] Review Milestone 1 with the guided security, duplication, intent, operations, and architecture passes; fix accepted findings and checkpoint the reviewed milestone.
+- [x] (2026-07-26 19:04Z) Fetched and rebased onto `origin/master` commit `3a634356`, where #821 landed as PR #1180; restored the Milestone 1 work without conflict and kept `.brokk/` untouched.
+- [x] (2026-07-26 20:17Z) Implemented Milestone 1: exact provenance, composition-root, and dependency-closure keys; typed boundary/effect/evidence contracts; deterministic full-summary composition and join; bounded byte-accounted in-memory reuse; and atomic publication from per-summary validated recursive topology.
+- [x] (2026-07-26 20:52Z) Completed the guided security, duplication, intent, operations, and architecture review passes; fixed every Critical/High finding plus accepted boundedness/lifecycle findings, and completed delta re-reviews with no unresolved Critical or High issue.
+- [x] (2026-07-26 21:08Z) Validated Milestone 1 with 15 reusable-summary tests, 27 query-local summary tests, 23 IDE tests, formatting/diff checks, and strict all-target/all-feature Clippy through the pinned Rust 1.96 toolchain.
 - [ ] Implement and validate Milestone 2: protocol summary projection and reuse over the landed typestate client.
 - [ ] Integrate Milestone 3 only after #821 lands: symbolic taint-transfer summaries and their split invalidation keys.
 - [ ] Run Milestone 4 lifecycle measurements and record the promotion decision; implement packed SQLite persistence only if the evidence passes #817's predeclared gates.
@@ -41,8 +43,20 @@ The first working milestone does not add a database table. It defines the stable
 - Observation: #817 already measured the current exploded solver state and classified it as persistence-ineligible.
   Evidence: `.agents/docs/dataflow-lifecycle-benchmark-2026-07-24.md` records `ephemeral_not_eligible; persist reusable summaries only after #823 defines and measures them` and does not invoke the promotion gate without an equivalent artifact.
 
-- Observation: #821 has an implementation branch but is not on `origin/master`.
-  Evidence: `origin/agent/issue-821-value-flow-taint` points to `b4267793` and adds the value-flow and taint modules; current `origin/master` is `4dceaf47`. Milestone 3 must not duplicate or cherry-pick that work prematurely.
+- Observation: at planning time, #821 had an implementation branch but was not yet on `origin/master`.
+  Evidence: the initial baseline was `4dceaf47` while `origin/agent/issue-821-value-flow-taint` pointed to `b4267793`. That constraint ended when PR #1180 landed and this branch rebased to `3a634356`.
+
+- Observation: #821 landed while Milestone 1 was under review, and the landed public contracts are now the only taint/value-flow baseline for this plan.
+  Evidence: `origin/master` commit `3a634356` (“Add direct, indirect, and taint data-flow clients (#1180)”) adds `src/analyzer/value_flow/`, `src/analyzer/taint/`, and their behavior tests. The issue branch was rebased onto that commit before further summary integration.
+
+- Observation: the initial Milestone 1 review exposed cache-safety gaps that ordinary compilation did not reveal.
+  Evidence: independent security, intent, operations, duplication, and architecture passes converged on structural provenance keys, derived dependency closure, shared SCC invalidation, distinct alternative/sequential evidence operations, summary-level effect composition, and explicit work/retention budgets.
+
+- Observation: dependency closure and recursive call topology are related but cannot be the same structure.
+  Evidence: composition must flatten nested call effects and dependencies to remain associative, while SCC validation must retain the source-level strongly connected topology. `publish_scc` therefore validates an explicit topology against the flattened dependency closure and hashes that topology into every group member key.
+
+- Observation: the shell resolves rustup's pinned `cargo`/`rustc` but Homebrew's `cargo-clippy`, and Rust 1.96 artifacts from those builds are metadata-incompatible despite sharing the same release number.
+  Evidence: the ordinary strict command failed with `found crate cc compiled by an incompatible version of rustc`, identifying the current compiler as Homebrew. Running the gate through `rustup run 1.96.0 cargo-clippy` keeps Cargo, Clippy, and rustc on the pinned toolchain.
 
 ## Decision Log
 
@@ -62,6 +76,10 @@ The first working milestone does not add a database table. It defines the stable
   Rationale: exposing one member while mutually recursive peers are still changing can make order affect results and can allow an incomplete dependency set to masquerade as complete.
   Date/Author: 2026-07-26 / Codex
 
+- Decision: keep recursive topology explicit and separate from the flattened retained dependency closure.
+  Rationale: nested effects and dependencies must flatten for associative composition and invalidation, but using that transitive closure as the call graph invents SCC edges and makes valid recursive batches unpublishable. The declared topology is hashed into the shared group key, checked for strong connectivity, and required to be represented in each source member's retained dependencies.
+  Date/Author: 2026-07-26 / Codex
+
 - Decision: represent external provenance as a validated opaque model identity and content digest in this layer.
   Rationale: issue #1144 owns model-pack authoring, discovery, and packaging. #823 needs to distinguish inferred source from validated external semantics without creating a competing pack schema.
   Date/Author: 2026-07-26 / Codex
@@ -70,13 +88,15 @@ The first working milestone does not add a database table. It defines the stable
   Rationale: #817 requires an equivalent artifact, serialization/hydration path, stable identity, size, invalidation behavior, and measured warm benefit before promotion. None exists until the in-memory summary contract works.
   Date/Author: 2026-07-26 / Codex
 
-- Decision: wait for #821 before adding `TaintTransferSummary`.
-  Rationale: the open #821 branch owns the carrier, universe, event, plan, client, and finding contracts that a symbolic taint summary must reuse. Recreating those types on #823 would create incompatible duplicate abstractions.
+- Decision: integrate Milestone 3 only against landed #821 commit `3a634356`.
+  Rationale: the merged value-flow and taint modules now own the carrier, universe, event, plan, client, and finding contracts that a symbolic taint summary must reuse. The earlier implementation-branch snapshot is no longer authoritative.
   Date/Author: 2026-07-26 / Codex
 
 ## Outcomes & Retrospective
 
-The issue is planned and the implementation branch is ready. No reusable summary code or persistence schema existed at the planning checkpoint. Update this section after every milestone with the behavior delivered, exact validation evidence, review outcomes, and remaining dependency or promotion gaps.
+Milestone 1 now supplies the reusable semantic foundation without adding global state or persistence. Exact keys include semantic artifact validity, declaration, schema, execution semantics, context, behavior, origin, dependency closure, and the full recursive-group closure. Composition derives its own dependency identity, preserves effects from reachable non-returning callees, distinguishes alternative joins from sequential conjunction, and is deterministic across association for the complete semantic payload. The repository publishes only complete entries, validates exact dependencies, validates explicit recursive topology as a real SCC, preflights whole batches atomically, accounts retained bytes, and supports owner-driven generation rotation.
+
+Focused `reusable_summaries` validation passes 15 behavior tests, including source/external/dependency invalidation, keyed composition-root identity, full-summary associativity, maximum-size idempotence, bounded composition work, non-returning effect preservation, complete-only publication, recursive closure invalidation, non-SCC rejection, composed SCC publication, byte capacity, and atomicity. The adjacent `dataflow_summaries` (27 tests) and `dataflow_ide` (23 tests) suites also pass. Strict `--all-targets --all-features` Clippy passes through the pinned Rust 1.96 toolchain, and the final specialist delta reviews found no unresolved Critical or High issue. The checkpoint commit remains before Milestone 2 begins.
 
 ## Context and Orientation
 
@@ -206,7 +226,7 @@ Use `scripts/with-isolated-cargo-target.sh` for every isolated Rust build so tem
 
 ## Artifacts and Notes
 
-The baseline is `origin/master` commit `4dceaf47`, which contains `5d228346` for the reusable typestate client and `4dceaf47` for bounded IDE propagation. The query-local recursive summary kernel landed in `3e94f809`, and bounded witnesses landed in `c8df49d3`. The open #821 implementation is currently visible at `b4267793` but is not a dependency that this branch may silently incorporate.
+The current baseline is `origin/master` commit `3a634356`, which lands #821 through PR #1180 on top of `5d228346` for the reusable typestate client and `4dceaf47` for bounded IDE propagation. The query-local recursive summary kernel landed in `3e94f809`, and bounded witnesses landed in `c8df49d3`. The earlier #821 branch snapshot at `b4267793` is historical only; all taint-summary work uses the landed contracts.
 
 The existing lifecycle conclusion is intentionally narrow: exploded query-local results are persistence-ineligible, while reusable summary artifacts remain unmeasured. This plan must not misstate the earlier benchmark as either evidence for or against persistence of the new artifacts.
 
