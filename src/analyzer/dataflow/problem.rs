@@ -4,8 +4,8 @@ use std::hash::Hash;
 
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::semantic::{
-    CallSiteHandle, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot,
-    ProgramPointHandle, ProofStatus,
+    CallSiteHandle, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind,
+    IcfgNodeId, IcfgSnapshot, ProgramPointHandle, ProofStatus,
 };
 
 define_dense_id! {
@@ -44,6 +44,14 @@ impl<F> DataflowSeed<F> {
 /// rows even if a callback ignores the signal, but clients must return
 /// cooperatively to keep their own CPU work bounded.
 pub trait DataflowOutput<T> {
+    /// Return whether the callback may continue before it computes its next
+    /// output. The default keeps simple collectors source-compatible; bounded
+    /// kernel outputs override this to expose cancellation and exhausted work
+    /// budgets even while a client is expanding intermediate rows.
+    fn should_continue(&self) -> bool {
+        true
+    }
+
     /// Emit one row, returning whether the callback may continue.
     #[must_use]
     fn emit(&mut self, value: T) -> bool;
@@ -63,6 +71,7 @@ pub struct DataflowEdge<'graph> {
     target: &'graph ProgramPointHandle,
     proof: &'graph ProofStatus,
     completeness: &'graph EvidenceCompleteness,
+    boundary: Option<&'graph DispatchBoundaryKind>,
 }
 
 impl<'graph> DataflowEdge<'graph> {
@@ -81,7 +90,13 @@ impl<'graph> DataflowEdge<'graph> {
             target,
             proof,
             completeness,
+            boundary: None,
         }
+    }
+
+    pub const fn with_boundary(mut self, boundary: &'graph DispatchBoundaryKind) -> Self {
+        self.boundary = Some(boundary);
+        self
     }
 
     /// Resolve one semantic edge and both procedure-local endpoint handles
@@ -93,14 +108,18 @@ impl<'graph> DataflowEdge<'graph> {
         let edge = snapshot.edge(edge_id)?;
         let source = snapshot.node(edge.source)?;
         let target = snapshot.node(edge.target)?;
-        Some(Self::new(
+        let descriptor = Self::new(
             edge.kind,
             edge.origin.as_ref(),
             source.point(),
             target.point(),
             &edge.proof,
             &edge.completeness,
-        ))
+        );
+        Some(match edge.boundary.as_ref() {
+            Some(boundary) => descriptor.with_boundary(boundary),
+            None => descriptor,
+        })
     }
 
     pub const fn kind(self) -> IcfgEdgeKind {
@@ -125,6 +144,11 @@ impl<'graph> DataflowEdge<'graph> {
 
     pub const fn completeness(self) -> &'graph EvidenceCompleteness {
         self.completeness
+    }
+
+    /// Structured dispatch boundary that produced this edge, when any.
+    pub const fn boundary(self) -> Option<&'graph DispatchBoundaryKind> {
+        self.boundary
     }
 }
 

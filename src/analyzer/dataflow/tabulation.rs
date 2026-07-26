@@ -74,6 +74,10 @@ impl<Fact> DataflowOutput<DataflowSeed<Fact>> for BoundedSeedOutputs<'_, '_, Fac
 where
     Fact: Copy + Eq + std::hash::Hash,
 {
+    fn should_continue(&self) -> bool {
+        !self.cancellation.is_cancelled() && self.invalid_node.is_none() && self.exceeded.is_none()
+    }
+
     fn emit(&mut self, seed: DataflowSeed<Fact>) -> bool {
         if self.cancellation.is_cancelled() {
             return false;

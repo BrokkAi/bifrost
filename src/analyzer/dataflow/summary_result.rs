@@ -481,6 +481,7 @@ pub struct SummaryDataflowResult<Fact> {
     semantic_work: SemanticWork,
     metrics: SummaryMetrics,
     witness_store: WitnessStore,
+    witness_retention_truncated: bool,
 }
 
 impl<Fact> SummaryDataflowResult<Fact> {
@@ -495,6 +496,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
         semantic_work: SemanticWork,
         metrics: SummaryMetrics,
         witness_store: WitnessStore,
+        witness_retention_truncated: bool,
     ) -> Self {
         reached.sort_by(compare_reached_facts);
         reached.dedup();
@@ -511,6 +513,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
             semantic_work,
             metrics,
             witness_store,
+            witness_retention_truncated,
         }
     }
 
@@ -550,6 +553,10 @@ impl<Fact> SummaryDataflowResult<Fact> {
         self.metrics
     }
 
+    pub const fn witness_retention_truncated(&self) -> bool {
+        self.witness_retention_truncated
+    }
+
     pub fn is_complete(&self) -> bool {
         self.termination.is_fixed_point() && self.coverage.is_complete()
     }
@@ -578,24 +585,40 @@ impl<Fact> SummaryDataflowResult<Fact> {
         quality: PathQuality,
         limits: WitnessReconstructionLimits,
     ) -> Result<SummaryWitness, SummaryWitnessError> {
-        let reached = self
+        let reached_index = self
             .reached
             .iter()
-            .find(|candidate| {
-                *candidate == reached
+            .position(|candidate| {
+                candidate == reached
                     && witness_owners_match(
                         candidate.witness_owner.as_ref(),
                         reached.witness_owner.as_ref(),
                     )
             })
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
+        self.witness_for_reached_index(reached_index, quality, limits)
+    }
+
+    pub(crate) fn witness_for_reached_index(
+        &self,
+        reached_index: usize,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let reached = self
+            .reached
+            .get(reached_index)
+            .ok_or(SummaryWitnessError::TargetNotInResult)?;
         if !reached.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
         }
-        let evidence = reached
-            .witnesses
-            .first(quality)
-            .ok_or(SummaryWitnessError::RetentionDisabled)?;
+        let Some(evidence) = reached.witnesses.first(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
         self.witness_store.reconstruct(
             evidence,
             quality,
@@ -630,10 +653,13 @@ impl<Fact> SummaryDataflowResult<Fact> {
         if !summary.path_qualities.contains(quality) {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
         }
-        let evidence = summary
-            .witnesses
-            .first(quality)
-            .ok_or(SummaryWitnessError::RetentionDisabled)?;
+        let Some(evidence) = summary.witnesses.first(quality) else {
+            return if self.witness_retention_truncated {
+                Ok(SummaryWitness::retention_truncated_marker(quality))
+            } else {
+                Err(SummaryWitnessError::RetentionDisabled)
+            };
+        };
         self.witness_store.reconstruct(
             evidence,
             quality,

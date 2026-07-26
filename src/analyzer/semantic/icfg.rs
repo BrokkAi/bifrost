@@ -89,6 +89,7 @@ pub struct ProcedureIcfgEdge {
     pub origin: Option<CallSiteHandle>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
+    pub boundary: Option<DispatchBoundaryKind>,
 }
 
 /// One procedure-local incomplete ICFG boundary before snapshot node
@@ -310,6 +311,7 @@ pub struct IcfgEdge {
     pub origin: Option<CallSiteHandle>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
+    pub boundary: Option<DispatchBoundaryKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -594,6 +596,7 @@ impl SnapshotBuilder {
         origin: Option<CallSiteHandle>,
         proof: ProofStatus,
         completeness: EvidenceCompleteness,
+        boundary: Option<DispatchBoundaryKind>,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<IcfgNodeId>, SemanticProviderError> {
         let existing_target = self.interner.get(&target_key).copied();
@@ -645,6 +648,7 @@ impl SnapshotBuilder {
             origin,
             proof,
             completeness,
+            boundary,
         };
         if self.edge_set.contains(&edge) {
             // A duplicate discovered after interning cannot own a new target.
@@ -688,7 +692,11 @@ impl SnapshotBuilder {
     }
 
     fn freeze(mut self) -> Result<IcfgSnapshot, SemanticProviderError> {
-        self.edges.sort_by_key(icfg_edge_sort_key);
+        self.edges.sort_by(|left, right| {
+            icfg_edge_sort_key(left)
+                .cmp(&icfg_edge_sort_key(right))
+                .then_with(|| left.boundary.cmp(&right.boundary))
+        });
         let node_count = self.nodes.len();
         let mut incoming_counts = vec![0_u32; node_count];
         for edge in &self.edges {
@@ -765,6 +773,16 @@ fn validate_frozen_edge(edge: &IcfgEdge, node_count: usize) -> Result<(), Semant
     if !matches!(edge.kind, IcfgEdgeKind::Intraprocedural(_)) && edge.origin.is_none() {
         return Err(SemanticProviderError::internal(
             "interprocedural ICFG edge has no originating call site",
+        ));
+    }
+    if edge.boundary.is_some()
+        && !matches!(
+            edge.kind,
+            IcfgEdgeKind::CallToNormalContinuation | IcfgEdgeKind::CallToExceptionalContinuation
+        )
+    {
+        return Err(SemanticProviderError::internal(
+            "dispatch-boundary metadata is attached to a non-continuation ICFG edge",
         ));
     }
     Ok(())
@@ -1148,6 +1166,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                                 Some(origin.clone()),
                                 proof,
                                 completeness,
+                                None,
                                 &mut staged_request,
                             )?;
                         }
@@ -1890,6 +1909,7 @@ pub(crate) fn project_call_boundary(
                     origin: Some(boundary.origin.clone()),
                     proof: boundary.dispatch.proof.clone(),
                     completeness: boundary.dispatch.completeness.clone(),
+                    boundary: Some(boundary.dispatch.kind.clone()),
                 });
             }
             ControlContinuation::Absent => {}
@@ -1950,6 +1970,7 @@ fn link_boundary_continuations(
             edge.origin,
             edge.proof,
             edge.completeness,
+            edge.boundary,
             request,
         )?;
     }
@@ -2002,6 +2023,7 @@ pub(crate) fn project_matched_return(
                 origin: Some(incoming.origin.clone()),
                 proof,
                 completeness,
+                boundary: None,
             }))
         }
         ControlContinuation::Absent => Ok(MatchedReturnProjection::Absent),
@@ -2114,6 +2136,7 @@ where
                 edge.origin,
                 edge.proof,
                 edge.completeness,
+                edge.boundary,
                 request,
             )?;
         }
@@ -2154,6 +2177,7 @@ fn add_local_edge(
         None,
         ProofStatus::Proven,
         EvidenceCompleteness::Complete,
+        None,
         request,
     )?;
     Ok(())
@@ -2290,6 +2314,7 @@ mod tests {
             origin: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
+            boundary: None,
         }
     }
 

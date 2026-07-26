@@ -6,11 +6,12 @@ use std::{
 };
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowOutput, DataflowRequest, DirectFlowProblem, DistributiveDataflowProblem,
-    PathQuality, SolverBudget, SolverBudgetDimension, SolverTermination, SummaryBoundaryKind,
-    SummaryDataflowError, SummaryDataflowResult, SummaryReachedFact, SummarySemanticStatus,
-    SummarySolveInput, SummaryWitness, SummaryWitnessError, SummaryWitnessStepKind,
-    WitnessReconstructionLimits, WitnessRetentionLimits, solve_with_summaries,
+    DataflowEdge, DataflowOutput, DataflowRequest, DirectFact, DirectFlowProblem,
+    DistributiveDataflowProblem, PathQuality, SolverBudget, SolverBudgetDimension,
+    SolverTermination, SummaryBoundaryKind, SummaryDataflowError, SummaryDataflowResult,
+    SummaryReachedFact, SummarySemanticStatus, SummarySolveInput, SummaryWitness,
+    SummaryWitnessError, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessRetentionLimits, solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBoundary, CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken,
@@ -1346,6 +1347,119 @@ fn intraprocedural_witness_is_opt_in_source_backed_and_bounded() {
 }
 
 #[test]
+fn best_effort_witness_exhaustion_does_not_change_semantic_results() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+                pub fn root(value: i32) -> i32 {
+                    value + 1
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let provider = analyzer.icfg_provider();
+    let solve = |entry_facts: &[MarkerFact],
+                 retention: WitnessRetentionLimits,
+                 witness_relations: usize| {
+        let cancellation = CancellationToken::default();
+        let mut limits = SolverBudget::default().limits();
+        limits.witness_relations = witness_relations;
+        let mut solver_budget = SolverBudget::new(limits);
+        let mut semantic_budget = SemanticBudget::default();
+        solve_with_summaries(
+            SummarySolveInput::new(&root, entry_facts).with_witness_retention(retention),
+            &provider,
+            &MarkerProblem,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .expect("valid best-effort witness fixture")
+    };
+
+    let baseline = solve(&[MarkerFact::Seed], WitnessRetentionLimits::disabled(), 0);
+    let request_exhausted = solve(
+        &[MarkerFact::Seed],
+        WitnessRetentionLimits::best_effort(1, 64, 64 * 1024 * 1024).unwrap(),
+        0,
+    );
+    let local_exhausted = solve(
+        &[MarkerFact::Seed],
+        WitnessRetentionLimits::best_effort(1, 1, 64 * 1024 * 1024).unwrap(),
+        64,
+    );
+    let byte_exhausted = solve(
+        &[MarkerFact::Seed],
+        WitnessRetentionLimits::best_effort(1, 64, 1).unwrap(),
+        64,
+    );
+    for candidate in [&request_exhausted, &local_exhausted, &byte_exhausted] {
+        assert_eq!(candidate.facts(), baseline.facts());
+        assert_eq!(candidate.reached(), baseline.reached());
+        assert_eq!(candidate.end_summaries(), baseline.end_summaries());
+        assert_eq!(candidate.coverage(), baseline.coverage());
+        assert_eq!(candidate.termination(), baseline.termination());
+        assert_eq!(candidate.work(), baseline.work());
+        assert_eq!(candidate.semantic_work(), baseline.semantic_work());
+        assert_eq!(candidate.metrics(), baseline.metrics());
+        assert!(candidate.witness_retention_truncated());
+
+        let reached = candidate
+            .reached()
+            .iter()
+            .find(|reached| candidate.fact(reached.fact()) == Some(&MarkerFact::Seed))
+            .expect("seed remains semantically reachable");
+        let quality = reached
+            .path_qualities()
+            .iter()
+            .next()
+            .expect("reached row retains one quality");
+        let marker = candidate
+            .witness_for_reached(reached, quality, WitnessReconstructionLimits::default())
+            .expect("best-effort exhaustion is explicit");
+        assert!(marker.steps().is_empty());
+        assert!(marker.truncated());
+        assert!(marker.alternatives_truncated());
+        assert!(marker.retention_truncated());
+        assert_eq!(marker.omitted_steps_lower_bound(), 1);
+    }
+
+    let late_baseline = solve(&[], WitnessRetentionLimits::disabled(), 0);
+    let late_exhausted = solve(
+        &[],
+        WitnessRetentionLimits::best_effort(1, 1, 64 * 1024 * 1024).unwrap(),
+        64,
+    );
+    let late_request_exhausted = solve(
+        &[],
+        WitnessRetentionLimits::best_effort(1, 64, 64 * 1024 * 1024).unwrap(),
+        1,
+    );
+    for candidate in [&late_exhausted, &late_request_exhausted] {
+        assert_eq!(candidate.facts(), late_baseline.facts());
+        assert_eq!(candidate.reached(), late_baseline.reached());
+        assert_eq!(candidate.end_summaries(), late_baseline.end_summaries());
+        assert_eq!(candidate.coverage(), late_baseline.coverage());
+        assert_eq!(candidate.termination(), late_baseline.termination());
+        let mut candidate_work = candidate.work();
+        let mut late_baseline_work = late_baseline.work();
+        candidate_work.witness_relations = 0;
+        late_baseline_work.witness_relations = 0;
+        assert_eq!(candidate_work, late_baseline_work);
+        assert!(candidate.witness_retention_truncated());
+    }
+}
+
+#[test]
 fn witness_alternative_retention_reports_its_strict_cap() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -1513,6 +1627,28 @@ fn direct_recursion_converges_without_inheriting_snapshot_call_depth() {
         "the recursive root should acquire a reusable normal end summary",
     );
     assert_all_retained_witnesses_reconstruct(&result);
+
+    let best_effort = solve_with_witness_limit(
+        &root,
+        &[],
+        &provider,
+        &problem,
+        WitnessRetentionLimits::best_effort(1, 65_536, 64 * 1024 * 1024).unwrap(),
+    );
+    let entry = root
+        .point_handle(root.semantics().entry_point())
+        .expect("recursive root entry");
+    let entry_witness = best_effort
+        .witness_for_reached(
+            reached_fact(&best_effort, &entry, DirectFact),
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("recursive root seed witness");
+    assert!(
+        !entry_witness.alternatives_truncated(),
+        "replaying the identical recursive entry seed is a duplicate, not an omitted alternative",
+    );
 
     let mut reference_budget =
         SemanticBudget::uniform(100_000_000).expect("positive reference budget");
