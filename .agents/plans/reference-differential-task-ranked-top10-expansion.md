@@ -182,6 +182,25 @@ comes through the local gate, but is not the focus.
   repositories and task counts, including stable 32-task and 22-task tie
   ordering; none is excluded by `large-repos.csv`, and all ten clones are
   tracked-clean at the expected readable heads with complete corpus metadata.
+- [x] (2026-07-26) Built the clean C++ baseline runner from `baa33f66` in the
+  normal repository target at niceness 10, then completed all ten explicit
+  task-ranked envelopes at the same niceness. The append-only strict run
+  returned the expected status 2 for 488 raw missing rows, not an
+  infrastructure failure. All records share fingerprint `f1ba53ab`, have clean
+  Bifrost and clone heads, satisfy every accounting invariant, and have no file
+  or candidate-limit errors.
+- [x] (2026-07-26) Independently audited the ten C++ envelopes and all raw
+  rows. Only ESPHome and Qpid reached the deliberate 1,000-target sample
+  ceiling; the other eight queried every distinct target. Blosc and libcbor
+  have zero raw missing rows, while `ljharb__qs` is a selector-faithful
+  zero-eligible-C++-file record.
+- [x] (2026-07-26) Searched the complete `FIRD:` issue set and found no
+  existing owner for the seven reduced C++ roots. Created issues #1182 through
+  #1188 already assigned to `jbellis`, covering temporary construction,
+  inherited fields, file-local globals, member calls, non-reference forward
+  contexts, nested owner references, and qualified constants. Delegated three
+  disjoint first implementations to Oldskool while root retains review,
+  integration, replay, publication, and issue closure.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
@@ -206,6 +225,17 @@ comes through the local gate, but is not the focus.
 
 - `task_repos` returns eligible records in corpus order, not task-count order.
   The campaign must apply a stable descending `task_count` sort explicitly.
+
+- C++ `run-corpus` appends completed envelopes in finish order, so the ten
+  authoritative records do not appear in selector rank order. Repository
+  identity, not JSONL line position, is the acceptance key.
+
+- The C++ baseline has no candidate-limit or file-error escape hatch. Its raw
+  discrepancies reduce to recurring structured families rather than repository
+  failures: declaration/definition pseudo-reference contexts dominate
+  log4cxx, while temporary construction, receiver/member resolution,
+  file-local identity, nested-owner ranges, and qualified values recur across
+  multiple repositories.
 
 - `tasks.py` canonical language keys are `js` and `ts`. Long aliases can return
   an empty result because the module filters its raw task directory before
